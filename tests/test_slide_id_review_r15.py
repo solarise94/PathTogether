@@ -5,7 +5,14 @@ import slide_storage
 import app as app_mod
 from _pt_helpers import csrf_client
 from test_reconcile_upload_capacity import recon, _uid, _task
-from test_capacity_lifecycle_channels import _isolate, _create
+from test_capacity_lifecycle_channels import _isolate
+
+
+def _create(client, name, size):
+    # U5（检查点 B）：原 HTTP V2 创建端点已删除——store 级等价夹具
+    # （owner 任务：无预约，按身份合同属豁免；断言不变）。
+    return upload_task_store.create_task(
+        "", name, name, size, upload_task_store.UPLOAD_CHUNK_SIZE)["upload_id"]
 
 
 def cli(pg_uri, root, *args):

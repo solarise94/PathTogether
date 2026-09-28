@@ -25,10 +25,9 @@ from pathlib import Path
 import pytest
 from test_slide_migration_tools import world, conn, full_apply
 from test_slide_migration_tools import migrator, verifier, drill
-from test_slide_publish_pg import _isolate, _client, _user_session, _v2_create, _v2_upload_full, _quota
-from test_slide_publish_pg import TIFF
+from test_slide_publish_pg import _isolate, _client, _user_session, TIFF
 import app as app_mod
-import slide_storage
+from _pt_helpers import publish_test_slide
 
 def verify(w, suffix):
     return verifier.run_verify(upload_dir=str(w['up']), out_dir=str(w['up'].parent / suffix),
@@ -70,30 +69,18 @@ def test_zero_used_bytes_blocks_go(world):
     result = verify(world, 'no-accounting')
     assert result['go_no_go'] != 'go', result['quota']
 
-def test_cleanup_failure_preserves_capacity(monkeypatch):
-    c = _client()
-    uid = _user_session(c, login='cleanup-review@example.com')
-    r = _v2_create(c, 'cleanup.tif')
-    assert r.status_code == 200, r.get_json()
-    upload_id = r.get_json()['upload_id']
-    _v2_upload_full(c, upload_id)
-    reserved = _quota(uid)['reserved_bytes']
-    assert reserved > 0
-    def fail_cleanup(*args, **kwargs):
-        raise OSError('injected cleanup IO failure')
-    monkeypatch.setattr(slide_storage, 'remove_staging_tree', fail_cleanup)
-    c.delete('/api/uploads/' + upload_id)
-    assert (Path(app_mod.UPLOAD_DIR) / '.staging' / upload_id / 'transfer' / 'data').is_file()
-    assert _quota(uid)['reserved_bytes'] == reserved
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py / test_cos_ingest_worker.py）。
+# （原 test_cleanup_failure_preserves_capacity：经旧 DELETE 取消端点注入
+#   清理失败后断言预约保留——取消侧清理编排随端点删除；存活通道的
+#   「清理失败不释放容量」由 test_capacity_lifecycle_cos.py::
+#   test_cancel_keeps_reservation_until_cleanup_confirmed 覆盖。）
 
 def test_new_id_session_owner_can_access(monkeypatch):
     c = _client()
     uid = _user_session(c, login='session-review@example.com')
-    created = _v2_create(c, 'brand-new.tif').get_json()
-    _v2_upload_full(c, created['upload_id'], chunk=len(TIFF))
-    response = c.post('/api/uploads/' + created['upload_id'] + '/commit')
-    assert response.status_code == 200, response.get_json()
-    sid = created['slide_id']
+    # U5（检查点 B）：旧上传端点删除——资产改由服务级发布夹具生成
+    sid = publish_test_slide('brand-new.tif', TIFF, owner_user_id=uid,
+                             upload_dir=app_mod.UPLOAD_DIR)
     assert c.get('/api/slides/' + sid + '/info').status_code == 200
     monkeypatch.setattr(app_mod, '_ai_session_record', lambda session_id: {
         'id': session_id, 'owner': uid, 'slide': 'brand-new.tif',

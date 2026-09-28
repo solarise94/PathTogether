@@ -28,7 +28,6 @@
 
 运行：cd PathTogether && .venv/bin/python -m pytest tests/test_raster_wiring.py -q
 """
-import hashlib
 import io
 import os
 import struct
@@ -43,13 +42,16 @@ UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 import pytest  # noqa: E402
 
 import share_server as share_srv  # noqa: E402
+import share_store  # noqa: E402
 import slide_cache  # noqa: E402
 import slide_io  # noqa: E402
 import slide_render  # noqa: E402
+import upload_content  # noqa: E402
 import upload_guard  # noqa: E402
 import upload_task_store  # noqa: E402
 import app as app_mod  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app, clear_upload_dir  # noqa: E402
+from _pt_helpers import (csrf_client, isolate_app, clear_upload_dir,  # noqa: E402
+                         publish_test_slide)
 
 
 # --------------------------------------------------------------------------- #
@@ -142,24 +144,12 @@ def _residue():
             or p.name.startswith(".extracting-")]
 
 
-def _v1_upload(client, name, data):
-    return client.post("/api/upload",
-                       data={"file": (io.BytesIO(data), name)},
-                       content_type="multipart/form-data")
-
-
-def _v2_create(client, name, size):
-    r = client.post("/api/uploads",
-                    json={"filename": name, "declared_size": size})
-    assert r.status_code == 200, r.get_data(as_text=True)
-    return r.get_json()["upload_id"]
-
-
-def _v2_put(client, upload_id, offset, data):
-    return client.put(
-        "/api/uploads/%s/chunk?offset=%d&sha256=%s"
-        % (upload_id, offset, hashlib.sha256(data).hexdigest()),
-        data=data, content_type="application/octet-stream")
+def _publish_slide(name, data):
+    """U5 检查点 B：旧 V1 端点已删——服务级直接发布 ready 资产作夹具
+    （owner 与本地免认证态上传资产的归属解析同源）。"""
+    return publish_test_slide(
+        name, data, owner_user_id=share_store.get_owner_user_id(),
+        upload_dir=UPLOAD_DIR)
 
 
 # =========================================================================== #
@@ -207,7 +197,7 @@ def test_slide_info_endpoint_raster_metadata_contract():
     """/api/slide/<name>/info 对普通图片输出 §4.4 JSON（不含物理标尺字段值）。"""
     bmp = _bmp_bytes(64, 48)
     c = _client()
-    sid = _v1_upload(c, "wire_meta.bmp", bmp).get_json()["slide_id"]
+    sid = _publish_slide("wire_meta.bmp", bmp)
     # P3：id_bundle 资产经 ID 端点读（name=None；按名 403 是预期）
     r = c.get("/api/slides/%s/info" % sid)
     assert r.status_code == 200, r.get_data(as_text=True)
@@ -227,7 +217,7 @@ def test_slide_info_endpoint_exif_corrected_dimensions():
     jpg = _jpeg_bytes(120, 40, orientation=6)
     assert jpg.startswith(b"\xff\xd8")  # 真 JPEG 字节
     c = _client()
-    sid = _v1_upload(c, "wire_rot.jpg", jpg).get_json()["slide_id"]
+    sid = _publish_slide("wire_rot.jpg", jpg)
     r = c.get("/api/slides/%s/info" % sid)
     assert r.status_code == 200, r.get_data(as_text=True)
     j = r.get_json()
@@ -238,8 +228,7 @@ def test_slide_info_endpoint_exif_corrected_dimensions():
 def test_slides_list_includes_raster_metadata():
     """/api/slides 列表对普通图片输出同一套缺标尺元数据（无物理倍率）。"""
     c = _client()
-    sid = _v1_upload(c, "wire_list.bmp",
-                     _bmp_bytes(48, 32)).get_json()["slide_id"]
+    sid = _publish_slide("wire_list.bmp", _bmp_bytes(48, 32))
     r = c.get("/api/slides")
     assert r.status_code == 200
     rows = {it["slide_id"]: it for it in r.get_json()}  # P3：name=None，按 ID 键
@@ -286,84 +275,9 @@ def test_slide_formats_endpoint_extension_vocab_no_drift():
 # =========================================================================== #
 # 3. V2 .part + format_hint（真实 _validate_slide_file，不打桩）
 # =========================================================================== #
-def test_v2_part_real_jpg_commit_committed():
-    """.uploading-*.part 的 .jpg 走真实验证：EXIF JPEG commit 成功，
-    提升字节 = 原始上传字节（§4.3：保留原始字节），无临时残留。"""
-    jpg = _jpeg_bytes(120, 40, orientation=8)
-    c = _client()
-    uid = _v2_create(c, "wire_v2.jpg", len(jpg))
-    assert _v2_put(c, uid, 0, jpg).status_code == 200
-    part = app_mod._upload_v2_part_path(upload_task_store.get_task(uid))
-    assert part.exists()  # P3：.staging/<uid>/transfer/ 暂存中
-    r = c.post("/api/uploads/%s/commit" % uid)
-    assert r.status_code == 200, r.get_data(as_text=True)
-    assert r.get_json()["state"] == "committed"
-    sid = r.get_json()["slide_id"]
-    assert (Path(UPLOAD_DIR) / "objects" / sid /
-            "data.jpg").read_bytes() == jpg
-    assert not (Path(UPLOAD_DIR) / ".staging" / uid).exists()
-    assert _residue() == []
-
-
-def test_v2_part_png_disguised_as_jpg_fails_clean():
-    """PNG 字节伪装 .jpg：commit 409 invalid_slide → failed，无提升无残留。"""
-    from PIL import Image as PILImage
-
-    b = io.BytesIO()
-    PILImage.new("RGB", (8, 6)).save(b, format="PNG")
-    png = b.getvalue()
-    c = _client()
-    uid = _v2_create(c, "wire_fake.jpg", len(png))
-    assert _v2_put(c, uid, 0, png).status_code == 200
-    r = c.post("/api/uploads/%s/commit" % uid)
-    assert r.status_code == 409
-    j = r.get_json()
-    assert j["code"] == "invalid_slide"  # §4.5：真实格式不符 → invalid_slide
-    assert j["state"] == "failed"
-    assert not (Path(UPLOAD_DIR) / "wire_fake.jpg").exists()
-    # 终态幂等：重复 commit 仍 409，DELETE 清 .part 后无残留
-    assert c.post("/api/uploads/%s/commit" % uid).status_code == 409
-    assert c.delete("/api/uploads/%s" % uid).status_code == 200
-    assert _residue() == []
-
-
-def test_v2_raster_failure_releases_quota_pg(monkeypatch):
-    """PG 后端：垃圾 .jpg commit 确定性失败后配额预占释放、无实占（不泄漏）。"""
-    import psycopg
-    import user_store
-
-    uid_user = user_store.create_user(
-        "rasterq@x.com", "pass1234pass1234", role="user")["user_id"]
-    with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO upload_user_quotas (user_id, quota_bytes) "
-                "VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE "
-                "SET quota_bytes = EXCLUDED.quota_bytes", (uid_user, 10 ** 7))
-    junk = b"\x00junk-not-jpeg" * 64
-    c = _client()
-    app_mod.AUTH_ENABLED = True
-    u = user_store.get_user(uid_user)
-    with c.session_transaction() as sess:
-        sess["auth_user"] = True
-        sess["user_id"] = uid_user
-        sess["role"] = "user"
-        sess["auth_version"] = (u or {}).get("auth_version", 1)
-    r = c.post("/api/uploads", json={"filename": "wire_junk.jpg",
-                                     "declared_size": len(junk)})
-    uid = r.get_json()["upload_id"]
-    assert _v2_put(c, uid, 0, junk).status_code == 200
-    assert c.post("/api/uploads/%s/commit" % uid).status_code == 409
-    with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT reserved_bytes, used_bytes "
-                        "FROM upload_user_quotas WHERE user_id=%s",
-                        (uid_user,))
-            reserved, used = cur.fetchone()
-    assert reserved == 0 and used == 0  # 预占释放、无实占
-    assert not (Path(UPLOAD_DIR) / "wire_junk.jpg").exists()
-    c.delete("/api/uploads/%s" % uid)
-    assert _residue() == []
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py / test_cos_ingest_worker.py）。
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py / test_cos_ingest_worker.py）。
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py / test_cos_ingest_worker.py）。
 
 
 # =========================================================================== #
@@ -381,16 +295,18 @@ def _make_zip(members):
 
 def _publish_prepared(bundle):
     """P4-app：prepare 产物经受理（allocate+bind+intent）→ 逐 item 统一发布
-    → finish_commit 的最小生产管线（镜像 test_zip_guard 聚合器）。"""
+    → finish_commit 的最小生产管线（镜像 test_zip_guard 聚合器）。
+
+    U5 检查点 B：app 端点壳已删——ZIP 原语改直调 upload_content
+    （cos_ingest_worker 同一生产模块）。"""
     import pg_store
-    import share_store
     import slide_publish
     import slide_storage
     import slide_store
     import upload_task_store
     owner = (share_store.get_owner_user_id() or "").strip()
     upload_id = upload_task_store.new_task_id()
-    artifacts = app_mod._zip_build_artifacts(bundle)
+    artifacts = upload_content.zip_build_artifacts(bundle)
     import psycopg.rows
     conn = pg_store.connect()
     conn.row_factory = psycopg.rows.dict_row
@@ -409,12 +325,12 @@ def _publish_prepared(bundle):
     finally:
         conn.close()
     items = upload_task_store.list_upload_task_items(upload_id)
-    plans = app_mod._zip_item_plans(artifacts, items)
-    published, _f, _s = app_mod._zip_publish_items(
+    plans = upload_content.zip_item_plans(artifacts, items)
+    published, _f, _s = upload_content.zip_publish_items(
         upload_id, token, plans, owner,
         extract_dir=bundle["extract_dir"], upload_root=app_mod.UPLOAD_DIR)
     upload_task_store.finish_commit(
-        upload_id, token, app_mod._upload_manifest_sha(artifacts),
+        upload_id, token, upload_content.manifest_sha(artifacts),
         settle_bytes=int(published))
     slide_storage.remove_staging_tree(upload_id, root=app_mod.UPLOAD_DIR)
     return {r["item_key"]: r["slide_id"]
@@ -426,7 +342,7 @@ def test_zip_valid_bmp_member_promoted_with_real_validation():
     （P4-app 断言换新：产物在 objects/<slide_id>/data.bmp，不平铺）。"""
     bmp = _bmp_bytes(64, 48)
     z = _make_zip([("wire_zip.bmp", bmp)])
-    result = app_mod._prepare_zip_bundle(z)
+    result = upload_content.prepare_zip_bundle(z, upload_root=UPLOAD_DIR)
     assert not isinstance(result, tuple), result
     assert [i["key"] for i in result["items"]] == ["wire_zip.bmp"]
     assert result["main"] == "wire_zip.bmp"
@@ -443,7 +359,7 @@ def test_zip_only_garbage_jpg_member_whole_rejected():
     """zip 内只有垃圾 .jpg 成员：整包 400 拒绝，无任何提升、无残留。"""
     junk = b"\x00not-jpeg-at-all" * 16
     z = _make_zip([("wire_bad.jpg", junk)])
-    result = app_mod._prepare_zip_bundle(z)
+    result = upload_content.prepare_zip_bundle(z, upload_root=UPLOAD_DIR)
     assert isinstance(result, tuple)  # (error_message, http_status)
     msg, status = result
     assert status == 400
@@ -458,7 +374,7 @@ def test_zip_mixed_valid_bmp_and_garbage_jpg():
     bmp = _bmp_bytes(32, 24)
     z = _make_zip([("wire_ok.bmp", bmp), ("wire_mixed_bad.jpg",
                                           b"\x00junk" * 16)])
-    result = app_mod._prepare_zip_bundle(z)
+    result = upload_content.prepare_zip_bundle(z, upload_root=UPLOAD_DIR)
     assert not isinstance(result, tuple), result
     assert [i["key"] for i in result["items"]] == ["wire_ok.bmp"]
     assert [f["item"] for f in result["invalid"]] == ["wire_mixed_bad.jpg"]
@@ -542,7 +458,7 @@ def test_bmp_info_dzi_tile_thumbnail_smoke():
 
     bmp = _bmp_bytes(96, 64)
     c = _client()
-    sid = _v1_upload(c, "wire_view.bmp", bmp).get_json()["slide_id"]
+    sid = _publish_slide("wire_view.bmp", bmp)
 
     # info：渲染 additive 字段可用（deepzoom 描述）；P3 起经 ID 端点
     info = c.get("/api/slides/%s/info" % sid).get_json()

@@ -25,7 +25,9 @@ def _iso(monkeypatch, tmp_path):
         user_store.create_user("imp-local-owner@x.com",
                                "implocalpass12345", role="user")["user_id"])
     # A0 异常契约：放行 stub 返回 None，签名兼容 format_hint 关键字
-    monkeypatch.setattr(app_mod, "_validate_slide_file", lambda p, **_: None)
+    import upload_content
+    monkeypatch.setattr(upload_content, "validate_slide_file",
+                        lambda p, **_: None)
     monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)
     return tmp_path
 

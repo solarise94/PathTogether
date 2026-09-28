@@ -224,8 +224,8 @@ def cmd_freeze(args):
     frozen, already = upload_task_store.freeze_drain_list()
     print("freeze 完成：新冻结 %d 行；清单既有 %d 行（幂等，不覆盖）"
           % (frozen, already))
-    print("frozen_at 即可信持久切换边界；随后以 PT_UPLOAD_LEGACY_MODE=drain "
-          "重启应用进入排空版")
+    print("frozen_at 即可信持久切换边界（检查点 A 构建以 PT_UPLOAD_LEGACY_MODE="
+          "drain 进入排空版；检查点 B 构建已删除旧端点，freeze 仅作审计边界）")
     return 0
 
 

@@ -29,7 +29,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
 DATA_DIR = _bootstrap.SHARE_DATA_DIR
 UPLOAD_DIR = _bootstrap.UPLOAD_DIR
-import hashlib  # noqa: E402
 import psycopg  # noqa: E402
 import pytest  # noqa: E402
 
@@ -39,7 +38,8 @@ import share_store  # noqa: E402
 import slide_store  # noqa: E402
 import user_store  # noqa: E402
 from _pt_helpers import csrf_client, isolate_app, FakeRequests  # noqa: E402
-from _pt_helpers import register_slide_row  # noqa: E402  # P6：夹具建仓
+from _pt_helpers import (publish_test_slide,  # noqa: E402  # U5：服务级发布夹具
+                         register_slide_row)
 from _tiff_fixtures import make_tiff_bytes  # noqa: E402
 
 
@@ -282,21 +282,12 @@ def test_slide_delete_clears_view_grants_no_orphans():
     names = {i["name"] for i in co.get("/api/slides").get_json()}
     assert slide not in names
 
-    # 同名重传（新管线 V2）→ 新 ID；tombstone 保持死亡（不复活、不重绑）
+    # 同名重传（服务级发布夹具）→ 新 ID；tombstone 保持死亡（不复活、不重绑）
     cu = _login(_client(), usera)
     tiff = make_tiff_bytes(32, 32)
-    r = cu.post("/api/uploads", json={"filename": slide,
-                                      "declared_size": len(tiff)})
-    assert r.status_code == 200, r.get_data(as_text=True)
-    upload_id = r.get_json()["upload_id"]
-    sha = hashlib.sha256(tiff).hexdigest()
-    put = cu.put("/api/uploads/%s/chunk?offset=0&sha256=%s"
-                 % (upload_id, sha), data=tiff,
-                 content_type="application/octet-stream")
-    assert put.status_code == 200, put.get_data(as_text=True)
-    rc = cu.post("/api/uploads/%s/commit" % upload_id)
-    assert rc.status_code == 200, rc.get_data(as_text=True)
-    new_slide_id = rc.get_json()["slide_id"]
+    new_slide_id = publish_test_slide(slide, tiff,
+                                      owner_user_id=usera["user_id"],
+                                      upload_dir=UPLOAD_DIR)
     assert new_slide_id and new_slide_id != old_slide_id
     # 旧授权不自动生效（失效语义）：owner 看不到新资产（按名/按 ID 都不可见）
     names = {i["name"] for i in co.get("/api/slides").get_json()}

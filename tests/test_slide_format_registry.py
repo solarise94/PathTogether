@@ -124,17 +124,22 @@ def test_upload_whitelist_unchanged_no_kfb():
 # 3. 普通图片族（BMP/JPEG）：能力登记 + 产品目录 + 白名单同步
 # --------------------------------------------------------------------------- #
 def test_raster_image_whitelist_synced():
-    """普通图片族进入上传白名单：SUPPORTED_EXTS / _upload_ext_allowed 同步。"""
+    """普通图片族在上传受理集内：SUPPORTED_EXTS / ingestion 形态分派同步。
+
+    U5（检查点 B）：app._upload_ext_allowed 已退役——受理判定经
+    _cos_ingestion_kind_for（注册表派生，bmp/jpg/jpeg → native）。"""
     import app
 
     assert {"bmp", "jpg", "jpeg"} <= app.SUPPORTED_EXTS
-    for name in ("a.bmp", "a.JPG", "a.jpeg"):
-        assert app._upload_ext_allowed(name) is True
-    # 大小写不敏感 + kfb/kfbf 走 convert-required 通道、未知仍拒绝
-    assert app._upload_ext_allowed("a.BMP") is True
-    assert app._upload_ext_allowed("a.kfb") is True   # convert-required 通道
-    assert app._upload_ext_allowed("a.kfbf") is True  # convert-required 通道
-    assert app._upload_ext_allowed("a.png") is False
+    with app.app.test_request_context("/"):
+        for name in ("a.bmp", "a.JPG", "a.jpeg"):
+            kind, err = app._cos_ingestion_kind_for(name.lower())
+            assert err is None and kind == "native", name
+        # 大小写不敏感 + kfb/kfbf 走 convert-required 通道、未知仍拒绝
+        assert app._cos_ingestion_kind_for("a.BMP")[0] == "native"
+        assert app._cos_ingestion_kind_for("a.kfb")[0] == "conversion"
+        assert app._cos_ingestion_kind_for("a.kfbf")[0] == "conversion"
+        assert app._cos_ingestion_kind_for("a.png")[0] is None  # 未知仍拒绝
 
 
 def test_public_catalog_raster_image_row():

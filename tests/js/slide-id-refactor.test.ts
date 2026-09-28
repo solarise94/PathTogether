@@ -4,9 +4,9 @@
  * 加载真实 static/app.js（最小 DOM + fetch mock + HostBridgeHost stub）：
  *  ① 同 display_name 两片并存——列表两行（data-slide-id 区分）、分别打开不串；
  *  ② 改名（PATCH /api/slides/<id> 后重拉列表）ID 不变、行仍指向同片；
- *  ③ V1 适配器（U3 排空过渡保留）上传完成按响应 slide_id 打开（ID 通道
- *     info，绝不按 file.name 猜）；
- *  ④ 续传键 v3 账户域隔离（换 account 不复用会话）；
+
+ *  （③V1 适配器上传目标 / ④续传键 v3 账户域隔离：随检查点 B 旧适配器
+ *   与续传键删除而退役——上传链路由 tests/js/cos-upload.test.ts 覆盖）；
  *  ⑤ slide_id_api=false（旧后端）回落 name 通道（旧端点 + 载荷无 id）；
  *  ⑥ ?slide=<slide_id> URL 通道加载即打开对应切片。
  */
@@ -458,123 +458,8 @@ describe("slide ID 化前端契约（P2 合同 §5）", () => {
 		expect(rowsAfter.some((r) => r.dataset.slideId === ID_A)).toBe(true);
 	});
 
-	it("③ V1 适配器上传完成按响应 slide_id 打开（ID 通道 info；不按 file.name 猜）", async () => {
-		const app = bootApp({ idMode: true });
-		await settle();
-		const uploadFileLegacy = app.upload.uploadFileLegacy as (f: unknown, row: unknown) => void;
-		uploadFileLegacy({ name: "v1.svs", size: 3 },
-			{ setStage() {}, finish() {}, markError() {} });
-		await settle();
-		expect(FakeXHR.instances).toHaveLength(1);
-		FakeXHR.instances[0].simulateLoad(200, JSON.stringify({
-			name: "v1.svs", state: "ready", slide_id: "sld_v1done00001",
-		}));
-		await settle(30);
-		// 打开目标 = 响应 slide_id（/api/slides/<id>/info）；不是 file.name
-		expect(app.fetchUrls().some((u) => u === "/api/slides/sld_v1done00001/info")).toBe(true);
-		expect(app.fetchUrls().some((u) => u === "/api/slide/v1.svs/info")).toBe(false);
-		expect(app.fetchUrls().some((u) => u === "/api/slides/v1.svs/info")).toBe(false);
-	});
 
-	it("④ 续传键 v3 账户域隔离：换 account 不复用会话", async () => {
-		const THRESHOLD = 16 * 1024 * 1024;
-		const file = {
-			name: "resume.svs",
-			size: THRESHOLD,
-			lastModified: 1,
-			slice() { return { arrayBuffer: async () => new ArrayBuffer(0) }; },
-		};
-		const auth = (uid: string) => ({
-			auth_enabled: true, role: "user", user_id: uid, username: uid + "@x",
-		});
 
-		// —— 账户 u1：预置 pt.upload.v3::u1:up-x（filename/size 匹配）→ GET 状态续传
-		const st1 = fakeStorage();
-		st1.setItem("pt.upload.v3::u1:up-x", JSON.stringify({
-			upload_id: "up-x", declared_size: THRESHOLD, chunk_size: 8,
-			filename: "resume.svs", slide_id: null,
-		}));
-		let statusU1 = 0;
-		let postedU1 = 0;
-		const urlsU1: string[] = [];
-		const fetchU1 = ((url: string, opts?: RequestInit) => {
-			const u = String(url);
-			const method = String((opts && opts.method) || "GET");
-			urlsU1.push(method + " " + u);
-			if (u === "/api/uploads/up-x" && method === "GET") {
-				statusU1++;
-				// active 且已确认到末尾 → 直接进 commit（无分片 PUT）
-				return jsonResponse({ upload_id: "up-x", state: "active", chunk_size: 8,
-					confirmed_offset: THRESHOLD, slide_id: null });
-			}
-			if (u === "/api/uploads/up-x/commit") {
-				return jsonResponse({ state: "ready", upload_id: "up-x", slide_id: "sld_resume0001" });
-			}
-			if (u === "/api/uploads" && method === "POST") {
-				postedU1++;
-				return jsonResponse({ upload_id: "up-new", chunk_size: 8, confirmed_offset: THRESHOLD });
-			}
-			if (u === "/api/uploads/up-new/commit") {
-				return jsonResponse({ state: "ready", upload_id: "up-new", slide_id: null });
-			}
-			if (u.includes("/api/auth/info")) return jsonResponse(auth("u1"));
-			return jsonResponse({});
-		}) as unknown as typeof fetch;
-		const app1 = bootApp({ idMode: true, storage: st1, fetchImpl: fetchU1 });
-		const uploadV2 = app1.upload.uploadFileV2 as (f: unknown, r: unknown) => void;
-		// 等 initAuth 微任务落地（currentUserId = u1 → uploadAccountScope = "u1"）
-		await settle(10);
-		uploadV2(file, makeUploadRow());
-		await settle(30);
-		// u1 域命中：GET /api/uploads/up-x 被查询（复用任务），无新建 POST
-		expect(statusU1).toBeGreaterThan(0);
-		expect(postedU1).toBe(0);
-		// 成功后 u1 域键清理
-		expect(st1.getItem("pt.upload.v3::u1:up-x")).toBeNull();
-
-		// —— 账户 u2：同一文件；u1 的 v3 键在 u2 域不可见 → 新建任务
-		const st2 = fakeStorage();
-		st2.setItem("pt.upload.v3::u1:up-x", JSON.stringify({
-			upload_id: "up-x", declared_size: THRESHOLD, chunk_size: 8,
-			filename: "resume.svs", slide_id: null,
-		}));
-		let statusU2 = 0;
-		let postedU2 = 0;
-		const urlsU2: string[] = [];
-		const fetchU2 = ((url: string, opts?: RequestInit) => {
-			const u = String(url);
-			const method = String((opts && opts.method) || "GET");
-			urlsU2.push(method + " " + u);
-			if (u === "/api/uploads/up-x" && method === "GET") {
-				statusU2++;
-				return jsonResponse({ upload_id: "up-x", state: "active", chunk_size: 8,
-					confirmed_offset: THRESHOLD, slide_id: null });
-			}
-			if (u === "/api/uploads" && method === "POST") {
-				postedU2++;
-				return jsonResponse({ upload_id: "up-y", chunk_size: 8, confirmed_offset: THRESHOLD });
-			}
-			if (u === "/api/uploads/up-y/commit") {
-				// 非确定性失败（500，无稳定码）：任务与 v3 键保留，
-				// 便于断言新任务键落在 u2 账户域
-				return Promise.resolve({ ok: false, status: 500, clone() { return this; },
-					json: () => Promise.resolve({ error: "server error" }) });
-			}
-			if (u.includes("/api/auth/info")) return jsonResponse(auth("u2"));
-			return jsonResponse({});
-		}) as unknown as typeof fetch;
-		const app2 = bootApp({ idMode: true, storage: st2, fetchImpl: fetchU2 });
-		const uploadV2_2 = app2.upload.uploadFileV2 as (f: unknown, r: unknown) => void;
-		await settle(10);
-		uploadV2_2(file, makeUploadRow());
-		await settle(30);
-		// u2 域看不到 u1 的记录：不查 /api/uploads/up-x，新建 POST /api/uploads
-		expect(statusU2).toBe(0);
-		expect(postedU2).toBe(1);
-		// 新任务记在 u2 域键下；u1 的旧键原样保留（不被 u2 迁走）
-		expect(st2.getItem("pt.upload.v3::u2:up-y")).toBeTruthy();
-		expect(st2.getItem("pt.upload.v3::u1:up-x")).toBeTruthy();
-	});
 
 
 	it("⑤ slide_id_api=false（旧后端）→ 回落 name 通道（旧端点 + 载荷无 id）", async () => {

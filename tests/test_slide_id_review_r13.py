@@ -2,6 +2,12 @@ import os
 import json
 import psycopg
 import pytest
+
+pytestmark = pytest.mark.skip(reason=
+    "U5（检查点 B）：本文件反例 2 的被测面（V1 _api_upload_native_single 早退分支）已按 docs/cos-only-upload-agent-plan-20260928.md §6 明确删除；断言按处置约定原样保留，仅整文件跳过（历史证据）。反例 1/3 的核账与恢复语义仍在 test_reconcile_upload_capacity.py 生效。")
+
+
+
 import slide_storage
 import upload_guard as guard
 import upload_task_store

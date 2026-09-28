@@ -20,33 +20,21 @@ from pathlib import Path
 import psycopg
 import pytest
 import app as app_mod
-import slide_storage
+import upload_guard
 import upload_task_store
-from test_slide_publish_pg import _isolate, _client, _user_session, _v2_create, _v2_upload_full, _quota, TIFF
+from test_slide_publish_pg import _isolate, _client, _user_session, _quota, TIFF
 from test_slide_migration_tools import conn, world, full_apply, verifier, drill
 
 def verify(w):
     return verifier.run_verify(upload_dir=str(w['up']), out_dir=str(w['up'].parent / 'recheck'),
         plan_path=str(w['plan']), journal_path=str(w['journal']), database_url=w['uri'])
 
-def test_cleanup_hold_survives_reservation_expiry(monkeypatch, pg_uri):
-    c = _client()
-    uid = _user_session(c, login='pending-expiry@example.com')
-    task = _v2_create(c, 'pending.tif').get_json()
-    _v2_upload_full(c, task['upload_id'], chunk=len(TIFF))
-    def fail(*args, **kwargs):
-        raise OSError('cleanup blocked')
-    monkeypatch.setattr(slide_storage, 'remove_staging_tree', fail)
-    assert c.delete('/api/uploads/' + task['upload_id']).status_code == 503
-    pending = upload_task_store.get_cleanup_pending(task['upload_id'])
-    held = _quota(uid)['reserved_bytes']
-    assert held > 0
-    with psycopg.connect(pg_uri, autocommit=True) as db:
-        db.execute("UPDATE upload_reservations SET expires_at=now()-interval '1 second' WHERE reservation_id=%s", (pending['reservation_id'],))
-    new = _v2_create(c, 'next.tif')
-    assert new.status_code == 200
-    assert (Path(app_mod.UPLOAD_DIR)/'.staging'/task['upload_id']/'transfer'/'data').is_file()
-    assert _quota(uid)['reserved_bytes'] == held + len(TIFF)
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py / test_cos_ingest_worker.py）。
+# （原 test_cleanup_hold_survives_reservation_expiry：经 DELETE 503 注入清理
+#   失败后断言 pending 预约不被 TTL/新准入回收——入口与断言均属旧取消端点
+#   的 cleanup-retry 行为；不变量的存活通道版由 test_capacity_lifecycle_cos.py
+#   与 test_reconcile_upload_capacity.py::test_terminal_pending_legacy_stock_
+#   bound_not_reclaimed 覆盖。）
 
 def test_clear_cleanup_returns_reservation_and_removes_row():
     upload_task_store.record_cleanup_pending('upt-review', 'rsv-review', error='failure')
@@ -68,55 +56,36 @@ def test_claimed_share_revocation_blocks_go(world):
 # 编排方补充（R7 修复要求：「验证用户重复 DELETE 和管理员清理两条完整
 # 收尾路径」）——非审查方复现，断言编排方口径。
 # --------------------------------------------------------------------------- #
-def test_repeated_delete_completes_release_after_cleanup_recovery(
-        monkeypatch, pg_uri):
-    """完整收尾路径①（用户重复 DELETE）：清理失败保留预约 → 恢复后重复
-    DELETE → 物理清理 + 预约释放 + pending 行消除，三者一次完成。"""
-    c = _client()
-    uid = _user_session(c, login="retry-path@example.com")
-    task = _v2_create(c, "retry-path.tif").get_json()
-    _v2_upload_full(c, task["upload_id"], chunk=len(TIFF))
-    state = {"fail": True}
-    real = slide_storage.remove_staging_tree
-
-    def flaky(task_id, root=None):
-        if state["fail"]:
-            raise OSError("cleanup blocked")
-        return real(task_id, root=root)
-
-    monkeypatch.setattr(slide_storage, "remove_staging_tree", flaky)
-    assert c.delete("/api/uploads/" + task["upload_id"]).status_code == 503
-    held = _quota(uid)["reserved_bytes"]
-    assert held > 0
-    assert upload_task_store.get_cleanup_pending(task["upload_id"]) is not None
-
-    state["fail"] = False  # 清理恢复
-    r2 = c.delete("/api/uploads/" + task["upload_id"])
-    assert r2.status_code == 200, r2.get_json()
-    assert not (Path(app_mod.UPLOAD_DIR) / ".staging" /
-                task["upload_id"]).exists()
-    assert _quota(uid)["reserved_bytes"] == 0
-    assert upload_task_store.get_cleanup_pending(task["upload_id"]) is None
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py / test_cos_ingest_worker.py）。
+# （原 test_repeated_delete_completes_release_after_cleanup_recovery：核心
+#   即旧 DELETE 取消端点的「清理失败 503 → 恢复后重复 DELETE 收口」重试
+#   路径本身；同语义的存活收口原语 confirm_cleanup_and_release 单事务
+#   行为由 test_slide_id_review_r12/r13 覆盖。）
 
 
-def test_admin_cleanup_releases_held_reservation(monkeypatch, pg_uri):
+def test_admin_cleanup_releases_held_reservation(pg_uri):
     """完整收尾路径②（管理员确认清理）：pending 持有的过期预约不被 TTL/
-    新准入回收；管理员 staging-residue 确认清理后释放并消除 pending。"""
+    新准入回收；管理员 staging-residue 确认清理后释放并消除 pending。
+
+    U5（检查点 B）：入口态改由服务级构造（create_task + 绑定预约 +
+    物理残留 + record_cleanup_pending，终态经 cancel_task 落定——与旧
+    DELETE 取消路径同状态）；原「清理失败 503」注入随旧上传端点删除，
+    以下收尾断言原样保留。"""
+    import user_store
     from _pt_helpers import csrf_client
     c = _client()
     uid = _user_session(c, login="admin-path@example.com")
-    task = _v2_create(c, "admin-path.tif").get_json()
-    _v2_upload_full(c, task["upload_id"], chunk=len(TIFF))
-    state = {"fail": True}
-    real = slide_storage.remove_staging_tree
-
-    def flaky(task_id, root=None):
-        if state["fail"]:
-            raise OSError("cleanup blocked")
-        return real(task_id, root=root)
-
-    monkeypatch.setattr(slide_storage, "remove_staging_tree", flaky)
-    assert c.delete("/api/uploads/" + task["upload_id"]).status_code == 503
+    task = upload_task_store.create_task(uid, "admin-path.tif",
+                                         "admin-path.tif", len(TIFF), 32)
+    rid = upload_guard.reserve_upload(
+        uid, len(TIFF), holder_kind="upload_task",
+        holder_id=task["upload_id"], purpose="upload")["reservation_id"]
+    staged = Path(app_mod.UPLOAD_DIR) / ".staging" / task["upload_id"] / "transfer"
+    staged.mkdir(parents=True)
+    (staged / "data").write_bytes(TIFF)
+    upload_task_store.cancel_task(task["upload_id"])
+    upload_task_store.record_cleanup_pending(task["upload_id"], rid,
+                                             error="cleanup blocked")
     held = _quota(uid)["reserved_bytes"]
     pending = upload_task_store.get_cleanup_pending(task["upload_id"])
     assert pending and pending["reservation_id"]
@@ -126,12 +95,10 @@ def test_admin_cleanup_releases_held_reservation(monkeypatch, pg_uri):
         db.execute("UPDATE upload_reservations SET expires_at="
                    "now()-interval '1 second' WHERE reservation_id=%s",
                    (pending["reservation_id"],))
-    assert _v2_create(c, "admin-next.tif").status_code == 200
+    upload_guard.reserve_upload(uid, len(TIFF))
     assert _quota(uid)["reserved_bytes"] == held + len(TIFF)
 
     # 管理员确认清理（真实 owner 用户会话直调端点）
-    state["fail"] = False
-    import user_store
     admin_user = user_store.create_user(
         "admin-path-owner@example.com", "ownerpass123456", role="owner")
     admin = csrf_client(app_mod.app.test_client())

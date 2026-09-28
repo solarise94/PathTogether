@@ -11,12 +11,11 @@
   2. **冻结别名**固定 ID 查找仍工作：resolve_legacy_alias 照常解析（书签
      兼容）；**已迁移行**（id_bundle + 保留 legacy_filename）按别名解析到
      行、按 ID 读全通、分享 token 按 ID 成员照常、成员清单路径不再指旧位。
-  3. 升级窗口分支拆除后的恢复语义：committing 旧形态 → fail-closed 保持
-     committing（新链路恢复回归见 test_upload_v2 / test_slide_publish_pg /
-     test_kfb_upload 的既有用例）。
-  4. ``.uploading-*.lock`` sidecar 收进任务 staging 目录：锁在
-     ``.staging/<upload_id>/chunk.lock`` 生效，UPLOAD_DIR 根**无任何**
-     ``.uploading-*`` 残留（含锁与 .part）。
+  3. 升级窗口分支拆除后的恢复语义：旧 V2 committing 形态的恢复扫描用例
+     随上传端点删除归 COS 链路（tests/test_cos_ingestion_kinds.py /
+     test_ingestion_api.py / test_cos_ingest_worker.py）。
+  4. ``.uploading-*.lock`` sidecar 收进任务 staging 目录：分片传输布局
+     用例随上传端点删除归 COS 链路（同上）。
 
 运行：cd 项目根 && python3 -m pytest tests/test_p6_legacy_runtime_retirement.py -q
 """
@@ -36,11 +35,11 @@ import app as app_mod  # noqa: E402
 import share_server as share_srv  # noqa: E402
 import share_store  # noqa: E402
 import slide_store  # noqa: E402
-import slide_storage  # noqa: E402
 import upload_guard  # noqa: E402
 import upload_task_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import clear_upload_dir, csrf_client, isolate_app  # noqa: E402
+from _pt_helpers import (clear_upload_dir, csrf_client, isolate_app,  # noqa: E402
+                         publish_test_slide)
 from _tiff_fixtures import make_tiff_bytes  # noqa: E402
 
 PG_URI = os.environ["DATABASE_URL"]
@@ -91,25 +90,14 @@ def _seed_legacy_row(slide_id, legacy_name, owner, *, public=False):
         (slide_id, legacy_name, owner, public, len(TIFF), legacy_name))
 
 
-def _v2_publish_migrated(client, name, alias):
-    """V2 上传发布 id_bundle 资产后，模拟 P6 迁移的冻结别名（行保留
+def _publish_migrated(owner, name, alias):
+    """服务级发布 id_bundle 资产后，模拟 P6 迁移的冻结别名（行保留
     legacy_filename、布局 id_bundle）——「已迁移行」形态。"""
-    r = client.post("/api/uploads", json={"filename": name,
-                                          "declared_size": len(TIFF)})
-    assert r.status_code == 200, r.get_data(as_text=True)
-    uid = r.get_json()["upload_id"]
-    data = TIFF
-    for off in range(0, len(data), 4096):
-        rr = client.put(
-            "/api/uploads/%s/chunk?offset=%d&sha256=%s"
-            % (uid, off, hashlib.sha256(data[off:off + 4096]).hexdigest()),
-            data=data[off:off + 4096],
-            content_type="application/octet-stream")
-        assert rr.status_code == 200, rr.get_data(as_text=True)
-    r = client.post("/api/uploads/%s/commit" % uid)
-    assert r.status_code == 200, r.get_data(as_text=True)
-    sid = r.get_json()["slide_id"]
-    _exec("UPDATE slides SET legacy_filename=%s WHERE slide_id=%s", (alias, sid))
+    sid = publish_test_slide(name, TIFF, owner_user_id=owner,
+                             upload_dir=UPLOAD_DIR)
+    if alias:
+        _exec("UPDATE slides SET legacy_filename=%s WHERE slide_id=%s",
+              (alias, sid))
     return sid
 
 
@@ -180,7 +168,7 @@ def test_frozen_alias_and_migrated_row_still_readable_by_id():
         sess["user_id"] = owner
         sess["role"] = "user"
         sess["auth_version"] = 1
-    sid = _v2_publish_migrated(c, "migrated.tif", "migrated-alias.svs")
+    sid = _publish_migrated(owner, "migrated.tif", "migrated-alias.svs")
     # 迁移源冻结保留在根（不删源），但读路径只认 objects/<sid>/
     assert (Path(UPLOAD_DIR) / "migrated.tif").exists() is False
     # 冻结别名解析照常（固定 ID 查找——书签兼容）
@@ -207,7 +195,7 @@ def test_migrated_row_share_token_by_id_member_works():
         sess["user_id"] = owner
         sess["role"] = "user"
         sess["auth_version"] = 1
-    sid = _v2_publish_migrated(c, "sharedmig.tif", "shared-alias.svs")
+    sid = _publish_migrated(owner, "sharedmig.tif", "shared-alias.svs")
     share = share_store.create_share(
         ["shared-alias.svs"], 24, creator_user_id=owner, slide_ids=[sid])
     token = share["token"]
@@ -225,76 +213,22 @@ def test_migrated_row_share_token_by_id_member_works():
 
 
 # =========================================================================== #
-# 3. 升级窗口分支拆除：committing 旧形态 fail-closed（请求路径确定失败的
-#    对应用例在 test_upload_v2.py；此处补恢复扫描入口的端到端形态）
+# 3. 升级窗口分支拆除：committing 旧形态 fail-closed
 # =========================================================================== #
-def test_old_form_committing_survives_recovery_scan(monkeypatch):
-    c = _client()
-    r = c.post("/api/uploads", json={"filename": "oldrec.svs",
-                                     "declared_size": 64})
-    uid = r.get_json()["upload_id"]
-    # 降级为升级窗口旧形态（无 slide_id / 无 intent / 无 v1_artifacts）
-    _exec("UPDATE upload_tasks SET slide_id=NULL WHERE upload_id=%s", (uid,))
-    data = b"o" * 64
-    rr = c.put("/api/uploads/%s/chunk?offset=0&sha256=%s"
-               % (uid, hashlib.sha256(data).hexdigest()),
-               data=data, content_type="application/octet-stream")
-    assert rr.status_code == 200
-    upload_task_store.begin_commit(uid)
-    _exec("UPDATE upload_tasks SET commit_started_at=now() - interval '1 hour' "
-          "WHERE upload_id=%s", (uid,))
-    out = app_mod._upload_v2_maintain(upload_task_store.get_task(uid))
-    assert out["state"] == "committing"  # fail-closed：不猜、不入账、不释放
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py / test_cos_ingest_worker.py）。
+# （原 test_old_form_committing_survives_recovery_scan：升级窗口旧形态
+#   committing 任务经 POST/PUT /api/uploads 造任务并由已删除的
+#   app._upload_v2_maintain 恢复扫描——纯旧上传链路行为。）
 
 
 # =========================================================================== #
 # 4. .uploading-*.lock 收进任务 staging 目录（旧位零残留）
 # =========================================================================== #
-def test_chunk_lock_lives_in_staging_no_flat_residue():
-    """R12 修订：每任务写租约迁至任务存储锁（``.task-locks/``，暂存树外
-    稳定 inode）——staging 内不再有锁 sidecar；平铺旧位零产生；收口后
-    整树清理而**锁文件保留**（运行期不删，同任务 ID 不换锁）。"""
-    c = _client()
-    r = c.post("/api/uploads", json={"filename": "lock.tif",
-                                     "declared_size": len(TIFF)})
-    uid = r.get_json()["upload_id"]
-    rr = c.put("/api/uploads/%s/chunk?offset=0&sha256=%s"
-               % (uid, hashlib.sha256(TIFF).hexdigest()),
-               data=TIFF, content_type="application/octet-stream")
-    assert rr.status_code == 200
-    import task_storage_lock
-    lock = task_storage_lock.task_lock_path(
-        "upload_task", uid, root=Path(UPLOAD_DIR))
-    assert lock.is_file()
-    assert lock.parent.parent.name == ".task-locks"  # 暂存树外
-    assert not (slide_storage.staging_task_dir(
-        uid, root=Path(UPLOAD_DIR)) / "chunk.lock").exists()
-    flat = [p.name for p in Path(UPLOAD_DIR).iterdir()
-            if p.name.startswith(".uploading-")]
-    assert flat == []
-    part = app_mod._upload_v2_part_path(upload_task_store.get_task(uid))
-    assert part.is_file() and part.parent.parent.parent.name == ".staging"
-    rc = c.post("/api/uploads/%s/commit" % uid)
-    assert rc.status_code == 200, rc.get_data(as_text=True)
-    assert not slide_storage.staging_task_dir(
-        uid, root=Path(UPLOAD_DIR)).exists()
-    assert [p.name for p in Path(UPLOAD_DIR).iterdir()
-            if p.name.startswith(".uploading-")] == []
-    assert lock.is_file()  # 稳定 inode：清理暂存树不删除任务锁
-
-def test_chunk_lock_cleanup_on_cancel():
-    c = _client()
-    r = c.post("/api/uploads", json={"filename": "lock2.tif",
-                                     "declared_size": len(TIFF)})
-    uid = r.get_json()["upload_id"]
-    c.put("/api/uploads/%s/chunk?offset=0&sha256=%s"
-          % (uid, hashlib.sha256(TIFF[:32]).hexdigest()),
-          data=TIFF[:32], content_type="application/octet-stream")
-    assert c.delete("/api/uploads/%s" % uid).status_code == 200
-    assert not slide_storage.staging_task_dir(
-        uid, root=Path(UPLOAD_DIR)).exists()
-    assert [p.name for p in Path(UPLOAD_DIR).iterdir()
-            if p.name.startswith(".uploading-")] == []
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py / test_cos_ingest_worker.py）。
+# （原 test_chunk_lock_lives_in_staging_no_flat_residue /
+#   test_chunk_lock_cleanup_on_cancel：分片传输的任务锁与暂存布局——
+#   依赖 PUT /api/uploads/<id>/chunk 与 DELETE /api/uploads/<id> 及已删除的
+#   app._upload_v2_part_path。）
 
 
 # =========================================================================== #
@@ -324,7 +258,7 @@ def test_slide_revision_id_bundle_from_assets_legacy_empty():
         sess["user_id"] = owner
         sess["role"] = "user"
         sess["auth_version"] = 1
-    sid = _v2_publish_migrated(c, "rev.tif", None)
+    sid = _publish_migrated(owner, "rev.tif", None)
     desc = slide_store.resolve_slide_id(sid)
     assert app_mod._slide_revision(desc) == "sha256:%s" % TIFF_SHA[:16]
     # legacy 布局 descriptor：不可读 → revision 空串（无消费者）

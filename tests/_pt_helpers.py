@@ -433,3 +433,49 @@ def make_snapshot_attestation(key, sid, snap, bbox=None, rev=None, fp=None,
                     ("%s\n" % domain).encode("utf-8") + payload_bytes,
                     hashlib.sha256).digest()
     return "v1.%s.%s" % (_shorten(payload_bytes), _shorten(mac))
+
+
+# --------------------------------------------------------------------------- #
+# 服务级切片发布夹具（U5 检查点 B 起：测试不再经 HTTP 上传造资产——旧
+# V1/V2 端点已删除，COS 链路夹具见 test_cos_ingest_worker/_kinds 模式）
+# --------------------------------------------------------------------------- #
+def publish_test_slide(name, data, *, owner_user_id="", upload_dir=None):
+    """直接发布一张 ready 切片，返回 slide_id。
+
+    allocate_slide + staging 落盘 + slide_publish.publish_standalone（CLI
+    导入/种子登记同款离线受管理通道：不走任务状态机、不结算配额——配额
+    行为断言属上传链路测试，统一在 COS 侧覆盖）。"""
+    import hashlib
+    import secrets as _secrets
+    from pathlib import Path as _Path
+
+    import psycopg.rows
+    import pg_store
+    import slide_publish
+    import slide_storage
+    import slide_store
+
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else "tif"
+    root = _Path(upload_dir) if upload_dir else None
+    conn = pg_store.connect()
+    conn.row_factory = psycopg.rows.dict_row  # slide_store descriptor 读 dict 行
+    try:
+        with pg_store.transaction(conn):   # allocate_slide(conn=) 不自提交
+            desc = slide_store.allocate_slide(
+                owner_user_id or "", original_filename=name,
+                format_ext=ext, conn=conn)
+    finally:
+        conn.close()
+    staging = slide_storage.staging_dir(
+        "tst-" + _secrets.token_hex(8), "1",
+        root=root if root is not None else slide_storage.upload_root())
+    entry = "data." + ext
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / entry).write_bytes(data)
+    sha = hashlib.sha256(data).hexdigest()
+    manifest = slide_publish.build_manifest(entry, len(data), sha)
+    slide_publish.publish_standalone(
+        desc.slide_id, manifest, staging, sha256=sha,
+        accounted_bytes=len(data),
+        upload_root=root if root is not None else slide_storage.upload_root())
+    return desc.slide_id

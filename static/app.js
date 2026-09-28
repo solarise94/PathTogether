@@ -51,10 +51,7 @@
     "upload.err.slide_open_failed": { zh: "切片解析失败：文件可能损坏或不完整，请重试上传", en: "Slide parsing failed: the file may be corrupted or incomplete, please retry" },
     "upload.err.commit_retry": { zh: "服务端校验暂时失败，请稍后重试提交", en: "Server validation failed temporarily, retry commit later" },
     "upload.err.size_mismatch": { zh: "文件大小与声明不符，请重新上传", en: "File size mismatch, please re-upload" },
-    "upload.err.resume": { zh: "上传中断；刷新页面后将从断点续传", en: "Upload interrupted; refresh to resume from breakpoint" },
     // U3 三段状态（§3.5：正在传输 → 服务端校验 → 入库完成）
-    "upload.stage.transferring": { zh: "正在传输", en: "Transferring" },
-    "upload.stage.validating": { zh: "服务端校验中", en: "Validating on server" },
     "upload.stage.converting": { zh: "切片转换中", en: "Converting slide" },
     "upload.stage.done": { zh: "入库完成", en: "Completed" },
     "upload.stage.failed": { zh: "上传失败", en: "Upload failed" },
@@ -6328,29 +6325,6 @@
       .catch(function (e) { toast(t("del.slide.fail", { e: e.message }), "error"); });
   }
 
-  // ---------- 上传 ----------
-  // 上传错误信息：已知机器码翻成可读文案，其余回退服务端 error 字段
-  // （多为中文描述）或 HTTP 状态码。U3 补充 V2 分片机器码（offset_mismatch/
-  // hash_mismatch/upload_state_conflict 等，upload-resumable-fix-plan §3.6）。
-  function uploadErrorMessage(xhr, data) {
-    var code = (data && (data.code || data.error)) || "";
-    var status = (xhr && xhr.status) || 0;
-    if (code === "csrf_required") return tt("upload.err.csrf");
-    if (code === "upload_guard_unavailable") return tt("upload.err.guard");
-    if (code === "name_unavailable") return tt("upload.err.name");
-    if (code === "offset_mismatch") return tt("upload.err.offset_mismatch");
-    if (code === "hash_mismatch") return tt("upload.err.hash_mismatch");
-    if (code === "upload_state_conflict") return tt("upload.err.state_conflict");
-    if (code === "use_legacy_upload") return tt("upload.err.use_legacy");
-    if (code === "invalid_slide") return tt("upload.err.invalid_slide");
-    if (code === "slide_open_unsupported") return tt("upload.err.slide_open_unsupported");
-    if (code === "slide_open_failed") return tt("upload.err.slide_open_failed");
-    if (code === "commit_retryable") return tt("upload.err.commit_retry");
-    if (code === "size_mismatch") return tt("upload.err.size_mismatch");
-    if (code === "upload_too_large" || status === 413) return tt("upload.err.too_large");
-    if (status === 507) return tt("upload.err.disk");
-    return code || status;
-  }
 
   // ---------- 多文件独立进度行（U3 §3.5：修共用进度条的 bug） ----------
   // 每个上传文件一行（名称 + 独立进度条 + 三段状态文本）；行挂在侧栏
@@ -6428,111 +6402,7 @@
     };
   }
 
-  // ---------- Upload V2：分片续传（U3；docs/upload-resumable-fix-plan §3） ----------
-  // 阈值唯一权威来源是服务端 UPLOAD_V2_THRESHOLD_BYTES，经模板 bootstrap
-  // （HP_APP_BOOTSTRAP.capabilities.upload_v2_threshold_bytes）下发（上传修复
-  // A1，替换旧前端 128MiB 硬编码双来源）；解析失败回落 16MiB。ZIP/MRXS 留旧
-  // 接口（§3.4 首版只支持单文件 WSI）。分片严格串行单并发（§3.2.2），每片算
-  // SHA-256（Web Crypto 对该片 ArrayBuffer，不整文件入内存）；offset 以服务端
-  // confirmed_offset 为权威，offset_mismatch 时对齐重传（§3.2.1）。
 
-  // ---------- 上传续传键（P2 合同 §5.3：账户域 + upload_id 键） ----------
-  // v3 键形如 pt.upload.v3::<account>:<upload_id>；值 {upload_id, declared_size,
-  // chunk_size, filename, slide_id}（filename/size 供用户辨认与刷新后按文件
-  // 匹配；slide_id 是字段位，committed 响应回填）。换账户不复用会话：键含
-  // 账户域，天然隔离。v2 键（pt.upload.v2::<名>:<size>:<mtime>，无账户域）只做
-  // 一次性只读迁移：能映射 upload_id 的迁入 v3，迁完删旧键。
-  var UPLOAD_RESUME_V3_PREFIX = "pt.upload.v3::";
-  var UPLOAD_RESUME_V2_PREFIX = "pt.upload.v2::";
-
-  function uploadAccountScope() {
-    // 账户域 = 当前登录标识（预览中为被预览用户，与 userScope 同源）；
-    // 匿名/未知回落 local
-    return String(currentUserId || "local");
-  }
-
-  function uploadResumeKeyPrefix() {
-    return UPLOAD_RESUME_V3_PREFIX + uploadAccountScope() + ":";
-  }
-
-  // v2 → v3 一次性迁移（幂等：迁完删旧键，重复执行无残留可迁）
-  function migrateUploadV2ResumeKeys() {
-    try {
-      var doomed = [];
-      for (var i = 0; i < localStorage.length; i++) {
-        var k = localStorage.key(i);
-        if (!k || k.indexOf(UPLOAD_RESUME_V2_PREFIX) !== 0) continue;
-        try {
-          var v = JSON.parse(localStorage.getItem(k) || "null");
-        } catch (e) { doomed.push(k); continue; }  // 畸形旧键：清理
-        if (!v || !v.upload_id) { doomed.push(k); continue; }  // 无任务号：作废
-        // v2 键尾部两段是 size:mtime——从右解析出文件名（文件名本身可含 ":"）
-        var rest = k.slice(UPLOAD_RESUME_V2_PREFIX.length);
-        var m1 = rest.lastIndexOf(":");
-        var m2 = rest.lastIndexOf(":", m1 - 1);
-        var fname = m2 > 0 ? rest.slice(0, m2) : "";
-        var migrated = {
-          upload_id: v.upload_id,
-          declared_size: (typeof v.declared_size === "number")
-            ? v.declared_size : Number(rest.slice(m2 + 1, m1)) || 0,
-          chunk_size: v.chunk_size || null,
-          filename: fname,
-          slide_id: null,  // v2 值无 slide_id；committed 时由响应回填
-        };
-        localStorage.setItem(uploadResumeKeyPrefix() + v.upload_id,
-                             JSON.stringify(migrated));
-        doomed.push(k);
-      }
-      doomed.forEach(function (k) { localStorage.removeItem(k); });
-    } catch (e) { /* localStorage 不可用：跳过迁移 */ }
-  }
-
-  // 当前账户域的全部 v3 续传记录（首次访问顺带执行 v2 迁移）
-  function uploadResumeEntries() {
-    migrateUploadV2ResumeKeys();
-    var out = [];
-    try {
-      var prefix = uploadResumeKeyPrefix();
-      for (var i = 0; i < localStorage.length; i++) {
-        var k = localStorage.key(i);
-        if (!k || k.indexOf(prefix) !== 0) continue;
-        try {
-          var v = JSON.parse(localStorage.getItem(k) || "null");
-        } catch (e) { continue; }
-        if (v && v.upload_id && typeof v.declared_size === "number") out.push(v);
-      }
-    } catch (e) { /* localStorage 不可用 */ }
-    return out;
-  }
-
-  // 刷新后按文件找回未完成任务（§3.5 断点恢复；v3 起按 filename+size 匹配
-  // 账户域内的记录——文件名/大小只是候选，权威是服务端 GET 状态）
-  function uploadResumeFind(file) {
-    var entries = uploadResumeEntries();
-    for (var i = 0; i < entries.length; i++) {
-      if (entries[i].filename === (file && file.name) &&
-          entries[i].declared_size === (file && file.size)) {
-        return entries[i];
-      }
-    }
-    return null;
-  }
-
-  function uploadResumeSave(task, file, slideId) {
-    try {
-      localStorage.setItem(uploadResumeKeyPrefix() + task.upload_id, JSON.stringify({
-        upload_id: task.upload_id,
-        declared_size: file.size,
-        chunk_size: task.chunk_size,
-        filename: file.name || "",
-        slide_id: slideId || null,
-      }));
-    } catch (e) { /* localStorage 不可用：仅失去刷新恢复 */ }
-  }
-
-  // 上传完成后的打开目标（P2 合同 §5.2）：slide_id 唯一；旧后端响应缺
-  // slide_id 时才按名回落，且 console.debug 标注回落（P3 拆除回落）。
-  // **禁止**按 file.name/canonical_name 猜打开目标（同名不同 ID 会串片）。
   function uploadedTarget(body, file) {
     var b = body || {};
     var sid = b.slide_id || null;
@@ -6550,204 +6420,6 @@
   }
 
 
-  function sha256Hex(buf) {
-    // 单片哈希：Web Crypto 只需该片入内存（整文件哈希受限于无增量 API，
-    // 创建时不带 sha256_expected；commit 时服务端复算为权威，§3.2.3 裁决）
-    return crypto.subtle.digest("SHA-256", buf).then(function (digest) {
-      var bytes = new Uint8Array(digest);
-      var hex = "";
-      for (var i = 0; i < bytes.length; i++) {
-        hex += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
-      }
-      return hex;
-    });
-  }
-
-  // XHR 发送（PUT 分片二进制用；与 apiFetch 同一 CSRF 双提交头契约）
-  function xhrSend(method, url, body, opts) {
-    opts = opts || {};
-    return new Promise(function (resolve, reject) {
-      var xhr = new XMLHttpRequest();
-      if (opts.onProgress) {
-        xhr.upload.addEventListener("progress", opts.onProgress);
-      }
-      xhr.addEventListener("load", function () {
-        var data = null;
-        try { data = JSON.parse(xhr.responseText); } catch (e) { /* 非 JSON body */ }
-        resolve({ status: xhr.status, data: data });
-      });
-      xhr.addEventListener("error", function () { reject({ network: true }); });
-      xhr.open(method, url);
-      var tok = csrfToken();
-      if (tok) xhr.setRequestHeader("X-CSRF-Token", tok);
-      xhr.send(body);
-    });
-  }
-
-  function uploadV2Chunks(file, task, row) {
-    // 严格串行：从 task.offset（= 服务端 confirmed_offset）逐片推进
-    var size = file.size;
-    function nextChunk() {
-      var offset = task.offset;
-      if (offset >= size) return Promise.resolve();
-      var end = Math.min(offset + task.chunk_size, size);
-      return file.slice(offset, end).arrayBuffer().then(function (buf) {
-        return sha256Hex(buf).then(function (hex) {
-          return xhrSend(
-            "PUT",
-            "/api/uploads/" + encodeURIComponent(task.upload_id) +
-              "/chunk?offset=" + offset + "&sha256=" + hex,
-            buf,
-            {
-              onProgress: function (e) {
-                // 乐观的片内发送进度（上限 99.9%，最终以 confirmed_offset 为准）
-                if (e.lengthComputable) {
-                  row.setStage("upload.stage.transferring",
-                    Math.min((offset + e.loaded) / size, 0.999));
-                }
-              },
-            });
-        });
-      }).then(function (resp) {
-        if (resp.status === 200 && resp.data &&
-            typeof resp.data.confirmed_offset === "number") {
-          // 服务端权威进度（§3.5：不用 XHR 本地发送进度）
-          task.offset = resp.data.confirmed_offset;
-          row.setStage("upload.stage.transferring", task.offset / size);
-          return nextChunk();
-        }
-        if (resp.status === 409 && resp.data &&
-            resp.data.code === "offset_mismatch" &&
-            typeof resp.data.confirmed_offset === "number") {
-          // 对齐重传（§3.2.1）：按服务端 confirmed_offset 回退/前进后重发
-          task.offset = resp.data.confirmed_offset;
-          return nextChunk();
-        }
-        throw { status: resp.status, data: resp.data };
-      });
-    }
-    return nextChunk();
-  }
-
-  function uploadFileV2(file, row, resumeOnly) {
-    // U3 排空过渡：resumeOnly=旧任务恢复专用（**不新建 V2**——新任务只走
-    // COS）；恢复未命中上抛 {resumeMiss} 哨兵，调用方清理陈旧记录后转 COS。
-    // 检查点 B 随 V2 适配器一并删除。返回链 Promise（原调用方不依赖返回值）。
-    var resumeKey = null;   // pt.upload.v3::<account>:<upload_id>（创建/续传时定）
-    var task = null;
-    return Promise.resolve().then(function () {
-      // 1) 刷新恢复：按文件（名+大小）在当前账户域找未完成任务，GET 状态后
-      //    从 confirmed_offset 续传
-      var saved = uploadResumeFind(file);
-      if (!saved || !saved.upload_id || saved.declared_size !== file.size) return null;
-      row.setStage("upload.stage.transferring", 0);
-      return apiFetch("/api/uploads/" + encodeURIComponent(saved.upload_id))
-        .then(function (r) {
-          if (!r.ok) return null;  // 403/404/409 等：任务没了 → 重新创建
-          return r.json().then(function (body) {
-            if (!body) return null;
-            if (body.state === "committed") {
-              // commit 已收口但转换入队/响应可能丢失：重放 commit 取 conversion_job_id
-              resumeKey = uploadResumeKeyPrefix() + saved.upload_id;
-              return { upload_id: saved.upload_id, committed: true,
-                       chunk_size: body.chunk_size,
-                       offset: body.confirmed_offset | 0 };
-            }
-            if (body.state !== "active") return null;
-            resumeKey = uploadResumeKeyPrefix() + saved.upload_id;
-            // committed 前 slide_id 恒 null；防御性回填（服务端若已带）
-            if (body.slide_id) uploadResumeSave(
-              { upload_id: saved.upload_id, chunk_size: body.chunk_size },
-              file, body.slide_id);
-            return { upload_id: saved.upload_id,
-                     chunk_size: body.chunk_size,
-                     offset: body.confirmed_offset | 0 };
-          });
-        })
-        .catch(function () { return null; });
-    }).then(function (resumed) {
-      if (resumed) { task = resumed; return; }
-      if (resumeOnly) throw { resumeMiss: true };
-      // 2) 创建新任务（初始化即预占配额，服务端给 chunk_size）
-      row.setStage("upload.stage.transferring", 0);
-      return apiFetch("/api/uploads", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ filename: file.name, declared_size: file.size }),
-      }).then(function (r) {
-        return r.json().then(function (body) {
-          if (!r.ok || !body || !body.upload_id) {
-            throw { status: r.status, data: body };
-          }
-          task = { upload_id: body.upload_id,
-                   chunk_size: body.chunk_size,
-                   offset: body.confirmed_offset | 0 };
-          resumeKey = uploadResumeKeyPrefix() + task.upload_id;
-          uploadResumeSave(task, file, null);
-        });
-      });
-    }).then(function () {
-      // 3) 串行传完全部分片；committed 恢复跳过 PUT，直接重放 commit
-      if (task && task.committed) return;
-      return uploadV2Chunks(file, task, row);
-    }).then(function () {
-      // 4) 服务端校验（commit 三段式：整文件复算 + OpenSlide + 原子提升）
-      row.setStage("upload.stage.validating");
-      return apiFetch("/api/uploads/" + encodeURIComponent(task.upload_id) +
-                      "/commit", { method: "POST" });
-    }).then(function (r) {
-      return r.json().then(function (body) {
-        if (!r.ok) throw { status: r.status, data: body };
-        return body;
-      });
-    }).then(function (body) {
-      try { if (resumeKey) localStorage.removeItem(resumeKey); } catch (e) { /* 同上 */ }
-      if (body && body.conversion_job_id && body.state && body.state !== "ready") {
-        return pollConversionJob(body, row, file);
-      }
-      // P2 合同 §5.2：打开目标 = 响应 slide_id（唯一）；缺字段才按名回落
-      var target = uploadedTarget(body, file);
-      row.setStage("upload.stage.done");
-      row.finish();
-      toast(t("upload.done", { name: target.name }), "success");
-      loadAll();
-      importAssociateUploaded(target.id, target.name);   // W4：上传行自身的目标关联（若有）
-      openSlide(target.id || target.name);
-    }).catch(function (err) {
-      var data = (err && err.data) || null;
-      var status = (err && err.status) || 0;
-      var msg;
-      if (err && err.network) {
-        // 网络中断：任务与已传分片保留，刷新后可从 confirmed_offset 续传
-        msg = tt("upload.err.resume");
-      } else {
-        msg = uploadErrorMessage({ status: status }, data);
-      }
-      // 确定性失败（§3.1）：原任务不可再用，清恢复记录（下次全新上传）；
-      // A0 新增 slide_open_* 稳定码同属确定性失败
-      var code = data && data.code;
-      if (code === "hash_mismatch" || code === "invalid_slide" ||
-          code === "slide_open_unsupported" || code === "slide_open_failed" ||
-          code === "name_unavailable" || code === "size_mismatch") {
-        try { if (resumeKey) localStorage.removeItem(resumeKey); } catch (e) { /* 同上 */ }
-      }
-      row.markError();
-      row.setStage("upload.stage.failed");
-      row.finish(10000);
-      toast(t("upload.fail", { e: msg }), "error");
-    });
-  }
-
-  // 转换轮询（W4/R5 修复）：后台任务状态是成功的唯一权威。
-  //  - 本地观察超过 15 分钟**不再判失败**：提示「仍在后台处理」后继续退避轮询；
-  //  - 401/403：权限失效 → 停止轮询（不再无意义重试）；
-  //  - 404：任务不存在（终态提示，不冒充失败重试）；
-  //  - 其他非 2xx / 网络异常：显示「暂时无法获取进度」并退避重试，绝不永久判失败；
-  //  - ready：保持既有行为（完成 + 刷新 + 打开本行上传的切片——这是上传行
-  //    自身的原行为，不属于持久任务列表的自动抢占）；失败/取消仍以后端为准。
-  //  - P2 合同 §5.2：ready 打开目标 = 响应 slide_id（当前轮询 GET 响应不带
-  //    slide_id——用刷新后的列表按 canonical 名解析；两处都无才按名回落并
-  //    console.debug 标注）。
   function pollConversionJob(body, row, file) {
     var jobId = body.conversion_job_id;
     var canonical = body.canonical_name;
@@ -6848,21 +6520,6 @@
     // 创建并提示，**不回退 V1/V2**；词表与上限以服务端 capability 为唯一
     // 权威（cosUploadEligible 判定），不合格即说明原因。
     var row = makeUploadRow(file);
-    // 排空过渡（检查点 A 合同 §5）：同名同大小存在旧 V2 未完记录 → 恢复
-    // 旧任务（uploadFileV2 resumeOnly 分支——不新建 V2）；恢复未命中/旧
-    // 任务已收口 → 清陈旧记录转 COS。检查点 B 随 V2 适配器一并删除。
-    if (!opts.legacyV2Checked && uploadResumeFind(file)) {
-      uploadFileV2(file, row, true).catch(function (err) {
-        if (!(err && err.resumeMiss)) return;  // 其余错误已在 V2 内部呈现
-        var stale = uploadResumeFind(file);
-        if (stale && stale.upload_id) {
-          try { localStorage.removeItem(uploadResumeKeyPrefix() + stale.upload_id); }
-          catch (e) { /* localStorage 不可用：仅多一次状态查询 */ }
-        }
-        uploadFile(file, { legacyV2Checked: true });
-      });
-      return;
-    }
     if (!COS_UPLOAD_CONFIG) {
       row.markError();
       row.setStage("upload.cos.unavailable");
@@ -6880,68 +6537,7 @@
       opts.cosRetry ? { resumeJobId: opts.cosRetry, skipConfirm: true } : null);
   }
 
-  // 旧单请求上传：小文件与 ZIP/MRXS（§3.4 并存）
-  function uploadFileLegacy(file, row) {
-    var formData = new FormData();
-    formData.append("file", file);
-    if (importTargetState && importTargetState.pid) {
-      formData.append("target_project_id", importTargetState.pid);
-    }
-    var xhr = new XMLHttpRequest();
-    row.setStage("upload.stage.transferring", 0);
-    xhr.upload.addEventListener("progress", function (e) {
-      if (e.lengthComputable) {
-        row.setStage("upload.stage.transferring", e.loaded / e.total);
-      }
-    });
-    xhr.addEventListener("load", function () {
-      var data;
-      try { data = JSON.parse(xhr.responseText); } catch (e) { row.finish(); toast(t("upload.parse.fail"), "error"); return; }
-      if (xhr.status >= 200 && xhr.status < 300) {
-        if (data && data.conversion_job_id && data.state && data.state !== "ready") {
-          pollConversionJob(data, row, file);
-          return;
-        }
-        // P2 合同 §5.2：打开目标 = 响应 slide_id（唯一）；缺字段才按名回落
-        var target = uploadedTarget(data, file);
-        row.setStage("upload.stage.done");
-        row.finish();
-        toast(t("upload.done", { name: target.name }), "success");
-        loadAll();
-        importAssociateUploaded(target.id, target.name);   // W4：上传行自身的目标关联（若有）
-        openSlide(target.id || target.name);
-      } else {
-        row.markError();
-        row.setStage("upload.stage.failed");
-        row.finish(10000);
-        toast(t("upload.fail", { e: uploadErrorMessage(xhr, data) }), "error");
-      }
-    });
-    xhr.addEventListener("error", function () {
-      row.markError();
-      row.setStage("upload.stage.failed");
-      row.finish(10000);
-      toast(t("upload.net.fail"), "error");
-    });
-    xhr.open("POST", "/api/upload");
-    // 裸 XHR 与 apiFetch 同一 CSRF 契约：双提交头必须带上（上传修复 U1，
-    // 漏头会被服务端 400 csrf_required 拒绝）
-    xhr.setRequestHeader("X-CSRF-Token", csrfToken());
-    xhr.send(formData);
-  }
 
-  // =========================================================================
-  // COS 直传（Phase 4；docs/cos-direct-upload-audit-plan.md §5/§10 Phase 4、
-  // docs/upload-routing-open-source-review.md D3/D6/D7/D8/D10）
-  // 授权决议 A-presign-parts：浏览器只持有绑定 Content-Length 的 UploadPart
-  // 预签名 URL；Initiate/Complete/Abort 全在 worker。控制 API（创建/签名/
-  // 完成/取消）走 apiFetch（登录会话 + CSRF）；COS PUT 必须走独立传输——
-  // 裸 fetch + credentials:"omit"，绝不带平台 Cookie/CSRF（§5）。
-  // 选路 manual_only（校准规则 3）：默认关，用户勾选后才对 eligible 文件
-  // 走 COS，不按大小自动导流；任务开始后 transport 冻结（D8）——
-  // uploadFileCos 内部不回退平台路径，超上限只给「改用平台上传」显式按钮
-  //（用户明确选择的全新平台任务，不算自动换路）。
-  // =========================================================================
   var COS_JOBS_KEY = "pt.cos.jobs";
 
   function resolveCosConfig() {
@@ -7063,7 +6659,7 @@
 
   // ---------- COS PUT 独立传输（§5/Phase 4-2） ----------
   function cosPutPart(url, blob, abortCtl) {
-    // 绝不走 apiFetch/xhrSend——它们会注入 X-CSRF-Token（对 COS 是污染头，
+    // 绝不走 apiFetch——它会注入 X-CSRF-Token（对 COS 是污染头，
     // 还会触发不必要的 CORS 预检）。credentials:"omit" 显式不带平台 Cookie；
     // mode:"cors" 走 COS 暴露的响应头读 ETag（仅提示，§3.1）。Content-Length
     // 由浏览器按 body 自动设置（与签名绑定值一致），手动设置既多余又会被
@@ -7084,7 +6680,7 @@
     });
   }
 
-  // ---------- 稳定机器码 → 可读文案（照 uploadErrorMessage 的兜底模式） ----------
+  // ---------- 稳定机器码 → 可读文案（未知码保留原文的兜底模式） ----------
   function cosErrorMessage(status, data) {
     var code = (data && (data.code || data.error)) || "";
     if (code === "upload_too_large") return tt("upload.cos.err.too_large");
@@ -7564,10 +7160,6 @@
   // 与 HP_AUTH 同风格的命名空间导出，不进业务调用面
   window.HP_UPLOAD = {
     uploadFile: uploadFile,
-    // U3：V1/V2 适配器仅旧任务恢复/排空窗口过渡保留（检查点 B 删除）；
-    // 新任务一律 COS（uploadFile 内部裁决，不再按大小/格式分流）。
-    uploadFileV2: uploadFileV2,
-    uploadFileLegacy: uploadFileLegacy,
     // W4/R5：转换轮询（观察超时不判失败；401/403/404 分级处理）
     pollConversionJob: pollConversionJob,
     // COS 直传（测试入口：真实路由/状态机/独立传输的驱动面）

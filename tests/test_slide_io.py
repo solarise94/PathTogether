@@ -45,6 +45,7 @@ import slide_io  # noqa: E402
 import upload_guard  # noqa: E402
 import upload_task_store  # noqa: E402
 import app as app_mod  # noqa: E402
+import upload_content  # noqa: E402
 from _pt_helpers import csrf_client, isolate_app, clear_upload_dir  # noqa: E402
 from _tiff_fixtures import (  # noqa: E402
     make_ome_multifile_bytes,
@@ -355,17 +356,17 @@ def test_open_slide_missing_file_stable_code(tmp_path):
 def test_validate_slide_file_returns_none_on_success(tmp_path):
     ok = tmp_path / "ok.tiff"
     ok.write_bytes(make_tiff_bytes())
-    assert app_mod._validate_slide_file(ok) is None
+    assert upload_content.validate_slide_file(ok) is None
     part = tmp_path / ".uploading-x.part"
     part.write_bytes(make_tiff_bytes())
-    assert app_mod._validate_slide_file(part, format_hint=TIFF_NAME) is None
+    assert upload_content.validate_slide_file(part, format_hint=TIFF_NAME) is None
 
 
 def test_validate_slide_file_raises_typed_error(tmp_path):
     p = tmp_path / "bad.tif"
     p.write_bytes(b"junk" * 16)
     with pytest.raises(slide_io.SlideValidationError) as ei:
-        app_mod._validate_slide_file(p, format_hint="bad.tif")
+        upload_content.validate_slide_file(p, format_hint="bad.tif")
     assert ei.value.code == "invalid_slide"
     assert ei.value.cause_type  # 底层异常类型名进日志（不透出前端）
 
@@ -378,7 +379,7 @@ def test_validate_slide_file_unknown_exception_becomes_slide_open_failed(
 
     monkeypatch.setattr(slide_io, "open_slide", boom)
     with pytest.raises(slide_io.SlideValidationError) as ei:
-        app_mod._validate_slide_file(tmp_path / "x.tiff", format_hint="x.tiff")
+        upload_content.validate_slide_file(tmp_path / "x.tiff", format_hint="x.tiff")
     assert ei.value.code == "slide_open_failed"
     assert ei.value.cause_type == "RuntimeError"
 
@@ -420,34 +421,11 @@ def _residue():
             or p.name.startswith(".extracting-")]
 
 
-def test_v1_small_real_tiff_no_monkeypatch():
-    """V1 小 TIFF 真验证：.part 临时名 + 净化名 hint → 200 提升。"""
-    tiff = make_tiff_bytes()
-    c = _client()
-    r = c.post("/api/upload",
-               data={"file": (io.BytesIO(tiff), TIFF_NAME)},
-               content_type="multipart/form-data")
-    assert r.status_code == 200, r.get_data(as_text=True)
-    assert r.get_json()["name"] == TIFF_NAME
-    # P3：id_bundle 布局——入口 objects/<slide_id>/data.tiff（根目录不再落文件）
-    _sid = r.get_json()["slide_id"]
-    assert (Path(UPLOAD_DIR) / "objects" / _sid /
-            "data.tiff").read_bytes() == tiff
-    assert _residue() == []
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖
+#（tests/test_cos_ingest_worker.py / test_cos_ingestion_kinds.py）。
 
-
-def test_v1_real_truncated_tiff_stable_code_no_residue():
-    """V1 截断 TIFF：稳定码 + 临时文件清理（无残留）。"""
-    data = make_tiff_bytes()[:24]
-    c = _client()
-    r = c.post("/api/upload",
-               data={"file": (io.BytesIO(data), "cut.tif")},
-               content_type="multipart/form-data")
-    assert r.status_code == 400
-    assert r.get_json()["code"] == "invalid_slide"
-    assert not (Path(UPLOAD_DIR) / "cut.tif").exists()
-    assert _residue() == []
-
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖
+#（tests/test_cos_ingest_worker.py / test_cos_ingestion_kinds.py）。
 
 def _put(client, upload_id, offset, data):
     return client.put(
@@ -456,171 +434,32 @@ def _put(client, upload_id, offset, data):
         data=data, content_type="application/octet-stream")
 
 
-def test_v2_create_chunks_commit_real_tiff_no_monkeypatch():
-    """V2 create→多 chunk→commit 真验证（无 monkeypatch），中文空格名。"""
-    tiff = make_tiff_bytes()
-    c = _client()
-    r = c.post("/api/uploads", json={"filename": TIFF_NAME,
-                                     "declared_size": len(tiff)})
-    assert r.status_code == 200, r.get_data(as_text=True)
-    uid = r.get_json()["upload_id"]
-    for off in range(0, len(tiff), 4096):
-        assert _put(c, uid, off, tiff[off:off + 4096]).status_code == 200
-    # P3：传输暂存迁 .staging/<uid>/transfer/（不平铺；经权威 helper 取路径）
-    part = app_mod._upload_v2_part_path(upload_task_store.get_task(uid))
-    assert part.exists()  # 传完但未 commit：暂存件在
-    r = c.post("/api/uploads/%s/commit" % uid)
-    assert r.status_code == 200, r.get_data(as_text=True)
-    assert r.get_json()["state"] == "committed"
-    sid = r.get_json()["slide_id"]
-    # id_bundle 布局：入口 objects/<slide_id>/data.tif
-    assert (Path(UPLOAD_DIR) / "objects" / sid /
-            "data.tiff").read_bytes() == tiff  # 入口 ext=白名单后缀
-    assert not (Path(UPLOAD_DIR) / ".staging" / uid).exists()
-    assert _residue() == []
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖
+#（tests/test_cos_ingest_worker.py / test_cos_ingestion_kinds.py）。
 
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖
+#（tests/test_cos_ingest_worker.py / test_cos_ingestion_kinds.py）。
 
-def test_v2_real_invalid_tiff_commit_stable_code():
-    """V2 垃圾 .tif commit：稳定码 failed；DELETE 清 part；终态幂等可查。"""
-    junk = b"\x00junk-not-tiff" * 8
-    c = _client()
-    r = c.post("/api/uploads", json={"filename": "junk.tif",
-                                     "declared_size": len(junk)})
-    uid = r.get_json()["upload_id"]
-    assert _put(c, uid, 0, junk).status_code == 200
-    r = c.post("/api/uploads/%s/commit" % uid)
-    assert r.status_code == 409
-    j = r.get_json()
-    assert j["code"] == "invalid_slide"
-    assert j["state"] == "failed"
-    # 终态幂等：重复 commit 仍 409 failed，GET 可查
-    assert c.post("/api/uploads/%s/commit" % uid).status_code == 409
-    assert c.get("/api/uploads/%s" % uid).get_json()["state"] == "failed"
-    assert not (Path(UPLOAD_DIR) / "junk.tif").exists()  # 新管线不落根目录
-    assert not (Path(UPLOAD_DIR) / ".staging" / uid).exists()
-    assert c.delete("/api/uploads/%s" % uid).status_code == 200
-    assert _residue() == []
-
-
-def test_v2_quota_cleanup_on_real_invalid_commit_pg(monkeypatch):
-    """PG 后端：真验证失败的确定性失败仍释放预占（无 reservation 泄漏）。"""
-    import psycopg
-    import user_store
-
-    uid_user = user_store.create_user("si@x.com", "pass1234pass1234",
-                                      role="user")["user_id"]
-    with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO upload_user_quotas (user_id, quota_bytes) "
-                "VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE "
-                "SET quota_bytes = EXCLUDED.quota_bytes", (uid_user, 10 ** 7))
-    junk = b"\x00junk" * 64
-    c = _client()
-    app_mod.AUTH_ENABLED = True
-
-    u = user_store.get_user(uid_user)
-    with c.session_transaction() as sess:
-        sess["auth_user"] = True
-        sess["user_id"] = uid_user
-        sess["role"] = "user"
-        sess["auth_version"] = (u or {}).get("auth_version", 1)
-    r = c.post("/api/uploads", json={"filename": "jq.tif",
-                                     "declared_size": len(junk)})
-    uid = r.get_json()["upload_id"]
-    assert _put(c, uid, 0, junk).status_code == 200
-    assert c.post("/api/uploads/%s/commit" % uid).status_code == 409
-    with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT reserved_bytes, used_bytes "
-                        "FROM upload_user_quotas WHERE user_id=%s", (uid_user,))
-            reserved, used = cur.fetchone()
-    assert reserved == 0 and used == 0  # 预占释放、无实占
-
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖
+#（tests/test_cos_ingest_worker.py / test_cos_ingestion_kinds.py）。
 
 # --------------------------------------------------------------------------- #
 # 5.5 普通图片族（BMP/JPEG）路由级真验证（不 monkeypatch）
 # --------------------------------------------------------------------------- #
-def test_v1_small_real_bmp_no_monkeypatch():
-    """V1 真 BMP：.part + 净化名 hint → 200 提升（普通图片走真验证）。"""
-    bmp = _raster_bmp_bytes()
-    c = _client()
-    r = c.post("/api/upload",
-               data={"file": (io.BytesIO(bmp), "photo.bmp")},
-               content_type="multipart/form-data")
-    assert r.status_code == 200, r.get_data(as_text=True)
-    assert r.get_json()["name"] == "photo.bmp"
-    # P3：id_bundle 布局——入口 objects/<slide_id>/data.bmp（根目录不再落文件）
-    sid = r.get_json()["slide_id"]
-    assert (Path(UPLOAD_DIR) / "objects" / sid / "data.bmp").read_bytes() == bmp
-    assert _residue() == []
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖
+#（tests/test_cos_ingest_worker.py / test_cos_ingestion_kinds.py）。
 
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖
+#（tests/test_cos_ingest_worker.py / test_cos_ingestion_kinds.py）。
 
-def test_v1_truncated_bmp_stable_code_no_residue():
-    """V1 截断 BMP：slide_open_failed 稳定码 + 临时文件清理（无残留）。"""
-    bmp = _raster_bmp_bytes(64, 48)
-    data = bmp[:int(len(bmp) * 0.7)]
-    c = _client()
-    r = c.post("/api/upload",
-               data={"file": (io.BytesIO(data), "cut.bmp")},
-               content_type="multipart/form-data")
-    assert r.status_code == 400
-    assert r.get_json()["code"] == "slide_open_failed"
-    assert not (Path(UPLOAD_DIR) / "cut.bmp").exists()
-    assert _residue() == []
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖
+#（tests/test_cos_ingest_worker.py / test_cos_ingestion_kinds.py）。
 
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖
+#（tests/test_cos_ingest_worker.py / test_cos_ingestion_kinds.py）。
 
-def test_v1_png_disguised_as_bmp_stable_code_no_residue():
-    """V1 PNG 字节伪装 .bmp：invalid_slide（真实字节格式校验）。"""
-    from PIL import Image as PILImage
-
-    b = io.BytesIO()
-    PILImage.new("RGB", (8, 6)).save(b, format="PNG")
-    c = _client()
-    r = c.post("/api/upload",
-               data={"file": (io.BytesIO(b.getvalue()), "fake.bmp")},
-               content_type="multipart/form-data")
-    assert r.status_code == 400
-    assert r.get_json()["code"] == "invalid_slide"
-    assert _residue() == []
-
-
-def test_v2_real_bmp_create_chunks_commit_no_monkeypatch():
-    """V2 create→chunk→commit 真 BMP：committed + 无临时残留。"""
-    bmp = _raster_bmp_bytes()
-    c = _client()
-    r = c.post("/api/uploads", json={"filename": "photo.bmp",
-                                     "declared_size": len(bmp)})
-    assert r.status_code == 200, r.get_data(as_text=True)
-    uid = r.get_json()["upload_id"]
-    for off in range(0, len(bmp), 4096):
-        assert _put(c, uid, off, bmp[off:off + 4096]).status_code == 200
-    r = c.post("/api/uploads/%s/commit" % uid)
-    assert r.status_code == 200, r.get_data(as_text=True)
-    assert r.get_json()["state"] == "committed"
-    sid = r.get_json()["slide_id"]
-    assert (Path(UPLOAD_DIR) / "objects" / sid / "data.bmp").read_bytes() == bmp
-    assert not (Path(UPLOAD_DIR) / ".staging" / uid).exists()
-    assert _residue() == []
-
-
-def test_v2_junk_jpg_commit_stable_code():
-    """V2 垃圾 .jpg commit：409 invalid_slide failed；part 清理。"""
-    junk = b"\x00junk-not-jpeg" * 8
-    c = _client()
-    r = c.post("/api/uploads", json={"filename": "junk.jpg",
-                                     "declared_size": len(junk)})
-    uid = r.get_json()["upload_id"]
-    assert _put(c, uid, 0, junk).status_code == 200
-    r = c.post("/api/uploads/%s/commit" % uid)
-    assert r.status_code == 409
-    j = r.get_json()
-    assert j["code"] == "invalid_slide"
-    assert j["state"] == "failed"
-    assert not (Path(UPLOAD_DIR) / "junk.jpg").exists()
-    assert c.delete("/api/uploads/%s" % uid).status_code == 200
-    assert _residue() == []
-
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖
+#（tests/test_cos_ingest_worker.py / test_cos_ingestion_kinds.py）。
 
 # --------------------------------------------------------------------------- #
 # 6. Batch 2：多通道 OME（series 选择 / 结构化元数据 / 通道区域读取 / 拒绝）
@@ -784,7 +623,7 @@ def test_multifile_ome_rejected_before_any_pixels():
     assert ei2.value.code == "unsupported_multifile_ome"
     # 上传校验路径收敛为稳定码（不透出裸异常）
     with pytest.raises(slide_io.SlideValidationError) as ei3:
-        app_mod._validate_slide_file(io.BytesIO(data), format_hint="m.ome.tiff")
+        upload_content.validate_slide_file(io.BytesIO(data), format_hint="m.ome.tiff")
     assert ei3.value.code in ("invalid_slide", "slide_open_failed")
 
 

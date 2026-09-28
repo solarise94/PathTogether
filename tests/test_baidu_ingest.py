@@ -201,77 +201,7 @@ def test_b08_source_changed_and_same_name_independent(tmp_path, monkeypatch):
     assert row == ("other-user", "legacy")  # 既有行不被认领/改绑
 
 
-def test_c02_local_upload_native_and_kfb_associate(tmp_path, monkeypatch):
-    import app as app_mod
-    import upload_guard
-    import user_store
-    from _pt_helpers import csrf_client
-    # P3：改认证 owner 会话（本地免认证态的资产归属随配置 owner 解析后，
-    # 与 KFB 转换链按 ident.user_id 记 job owner 的旧口径不一致——P4 统一；
-    # 本用例场景用认证 owner 保持两侧同源）
-    monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
-    monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)
-    app_mod.app.config["TESTING"] = True
-    c = csrf_client(app_mod.app.test_client())
-    _own = user_store.create_user("c02@x.com", "c02ownerpass12345",
-                                  role="owner")
-    with c.session_transaction() as sess:
-        sess["auth_user"] = True
-        sess["user_id"] = _own["user_id"]
-        sess["role"] = "owner"
-        sess["auth_version"] = 1
-    pr = c.post("/api/project/create", json={"name": "本地导入", "slides": []})
-    assert pr.status_code == 200, pr.get_data(as_text=True)
-    proj = pr.get_json()
-    tif = make_tiff_bytes()
-    r = c.post("/api/upload", data={
-        "file": (io_bytes(tif), "local.tif"),
-        "target_project_id": proj["pid"],
-    })
-    assert r.status_code in (200, 201), r.get_data(as_text=True)
-    got = share_store.get_project(proj["pid"])
-    # P3：原生单文件新管线按 slide_ids 关联（id_bundle 无名快照——合同 §3.4）
-    assert r.get_json()["slide_id"] in (got.get("slide_ids") or [])
-
-    kfb_path = build_synthetic_kfb(tmp_path / "loc.kfb")
-    with open(kfb_path, "rb") as fh:
-        r2 = c.post("/api/upload", data={
-            "file": (fh, "loc.kfb"),
-            "target_project_id": proj["pid"],
-        })
-    assert r2.status_code in (200, 202), r2.get_data(as_text=True)
-    job_id = r2.get_json()["conversion_job_id"]
-    import conversion_worker
-    if r2.status_code == 202:
-        conversion_worker.run_once(upload_dir=str(app_mod.UPLOAD_DIR))
-    job = conversion_store.get_job(job_id)
-    assert job["state"] == "ready"
-    assert job.get("project_associate_state") == "succeeded"
-    got = share_store.get_project(proj["pid"])
-    # P4-app：转换产物按 slide_id 关联（job.slide_id 预分配）
-    assert job["slide_id"] in (got.get("slide_ids") or [])
-    kfb2 = build_synthetic_kfb(tmp_path / "gone.kfb", width=400, height=280)
-    with open(kfb2, "rb") as fh:
-        r3 = c.post("/api/upload", data={
-            "file": (fh, "gone.kfb"),
-            "target_project_id": proj["pid"],
-        })
-    assert r3.status_code in (200, 202), r3.get_data(as_text=True)
-    job3 = r3.get_json()["conversion_job_id"]
-    share_store.delete_project(proj["pid"])
-    if r3.status_code == 202:
-        conversion_worker.run_once(upload_dir=str(app_mod.UPLOAD_DIR))
-    job = conversion_store.get_job(job3)
-    assert job["state"] == "ready"
-    assert job.get("project_associate_state") == "failed"
-    assert (app_mod.UPLOAD_DIR / "objects" / job["slide_id"] /
-            "data.tif").is_file()
-    assert not (app_mod.UPLOAD_DIR / "gone.tif").exists()
-
-
-def io_bytes(data):
-    import io
-    return io.BytesIO(data)
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py / test_cos_ingest_worker.py）。
 
 
 # --------------------------------------------------------------------------- #

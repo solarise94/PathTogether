@@ -11,10 +11,8 @@
   - 确定性并发：COS 新准入先赢（与 r10 并发 / r11 续租先赢互补）；
     V2 取消×新准入×清理失败（责任持续计入、确认后恰一次释放）。
 """
-import hashlib
 import os
 import sys
-import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import _bootstrap  # noqa: E402,F401
@@ -25,12 +23,10 @@ import pytest  # noqa: E402
 
 import app as app_mod  # noqa: E402
 import share_store  # noqa: E402
-import slide_storage  # noqa: E402
 import upload_guard  # noqa: E402
 import upload_task_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import (csrf_client, clear_upload_dir,  # noqa: E402
-                         isolate_app)
+from _pt_helpers import clear_upload_dir, isolate_app  # noqa: E402
 
 PG_URI = os.environ["DATABASE_URL"]
 
@@ -48,24 +44,6 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setitem(app_mod.app.config, "MAX_CONTENT_LENGTH", None)
     clear_upload_dir(UPLOAD_DIR)
     yield
-
-
-def _client_user(tag):
-    app_mod.app.config["TESTING"] = True
-    app_mod.AUTH_ENABLED = True
-    client = csrf_client(app_mod.app.test_client())
-    uid = user_store.create_user(
-        "life-ch-%s@example.com" % tag, "pass1234pass1234", role="user"
-    )["user_id"]
-    with client.session_transaction() as s:
-        s["auth_user"] = True
-        s["user_id"] = uid
-        s["role"] = "user"
-        s["auth_version"] = 1
-    with psycopg.connect(PG_URI, autocommit=True) as db:
-        db.execute("UPDATE upload_user_quotas SET quota_bytes=%s "
-                   "WHERE user_id=%s", (10 ** 7, uid))
-    return client, uid
 
 
 def _rid_row(rid):
@@ -93,147 +71,25 @@ def _ledger_ok(uid):
     return int(q) == int(s), int(q), int(s)
 
 
-def _create(client, name, size):
-    r = client.post("/api/uploads", json={
-        "filename": name, "declared_size": size,
-        "sha256_expected": hashlib.sha256(b"x" * size).hexdigest()})
-    assert r.status_code == 200, r.get_data(as_text=True)
-    return r.get_json()["upload_id"]
-
-
 # --------------------------------------------------------------------------- #
 # V2：创建即绑定
 # --------------------------------------------------------------------------- #
-def test_v2_create_binds_reservation_native():
-    client, uid = _client_user("v2n")
-    upload_id = _create(client, "n.svs", 1000)
-    task = upload_task_store.get_task(upload_id)
-    assert _rid_row(task["reservation_id"]) == \
-        ("reserved", "upload_task", upload_id)
-
-
-def test_v2_create_binds_reservation_convert():
-    client, uid = _client_user("v2k")
-    upload_id = _create(client, "n.kfb", 1000)
-    task = upload_task_store.get_task(upload_id)
-    assert _rid_row(task["reservation_id"]) == \
-        ("reserved", "upload_task", upload_id)
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py / test_cos_ingest_worker.py）。
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py / test_cos_ingest_worker.py）。
 
 
 # --------------------------------------------------------------------------- #
 # V1：受理前失败的清理确认后释放
 # --------------------------------------------------------------------------- #
-def test_v1_preaccept_abort_cleanup_failure_keeps_reservation(monkeypatch):
-    client, uid = _client_user("v1a")
-    real_remove = slide_storage.remove_staging_tree
-    seen = {"rid": None}
-
-    def _fail_remove(task_id, *, root=None):
-        if task_id and str(task_id).startswith("upt_"):
-            raise OSError("boom")
-        return real_remove(task_id, root=root)
-
-    monkeypatch.setattr(slide_storage, "remove_staging_tree", _fail_remove)
-    # 非法内容（validation 失败）→ 受理前 abort → 清理失败 → pending 保留
-    r = client.post("/api/upload", data={
-        "file": (open(os.devnull, "rb"), "bad.svs")}, content_type=
-        "multipart/form-data")
-    assert r.status_code == 400
-    monkeypatch.setattr(slide_storage, "remove_staging_tree", real_remove)
-    # 预约仍持有（无任务行——责任挂在 pending 行，重试经 DELETE/admin）
-    with psycopg.connect(PG_URI) as db:
-        row = db.execute(
-            "SELECT upload_id, reservation_id FROM upload_cleanup_pending "
-            "LIMIT 1").fetchone()
-        reserved = db.execute(
-            "SELECT COALESCE(SUM(reserved_bytes),0) FROM upload_reservations "
-            "WHERE user_id=%s AND state='reserved'", (uid,)).fetchone()[0]
-    assert row, "清理失败必须留下 pending 行"
-    assert int(reserved) > 0  # 容量责任保留
-    task_id, rid = row[0], row[1]
-    # 清理确认（重试成功）→ 按持有者释放
-    slide_storage.remove_staging_tree(task_id, root=UPLOAD_DIR)
-    out = upload_task_store.clear_cleanup_pending(task_id)
-    assert out == rid
-    upload_guard.release_reservation(rid, expect_holder=("upload_task",
-                                                         task_id))
-    ok, qv, sv = _ledger_ok(uid)
-    assert ok, (qv, sv)
-
-
-def test_v1_preaccept_abort_cleanup_success_releases():
-    client, uid = _client_user("v1b")
-    r = client.post("/api/upload", data={
-        "file": (open(os.devnull, "rb"), "bad.svs")},
-        content_type="multipart/form-data")
-    assert r.status_code == 400
-    assert _quota(uid) == (0, 0)  # 清理成功 → 确认后释放
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py / test_cos_ingest_worker.py）。
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py / test_cos_ingest_worker.py）。
 
 
 # --------------------------------------------------------------------------- #
 # V2：取消 / TTL 维护的清理确认门
 # --------------------------------------------------------------------------- #
-def test_v2_delete_cancel_cleanup_failure_keeps_then_retry_releases(
-        monkeypatch):
-    client, uid = _client_user("v2c")
-    upload_id = _create(client, "c.svs", 1000)
-    rid = upload_task_store.get_task(upload_id)["reservation_id"]
-    # 写入分片（产生 staging 树）
-    r = client.put("/api/uploads/%s/chunk?offset=0&sha256=%s"
-                   % (upload_id, hashlib.sha256(b"x" * 200).hexdigest()),
-                   data=b"x" * 200, content_type="application/octet-stream")
-    assert r.status_code == 200, r.get_data(as_text=True)
-    real_remove = slide_storage.remove_staging_tree
-
-    def _fail_remove(task_id, *, root=None):
-        if task_id == upload_id:
-            raise OSError("boom")
-        return real_remove(task_id, root=root)
-
-    monkeypatch.setattr(slide_storage, "remove_staging_tree", _fail_remove)
-    r = client.delete("/api/uploads/%s" % upload_id)
-    assert r.status_code == 503
-    assert r.get_json()["code"] == "cleanup_retryable"
-    assert _rid_row(rid) == ("reserved", "upload_task", upload_id)
-    assert _quota(uid)[1] == 1000  # 责任持续计入
-    ok, qv, sv = _ledger_ok(uid)
-    assert ok, (qv, sv)
-    # 重试（清理恢复）→ 确认后恰一次释放
-    monkeypatch.setattr(slide_storage, "remove_staging_tree", real_remove)
-    r2 = client.delete("/api/uploads/%s" % upload_id)
-    assert r2.status_code == 200
-    assert _rid_row(rid)[0] == "released"
-    assert _quota(uid) == (0, 0)
-    # 幂等：再删不重复释放
-    client.delete("/api/uploads/%s" % upload_id)
-    assert _quota(uid) == (0, 0)
-
-
-def test_v2_maintain_expire_cleanup_failure_keeps_reservation(monkeypatch):
-    client, uid = _client_user("v2m")
-    upload_id = _create(client, "m.svs", 1000)
-    rid = upload_task_store.get_task(upload_id)["reservation_id"]
-    # 任务过期 + 清理失败 → 维护路径不释放（此前为无条件释放）
-    with psycopg.connect(PG_URI, autocommit=True) as db:
-        db.execute("UPDATE upload_tasks SET expires_at="
-                   "now() - interval '10 seconds' WHERE upload_id=%s",
-                   (upload_id,))
-    real_remove = slide_storage.remove_staging_tree
-
-    def _fail_remove(task_id, *, root=None):
-        if task_id == upload_id:
-            raise OSError("boom")
-        return real_remove(task_id, root=root)
-
-    monkeypatch.setattr(slide_storage, "remove_staging_tree", _fail_remove)
-    r = client.get("/api/uploads/%s" % upload_id)
-    assert r.status_code == 200
-    task = upload_task_store.get_task(upload_id)
-    assert task["state"] == upload_task_store.STATE_EXPIRED
-    assert _rid_row(rid) == ("reserved", "upload_task", upload_id)
-    assert upload_task_store.get_cleanup_pending(upload_id) is not None
-    ok, qv, sv = _ledger_ok(uid)
-    assert ok, (qv, sv)
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py / test_cos_ingest_worker.py）。
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py / test_cos_ingest_worker.py）。
 
 
 # --------------------------------------------------------------------------- #
@@ -386,60 +242,4 @@ def test_cos_admission_first_then_renewal_keeps_capacity():
     ok, qv, sv = _ledger_ok(uid)
     assert ok, (qv, sv)
 
-
-def test_cancel_vs_admission_with_cleanup_failure_keeps_duty(monkeypatch):
-    """§7 行「取消/超期 × 新准入 × 删除失败」：屏障同时起跑 DELETE 取消
-    （清理失败注入）与同用户新建任务——旧责任持续计入，重试清理确认后
-    恰一次释放；全程账本一致。"""
-    client, uid = _client_user("v2x")
-    upload_id = _create(client, "x.svs", 1000)
-    rid = upload_task_store.get_task(upload_id)["reservation_id"]
-    r = client.put("/api/uploads/%s/chunk?offset=0&sha256=%s"
-                   % (upload_id, hashlib.sha256(b"x" * 100).hexdigest()),
-                   data=b"x" * 100, content_type="application/octet-stream")
-    assert r.status_code == 200
-    real_remove = slide_storage.remove_staging_tree
-
-    def _fail_remove(task_id, *, root=None):
-        if task_id == upload_id:
-            raise OSError("boom")
-        return real_remove(task_id, root=root)
-
-    monkeypatch.setattr(slide_storage, "remove_staging_tree", _fail_remove)
-    barrier = threading.Barrier(2)
-    errors = [None, None]
-
-    def _cancel():
-        barrier.wait(timeout=30)
-        try:
-            client.delete("/api/uploads/%s" % upload_id)
-        except Exception as exc:  # noqa: BLE001
-            errors[0] = exc
-
-    def _create_new():
-        barrier.wait(timeout=30)
-        try:
-            _create(client, "y.svs", 3000)
-        except Exception as exc:  # noqa: BLE001
-            errors[1] = exc
-
-    ts = [threading.Thread(target=_cancel), threading.Thread(target=_create_new)]
-    for t in ts:
-        t.start()
-    for t in ts:
-        t.join(timeout=30)
-        assert not t.is_alive(), "并发场景死锁"
-    assert errors == [None, None], errors
-    # 清理失败的旧责任 + 新任务责任都在账上
-    assert _rid_row(rid) == ("reserved", "upload_task", upload_id)
-    assert _quota(uid)[1] == 4000
-    ok, qv, sv = _ledger_ok(uid)
-    assert ok, (qv, sv)
-    # 重试清理确认 → 旧责任恰一次释放
-    monkeypatch.setattr(slide_storage, "remove_staging_tree", real_remove)
-    r2 = client.delete("/api/uploads/%s" % upload_id)
-    assert r2.status_code == 200
-    assert _rid_row(rid)[0] == "released"
-    assert _quota(uid)[1] == 3000
-    ok, qv, sv = _ledger_ok(uid)
-    assert ok, (qv, sv)
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py / test_cos_ingest_worker.py）。

@@ -1,31 +1,28 @@
 # -*- coding: utf-8 -*-
-"""slide ID 化重构 P3：统一本地发布门禁测试（V2 分片 + V1 原生单文件）。
+"""slide ID 化重构 P3：统一本地发布门禁测试（U5 检查点 B 后保留面）。
 
 合同：docs/slide-id-refactor-p3-contract-20260925.md §6（计划 §8 矩阵的 P3
-部分）。逐条覆盖：
+部分）。旧 V1/V2 上传端点已随 COS 上传统一删除：发布链路（任务状态机/
+commit 三段式/取消/配额预占）断言归 COS 链路测试
+（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py /
+test_cos_ingest_worker.py）；本文件保留**资产侧**行为——同名独立 ID/归属、
+删除减账与授权不继承、显示名/revision 语义、ID 端点读路径。资产夹具走
+_pt_helpers.publish_test_slide（服务级发布，无 HTTP）。
 
-  1. V2 同名并发（两账户同名同字节）→ 不同 slide_id/不同 objects 目录、
-     各自归属、互不冲突 409；
-  2. 同一任务重复 commit/响应丢失重试 → 同一 slide_id、一次配额结算、
-     无重复资产；
-  3. intent 前 / 包发布后 / DB commit 前崩溃（monkeypatch 阶段屏障注入，
-     不用 sleep）→ 未 ready 不可读（文件已在 objects 也不可读）；恢复收口
-     一次；存活字节有预约或实占；
-  4. 取消与发布并发、删除与发布并发 → 状态机 CAS 裁定明确胜者；
-  5. 满配额、预约过期 → 不可读、不漏账、不重复收费；
-  6. 删除 A（id_bundle）→ 同名重传 B → 新 ID；旧分享/授权/标注/AI run
-     grant/Demo 不指向 B；
-  7. 删除减账幂等：重复 DELETE 不重复减；
-  8. 显示名修改不移动文件、不动 revision；
-  9. 旧端点对 id_bundle 资产按名找不到（403/404 预期——新资产无
-     legacy_filename）；列表/info/dzi/tile/crop/region 经 ID 端点全通；
-  10. 机器通道无行兼容分支已删：无行文件经 internal/plugin 解析一律拒；
-  11. annotations_by_slide 对同名 id_bundle 资产按 ID 分组不串。
+仍覆盖：
+
+  1. 同名（两账户/同账户）→ 不同 slide_id/不同 objects 目录、各自归属；
+  2. 删除 → tombstone + 减账幂等；同名重传 → 新 ID；旧分享/授权/标注/AI
+     run grant/Demo 不指向新资产；
+  3. annotations_by_slide 对同名 id_bundle 资产按 ID 分组不串；
+  4. 显示名修改不移动文件、不动 revision；
+  5. 旧端点对 id_bundle 资产按名找不到（403 预期）；列表/info/dzi/tile/
+     crop/region 经 ID 端点全通；
+  6. 机器通道无行兼容分支已删：无行文件经 internal/plugin 解析一律拒。
 
 运行：cd 项目根 && python3 -m pytest tests/test_slide_publish_pg.py -q
 """
 import hashlib
-import io
 import os
 import sys
 from pathlib import Path
@@ -45,7 +42,8 @@ import slide_storage  # noqa: E402
 import upload_guard  # noqa: E402
 import upload_task_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import clear_upload_dir, csrf_client, isolate_app  # noqa: E402
+from _pt_helpers import (clear_upload_dir, csrf_client, isolate_app,  # noqa: E402
+                         publish_test_slide)
 from _tiff_fixtures import make_tiff_bytes  # noqa: E402
 
 PG_URI = os.environ["DATABASE_URL"]
@@ -105,52 +103,17 @@ def _quota_bytes(uid, n):
                         "quota_bytes=%s", (uid, n, n))
 
 
+def _settle_used(uid, n):
+    """模拟上传链路的配额结算前置态（publish_test_slide 离线通道不结算
+    配额——删除减账断言需要 used_bytes 已按 accounted_bytes 入账）。"""
+    with psycopg.connect(PG_URI, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE upload_user_quotas SET used_bytes=%s "
+                        "WHERE user_id=%s", (n, uid))
+
+
 TIFF = make_tiff_bytes(64, 96)
 TIFF_SHA = hashlib.sha256(TIFF).hexdigest()
-
-
-def _v2_create(client, name="same.tif", size=None, sha=None):
-    body = {"filename": name, "declared_size": size if size else len(TIFF)}
-    if sha:
-        body["sha256_expected"] = sha
-    return client.post("/api/uploads", json=body)
-
-
-def _v2_put(client, upload_id, offset, data):
-    return client.put(
-        "/api/uploads/%s/chunk?offset=%d&sha256=%s"
-        % (upload_id, offset, hashlib.sha256(data).hexdigest()),
-        data=data, content_type="application/octet-stream")
-
-
-def _v2_upload_full(client, upload_id, data=None, chunk=32):
-    data = TIFF if data is None else data
-    r = None
-    for off in range(0, len(data), chunk):
-        r = _v2_put(client, upload_id, off, data[off:off + chunk])
-        assert r.status_code == 200, r.get_data(as_text=True)
-    return r
-
-
-def _v2_flow(client, name="same.tif", data=None, sha=None):
-    """创建 → 传完 → commit；返回 (slide_id, commit_resp_json)。"""
-    data = TIFF if data is None else data
-    r = _v2_create(client, name, size=len(data), sha=sha)
-    assert r.status_code == 200, r.get_data(as_text=True)
-    upload_id = r.get_json()["upload_id"]
-    assert r.get_json().get("slide_id"), "创建即绑定 slide_id（合同 §3.1.4）"
-    _v2_upload_full(client, upload_id, data)
-    r = client.post("/api/uploads/%s/commit" % upload_id)
-    assert r.status_code == 200, r.get_data(as_text=True)
-    return r.get_json()["slide_id"], r.get_json()
-
-
-def _v1_upload(client, name="same.tif", data=None):
-    data = TIFF if data is None else data
-    return client.post(
-        "/api/upload",
-        data={"file": (io.BytesIO(data), name)},
-        content_type="multipart/form-data")
 
 
 def _bundle_dir(slide_id):
@@ -162,17 +125,18 @@ def _desc(slide_id):
 
 
 # --------------------------------------------------------------------------- #
-# §6-1 V2 同名并发（两账户同名同字节）→ 不同 ID/目录/归属
+# §6-1 同名并发（两账户同名同字节）→ 不同 ID/目录/归属
 # --------------------------------------------------------------------------- #
 def test_v2_same_name_two_accounts_distinct_ids(tmp_path):
     ca = _client()
     cb = _client()
     uid_a = _user_session(ca, login="a@x.com")
     uid_b = _user_session(cb, login="b@x.com")
-    sid_a, body_a = _v2_flow(ca, "same.tif")
-    sid_b, body_b = _v2_flow(cb, "same.tif")
+    sid_a = publish_test_slide("same.tif", TIFF, owner_user_id=uid_a,
+                               upload_dir=UPLOAD_DIR)
+    sid_b = publish_test_slide("same.tif", TIFF, owner_user_id=uid_b,
+                               upload_dir=UPLOAD_DIR)
     assert sid_a != sid_b
-    assert sid_a == body_a["slide_id"] and sid_b == body_b["slide_id"]
     da, db = _desc(sid_a), _desc(sid_b)
     assert da.storage_layout == "id_bundle" and db.storage_layout == "id_bundle"
     assert da.owner_user_id == uid_a and db.owner_user_id == uid_b
@@ -183,212 +147,50 @@ def test_v2_same_name_two_accounts_distinct_ids(tmp_path):
     assert (_bundle_dir(sid_a) / "data.tif").is_file()
     assert (_bundle_dir(sid_b) / "data.tif").is_file()
     # 同账号同名并发同样不冲突（allocate_slide 不查原名）
-    sid_a2, _ = _v2_flow(ca, "same.tif")
+    sid_a2 = publish_test_slide("same.tif", TIFF, owner_user_id=uid_a,
+                                upload_dir=UPLOAD_DIR)
     assert sid_a2 not in (sid_a, sid_b)
 
 
-def test_v2_same_name_no_conflict_409_gone(tmp_path):
-    """同名不再 409（_upload_name_conflict 调用已删——原生通道）。"""
-    ca = _client()
-    _user_session(ca, login="a@x.com")
-    sid1, _ = _v2_flow(ca, "dup.tif")
-    # 已有同名已发布资产后，同名第二份创建不再报 name_unavailable
-    r = _v2_create(ca, "dup.tif")
-    assert r.status_code == 200, r.get_data(as_text=True)
-    assert r.get_json()["slide_id"] != sid1
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py / test_cos_ingest_worker.py）。
+# （原 §6-1 test_v2_same_name_no_conflict_409_gone：create 端点同名不再 409
+#   的响应断言——端点行为；同名独立 ID 的资产侧语义由上面的用例覆盖。）
 
 
 # --------------------------------------------------------------------------- #
 # §6-2 重复 commit / 响应丢失重试 → 同 ID 一次结算
 # --------------------------------------------------------------------------- #
-def test_v2_repeat_commit_same_id_single_settlement(tmp_path):
-    c = _client()
-    uid = _user_session(c, login="q@x.com")
-    _quota_bytes(uid, 10 * 1024 * 1024)
-    r = _v2_create(c, "once.tif")
-    upload_id = r.get_json()["upload_id"]
-    _v2_upload_full(c, upload_id)
-    r1 = c.post("/api/uploads/%s/commit" % upload_id)
-    assert r1.status_code == 200
-    sid = r1.get_json()["slide_id"]
-    # 响应丢失重试：重复 commit 幂等
-    r2 = c.post("/api/uploads/%s/commit" % upload_id)
-    assert r2.status_code == 200
-    assert r2.get_json()["slide_id"] == sid
-    q = _quota(uid)
-    assert q["used_bytes"] == len(TIFF)      # 一次结算
-    assert q["reserved_bytes"] == 0
-    # 资产唯一：slide_assets revision 一行；objects 目录一个
-    assert _one("SELECT count(*) FROM slide_assets WHERE slide_id=%s",
-                (sid,)) == 1
-    assert _one("SELECT count(*) FROM slides WHERE slide_id=%s", (sid,)) == 1
-    task = upload_task_store.get_task(upload_id)
-    assert task["state"] == "committed"
-    assert task["commit_intent_json"] is None   # 收口清 intent
-    assert r1.get_json()["slide_id"] == task["slide_id"]
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py / test_cos_ingest_worker.py）。
+# （原 §6-2 test_v2_repeat_commit_same_id_single_settlement：commit 三段式
+#   幂等与配额恰一次结算——纯 V2 commit 端点行为。）
 
 
 # --------------------------------------------------------------------------- #
 # §6-3 三处崩溃点（阶段屏障注入）→ 恢复收口一次、未 ready 不可读
 # --------------------------------------------------------------------------- #
-def _recover_now(monkeypatch):
-    """恢复判定立即生效（commit 超时=0；不用 sleep）。"""
-    monkeypatch.setattr(upload_task_store, "UPLOAD_COMMIT_TIMEOUT_SECONDS", 0)
-
-
-def test_crash_before_intent_retryable(tmp_path, monkeypatch):
-    """intent 前（begin_commit 内）崩溃：任务保持 active，staging 保留，
-    预占仍持有（存活字节有预约）；重试 commit 收口一次。"""
-    c = _client()
-    uid = _user_session(c, login="c1@x.com")
-    r = _v2_create(c, "crash1.tif")
-    upload_id = r.get_json()["upload_id"]
-    sid = r.get_json()["slide_id"]
-    _v2_upload_full(c, upload_id)
-
-    real = upload_task_store.begin_commit
-
-    def _boom(*a, **kw):
-        raise RuntimeError("crash before intent")
-
-    monkeypatch.setattr(upload_task_store, "begin_commit", _boom)
-    with pytest.raises(RuntimeError):
-        c.post("/api/uploads/%s/commit" % upload_id)
-    monkeypatch.setattr(upload_task_store, "begin_commit", real)
-
-    task = upload_task_store.get_task(upload_id)
-    assert task["state"] == "active"
-    assert task["commit_intent_json"] is None
-    # 未 ready 不可读（staging 门禁）
-    assert c.get("/api/slides/%s/info" % sid).status_code == 403
-    # 存活字节有预约：reserved 仍占
-    assert _quota(uid)["reserved_bytes"] == len(TIFF)
-    # 传输暂存在 .staging/<uid>/transfer/（不平铺）
-    assert (Path(UPLOAD_DIR) / ".staging" / upload_id / "transfer"
-            / "data").is_file()
-    # 重试收口
-    rr = c.post("/api/uploads/%s/commit" % upload_id)
-    assert rr.status_code == 200, rr.get_data(as_text=True)
-    assert _desc(sid).asset_state == "ready"
-    assert c.get("/api/slides/%s/info" % sid).status_code == 200
-    assert _quota(uid)["used_bytes"] == len(TIFF)
-    assert not (Path(UPLOAD_DIR) / ".staging" / upload_id).exists()
-
-
-def test_crash_after_intent_before_publish_recovered(tmp_path, monkeypatch):
-    """intent 后、包发布前崩溃：保持 committing；恢复幂等重跑发布并收口。"""
-    c = _client()
-    uid = _user_session(c, login="c2@x.com")
-    r = _v2_create(c, "crash2.tif")
-    upload_id = r.get_json()["upload_id"]
-    sid = r.get_json()["slide_id"]
-    _v2_upload_full(c, upload_id)
-
-    real = slide_storage.publish_bundle_no_clobber
-    monkeypatch.setattr(slide_storage, "publish_bundle_no_clobber",
-                        lambda *a, **kw: (_ for _ in ()).throw(
-                            OSError("disk hiccup")))
-    rr = c.post("/api/uploads/%s/commit" % upload_id)
-    assert rr.status_code == 503
-    assert rr.get_json()["code"] == "commit_in_progress"
-    monkeypatch.setattr(slide_storage, "publish_bundle_no_clobber", real)
-
-    task = upload_task_store.get_task(upload_id)
-    assert task["state"] == "committing"
-    assert task["commit_intent_json"] is not None
-    assert c.get("/api/slides/%s/info" % sid).status_code == 403
-
-    _recover_now(monkeypatch)
-    rs = c.get("/api/uploads/%s" % upload_id)
-    assert rs.status_code == 200
-    assert rs.get_json()["state"] == "committed"
-    assert rs.get_json()["slide_id"] == sid
-    assert _desc(sid).asset_state == "ready"
-    assert _quota(uid)["used_bytes"] == len(TIFF)   # 一次结算
-    assert (_bundle_dir(sid) / "data.tif").is_file()
-    assert c.get("/api/slides/%s/info" % sid).status_code == 200
-
-
-def test_crash_after_publish_before_db_invisible_then_recovered(
-        tmp_path, monkeypatch):
-    """包发布后、DB 收口前崩溃：文件已在 objects 仍不可读（DB ready 是唯一
-    可见性开关）；恢复只做 DB CAS（幂等收口一次）。"""
-    import slide_publish
-    c = _client()
-    uid = _user_session(c, login="c3@x.com")
-    r = _v2_create(c, "crash3.tif")
-    upload_id = r.get_json()["upload_id"]
-    sid = r.get_json()["slide_id"]
-    _v2_upload_full(c, upload_id)
-
-    def _boom(*a, **kw):
-        raise RuntimeError("db crash")
-
-    orig = slide_publish._settle_publish
-    slide_publish._settle_publish = _boom   # 阶段屏障：包发布后、DB 收口前
-    try:
-        rr = c.post("/api/uploads/%s/commit" % upload_id)
-        assert rr.status_code == 503
-        assert rr.get_json()["code"] == "commit_in_progress"
-    finally:
-        slide_publish._settle_publish = orig
-
-    # FS 已发布但 DB 未收口：不可读（P3 完成标准核心断言）
-    assert (_bundle_dir(sid) / "data.tif").is_file()
-    assert _desc(sid).asset_state == "staging"
-    assert c.get("/api/slides/%s/info" % sid).status_code == 403
-
-    _recover_now(monkeypatch)
-    rs = c.get("/api/uploads/%s" % upload_id)
-    assert rs.get_json()["state"] == "committed"
-    assert _desc(sid).asset_state == "ready"
-    assert c.get("/api/slides/%s/info" % sid).status_code == 200
-    assert _quota(uid)["used_bytes"] == len(TIFF)
-    assert _one("SELECT count(*) FROM slide_assets WHERE slide_id=%s",
-                (sid,)) == 1
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py / test_cos_ingest_worker.py）。
+# （原 §6-3 三个 test_crash_* 用例：intent 前/intent 后发布前/发布后 DB 前
+#   的 commit 崩溃窗口与恢复——纯 V2 commit 端点行为。）
 
 
 # --------------------------------------------------------------------------- #
 # §6-4 取消/删除与发布并发 → 状态机裁定明确胜者
 # --------------------------------------------------------------------------- #
-def test_cancel_wins_before_commit(tmp_path):
-    c = _client()
-    uid = _user_session(c, login="d1@x.com")
-    r = _v2_create(c, "cancel.tif")
-    upload_id = r.get_json()["upload_id"]
-    sid = r.get_json()["slide_id"]
-    _v2_upload_full(c, upload_id)
-    # 取消先赢：active → cancelled；清 staging 后释放预占；资产行 failed
-    rd = c.delete("/api/uploads/%s" % upload_id)
-    assert rd.status_code == 200 and rd.get_json()["state"] == "cancelled"
-    assert not (Path(UPLOAD_DIR) / ".staging" / upload_id).exists()
-    assert _quota(uid)["reserved_bytes"] == 0
-    assert _desc(sid).asset_state == "failed"
-    # 新 ID 资产不受旧任务清理影响：另一任务照常发布
-    sid2, _ = _v2_flow(c, "cancel.tif")
-    assert _desc(sid2).asset_state == "ready"
-
-
-def test_cancel_rejected_during_committing(tmp_path):
-    """committing（不可撤销段）取消恒 409——发布继续/恢复完成。"""
-    c = _client()
-    _user_session(c, login="d2@x.com")
-    r = _v2_create(c, "cc.tif")
-    upload_id = r.get_json()["upload_id"]
-    sid = r.get_json()["slide_id"]
-    _v2_upload_full(c, upload_id)
-    rc = c.post("/api/uploads/%s/commit" % upload_id)
-    assert rc.status_code == 200
-    rd = c.delete("/api/uploads/%s" % upload_id)
-    assert rd.status_code == 409
-    assert _desc(sid).asset_state == "ready"
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py / test_cos_ingest_worker.py）。
+# （原 §6-4 test_cancel_wins_before_commit / test_cancel_rejected_during_
+#   committing：DELETE /api/uploads/<id> 取消端点语义。删除与发布的胜者
+#   （删除方向）由下方 test_delete_after_publish_refunds_and_tombstones 覆盖。）
 
 
 def test_delete_after_publish_refunds_and_tombstones(tmp_path):
     """删除与发布的胜者：ready 后删除 → deleting 立即拒读 → 结算减账。"""
     c = _client()
     uid = _user_session(c, login="d3@x.com")
-    sid, _ = _v2_flow(c, "del.tif")
+    sid = publish_test_slide("del.tif", TIFF, owner_user_id=uid,
+                             upload_dir=UPLOAD_DIR)
+    # 配额结算前置态（上传链路入账语义归 COS 侧；此处直铺删除结算起点）
+    _quota_bytes(uid, 10 * 1024 * 1024)
+    _settle_used(uid, len(TIFF))
     assert c.get("/api/slides/%s/info" % sid).status_code == 200
     rd = c.delete("/api/slides/%s" % sid)
     assert rd.status_code == 200 and rd.get_json()["state"] == "deleted"
@@ -402,52 +204,10 @@ def test_delete_after_publish_refunds_and_tombstones(tmp_path):
 # --------------------------------------------------------------------------- #
 # §6-5 满配额 / 预约过期 → 不漏账不重复收费
 # --------------------------------------------------------------------------- #
-def test_quota_exceeded_no_leak(tmp_path):
-    c = _client()
-    uid = _user_session(c, login="e1@x.com")
-    _quota_bytes(uid, 8)   # 配额小于文件
-    r = _v2_create(c, "big.tif")
-    assert r.status_code == 413
-    assert r.get_json()["code"] == "upload_quota_exceeded"
-    # 不漏账：无任务行、无 staging 资产行、预占为 0
-    assert _one("SELECT count(*) FROM upload_tasks WHERE owner_user_id=%s",
-                (uid,)) == 0
-    assert _one("SELECT count(*) FROM slides WHERE owner_user_id=%s AND "
-                "asset_state='staging'", (uid,)) == 0
-    q = _quota(uid)
-    assert q["reserved_bytes"] == 0 and q["used_bytes"] == 0
-
-
-def test_reservation_lease_expired_settles_once_no_double_charge(tmp_path):
-    """0072 生命周期合同（替代旧「预占过期 → 409 fail-closed」，plan §D
-    注记）：绑定预约租约过期不丢容量——合法任务照常提交、恰一次结算、
-    重复 commit 不重复收费。"""
-    c = _client()
-    uid = _user_session(c, login="e2@x.com")
-    _quota_bytes(uid, 10 * 1024 * 1024)
-    r = _v2_create(c, "exp.tif")
-    upload_id = r.get_json()["upload_id"]
-    sid = r.get_json()["slide_id"]
-    _v2_upload_full(c, upload_id)
-    # 直接把预占租约置为已过期（不 sleep）
-    with psycopg.connect(PG_URI, autocommit=True) as conn:
-        with conn.cursor() as cur:
-            cur.execute("UPDATE upload_reservations SET expires_at = "
-                        "now() - interval '1 second' WHERE user_id=%s AND "
-                        "state='reserved'", (uid,))
-    rc = c.post("/api/uploads/%s/commit" % upload_id)
-    assert rc.status_code == 200, rc.get_data(as_text=True)
-    # 可读；恰一次结算；不漏账不重复收费（used == accounted，reserved 0）
-    assert c.get("/api/slides/%s/info" % sid).status_code == 200
-    q = _quota(uid)
-    assert q["used_bytes"] == _desc(sid).accounted_bytes
-    assert q["reserved_bytes"] == 0
-    assert not (Path(UPLOAD_DIR) / ".staging" / upload_id).exists()
-    assert _desc(sid).asset_state == "ready"
-    # 重复 commit 幂等回放，不重复收费
-    rc2 = c.post("/api/uploads/%s/commit" % upload_id)
-    assert rc2.status_code == 200
-    assert _quota(uid)["used_bytes"] == q["used_bytes"]
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py / test_cos_ingest_worker.py）。
+# （原 §6-5 test_quota_exceeded_no_leak：create 端点 413 配额预占拒绝——
+#   端点行为。原 §6-5 test_reservation_lease_expired_settles_once_no_double_
+#   charge：预占租约过期后的 commit 结算——纯 V2 commit 端点行为。）
 
 
 def test_delete_then_reupload_new_id_no_inheritance(tmp_path):
@@ -456,7 +216,8 @@ def test_delete_then_reupload_new_id_no_inheritance(tmp_path):
     uid_a = _user_session(ca, login="f1@x.com")
     uid_b = _user_session(cb, login="f2@x.com")
 
-    sid_a, _ = _v2_flow(ca, "inherit.tif")
+    sid_a = publish_test_slide("inherit.tif", TIFF, owner_user_id=uid_a,
+                               upload_dir=UPLOAD_DIR)
     # 建立全部引用面：view grant / share+claim / 标注 / run grant / Demo
     share_store.grant_slide_view(uid_b, "inherit.tif", slide_id=sid_a)
     share = share_store.create_share(
@@ -486,7 +247,8 @@ def test_delete_then_reupload_new_id_no_inheritance(tmp_path):
                 "NOT revoked", (sid_a,)) == 0
 
     # 同名重传 → 新 ID
-    sid_b, _ = _v2_flow(ca, "inherit.tif")
+    sid_b = publish_test_slide("inherit.tif", TIFF, owner_user_id=uid_a,
+                               upload_dir=UPLOAD_DIR)
     assert sid_b != sid_a
     # 旧授权/分享/能力不指向 B
     assert cb.get("/api/slides/%s/info" % sid_b).status_code == 403
@@ -512,8 +274,10 @@ def test_annotations_same_name_id_bundle_not_crossed(tmp_path):
     """§6-11：两份同名 id_bundle 资产，标注按 ID 分组互不串。"""
     ca = _client()
     uid = _user_session(ca, login="g1@x.com")
-    sid_a, _ = _v2_flow(ca, "twin.tif")
-    sid_b, _ = _v2_flow(ca, "twin.tif")
+    sid_a = publish_test_slide("twin.tif", TIFF, owner_user_id=uid,
+                               upload_dir=UPLOAD_DIR)
+    sid_b = publish_test_slide("twin.tif", TIFF, owner_user_id=uid,
+                               upload_dir=UPLOAD_DIR)
     # 工作台标注（token=admin）分别落在两份同名资产上
     share_store.add_roi("admin", "twin.tif", "A", x=1.0, y=1.0,
                         w=2.0, h=2.0, size_mm=0.1, slide_id=sid_a,
@@ -540,7 +304,9 @@ def test_delete_refund_idempotent(tmp_path):
     c = _client()
     uid = _user_session(c, login="h1@x.com")
     _quota_bytes(uid, 10 * 1024 * 1024)
-    sid, _ = _v2_flow(c, "idem.tif")
+    sid = publish_test_slide("idem.tif", TIFF, owner_user_id=uid,
+                             upload_dir=UPLOAD_DIR)
+    _settle_used(uid, len(TIFF))
     assert _quota(uid)["used_bytes"] == len(TIFF)
     r1 = c.delete("/api/slides/%s" % sid)
     assert r1.status_code == 200
@@ -552,7 +318,9 @@ def test_delete_refund_idempotent(tmp_path):
     assert r3.status_code == 200
     assert _quota(uid)["used_bytes"] == 0
     # worker 重试语义：deleting 中断后重入（状态直改模拟清理中断）
-    sid2, _ = _v2_flow(c, "idem2.tif")
+    sid2 = publish_test_slide("idem2.tif", TIFF, owner_user_id=uid,
+                              upload_dir=UPLOAD_DIR)
+    _settle_used(uid, len(TIFF))
     with psycopg.connect(PG_URI, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE slides SET asset_state='deleting' "
@@ -568,8 +336,9 @@ def test_delete_refund_idempotent(tmp_path):
 # --------------------------------------------------------------------------- #
 def test_display_name_edit_no_file_no_revision_change(tmp_path):
     c = _client()
-    _user_session(c, login="i1@x.com")
-    sid, _ = _v2_flow(c, "rename.tif")
+    uid = _user_session(c, login="i1@x.com")
+    sid = publish_test_slide("rename.tif", TIFF, owner_user_id=uid,
+                             upload_dir=UPLOAD_DIR)
     d0 = _desc(sid)
     path0 = slide_storage.resolve_descriptor_path(d0, root=UPLOAD_DIR)
     stat0 = path0.stat()
@@ -590,8 +359,9 @@ def test_display_name_edit_no_file_no_revision_change(tmp_path):
 # --------------------------------------------------------------------------- #
 def test_id_endpoints_full_read_path_and_legacy_name_404(tmp_path):
     c = _client()
-    _user_session(c, login="j1@x.com")
-    sid, _ = _v2_flow(c, "read.tif")
+    uid = _user_session(c, login="j1@x.com")
+    sid = publish_test_slide("read.tif", TIFF, owner_user_id=uid,
+                             upload_dir=UPLOAD_DIR)
     # 列表出列：name=None + slide_id/original_filename/display_name/format_ext
     items = c.get("/api/slides").get_json()
     mine = [it for it in items if it.get("slide_id") == sid]
@@ -639,42 +409,7 @@ def test_machine_channel_no_row_rejected(tmp_path):
 # --------------------------------------------------------------------------- #
 # V1 原生单文件新管线（同矩阵抽验：同名并发/幂等/删除减账）
 # --------------------------------------------------------------------------- #
-def test_v1_native_upload_publishes_id_bundle(tmp_path):
-    c = _client()
-    uid = _user_session(c, login="k1@x.com")
-    _quota_bytes(uid, 10 * 1024 * 1024)
-    r = _v1_upload(c, "v1.tif")
-    assert r.status_code == 200, r.get_data(as_text=True)
-    body = r.get_json()
-    sid = body["slide_id"]
-    assert sid and body["name"] == "v1.tif"
-    d = _desc(sid)
-    assert d.asset_state == "ready" and d.storage_layout == "id_bundle"
-    assert d.legacy_filename is None
-    assert d.owner_user_id == uid
-    assert (_bundle_dir(sid) / "data.tif").is_file()
-    assert not list((Path(UPLOAD_DIR)).glob(".uploading-*"))  # 不再平铺
-    assert _quota(uid)["used_bytes"] == len(TIFF)
-    # 同名并发第二份：不同 ID、无 409
-    r2 = _v1_upload(c, "v1.tif")
-    assert r2.status_code == 200
-    assert r2.get_json()["slide_id"] != sid
-    # 删除走 by-ID 端点并减账
-    rd = c.delete("/api/slides/%s" % sid)
-    assert rd.status_code == 200
-    assert _quota(uid)["used_bytes"] == len(TIFF)  # 只减第一份
-
-
-def test_v1_native_invalid_content_fails_clean(tmp_path):
-    c = _client()
-    uid = _user_session(c, login="k2@x.com")
-    r = _v1_upload(c, "bad.tif", data=b"not a slide at all")
-    assert r.status_code == 400
-    # 受理前失败：无任务、无资产行、预占释放、无 staging 残留
-    assert _one("SELECT count(*) FROM upload_tasks WHERE owner_user_id=%s",
-                (uid,)) == 0
-    assert _one("SELECT count(*) FROM slides WHERE owner_user_id=%s",
-                (uid,)) == 0
-    assert _quota(uid)["reserved_bytes"] == 0
-    staging_root = Path(UPLOAD_DIR) / ".staging"
-    assert not staging_root.exists() or not any(staging_root.iterdir())
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py / test_cos_ingest_worker.py）。
+# （原 test_v1_native_upload_publishes_id_bundle：V1 单请求端点的发布/配额/
+#   同名并发行为。原 test_v1_native_invalid_content_fails_clean：V1 端点对
+#   非法内容的 400 拒绝与受理前零残留——端点拒绝场景随端点删除。）

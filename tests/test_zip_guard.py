@@ -37,7 +37,7 @@ import share_store  # noqa: E402
 import user_store  # noqa: E402
 import upload_guard  # noqa: E402
 import slide_io  # noqa: E402
-import app as app_mod  # noqa: E402
+import upload_content  # noqa: E402  # U5：zip 服务直驱（app 壳已随检查点 B 删除）
 from pg_compat import BACKEND  # noqa: E402
 from _pt_helpers import isolate_app, clear_upload_dir  # noqa: E402
 
@@ -57,15 +57,15 @@ def _isolate(tmp_path, monkeypatch):
         user_store.create_user("p3-local-owner@x.com",
                                "localownerpass12345", role="user")["user_id"])
     monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)
-    monkeypatch.setattr(app_mod, "ZIP_MAX_MEMBERS", 4096)
-    monkeypatch.setattr(app_mod, "ZIP_MAX_PATH_DEPTH", 8)
-    monkeypatch.setattr(app_mod, "ZIP_MAX_MEMBER_BYTES",
+    monkeypatch.setattr(upload_content, "ZIP_MAX_MEMBERS", 4096)
+    monkeypatch.setattr(upload_content, "ZIP_MAX_PATH_DEPTH", 8)
+    monkeypatch.setattr(upload_content, "ZIP_MAX_MEMBER_BYTES",
                         upload_guard.UPLOAD_MAX_REQUEST_BYTES)
-    monkeypatch.setattr(app_mod, "ZIP_MAX_TOTAL_BYTES",
+    monkeypatch.setattr(upload_content, "ZIP_MAX_TOTAL_BYTES",
                         2 * upload_guard.UPLOAD_MAX_REQUEST_BYTES)
-    monkeypatch.setattr(app_mod, "ZIP_MAX_COMPRESSION_RATIO", 100.0)
+    monkeypatch.setattr(upload_content, "ZIP_MAX_COMPRESSION_RATIO", 100.0)
     # A0 异常契约：放行 stub 返回 None，签名兼容 format_hint 关键字
-    monkeypatch.setattr(app_mod, "_validate_slide_file",
+    monkeypatch.setattr(upload_content, "validate_slide_file",
                         lambda p, **_: None)
     clear_upload_dir(UPLOAD_DIR)
     yield
@@ -102,13 +102,14 @@ def _extract_and_promote(z, reservation=None):
     import slide_storage
     import upload_task_store
 
-    result = app_mod._prepare_zip_bundle(z, reservation=reservation)
+    result = upload_content.prepare_zip_bundle(
+        z, reservation=reservation, upload_root=UPLOAD_DIR)
     if isinstance(result, tuple):
         return result
     bundle = result
     owner = (share_store.get_owner_user_id() or "").strip()
     upload_id = upload_task_store.new_task_id()
-    artifacts = app_mod._zip_build_artifacts(bundle)
+    artifacts = upload_content.zip_build_artifacts(bundle)
     try:
         import psycopg.rows
         conn = pg_store.connect()
@@ -130,22 +131,22 @@ def _extract_and_promote(z, reservation=None):
         finally:
             conn.close()
         items = upload_task_store.list_upload_task_items(upload_id)
-        plans = app_mod._zip_item_plans(artifacts, items)
-        published, _failures, _settled = app_mod._zip_publish_items(
+        plans = upload_content.zip_item_plans(artifacts, items)
+        published, _failures, _settled = upload_content.zip_publish_items(
             upload_id, token, plans, owner,
             extract_dir=bundle["extract_dir"],
-            upload_root=app_mod.UPLOAD_DIR)
+            upload_root=UPLOAD_DIR)
         upload_task_store.finish_commit(
-            upload_id, token, app_mod._upload_manifest_sha(artifacts),
+            upload_id, token, upload_content.manifest_sha(artifacts),
             settle_bytes=int(published))
     finally:
         slide_storage.remove_staging_tree(upload_id,
-                                          root=app_mod.UPLOAD_DIR)
+                                          root=UPLOAD_DIR)
     slide_ids = {r["item_key"]: r["slide_id"]
                  for r in upload_task_store.list_upload_task_items(upload_id)}
     info = {"slide_ids": slide_ids,
             "objects": {k: slide_storage.bundle_dir(v,
-                                                    root=app_mod.UPLOAD_DIR)
+                                                    root=UPLOAD_DIR)
                         for k, v in slide_ids.items()}}
     return bundle["main"], [i["key"] for i in bundle["items"]], info
 
@@ -224,7 +225,7 @@ def test_legal_multiple_single_file_slides():
 # =========================================================================== #
 def test_declared_member_size_over_limit(monkeypatch):
     """随机数据（压缩比≈1）超单成员上限 → 拒绝（不依赖压缩比触发）。"""
-    monkeypatch.setattr(app_mod, "ZIP_MAX_MEMBER_BYTES", 1000)
+    monkeypatch.setattr(upload_content, "ZIP_MAX_MEMBER_BYTES", 1000)
     z = _make_zip([("a.svs", os.urandom(5000))])
     msg, status = _extract_and_promote(z)
     assert status == 400 and "大小上限" in msg
@@ -232,8 +233,8 @@ def test_declared_member_size_over_limit(monkeypatch):
 
 
 def test_total_expansion_over_limit(monkeypatch):
-    monkeypatch.setattr(app_mod, "ZIP_MAX_MEMBER_BYTES", 10 ** 9)
-    monkeypatch.setattr(app_mod, "ZIP_MAX_TOTAL_BYTES", 2000)
+    monkeypatch.setattr(upload_content, "ZIP_MAX_MEMBER_BYTES", 10 ** 9)
+    monkeypatch.setattr(upload_content, "ZIP_MAX_TOTAL_BYTES", 2000)
     z = _make_zip([("a.svs", os.urandom(1200)), ("b.svs", os.urandom(1200))])
     msg, status = _extract_and_promote(z)
     assert status == 400 and "总展开量" in msg
@@ -249,7 +250,7 @@ def test_extreme_compression_ratio_rejected():
 
 
 def test_too_many_members(monkeypatch):
-    monkeypatch.setattr(app_mod, "ZIP_MAX_MEMBERS", 5)
+    monkeypatch.setattr(upload_content, "ZIP_MAX_MEMBERS", 5)
     z = _make_zip([("S.mrxs", b"m")] + [("S/f%d.dat" % i, b"d") for i in range(6)])
     msg, status = _extract_and_promote(z)
     assert status == 400 and "成员数" in msg
@@ -384,7 +385,7 @@ def test_actual_stream_exceeds_declared_backstop(monkeypatch):
 
 def test_watermark_during_extraction_507(monkeypatch):
     """解压过程中的水位检查：首块即查（检查粒度压到 1 字节）。"""
-    monkeypatch.setattr(app_mod, "ZIP_WATERMARK_CHECK_BYTES", 1)
+    monkeypatch.setattr(upload_content, "ZIP_WATERMARK_CHECK_BYTES", 1)
     monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 10 ** 15)
     z = _make_zip([("a.svs", SVS)])
     msg, status = _extract_and_promote(z)

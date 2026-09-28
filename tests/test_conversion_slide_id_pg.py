@@ -2,11 +2,13 @@
 """slide ID 化重构 P4-app：转换链 slide_id 统一发布门禁测试。
 
 合同：docs/slide-id-refactor-p4-contract-20260925.md §3/§8（计划 §8 矩阵的
-转换行）。逐条覆盖：
+转换行）。U5 检查点 B 起旧 POST /api/upload 端点已删除：源受理改走服务级
+夹具 _kfb_job（预占 → begin_legacy_commit → 建 job → 源副本入任务 staging →
+finish_commit 按源字节结算——旧端点的离线等价链）。逐条覆盖：
 
-  1. 同名源/产物不冲突（独立 ID）：同名不同内容的两次 KFB 上传 → 两个
-     任务、两个产物资产（canonical 展示快照同名），互不干扰；V1/V2 响应
-     与轮询端点的 slide_id 均从任务绑定读；
+  1. 同名源/产物不冲突（独立 ID）：同名不同内容的两次 KFB 受理 → 两个
+     任务、两个产物资产（canonical 展示快照同名），互不干扰；轮询端点的
+     slide_id 从任务绑定读；
   2. failure/retry 不重复 ID/项目关联/配额：任务失败 → 同 id 重试（产物
      绑定复用）→ ready；used_bytes 只结算一次；项目关联按 slide_id 恰一次；
   3. 源删除后产物仍在（独立资产）；
@@ -18,7 +20,6 @@
 运行：cd 项目根 && python3 -m pytest tests/test_conversion_slide_id_pg.py -q
 """
 import hashlib
-import io
 import os
 import sys
 from pathlib import Path
@@ -39,6 +40,7 @@ import slide_io  # noqa: E402
 import slide_storage  # noqa: E402
 import slide_store  # noqa: E402
 import upload_guard  # noqa: E402
+import upload_task_store  # noqa: E402
 import user_store  # noqa: E402
 from _pt_helpers import clear_upload_dir, csrf_client, isolate_app  # noqa: E402
 from kfb.fixture import build_synthetic_kfb  # noqa: E402
@@ -90,14 +92,37 @@ def _one(sql, params=()):
             return row[0] if row else None
 
 
-def _upload_kfb(client, src_path, name, *, target_project_id=None):
-    with open(src_path, "rb") as f:
-        return client.post(
-            "/api/upload",
-            data={"file": (f, name),
-                  **({"target_project_id": target_project_id}
-                     if target_project_id else {})},
-            content_type="multipart/form-data")
+def _kfb_job(uid, src_path, name, *, target_project_id=None):
+    """服务级受理一次 KFB/KFBF 源（旧 POST /api/upload 的离线等价链）：
+    预占 → begin_legacy_commit → 建 job（预分配产物 slide_id）→ 源副本入
+    任务 staging → finish_commit 按源字节结算。返回 job dict。
+
+    stage_source_copy 会**移动**源文件（os.replace）——用例持有的 src_path
+    须保持原样，故从私有临时副本入仓。"""
+    import tempfile
+    src_path = Path(src_path)
+    data = src_path.read_bytes()
+    sha = hashlib.sha256(data).hexdigest()
+    res = upload_guard.reserve_upload(uid, len(data), inflight_limit=10,
+                                      hourly_limit=10)
+    upload_id, token, _task = upload_task_store.begin_legacy_commit(
+        owner_user_id=uid, filename=name, safe_name=name,
+        artifacts=[{"name": name, "size": len(data), "sha256": sha,
+                    "slide": False}],
+        reservation_id=res["reservation_id"])
+    job = conversion_store.create_job(
+        owner_user_id=uid, upload_id=upload_id, source_name=name,
+        source_sha256=sha, source_format=src_path.suffix.lstrip(".").lower(),
+        canonical_name="%s.tif" % name.rsplit(".", 1)[0],
+        target_project_id=target_project_id)
+    fd, tmp_src = tempfile.mkstemp(suffix=src_path.suffix)
+    os.close(fd)
+    Path(tmp_src).write_bytes(data)
+    conversion_worker.stage_source_copy(job["id"], tmp_src, UPLOAD_DIR)
+    Path(tmp_src).unlink(missing_ok=True)   # 已被 move 入仓则无残留
+    upload_task_store.finish_commit(upload_id, token, sha,
+                                    settle_bytes=len(data))
+    return job
 
 
 def _quota_bytes(uid):
@@ -115,35 +140,33 @@ def test_same_name_source_and_product_independent_ids(tmp_path):
 
     src_a = build_synthetic_kfb(tmp_path / "case.kfb", width=580, height=300)
     src_b = build_synthetic_kfb(tmp_path / "case2.kfb", width=300, height=280)
-    ra = _upload_kfb(c, src_a, "case.kfb")
-    rb = _upload_kfb(c, src_b, "case.kfb")  # 同名、不同内容
-    assert ra.status_code == 202 and rb.status_code == 202, (
-        ra.get_data(as_text=True), rb.get_data(as_text=True))
-    ba, bb = ra.get_json(), rb.get_json()
+    ja = _kfb_job(uid, src_a, "case.kfb")
+    jb = _kfb_job(uid, src_b, "case.kfb")  # 同名、不同内容
     # 两个任务、两个预分配产物 ID（canonical 展示快照同名——独立资产）
-    assert ba["conversion_job_id"] != bb["conversion_job_id"]
-    assert ba["slide_id"] and bb["slide_id"] and ba["slide_id"] != bb["slide_id"]
-    assert ba["canonical_name"] == bb["canonical_name"] == "case.tif"
+    assert ja["id"] != jb["id"]
+    assert ja["slide_id"] and jb["slide_id"] \
+        and ja["slide_id"] != jb["slide_id"]
+    assert ja["canonical_name"] == jb["canonical_name"] == "case.tif"
     # 源副本各归各任务 staging（同名源不冲突——不平铺）
     assert (conversion_worker.source_staging_dir(
-        ba["conversion_job_id"], app_mod.UPLOAD_DIR) / "data.kfb").is_file()
+        ja["id"], app_mod.UPLOAD_DIR) / "data.kfb").is_file()
     assert (conversion_worker.source_staging_dir(
-        bb["conversion_job_id"], app_mod.UPLOAD_DIR) / "data.kfb").is_file()
+        jb["id"], app_mod.UPLOAD_DIR) / "data.kfb").is_file()
 
     assert conversion_worker.run_once(upload_dir=str(app_mod.UPLOAD_DIR))
     assert conversion_worker.run_once(upload_dir=str(app_mod.UPLOAD_DIR))
-    for body in (ba, bb):
-        job = conversion_store.get_job(body["conversion_job_id"])
-        assert job["state"] == "ready"
-        assert job["slide_id"] == body["slide_id"]
+    for job in (ja, jb):
+        row = conversion_store.get_job(job["id"])
+        assert row["state"] == "ready"
+        assert row["slide_id"] == job["slide_id"]
         desc = slide_store.resolve_slide_id(job["slide_id"])
         assert desc.asset_state == "ready"
         assert desc.storage_layout == "id_bundle"
         assert slide_storage.resolve_descriptor_path(
             desc, root=app_mod.UPLOAD_DIR).is_file()
         # 轮询端点的 slide_id 从任务绑定读（public_view 含 job.slide_id）
-        st = c.get("/api/conversions/%s" % job["id"]).get_json()
-        assert st["slide_id"] == job["slide_id"]
+        st = c.get("/api/conversions/%s" % row["id"]).get_json()
+        assert st["slide_id"] == row["slide_id"]
 
 
 # --------------------------------------------------------------------------- #
@@ -156,14 +179,12 @@ def test_failure_retry_same_id_and_single_settlement(tmp_path):
 
     src = build_synthetic_kfb(tmp_path / "rt.kfb")
     pid = _mk_project(uid)
-    r = _upload_kfb(c, src, "rt.kfb", target_project_id=pid)
-    assert r.status_code == 202, r.get_data(as_text=True)
-    body = r.get_json()
-    jid = body["conversion_job_id"]
-    sid = body["slide_id"]
+    job = _kfb_job(uid, src, "rt.kfb", target_project_id=pid)
+    jid = job["id"]
+    sid = job["slide_id"]
 
     # 第一次运行失败：抽走源副本（worker 判 source missing → failed）
-    used_after_upload = _quota_bytes(uid)  # 源字节已结算（上传任务口径）
+    used_after_upload = _quota_bytes(uid)  # 源字节已结算（受理任务口径）
     src_copy = conversion_worker.source_staging_dir(
         jid, app_mod.UPLOAD_DIR) / "data.kfb"
     src_bytes = src_copy.read_bytes()
@@ -211,9 +232,8 @@ def test_product_survives_source_deletion(tmp_path):
     _set_quota(uid, 10 ** 8)
 
     src = build_synthetic_kfb(tmp_path / "sd.kfb")
-    r = _upload_kfb(c, src, "sd.kfb")
-    assert r.status_code == 202
-    jid = r.get_json()["conversion_job_id"]
+    job = _kfb_job(uid, src, "sd.kfb")
+    jid = job["id"]
     assert conversion_worker.run_once(upload_dir=str(app_mod.UPLOAD_DIR))
     job = conversion_store.get_job(jid)
     sid = job["slide_id"]
@@ -244,11 +264,9 @@ def test_delete_product_invalidates_job_by_slide_id(tmp_path):
     _set_quota(uid, 10 ** 8)
 
     src = build_synthetic_kfb(tmp_path / "dl.kfb")
-    r = _upload_kfb(c, src, "dl.kfb")
-    assert r.status_code == 202
-    body = r.get_json()
-    jid = body["conversion_job_id"]
-    sid = body["slide_id"]
+    job = _kfb_job(uid, src, "dl.kfb")
+    jid = job["id"]
+    sid = job["slide_id"]
     assert conversion_worker.run_once(upload_dir=str(app_mod.UPLOAD_DIR))
     assert conversion_store.get_job(jid)["state"] == "ready"
 
@@ -261,16 +279,14 @@ def test_delete_product_invalidates_job_by_slide_id(tmp_path):
     assert slide_store.resolve_slide_id(sid).asset_state == "deleted"
 
     # 同内容重传：复用同 job（幂等键），产物改绑**新** slide_id
-    r2 = _upload_kfb(c, src, "dl.kfb")
-    assert r2.status_code == 202, r2.get_data(as_text=True)
-    b2 = r2.get_json()
-    assert b2["conversion_job_id"] == jid
-    assert b2["slide_id"] != sid
+    job2 = _kfb_job(uid, src, "dl.kfb")
+    assert job2["id"] == jid
+    assert job2["slide_id"] != sid
     assert conversion_worker.run_once(upload_dir=str(app_mod.UPLOAD_DIR))
     job2 = conversion_store.get_job(jid)
     assert job2["state"] == "ready"
-    assert job2["slide_id"] == b2["slide_id"]
-    assert c.get("/api/slides/%s/info" % b2["slide_id"]).status_code == 200
+    assert job2["slide_id"] != sid
+    assert c.get("/api/slides/%s/info" % job2["slide_id"]).status_code == 200
 
 
 # --------------------------------------------------------------------------- #
@@ -283,9 +299,8 @@ def test_product_bundle_contains_all_members(tmp_path):
 
     from kfb.fixture_fl import build_synthetic_kfbf
     src = build_synthetic_kfbf(tmp_path / "fl.kfbf")
-    r = _upload_kfb(c, src, "fl.kfbf")
-    assert r.status_code == 202, r.get_data(as_text=True)
-    jid = r.get_json()["conversion_job_id"]
+    job = _kfb_job(uid, src, "fl.kfbf")
+    jid = job["id"]
     assert conversion_worker.run_once(upload_dir=str(app_mod.UPLOAD_DIR))
     job = conversion_store.get_job(jid)
     assert job["state"] == "ready"
@@ -326,167 +341,8 @@ if __name__ == "__main__":
 # 6. review 门禁回归（F1/F2）：预占失效（请求路径 + 恢复路径）连带收口
 #    转换任务——作废 job + 产物资产 failed（ready 则撤包+退款）+ 不死循环
 # --------------------------------------------------------------------------- #
-def _expire_reservations():
-    with psycopg.connect(PG_URI, autocommit=True) as conn:
-        with conn.cursor() as cur:
-            cur.execute("UPDATE upload_reservations SET expires_at = "
-                        "now() - interval '1 second' WHERE state='reserved'")
-
-
-def _v2_kfb_upload(client, src, name):
-    """V2 创建 + 传完（不 commit），返回 upload_id。"""
-    data = src.read_bytes()
-    r = client.post("/api/uploads", json={
-        "filename": name, "declared_size": len(data),
-        "sha256_expected": hashlib.sha256(data).hexdigest()})
-    assert r.status_code == 200, r.get_data(as_text=True)
-    upload_id = r.get_json()["upload_id"]
-    for off in range(0, len(data), 1 << 20):
-        chunk = data[off:off + (1 << 20)]
-        pr = client.put(
-            "/api/uploads/%s/chunk?offset=%d&sha256=%s"
-            % (upload_id, off, hashlib.sha256(chunk).hexdigest()),
-            data=chunk, content_type="application/octet-stream")
-        assert pr.status_code == 200, pr.get_data(as_text=True)
-    return upload_id
-
-
-def test_reservation_lease_expired_at_commit_still_settles(
-        tmp_path, monkeypatch):
-    """0072 生命周期合同（替代旧「预占过期 → 409 连带作废」，plan §D 注记）：
-
-    旧合同：commit 收口时预占失效（预检后过期的窄窗）→ 409 + 连带作废
-    job + 产物 failed + 配额零入账。
-    新合同：任务持有的容量**绑定后不被 TTL 回收**——租约过期只影响执行
-    许可，合法任务的结算不受拒绝（心跳停止不代表字节消失）：commit 正常
-    完成、job 保持、配额按源字节一次结算。「真正 released」的不变量处置
-    由 ZIP 侧回归（test_slide_id_review_r8/r9）与模型测试覆盖。
-    """
-    import upload_task_store
-    c = _client()
-    uid = _user_session(c, login="cv-exp@x.com")
-    _set_quota(uid, 10 ** 8)
-    src = build_synthetic_kfb(tmp_path / "exp.kfb")
-    data_len = src.stat().st_size
-    upload_id = _v2_kfb_upload(c, src, "exp.kfb")
-    # 租约过期注入在 finish_commit 边界（commit 前置预检已通过之后）
-    real_finish = upload_task_store.finish_commit
-
-    def _expire_then_finish(*a, **kw):
-        _expire_reservations()
-        return real_finish(*a, **kw)
-
-    monkeypatch.setattr(upload_task_store, "finish_commit",
-                        _expire_then_finish)
-    rc = c.post("/api/uploads/%s/commit" % upload_id)
-    assert rc.status_code == 202, rc.get_data(as_text=True)
-    t = upload_task_store.get_task(upload_id)
-    assert t["state"] == upload_task_store.STATE_COMMITTED
-    job = conversion_store.get_job_by_upload_id(upload_id)
-    assert job is not None and job["state"] not in ("cancelled", "failed")
-    sid = job.get("slide_id")
-    assert sid
-    assert slide_store.resolve_slide_id(sid).asset_state != "failed"
-    q = upload_guard.get_quota_row(uid)
-    assert int(q["used_bytes"]) == data_len  # 源字节一次结算
-    assert int(q["reserved_bytes"]) == 0
-
-
-
-def test_recovery_reservation_expired_cancels_job_no_livelock(tmp_path,
-                                                              monkeypatch):
-    """KFB committing 恢复遇预占失效 → 任务 failed + job cancelled + 产物
-    failed（不保持 committing 死循环；两次扫描幂等）。"""
-    import upload_task_store
-    c = _client()
-    uid = _user_session(c, login="cv-rec@x.com")
-    _set_quota(uid, 10 ** 8)
-    src = build_synthetic_kfb(tmp_path / "rec.kfb")
-    data = src.read_bytes()
-    sha = hashlib.sha256(data).hexdigest()
-    r = upload_guard.reserve_upload(uid, len(data), inflight_limit=10,
-                                    hourly_limit=10)
-    # 崩溃窗口：任务已受理 + job 已建 + 源副本已在任务 staging
-    upload_id, _token, task = upload_task_store.begin_legacy_commit(
-        owner_user_id=uid, filename="rec.kfb", safe_name="rec.kfb",
-        artifacts=[{"name": "rec.kfb", "size": len(data), "sha256": sha,
-                    "slide": False}],
-        reservation_id=r["reservation_id"])
-    job = conversion_store.create_job(
-        owner_user_id=uid, upload_id=upload_id, source_name="rec.kfb",
-        source_sha256=sha, source_format="kfb", canonical_name="rec.tif")
-    conversion_worker.stage_source_copy(job["id"], str(src), UPLOAD_DIR)
-    sid = job["slide_id"]
-    _expire_reservations()
-    monkeypatch.setattr(upload_task_store, "UPLOAD_COMMIT_TIMEOUT_SECONDS", 0)
-    for _ in range(2):
-        app_mod._upload_legacy_recover_stale({"role": "owner"})
-    t = upload_task_store.get_task(upload_id)
-    assert t["state"] == upload_task_store.STATE_FAILED
-    assert conversion_store.get_job(job["id"])["state"] == "cancelled"
-    assert slide_store.resolve_slide_id(sid).asset_state == "failed"
-    assert not slide_storage.staging_task_dir(
-        job["id"], root=UPLOAD_DIR).exists()
-    q = upload_guard.get_quota_row(uid)
-    assert int(q["used_bytes"]) == 0 and int(q["reserved_bytes"]) == 0
-
-
-def test_recovery_withdraws_settled_product_and_refunds(tmp_path,
-                                                        monkeypatch):
-    """恢复尾窗：产物已被 worker 结算（ready + used_bytes 已收）而上传任务
-    仍 committing 且预占失效 → 撤包 + 资产 failed + 退款（不超发）。"""
-    import upload_task_store
-    c = _client()
-    uid = _user_session(c, login="cv-set@x.com")
-    _set_quota(uid, 10 ** 8)
-    src = build_synthetic_kfb(tmp_path / "set.kfb")
-    data = src.read_bytes()
-    sha = hashlib.sha256(data).hexdigest()
-    r = upload_guard.reserve_upload(uid, len(data), inflight_limit=10,
-                                    hourly_limit=10)
-    upload_id, _token, task = upload_task_store.begin_legacy_commit(
-        owner_user_id=uid, filename="set.kfb", safe_name="set.kfb",
-        artifacts=[{"name": "set.kfb", "size": len(data), "sha256": sha,
-                    "slide": False}],
-        reservation_id=r["reservation_id"])
-    job = conversion_store.create_job(
-        owner_user_id=uid, upload_id=upload_id, source_name="set.kfb",
-        source_sha256=sha, source_format="kfb", canonical_name="set.tif")
-    conversion_worker.stage_source_copy(job["id"], str(src), UPLOAD_DIR)
-    sid = job["slide_id"]
-    # 模拟 worker 已完成统一发布（FS 发布 + 结算事务）：
-    product = b"converted-product-bytes"
-    staged = slide_storage.staging_dir(job["id"], "1", root=UPLOAD_DIR)
-    staged.mkdir(parents=True)
-    (staged / "data.tif").write_bytes(product)
-    manifest = {"entry": "data.tif", "files": [
-        {"path": "data.tif", "size": len(product),
-         "sha256": hashlib.sha256(product).hexdigest()}]}
-    slide_storage.publish_bundle_no_clobber(staged, sid, manifest,
-                                            root=UPLOAD_DIR)
-    claimed = conversion_store.claim_job(job["id"], "w1")
-    assert claimed is not None
-    gen = str(claimed["attempt"])
-    conversion_store.mark_state(job["id"], "w1", "validating")
-    conversion_store.persist_commit_intent(job["id"], "w1", {
-        "task_ref": job["id"], "generation": gen, "commit_token": gen,
-        "slide_id": sid, "owner_user_id": uid, "manifest": manifest,
-        "sha256": manifest["files"][0]["sha256"],
-        "accounted_bytes": len(product)})
-    out, already = conversion_store.worker_settle_ready(
-        job["id"], "w1", gen, slide_id=sid, canonical_name="set.tif",
-        sha256=manifest["files"][0]["sha256"], settle_bytes=len(product))
-    assert not already and out["state"] == "ready"
-    assert slide_store.resolve_slide_id(sid).asset_state == "ready"
-    assert int(upload_guard.get_quota_row(uid)["used_bytes"]) == len(product)
-    # 恢复：预占失效 → 连带撤回 + 退款
-    _expire_reservations()
-    monkeypatch.setattr(upload_task_store, "UPLOAD_COMMIT_TIMEOUT_SECONDS", 0)
-    app_mod._upload_legacy_recover_stale({"role": "owner"})
-    t = upload_task_store.get_task(upload_id)
-    assert t["state"] == upload_task_store.STATE_FAILED
-    assert conversion_store.get_job(job["id"])["state"] == "cancelled"
-    assert slide_store.resolve_slide_id(sid).asset_state == "failed"
-    assert not slide_storage.bundle_dir(sid, root=UPLOAD_DIR).exists()
-    q = upload_guard.get_quota_row(uid)
-    assert int(q["used_bytes"]) == 0 and int(q["reserved_bytes"]) == 0
+# U5（检查点 B）：旧上传端点删除，本场景已由 COS 统一链路覆盖（tests/test_cos_ingestion_kinds.py / test_ingestion_api.py / test_cos_ingest_worker.py）。
+# （原 test_reservation_lease_expired_at_commit_still_settles：V2 commit 端点
+#   的租约过期结算；原 test_recovery_reservation_expired_cancels_job_no_
+#   livelock / test_recovery_withdraws_settled_product_and_refunds：依赖随
+#   端点一并删除的 app._upload_legacy_recover_stale 恢复扫描入口。）

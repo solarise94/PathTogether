@@ -107,7 +107,9 @@ def test_csrf_traversal_collects_nontrivial_routes():
     cases = _collect_cases()
     paths = {r.rule for r, _m, _p in cases}
     assert len(cases) >= 40, "url_map 遍历收集到的写路由过少：%d" % len(cases)
-    for must in ("/api/upload", "/api/uploads", "/api/share/create",
+    # U5（检查点 B）：/api/upload(s) 已删除（新上传统一 /api/ingestions——
+    # 在 must 列表内的写端点断言相应收缩）
+    for must in ("/api/ingestions", "/api/share/create",
                  "/api/annotation", "/api/ai/run", "/api/admin/v1/users",
                  "/api/admin/preview/start", "/api/admin/preview/stop",
                  "/api/ai/session/<session_id>/archive"):
@@ -144,16 +146,19 @@ def test_write_route_without_token_gets_400(rule_path, method):
 def test_api_routes_do_not_accept_form_token_fallback():
     """P1-5 契约注意点：/api/* 只认 header——**带 form 域 token 不算通过**。
 
-    对抽查的 /api/upload（multipart 场景）发送 form 域 csrf_token：仍必须 400
-    （header-only 契约；否则「无 token 在 body 接收前即拒」不成立）。
+    U5（检查点 B）：原 multipart 抽查端点 /api/upload 已删除；改抽查仍在的
+    JSON 写端点（/api/ingestions——统一上传创建）：form 域 token 同样不算
+    通过（header-only 契约不变）。
     """
     client = _bare_client()
     tok = client.get_cookie("csrf_token", domain="localhost", path="/")
     assert tok, "GET /login 应下发 csrf_token cookie"
-    r = client.post("/api/upload", data={
-        "csrf_token": tok.value, "file": (b"stub", "a.svs")})
+    r = client.post("/api/ingestions", data={
+        "csrf_token": tok.value,
+        "filename": "a.svs", "declared_size": "10"})
     assert r.status_code == 400
     assert r.get_json()["error"] == "csrf_required"
+
 
 
 # --------------------------------------------------------------------------- #

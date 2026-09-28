@@ -10,7 +10,7 @@
 ``--move`` 在发布成功后删除暂存源文件；无 --move 时源保留。归属 ``--owner``
 参数语义不变（空 → 部署 owner，与免认证归一一致）。
 
-ZIP / MRXS 伴侣包不在本通道（请走 ``POST /api/upload``）。
+ZIP / MRXS 伴侣包不在本通道（请经 /api/ingestions 云直传上传 zip 包）。
 
 容器内用法::
 
@@ -120,7 +120,7 @@ def import_one(src: Path, upload_dir: Path, owner_user_id, requester_role,
         raise ValueError("非法文件名：%r" % name)
     ext = Path(safe).suffix.lower().lstrip(".")
     if ext in getattr(app_mod, "ARCHIVE_EXTS", {"zip"}) or ext == "mrxs":
-        raise ValueError("ZIP/MRXS 请走 POST /api/upload，本通道只收单文件 WSI：%s" % name)
+        raise ValueError("ZIP/MRXS 请经 /api/ingestions 云直传上传 zip 包，本通道只收单文件 WSI：%s" % name)
     if ext not in app_mod.SUPPORTED_EXTS:
         raise ValueError("不支持的扩展名 .%s：%s" % (ext, name))
 
@@ -132,9 +132,10 @@ def import_one(src: Path, upload_dir: Path, owner_user_id, requester_role,
     # 先在源上只读校验（A0 异常契约：_validate_slide_file 失败抛
     # SlideValidationError；传净化后的原始 basename 作 format_hint）。
     import slide_io
+    import upload_content
 
     try:
-        app_mod._validate_slide_file(src, format_hint=safe)
+        upload_content.validate_slide_file(src, format_hint=safe)
     except slide_io.SlideValidationError as e:
         raise ValueError(
             "无效的切片文件（code=%s）：%s" % (e.code, name)) from e

@@ -1,0 +1,298 @@
+FFFFF                                                                    [100%]
+=================================== FAILURES ===================================
+__________________ test_same_size_content_drift_blocks_apply ___________________
+/tmp/slide-id-review-r13/test_r13.py:33: in test_same_size_content_drift_blocks_apply
+    assert rc == 3, 'Changed content was accepted against the frozen plan'
+E   AssertionError: Changed content was accepted against the frozen plan
+E   assert 0 == 3
+----------------------------- Captured stdout call -----------------------------
+{
+  "mode": "plan-out",
+  "tool_version": "r12.1",
+  "actions": [
+    {
+      "action_key": "stop:upload_task:upt_r13_bytes",
+      "action": "stop",
+      "kind": "upload_task",
+      "id": "upt_r13_bytes",
+      "observed": "missing",
+      "evidence": {
+        "bytes": 100
+      }
+    },
+    {
+      "action_key": "repair:upload_task:upt_r13_bytes",
+      "action": "repair",
+      "kind": "upload_task",
+      "id": "upt_r13_bytes",
+      "owner": "usr_oD30cwl6wFk",
+      "evidence": {
+        "bytes": 100,
+        "files": 1
+      }
+    }
+  ],
+  "blockers": [],
+  "over_quota": [],
+  "pending_work": {
+    "upload_cleanup_pending": [],
+    "ingestion_local_cleanup": []
+  },
+  "note": "dry-run 仅预审；应用需冻结计划（--plan-out） + --apply --plan",
+  "plan_out": "/tmp/pytest-of-solarise/pytest-2/test_same_size_content_drift_b0/plan.json",
+  "plan_hash": "bc63d80e622d274a048675a32b0b9a023274cd4fbd9735af9af5cfe428a90ad5"
+}
+{
+  "mode": "apply",
+  "plan_hash": "bc63d80e622d274a048675a32b0b9a023274cd4fbd9735af9af5cfe428a90ad5",
+  "applied": [
+    {
+      "action_key": "stop:upload_task:upt_r13_bytes",
+      "result": {
+        "stopped": true
+      }
+    },
+    {
+      "action_key": "repair:upload_task:upt_r13_bytes",
+      "result": {
+        "repaired": "upr_bb628bd80c99b3b8845cb91f",
+        "bytes": 100
+      }
+    }
+  ],
+  "skipped": [],
+  "over_quota": [],
+  "pending_work": {
+    "upload_cleanup_pending": [
+      {
+        "upload_id": "upt_r13_bytes",
+        "reservation_id": "upr_bb628bd80c99b3b8845cb91f",
+        "attempts": 1
+      }
+    ],
+    "ingestion_local_cleanup": []
+  },
+  "unexplained": [],
+  "note": null
+}
+_________________ test_owner_drift_blocks_before_any_mutation __________________
+/tmp/slide-id-review-r13/test_r13.py:49: in test_owner_drift_blocks_before_any_mutation
+    assert row == (None, None) and receipts == 0, (row, receipts)
+E   AssertionError: (('upload_task', 'upt_r13_owner'), 1)
+E   assert (('upload_task...pt_r13_owner') == (None, None)
+E     
+E     At index 0 diff: 'upload_task' != None
+E     Use -v to get more diff)
+----------------------------- Captured stdout call -----------------------------
+{
+  "mode": "plan-out",
+  "tool_version": "r12.1",
+  "actions": [
+    {
+      "action_key": "bind:upload_task:upt_r13_owner:upr_6c586678bdf9505e09168581",
+      "action": "bind",
+      "kind": "upload_task",
+      "id": "upt_r13_owner",
+      "reservation_id": "upr_6c586678bdf9505e09168581",
+      "evidence": {
+        "bytes": 0,
+        "reserved_bytes": 100
+      }
+    }
+  ],
+  "blockers": [],
+  "over_quota": [],
+  "pending_work": {
+    "upload_cleanup_pending": [],
+    "ingestion_local_cleanup": []
+  },
+  "note": "dry-run 仅预审；应用需冻结计划（--plan-out） + --apply --plan",
+  "plan_out": "/tmp/pytest-of-solarise/pytest-2/test_owner_drift_blocks_before0/plan.json",
+  "plan_hash": "ac5e9545baff52dd2184d63c5a18cefbb3a2af7f273d59e5c4a40933a0d0bfea"
+}
+{
+  "mode": "apply",
+  "plan_hash": "ac5e9545baff52dd2184d63c5a18cefbb3a2af7f273d59e5c4a40933a0d0bfea",
+  "applied": [
+    {
+      "action_key": "bind:upload_task:upt_r13_owner:upr_6c586678bdf9505e09168581",
+      "result": {
+        "bound": "upr_6c586678bdf9505e09168581"
+      }
+    }
+  ],
+  "skipped": [],
+  "over_quota": [],
+  "pending_work": {
+    "upload_cleanup_pending": [],
+    "ingestion_local_cleanup": []
+  },
+  "unexplained": [
+    {
+      "kind": "upload_task",
+      "id": "upt_r13_owner",
+      "reason": "mismatch_owner",
+      "reservation_id": "upr_6c586678bdf9505e09168581"
+    }
+  ],
+  "note": null
+}
+________________ test_consumed_published_hardlink_not_recharged ________________
+/tmp/slide-id-review-r13/test_r13.py:66: in test_consumed_published_hardlink_not_recharged
+    assert _q(uid) == (100, 0), 'Already consumed bytes were charged a second time'
+E   AssertionError: Already consumed bytes were charged a second time
+E   assert (100, 100) == (100, 0)
+E     
+E     At index 1 diff: 100 != 0
+E     Use -v to get more diff
+----------------------------- Captured stdout call -----------------------------
+{
+  "mode": "plan-out",
+  "tool_version": "r12.1",
+  "actions": [
+    {
+      "action_key": "repair:upload_task:upt_r13_consumed",
+      "action": "repair",
+      "kind": "upload_task",
+      "id": "upt_r13_consumed",
+      "owner": "usr_gWdsvNjGCoQ",
+      "evidence": {
+        "bytes": 100,
+        "files": 1
+      }
+    }
+  ],
+  "blockers": [],
+  "over_quota": [],
+  "pending_work": {
+    "upload_cleanup_pending": [],
+    "ingestion_local_cleanup": []
+  },
+  "note": "dry-run 仅预审；应用需冻结计划（--plan-out） + --apply --plan",
+  "plan_out": "/tmp/pytest-of-solarise/pytest-2/test_consumed_published_hardli0/plan.json",
+  "plan_hash": "af03c00f855310a2dde70c28e6ea14c430925e044d3b212362583a77d3e6d868"
+}
+{
+  "mode": "apply",
+  "plan_hash": "af03c00f855310a2dde70c28e6ea14c430925e044d3b212362583a77d3e6d868",
+  "applied": [
+    {
+      "action_key": "repair:upload_task:upt_r13_consumed",
+      "result": {
+        "repaired": "upr_f5b08eea0df272b79a733ffe",
+        "bytes": 100
+      }
+    }
+  ],
+  "skipped": [],
+  "over_quota": [],
+  "pending_work": {
+    "upload_cleanup_pending": [],
+    "ingestion_local_cleanup": []
+  },
+  "unexplained": [],
+  "note": null
+}
+_________________ test_replay_after_cleanup_is_successful_noop _________________
+/tmp/slide-id-review-r13/test_r13.py:79: in test_replay_after_cleanup_is_successful_noop
+    assert cli(pg_uri, tmp_path, '--apply', '--plan', plan, '--repair-residuals') == 0
+E   AssertionError: assert 3 == 0
+E    +  where 3 = cli('postgresql://postgres:@/postgres?host=/tmp/svs-pg-conftest-krk5bshz', PosixPath('/tmp/pytest-of-solarise/pytest-2/test_replay_after_cleanup_is_s0'), '--apply', '--plan', PosixPath('/tmp/pytest-of-solarise/pytest-2/test_replay_after_cleanup_is_s0/plan.json'), '--repair-residuals')
+----------------------------- Captured stdout call -----------------------------
+{
+  "mode": "plan-out",
+  "tool_version": "r12.1",
+  "actions": [
+    {
+      "action_key": "stop:upload_task:upt_r13_replay",
+      "action": "stop",
+      "kind": "upload_task",
+      "id": "upt_r13_replay",
+      "observed": "missing",
+      "evidence": {
+        "bytes": 100
+      }
+    },
+    {
+      "action_key": "repair:upload_task:upt_r13_replay",
+      "action": "repair",
+      "kind": "upload_task",
+      "id": "upt_r13_replay",
+      "owner": "usr_ShkCCBtGNMc",
+      "evidence": {
+        "bytes": 100,
+        "files": 1
+      }
+    }
+  ],
+  "blockers": [],
+  "over_quota": [],
+  "pending_work": {
+    "upload_cleanup_pending": [],
+    "ingestion_local_cleanup": []
+  },
+  "note": "dry-run 仅预审；应用需冻结计划（--plan-out） + --apply --plan",
+  "plan_out": "/tmp/pytest-of-solarise/pytest-2/test_replay_after_cleanup_is_s0/plan.json",
+  "plan_hash": "e352253a81995119f48e5c05c59771aaa5d9bb90861b2f9a2d427ce0b046ae9b"
+}
+{
+  "mode": "apply",
+  "plan_hash": "e352253a81995119f48e5c05c59771aaa5d9bb90861b2f9a2d427ce0b046ae9b",
+  "applied": [
+    {
+      "action_key": "stop:upload_task:upt_r13_replay",
+      "result": {
+        "stopped": true
+      }
+    },
+    {
+      "action_key": "repair:upload_task:upt_r13_replay",
+      "result": {
+        "repaired": "upr_793eece48ab3a1521d612679",
+        "bytes": 100
+      }
+    }
+  ],
+  "skipped": [],
+  "over_quota": [],
+  "pending_work": {
+    "upload_cleanup_pending": [
+      {
+        "upload_id": "upt_r13_replay",
+        "reservation_id": "upr_793eece48ab3a1521d612679",
+        "attempts": 1
+      }
+    ],
+    "ingestion_local_cleanup": []
+  },
+  "unexplained": [],
+  "note": null
+}
+----------------------------- Captured stderr call -----------------------------
+预检 no-go（文件证据漂移）：文件证据漂移：repair:upload_task:upt_r13_replay（100/1 → 0/0）
+___________ test_native_upload_owner_failure_does_not_relock_itself ____________
+task_storage_lock.py:81: in task_storage_lock
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+E   BlockingIOError: [Errno 11] Resource temporarily unavailable
+
+During handling of the above exception, another exception occurred:
+/tmp/slide-id-review-r13/test_r13.py:92: in test_native_upload_owner_failure_does_not_relock_itself
+    _, status = app_mod._api_upload_native_single(
+app.py:12553: in _api_upload_native_single
+    _upload_abandon_staging(upload_id, reservation)
+app.py:12066: in _upload_abandon_staging
+    with task_storage_lock.task_storage_lock("upload_task", upload_id):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:141: in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+task_storage_lock.py:89: in task_storage_lock
+    raise TaskStorageLockTimeout(
+E   task_storage_lock.TaskStorageLockTimeout: 等待任务存储锁超时（upload_task/upt_addac764653a72b1d37f2eb9，timeout=0.05）——未获得写入/清理权，不得视为完成
+=========================== short test summary info ============================
+FAILED ../../../../../tmp/slide-id-review-r13/test_r13.py::test_same_size_content_drift_blocks_apply
+FAILED ../../../../../tmp/slide-id-review-r13/test_r13.py::test_owner_drift_blocks_before_any_mutation
+FAILED ../../../../../tmp/slide-id-review-r13/test_r13.py::test_consumed_published_hardlink_not_recharged
+FAILED ../../../../../tmp/slide-id-review-r13/test_r13.py::test_replay_after_cleanup_is_successful_noop
+FAILED ../../../../../tmp/slide-id-review-r13/test_r13.py::test_native_upload_owner_failure_does_not_relock_itself
+5 failed in 1.25s

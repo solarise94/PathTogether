@@ -62,18 +62,36 @@ reservation，释放与删 pending 行同一事务；收口失败补登记 pendi
 | COS 验证/发布 | `_validating_critical_section`（定位/搬入/publish/暂存清理+confirm 全锁内；失败同上延迟） |
 | V2 PUT chunk | `_upload_v2_chunk_lock` = 任务存储锁（renew+maintain+pwrite+append_chunk） |
 | V2 native commit | 受理+搬入+发布段在锁内（验证/受理前失败在锁外走公共清理入口） |
-| V1 native/ZIP | bind 后整段（接收/解压/受理/发布）在锁内；abort 走 `_abandon_staging_under_storage_lock` |
+| V1 native/ZIP | bind 后整段（接收/解压/受理/发布）在锁内；**所有**早退/异常分支（含 entry 不支持、owner 缺失）走 `_abandon_staging_under_storage_lock`（R13：公开入口自取锁，flock 不可重入） |
 | V1/V2 KFB | 段1 upload 锁（接收+验证）；源副本搬移经 `_stage_source_copy_locked`（conversion 锁嵌套于 upload 锁下，固定跨类序） |
 | 转换 worker | `conversion_worker.process_job` 临界区（work 写/断点重转/发布/换代清场）；成功整树清场延迟到锁外 |
 | 百度 worker | `_phase_download` 本地暂存写在 baidu_batch 锁内（当前无本地删除路径，锁先行保证协议一致） |
 | 清理入口 | `cancel/fail/sweep/retry/admin`：终止短事务（不持文件锁）提交后，`_local_cleanup_finish`/`_upload_v2_cleanup_part` 自取锁完成「重验资格 → 删树 → 收口」；锁等待超时≠删除成功（调度器 30s 上界跳过重试） |
 
-核账（R12 §3.4/3.5/§4）：`scripts/reconcile_upload_capacity.py`——
-冻结计划（--plan-out）→ 全量预检（计划自洽/DB 前态/文件证据；硬链接按
-inode 计量；证据不完整=no-go 不低报 0）→ 单事务应用 + 0073 回执幂等 →
+核账（R12 §3.4/3.5/§4 + R13 修订）：`scripts/reconcile_upload_capacity.py`
+——冻结计划（--plan-out）→ 全量预检（计划自洽/DB 前态/文件证据；硬链接
+按 inode 计量；证据不完整=no-go 不低报 0）→ 单事务应用 + 0073 回执幂等 →
 应用后重扫。只补责任不恢复执行（--repair-residuals；--reattach 显式
 exit 2）；维护补记走 `upload_guard.record_reconciled_residual_locked`
 （共享财务 SQL，不走新上传准入；超额如实补记）。
+
+R13 修订（docs/review-evidence/r13/）：
+  - **写入前阻断**：预检与应用同一事务；新 blocker / 计划外动作 / 计划
+    动作失效在任何写入前 no-go（exit 3，数据与回执零变化）；DB 前态为
+    裁决字段级（目标 owner/state/rid + 预约 owner/state/holder/purpose/
+    金额 + pending 清单子集），应用前目标/预约行 `FOR UPDATE` 锁定重判。
+  - **consumed 一律阻断**：字节已结算进 used（活跃或终态）——暂存残留
+    与已发布对象/已结算源的资产关系无法在核账内证明独立，自动补
+    reserved = 重复收费；consumed_unexplained 交人工核对。
+  - **逐文件证据**：冻结清单为逐成员相对路径/类型/size/sha256（同数量
+    等大小内容替换/改名可检出）；目录符号链接、目录枚举失败、成员读取
+    失败显式 no-go（不把少扫描当没有数据）。
+  - **回执优先重放**：先按 0073 回执（含 repair 新预约
+    result_reservation_id）识别已应用动作并核验合法后继（仍持有=清单一
+    致+预约绑定一致 / 已合法结算=残留已清+预约 released / stop 目标终
+    态），未应用动作才要求原前态与原文件——正常清理后的旧计划重跑是
+    成功 no-op（exit 0 不重新收费），真实漂移（残留消失但预约仍持有、
+    预约释放但残留仍在、清单内容漂移）仍被拒绝。
 
 ## 3. 锁图（全部事务的实际加锁顺序）
 

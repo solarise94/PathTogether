@@ -500,3 +500,51 @@ no-go/dangling/未知目录/硬链接/超额/旧 --reattach exit 2）。
 切换必须停写并停所有旧进程/子进程/清理器（旧 writer 不认识新文件锁、
 旧脚本不认识新核账合同，不能滚动混跑）；回滚须用理解同一合同的兼容
 版本或整套备份恢复。
+
+---
+
+## R13（2026-09-27 独立审查处置；基线 7ac4b37）
+
+审查记录与反例：docs/review-evidence/r13/（REVIEW.md / test_r13.py /
+results.txt——原样入仓为回归 tests/test_slide_id_review_r13.py，不改断
+言）。五缺陷处置：
+
+1. **P1 归属漂移先提交后 no-go**（reconcile apply 预检只查新增 action
+   key、忽略 blockers_now，前态只查行数）：预检与应用并入同一事务；新
+   blocker/计划外动作/计划动作失效在**任何写入前**阻断（exit 3，数据与
+   回执零变化——no-go 用例同时断言两者）；DB 前态升级为裁决字段级（目标
+   state/rid/**owner** + 预约 owner/state/holder/purpose/金额 + pending
+   清单子集规则：只允许基线行合法清理删除与已应用 stop 的 upsert 新增）；
+   应用前目标/预约行 `SELECT ... FOR UPDATE` 锁定重判（事务内锁定前态，
+   不以事后退出码代替预检失败）。
+2. **P1 终态 consumed 残留自动补 reserved（重复收费）**：consumed（活跃
+   或终态）一律 blocker `consumed_unexplained`——字节已结算进 used，暂
+   存残留与已发布对象/已结算源的资产关系（scan 的 inode 去重只在单任务
+   树内）无法在核账内证明独立；只有人工核对或独立证据才能继续。共享
+   inode 的清理便利与容量责任分离，不为了让清理有 rid 就重复收费。
+3. **P2 冻结证据只比总数/总大小**：清单化为逐成员相对路径/类型/size/
+   sha256（硬链接按 inode 复用哈希、计量仍去重）；`os.walk` 显式
+   onerror、目录符号链接由静默过滤改为拒绝、非常规文件拒绝——同数量等
+   大小内容替换/改名/不可读目录/目录 symlink 全部 no-go（新增 3 例门禁
+   + 反例 1 例）。报告输出将清单折叠为条目数，计划 JSON 保完整清单。
+4. **P2 清理后重跑旧计划 exit 3**（文件预检先于回执读取）：改为**回执
+   优先**——0073 回执（repair 回执持久记录 `result_reservation_id`）识
+   别已应用动作并核验合法后继：仍持有（清单一致+预约 reserved 绑定/
+   owner/金额一致）/ 已合法结算（冻结曾有残留且现已消失+预约 released）
+   / stop 目标终态；仅未应用动作要求原前态与原文件。`_verify_prestate`
+   的 stop→pending+1 折算改为 pending 子集规则（正常清理删除 pending 不
+   再判为漂移）。正常清理后的重跑=成功 no-op（exit 0、不重新收费）；
+   真实漂移（残留消失但预约仍持有/预约释放但残留仍在/清单内容漂移）仍
+   拒绝。
+5. **P2 V1 原生 owner 缺失分支自锁**（已持 upload_task 锁再调用自取锁
+   的 `_upload_abandon_staging`，timeout=None 永等）：entry 不支持与
+   owner 缺失两分支改走 `_abandon_staging_under_storage_lock`；以 AST
+   全量审计 app.py 锁内调用（全部公开自取锁入口），确认无其余自锁点。
+
+工具合同配套：TOOL_VERSION→r13.1（旧计划按版本拒绝、需重新冻结）；
+`--repair-residuals` 与冻结计划不一致 → exit 2。
+
+**测试**：R13 五反例转绿；tests/test_reconcile_upload_capacity.py 12→15
+（新增改名/不可读目录/目录 symlink 门禁）；R12 反例 4 + 生命周期验收 6
++ 容量三套 + followup/relations 66 + 上传/zip/kfb/百度/转换/删除/发布/
+R8–R11 回归批 309 全绿；全量门禁见提交信息。

@@ -313,3 +313,69 @@ def test_hardlink_counted_once(tmp_path):
     os.link(f1, a / "data2.svs")  # 单任务内硬链接也只计一次（物理 inode）
     n3, t3 = recon.scan_task_tree(str(tmp_path), "a")
     assert (n3, t3) == (1, 30)
+
+
+def test_manifest_catches_rename_same_size(tmp_path):
+    """R13-3：同大小改名（内容不变）——逐成员路径清单可检出，总数/总字节
+    比对不可检出。"""
+    uid = _uid("rename")
+    tid = "upt_rec_rename"
+    _task(uid, tid, None)
+    data = slide_storage.staging_dir(tid, "transfer", root=tmp_path) / "data.svs"
+    data.parent.mkdir(parents=True, exist_ok=True)
+    data.write_bytes(b"x" * 40)
+    rc, plan = _freeze("rename", upload_dir=str(tmp_path),
+                       extra=["--repair-residuals"])
+    assert rc == 0
+    os.replace(data, data.with_name("renamed.svs"))  # 同内容同大小改名
+    assert _apply(plan, upload_dir=str(tmp_path),
+                  extra=["--repair-residuals"]) == 3
+    with psycopg.connect(PG_URI) as db:
+        n = db.execute("SELECT COUNT(*) FROM "
+                       "upload_capacity_repair_receipts").fetchone()[0]
+    assert int(n) == 0
+
+
+def test_unreadable_directory_blocks_apply(tmp_path):
+    """R13-3：目录枚举失败（chmod 000）= 证据不完整 → no-go，不是 0。"""
+    uid = _uid("unread")
+    tid = "upt_rec_unread"
+    _task(uid, tid, None)
+    data = slide_storage.staging_dir(tid, "transfer", root=tmp_path) / "data.svs"
+    data.parent.mkdir(parents=True, exist_ok=True)
+    data.write_bytes(b"x" * 40)
+    rc, plan = _freeze("unread", upload_dir=str(tmp_path),
+                       extra=["--repair-residuals"])
+    assert rc == 0
+    os.chmod(data.parent, 0o000)
+    try:
+        assert _apply(plan, upload_dir=str(tmp_path),
+                      extra=["--repair-residuals"]) == 3
+    finally:
+        os.chmod(data.parent, 0o755)
+    with psycopg.connect(PG_URI) as db:
+        n = db.execute("SELECT COUNT(*) FROM "
+                       "upload_capacity_repair_receipts").fetchone()[0]
+    assert int(n) == 0
+
+
+def test_directory_symlink_in_tree_blocks_apply(tmp_path):
+    """R13-3：树内目录符号链接（越过即漏扫描）→ 显式拒绝。"""
+    uid = _uid("dsym")
+    tid = "upt_rec_dsym"
+    _task(uid, tid, None)
+    tdir = slide_storage.staging_dir(tid, "transfer", root=tmp_path)
+    (tdir / "extra").mkdir(parents=True, exist_ok=True)
+    (tdir / "extra" / "part.bin").write_bytes(b"z" * 10)
+    rc, plan = _freeze("dsym", upload_dir=str(tmp_path),
+                       extra=["--repair-residuals"])
+    assert rc == 0
+    (tdir / "extra" / "part.bin").unlink()
+    (tdir / "extra").rmdir()
+    os.symlink(str(tmp_path), str(tdir / "extra"))
+    assert _apply(plan, upload_dir=str(tmp_path),
+                  extra=["--repair-residuals"]) == 3
+    with psycopg.connect(PG_URI) as db:
+        n = db.execute("SELECT COUNT(*) FROM "
+                       "upload_capacity_repair_receipts").fetchone()[0]
+    assert int(n) == 0

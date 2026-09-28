@@ -12546,11 +12546,13 @@ def _api_upload_native_single(file, filename, safe, ext, ident, reservation,
         try:
             entry = _upload_native_entry(safe)
         except ValueError:
-            _upload_abandon_staging(upload_id, reservation)
+            # R13：已持 upload_task 存储锁——走锁内收口变体（公开入口会
+            # 再取同一锁，flock 不可重入 → 自等待）。
+            _abandon_staging_under_storage_lock(upload_id, reservation)
             return jsonify(error="不支持的文件类型"), 400
         owner = _upload_asset_owner(ident)
         if not owner:
-            _upload_abandon_staging(upload_id, reservation)
+            _abandon_staging_under_storage_lock(upload_id, reservation)
             return jsonify(error="无法解析上传资产 owner（本地态未配置 owner）"), 500
         staging_gen = slide_storage.staging_dir(upload_id, "1", root=UPLOAD_DIR)
         staged = staging_gen / entry

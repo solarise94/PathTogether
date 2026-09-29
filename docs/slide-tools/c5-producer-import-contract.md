@@ -1,7 +1,7 @@
 # C5 producer 导入 API 与权限合同（冻结稿 v1）
 
 - 日期：2026-09-29。基线：PathTogether HEAD `11b1594`；下一个可用迁移号 **0077**（`migrations/` 止于 `0076_conversion_jobs_held.sql`）。
-- 状态：设计冻结（C5 双子代理——平台 producer import API 与百度插件——开工前冻结本文；实现偏差需回改本文再动代码）。
+- 状态：设计冻结；§8 八项开放问题已于 2026-09-29 按本文建议定稿（用户确认按建议处理）。C5 双子代理——平台 producer import API 与百度插件——以本文为准；实现偏差需回改本文再动代码。
 - 上游方案：`docs/browser-slide-tools-and-baidu-plugin-agent-plan-20260929.md` §1.1/§7/§8/§10.4。
 - 对接（不重写、不编辑）：`docs/plugin-capability-layer-design.md`（用户编辑中）——本合同的新权限条目须登记进其 §6.1 权限矩阵（新增一行「producer 导入委托」）。
 - 本文只定义合同；不写任何 SQL/代码。§3 只**提议** 0077 的表结构语义。
@@ -70,7 +70,7 @@
 
 ### 1.4 `POST /api/plugin/v1/imports/<import_id>/commit`
 
-请求：`{}`（可带 `"declared_sha256"` 仅作交叉核对**参考**，不作信任依据——§7.2「不能信任客户端完整哈希声明」）。
+请求：`{}`（可带 `"declared_sha256"` 作交叉核对，不作信任依据——§7.2「不能信任客户端完整哈希声明」；平台自算值为权威。**声明不符 → `422 declared_checksum_mismatch`**，不持久化 intent、任务保持 `writing`；插件核对后可带正确声明重 commit，或取消任务——§8 裁决 6）。
 
 行为（顺序即语义）：
 
@@ -252,7 +252,7 @@ created → writing → committing → published → done
 - **写者 fencing**：清理确认前插件必须先停写（插件任务序 `awaiting_receipt → cleanup_pending` 自证）；平台侧以 task_storage_lock 保证平台文件操作互斥；跨进程「插件已停写」由插件声明 + 受管根核对（首次列目录发现近期 mtime 异动 → 拒绝并退避重试）。
 - **验证清理**：cleanup-confirm = 受管根存在且为空（或整个删除）才算 cleaned；非空 → `cleanup_not_verified` + 残余字节，scratch 不释放。
 
-**明确延后（不在 C5）**：挂载命名空间/独立 UID 的强隔离、cgroup 级磁盘配额、受管清理器进程代删（§7.3「隔离挂载+受管清理器」的完整形态）。延后风险已由 scratch 预约 + 对账覆盖（账面责任始终在），物理隔离缺口在 C7 前评审；若用户要求 C5 即上强隔离，见 §8 开放问题 5。
+**明确延后（不在 C5）**：挂载命名空间/独立 UID 的强隔离、cgroup 级磁盘配额、受管清理器进程代删（§7.3「隔离挂载+受管清理器」的完整形态）。延后风险已由 scratch 预约 + 对账覆盖（账面责任始终在），物理隔离缺口在 C7 前评审（§8 裁决 5）。
 
 ## 6. 百度迁移映射（§7.1/§8）
 
@@ -277,7 +277,7 @@ created → writing → committing → published → done
 ### 6.4 存量过渡（§8 检查点 A 口径）
 
 - 存量 `baidu_import_batches/items` 行**不迁移 schema**：A 前 frozen 旧执行路径继续排空在途批次；用户面列表对新旧行统一可读。
-- 无法排空的批次按 §8 冻结迁移计划移交插件：接管 source 文件证据、容量 holder（`baidu_batch` 预约原样持有或经 `record_reconciled_residual_locked` 补记为 producer_import/scratch——**二选一，推荐原样持有 `baidu_batch` 不换 holder**，避免双记账窗口）、产物绑定与所有权；单一执行者接管 + 幂等回执；不重新生成已发布资产、不重新收费。
+- 无法排空的批次按 §8 冻结迁移计划移交插件：接管 source 文件证据、容量 holder（`baidu_batch` 预约原样持有或经 `record_reconciled_residual_locked` 补记为 producer_import/scratch——**裁决：原样持有 `baidu_batch`，不换 holder**，避免双记账窗口——§8 裁决 8）、产物绑定与所有权；单一执行者接管 + 幂等回执；不重新生成已发布资产、不重新收费。
 - 旧转换 item（conversion_job 路径）的交接服从 §8 转换链路自身裁决，不在本合同内。
 
 ## 7. C5 测试矩阵（源自方案 §10.4；每行 = 用例 → 断言）
@@ -289,7 +289,7 @@ created → writing → committing → published → done
 | T3 | 重复 commit / commit 响应丢失后 status | 同一回执；无第二份资产/计费（slides 行唯一、reservation 单次 consume） |
 | T4 | 重复 cancel / cleanup-confirm | 幂等；scratch 释放恰一次（release 幂等态可重放） |
 | T5 | write 断线续传（错 offset） | 409 `offset_conflict` + expected_offset；续传后 confirmed_offset 单调、无空洞无重复字节 |
-| T6 | 块 sha256 篡改 / 整体哈希与声明不符 | 409 `checksum_mismatch`（块级）；commit 平台自算 sha 为权威，声明不符只记 warning 不阻断（或反之，见 §8 开放问题 6） |
+| T6 | 块 sha256 篡改 / 整体哈希与声明不符 | 409 `checksum_mismatch`（块级）；commit 声明与平台自算不符 → 422 `declared_checksum_mismatch`，无 intent、状态仍 `writing`（§8 裁决 6） |
 | T7 | 超流长限制（块 > 64 MiB / declared_size 越界 / >10 GiB 产物） | 413 `size_exceeded`/`upload_too_large`；topup 后可续 |
 | T8 | 伪造 owner / 任意路径 body / 越权 project | owner 恒 = grant.user_id（资产行核验）；无任何端点接受路径；非本人项目 403 `import_grant_invalid(project_mismatch)` |
 | T9 | grant 过期/撤销、插件 disable、用户禁用 | 按 §2.4 表逐格断言：新操作拒绝码；intent 后 commit 恢复路径仍收口；cleanup-confirm 仍可用 |
@@ -306,13 +306,15 @@ created → writing → committing → published → done
 
 （真实百度账号下载为外部门禁，替身成功不宣称真实可用——§9.1。）
 
-## 8. 开放问题（需用户裁决；均附建议）
+## 8. 裁决（2026-09-29 定稿，均按草案建议）
 
-1. **grant 可否覆盖多任务**：本文定为「grant 绑 (installation, user, project)，TTL 内可 begin 多个任务；每任务另发 job 级 write_token」。备选：单任务单 grant（更严但百度多文件批次要 N 次授权）。**建议采纳本文方案**（§7.2 的 job 绑定由 write_token 层满足）。
-2. **grant 默认 TTL**：本文定 24 h（run grant 30 min 不够长链路）。**建议 24 h**，env 可调。
-3. **agent 触发导入**：C5 不开放（§2.6）。**建议维持**，留待 plugin-capability-layer P2 写能力评审时一并定。
-4. **关联失败语义**：本文沿用「产物不回滚、记 failed 状态」（`baidu_ingest.py:122`）。方案 §7.3 说「项目关联和 owner 校验在平台提交事务内完成」——校验在事务内满足；插入受 share_store 后端形态约束若不能同事务，是否接受幂等收敛？**建议接受「校验在事务内 + 插入紧邻同锁窗口 + 状态收敛」，实现时若 PG 可同事务则同事务。**
-5. **C5 受管根隔离深度**：目录派生+非空核验 vs 挂载/UID 强隔离。**建议 C5 用前者**（§5 已列延后风险），C7 前再评审。
-6. **declared_sha256 声明不符时**：仅记 warning 还是 422 拒绝。**建议 422 拒绝**（fail-closed 与全仓口径一致；插件可改正后重 commit——begin 未终态前可重算）。
-7. **scratch 计费倍率**：scratch = 源+中间+输出副本峰值，插件申报有低报动机。是否设 `scratch_bytes ≤ k × max(declared_size, 源申报)` 硬上限？**建议 C5 不设倍率硬上限**（对账兜底 + admin 可见），列为观测项。
-8. **百度存量 holder 迁移**：§6.4 推荐原样持有 `baidu_batch`。若用户倾向统一换 producer_import holder，需补一段冻结窗口核账，成本更高。
+原为开放问题；用户确认按建议定稿。实现不得偏离，需变更先改本节。
+
+1. **grant 覆盖多任务**：grant 绑 (installation, user, project)，TTL 内可 begin 多个任务；每任务另发 job 级 write_token（§7.2 的 job 绑定由 write_token 层满足）。
+2. **grant 默认 TTL = 24 h**，env `IMPORT_GRANT_TTL_SECONDS` 可调（run grant 30 min 不适用长链路）。
+3. **agent 触发导入：C5 不开放**（§2.6），留待 plugin-capability-layer P2 写能力评审。
+4. **关联语义**：owner/项目权限校验在发布结算事务内完成；关联插入 PG 可同事务则同事务，否则紧邻同锁窗口插入 + 幂等状态收敛；关联失败不回滚已发布产物，记 `project_associate_state=failed` 并可重试（沿用 `baidu_ingest.py:122` 口径）。
+5. **受管根隔离**：C5 采用平台派生目录 + cleanup-confirm 非空核验；挂载命名空间/独立 UID 强隔离延后到 C7 前评审（§5 已列风险）。
+6. **declared_sha256 不符 → 422 `declared_checksum_mismatch`**（fail-closed）；不持久化 intent、状态保持 `writing`，插件可纠正声明后重 commit 或取消。
+7. **scratch 不设倍率硬上限**；由对账兜底 + admin 可见，列为观测项（记录每任务 scratch 申报/实际峰值比）。
+8. **百度存量 holder**：原样持有 `baidu_batch`，不迁移为 producer_import（§6.4），免冻结窗口双记账。

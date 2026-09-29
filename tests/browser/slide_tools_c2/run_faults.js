@@ -304,6 +304,22 @@ function makeScenarios(F) {
     return { r, jobs };
   }]);
 
+  S.push(['list-jobs-saved-settings-bare-resume', async (page) => {
+    // a non-default profile/policy must come back from listJobs() and a
+    // bare resumeJob(id) must reuse them (the /tools page resume entry)
+    const b = await begin(page, F.bf, { profileId: 'balanced', policy: 'allow-edge', faults: { crashAfterCheckpoint: true, journalIntervalBytes: 1024 } });
+    await waitForFault(page, 'crashAfterCheckpoint', b.base, b.jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    await page.reload({ waitUntil: 'load' });
+    await L.open(page, PORT);
+    const listed = await page.evaluate((id) => window.__c2.listJobs().then((js) => js.find((j) => j.id === id)), b.jobId);
+    const base = await page.evaluate(() => window.__c2.eventCount());
+    await page.evaluate((id) => window.__runner.resumeJob(id).then(() => true), b.jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    const after = await page.evaluate((id) => window.__c2.getJob(id), b.jobId);
+    return { listed, done, after, sha: await shaOf(page, b.jobId), expect: F.native.bf };
+  }]);
+
   S.push(['settings-change-refused', async (page) => {
     const b = await begin(page, F.bf, { profileId: 'saver', faults: { crashAtWrite: 6 } }); const jobId = b.jobId; const base = b.base;
     await waitForFault(page, 'crashAtWrite', base, jobId);
@@ -465,6 +481,15 @@ function verdict(name, r) {
     case 'unsupported-input-not-staged':
       return r.r && r.r.refused && r.r.code === 'unsupported_input' && Array.isArray(r.jobs) && r.jobs.length === 0
         ? ok() : fail(safeJson(r));
+    case 'list-jobs-saved-settings-bare-resume': {
+      const l = r.listed || {};
+      const okList = l.nextAction === 'resume' && l.settings && l.settings.profileId === 'balanced'
+        && l.settings.policy === 'allow-edge' && l.committedBytes > 0 && l.source && l.source.size > 0;
+      const okAfter = r.after && r.after.nextAction === 'export' && r.after.result
+        && r.after.result.sha256 === r.expect;
+      return okList && r.done && r.done.ok && r.sha === r.expect && okAfter
+        ? ok() : fail(safeJson({ listed: l, done: r.done && r.done.ok, after: r.after }));
+    }
     case 'settings-change-refused':
       const pc = r.profileChange && r.profileChange.code, lc = r.policyChange && r.policyChange.code;
       return pc === 'resume_refused' && lc === 'resume_refused' && r.done && r.done.ok && r.sha === r.expect

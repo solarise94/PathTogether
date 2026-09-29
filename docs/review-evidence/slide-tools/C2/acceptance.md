@@ -4,7 +4,7 @@
 `static/tools/slide-transform/{runner,engine,worker}.js`、`slide-transform-core/`（resume/validate/estimate
 扩展）、`tests/browser/slide_tools_c2/`。
 
-结论：**C2 通过，附一项需用户知悉的字面偏差**（§4）。真实样本只以别名出现。
+结论：**允许进入 C3；最终设备验收未完成。** 绝对内存目标、崩溃恢复字节一致与真实样本一致性有证据支撑；规模无关性指标（1→10 GiB 增量增长 ≤20%）实测 +57%，**未通过**，已由用户确认作为偏差接受并把真实 4 GB 设备复测列为 C7 门禁（§4、计划 §4/§9）。真实样本只以别名出现。
 
 ## 1. 过程说明（如实）
 
@@ -44,7 +44,7 @@
 | KFB-1 原生 | CLI convert → sha256 | `385a59c6…`（C1 标定不变） |
 | grep 门 | `test_no_whole_file.js` | PASS |
 | 冒烟 | `run_smoke.js` | 浏览器 = 原生；准备任务被复用；导出 |
-| 故障矩阵 | `run_faults.js` | **24/24** |
+| 故障矩阵 | `run_faults.js` | **25/25**（含 C3 前补的「listJobs 带回保存设置 + 不传设置续跑」） |
 | 真实样本 | `run_parity.js --fl-all` | KFB-1、KFBF-A..D 五个浏览器 sha256 = 原生 |
 | 内存（cgroup 模拟） | `run_mem_cgroup.sh` × 8 次 | 见 §3 |
 
@@ -59,18 +59,26 @@
 
 ## 4. 需用户知悉 / 裁决
 
-1. **规模无关性字面未过**：计划要求节省档 1→10 GiB 增量增长 ≤20%；实测 109 → 171 MiB（+57%）。
+1. **规模无关性未通过**：计划要求节省档 1→10 GiB 增量增长 ≤20%；实测 109 → 171 MiB（+57%）。
    但 4.4 → 9.8 GiB 为 176 → 171（不增长），差值是长作业达到稳态的固定开销而非按字节增长；
-   绝对值为目标的 34%。验收方建议接受并在 C7 终验时于真实设备复测。
+   绝对值为目标的 34%。用户裁决（2026-09-29）：作为已知偏差接受，不记为通过；真实 4 GB 设备复测为 C7 门禁。
 2. **临时盘翻倍**：源副本使 OPFS 峰值 ≈ 源 + 输出（9.8 GiB 输入约 19.6 GiB）。
 3. **新 profile 上 >~4.9 GiB 输入需用户确认磁盘**：Chromium 只报告 usage+10 GiB，超出部分无法
    预知；运行器返回 `disk_precheck_failed{uncertain:true}`，C3 工具页必须提供确认交互。
 4. 外部门禁不变：真实 4/8 GB 设备、Firefox/Safari/Edge、真实配额耗尽、`persist()` 手势、
    `showSaveFilePicker` 写用户磁盘。
 
-## 5. 转交 C3
+## 5. 转交 C3（运行器公开接口，以代码为准）
 
-- 工具页使用 `probe(file)` → 展示 → `startJob(file, {jobId, profileId, policy, confirmUncertainDisk})`；
-  放弃时 `discardJob(jobId)`（否则准备目录会保留，C3 需列出/清理未启动的 `prepared` 任务）。
-- 磁盘 `uncertain` 确认文案、复制进度（`progress.unit === 'stage'`）、续跑入口（无需重选文件）。
+- `const prep = await runner.probe(file, {confirmUncertainDisk})` → `{jobId, probe, identity}`：
+  嗅探文件头 → 复制进 OPFS → 在副本上完整 probe → 空间门 → 任务记为 `prepared`。
+- `const {jobId, done} = await runner.startJob(file, {jobId: prep.jobId, profileId, policy, outputCapBytes, channelJson, confirmUncertainDisk})`：
+  **第一个参数仍是 File**；传入 `prepared` 任务的 `jobId` 时复用副本不再复制，未传或任务不是
+  `prepared` 时先走一遍 probe 流程。
+- `runner.resumeJob(jobId)`：不传设置时沿用任务记录中保存的档位/策略/上限/channel.json；显式传入不同值则
+  `resume_refused`。`listJobs()`/`getJob()` 返回 JobSummary（`nextAction`=start/resume/export/wait/discard、`settings`、`source`、`estimate`、`committedBytes`、`result`），供续跑入口展示。
+- `runner.discardJob(jobId)`：删除任务目录（含副本与产物），失败记入 pending-cleanup。
+- `runner.exportJob(jobId, getWritable)`：仅 `ready`/`exported`。
+- 空间门：`disk_precheck_failed{uncertain:true}` 时需用户确认后以 `confirmUncertainDisk:true` 重试。
+  页面文案须说明临时空间约为「源文件＋输出文件」，且 OPFS 中完成的产物在导出前**未保存到用户磁盘**。
 - 小问题（P3）：`resume.rs` 手写 JSON 解析；`encode_gray` 与 `encode_rgb` 量化表口径不一（C1 遗留）。

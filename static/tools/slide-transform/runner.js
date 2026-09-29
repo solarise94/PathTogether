@@ -2,13 +2,30 @@
 // Replaces the C1 placeholder runner: production API for the future /tools
 // page (C3) and for the C2 test harness. ES module, no dependencies.
 //
+// Public API (the only surface the /tools page may use):
+//
 //   const runner = await SlideToolsRunner.create();
-//   const prep   = await runner.probe(file);          // stages + probes
-//   const job    = await runner.startJob(file, { jobId: prep.jobId, profileId, policy, ... });
-//   const resumed= await runner.resumeJob(jobId);     // reads the staged copy
-//   await runner.discardJob(jobId);
-//   await runner.cancelJob(jobId);
+//   // sniff 8-byte header → copy File into OPFS → full probe on the copy →
+//   // disk gate → job recorded as `prepared`
+//   const prep = await runner.probe(file, { confirmUncertainDisk });
+//        // → { jobId, probe, identity: { size, sha256 } }
+//   // the FIRST argument is still the File; passing a `prepared` jobId
+//   // reuses its copy (no second copy), otherwise probe() runs first
+//   const { jobId, done } = await runner.startJob(file, {
+//     jobId: prep.jobId, profileId, policy, outputCapBytes, channelJson,
+//     confirmUncertainDisk });
+//   // resume never needs the File; omitted settings default to the saved
+//   // ones, explicitly different ones are refused (`resume_refused`)
+//   const { done } = await runner.resumeJob(jobId);
+//   const jobs = await runner.listJobs();   // [JobSummary], see _summary()
+//   const job  = await runner.getJob(jobId); // JobSummary | null
+//   await runner.cancelJob();                // the running job of this tab
+//   await runner.discardJob(jobId);          // delete copy + artifact
 //   await runner.exportJob(jobId, () => savePicker.createWritable());
+//
+// Disk gate: `disk_precheck_failed` with `uncertain: true` means the
+// browser's quota report is capped (usage + 10 GiB) and cannot prove the
+// space either way — ask the user, then retry with confirmUncertainDisk.
 //
 // State machine (plan §5):
 //   selected → probing → planned → running ↔ paused → finalizing →
@@ -22,6 +39,16 @@
 import * as E from './engine.js';
 
 const LOCK_HEAVY = 'slide-transform:heavy';
+
+/// Settings a resumed run must match (see _startOrResume refusals).
+function savedSettings(rec) {
+  return {
+    profileId: rec.profile || undefined,
+    policy: rec.policy || 'allow-edge',
+    outputCapBytes: rec.cap || undefined,
+    channelJson: rec.channelJson || undefined,
+  };
+}
 const EXPORT_CHUNK = 4 * 2 ** 20;
 
 export class SlideToolsRunner {
@@ -399,7 +426,14 @@ export class SlideToolsRunner {
         '另一个标签页正在执行重转换任务（Web Lock）');
     }
     try {
-      return await this._startOrResume(null, opts, jobId);
+      let saved = {};
+      try {
+        const rec = await this._readJobRecord(jobId);
+        if (rec) saved = savedSettings(rec);
+      } catch { /* missing dir is reported by _startOrResume */ }
+      const explicit = Object.fromEntries(
+        Object.entries(opts).filter(([, v]) => v !== undefined));
+      return await this._startOrResume(null, { ...saved, ...explicit }, jobId);
     } catch (e) {
       this._releaseHeavyLock();
       throw e;
@@ -512,8 +546,11 @@ export class SlideToolsRunner {
       profile: profile.id,
       channelJsonHash: opts.channelJson
         ? E.fnv2x32(new TextEncoder().encode(opts.channelJson)) : null,
+      // kept locally so resume can re-supply the identical companion
+      channelJson: opts.channelJson || null,
       cap: opts.outputCapBytes || null,
       estimate,
+      modality,
     });
 
     this._setState('planned');
@@ -707,18 +744,72 @@ export class SlideToolsRunner {
 
   // -------------------------------------------------------------- listing --
 
+  /// JobSummary: {id, state, nextAction, active, createdAt, updatedAt,
+  ///   source: {name, size, sha256} | null, modality, estimate,
+  ///   settings: {profileId, policy, outputCapBytes, channelJson} | null,
+  ///   committedBytes, result: {outputBytes, sha256} | null, error}
+  /// nextAction: 'start' (prepared) | 'resume' (interrupted run) |
+  ///   'export' (ready/exported) | 'wait' (running in this tab) | 'discard'.
+  async _summary(id, dirHandle, rec) {
+    const active = this.jobId === id && !!this._lockRelease &&
+      ['probing', 'planned', 'running', 'paused', 'finalizing', 'validating'].includes(this._state);
+    let committedBytes = 0;
+    let hasJournal = false;
+    try {
+      const fh = await dirHandle.getFileHandle(E.JOURNAL_FILE);
+      const f = await fh.getFile();
+      hasJournal = f.size > 0;
+      if (hasJournal && f.size <= 64 * 2 ** 20) {
+        const { records } = E.decodeJournal(new TextDecoder().decode(
+          await f.slice(0, f.size).arrayBuffer()));
+        const st = E.journalState(records);
+        committedBytes = st.lastCommit ? st.lastCommit.st.out : 0;
+      }
+    } catch { /* no journal yet */ }
+    const state = rec ? rec.state : 'staging';
+    let nextAction = 'discard';
+    if (active) nextAction = 'wait';
+    else if (state === 'prepared') nextAction = 'start';
+    else if ((state === 'planned' || state === 'paused') && hasJournal) nextAction = 'resume';
+    else if (state === 'planned' || state === 'paused') nextAction = 'start';
+    else if (state === 'ready' || state === 'exported') nextAction = 'export';
+    const id0 = rec && rec.identity;
+    return {
+      id, state, nextAction, active,
+      createdAt: rec ? rec.createdAt : null,
+      updatedAt: rec ? rec.updatedAt : null,
+      source: id0 ? { name: id0.name, size: id0.size, sha256: id0.sha256 } : null,
+      modality: rec ? rec.modality || null : null,
+      estimate: rec ? rec.estimate || null : null,
+      settings: rec && rec.profile ? savedSettings(rec) : null,
+      committedBytes,
+      result: rec && rec.result
+        ? { outputBytes: rec.result.output_bytes, sha256: rec.validation && rec.validation.sha256 }
+        : null,
+      error: rec ? rec.error || null : null,
+    };
+  }
+
   async listJobs() {
     let jobs;
     try { jobs = await this._jobsDir(); } catch { return []; }
     const out = [];
     for await (const [name, handle] of jobs.entries()) {
-      if (handle.kind !== 'directory') continue;
-      try {
-        const rec = await E.readSlotRecord(handle, 'job');
-        if (rec) out.push({ id: name, state: rec.state, updatedAt: rec.updatedAt });
-      } catch { /* skip unreadable */ }
+      if (handle.kind !== 'directory' || name.startsWith('.')) continue;
+      let rec = null;
+      try { rec = await E.readSlotRecord(handle, 'job'); } catch { rec = null; }
+      try { out.push(await this._summary(name, handle, rec)); } catch { /* raced delete */ }
     }
+    out.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
     return out;
+  }
+
+  async getJob(jobId) {
+    let dir;
+    try { dir = await (await this._jobsDir()).getDirectoryHandle(jobId); } catch { return null; }
+    let rec = null;
+    try { rec = await E.readSlotRecord(dir, 'job'); } catch { rec = null; }
+    return this._summary(jobId, dir, rec);
   }
 
   /// Read back the artifact sha256 through the worker (wasm sha2 over a

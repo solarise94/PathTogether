@@ -258,6 +258,7 @@ window.__c2 = {
     return runner.hashArtifact(id);
   },
   async listJobs() { await ensureRunner(); return runner.listJobs(); },
+  async getJob(id = currentJob) { await ensureRunner(); return runner.getJob(id); },
   async terminateWorker() { await runner.terminateWorkerForTest(); },
   async newRunner() {
     runner = null;

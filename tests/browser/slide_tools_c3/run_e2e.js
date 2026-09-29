@@ -156,15 +156,32 @@ async function scenarioA() {
   }
 }
 
-// (b) KFBF 荧光夹具 + 可选 channel.json 伴随输入（≤1 MiB 有界读）。
-async function scenarioB() {
-  const kfbf = L.ensureFixture('fl-600x400.kfbf', ['gen-kfbf']);
+function channelFixture() {
   const cj = path.join(L.GATE, 'fixtures', 'channel.json');
   fs.mkdirSync(path.dirname(cj), { recursive: true });
   fs.writeFileSync(cj, JSON.stringify([
     { channelName: 'DAPI', channelIndex: 1, channelColor: '#0000E5', lower: 13, upper: 227, gamma: 1, show: true },
     { channelName: '520', channelIndex: 2, channelColor: '#00FF00', lower: 16, upper: 175, gamma: 1, show: true },
   ]));
+  return cj;
+}
+
+/// channel.json 只进结果报告（显示窗口），不改 TIFF 像素——输出哈希比对发现不了
+/// 它的丢失，必须直接断言结果面板里的显示窗口。
+async function assertDisplayWindows(page) {
+  const c0 = (await page.textContent('#result-channel-0')) || '';
+  const c1 = (await page.textContent('#result-channel-1')) || '';
+  if (!/13\s*–\s*227/.test(c0) || !/16\s*–\s*175/.test(c1)) {
+    throw new Error(`display windows missing: ch0="${c0}" ch1="${c1}"`);
+  }
+  return { ch0: c0.trim(), ch1: c1.trim() };
+}
+
+// (b) KFBF 荧光夹具 + 可选 channel.json 伴随输入（≤1 MiB 有界读）。
+// 伴随文件在选源文件之后才选：走「准备后改选 → 写回任务记录」路径。
+async function scenarioB() {
+  const kfbf = L.ensureFixture('fl-600x400.kfbf', ['gen-kfbf']);
+  const cj = channelFixture();
   const native = L.nativeConvert(kfbf, path.join(L.GATE, 'fixtures', 'fl-native.tif'), ['--channel-json', cj]);
   const nativeSha = await L.sha256File(native);
 
@@ -178,11 +195,13 @@ async function scenarioB() {
     if (!/DAPI/.test(channelsText)) throw new Error('probe summary missing channel names');
     await page.click('#convert-btn');
     await waitVisible(page, '#result-section:not([hidden])');
+    const windows = await assertDisplayWindows(page);
     await page.click('#save-btn');
     await waitText(page, '#save-status', /已保存|Saved/);
     const saved = await L.opfsSha256(page);
     if (saved.sha256 !== nativeSha) throw new Error(`saved sha ${saved.sha256} != native ${nativeSha}`);
-    record('b-kfbf-happy-path', true, { savedSha256: saved.sha256, nativeSha256: nativeSha, savedBytes: saved.size });
+    record('b-kfbf-happy-path', true, { savedSha256: saved.sha256, nativeSha256: nativeSha,
+      savedBytes: saved.size, displayWindows: windows });
   } catch (e) {
     record('b-kfbf-happy-path', false, { error: String(e).slice(0, 400) });
   } finally {
@@ -608,12 +627,77 @@ async function scenarioM() {
   }
 }
 
+/// 测试侧只读 OPFS 任务记录（经 engine.js 的双槽读取），不另起 runner 实例。
+const READ_JOB_RECORDS = `window.__readJobRecords = async () => {
+  const E = await import('/static/tools/slide-transform/engine.js');
+  const root = await navigator.storage.getDirectory();
+  let jobs;
+  try { jobs = await root.getDirectoryHandle('slide-jobs'); } catch { return []; }
+  const out = [];
+  for await (const [name, h] of jobs.entries()) {
+    if (h.kind !== 'directory' || name.startsWith('.')) continue;
+    const rec = await E.readSlotRecord(h, 'job').catch(() => null);
+    if (rec) out.push(rec);
+  }
+  return out;
+};`;
+
+// (n) C4-1：选择 → 准备 → 刷新 → 从任务列表开始，channel.json 不丢。
+//   n1：伴随文件先于源文件选择（随 probe 写入准备记录）
+//   n2：源文件准备完成后才选伴随文件（setPreparedChannelJson 写回）
+async function scenarioN() {
+  const kfbf = L.ensureFixture('fl-600x400.kfbf', ['gen-kfbf']);
+  const cj = channelFixture();
+  for (const variant of ['n1', 'n2']) {
+    const id = `${variant}-channel-json-refresh-list-start`;
+    const { context, page } = await L.launch(variant, [L.savePickerStub(), READ_JOB_RECORDS]);
+    page.on('dialog', (d) => d.accept());
+    try {
+      await L.openTools(page, PORT);
+      if (variant === 'n1') await page.setInputFiles('#channel-input', cj);
+      await L.setFile(page, kfbf);
+      await waitVisible(page, '#probe-section:not([hidden])');
+      if (variant === 'n2') await page.setInputFiles('#channel-input', cj);
+      // 等准备记录里落下 channel.json 后再刷新（异步谓词不能交给 waitForFunction：
+      // 它把返回的 Promise 当作真值立即放行）
+      const deadline = Date.now() + 20000;
+      for (;;) {
+        const recs = await page.evaluate(() => window.__readJobRecords());
+        if (recs.length === 1 && recs[0].state === 'prepared' && recs[0].channelJson) break;
+        if (Date.now() > deadline) throw new Error(`prepared record lacks channel.json: ${JSON.stringify(recs.map((r) => ({ state: r.state, gen: r.gen })))}`);
+        await page.waitForTimeout(200);
+      }
+      await page.reload({ waitUntil: 'load' });
+      await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
+      const startBtn = '.job-row[data-next-action="start"] button[data-action="start"]';
+      await waitVisible(page, startBtn);
+      const meta = await page.textContent('.job-row[data-next-action="start"]');
+      if (!/channel\.json/.test(meta)) throw new Error(`job row lacks channel.json marker: ${meta}`);
+      await page.click(startBtn);
+      await waitVisible(page, '#result-section:not([hidden])', 120000);
+      const windows = await assertDisplayWindows(page);
+      const rec = (await page.evaluate(() => window.__readJobRecords()))[0];
+      const report = (rec.result && rec.result.channels) || [];
+      const byName = Object.fromEntries(report.map((c) => [c.name, c.display_window]));
+      if (JSON.stringify(byName.DAPI) !== '[13,227]' || JSON.stringify(byName['520']) !== '[16,175]') {
+        throw new Error(`job report display windows wrong: ${JSON.stringify(byName)}`);
+      }
+      record(id, true, { displayWindows: windows, report: byName });
+    } catch (e) {
+      record(id, false, { error: String(e).slice(0, 400) });
+    } finally {
+      await context.close();
+    }
+  }
+}
+
 // ------------------------------------------------------------------ main --
 
 const SCENARIOS = [
   ['a', scenarioA], ['b', scenarioB], ['c', scenarioC], ['d', scenarioD],
   ['e', scenarioE], ['f', scenarioF], ['g', scenarioG], ['h', scenarioH],
   ['i', scenarioI], ['k', scenarioK], ['l', scenarioL], ['m', scenarioM],
+  ['n', scenarioN],
 ];
 
 async function main() {

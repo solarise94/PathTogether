@@ -7,10 +7,14 @@
 //   const runner = await SlideToolsRunner.create();
 //   // sniff 8-byte header → copy File into OPFS → full probe on the copy →
 //   // disk gate → job recorded as `prepared`
-//   const prep = await runner.probe(file, { confirmUncertainDisk });
+//   const prep = await runner.probe(file, { confirmUncertainDisk, channelJson });
 //        // → { jobId, probe, identity: { size, sha256 } }
+//   // channelJson (≤1 MiB string) is saved on the prepared record so a
+//   // start after a page refresh keeps it; replace it before starting with
+//   await runner.setPreparedChannelJson(prep.jobId, channelJson | null);
 //   // the FIRST argument is still the File; passing a `prepared` jobId
-//   // reuses its copy (no second copy), otherwise probe() runs first
+//   // reuses its copy (no second copy), otherwise probe() runs first.
+//   // channelJson: undefined = the saved one, null = none, string = this one
 //   const { jobId, done } = await runner.startJob(file, {
 //     jobId: prep.jobId, profileId, policy, outputCapBytes, channelJson,
 //     confirmUncertainDisk });
@@ -50,6 +54,19 @@ function savedSettings(rec) {
   };
 }
 const EXPORT_CHUNK = 4 * 2 ** 20;
+const CHANNEL_JSON_MAX = 2 ** 20;
+
+function checkedChannelJson(v) {
+  if (v === undefined || v === null || v === '') return null;
+  if (typeof v !== 'string' || v.length > CHANNEL_JSON_MAX) {
+    throw E.stError(E.ERROR_CODES.IO_RECOVERABLE, 'channel.json 须为不超过 1 MiB 的文本');
+  }
+  return v;
+}
+
+function channelJsonHash(v) {
+  return v ? E.fnv2x32(new TextEncoder().encode(v)) : null;
+}
 
 export class SlideToolsRunner {
   static async create(opts = {}) {
@@ -186,21 +203,34 @@ export class SlideToolsRunner {
     return E.readSlotRecord(dir, 'job');
   }
 
+  /// Record writes of this tab run one at a time: two interleaved
+  /// read-merge-writes would both take the same gen and one patch would be lost.
+  _serialRecord(fn) {
+    const run = (this._recordChain || Promise.resolve()).then(fn, fn);
+    this._recordChain = run.catch(() => {});
+    return run;
+  }
+
   /// Slot records replace wholesale — patches must read-merge-write.
   async _updateJobRecord(jobId, patch) {
-    const prev = (await this._readJobRecord(jobId)) || {};
-    const next = { ...prev, ...patch, updatedAt: E.nowIso() };
-    for (const k of Object.keys(next)) {
-      if (next[k] === undefined) delete next[k];
-    }
-    await this._writeJobRecord(jobId, next);
-    return next;
+    return this._serialRecord(async () => {
+      const prev = (await this._readJobRecord(jobId)) || {};
+      const next = { ...prev, ...patch, updatedAt: E.nowIso() };
+      for (const k of Object.keys(next)) {
+        if (next[k] === undefined) delete next[k];
+      }
+      await this._writeJobRecordNow(jobId, next);
+      return next;
+    });
   }
 
   async _writeJobRecord(jobId, obj) {
+    return this._serialRecord(() => this._writeJobRecordNow(jobId, obj));
+  }
+
+  async _writeJobRecordNow(jobId, obj) {
     const dir = await this._jobDir(jobId, true);
-    const gen = await E.writeSlotRecord(dir, 'job', { v: 1, id: jobId, ...obj });
-    return gen;
+    return E.writeSlotRecord(dir, 'job', { v: 1, id: jobId, ...obj });
   }
 
   async _readJournal(jobId) {
@@ -342,6 +372,21 @@ export class SlideToolsRunner {
     }
   }
 
+  /// Replace the companion saved on a job that has not started yet.
+  async setPreparedChannelJson(jobId, channelJson) {
+    const cj = checkedChannelJson(channelJson);
+    await this._serialRecord(async () => {
+      const rec = await this._readJobRecord(jobId);
+      if (!rec || rec.state !== 'prepared') {
+        throw E.stError(E.ERROR_CODES.RESUME_REFUSED, '任务已开始，不能再更换 channel.json',
+          { kind: 'channel-json' });
+      }
+      await this._writeJobRecordNow(jobId, {
+        ...rec, channelJson: cj, channelJsonHash: channelJsonHash(cj), updatedAt: E.nowIso(),
+      });
+    });
+  }
+
   async discardJob(jobId) {
     await this._request('release-source', {});
     const jobs = await this._jobsDir();
@@ -372,6 +417,7 @@ export class SlideToolsRunner {
       throw E.stError(E.ERROR_CODES.UNSUPPORTED_INPUT, '不是本工具支持的 KFB/KFBF 文件（文件头不符）');
     }
     this._setState('probing');
+    const channelJson = checkedChannelJson(opts.channelJson);
     const jobId = opts.jobId || E.newJobId();
     this.jobId = jobId;
     // before staging: the copy itself plus an output of about the same size
@@ -399,6 +445,9 @@ export class SlideToolsRunner {
       identity: { name: file.name, size: staged.size, lastModified: file.lastModified, sha256: staged.sha256 },
       core: this.coreVersion,
       estimate: doc.estimate || probeResult.estimate,
+      modality: doc.modality,
+      channelJson,
+      channelJsonHash: channelJsonHash(channelJson),
       createdAt: E.nowIso(),
       updatedAt: E.nowIso(),
     });
@@ -481,7 +530,14 @@ export class SlideToolsRunner {
       record = await this._readJobRecord(jobId);
     }
     this.jobId = jobId;
-    if (!resumeJobId) this._setState('probing');
+    if (!resumeJobId) {
+      opts = {
+        ...opts,
+        channelJson: opts.channelJson === undefined
+          ? (record.channelJson || null) : checkedChannelJson(opts.channelJson),
+      };
+      this._setState('probing');
+    }
 
     // ---- resume validation (typed refusals, never blind-continue)
     let resume = null;
@@ -508,8 +564,7 @@ export class SlideToolsRunner {
       }
       const capChanged = (record.cap || null) !== (opts.outputCapBytes || null);
       if (capChanged) refuse('输出上限设置已改变', { kind: 'cap' });
-      const cjHash = opts.channelJson ? E.fnv2x32(new TextEncoder().encode(opts.channelJson)) : null;
-      if ((record.channelJsonHash || null) !== cjHash) {
+      if ((record.channelJsonHash || null) !== channelJsonHash(opts.channelJson)) {
         refuse('伴随 channel.json 设置已改变', { kind: 'channel-json' });
       }
       // the staged copy must still be exactly the bytes hashed at staging
@@ -556,8 +611,7 @@ export class SlideToolsRunner {
       plan: 1,
       policy,
       profile: profile.id,
-      channelJsonHash: opts.channelJson
-        ? E.fnv2x32(new TextEncoder().encode(opts.channelJson)) : null,
+      channelJsonHash: channelJsonHash(opts.channelJson),
       // kept locally so resume can re-supply the identical companion
       channelJson: opts.channelJson || null,
       cap: opts.outputCapBytes || null,
@@ -760,7 +814,9 @@ export class SlideToolsRunner {
   /// JobSummary: {id, state, nextAction, active, createdAt, updatedAt,
   ///   source: {name, size, sha256} | null, modality, estimate,
   ///   settings: {profileId, policy, outputCapBytes, channelJson} | null,
-  ///   committedBytes, result: {outputBytes, sha256} | null, error}
+  ///   hasChannelJson, committedBytes,
+  ///   result: {outputBytes, sha256, channels: [{name, display_window, …}]} | null,
+  ///   error}
   /// nextAction: 'start' (prepared) | 'resume' (interrupted run) |
   ///   'export' (ready/exported) | 'wait' (running in this tab) | 'discard'.
   async _summary(id, dirHandle, rec) {
@@ -795,9 +851,14 @@ export class SlideToolsRunner {
       modality: rec ? rec.modality || null : null,
       estimate: rec ? rec.estimate || null : null,
       settings: rec && rec.profile ? savedSettings(rec) : null,
+      hasChannelJson: !!(rec && rec.channelJson),
       committedBytes,
       result: rec && rec.result
-        ? { outputBytes: rec.result.output_bytes, sha256: rec.validation && rec.validation.sha256 }
+        ? {
+          outputBytes: rec.result.output_bytes,
+          sha256: rec.validation && rec.validation.sha256,
+          channels: rec.result.channels || [],
+        }
         : null,
       error: rec ? rec.error || null : null,
     };

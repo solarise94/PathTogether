@@ -200,7 +200,9 @@ function askDiskConfirm({ title, body, confirmLabel }) {
 async function probeWithDiskFlow(file, opts = {}) {
   const confirmOverride = opts.confirmUncertainDisk || false;
   try {
-    return await page.runner.probe(file, { confirmUncertainDisk: confirmOverride });
+    return await page.runner.probe(file, {
+      confirmUncertainDisk: confirmOverride, channelJson: page.channelJson,
+    });
   } catch (e) {
     if (errCode(e) === 'disk_precheck_failed') {
       const info = (e && e.error) || {};
@@ -213,7 +215,9 @@ async function probeWithDiskFlow(file, opts = {}) {
           }),
         });
         if (!ok) throw e;
-        return await page.runner.probe(file, { confirmUncertainDisk: true });
+        return await page.runner.probe(file, {
+          confirmUncertainDisk: true, channelJson: page.channelJson,
+        });
       }
     }
     throw e;
@@ -264,6 +268,17 @@ async function readChannelJsonInput() {
   }
 }
 
+// 已准备（未开始）的任务：伴随文件改选后同步到任务记录，刷新后从列表开始仍带上它
+async function onChannelPicked() {
+  await readChannelJsonInput();
+  if (!page.prep || page.running) return;
+  try {
+    await page.runner.setPreparedChannelJson(page.prep.jobId, page.channelJson);
+  } catch (e) {
+    showError(e);
+  }
+}
+
 async function runProbeFlow() {
   clearError();
   els.stageSection.hidden = false;
@@ -271,8 +286,13 @@ async function runProbeFlow() {
   setProgress(els.stageProgress, els.stageBar, els.stageBytes, 0, `0 / ${fmtBytes(page.file.size)}`);
   setBeforeunload(true);
   try {
+    const cjAtProbe = page.channelJson;
     const prep = await probeWithDiskFlow(page.file);
     page.prep = prep;
+    // 伴随文件在复制/探测期间改选过：补写进任务记录
+    if (page.channelJson !== cjAtProbe) {
+      await page.runner.setPreparedChannelJson(prep.jobId, page.channelJson);
+    }
     renderProbeSummary();
   } catch (e) {
     setBeforeunload(false);
@@ -453,7 +473,7 @@ async function onConvert() {
       jobId: page.prep.jobId,
       profileId: selectedProfileId(),
       policy: selectedPolicy(),
-      channelJson: page.channelJson || undefined,
+      channelJson: page.channelJson,
     });
     page.prep.jobId = jobId;
     const result = await done;
@@ -472,6 +492,7 @@ async function onConvert() {
         sha256: result.validation && result.validation.sha256,
         modality: probeDoc().modality,
         sourceName: page.file.name,
+        channels: result.result.channels || [],
       };
       renderResultPanel();
       renderSaveStatus();
@@ -530,6 +551,15 @@ function renderResultPanel() {
   g.textContent = '';
   dlRow(g, t('tools.result.size'), fmtBytes(page.readyInfo.outputBytes), 'result-size');
   dlRow(g, t('tools.result.sha256'), String(page.readyInfo.sha256 || '—'), 'result-sha');
+  if (page.readyInfo.modality === 'fluorescence') {
+    (page.readyInfo.channels || []).forEach((c, i) => {
+      const dw = Array.isArray(c.display_window) ? c.display_window : null;
+      dlRow(g, t('tools.result.channel', { name: c.name }),
+        dw ? t('tools.result.channel.window', { lower: dw[0], upper: dw[1] })
+          : t('tools.result.channel.window.none'),
+        `result-channel-${i}`);
+    });
+  }
 }
 
 function renderSaveStatus() {
@@ -666,6 +696,7 @@ function renderJobs(jobs) {
         policy: t(`tools.jobs.policy.${job.settings.policy}`),
       })}`;
     }
+    if (job.hasChannelJson) meta.textContent += ` · ${t('tools.jobs.channel')}`;
     row.appendChild(meta);
 
     const actions = document.createElement('div');
@@ -719,7 +750,8 @@ async function onJobAction(action, job) {
     }
     if (action === 'start' || action === 'resume') {
       // prepared/paused 任务：源副本已在浏览器临时存储，无需重选文件。
-      // resume 不传设置 → 沿用任务保存的档位/策略；start（prepared）用当前界面选择。
+      // resume 不传设置 → 沿用任务保存的档位/策略；start（prepared）用当前界面选择，
+      // channel.json 沿用准备时保存在任务记录里的那份。
       els.runSection.hidden = false;
       els.cancelBtn.hidden = false;
       els.runProgress.hidden = false;
@@ -732,7 +764,6 @@ async function onJobAction(action, job) {
           jobId: job.id,
           profileId: selectedProfileId(),
           policy: selectedPolicy(),
-          channelJson: (job.settings && job.settings.channelJson) || undefined,
         });
       const result = await started.done;
       setBeforeunload(false);
@@ -747,6 +778,7 @@ async function onJobAction(action, job) {
           sha256: result.validation && result.validation.sha256,
           modality: job.modality,
           sourceName: job.source && job.source.name,
+          channels: result.result.channels || [],
         };
         page.saveMsg = null;
         renderResultPanel();
@@ -808,6 +840,7 @@ async function init() {
   refreshJobs();
 
   els.fileInput.addEventListener('change', () => { onFilePicked(); });
+  els.channelInput.addEventListener('change', () => { onChannelPicked(); });
   els.convertBtn.addEventListener('click', () => { onConvert(); });
   els.cancelBtn.addEventListener('click', () => { onCancel(); });
   els.saveBtn.addEventListener('click', () => { onSave(); });

@@ -369,6 +369,59 @@ fn err_json(e: &CoreError) -> String {
     )
 }
 
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn json_num(v: f64) -> String {
+    if v.is_finite() {
+        format!("{v}")
+    } else {
+        "null".to_string()
+    }
+}
+
+fn channels_report_json(channels: &[slide_transform_core::report::ChannelSummary]) -> String {
+    let items: Vec<String> = channels
+        .iter()
+        .map(|c| {
+            let dw = c
+                .display_window
+                .map(|(lo, hi)| format!("[{},{}]", json_num(lo), json_num(hi)))
+                .unwrap_or_else(|| "null".into());
+            let dws = c
+                .display_window_source
+                .as_deref()
+                .map(json_str)
+                .unwrap_or_else(|| "null".into());
+            format!(
+                "{{\"index\":{},\"name\":{},\"color_rgb\":[{},{},{}],\"exposure\":{},\"exposure_unit\":\"ms(assumed)\",\"gamma\":{},\"display_window\":{},\"display_window_source\":{}}}",
+                c.index,
+                json_str(&c.name),
+                c.color_rgb.0,
+                c.color_rgb.1,
+                c.color_rgb.2,
+                json_num(c.exposure),
+                json_num(c.gamma),
+                dw,
+                dws
+            )
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
 fn detect(src: &dyn ByteSource) -> CoreResult<[u8; 8]> {
     let head = src.read_at(0, 8)?;
     let mut m = [0u8; 8];
@@ -394,8 +447,10 @@ pub fn probe() -> String {
                 .iter()
                 .map(|c| {
                     format!(
-                        "{{\"index\":{},\"name\":\"{}\",\"exposure\":{},\"exposure_unit\":\"ms(assumed)\"}}",
-                        c.index, c.name, c.exposure
+                        "{{\"index\":{},\"name\":{},\"exposure\":{},\"exposure_unit\":\"ms(assumed)\"}}",
+                        c.index,
+                        json_str(&c.name),
+                        json_num(c.exposure)
                     )
                 })
                 .collect();
@@ -545,7 +600,7 @@ fn run_convert(strict_lossless: bool, channel_json: &str, resume: Option<ResumeP
             let warnings: Vec<String> =
                 r.warnings.iter().map(|w| format!("\"{w}\"")).collect();
             format!(
-                "{{{}\"format\":\"{}\",\"output_bytes\":{},\"width\":{},\"height\":{},\"ifd_count\":{},\"tiles_raw_copied\":{},\"tiles_reencoded\":{},\"resumed\":{},\"warnings\":[{}]}}",
+                "{{{}\"format\":\"{}\",\"output_bytes\":{},\"width\":{},\"height\":{},\"ifd_count\":{},\"tiles_raw_copied\":{},\"tiles_reencoded\":{},\"resumed\":{},\"channels\":{},\"warnings\":[{}]}}",
                 companion_json_warning,
                 r.format,
                 r.output_bytes,
@@ -555,6 +610,7 @@ fn run_convert(strict_lossless: bool, channel_json: &str, resume: Option<ResumeP
                 r.count_raw_copied(),
                 r.count_reencoded(),
                 resume.is_some(),
+                channels_report_json(&r.channels),
                 warnings.join(",")
             )
         }

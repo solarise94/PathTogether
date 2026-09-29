@@ -19,6 +19,17 @@
 - 容器未设 `BAIDU_IMPORT_STAGING_DIR`：旧百度执行器的本地下载在**容器 /tmp**（不在卷上），换容器后
   不可见；盘点须在旧容器内看，或视为随旧容器一并消失（不占卷容量）。
 
+### 1.1 生产只读盘点（2026-09-30 00:13，记录：`docs/review-evidence/slide-tools/C6/prod-inventory-20260930.md`）
+
+- `conversion_jobs` **0 行**：生产从未产生后端转换任务；无转换暂存树、平铺源、unknown `.staging` 目录；
+  文件扫描完整。report **GO**。
+- 百度：1 个 `failed` 批次（无预约、`cleanup_state=not_needed`），无在途批次；旧容器
+  `/tmp/baidu-import-staging` 不存在。
+- 旧容器实际在跑 `conversion_worker` 与 `baidu_import_worker`；env 显式 `BAIDU_IMPORT_WORKER=1`，
+  `CONVERSION_WORKER` 未设（缺省开）。`deploy.py prepare` 会把旧 env 带进新 release。
+- 上传侧（R16 范围）：1 个 2026-09-18 起停滞的 `active` 旧上传任务，预约 `reserved` 1,287,867,278 B 且已
+  过期——窗口内由上传排空/核账收口。
+
 ## 2. 盘点清单（工具输出 → 窗口判定）
 
 | 类别 | 工具 section / 码 | 窗口前必须为零 | 说明 |
@@ -39,62 +50,81 @@
 
 | 路线 | 适用 | 新镜像需要的改动 | 代价 |
 |---|---|---|---|
-| **R1：先发当前代码，再发 B** | 希望 C0–C5 功能早上线；把 12 个迁移与「删除」拆成两次风险 | 一个**新建转换关闭闸**：`POST /api/ingestions` 拒绝 KFB/KFBF conversion 形态（引导到 `/tools/slides`，零 COS 对象/零预约）；`POST /api/conversions/<id>/retry` 关闭；百度进程内执行器保持关闭（插件执行）。转换 worker 可保持运行作兜底（应无任务） | 小改动 + 测试；闸本身是 B 的子集，不白做 |
+| **R1：先发当前代码，再发 B**（**2026-09-30 用户选定**） | 希望 C0–C5 功能早上线；把 12 个迁移与「删除」拆成两次风险 | **新建转换关闭闸**（已实现 c08fef7）：`POST /api/ingestions` 对 KFB/KFBF 返回 422 `conversion_moved_to_browser` + 工具页地址（不建行/不占预约/不发凭证）；`POST /api/conversions/<id>/retry` 410；上传 capability 把这些格式列在 `browser_convert`。闸是模块常量，不读 env。**新部署必须 `CONVERSION_WORKER=0`、`BAIDU_IMPORT_WORKER=0`**（镜像缺省已关，但 release env 须显式写 0——旧 env 带 `BAIDU_IMPORT_WORKER=1`）；百度由插件执行。加一键「转换并上传」（§3.1） | 小改动 + 测试；闸本身是 B 的子集，不白做 |
 | **R2：等 C7，直接发 B** | 不急于上线；接受一次性大窗口 | 无（B 已删除创建路径） | 12 个迁移 + 删除同窗；回滚面更大 |
 
-建议 **R1**：迁移窗口只承担 schema 升级与新功能，删除另起一次窗口；闸的改动量小且 B 必然包含。
-F3（FS 发布后、结算前崩溃时重转 fail-closed）只影响在新镜像里执行的转换；R1 下新镜像不应再有
-转换任务，F3 不是窗口阻断，随 C7 删除一并消失（若 R1 期间仍允许转换，则必须先修 F3）。
+**R1 已选定**：迁移窗口只承担 schema 升级与新功能，删除另起一次窗口。F3（FS 发布后、结算前崩溃时
+重转 fail-closed）只影响在新镜像里执行的转换；R1 下新镜像既不建转换任务也不运行转换 worker，所以 F3
+不是窗口阻断，随 C7 删除一并消失。转换 worker 若在新部署里开着，这个前提就不成立——这是
+`CONVERSION_WORKER=0` 必须写死在 release env 的原因。
 
-## 4. 窗口步骤（R1 与 R2 共用，差别只在第 7 步的镜像）
+## 4. 窗口步骤（R1）
 
-窗口前（白天，只读，需授权）：
+原则：
+- **写者围栏**：迁移与核账期间，任何后台写者都不运行。旧镜像的写者随旧容器停止；新镜像的写者不只
+  是入口脚本拉起的 worker，还有 gunicorn 进程内的 daemon（producer 导入 sweep、删除执行器、AI
+  预算回收/绑定重试、保留期清理）——所以**迁移、盘点、核账都用一次性容器**（覆盖启动命令，不经
+  `docker_entry.sh`），核账通过之前不启动正式容器。
+- **可恢复备份先于任何破坏性动作**（删除残留、核账修复、迁移）。
+- **库快照不让在线文件扫描原子化**：写者全停后再跑最终盘点，以它为准。
 
-1. **生产只读盘点**：用新镜像单跑工具，不经入口脚本（`CMD` 可覆盖，不会触发迁移）：
-   `podman run --rm --network host -e DATABASE_URL=… -v <uploads 卷>:/data/uploads:ro
-   -v <输出目录>:/out <新镜像> python3 scripts/conversion_drain.py inventory
-   --upload-dir /data/uploads --json /out/inv.json`
-   （库连接由工具设为 `READ ONLY` 事务；上传卷只读挂载）。另在旧容器内 `ls /tmp/baidu-import-staging`。
-   按 §2 得出计数；据此确认 R1/R2 与窗口时长。
-2. **迁移演练**：按既有 recipe 取生产 schema-only dump + `schema_migrations`，本地套 0066–0077，
-   断言新对象与重跑幂等。
+窗口前（白天，只读，已授权部分已完成——见 §1.1）：
+
+1. 生产只读盘点：一次性容器 `--entrypoint python3`、`--read-only`、代码与上传卷 `:ro`、独立输出目录；
+   工具自身 `READ ONLY` 事务。旧容器内另行列出 `/tmp/baidu-import-staging` 与进程。
+2. 迁移演练：生产 schema-only dump + `schema_migrations` 本地套 0066–0077，断言新对象与重跑幂等。
+3. 准备 release：`deploy.py` 的 release env 显式 `CONVERSION_WORKER=0`、`BAIDU_IMPORT_WORKER=0`
+   （`prepare` 从旧容器 env 生成 .env——两项须进 EXTRA_ENV 白名单并覆盖旧值，shape 对比同步）；
+   插件 bundle 与来源策略 pin 就位。
 
 窗口内：
 
-3. **停新建**：边缘对上传/百度建批/转换重试返回维护提示（其余只读访问可保留）。
-4. **排空（旧镜像）**：等旧转换 worker 把 queued/converting 跑完；百度：进程内执行器若开着，等
-   在途批次终态，否则对 queued 批次二选一——留给插件执行（新世界 claim）或经用户面取消。
-   每 5 分钟跑一次 `report`（旧库形态），直到阻断只剩 §2「是否必须为零 = 否」的项。
-   超过预定时长仍不收口 → **no-go，结束窗口、恢复服务**（未做任何写，零部分状态）。
-5. **一次性残留清理**（F2 无运行时入口的项）：按 `report --json` 的 id 清单逐项删除取消任务树/
-   平铺源，删前核对状态仍为 cancelled；记录删除清单。
-6. **快照 BEFORE**：`inventory --json before.json`；停旧容器；**备份**（pg_dump 全库 + 上传卷元数据
-   清单 + 旧容器 env/镜像 tag）。
-7. 启动新镜像（自动迁移 0066–0077）→ 健康检查 → 插件安装 `approvePermissions:["slide:import"]` →
-   `report`（新库形态）与 `reconcile_upload_capacity` → **快照 AFTER** → `compare before.json
-   after.json` 必须零漂移。
-8. 通过则开放流量；任一步失败走 §5。
+4. **停新建**：边缘对上传、百度建批、转换重试返回维护提示；只读访问可保留。
+5. **排空（旧镜像，写者仍在）**：旧转换 worker/百度执行器跑完在途任务（按 §1.1 预期为零）；每 5 分钟
+   `report`，直到阻断只剩「是否必须为零 = 否」的项。超时不收口 → no-go，恢复服务（此前零写入）。
+6. **停旧容器**（全部旧写者随之停止）；确认无残留进程。
+7. **最终盘点（权威）**：一次性容器跑 `conversion_drain.py inventory --json before.json` 与 `report`
+   （旧库形态；`upload_drain.py` 依赖 0071 之后的表，放到步骤 11）。写者已停，文件扫描不再与写入
+   竞争；`inventory` 非零（含扫描不完整）即 no-go。
+8. **备份**：pg_dump 全库；上传卷、`share`、`plugins` 等卷的元数据清单（路径、大小、mtime）；将要删除
+   或修复的对象（步骤 9 的清单）按原路径复制到备份目录；旧容器 env 与镜像 tag。**校验备份可读后**
+   才进入下一步。
+9. **破坏性收口**（按步骤 7 的 id 清单，逐项核对状态后执行并记录）：F2 无运行时入口的残留（转换侧
+   按 §1.1 预期为零）。旧上传任务的停滞预约**不在旧库上修**——迁移后由核账工具处理（步骤 11）。
+10. **迁移（一次性容器，无写者）**：`--entrypoint python3` 执行与 `docker_entry.sh` 相同的
+    `pg_store.ensure_schema` 片段；随后重跑一次确认无新迁移（幂等）。
+11. **迁移后核账（一次性容器，无写者）**：`conversion_drain.py report` 与 `inventory --json after.json`、
+    `compare before.json after.json`（零漂移）、`reconcile_upload_capacity`（按 R16 的 stop/repair 处理
+    停滞旧上传任务，每个动作留回执）、`upload_drain.py report` 必须 GO。任一失败 → §5「开放流量前」回滚。
+12. **启动正式容器**（release env，入口脚本重跑 `ensure_schema` 为无操作）→ 健康检查 → 确认容器内
+    无 `conversion_worker` / `baidu_import_worker` 进程 → 插件安装 `approvePermissions:["slide:import"]`
+    → 再跑一次 `report`。
+13. 开放流量。
 
 ## 5. 回滚
 
-- **开放流量前**（第 7 步任意失败）：停新容器 → 用第 6 步 pg_dump 恢复库（新迁移随之撤销）→
-  启动旧容器（`deploy.py rollback`：恢复旧容器与插件链接）。新镜像在窗口内写入的文件只可能是
-  迁移产物/空目录，按清单删除。旧任务已在第 4 步排空，回滚不会让旧 worker 重新领取任何东西。
+- **开放流量前**（步骤 10–12 任一失败）：停新容器 → 用步骤 8 的 pg_dump 恢复库（新迁移随之撤销）→
+  按步骤 8 的副本恢复步骤 9 删除/修改过的对象 → 启动旧容器（`deploy.py rollback`：恢复旧容器与插件
+  链接）。新镜像在窗口内写入的文件只可能是迁移产物/空目录，按清单删除。旧任务已在步骤 5 排空，
+  回滚不会让旧 worker 重新领取任何东西。
 - **开放流量后**：不做库回退（会丢用户新写入）。优先前滚修复；若必须回退，只能用「理解已迁移
   责任的兼容版本」，不可回到会再次领取插件已接管批次的旧执行器（计划 §11）。
 - R1 → B 的第二次窗口：回滚目标是 R1 镜像（同 schema），不涉及迁移回退。
 
-## 6. C7 前必须由用户裁决的事项
+## 6. C7 前的裁决（2026-09-30 用户已定）与由此产生的工作
 
-1. **源字节计费（F1）**：转换源在上传/批次收口时计入 `used_bytes`，删除产物只退产物字节，源侧
-   永不退款。选项：接受既成计费；或 C7 引入源侧退款（旧库无 slides 记账列时只能按预约
-   `settled_bytes`）。工具给出逐用户 `live / charged_never_refundable / undetermined`。
-2. **保留源策略**：ready 任务的源长期保留（产物删除时连带删除）。C7 删除转换代码前，要么把
-   「产物 → 源文件」关系迁到通用来源/清理记录，要么一次性清理保留源（与第 1 项一起定）。
-3. **失败任务的保留源与作废产物包**（`failed_source_retained` / `failed_product_bundle_present`）：
-   退役后无重试入口，是否一次性清理。
-4. **百度终态批次的远端副本义务**（`baidu_remote_cleanup_pending|failed`）：进程内执行器退役后
-   由插件承担，还是接受残留在用户网盘（不占平台容量）。
+1. **纠正过时的源字节计费**：对「已证明计费、且文件已删除」的源恢复配额。每笔调整有可审计、幂等的
+   回执；不得按聚合残差或不确定分类（`undetermined`）计算额度。
+2. **保留源进入通用来源记录**：独立于转换运行时保存 owner、产物关系、位置、计费与清理状态；删除源时
+   恰好一次释放其已证明的计费。
+3. **清理已确认的孤儿产物与过时临时文件**。失败任务的源文件在通用记录下保持可恢复，直到被显式放弃
+   或移交；「任务失败」本身不足以证明其输入可丢弃。
+4. **插件负责未完成的百度副本清理**：义务转入持久、可重试的记录，失败回报平台；清理只针对记录在案的
+   应用创建副本，不触碰用户原始文件。
+
+这些是 C7 删除前的实现工作（新增通用来源/清理记录、回执化的计费纠正、插件侧清理义务）。按 §1.1，
+生产当前没有转换源、保留源或百度副本义务，因此它们不阻断 R1 窗口；R1 期间也不会产生新的转换源
+（服务端不再建转换任务）。C7 仍须对全部历史计费逐项证明后再调整。
 
 ## 7. 本地演练覆盖（证据见 c6-drain-report §3–§4）
 

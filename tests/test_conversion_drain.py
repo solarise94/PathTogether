@@ -925,7 +925,7 @@ def test_legacy_schema_inventory(tmp_path, _c6_dirs):
                     "upload_id, source_name, source_sha256, source_format, "
                     "canonical_name, converter_id, converter_version, state, "
                     "attempt, canonical_settled_bytes, finished_at) VALUES "
-                    "('cvj_old_ready', 'c6old', NULL, 'old2.kfb', %s, "
+                    "('cvj_old_ready', 'c6old', 'upt_old', 'old2.kfb', %s, "
                     "'kfb_bf_v1', 'old2.tif', 'kfb-bf', '1', 'ready', 1, 400,"
                     " now())", ("cd" * 32,))
                 cur.execute(
@@ -957,6 +957,19 @@ def test_legacy_schema_inventory(tmp_path, _c6_dirs):
                     "user_id, reserved_bytes, state, expires_at, "
                     "settled_at, settled_bytes) VALUES ('upr_old', 'c6old', "
                     "100, 'consumed', now() + interval '1 hour', now(), 100)")
+                # 旧上传任务结算的转换源（300 B）：0065 无产物身份
+                cur.execute(
+                    "INSERT INTO upload_reservations (reservation_id, "
+                    "user_id, reserved_bytes, state, expires_at, "
+                    "settled_at, settled_bytes) VALUES ('upr_old_src', "
+                    "'c6old', 300, 'consumed', now() + interval '1 hour', "
+                    "now(), 300)")
+                cur.execute(
+                    "INSERT INTO upload_tasks (upload_id, owner_user_id, "
+                    "filename, safe_name, declared_size, chunk_size, "
+                    "expires_at, reservation_id, state) VALUES ('upt_old', "
+                    "'c6old', 'old2.kfb', 'old2.kfb', 300, 300, now() + "
+                    "interval '1 hour', 'upr_old_src', 'committed')")
             conn.commit()
         finally:
             conn.close()
@@ -1003,6 +1016,12 @@ def test_legacy_schema_inventory(tmp_path, _c6_dirs):
         assert open_job["slide_id"] is None and open_job["has_intent"] is False
         # 台账退化为 used_bytes；源计费旧库只能从预约连接推导
         assert doc["ledger"]["per_user"][0]["used_bytes"] == 500
+        # ready 旧任务无产物身份（0065 无 slide_id/slides 记账）：源计费只能
+        # 记 undetermined，不能判「永不退款」
+        charges = doc["source_charges"]["per_user"]["c6old"]
+        assert charges["undetermined"] == 300
+        assert charges["charged_never_refundable"] == 0
+        assert charges["live"] == 0
 
         blockers = _drain_tool().derive_blockers(doc)
         codes = {b["code"] for b in blockers}
@@ -1116,3 +1135,67 @@ def test_compare_prints_reservation_change_count(capsys):
     out = capsys.readouterr().out
     assert "预约变化（1 项）" in out
     assert "reserved→released" in out
+
+
+# --------------------------------------------------------------------------- #
+# 扫描不完整必须 NO-GO（不得把读不到当作 0 字节 / 无残留）
+# --------------------------------------------------------------------------- #
+def test_unreadable_directory_makes_scan_incomplete(tmp_path, _c6_dirs):
+    if os.geteuid() == 0:
+        pytest.skip("root 忽略目录权限，无法构造读失败")
+    tool = _drain_tool()
+    up = _c6_dirs["upload_dir"]
+    h._mk_user("c6scan")
+    j = _mk_job("c6scan", "scan.kfb")
+    _stage_src(j["id"], b"s" * 64, up)
+    conversion_store.invalidate_by_slide_id(j["slide_id"])  # cancelled + 残留
+    src = conversion_worker.source_staging_dir(j["id"], str(up))
+    bs = Path(_c6_dirs["baidu_staging"])
+    hidden = bs / "bib_unreadable" / "inner"
+    hidden.mkdir(parents=True)
+    (hidden / "big.kfb").write_bytes(b"x" * 128)
+    locked = [src, hidden]
+    for d in locked:
+        os.chmod(d, 0)
+    try:
+        conn = tool._connect()
+        try:
+            doc = tool.collect(conn, up, bs)
+        finally:
+            conn.close()
+        errors = doc["files"]["scan_errors"]
+        assert {Path(e["path"]) for e in errors} >= {
+            slide_storage.staging_task_dir(j["id"], root=str(up)),
+            bs / "bib_unreadable"}
+        entry = {e["id"]: e for e in doc["files"]["conversion_staging"]}
+        assert entry[j["id"]]["classification"] == "scan_failed"
+        assert "source_bytes" not in entry[j["id"]]
+        bentry = {b["dir"]: b for b in doc["files"]["baidu_staging"]}
+        assert bentry["bib_unreadable"]["bytes"] is None
+        assert bentry["bib_unreadable"]["classification"] == "scan_failed"
+        assert doc["files"]["scan_complete"] is False
+        codes = {b["code"] for b in tool.derive_blockers(doc)}
+        assert "file_scan_incomplete" in codes
+
+        rc, _out = _tool_main(tool, ["inventory"] + _inv_argv(
+            _c6_dirs, tmp_path / "i.json"))
+        assert rc == 3
+        rc, out = _report(tool, _c6_dirs)
+        assert rc == 3 and "file_scan_incomplete" in out
+    finally:
+        for d in locked:
+            os.chmod(d, 0o755)
+
+
+def test_ready_charge_without_product_row_is_undetermined():
+    tool = _drain_tool()
+    job = {"state": "ready", "slide_id": None}
+    assert tool._source_charge_state(job, {}) == "undetermined"
+    job = {"state": "ready", "slide_id": "sld_missing"}
+    assert tool._source_charge_state(job, {}) == "undetermined"
+    slides = {"sld_x": {"asset_state": "deleted"}}
+    assert tool._source_charge_state({"state": "ready", "slide_id": "sld_x"},
+                                     slides) == "charged_never_refundable"
+    slides = {"sld_x": {"asset_state": "ready"}}
+    assert tool._source_charge_state({"state": "ready", "slide_id": "sld_x"},
+                                     slides) == "live"

@@ -25,6 +25,12 @@
 > - 迁移/排空计划与 A 构建判定见 [c6-migration-drain-plan.md](c6-migration-drain-plan.md)：0067 不回填
 >   旧转换任务 `slide_id`，新 worker 对其 fail-closed ⇒ 旧任务只能在旧镜像排空，A 不需要保留执行能力。
 
+> **用户复审修订（2026-09-30）**：文件扫描任何读失败（权限/IO）记入 `files.scan_errors`，条目归类
+> `scan_failed`、字节为 None；report 出阻断 `file_scan_incomplete`，inventory exit 3（此前 `os.walk`
+> 静默跳过不可读目录，返回 0 字节）。ready 任务无产物身份（0065 无 `slide_id`/slides 记账、或资产行
+> 不可见）时源计费记 `undetermined`（此前误判 `charged_never_refundable`）。新增 2 个用例 + 旧库计费断言，
+> 均已确认在旧实现上失败。
+
 ## 1. 交付物
 
 新增：

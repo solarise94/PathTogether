@@ -52,6 +52,8 @@
   reconcile_scan_failed        核账证据扫描失败（不把少扫描当没有数据）
   live_lock_holder             --probe-locks 探测到任务存储锁有活跃持有者
                                （排空窗口内不应有 worker 持锁）
+  file_scan_incomplete         文件证据读失败（权限/IO）：相关字节未知，
+                               不得当作 0 或「无残留」（inventory 同时 exit 3）
 
 非阻断（列出、不裁决）：queued/无人领取与 plugin: 租约的批次（插件工作）；
 failed 任务源缺失与产物/项目关联未收口（cleanup/decision，退役决策项）；
@@ -78,7 +80,7 @@ consume 的源字节合计）移动。因此
   python3 scripts/conversion_drain.py report   [同上选项]
   python3 scripts/conversion_drain.py compare  BEFORE.json AFTER.json
 
-退出码：0 = 通过/GO；3 = no-go/发现漂移；2 = 用法错误。
+退出码：0 = 通过/GO；3 = no-go/发现漂移/inventory 扫描不完整；2 = 用法错误。
 """
 
 from __future__ import annotations
@@ -89,6 +91,7 @@ import errno
 import fcntl
 import json
 import os
+import stat as _stat
 import sys
 from pathlib import Path
 
@@ -411,21 +414,32 @@ def _section_baidu(cur, schema, db_now):
             "reservations": reservations, "anomalies": anomalies}
 
 
+class ScanError(Exception):
+    """文件证据扫描不完整（权限/IO 错误）。字节数不可信，调用方记为
+    scan_failed——绝不当作 0 字节或「没有残留」。"""
+
+
+def _raise_scan(exc):
+    raise ScanError("%s: %s" % (getattr(exc, "filename", "?"), exc))
+
+
 def _tree_bytes(path):
-    """目录内常规文件总字节（不跟随符号链接；符号链接单独计数）。"""
+    """目录内常规文件总字节（不跟随符号链接；符号链接单独计数）。任何
+    子目录/文件读不到都抛 ScanError（os.walk 缺省会静默跳过）。"""
     total = 0
     links = 0
-    for root, dirs, names in os.walk(path, followlinks=False):
-        for n in names:
-            p = Path(root) / n
-            if p.is_symlink():
-                links += 1
-                continue
-            try:
+    try:
+        for root, dirs, names in os.walk(path, followlinks=False,
+                                         onerror=_raise_scan):
+            for n in names:
+                p = Path(root) / n
+                if p.is_symlink():
+                    links += 1
+                    continue
                 total += p.stat().st_size
-            except OSError:
-                continue
-        dirs[:] = [d for d in dirs if not (Path(root) / d).is_symlink()]
+            dirs[:] = [d for d in dirs if not (Path(root) / d).is_symlink()]
+    except OSError as exc:
+        _raise_scan(exc)
     return total, links
 
 
@@ -446,6 +460,9 @@ def _flat_source_names(cur, schema):
 
 
 def _section_files(cur, schema, upload_dir, baidu_staging_dir, probe_locks):
+    """文件证据（只 stat/listdir）。任何读失败记入 ``scan_errors``，相关条目
+    归类 ``scan_failed``、字节为 None——report 据此 NO-GO，inventory 非零退出
+    （不完整的扫描不能当作权威盘点）。"""
     feat = schema["features"]
     upload_dir = Path(upload_dir)
     jobs = {}
@@ -454,81 +471,31 @@ def _section_files(cur, schema, upload_dir, baidu_staging_dir, probe_locks):
                 _q(cur, "SELECT * FROM conversion_jobs")}
     flat_names = _flat_source_names(cur, schema)
 
+    scan_errors = []
     out = {"upload_dir": str(upload_dir),
-           "baidu_staging_dir": str(baidu_staging_dir)}
+           "baidu_staging_dir": str(baidu_staging_dir),
+           "scan_errors": scan_errors}
+
+    def failed(path, exc):
+        scan_errors.append({"path": str(path), "error": str(exc)})
 
     # (a) 每个转换任务的 .staging/<cvj_id>/ 树：source/ + 代次目录
-    conv_staging = []
     staging_root = upload_dir / ".staging"
-    dir_names = sorted(os.listdir(staging_root)) if staging_root.is_dir() \
-        else []
+    dir_names = []
+    try:
+        if staging_root.is_dir():
+            dir_names = sorted(os.listdir(staging_root))
+    except OSError as exc:
+        failed(staging_root, exc)
+    conv_staging = []
     for jid, job in jobs.items():
-        task_dir = staging_root / jid
-        if not task_dir.is_dir():
-            entry = {"id": jid, "state": job["state"], "dir_present": False}
-        else:
-            src_dir = task_dir / "source"
-            source_present = src_dir.is_dir() and any(
-                True for _ in src_dir.iterdir())
-            source_bytes = _tree_bytes(src_dir)[0] if src_dir.is_dir() else 0
-            attempts = []
-            stray = []
-            for child in sorted(task_dir.iterdir()):
-                if child == src_dir:
-                    continue
-                if child.is_dir():
-                    attempts.append({"name": child.name,
-                                     "bytes": _tree_bytes(child)[0]})
-                else:
-                    stray.append({"name": child.name,
-                                  "bytes": child.stat().st_size})
-            entry = {"id": jid, "state": job["state"], "dir_present": True,
-                     "source_present": source_present,
-                     "source_bytes": source_bytes,
-                     "attempt_dirs": attempts, "stray_files": stray}
-        # 平铺源回退（resolve_source 分支 3：百度 convert 路径写平铺源）
-        flats = []
-        for name, jids in flat_names.items():
-            if jid in jids:
-                p = upload_dir / name
-                flats.append({"name": name, "exists": p.is_file(),
-                              "bytes": p.stat().st_size if p.is_file()
-                              else None})
-        entry["flat_sources"] = flats
-        # 产物包（objects/<slide_id>/）：终态失败任务若仍有完整包在盘——典型
-        # 是「FS 发布后、结算前崩溃」被重转 fail-closed（资产 failed、包保留
-        # 待人工核对）——是需要处置的存储占用，不计 used_bytes
-        sid = (job.get("slide_id") or "").strip() \
-            if feat["conversion_slide_id"] else ""
-        if sid and job.get("state") == "failed":
-            bdir = upload_dir / "objects" / sid
-            if bdir.is_dir():
-                entry["product_bundle_bytes"] = _tree_bytes(bdir)[0]
-        entry["has_any_source"] = bool(entry.get("source_present")) or \
-            any(f["exists"] for f in flats)
-        state = job["state"]
-        if state == "cancelled":
-            content = bool(entry.get("source_present")) or \
-                bool(entry.get("attempt_dirs")) or bool(entry.get("stray_files"))
-            entry["classification"] = "residue_cancelled_job" if content \
-                else "clean"
-        elif state in _CONVERSION_TERMINAL_STATES:
-            if entry.get("attempt_dirs") or entry.get("stray_files"):
-                entry["classification"] = "residue_attempt_dir"
-            elif not entry["has_any_source"]:
-                entry["classification"] = \
-                    "source_missing_%s" % state  # failed/ready
-            else:
-                entry["classification"] = "expected_source_retained"
-        else:  # open（held/queued/converting/validating）
-            if not entry["has_any_source"]:
-                entry["classification"] = ("held_handoff_pending"
-                                           if state == "held"
-                                           else "source_missing_open")
-            elif state == "held":
-                entry["classification"] = "held_in_handoff"
-            else:
-                entry["classification"] = "expected_open"
+        try:
+            entry = _conversion_staging_entry(
+                jid, job, staging_root, upload_dir, flat_names, feat)
+        except (OSError, ScanError) as exc:
+            failed(staging_root / jid, exc)
+            entry = {"id": jid, "state": job["state"],
+                     "classification": "scan_failed"}
         conv_staging.append(entry)
     out["conversion_staging"] = conv_staging
 
@@ -537,48 +504,64 @@ def _section_files(cur, schema, upload_dir, baidu_staging_dir, probe_locks):
     for name, jids in sorted(flat_names.items()):
         p = upload_dir / name
         states = sorted({jobs[j]["state"] for j in jids if j in jobs})
-        classification = None
-        if p.is_file():
-            if states and all(s == "cancelled" for s in states):
-                classification = "residue_flat_source"
-            else:
-                classification = "retained_or_inflight_flat_source"
-        else:
+        try:
+            size = _file_size(p)
+        except OSError as exc:
+            failed(p, exc)
+            flat_sources.append({"name": name, "exists": None, "bytes": None,
+                                 "referenced_by_states": states,
+                                 "classification": "scan_failed"})
+            continue
+        if size is None:
             classification = "absent"
-        flat_sources.append({"name": name, "exists": p.is_file(),
-                             "bytes": p.stat().st_size if p.is_file()
-                             else None,
-                             "referenced_by_states": states,
+        elif states and all(st == "cancelled" for st in states):
+            classification = "residue_flat_source"
+        else:
+            classification = "retained_or_inflight_flat_source"
+        flat_sources.append({"name": name, "exists": size is not None,
+                             "bytes": size, "referenced_by_states": states,
                              "classification": classification})
     out["flat_sources"] = flat_sources
 
     # (c) 百度本地暂存 STAGING_ROOT/<batch_id>/
-    baidu_staging = []
     batch_states = {}
     if feat["baidu_tables"]:
         batch_states = {b["id"]: b for b in _q(
             cur, "SELECT id, state, cleanup_state FROM "
             "baidu_import_batches")}
     bs_root = Path(baidu_staging_dir)
-    out["baidu_staging_dir_present"] = bs_root.is_dir()
-    if bs_root.is_dir():
-        for name in sorted(os.listdir(bs_root)):
-            d = bs_root / name
+    baidu_staging = []
+    try:
+        present = bs_root.is_dir()
+        names = sorted(os.listdir(bs_root)) if present else []
+    except OSError as exc:
+        failed(bs_root, exc)
+        present, names = None, []
+    out["baidu_staging_dir_present"] = present
+    for name in names:
+        d = bs_root / name
+        batch = batch_states.get(name)
+        try:
             if not d.is_dir():
                 continue
             nbytes, links = _tree_bytes(d)
-            batch = batch_states.get(name)
-            if batch is None:
-                cls = "baidu_staging_unknown"
-            elif batch["state"] in _BAIDU_TERMINAL_STATES:
-                cls = "baidu_staging_residue" if nbytes > 0 else "clean"
-            else:
-                cls = "inflight_work"
-            baidu_staging.append({"dir": name, "bytes": nbytes,
-                                  "symlinks": links,
+        except (OSError, ScanError) as exc:
+            failed(d, exc)
+            baidu_staging.append({"dir": name, "bytes": None,
                                   "batch_state":
                                   batch["state"] if batch else None,
-                                  "classification": cls})
+                                  "classification": "scan_failed"})
+            continue
+        if batch is None:
+            cls = "baidu_staging_unknown"
+        elif batch["state"] in _BAIDU_TERMINAL_STATES:
+            cls = "baidu_staging_residue" if nbytes > 0 else "clean"
+        else:
+            cls = "inflight_work"
+        baidu_staging.append({"dir": name, "bytes": nbytes,
+                              "symlinks": links,
+                              "batch_state": batch["state"] if batch else None,
+                              "classification": cls})
     out["baidu_staging"] = baidu_staging
 
     # (d) .staging 下不归属任何已知表 id 的目录
@@ -598,45 +581,133 @@ def _section_files(cur, schema, upload_dir, baidu_staging_dir, probe_locks):
     if feat["slides_asset_accounting"]:
         known |= {r["slide_id"] for r in _q(
             cur, "SELECT slide_id FROM slides WHERE slide_id IS NOT NULL")}
-    unknown = [{"dir": n, "classification": "unknown_staging_dir"}
-               for n in dir_names if n not in known]
-    out["unknown_staging_dirs"] = unknown
+    out["unknown_staging_dirs"] = [
+        {"dir": n, "classification": "unknown_staging_dir"}
+        for n in dir_names if n not in known]
 
     # (e) 任务存储锁（--probe-locks 时只读探测既有锁文件，绝不创建）
     locks = []
     lock_root = upload_dir / ".task-locks"
-    if lock_root.is_dir():
-        for kind in _LOCK_KINDS:
-            kdir = lock_root / kind
-            if not kdir.is_dir():
+    for kind in _LOCK_KINDS:
+        kdir = lock_root / kind
+        try:
+            names = sorted(os.listdir(kdir)) if kdir.is_dir() else []
+        except OSError as exc:
+            failed(kdir, exc)
+            continue
+        for name in names:
+            if not name.endswith(".lock"):
                 continue
-            for name in sorted(os.listdir(kdir)):
-                if not name.endswith(".lock"):
-                    continue
-                entry = {"kind": kind, "task_id": name[:-len(".lock")]}
-                if probe_locks:
-                    fd = None
-                    try:
-                        fd = os.open(str(kdir / name), os.O_RDONLY)
-                        try:
-                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                            fcntl.flock(fd, fcntl.LOCK_UN)
-                            entry["holder"] = "free"
-                        except OSError as exc:
-                            if exc.errno in (errno.EACCES, errno.EAGAIN,
-                                             errno.EWOULDBLOCK):
-                                entry["holder"] = "live_holder"
-                            else:
-                                entry["holder"] = "probe_error:%s" % exc.errno
-                    except OSError as exc:
-                        entry["holder"] = "open_error:%s" % exc.errno
-                    finally:
-                        if fd is not None:
-                            os.close(fd)
-                locks.append(entry)
+            entry = {"kind": kind, "task_id": name[:-len(".lock")]}
+            if probe_locks:
+                entry["holder"] = _probe_lock(kdir / name)
+            locks.append(entry)
     out["locks"] = locks
     out["probe_locks"] = bool(probe_locks)
+    out["scan_complete"] = not scan_errors
     return out
+
+
+def _file_size(path):
+    """常规文件大小；不存在返回 None；其余读错误（权限等）抛 OSError。"""
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    except NotADirectoryError:
+        return None
+    return st.st_size if _stat.S_ISREG(st.st_mode) else None
+
+
+def _probe_lock(path):
+    fd = None
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return "free"
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                return "live_holder"
+            return "probe_error:%s" % exc.errno
+    except OSError as exc:
+        return "open_error:%s" % exc.errno
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _conversion_staging_entry(jid, job, staging_root, upload_dir,
+                              flat_names, feat):
+    """单个转换任务的 .staging 树证据与分类（任一读失败向上抛）。"""
+    task_dir = staging_root / jid
+    if not task_dir.is_dir():
+        entry = {"id": jid, "state": job["state"], "dir_present": False}
+    else:
+        src_dir = task_dir / "source"
+        source_bytes = 0
+        source_present = False
+        if src_dir.is_dir():
+            source_present = bool(os.listdir(src_dir))
+            source_bytes = _tree_bytes(src_dir)[0]
+        attempts = []
+        stray = []
+        for child in sorted(task_dir.iterdir()):
+            if child == src_dir:
+                continue
+            if child.is_dir():
+                attempts.append({"name": child.name,
+                                 "bytes": _tree_bytes(child)[0]})
+            else:
+                stray.append({"name": child.name,
+                              "bytes": child.stat().st_size})
+        entry = {"id": jid, "state": job["state"], "dir_present": True,
+                 "source_present": source_present,
+                 "source_bytes": source_bytes,
+                 "attempt_dirs": attempts, "stray_files": stray}
+    # 平铺源回退（resolve_source 分支 3：百度 convert 路径写平铺源）
+    flats = []
+    for name, jids in flat_names.items():
+        if jid in jids:
+            size = _file_size(upload_dir / name)
+            flats.append({"name": name, "exists": size is not None,
+                          "bytes": size})
+    entry["flat_sources"] = flats
+    # 产物包（objects/<slide_id>/）：终态失败任务若仍有完整包在盘——典型是
+    # 「FS 发布后、结算前崩溃」被重转 fail-closed（资产 failed、包保留待人工
+    # 核对）——是需要处置的存储占用，不计 used_bytes
+    sid = (job.get("slide_id") or "").strip() \
+        if feat["conversion_slide_id"] else ""
+    if sid and job.get("state") == "failed":
+        bdir = upload_dir / "objects" / sid
+        if bdir.is_dir():
+            entry["product_bundle_bytes"] = _tree_bytes(bdir)[0]
+    entry["has_any_source"] = bool(entry.get("source_present")) or \
+        any(f["exists"] for f in flats)
+    state = job["state"]
+    if state == "cancelled":
+        content = bool(entry.get("source_present")) or \
+            bool(entry.get("attempt_dirs")) or bool(entry.get("stray_files"))
+        entry["classification"] = "residue_cancelled_job" if content \
+            else "clean"
+    elif state in _CONVERSION_TERMINAL_STATES:
+        if entry.get("attempt_dirs") or entry.get("stray_files"):
+            entry["classification"] = "residue_attempt_dir"
+        elif not entry["has_any_source"]:
+            entry["classification"] = "source_missing_%s" % state
+        else:
+            entry["classification"] = "expected_source_retained"
+    else:  # open（held/queued/converting/validating）
+        if not entry["has_any_source"]:
+            entry["classification"] = ("held_handoff_pending"
+                                       if state == "held"
+                                       else "source_missing_open")
+        elif state == "held":
+            entry["classification"] = "held_in_handoff"
+        else:
+            entry["classification"] = "expected_open"
+    return entry
 
 
 def _slide_states(cur, schema):
@@ -663,7 +734,11 @@ def _source_charge_state(job, slides):
     sid = (job.get("slide_id") or "").strip()
     srow = slides.get(sid) if sid else None
     if state == "ready":
-        if srow and srow.get("asset_state") in ("ready", "deleting"):
+        if srow is None:
+            # 无产物身份（0067 前旧库无 slide_id/slides 记账列）或资产行不可
+            # 见：没有产物状态的证据，不能判「永不退款」
+            return "undetermined"
+        if srow.get("asset_state") in ("ready", "deleting"):
             return "live"
         return "charged_never_refundable"
     if state in ("cancelled", "failed"):
@@ -1102,6 +1177,11 @@ def derive_blockers(doc):
                 "ids": [a["batch_id"] for a in anomalies]})
 
     files = doc.get("files") or {}
+    if files.get("scan_errors"):
+        blockers.append({
+            "code": "file_scan_incomplete",
+            "ids": [e["path"] for e in files["scan_errors"]],
+            "detail": {e["path"]: e["error"] for e in files["scan_errors"]}})
     residue_attempt = []
     residue_cancelled = []
     missing_open = []
@@ -1297,6 +1377,13 @@ def cmd_inventory(args):
     if args.json:
         _dump(doc, args.json)
         print("盘点 JSON 已写入 %s" % args.json)
+    errors = doc["files"].get("scan_errors") or []
+    if errors:
+        print("\n文件扫描不完整（%d 处读失败）——本盘点不可作为权威依据：" % len(errors),
+              file=sys.stderr)
+        for e in errors[:20]:
+            print("  - %s: %s" % (e["path"], e["error"]), file=sys.stderr)
+        return 3
     return 0
 
 

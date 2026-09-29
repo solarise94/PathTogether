@@ -74,3 +74,20 @@
 | 全量 pytest（串行，TMPDIR 指大盘；deselect 他人在途无关失败 1 条） | **2846 passed, 8 skipped**（首跑以 `-x` 在 Containerfile 用例停下 = §1 #8，修复后全量重跑；`results/pytest-full.txt`） |
 
 复跑命令见 `platform/RERUN.md`、`plugin/RERUN.md`。
+
+## 7. 补记：验收后发现的双重计费（2026-09-29，C6 演练中发现并修复）
+
+§1 #1 的修复（插件路径批次收口调用 `_finalize_batch`）引入了**双重计费**：插件路径每个条目的产物
+已由 producer 任务自身的 final 预约计费（`used_bytes += 产物字节`），批次收口又按 Σ ready 条目
+`source_size` consume 批次预算——native TIFF 经插件导入即被计两次。§6 集成用例当时断言批次预约
+`consumed`，把缺陷固化成了预期。
+
+修复：批次预算结算额只计**未经 producer 导入发布**的 ready 条目（`_chargeable_ready_bytes`；已发布
+producer 任务 = state published/done 且 `terminal_at` 为空）。进程内路径（native 产物不单独计费、转换
+路径源字节只在批次收口计费）与「进程内已 ready、插件接管收口」的交接场景仍按批次 consume。
+`_apply_cancel` 同口径，并修正「有 ready 但结算额为 0 时既不 consume 也不 release」的悬空分支。
+
+回归：集成 `test_worker_full_chain_against_real_app` 改为断言批次预约 `released`、用户
+`used_bytes == 产物 accounted_bytes`、`reserved_bytes == 0`（去掉修复即 `'consumed' == 'released'`
+失败）；新增 `test_plugin_finalize_charges_only_items_not_published_by_producer`（交接条目仍按源字节
+consume）。

@@ -1702,6 +1702,21 @@ def run_claimed_batch(claim, adapter, *, staging_root=None,
             hb.join(timeout=5)
 
 
+def _chargeable_ready_bytes(cur, batch_id):
+    """批次预算结算额：ready 条目源字节之和，**排除**已经 producer 导入发布的
+    条目——插件路径每个条目的产物已由 producer 任务自身的 final 预约计费，
+    再按批次 consume 就是双重计费；进程内路径（native 产物不单独计费、转换
+    路径源字节只在批次收口计费）仍按批次 consume。已发布的 producer 任务 =
+    state published/done 且 terminal_at 为空（取消/失败/过期才写 terminal_at）。"""
+    cur.execute(
+        "SELECT COALESCE(SUM(i.source_size),0)::bigint AS bytes "
+        "FROM baidu_import_items i WHERE i.batch_id=%s AND i.stage='ready' "
+        "AND NOT EXISTS (SELECT 1 FROM producer_imports p "
+        "WHERE p.slide_id=i.slide_id AND p.state IN ('published','done') "
+        "AND p.terminal_at IS NULL)", (batch_id,))
+    return int(cur.fetchone()["bytes"])
+
+
 def _apply_cancel(batch):
     """取消收口：停止未开始条目；有 ready 产物时批次落 partial_failed
     （成功产物不冒充失败也不删除）；无 ready 产物释放未消费预占。
@@ -1755,11 +1770,7 @@ def _apply_cancel(batch):
                     return False  # 新 worker 已接管：跳过配额收口
                 applied = True
                 reservation_id = batch["quota_reservation_id"]
-                cur.execute(
-                    "SELECT COALESCE(SUM(source_size),0)::bigint AS bytes "
-                    "FROM baidu_import_items WHERE batch_id=%s "
-                    "AND stage='ready'", (batch["id"],))
-                ready_bytes = int(cur.fetchone()["bytes"])
+                ready_bytes = _chargeable_ready_bytes(cur, batch["id"])
                 if reservation_id:
                     # 0072：批次终态 CAS 与配额收口**同一事务**（绑定预算
                     # 不被 TTL 回收，崩溃窗口内不得留「终态已落、结算未
@@ -1767,10 +1778,10 @@ def _apply_cancel(batch):
                     # 记日志放弃配额收口，不阻塞批次终态——账本以预约行
                     # 现状为准（终态 CAS 已 fenced，恰好一次）。
                     try:
-                        if has_ready and ready_bytes > 0:
+                        if ready_bytes > 0:
                             _consume_reservation(cur, reservation_id,
                                                  batch["id"], ready_bytes)
-                        elif not has_ready:
+                        else:
                             _release_reservation(cur, reservation_id,
                                                  batch["id"])
                     except upload_guard.ReservationInvalid:
@@ -1810,7 +1821,7 @@ def _finalize_batch(batch, adapter, worker_id, *, cleanup_copies=True):
                     "GROUP BY stage", (batch["id"],))
                 stats = {r["stage"]: (int(r["n"]), int(r["bytes"]))
                          for r in cur.fetchall()}
-                ready_n, ready_bytes = stats.get("ready", (0, 0))
+                ready_n = stats.get("ready", (0, 0))[0]
                 failed_n = stats.get("failed", (0, 0))[0]
                 cancelled_n = stats.get("cancelled", (0, 0))[0]
                 pending = sum(n for s, (n, _) in stats.items()
@@ -1836,7 +1847,7 @@ def _finalize_batch(batch, adapter, worker_id, *, cleanup_copies=True):
                     return False  # 条件更新未赢：跳过配额收口与清理
                 won = True
                 reservation_id = batch["quota_reservation_id"]
-                consumed_bytes = ready_bytes
+                consumed_bytes = _chargeable_ready_bytes(cur, batch["id"])
                 if reservation_id:
                     # 0072：批次终态与配额收口同一事务（同 _apply_cancel 的
                     # 崩溃窗口论证；consume 幂等，崩溃重跑不双扣）。

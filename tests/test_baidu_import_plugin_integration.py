@@ -219,15 +219,22 @@ def test_worker_full_chain_against_real_app(http_app, env, batch, kfb_bytes,
         "WHERE batch_id=%s ORDER BY created_at LIMIT 1", (batch_id,))
     assert item[0] == "ready"
     assert item[1] == slide_id
-    # 批次收口（末条 report 后平台同事务 finalize）：终态 + 批次预算
-    # 一次性 consume（与进程内 worker 同一 _finalize_batch）
+    # 批次收口（末条 report 后平台同事务 finalize）：终态 + 批次预算收口。
+    # 条目产物已由 producer 任务自身的 final 预约计费，批次预算只释放——
+    # 再 consume 就是双重计费。
     bstate, bres = _sql_one(
         "SELECT state, quota_reservation_id FROM baidu_import_batches "
         "WHERE id=%s", (batch_id,))
     assert bstate == "succeeded"
-    if bres:
-        assert _sql_one("SELECT state FROM upload_reservations "
-                        "WHERE reservation_id=%s", (bres,))[0] == "consumed"
+    assert bres, "测试用户受配额约束，批次应有预算预约"
+    assert _sql_one("SELECT state FROM upload_reservations "
+                    "WHERE reservation_id=%s", (bres,))[0] == "released"
+    used, reserved = _sql_one(
+        "SELECT used_bytes, reserved_bytes FROM upload_user_quotas "
+        "WHERE user_id=%s", (env.uid,))
+    assert int(used) == int(desc.accounted_bytes), \
+        "实占只计产物一次（%s != %s）" % (used, desc.accounted_bytes)
+    assert int(reserved) == 0
 
     # 容量对账：final consumed / scratch released（单任务两份预约）
     purposes = {}

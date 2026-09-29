@@ -374,3 +374,25 @@ def test_batch_finalized_after_last_report_and_on_reclaim(client, env, plugin,
     row = sql_one("SELECT state, lease_token FROM baidu_import_batches "
                   "WHERE id=%s", (batch["id"],))
     assert row["state"] == "failed" and row["lease_token"] is None
+
+
+def test_plugin_finalize_charges_only_items_not_published_by_producer(
+        client, env, plugin, batch):
+    """插件路径收口的批次预算：进程内路径完成的 ready 条目（产物未单独计费）
+    仍按源字节 consume；producer 导入发布的条目已由其 final 预约计费，不再
+    计入批次 consume（否则双重计费）。"""
+    claim = bstore.plugin_claim_batch("plugin:%s" % env.installation_id)
+    token = claim["batch"]["lease"]["lease_token"]
+    item = claim["items"][0]
+    size = int(item["source_size"])
+    # 交接场景：该条目此前由进程内路径推进到 ready（无 producer 任务）
+    bstore._update_item(item["id"], {"stage": "ready"},
+                        batch_id=batch["id"], lease_token=token)
+    assert bstore.plugin_finalize_if_settled(batch["id"], token)
+    row = sql_one("SELECT r.state, r.settled_bytes FROM upload_reservations r "
+                  "JOIN baidu_import_batches b ON "
+                  "b.quota_reservation_id=r.reservation_id WHERE b.id=%s",
+                  (batch["id"],))
+    assert row is not None, "测试用户受配额约束，批次应有预算预约"
+    assert row["state"] == "consumed"
+    assert int(row["settled_bytes"]) == size

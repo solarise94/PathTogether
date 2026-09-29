@@ -1,0 +1,22 @@
+PASS [a-oneclick-order-network] {"preClickApi":0,"preClickCross":0,"creates":1,"filename":"bf-580x300.tif","productSha":"f265596a7662","uploadedSha":"f265596a7662","putBytes":287803,"intentState":"done","intentAccountBound":true}
+PASS [b1-convert-fail-zero-ingestion] {"creates":0,"jobState":"failed","intentState":"revoked"}
+PASS [b2-cancel-during-convert-zero-ingestion] {"creates":0,"jobDirs":0}
+PASS [c1-oversize-stops] {"creates":0,"reason":"输出文件超过平台上限（1000 B 以内可上传）；已禁用上传","intentState":"pending","productSha":"f265596a7662"}
+PASS [c2-not-viewable-stops] {"creates":0,"reason":"平台暂不支持查看该输出格式；已禁用上传（导出能力不受影响），","intentState":"pending","productSha":"f265596a7662"}
+PASS [d1-login-expired-before-click] {"loginLink":"/login?next=/tools/slides","creates":0,"conversionStarted":false,"intent":null}
+PASS [d2-session-loss-reopen-continue] {"creates":1,"accountRebound":false,"reconfirmDialogs":0,"dismissedFirst":false}
+PASS [d3-different-account-reconfirm] {"creates":1,"accountRebound":true,"reconfirmDialogs":2,"dismissedFirst":true}
+PASS [e1-refresh-during-convert] {"creates":1,"intentLabel":"继续转换并上传"}
+PASS [e3-refresh-during-copy] {"creates":0,"rowsAfterSweep":[]}
+PASS [f1-repeated-clicks-one-ingestion] {"creates":1}
+PASS [f2-second-tab-one-ingestion] {"creates":1}
+PASS [f3-replayed-complete-one-ingestion] {"completeReqs":2,"creates":1}
+PASS [g-cancel-after-convert-revokes-intent] {"creates":0,"intentState":"revoked","productKept":true}
+PASS [h-local-only-zero-network] {"apiCalls":0,"crossOrigin":0,"jobId":"job-25fd450e5e1ba3ab"}
+PASS [i-workbench-handoff] {"creates":1,"projectId":"prj_c7DY_cZrliXrog","assocSlideIds":["sld_r1fake00000000000000001"],"popupReselected":false,"offerText":"在本机转换并上传"}
+PASS [i2-native-direct-upload] {"creates":1,"convertOffers":0}
+PASS [i3-popup-blocked-fallback] {"toolsLink":"/tools/slides","pages":1,"retryKept":true}
+PASS [i4-handoff-new-project-target] {"creates":1,"projectCreatedAfterPublish":true,"idemKey":"2a11ef41…","assocPid":"prj_r1new_1"}
+PASS [i5-assoc-failure-retry] {"creates":1,"projectsCreated":1,"assocAttempts":2,"pendingAfterFailure":true,"retryAfterReload":true,"finalState":"done"}
+PASS [j-disk-confirm-gates-oneclick] {"dialogShown":true,"convertEnabledBeforeConfirm":false,"creates":0,"jobDirs":0}
+E2E ALL PASS (21/21)

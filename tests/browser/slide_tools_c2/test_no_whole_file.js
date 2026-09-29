@@ -18,6 +18,9 @@ const FILES = [
   'static/upload/cos-uploader.js',
   'static/tools/tools-slides-upload.js',
   'static/tools/tools-slides.js',
+  // R1 one-click convert-and-upload: no file bytes flow through this module
+  // (conversion via the runner, upload via the C4 controller)
+  'static/tools/tools-slides-convert-upload.js',
 ];
 
 // [pattern, why-forbidden]

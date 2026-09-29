@@ -3268,12 +3268,17 @@ def api_tools_slides_upload_capability():
     - cos_upload：与工作台 bootstrap 同一权威 payload
       （_cos_upload_capability_payload；available=false 也回 200——页面需要
       明确原因，不是错误）；
-    - viewable_formats：SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS（见上）。
+    - viewable_formats：SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS（见上）；
+    - account：当前登录 user_id（R1 一键转换并上传，drain 计划 §3.1——
+      本地任务记录把上传意图绑定到授权用户；重新登录为另一账号时页面据此
+      要求重新确认，不静默换账号上传。内网免登录态为空串，绑定语义退化为
+      「同一（唯一）账号」，不构成换账号绕过）。
     """
     payload = _cos_upload_capability_payload(False)
     return jsonify(
         cos_upload=payload,
-        viewable_formats=list(SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS))
+        viewable_formats=list(SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS),
+        account=(current_identity().get("user_id") or ""))
 
 
 def _plugin_ui_dir(plugin_id):

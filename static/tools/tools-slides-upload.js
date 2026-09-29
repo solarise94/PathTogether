@@ -35,7 +35,9 @@ function pageApiFetch(url, opts = {}) {
   return fetch(url, { credentials: 'same-origin', ...opts });
 }
 
-async function fetchCapability() {
+/// R1 一键转换并上传控制器（tools-slides-convert-upload.js）与本控制器
+/// 共用同一能力判定语义（登录/离线/负载解析），导出复用。
+export async function fetchCapability() {
   let resp;
   try {
     resp = await pageApiFetch(CAPABILITY_URL);
@@ -62,7 +64,9 @@ function isAuthError(err) {
 
 const TERMINAL_UPLOAD_STATES = ['published', 'failed', 'cancelled'];
 
-export function createUploadController({ runner, t, onJobsRefresh }) {
+export function createUploadController({
+  runner, t, onJobsRefresh, onPublished,
+}) {
   const state = {
     busyJobId: null,     // 本标签唯一进行中的上传
     handle: null,        // 引擎句柄（取消用）
@@ -246,19 +250,22 @@ export function createUploadController({ runner, t, onJobsRefresh }) {
   /// 上传/继续上传（唯一入口）。本标签 busy 守卫 + 跨标签 Web Lock：同一任务
   /// 任何时刻只有一处在上传，重复点击/多标签都不会并发创建 ingestion。
   async function startOrContinue(jobId) {
-    if (state.busyJobId) return;
-    if (state.disabled[jobId]) return;
+    if (state.busyJobId) return null;
+    if (state.disabled[jobId]) return null;
     state.busyJobId = jobId;
+    let outcome = null;
     const ran = await navigator.locks.request(E.uploadLockName(jobId), { ifAvailable: true },
       async (lock) => {
         if (!lock) return false;
-        await runLocked(jobId);
+        outcome = await runLocked(jobId);
         return true;
       });
     if (!ran) {
       state.busyJobId = null;
       setMsg('tools.upload.other.tab');
+      return { ok: false, reason: 'other-tab' };
     }
+    return outcome || { ok: false };
   }
 
   async function runLocked(jobId) {
@@ -279,6 +286,21 @@ export function createUploadController({ runner, t, onJobsRefresh }) {
       if (cap.authRequired) {
         setMsgWithLink('tools.upload.login.required', LOGIN_URL, 'tools.upload.login.link');
         return;
+      }
+      // ①b R1 意图绑定账号核对：任务挂着待执行的上传意图，但当前登录已是
+      //     另一账号——绝不静默换账号上传；须显式确认后才重绑并继续（drain
+      //     计划 §3.1「重新登录为另一账号……须重新确认，不能自动替换」）。
+      const intent = job.intent;
+      if (intent && intent.state === 'pending' && typeof cap.account === 'string'
+          && intent.account && cap.account !== intent.account) {
+        const ok = window.confirm(t('tools.upload.account.changed.confirm'));
+        if (!ok) {
+          setMsg('tools.upload.account.changed');
+          return;
+        }
+        await runner.setJobIntent(jobId, {
+          account: cap.account, reconfirmedAt: E.nowIso(),
+        });
       }
       const cfg = window.HP_COS_UPLOAD
         ? window.HP_COS_UPLOAD.resolveConfig(cap.cos_upload) : null;
@@ -357,7 +379,9 @@ export function createUploadController({ runner, t, onJobsRefresh }) {
         setMsg('tools.upload.cancelled');
         return;
       }
-      // published：先冲刷记录写入，再读回填的 slide id（storage.complete 已排队）
+      // published：先冲刷记录写入（storage.complete 已排队），再读回填的
+      // slide id；R1 意图收口（done 标记 + 工作台目标关联 + 打开者通知）在
+      // onPublished 回调里做——那里按意图当前状态幂等处理
       await Promise.race([state.writes, new Promise((r) => setTimeout(r, 3000))]);
       const after = await runner.getJob(jobId);
       const sid = after && after.upload && after.upload.slideId;
@@ -374,6 +398,11 @@ export function createUploadController({ runner, t, onJobsRefresh }) {
       }
       state.statusKey = 'tools.upload.published';
       state.statusVars = { id: sid || '—' };
+      // R1：发布收口回调（页面用它做工作台目标的关联与打开者通知）
+      if (onPublished) {
+        try { await onPublished(jobId, sid || null); } catch { /* 关联失败已明示 */ }
+      }
+      return { ok: true, slideId: sid || null };
     } catch (err) {
       handleFailure(err, jobId);
     } finally {
@@ -408,10 +437,29 @@ export function createUploadController({ runner, t, onJobsRefresh }) {
 
   /// 引擎 cancel 会立即结束 done（进行中的等待一并结束），runLocked 随之
   /// 走完 finally：清 busy、冲刷记录写入、释放上传锁、刷新列表。
+  /// R1 扩展：上传尚未开始（转换后、上传前的停止态）时，cancel 撤销待执行
+  /// 的自动上传意图（无 ingestion、本地产物保留）——「取消停止当前阶段并
+  /// 撤销后续自动上传意图」（drain 计划 §3.1）。
   function cancel() {
-    if (!state.handle) return;
-    state.handle.cancel();
-    setMsg('tools.upload.cancelled');
+    if (state.handle) {
+      state.handle.cancel();
+      setMsg('tools.upload.cancelled');
+      return;
+    }
+    const jobId = page.currentJobId;
+    if (!jobId) return;
+    runner.getJob(jobId).then((job) => {
+      const pendingIntent = job && job.intent && job.intent.state === 'pending';
+      const uploadSettled = !job || !job.upload
+        || TERMINAL_UPLOAD_STATES.includes(job.upload.state);
+      if (!pendingIntent || !uploadSettled) return;
+      return runner.setJobIntent(jobId, {
+        state: 'revoked', revokedReason: 'user_cancel', revokedAt: E.nowIso(),
+      }).then(() => {
+        setMsg('tools.upload.intent.revoked');
+        if (onJobsRefresh) onJobsRefresh();
+      });
+    }).catch(() => { /* 记录写不进去时按钮仍可用（下次再试） */ });
   }
 
   /// 任务列表行：上传状态 + 继续/上传按钮 + 删除禁用（上传进行中）。
@@ -435,6 +483,24 @@ export function createUploadController({ runner, t, onJobsRefresh }) {
       p.appendChild(document.createTextNode(t('tools.upload.row.published.prefix') + ' '));
       p.appendChild(a);
       actionsEl.parentNode.insertBefore(p, actionsEl);
+      // 已发布但目标项目关联未完成（关联失败/发布后标签关闭）：点击重试
+      const it = job.intent;
+      if (it && it.state === 'pending' && it.target && onPublished) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn btn-secondary';
+        btn.dataset.action = 'assoc-retry';
+        btn.textContent = t('tools.upload.assoc.retry');
+        btn.disabled = isActive;
+        btn.addEventListener('click', async () => {
+          btn.disabled = true;
+          try {
+            await onPublished(job.id, up.slideId || null);
+          } catch { /* 失败原因已由回调显示 */ }
+          if (onJobsRefresh) onJobsRefresh();
+        });
+        actionsEl.appendChild(btn);
+      }
       return;
     }
     if (!up || TERMINAL_UPLOAD_STATES.includes(up.state)) {
@@ -447,12 +513,16 @@ export function createUploadController({ runner, t, onJobsRefresh }) {
         { err: up.error || '' });
         actionsEl.parentNode.insertBefore(p, actionsEl);
       }
+      // R1：待执行的自动上传意图（转换后停止/刷新恢复）→「继续上传」，
+      // 与无意图的手动「上传到工作台」区分（点击仍是同一续传入口）。
+      const intentPending = !!(job.intent && job.intent.state === 'pending');
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'btn btn-secondary';
-      btn.dataset.action = 'upload';
+      btn.dataset.action = intentPending ? 'upload-continue' : 'upload';
       btn.dataset.jobUpload = job.id;
-      btn.textContent = t('tools.upload.btn');
+      btn.textContent = t(intentPending
+        ? 'tools.upload.continue' : 'tools.upload.btn');
       btn.disabled = !!state.disabled[job.id] || isActive;
       btn.addEventListener('click', () => { startOrContinue(job.id); });
       actionsEl.appendChild(btn);

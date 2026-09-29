@@ -219,6 +219,24 @@ def test_capability_endpoint_payload_fields(_iso, _cos_on, owner_client):
     assert set(fmts) == set(app_mod.SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS)
 
 
+def test_capability_endpoint_exposes_account(_iso, _cos_on, owner_client):
+    """R1（drain 计划 §3.1）：响应携带当前登录 user_id——本地任务记录把上传
+    意图绑定到授权用户；换账号续传时页面据此要求重新确认。"""
+    r = owner_client.get("/api/tools/slides/upload-capability")
+    assert r.status_code == 200
+    assert r.get_json()["account"] == "owner-c4"
+
+    # 换账号（不同 user_id）：同一端点回显新身份——绑定判定在客户端
+    _mkuser("user-c4b", "user")
+    with owner_client.session_transaction() as s:
+        s["auth_user"] = "user-c4b@x"
+        s["user_id"] = "user-c4b"
+        s["role"] = "user"
+    r2 = owner_client.get("/api/tools/slides/upload-capability")
+    assert r2.status_code == 200
+    assert r2.get_json()["account"] == "user-c4b"
+
+
 def test_capability_endpoint_off_still_200_with_reason(_iso, owner_client):
     """capability off：仍 200（页面要展示明确原因），available=False，
     viewable_formats 照常下发（格式判定与上传开关是两件事）。"""

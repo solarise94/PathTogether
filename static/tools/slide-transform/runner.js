@@ -33,6 +33,11 @@
 //   // typed `upload_active` while a tab holds E.uploadLockName(jobId), and for
 //   // a leftover non-terminal record unless { abandonUpload: true }.
 //   await runner.setJobUpload(jobId, patch);
+//   // R1 一键转换并上传：merge a patch into record.intent (the upload
+//   // intent: authorized account + target + pending/revoked/done state).
+//   // Written BEFORE conversion starts (prepared onward) so a refresh
+//   // mid-convert keeps it; the page revokes it on failure / user cancel.
+//   await runner.setJobIntent(jobId, patch);
 //
 // Disk gate: `disk_precheck_failed` with `uncertain: true` means the
 // browser's quota report is capped (usage + 10 GiB) and cannot prove the
@@ -416,6 +421,31 @@ export class SlideToolsRunner {
       await this._writeJobRecordNow(jobId, {
         ...rec,
         upload: { ...prev, ...patch, updatedAt: E.nowIso() },
+      });
+    });
+  }
+
+  /// R1 一键转换并上传（drain 计划 §3.1）：merge `patch` into record.intent —
+  /// 页面管理的上传意图（授权账号/目标/状态）。与 upload 记录不同，意图在
+  /// **转换开始前**就要落盘（prepared 起），刷新/崩溃后「继续转换并上传」
+  /// 依赖它；转换失败/取消后由页面撤销（state: 'revoked'）。字段建议：
+  /// {state: 'pending'|'revoked'|'done', account, target, channel, updatedAt}。
+  async setJobIntent(jobId, patch) {
+    if (!patch || typeof patch !== 'object') {
+      throw E.stError(E.ERROR_CODES.IO_RECOVERABLE, 'intent 记录须为对象');
+    }
+    await this._serialRecord(async () => {
+      const rec = await this._readJobRecord(jobId);
+      if (!rec || !['prepared', 'planned', 'paused', 'ready', 'exported', 'failed']
+        .includes(rec.state)) {
+        throw E.stError(E.ERROR_CODES.NOT_READY,
+          `任务状态 ${rec ? rec.state : 'missing'} 不可挂上传意图` +
+          '（仅 prepared/planned/paused/ready/exported/failed）');
+      }
+      const prev = rec.intent || {};
+      await this._writeJobRecordNow(jobId, {
+        ...rec,
+        intent: { ...prev, ...patch, updatedAt: E.nowIso() },
       });
     });
   }
@@ -871,6 +901,8 @@ export class SlideToolsRunner {
   ///   result: {outputBytes, sha256, channels: [{name, display_window, …}]} | null,
   ///   upload: {ingestionId, filename, size, state, confirmedParts, slideId,
   ///            updatedAt, error} | null (C4; page-managed shape),
+  ///   intent: {state, account, target, channel, updatedAt} | null
+  ///            (R1 一键转换并上传；page-managed shape),
   ///   error}
   /// nextAction: 'start' (prepared) | 'resume' (interrupted run) |
   ///   'export' (ready/exported) | 'wait' (running in this tab) | 'discard'.
@@ -917,6 +949,7 @@ export class SlideToolsRunner {
         }
         : null,
       upload: rec && rec.upload ? { ...rec.upload } : null,
+      intent: rec && rec.intent ? { ...rec.intent } : null,
       error: rec ? rec.error || null : null,
     };
   }

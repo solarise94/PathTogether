@@ -1,0 +1,1 @@
+no-whole-file gate: PASS (bounded slices only in static/tools/slide-transform/engine.js, static/tools/slide-transform/worker.js, static/tools/slide-transform/runner.js, static/upload/cos-uploader.js, static/tools/tools-slides-upload.js, static/tools/tools-slides.js, static/tools/tools-slides-convert-upload.js)

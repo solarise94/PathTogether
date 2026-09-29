@@ -1,0 +1,16 @@
+PASS [a-bf] {"filename":"bf-580x300.tif","putBytes":287803,"slideLink":"/app","sha":"f265596a7662","size":287803}
+PASS [a-fl] {"filename":"fl-600x400.ome.tif","putBytes":134114,"slideLink":"/app","sha":"910d170ecf66","size":134114}
+PASS [b-401-continue] {"loginLink":"/login?next=/tools/slides","creates":1,"sha":"f265596a7662"}
+PASS [c-refresh-continue] {"creates":1,"resumeSigned":[[3,4]],"resumePuts":[3,4],"sha":"f265596a7662"}
+PASS [d-repeated-clicks] {"creates":1,"sha":"f265596a7662"}
+PASS [e-lost-complete] {"completeReqs":2,"sha":"f265596a7662"}
+PASS [f-oversize] {"reason":"输出文件超过平台上限（1000 B 以内可上传）；已禁用上传，本地产物保留，仍可","creates":0,"savedSha":"f265596a7662"}
+PASS [g-format-unsupported] {"reason":"平台暂不支持查看该输出格式；已禁用上传（导出能力不受影响），本地产物保留，仍可本","creates":0,"savedSha":"f265596a7662"}
+PASS [h-cancel-terminal] {"cancels":1,"creates":2,"sha":"f265596a7662","discarded":true}
+PASS [i-network-capture] {"preClickApi":0,"preClickCross":0,"postClickUrls":["GET /tools/slides","GET /static/tools/tools-slides.css","GET /static/i18n.js","GET /static/tools/tools-slides.js","GET /static/upload/cos-uploader.js","GET /static/tools/slide-transform/runner.js","GET /static/tools/slide-transform/engine.js","GET
+PASS [j-real-session-loss] {"loginLink":"/login?next=/tools/slides","creates":1,"sha":"f265596a7662"}
+PASS [k-cross-tab-abandon] {"jobId":"job-552a18ec50b3b656","creates":1,"cancels":1,"dialogs":3}
+PASS [l-record-write-failure] {"creates":4,"cancels":5,"signs":1,"puts":2,"gets":3,"putBytes":287803,"sha":"f265596a7662"}
+PASS [m1-cancel-during-poll] {"settleMs":224,"cancels":1,"requestsAfterCancel":0,"sha":"f265596a7662"}
+PASS [m2-cancel-during-backoff] {"settleMs":228,"cancels":1,"requestsAfterCancel":0,"sha":"f265596a7662"}
+E2E ALL PASS

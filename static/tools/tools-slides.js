@@ -13,6 +13,7 @@
 import { SlideToolsRunner } from './slide-transform/runner.js';
 import * as E from './slide-transform/engine.js';
 import { createUploadController } from './tools-slides-upload.js';
+import { createConvertUploadController } from './tools-slides-convert-upload.js';
 
 const CHANNEL_JSON_MAX_BYTES = 1 << 20; // 伴随文件读取上限 1 MiB（有界）
 
@@ -35,6 +36,7 @@ const els = {
   policyStrictWarn: $('policy-strict-warn'),
   runSection: $('run-section'),
   convertBtn: $('convert-btn'),
+  convertUploadBtn: $('convert-upload-btn'),
   cancelBtn: $('cancel-btn'),
   runStatus: $('run-status'),
   runProgress: $('run-progress'),
@@ -142,6 +144,7 @@ function dlRow(grid, term, definition, ddId) {
 const page = {
   runner: null,
   uploadCtl: null,         // C4 上传控制器（tools-slides-upload.js）
+  convertUploadCtl: null,  // R1 一键转换并上传控制器（tools-slides-convert-upload.js）
   file: null,
   channelJson: null,       // string | null（≤1 MiB 读取结果）
   channelJsonName: null,
@@ -150,6 +153,7 @@ const page = {
   readyInfo: null,         // { jobId, outputBytes, sha256, modality, sourceName }
   saveSupported: typeof window.showSaveFilePicker === 'function',
   beforeunloadOn: false,
+  lastJobs: [],
 };
 
 // ------------------------------------------------------------ i18n glue --
@@ -163,12 +167,29 @@ function rerenderForLang() {
   renderResultPanel();
   renderJobs(page.lastJobs || []);
   if (page.uploadCtl) page.uploadCtl.rerenderForLang();
+  if (page.convertUploadCtl) page.convertUploadCtl.rerenderForLang();
   if (page.prep) renderProbeSummary();
   if (page.busyPhaseLabelKey) els.runStatus.textContent = t(page.busyPhaseLabelKey);
   if (stageMsg.key) els.stageStatus.textContent = t(stageMsg.key, stageMsg.vars);
   if (statusMsg.key) els.pageStatus.textContent = t(statusMsg.key, statusMsg.vars);
   if (runBytesMsg.key && !els.runBytes.hidden) els.runBytes.textContent = t(runBytesMsg.key, runBytesMsg.vars);
   updateStrictWarning();
+}
+
+/// R1 一键链流程文案（#page-status；「去登录」链接是文案的一部分——DOM
+/// 构造，不用 innerHTML）。语言切换由 convertUploadCtl.rerenderForLang 重放。
+function renderFlowMsg(key, vars) {
+  els.pageStatus.textContent = '';
+  if (key === 'tools.cu.login.required') {
+    els.pageStatus.appendChild(document.createTextNode(t(key)));
+    els.pageStatus.appendChild(document.createTextNode(' '));
+    const a = document.createElement('a');
+    a.href = '/login?next=/tools/slides';
+    a.textContent = t('tools.upload.login.link');
+    els.pageStatus.appendChild(a);
+    return;
+  }
+  if (key) els.pageStatus.textContent = t(key, vars || {});
 }
 
 // ------------------------------------------------------------- dialogs --
@@ -240,6 +261,7 @@ function resetFlowPanels() {
     els.policySection, els.resultSection]) el.hidden = true;
   els.runSection.hidden = true;
   els.convertBtn.disabled = true;
+  if (els.convertUploadBtn) els.convertUploadBtn.disabled = true;
   els.runStatus.textContent = '';
   els.runProgress.hidden = true;
   els.runBytes.hidden = true;
@@ -255,6 +277,19 @@ async function onFilePicked() {
   resetFlowPanels();
   page.file = file;
   await readChannelJsonInput();
+  await runProbeFlow();
+}
+
+/// R1 工作台交接：postMessage 收到的 File 走与手动选择完全相同的流程
+/// （复制与探测、磁盘确认、设置、结果）。不复制第二次——唯一副本仍是
+/// 运行器 staging 进 OPFS 的 source.bin。用户无需重选文件。
+async function takeHandoffFile(file) {
+  if (!file) return;
+  resetFlowPanels();
+  els.fileInput.value = '';
+  page.file = file;
+  page.channelJson = null;
+  page.channelJsonName = null;
   await runProbeFlow();
 }
 
@@ -332,6 +367,7 @@ async function runProbeFlow() {
   els.policySection.hidden = false;
   els.runSection.hidden = false;
   els.convertBtn.disabled = false;
+  if (els.convertUploadBtn) els.convertUploadBtn.disabled = false;
   applyProfileSuggestion();
   updateStrictWarning();
   refreshJobs();
@@ -463,10 +499,13 @@ function phaseText(state) {
   return key ? t(key) : state;
 }
 
-async function onConvert() {
-  if (!page.prep || !page.file) return;
+/// 转换执行驱动（「仅转换并保存」与 R1「转换并上传」共用）：startJob →
+/// 进度/结果 UI。返回 worker 的 result（{ok}|{type:'cancelled'}|失败形态）。
+async function driveConversion() {
+  if (!page.prep || !page.file) return null;
   clearError();
   els.convertBtn.disabled = true;
+  if (els.convertUploadBtn) els.convertUploadBtn.disabled = true;
   els.fileInput.disabled = true;
   els.channelInput.disabled = true;
   els.cancelBtn.hidden = false;
@@ -508,12 +547,16 @@ async function onConvert() {
       els.runStatus.textContent = phaseText('cancelled');
       setPageMsg('tools.run.cancelled.note');
       els.convertBtn.disabled = false;
+      if (els.convertUploadBtn) els.convertUploadBtn.disabled = false;
     } else {
       const err = (result && result.error) || { code: 'io_recoverable', message: 'unknown' };
       els.runStatus.textContent = phaseText('failed');
       showError(err);
       els.convertBtn.disabled = false;
+      if (els.convertUploadBtn) els.convertUploadBtn.disabled = false;
     }
+    refreshJobs();
+    return result;
   } catch (e) {
     page.running = false;
     setBeforeunload(false);
@@ -523,7 +566,25 @@ async function onConvert() {
     els.runStatus.textContent = phaseText('failed');
     showError(e);
     els.convertBtn.disabled = false;
+    if (els.convertUploadBtn) els.convertUploadBtn.disabled = false;
+    refreshJobs();
+    return { ok: false, error: e };
   }
+}
+
+async function onConvert() {
+  await driveConversion();
+}
+
+/// R1 一键「转换并上传」：授权整条链（预检 → 意图落盘 → 本机转换 → 校验 →
+/// 重新准入 → 上传 → 可查看），转换成功后自动上传、无第二次确认。
+async function onConvertUpload() {
+  if (!page.prep || !page.file) return;
+  await page.convertUploadCtl.start({
+    jobId: page.prep.jobId,
+    target: page.convertUploadCtl.handoffTarget(),
+    runConvert: driveConversion,
+  });
   refreshJobs();
 }
 
@@ -658,6 +719,13 @@ const JOB_ACTION_LABEL_KEY = {
   discard: 'tools.jobs.action.discard',
 };
 
+/// R1：挂着待执行上传意图的任务，开始/续跑按钮文案换成「继续转换并上传」
+/// （动作不变——完成后自动进入上传）。
+const JOB_ACTION_INTENT_LABEL_KEY = {
+  start: 'tools.jobs.action.intent.start',
+  resume: 'tools.jobs.action.intent.resume',
+};
+
 function renderJobs(jobs) {
   page.lastJobs = jobs;
   els.jobsList.textContent = '';
@@ -711,12 +779,17 @@ function renderJobs(jobs) {
     const actions = document.createElement('div');
     actions.className = 'job-actions';
     const primary = job.nextAction;
+    const intentPending = !!(job.intent && job.intent.state === 'pending');
     if (primary !== 'discard') {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = primary === 'export' ? 'btn btn-primary' : 'btn btn-secondary';
       btn.dataset.action = primary;
-      btn.textContent = t(JOB_ACTION_LABEL_KEY[primary]);
+      if (intentPending && JOB_ACTION_INTENT_LABEL_KEY[primary]) {
+        btn.dataset.intent = '1';
+      }
+      btn.textContent = t(intentPending && JOB_ACTION_INTENT_LABEL_KEY[primary]
+        ? JOB_ACTION_INTENT_LABEL_KEY[primary] : JOB_ACTION_LABEL_KEY[primary]);
       btn.disabled = primary === 'export' && typeof window.showSaveFilePicker !== 'function';
       btn.addEventListener('click', () => onJobAction(primary, job));
       actions.appendChild(btn);
@@ -738,6 +811,21 @@ function renderJobs(jobs) {
 
     els.jobsList.appendChild(row);
   }
+  updateUploadCancelVisibility();
+}
+
+/// R1：#upload-cancel-btn 在两种形态下可见——上传进行中（C4 既有语义），
+/// 或当前结果面板指向的任务还挂着待执行的自动上传意图（转换后、上传前的
+/// 停止态；点击 = 撤销自动上传，产物保留、无 ingestion）。
+function updateUploadCancelVisibility() {
+  if (!page.uploadCtl) return;
+  let pending = false;
+  if (page.readyInfo) {
+    const job = (page.lastJobs || []).find((j) => j.id === page.readyInfo.jobId);
+    pending = !!(job && job.intent && job.intent.state === 'pending'
+      && (!job.upload || job.upload.state !== 'published'));
+  }
+  els.uploadCancelBtn.hidden = !(page.uploadCtl.isBusy() || pending);
 }
 
 async function onJobAction(action, job) {
@@ -806,6 +894,11 @@ async function onJobAction(action, job) {
         page.saveMsg = null;
         renderResultPanel();
         renderSaveStatus();
+        // R1「继续转换并上传」：任务挂着待执行的上传意图时，转换完成后
+        // 自动进入上传（无第二次确认；大小/格式重新准入在上传控制器内）。
+        if (job.intent && job.intent.state === 'pending') {
+          await page.uploadCtl.startOrContinue(job.id);
+        }
       } else if (result && result.type === 'cancelled') {
         els.runStatus.textContent = phaseText('cancelled');
       } else {
@@ -864,12 +957,26 @@ async function init() {
     runner: page.runner,
     t,
     onJobsRefresh: refreshJobs,
+    onPublished: (jobId, slideId) => (page.convertUploadCtl
+      ? page.convertUploadCtl.handlePublished(jobId, slideId) : undefined),
   });
+  page.convertUploadCtl = createConvertUploadController({
+    runner: page.runner,
+    uploadCtl: page.uploadCtl,
+    t,
+    onJobsRefresh: refreshJobs,
+    onFlowMessage: renderFlowMsg,
+    takeFile: takeHandoffFile,
+  });
+  page.convertUploadCtl.installHandoffReceiver();
   refreshJobs();
 
   els.fileInput.addEventListener('change', () => { onFilePicked(); });
   els.channelInput.addEventListener('change', () => { onChannelPicked(); });
   els.convertBtn.addEventListener('click', () => { onConvert(); });
+  if (els.convertUploadBtn) {
+    els.convertUploadBtn.addEventListener('click', () => { onConvertUpload(); });
+  }
   els.cancelBtn.addEventListener('click', () => { onCancel(); });
   els.saveBtn.addEventListener('click', () => { onSave(); });
   els.persistBtn.addEventListener('click', () => { onPersist(); });

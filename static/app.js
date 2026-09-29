@@ -82,6 +82,13 @@
     "upload.cos.err.state": { zh: "任务状态冲突，请刷新页面后重试", en: "Job state conflict; please refresh and retry" },
     "upload.cos.err.rate": { zh: "签名请求过于频繁，请稍后重试", en: "Signing rate limited; please retry later" },
     "upload.cos.err.reconcile": { zh: "云端容量对账中，暂不可继续，请稍后重试", en: "Cloud capacity reconciliation in progress; retry later" },
+    // R1 一键转换并上传（工作台入口；i18n.js 为主源，此处兜底）
+    "upload.kfb.hint": { zh: "该格式需在本机转换后上传（平台不再在服务器端转换 KFB/KFBF）", en: "This format must be converted on your machine before uploading (the platform no longer converts KFB/KFBF server-side)" },
+    "upload.kfb.btn": { zh: "在本机转换并上传", en: "Convert on this machine and upload" },
+    "upload.kfb.handoff.sent": { zh: "已交给本机转换工具（新窗口）：在那里继续转换与上传", en: "Handed off to the local conversion tool (new window); conversion and upload continue there" },
+    "upload.kfb.popup.blocked": { zh: "弹窗被浏览器拦截：请允许本站弹出窗口后重试，或打开本地切片工具手动选择文件", en: "The popup was blocked: allow popups for this site and retry, or open the local slide tool and select the file manually" },
+    "upload.kfb.tools.link": { zh: "打开本地切片工具", en: "Open the local slide tool" },
+    "upload.kfb.done": { zh: "本机转换并上传完成：{name} 已按目标位置入库", en: "Local convert-and-upload finished: {name} stored under the chosen target" },
 
     // 升级 C（§6.1）：矩形工具文案（i18n.js 为主源；此处兜底）
     "roi.rect.tip": { zh: "矩形工具：在视野中拖出矩形，或输入宽高后点击中心放置；拖内部平移、边/角调整大小；Escape 取消",
@@ -6528,6 +6535,12 @@
       return;
     }
     if (!cosUploadEligible(file)) {
+      // R1：KFB/KFBF 在服务端受理词表外但属 browser_convert 词表 → 本机
+      // 转换并上传入口（不判失败、不回退其它后端）
+      if (isBrowserConvertFile(file)) {
+        offerBrowserConvert(file, row);
+        return;
+      }
       row.markError();
       row.setStage("upload.stage.failed");
       row.finish(10000);
@@ -6536,6 +6549,136 @@
     }
     uploadFileCos(file, row,
       opts.cosRetry ? { resumeJobId: opts.cosRetry, skipConfirm: true } : null);
+  }
+
+  // =========================================================================
+  // R1 一键转换并上传（drain 计划 §3.1）：工作台入口。
+  // KFB/KFBF 不再经服务器转换（422 conversion_moved_to_browser）——选择这类
+  // 文件时给出「在本机转换并上传」：同源 popup 打开 /tools/slides，File 经
+  // postMessage structured clone 交接（零额外整文件复制——唯一副本是运行器
+  // staging 的 OPFS source.bin），并携带显式项目目标；转换/校验/准入/上传
+  // 都在工具页完成，发布后本页收到通知刷新列表（目标关联由工具页按服务端
+  // 权限检查完成）。弹窗被拦截时明示原因并给出工具页链接，选择不静默丢失
+  //（重试按钮仍在）。
+  // =========================================================================
+
+  /// bootstrap 能力下发的 browser_convert 词表（cos_upload.browser_convert。
+  /// formats；服务端唯一权威——前端不自维护第二份）。
+  function browserConvertFormats() {
+    try {
+      var caps = window.HP_APP_BOOTSTRAP && window.HP_APP_BOOTSTRAP.capabilities;
+      var bc = caps && caps.cos_upload && caps.cos_upload.browser_convert;
+      return (bc && Array.isArray(bc.formats)) ? bc.formats : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function isBrowserConvertFile(file) {
+    if (!file || typeof file.name !== "string") return false;
+    var ext = file.name.slice(file.name.lastIndexOf(".") + 1).toLowerCase();
+    return browserConvertFormats().indexOf(ext) >= 0;
+  }
+
+  var CONVERT_HANDOFF_URL = "/tools/slides";
+  var HANDOFF_MSG = "pt:convert-upload-handoff";
+  var HANDOFF_ACK = "pt:convert-upload-ack";
+  var HANDOFF_DONE = "pt:convert-upload-published";
+  var convertHandoff = { popup: null, listenerOn: false };
+
+  /// 交接目标（显式项目目标沿用；「新项目」把名称与一次性幂等键交给工具页，
+  /// 仅在上传成功后创建——转换失败不留空项目）。
+  function convertHandoffTarget() {
+    var st = importTargetState;
+    if (st.pid) return { project: st.pid };
+    if (st.newProjectName) {
+      if (!st.createKey) st.createKey = uuid();
+      return { newProject: { name: st.newProjectName, key: st.createKey } };
+    }
+    return null;   // 未归类
+  }
+
+  function convertHandoffMessage(ev) {
+    if (ev.origin !== window.location.origin) return;
+    var d = ev.data;
+    if (!d || typeof d !== "object") return;
+    if (d.type === HANDOFF_ACK) {
+      convertHandoff.acked = true;
+      return;
+    }
+    if (d.type === HANDOFF_DONE) {
+      // 工具页发布完成（目标关联已在工具页按服务端权限完成）
+      toast(tt("upload.kfb.done", { name: d.slideId || "" }), "success");
+      loadAll();
+      reloadProjectsAndUnfiled();
+    }
+  }
+
+  function ensureConvertHandoffListener() {
+    if (convertHandoff.listenerOn) return;
+    window.addEventListener("message", convertHandoffMessage);
+    convertHandoff.listenerOn = true;
+  }
+
+  /// 「在本机转换并上传」点击：popup 交接。弹窗被拦截 → 明示 + 工具页链接
+  ///（选择不静默丢失：允许弹窗后重按同一按钮即可重试）。
+  function openConvertHandoff(file, row) {
+    ensureConvertHandoffListener();
+    var target = convertHandoffTarget();
+    var popup = null;
+    try {
+      popup = window.open(CONVERT_HANDOFF_URL, "pt-convert-upload");
+    } catch (e) {
+      popup = null;
+    }
+    if (!popup || popup.closed) {
+      row.setStage("upload.kfb.popup.blocked");
+      // 明确的工具页链接（手动入口——需要用户重新选择文件）
+      var link = document.createElement("a");
+      link.href = CONVERT_HANDOFF_URL;
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.textContent = tt("upload.kfb.tools.link");
+      if (row._row && row._row.appendChild) row._row.appendChild(link);
+      row.finish(60000);
+      toast(tt("upload.kfb.popup.blocked"), "error");
+      return;
+    }
+    convertHandoff.popup = popup;
+    convertHandoff.acked = false;
+    row.setStage("upload.kfb.handoff.sent");
+    // popup 加载完成前 postMessage 可能丢失：重投至 ack（File 句柄克隆，
+    // 零字节复制；工具页幂等去重）
+    var attempts = 0;
+    var timer = setInterval(function () {
+      attempts++;
+      var closed = false;
+      try { closed = popup.closed; } catch (e) { closed = true; }
+      if (convertHandoff.acked || closed || attempts > 150) {
+        clearInterval(timer);
+        if (!convertHandoff.acked && !closed) {
+          row.setStage("upload.kfb.popup.blocked");
+        }
+        return;
+      }
+      try {
+        popup.postMessage({
+          type: HANDOFF_MSG,
+          file: file,
+          target: target,
+        }, window.location.origin);
+      } catch (e) { /* retry next tick */ }
+    }, 400);
+    row.finish(60000);
+  }
+
+  /// KFB/KFBF 行：不判失败——给出「在本机转换并上传」入口（能力词表内）。
+  function offerBrowserConvert(file, row) {
+    row.setStage("upload.kfb.hint");
+    addRowButton(row, tt("upload.kfb.btn"), function () {
+      openConvertHandoff(file, row);
+    });
+    row.finish(60000);
   }
 
 
@@ -6899,6 +7042,11 @@
     cosStageKey: cosStageKey,
     initCosUploadUi: initCosUploadUi,
     restoreCosJobs: restoreCosJobs,
+    // R1 一键转换并上传（工作台入口的驱动面）
+    browserConvertFormats: browserConvertFormats,
+    isBrowserConvertFile: isBrowserConvertFile,
+    convertHandoffTarget: convertHandoffTarget,
+    openConvertHandoff: openConvertHandoff,
   };
   // 供测试（升级 A）：侧栏开合控制器与偏好存取的真实逻辑入口
   window.HP_SIDEBAR = {

@@ -2801,14 +2801,32 @@ def _app_capabilities(mode):
 UPLOAD_PRODUCT_MAX_BYTES = upload_guard.UPLOAD_MAX_REQUEST_BYTES
 
 
+#: R1：服务端不再新建后端转换。KFB/KFBF 在浏览器本机转换，平台只受理标准
+#: 产物（BigTIFF / OME-BigTIFF）。不读 env——部署配置无法把旧转换链路重新
+#: 打开；只有覆盖旧代码路径的测试会置 True。
+SERVER_CONVERSION_CREATION = False
+BROWSER_CONVERT_URL = "/tools/slides"
+
+
+def _server_conversion_closed(message):
+    return jsonify(error=message, code="conversion_moved_to_browser",
+                   tools_url=BROWSER_CONVERT_URL)
+
+
+def _browser_convert_formats():
+    return set(slide_format_registry.capability_exts(
+        slide_format_registry.CAP_CONVERT_REQUIRED))
+
+
 def _cos_accepted_formats():
     """COS 统一上传受理词表（U2 §3.2）：从格式注册表派生——原生单文件 +
-    convert-required + 归档 zip；裸 bundle（.mrxs）不在直传集（需打包 zip）。
-    后端权威下发（capability payload），前端不再维护第二份词表。"""
+    归档 zip（+ convert-required，仅当服务端转换仍开放）；裸 bundle（.mrxs）
+    不在直传集（需打包 zip）。后端权威下发（capability payload），前端不再
+    维护第二份词表。"""
     exts = set(slide_format_registry.capability_exts(
         slide_format_registry.CAP_NATIVE_SINGLE_FILE))
-    exts |= set(slide_format_registry.capability_exts(
-        slide_format_registry.CAP_CONVERT_REQUIRED))
+    if SERVER_CONVERSION_CREATION:
+        exts |= _browser_convert_formats()
     exts.add("zip")
     exts.discard("mrxs")
     return exts
@@ -2845,6 +2863,10 @@ def _cos_upload_capability_payload(demo):
     （fail-closed；瞬时余额不足由任务 waiting 表达，不在此开关）。"""
     payload = {"available": False, "manual_only": True,
                "formats": sorted(_cos_accepted_formats())}
+    if not SERVER_CONVERSION_CREATION:
+        payload["browser_convert"] = {
+            "formats": sorted(_browser_convert_formats()),
+            "url": BROWSER_CONVERT_URL}
     if demo or cos_config.COS_UPLOAD_CAPABILITY not in ("off", "internal", "on"):
         return payload
     _sid, _skey, ok = cos_config.cos_credentials()
@@ -11605,6 +11627,10 @@ def api_ingestions_create():
     kind, ferr = _cos_ingestion_kind_for(safe)
     if ferr is not None:
         return ferr
+    if kind == "conversion" and not SERVER_CONVERSION_CREATION:
+        # 不建行、不占预约、不发凭证：引导到本机「转换并上传」
+        return _server_conversion_closed(
+            "该格式需在本机转换后上传，请使用切片转换工具的「转换并上传」"), 422
 
     try:
         declared_size = int(body.get("declared_size"))
@@ -11850,6 +11876,9 @@ def api_conversion_retry(job_id):
     import conversion_worker
     if not can_upload():
         return jsonify(error="无上传权限"), 403
+    if not SERVER_CONVERSION_CREATION:
+        return _server_conversion_closed(
+            "后台转换已停用，请在本机重新转换并上传"), 410
     ident = current_identity()
     job = conversion_store.get_job(job_id)
     # 源可用性按任务源解析判定（P4-app：任务 staging 副本 / 平铺 alias

@@ -159,7 +159,12 @@ def test_format_acceptance_derived_from_registry(owner_client):
         r = _create(owner_client, filename=name)
         assert r.status_code == 422, name
         assert r.get_json()["code"] == "cos_format_unsupported"
-    accepted = {"cosapi-a.zip": "zip", "cosapi-a.kfb": "conversion",
+    # R1：convert-required（kfb）不再建后端转换任务，引导本机「转换并上传」
+    # （闸的完整断言见 tests/test_r1_conversion_gate.py）
+    r = _create(owner_client, filename="cosapi-a.kfb", size=100_000)
+    assert r.status_code == 422
+    assert r.get_json()["code"] == "conversion_moved_to_browser"
+    accepted = {"cosapi-a.zip": "zip",
                 "cosapi-b.svs": "native", "cosapi-a.bmp": "native",
                 "cosapi-c.tif": "native"}
     for name, kind in accepted.items():
@@ -391,7 +396,8 @@ def test_capability_payload_shapes(monkeypatch):
         assert p["max_size_bytes"] == 800_000
         assert p["policy_version"] == "v1-manual"
         assert "svs" in p["formats"]
-        assert "zip" in p["formats"] and "kfb" in p["formats"]
+        assert "zip" in p["formats"] and "kfb" not in p["formats"]
+        assert "kfb" in p["browser_convert"]["formats"]
         assert "mrxs" not in p["formats"]
         # 配置门禁未过（结构性 < 产品上限）→ fail-closed 不可用
         monkeypatch.setattr(app_mod, "UPLOAD_PRODUCT_MAX_BYTES", 950_000)

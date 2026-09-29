@@ -153,14 +153,13 @@ esac
 
 # ---------------------------------------------------------------------------
 # KFB 转换 worker（Phase B）：conversion_jobs 排水。独立于 Gunicorn。
-# CONVERSION_WORKER=0/false/no/off 关闭。
+# R1 起服务端不再新建转换（KFB/KFBF 在浏览器本机转换后上传），缺省关闭；
+# 旧镜像建的任务只能在旧镜像跑完（新 worker 对无 slide_id 旧任务 fail-closed）。
+# CONVERSION_WORKER=1/true/yes/on 才拉起。
 # ---------------------------------------------------------------------------
-_cv_worker="$(printf '%s' "${CONVERSION_WORKER:-1}" | tr '[:upper:]' '[:lower:]')"
+_cv_worker="$(printf '%s' "${CONVERSION_WORKER:-0}" | tr '[:upper:]' '[:lower:]')"
 case "$_cv_worker" in
-  0|false|no|off)
-    echo "[entry] CONVERSION_WORKER=$_cv_worker, skip conversion worker"
-    ;;
-  *)
+  1|true|yes|on)
     echo "[entry] starting conversion_worker --loop"
     (
       while :; do
@@ -169,6 +168,9 @@ case "$_cv_worker" in
         sleep 2
       done
     ) &
+    ;;
+  *)
+    echo "[entry] CONVERSION_WORKER=$_cv_worker, skip conversion worker"
     ;;
 esac
 

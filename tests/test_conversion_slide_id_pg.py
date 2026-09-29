@@ -172,7 +172,9 @@ def test_same_name_source_and_product_independent_ids(tmp_path):
 # --------------------------------------------------------------------------- #
 # 2. failure/retry 不重复 ID/项目关联/配额
 # --------------------------------------------------------------------------- #
-def test_failure_retry_same_id_and_single_settlement(tmp_path):
+def test_failure_retry_same_id_and_single_settlement(tmp_path, monkeypatch):
+    # R1 关闭了重试入口（410）；本用例覆盖 C7 删除前仍在的旧重试代码路径
+    monkeypatch.setattr(app_mod, "SERVER_CONVERSION_CREATION", True)
     c = _client()
     uid = _user_session(c, login="cv-retry@x.com")
     _set_quota(uid, 10 ** 8)

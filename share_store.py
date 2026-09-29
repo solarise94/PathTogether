@@ -107,6 +107,7 @@ _PUBLIC_NAMES = (
     "list_plugin_installations",
     # —— 插件能力层：能力注册表登记 ——
     "set_installation_capabilities",
+    "set_installation_approved_scopes",
     "create_run_grant",
     "get_run_grant",
     "revoke_run_grant",

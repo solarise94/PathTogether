@@ -321,6 +321,10 @@ def test_schema_migrations_recorded(conn):
         # R16：KFB 交接的不可领取子任务态 held（父任务 intent 前创建，
         # 源文件就位后与源字节结算同事务转 queued）。
         "0076_conversion_jobs_held.sql",
+        # C5 producer 导入（docs/slide-tools/c5-producer-import-contract.md
+        # §2/§3）：producer_imports/producer_import_events/plugin_import_grants
+        # 三表 + plugin_installations.approved_scopes（安装行批准权限面）。
+        "0077_producer_imports.sql",
     ]
 
 

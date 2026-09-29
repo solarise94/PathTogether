@@ -34,12 +34,23 @@ PLUGIN_CONTRACT_VERSION = "1.0.0"
 BRIDGE_PROTOCOL_VERSION = "1.0.0"
 
 # manifest permissions 枚举（§7.1；与 capabilities 列表对齐，未知值校验失败）。
+# slide:import（C5 producer 导入合同 §2.1，2026-09-29）：机器生产者导入通道
+# 权限——manifest 可申请，但安装时需 admin 显式批准进安装行 approved_scopes
+# （未批准的申请 = 安装被拒，fail-closed）；JWT 按安装行裁剪发放，存量安装
+# 行不自动获得（防自动提权）。老插件零迁移（不声明则完全不受影响）。
 MANIFEST_PERMISSIONS = (
     "slide:metadata:read",
     "slide:region:read",
     "annotation:read",
     "annotation:write",
     "viewer:navigate",
+    "slide:import",
+)
+
+#: 需要安装时 admin 显式批准的扩展权限（fail-closed：manifest 申请但
+#: approvePermissions 未给出 → 安装被拒）。基础 5 项不在此列。
+MANIFEST_APPROVAL_REQUIRED_PERMISSIONS = (
+    "slide:import",
 )
 
 # Manifest v1.1（docs/admin-billing-plugin-implementation-plan.md §8.2/§8.4）：

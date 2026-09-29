@@ -611,11 +611,14 @@ def _installation_out(row: dict) -> dict:
     """installation 导出副本：剥离 secret_hash（hash 不出存储层）。
 
     capabilities（插件能力注册表，docs §4.1）缺省补 []——旧安装行没有该字段，
-    读侧一律拿到 list（兼容 0011 迁移前的旧行）。
+    读侧一律拿到 list（兼容 0011 迁移前的旧行）。approved_scopes（C5 §2.1，
+    0077 列）缺省归一 []——存量安装行不自动获得 slide:import 等扩展权限。
     """
     out = dict(row)
     out.pop("secret_hash", None)
     out["enabled"] = bool(row.get("enabled"))
     caps = out.get("capabilities")
     out["capabilities"] = [c for c in caps if isinstance(c, dict)] if isinstance(caps, list) else []
+    scopes = out.get("approved_scopes")
+    out["approved_scopes"] = [s for s in scopes if isinstance(s, str)] if isinstance(scopes, list) else []
     return out

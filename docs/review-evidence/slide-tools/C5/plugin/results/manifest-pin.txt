@@ -1,0 +1,6 @@
+# manifest sha256 pin（source-policy 条目值）
+7c6ea101584b09670b95c8096369df7021b34812fd5fbc888d15f25d5167fa20  plugins/pathtogether-baidu-import/manifest.json
+
+# 校验器（平台 SDK，已含 slide:import 枚举）
+validate_manifest: []
+negotiate_versions: {'manifestSchemaVersion': '1.2.0', 'id': 'dev.pathtogether.baidu-import', 'pluginVersion': '0.1.0', 'pluginContractVersion': '1.1.0', 'bridgeProtocolVersion': '1.0.0'}

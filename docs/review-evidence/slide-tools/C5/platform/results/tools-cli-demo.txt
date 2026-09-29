@@ -1,0 +1,6 @@
+== fixture: in-flight producer import pim_SJiKrIvIyTilcLUr writing
+== reconcile dry-run exit 0
+counts: None
+== drain audit exit 0
+异常: 无
+producer 导入暂存证据（新通道，逐成员扫描，未裁决）：1

@@ -39,6 +39,7 @@ KINDS = frozenset({
     "ingestion_job",   # COS 下载/发布（.staging/<inj_id>/）
     "conversion_job",  # 转换源副本/work（.staging/<cvj_id>/）
     "baidu_batch",     # 百度批次本地暂存（staging_root/<bib_id>/）
+    "producer_import", # C5 producer 导入（.staging/<pim_id>/<commit_token>/）
 })
 
 _LOCK_DIRNAME = ".task-locks"

@@ -1,0 +1,27 @@
+# 全量 pytest（串行；TMPDIR=$PWD/.gate-tmp；--deselect tests/test_ai_budget_wiring.py::test_ui_budget_card_and_max_steps_sync_present = 他人在途无关失败）
+# 2026-09-29 验收修复后
+    data.shape = shape
+tests/test_raster_viewing.py::test_raster_rendered_view_passthrough_native
+tests/test_raster_viewing.py::test_raster_rendered_view_passthrough_native
+  /home/solarise/ZCodeProject/histopilot-suite/PathTogether/tests/test_raster_viewing.py:220: DeprecationWarning: Image.Image.getdata is deprecated and will be removed in Pillow 14 (2027-10-15). Use get_flattened_data instead.
+    assert list(direct.getdata()) == list(via_view.getdata())
+tests/test_raster_viewing.py::test_share_raster_with_multichannel_flag_on
+tests/test_raster_viewing.py::test_share_raster_with_multichannel_flag_on
+  /home/solarise/ZCodeProject/histopilot-suite/PathTogether/tests/test_raster_viewing.py:401: DeprecationWarning: Image.Image.getdata is deprecated and will be removed in Pillow 14 (2027-10-15). Use get_flattened_data instead.
+    assert list(p1.getdata()) == list(p2.getdata())
+tests/test_zip_guard.py::test_exact_duplicate_path_rejected
+  /usr/lib/python3.14/zipfile/__init__.py:1721: UserWarning: Duplicate name: 'a.svs'
+    return self._open_to_write(zinfo, force_zip64=force_zip64)
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+2846 passed, 8 skipped, 1 deselected, 252 warnings in 1537.91s (0:25:37)
+Failed postgres command (1, ['/home/solarise/ZCodeProject/histopilot-suite/PathTogether/.venv/lib/python3.14/site-packages/pgserver/pginstall/bin/pg_ctl', '-D', '/home/solarise/ZCodeProject/histopilot-suite/PathTogether/.gate-tmp/svs-pg-conftest-sjtlmont', '-w', 'stop']) with kwargs: `{'user': None}`:
+error:
+Command '['/home/solarise/ZCodeProject/histopilot-suite/PathTogether/.venv/lib/python3.14/site-packages/pgserver/pginstall/bin/pg_ctl', '-D', '/home/solarise/ZCodeProject/histopilot-suite/PathTogether/.gate-tmp/svs-pg-conftest-sjtlmont', '-w', 'stop']' returned non-zero exit status 1.
+stdout:
+waiting for server to shut down............................................................... failed
+---
+stderr:
+pg_ctl: server does not shut down
+---
+Failed to stop server, killing it instead.
+exit=0

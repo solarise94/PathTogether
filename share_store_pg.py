@@ -2984,7 +2984,7 @@ def archived_slide_names():
 def _fetch_installation(cur, installation_id):
     cur.execute(
         "SELECT installation_id, plugin_id, version, enabled, secret_hash, "
-        " capabilities, "
+        " capabilities, approved_scopes, "
         " extract(epoch from created_at)::float8 AS created_at, "
         " extract(epoch from disabled_at)::float8 AS disabled_at "
         "FROM plugin_installations WHERE installation_id=%s",
@@ -2993,10 +2993,11 @@ def _fetch_installation(cur, installation_id):
 
 
 def create_plugin_installation(plugin_id, version="", secret=None,
-                               capabilities=None):
+                               capabilities=None, approved_scopes=None):
     """创建插件安装行，返回 {**installation, "secret": 明文}（仅此一次）。
 
     capabilities 为可选的能力注册表登记项（docs §4.1；缺省 []）。
+    approved_scopes 为可选的已批准扩展权限列表（C5 合同 §2.1；缺省 []）。
     """
     if not isinstance(plugin_id, str) or not plugin_id.strip():
         raise ValueError("plugin_id 不能为空")
@@ -3006,6 +3007,7 @@ def create_plugin_installation(plugin_id, version="", secret=None,
     now = time.time()
     caps_json = json.dumps(
         [dict(c) for c in capabilities] if isinstance(capabilities, list) else [])
+    scopes = [str(s) for s in (approved_scopes or []) if s]
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -3013,10 +3015,11 @@ def create_plugin_installation(plugin_id, version="", secret=None,
                 cur.execute(
                     "INSERT INTO plugin_installations "
                     "(installation_id, plugin_id, version, enabled, secret_hash, "
-                    " capabilities, created_at) "
-                    "VALUES (%s,%s,%s,TRUE,%s,%s, to_timestamp(%s))",
+                    " capabilities, approved_scopes, created_at) "
+                    "VALUES (%s,%s,%s,TRUE,%s,%s,%s, to_timestamp(%s))",
                     (installation_id, plugin_id.strip(), version or "",
-                     _hash_installation_secret(plaintext), caps_json, now))
+                     _hash_installation_secret(plaintext), caps_json, scopes,
+                     now))
                 row = _fetch_installation(cur, installation_id)
         out = _installation_out(dict(row))
         out["secret"] = plaintext
@@ -3113,7 +3116,7 @@ def list_plugin_installations():
             with c.cursor() as cur:
                 cur.execute(
                     "SELECT installation_id, plugin_id, version, enabled, "
-                    " capabilities, "
+                    " capabilities, approved_scopes, "
                     " extract(epoch from created_at)::float8 AS created_at, "
                     " extract(epoch from disabled_at)::float8 AS disabled_at "
                     "FROM plugin_installations ORDER BY created_at ASC")
@@ -3138,6 +3141,29 @@ def set_installation_capabilities(installation_id, capabilities):
                     "UPDATE plugin_installations SET capabilities=%s "
                     "WHERE installation_id=%s",
                     (caps_json, installation_id))
+                if cur.rowcount == 0:
+                    return None
+                row = _fetch_installation(cur, installation_id)
+        return _installation_out(dict(row))
+    finally:
+        conn.close()
+
+
+def set_installation_approved_scopes(installation_id, approved_scopes):
+    """整体替换安装行的批准权限面（C5 合同 §2.1；0077 列 approved_scopes）。
+
+    值 = 字符串列表（经 MANIFEST_APPROVAL_REQUIRED_PERMISSIONS 枚举校验的
+    调用方传入）；空列表 = 未批准任何扩展权限（存量行缺省语义）。返回更新
+    后的安装行（不含 hash）；不存在返回 None。"""
+    scopes = [str(s) for s in (approved_scopes or []) if s]
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE plugin_installations SET approved_scopes=%s "
+                    "WHERE installation_id=%s",
+                    (scopes, installation_id))
                 if cur.rowcount == 0:
                     return None
                 row = _fetch_installation(cur, installation_id)

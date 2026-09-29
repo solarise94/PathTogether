@@ -142,6 +142,7 @@ import cos_client
 import cos_config
 import cos_pool_store
 import ingestion_store
+import producer_import_store
 # SER-8 测试申请（wip/ser8-dev）：已验证待激活用户申请测试资格 + owner 审核
 # 原子激活（含默认额度 provisioning）。test_application_store 提供
 # submit/get/list_applications/review 原语（PostgreSQL 唯一后端，0054；
@@ -182,6 +183,7 @@ from plugins.sdk.manifest import (  # noqa: E402
     CAPABILITY_DEFAULT_TIMEOUT_MS,
     CAPABILITY_MAX_TIMEOUT_MS,
     CAPABILITY_REQUIRED_PERMISSIONS,
+    MANIFEST_APPROVAL_REQUIRED_PERMISSIONS,
     capability_tool_name,
     validate_manifest,
     validate_provides,
@@ -1186,6 +1188,13 @@ def require_active_account():
     return None
 
 
+# C5 producer 导入 write 数据面路径（/api/plugin/v1/imports/<id>/write）：
+# 不进控制面 120/min 桶（视图内 _PRODUCER_IMPORT_WRITE_LIMITER 单列限流，
+# 默认 600/min——合同 §1.1）。import_id 为 pim_ 前缀安全组件。
+_PRODUCER_IMPORT_WRITE_PATH_RE = re.compile(
+    r"^/api/plugin/v1/imports/[^/]+/write$")
+
+
 @app.before_request
 def _plugin_v1_rate_limit():
     """v1 能力端点统一速率限制（进程内 token bucket per installation_id）。
@@ -1198,7 +1207,9 @@ def _plugin_v1_rate_limit():
     头泄漏 token 有效性）。
 
     - auth/token 换发端点不在此列（无 Bearer、走 secret 校验，属引导通道）；
-    - regions 端点也计入总桶（权重 1），其像素预算/并发闸在视图内单独再叠加。
+    - regions 端点也计入总桶（权重 1），其像素预算/并发闸在视图内单独再叠加；
+    - C5 producer 导入 write 是数据面：不进本桶（视图内
+      _PRODUCER_IMPORT_WRITE_LIMITER 单列限流，合同 §1.1）。
     超限 → 429 rate_limited(retryable=true) + Retry-After（§7.7）。
     """
     path = request.path
@@ -1206,6 +1217,8 @@ def _plugin_v1_rate_limit():
         return None
     if path == "/api/plugin/v1/auth/token":
         return None  # 引导换发端点：无 Bearer，交视图按 secret 校验
+    if _PRODUCER_IMPORT_WRITE_PATH_RE.match(path):
+        return None
     authz = request.headers.get("Authorization") or ""
     if not authz.startswith("Bearer "):
         return None  # 无 token → 交视图 401，不计入桶
@@ -1254,6 +1267,10 @@ CSRF_FORM_FIELD = "csrf_token"
 _CSRF_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 # 非 Cookie 会话通道（internal token / plugin JWT / Demo capability），不混用 CSRF 语义
 _CSRF_EXEMPT_PREFIXES = ("/internal/", "/api/plugin/", "/api/demo/")
+# C5（§2.2）：/api/plugin/import-grants* 是 **Cookie session + CSRF 的用户面**
+# （用户导入委托 grant 的创建/列表/撤销），不是机器 JWT 通道——前缀豁免在此
+# 显式收回（不豁免），与 DELETE /api/ai/run-grants/<id> 同面。
+_PLUGIN_USER_FACE_PREFIX = "/api/plugin/import-grants"
 # 静态资源通道（只读 GET）：不下发 token/cookie（避免每个资源响应都带 Set-Cookie）；
 # 非安全方法仍走统一校验（静态路由本无写端点，属纵深防御）
 #: 静态/资源通道前缀：不做 CSRF 镜像、不在 GET 时 ensure token（session 不
@@ -1267,6 +1284,10 @@ _CSRF_STATIC_PREFIXES = ("/static/", "/plugins/", "/admin/plugin-assets/")
 
 
 def _csrf_exempt_path(path: str) -> bool:
+    # C5 用户面 grant 端点走 Cookie+CSRF（前缀豁免的显式例外）
+    if path == _PLUGIN_USER_FACE_PREFIX or \
+            path.startswith(_PLUGIN_USER_FACE_PREFIX + "/"):
+        return False
     return path.startswith(_CSRF_EXEMPT_PREFIXES)
 
 
@@ -13280,6 +13301,21 @@ _PLUGIN_ERROR_RETRYABLE = {
     "hold_conflict": False,
     "hold_not_open": False,
     "hold_not_found": False,
+    # C5 producer 导入（docs/slide-tools/c5-producer-import-contract.md §1.8）
+    "import_not_found": False,
+    "import_state_invalid": False,
+    "idempotency_conflict": False,
+    "offset_conflict": False,
+    "checksum_mismatch": False,
+    "incomplete_write": False,
+    "commit_in_progress": False,
+    "size_exceeded": False,
+    "upload_quota_exceeded": False,
+    "disk_watermark_exceeded": True,
+    "format_unsupported": False,
+    "import_grant_invalid": False,
+    "cleanup_not_verified": False,
+    "declared_checksum_mismatch": False,
 }
 
 
@@ -13443,6 +13479,15 @@ _PLUGIN_REGION_CONCURRENCY_SEM = threading.BoundedSemaphore(_PLUGIN_REGION_MAX_C
 _PLUGIN_PIXEL_WINDOW = _SlidingPixelWindow(_PLUGIN_REGION_PIXEL_BUDGET_PER_MIN)
 _PLUGIN_RATE_LIMITER = _PluginRateLimiter(_PLUGIN_RATE_LIMIT_PER_MIN)
 
+# C5 producer 导入 write 数据面（合同 §1.1）：控制面沿用 PLUGIN_RATE_LIMIT_
+# PER_MIN（120/min）；write 单列放宽桶（默认 600/min，env 可调），仍
+# per-installation token bucket、超限 429 + Retry-After。write 不进像素
+# 预算/并发信号量（那两道闸是 regions 专用）。
+_PRODUCER_IMPORT_WRITE_RATE_LIMIT_PER_MIN = max(1, int(
+    os.environ.get("PRODUCER_IMPORT_WRITE_RATE_LIMIT_PER_MIN") or 600))
+_PRODUCER_IMPORT_WRITE_LIMITER = _PluginRateLimiter(
+    _PRODUCER_IMPORT_WRITE_RATE_LIMIT_PER_MIN)
+
 # --------------------------------------------------------------------------- #
 # 插件能力层 P1：dispatch 通道常量（docs §4.2）
 #
@@ -13463,13 +13508,19 @@ _PLUGIN_DISPATCH_RESULT_MAX_BYTES = 64 * 1024  # result JSON 序列化后上限
 _DISPATCH_RATE_LIMITER = _PluginRateLimiter(_PLUGIN_DISPATCH_RATE_LIMIT_PER_MIN)
 
 
-def _require_plugin_token(required_scope=None):
+def _require_plugin_token(required_scope=None, *, require_enabled=True):
     """plugin v1 端点鉴权：Authorization: Bearer <scoped JWT>。
 
     校验链：Bearer 形态 → 签名/iss/aud/exp（过期 → 401 token_expired）→
-    installation 存在且 enabled（**每次回查**，disable 后旧 token 立即失效；
-    demo 规模不做缓存）→ required_scope 包含于 payload.scope（不足 403 forbidden）。
+    installation 存在且（require_enabled 时）enabled（**每次回查**，disable 后
+    旧 token 立即失效；demo 规模不做缓存）→ required_scope 包含于
+    payload.scope（不足 403 forbidden）。
     返回 (claims, None) 或 (None, error_response)。
+
+    require_enabled=False（C5 合同 §2.4 清理列）：任务级收尾操作
+    （cleanup-confirm）不依赖插件存活——只验安装行存在（write_token 校验
+    不查 enabled）；新操作（begin/write/commit）仍走默认 enabled 回查。
+    agent-tool-token（aud=agent-tool）在此解码为 invalid → 401（§2.6 域隔离）。
     """
     authz = request.headers.get("Authorization") or ""
     if not authz.startswith("Bearer ") or not authz[len("Bearer "):].strip():
@@ -13482,7 +13533,8 @@ def _require_plugin_token(required_scope=None):
         return None, _plugin_error(401, "unauthorized", "token 无效")
     installation_id = payload.get("sub") or ""
     installation = share_store.get_plugin_installation(installation_id)
-    if installation is None or not installation.get("enabled"):
+    if installation is None or (require_enabled and
+                                not installation.get("enabled")):
         return None, _plugin_error(401, "unauthorized", "插件安装不存在或已停用")
     if required_scope:
         scopes = (payload.get("scope") or "").split()
@@ -13491,6 +13543,22 @@ def _require_plugin_token(required_scope=None):
                 403, "forbidden",
                 "scope 不足：需要 %s（当前 %s）" % (required_scope, payload.get("scope")))
     return payload, None
+
+
+def _installation_jwt_scopes(installation):
+    """C5 合同 §2.1：JWT scope = 既有 5 项基础 scope ∪ 安装行 approved_scopes
+    （approved_scopes 只放开**扩展权限**——当前仅 slide:import，不在基础 5 项
+    内）。
+
+    存量安装行（approved_scopes 缺省 []）拿到的就是既有 5 项基础 scope，老
+    token 语义不变——即「存量安装不发 slide:import」（防自动提权）。返回
+    空格分隔 scope 字符串。"""
+    base = list(_PLUGIN_JWT_SCOPES.split())
+    approved = set(installation.get("approved_scopes") or [])
+    extra = [s for s in approved
+             if s in MANIFEST_APPROVAL_REQUIRED_PERMISSIONS
+             and s not in base]
+    return " ".join(base + extra)
 
 
 def _bootstrap_plugin_installations(environ=None):
@@ -13628,7 +13696,9 @@ def plugin_v1_auth_token():
         "aud": _PLUGIN_JWT_AUDIENCE,
         "sub": installation_id,
         "plugin_id": installation.get("plugin_id") or "",
-        "scope": _PLUGIN_JWT_SCOPES,
+        # C5 §2.1：scope 按安装行 approved_scopes 裁剪——slide:import 只在
+        # 显式批准的安装出现；存量安装行（缺省 []）老 token 语义不变。
+        "scope": _installation_jwt_scopes(installation),
     }
     token = _plugin_jwt_encode(payload)
     return jsonify(access_token=token, expires_in=_PLUGIN_JWT_TTL_SECONDS,
@@ -13764,14 +13834,18 @@ def _read_plugin_bundle_manifest(plugin_key):
     return manifest, None
 
 
-def install_plugin_bundle(plugin_key):
+def install_plugin_bundle(plugin_key, approved_permissions=None):
     """安装/更新插件 bundle：解析 manifest → 来源策略 → 登记能力注册表。
 
     返回 (installation_dict, None) 或 (None, (resp, status))。流程（docs §4.1）：
       1. manifest 读取（结构错误 400）；
       2. 来源策略校验（sha256 pin 不符 403，沿用 plugin_source_allowed）；
       3. provides 解析（任何校验错误 400——登记失败 = 安装失败，fail-closed）；
-      4. 同 plugin_id 已有安装行 → 整体替换 capabilities（版本随之刷新）；
+      4. 扩展权限审批（C5 合同 §2.1）：manifest.permissions 申请
+         MANIFEST_APPROVAL_REQUIRED_PERMISSIONS（当前仅 slide:import）而
+         approved_permissions 未显式批准 → 400 安装被拒（fail-closed，
+         登记失败 = 安装失败，现状语义）；批准则写入安装行 approved_scopes；
+      5. 同 plugin_id 已有安装行 → 整体替换 capabilities（版本随之刷新）；
          否则创建新安装行（secret 平台生成，明文不落盘不返回）。
     """
     manifest, mf_err = _read_plugin_bundle_manifest(plugin_key)
@@ -13786,6 +13860,18 @@ def install_plugin_bundle(plugin_key):
     except ValueError as e:
         return None, (jsonify(error="manifest 校验失败（安装被拒绝）：%s" % e,
                               plugin=plugin_key), 400)
+    requested = [p for p in (manifest.get("permissions") or [])
+                 if p in MANIFEST_APPROVAL_REQUIRED_PERMISSIONS]
+    approved = [p for p in (approved_permissions or [])
+                if p in MANIFEST_APPROVAL_REQUIRED_PERMISSIONS]
+    unapproved = [p for p in requested if p not in approved]
+    if unapproved:
+        return None, (jsonify(
+            error="manifest 申请的扩展权限未获批准（安装被拒，fail-closed）：%s"
+                  % ", ".join(unapproved),
+            plugin=plugin_key,
+            need_approval=unapproved,
+            approve_with={"approvePermissions": unapproved}), 400)
     plugin_id = manifest.get("id") or plugin_key
     version = manifest.get("pluginVersion") or ""
     existing = [i for i in share_store.list_plugin_installations()
@@ -13796,10 +13882,14 @@ def install_plugin_bundle(plugin_key):
             installation_id, capabilities)
         if updated is None:
             return None, (jsonify(error="安装行更新失败", plugin=plugin_key), 500)
+        if approved:
+            share_store.set_installation_approved_scopes(
+                installation_id, approved)
         installation = share_store.get_plugin_installation(installation_id)
     else:
         created = share_store.create_plugin_installation(
-            plugin_id, version=version, capabilities=capabilities)
+            plugin_id, version=version, capabilities=capabilities,
+            approved_scopes=approved)
         installation = {k: v for k, v in created.items() if k != "secret"}
     # 审计主体取当前身份；函数可能被启动引导/测试在请求上下文外调用，退化按
     # owner（与 current_identity 的无 session 归一语义一致）。
@@ -13827,9 +13917,10 @@ def install_plugin_bundle(plugin_key):
 def api_admin_plugins_install():
     """安装/更新插件 bundle 并登记能力注册表（owner-only，docs §4.1）。
 
-    body: {"plugin": "<plugins/ 下目录名>"}。成功返回安装行（含 capabilities，
+    body: {"plugin": "<plugins/ 下目录名>", "approvePermissions"?:
+    ["slide:import", …]}。成功返回安装行（含 capabilities/approved_scopes，
     不含 secret）；manifest 校验失败 400（fail-closed：登记失败 = 安装失败）、
-    来源策略拒绝 403。
+    扩展权限申请未批准 400、来源策略拒绝 403。
     """
     auth = _require_owner()
     if auth:
@@ -13838,7 +13929,13 @@ def api_admin_plugins_install():
     plugin_key = body.get("plugin")
     if not isinstance(plugin_key, str) or not plugin_key.strip():
         return jsonify(error="plugin 必填（plugins/ 下目录名）"), 400
-    installation, err = install_plugin_bundle(plugin_key.strip())
+    approved_permissions = body.get("approvePermissions")
+    if approved_permissions is not None and (
+            not isinstance(approved_permissions, list)
+            or not all(isinstance(p, str) for p in approved_permissions)):
+        return jsonify(error="approvePermissions 需为字符串数组"), 400
+    installation, err = install_plugin_bundle(
+        plugin_key.strip(), approved_permissions=approved_permissions)
     if err is not None:
         return err
     return jsonify(installation)
@@ -14946,6 +15043,42 @@ def _start_slide_delete_worker_thread():
 
 
 _SLIDE_DELETE_WORKER_THREAD = _start_slide_delete_worker_thread()
+
+
+def _start_producer_import_sweep_thread():
+    """C5 producer 导入平台 duty daemon（合同 §1.4 崩溃恢复、§3.1 绝对期限、
+    §4.4 本地清理重试）：周期跑 ``producer_import_store.sweep_producer_imports``。
+
+    - ``PRODUCER_IMPORT_SWEEP_INTERVAL_SECONDS``：间隔秒数（缺省 30；``0`` 或
+      负数 = 关闭）；
+    - 多 gunicorn worker 同时跑是安全的：发布恢复在 slide advisory 锁内重验
+      （与在途 commit 串行，后到者见已结算）、清理在 task_storage_lock 内；
+    - pytest（``app.config['TESTING']``）下不执行：跨用例写库会破坏 TRUNCATE
+      隔离，语义由测试直调 sweep 覆盖。
+    """
+    interval = _env_float("PRODUCER_IMPORT_SWEEP_INTERVAL_SECONDS", 30)
+    if interval <= 0:
+        return None
+
+    def _loop():
+        while True:
+            time.sleep(interval)
+            if app.config.get("TESTING"):
+                continue
+            try:
+                producer_import_store.sweep_producer_imports(
+                    upload_root=Path(UPLOAD_DIR))
+            except Exception:
+                app.logger.warning("producer 导入 sweep 轮次异常（下一轮重试）",
+                                   exc_info=True)
+
+    th = threading.Thread(target=_loop, name="producer-import-sweep",
+                          daemon=True)
+    th.start()
+    return th
+
+
+_PRODUCER_IMPORT_SWEEP_THREAD = _start_producer_import_sweep_thread()
 
 
 def _run_daily_retention_once():
@@ -18659,6 +18792,834 @@ def plugin_v1_run_grant_verify():
     valid, reason = _verify_run_grant(grant_id, slide, claims.get("sub") or "",
                                       slide_id=slide_id or None)
     return jsonify(valid=valid, reason=reason if not valid else "")
+
+
+# --------------------------------------------------------------------------- #
+# C5 producer 导入通道（docs/slide-tools/c5-producer-import-contract.md §1/§2）
+#
+# 通用、授权受限的机器生产者导入：插件后端把最终单文件产物按有界流写入平台
+# 私有 staging，平台自行验证并经唯一 slide_publish 发布结算。鉴权三层
+# （§2.3）：plugin JWT（slide:import scope，installation enabled 每请求回查）
+# → 用户导入委托 grant（owner 只来自 grant.user_id）→ 任务级 write_token
+# （begin 一次性下发，存哈希）。agent-tool-token 在 _require_plugin_token
+# 解码层即 401（aud 域隔离，§2.6）。
+#
+# 错误码表/幂等域/限流（write 数据面 600/min 单列；控制面沿用 120/min 桶）
+# 见合同 §1.1/§1.8。响应绝不携带 staging 路径或任何秘密。
+# --------------------------------------------------------------------------- #
+def _pi_error(exc):
+    """producer_import_store 异常 → 统一插件错误信封。"""
+    if isinstance(exc, producer_import_store.GrantInvalid):
+        return _plugin_error(exc.http_status, exc.code, exc.message,
+                             details={"reason": exc.reason})
+    return _plugin_error(exc.http_status, exc.code, exc.message)
+
+
+def _pi_load_owned(import_id, claims):
+    """加载本 installation 名下的任务；他人/不存在统一 404 import_not_found
+    （§1.8：不泄露存在性）。"""
+    imp = producer_import_store.get_import(import_id)
+    if imp is None or imp.get("installation_id") != (claims.get("sub") or ""):
+        return None, _plugin_error(404, "import_not_found",
+                                   "任务不存在或不属于本安装")
+    return imp, None
+
+
+def _pi_write_token_ok(imp, write_token):
+    """任务级凭证校验（§2.3 第 3 层；不匹配统一 403 forbidden 不区分层）。"""
+    if not producer_import_store.write_token_matches(imp, write_token):
+        return _plugin_error(403, "forbidden", "任务凭证无效")
+    return None
+
+
+def _pi_grant_ok(imp):
+    """§2.3 第 2/4 层：grant 活跃 + 创建者/项目复查（新数据操作重跑；
+    清理/收尾类操作不查——§2.4 分层语义）。"""
+    try:
+        producer_import_store.verify_import_grant(
+            imp.get("grant_id"), imp.get("installation_id"),
+            imp.get("project_id"))
+    except producer_import_store.GrantInvalid as exc:
+        return _pi_error(exc)
+    return None
+
+
+def _pi_body_str(body, key, *, required=True, max_len=0):
+    """请求体字符串字段的形态校验；返回 (value, error_response|None)。"""
+    v = body.get(key)
+    if v is None or v == "":
+        if required:
+            return None, _plugin_error(400, "invalid_request",
+                                       "%s 必填" % key)
+        return None, None
+    if not isinstance(v, str) or not v.strip():
+        return None, _plugin_error(400, "invalid_request",
+                                   "%s 形态非法（需非空字符串）" % key)
+    if max_len and len(v) > max_len:
+        return None, _plugin_error(400, "invalid_request",
+                                   "%s 超长（>%d 字符）" % (key, max_len))
+    return v.strip(), None
+
+
+def _pi_receipt(imp):
+    """§1.4/§1.5 稳定回执（status 视图同源；绝不带路径/秘密）。"""
+    view = producer_import_store.import_status_view(imp)
+    view["idempotency_key"] = imp.get("idempotency_key")
+    view["chunk_max_bytes"] = producer_import_store.CHUNK_MAX_BYTES
+    return view
+
+
+@app.route("/api/plugin/v1/imports/begin", methods=["POST"])
+def plugin_v1_imports_begin():
+    """§1.2 begin：grant 复核 → 归属复核 → 幂等裁决 → 预分配 → final/scratch
+    预约准入即绑定（单事务）。201 返回 write_token（仅本次一次）。"""
+    claims, err = _require_plugin_token("slide:import")
+    if err is not None:
+        return err
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return _plugin_error(400, "invalid_request", "request body 需为 JSON object")
+    idem = (request.headers.get("Idempotency-Key") or "").strip()
+    if not idem or not _REQUEST_ID_RE.match(idem):
+        return _plugin_error(
+            400, "invalid_request",
+            "Idempotency-Key 头必填（1-128 [A-Za-z0-9_-]）")
+    body_idem = body.get("idempotency_key")
+    if body_idem is not None:
+        if not isinstance(body_idem, str) or \
+                not _REQUEST_ID_RE.match(body_idem):
+            return _plugin_error(400, "invalid_request",
+                                 "idempotency_key 形态非法")
+        if body_idem != idem:
+            return _plugin_error(
+                400, "invalid_request",
+                "body idempotency_key 与 Idempotency-Key 头必须一致")
+    grant_id, gerr = _pi_body_str(body, "grant_id", max_len=128)
+    if gerr:
+        return gerr
+    project_id, perr = _pi_body_str(body, "project_id", required=False,
+                                    max_len=128)
+    if perr:
+        return perr
+    filename, ferr = _pi_body_str(body, "filename", max_len=255)
+    if ferr:
+        return ferr
+    try:
+        filename = slide_store.sanitize_original_filename(filename)
+    except ValueError as e:
+        return _plugin_error(400, "invalid_request", "filename 非法：%s" % e)
+    format_ext, xerr = _pi_body_str(body, "format_ext", max_len=16)
+    if xerr:
+        return xerr
+    try:
+        format_ext = slide_store.normalize_format_ext(format_ext)
+    except ValueError as e:
+        return _plugin_error(400, "invalid_request", "format_ext 非法：%s" % e)
+    try:
+        declared_size = int(body.get("declared_size"))
+        scratch_bytes = int(body.get("scratch_bytes") or 0)
+    except (TypeError, ValueError):
+        return _plugin_error(400, "invalid_request",
+                             "declared_size/scratch_bytes 需为整数")
+    if declared_size <= 0 or \
+            declared_size > upload_guard.UPLOAD_MAX_REQUEST_BYTES:
+        return _plugin_error(
+            413, "size_exceeded",
+            "declared_size 需在 (0, %d]" % upload_guard.UPLOAD_MAX_REQUEST_BYTES)
+    if scratch_bytes < 0:
+        return _plugin_error(400, "invalid_request",
+                             "scratch_bytes 需为非负整数")
+    profile = body.get("profile")
+    profile_json = None
+    if profile is not None:
+        if not isinstance(profile, dict):
+            return _plugin_error(400, "invalid_request", "profile 需为 JSON object")
+        profile_json = json.dumps(profile, ensure_ascii=False, sort_keys=True)
+        if len(profile_json.encode("utf-8")) > \
+                producer_import_store.PROFILE_MAX_BYTES:
+            return _plugin_error(400, "invalid_request", "profile 超过 4 KiB")
+    baidu_item_id = None
+    raw_item = body.get("baidu_item_id")
+    if raw_item is not None:
+        # §6.3 begin 侧 item.slide_id 绑定：仅百度驱动白名单安装可携带。
+        if (claims.get("plugin_id") or "") not in _BAIDU_IMPORT_PLUGIN_IDS:
+            return _plugin_error(400, "invalid_request",
+                                 "baidu_item_id 仅百度驱动插件安装可携带")
+        baidu_item_id, berr = _pi_body_str(body, "baidu_item_id", max_len=64)
+        if berr:
+            return berr
+    payload_sha256 = hashlib.sha256(json.dumps({
+        "grant_id": grant_id, "project_id": project_id or "",
+        "filename": filename, "format_ext": format_ext,
+        "declared_size": declared_size, "scratch_bytes": scratch_bytes,
+        "profile": profile, "baidu_item_id": baidu_item_id or "",
+    }, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+    try:
+        imp, write_token, replay = producer_import_store.begin_import(
+            claims.get("sub") or "", claims.get("plugin_id") or "",
+            grant_id, project_id, filename, format_ext,
+            declared_size, scratch_bytes, profile_json,
+            idem, payload_sha256, baidu_item_id=baidu_item_id)
+    except producer_import_store.ProducerImportError as exc:
+        return _pi_error(exc)
+    except upload_guard.QuotaExceeded:
+        return _plugin_error(413, "upload_quota_exceeded", "用户存储配额不足")
+    except (upload_guard.InflightLimitExceeded, upload_guard.RateLimitExceeded):
+        return _plugin_error(429, "rate_limited", "在途/频次超限，请稍后重试",
+                             retryable=True)
+    if replay:
+        # 同键同载荷重放：原样返回（write_token 不重发——凭 status + 原
+        # token 续传，§1.2）；已终态返回终态回执。
+        out = _pi_receipt(imp)
+        out["write_token"] = None
+        out["replay"] = True
+        return jsonify(out)
+    return jsonify(import_id=imp["import_id"], slide_id=imp["slide_id"],
+                   state=imp["state"], write_token=write_token,
+                   chunk_max_bytes=producer_import_store.CHUNK_MAX_BYTES,
+                   confirmed_offset=0, idempotency_key=idem), 201
+
+
+@app.route("/api/plugin/v1/imports/<import_id>/write", methods=["POST"])
+def plugin_v1_imports_write(import_id):
+    """§1.3 write：有界流一块（1 B–64 MiB）+ offset 续传 + 逐块 sha256，
+    全程 task_storage_lock("producer_import", import_id) 文件锁内追加。"""
+    claims, err = _require_plugin_token("slide:import")
+    if err is not None:
+        return err
+    ok, retry = _PRODUCER_IMPORT_WRITE_LIMITER.consume(claims.get("sub") or "")
+    if not ok:
+        return _plugin_rate_limited_response(
+            "write 请求过于频繁（每分钟 %d 次），请稍后重试"
+            % _PRODUCER_IMPORT_WRITE_RATE_LIMIT_PER_MIN, retry,
+            details={"limit_per_min":
+                     _PRODUCER_IMPORT_WRITE_RATE_LIMIT_PER_MIN,
+                     "plane": "producer_import_write"})
+    write_token = request.headers.get("X-Import-Token") or ""
+    raw_offset = request.headers.get("X-Import-Offset") or ""
+    chunk_sha = (request.headers.get("X-Import-Chunk-Sha256") or "").strip().lower()
+    try:
+        offset = int(raw_offset)
+    except (TypeError, ValueError):
+        return _plugin_error(400, "invalid_request", "X-Import-Offset 需为整数")
+    if offset < 0:
+        return _plugin_error(400, "invalid_request", "X-Import-Offset 需为非负整数")
+    if not re.fullmatch(r"[0-9a-f]{64}", chunk_sha):
+        return _plugin_error(400, "invalid_request",
+                             "X-Import-Chunk-Sha256 需为 64 位 hex")
+    try:
+        data = request.stream.read(
+            producer_import_store.CHUNK_MAX_BYTES + 1)
+    except Exception:  # noqa: BLE001 - 计数流超限等 → 交 413/400 分支
+        return _plugin_error(413, "size_exceeded", "请求体读取失败/超限")
+    if len(data) > producer_import_store.CHUNK_MAX_BYTES:
+        return _plugin_error(413, "size_exceeded",
+                             "单块超过 64 MiB 上限（分块重发）")
+    if not data:
+        return _plugin_error(400, "invalid_request", "块不能为空（1 B 起）")
+    try:
+        with task_storage_lock.task_storage_lock(
+                producer_import_store.HOLDER_KIND, import_id):
+            imp, lerr = _pi_load_owned(import_id, claims)
+            if lerr:
+                return lerr
+            terr = _pi_write_token_ok(imp, write_token)
+            if terr:
+                return terr
+            if imp["state"] not in producer_import_store.WRITABLE_STATES:
+                return _plugin_error(
+                    409, "import_state_invalid",
+                    "write 要求 created/writing（当前 %s）" % imp["state"],
+                    details={"state": imp["state"]})
+            # §2.4：grant 撤销/过期/创建者复查失败 → 新 write 块拒绝。
+            gerr = _pi_grant_ok(imp)
+            if gerr:
+                return gerr
+            confirmed = int(imp["confirmed_offset"])
+            if offset != confirmed:
+                return _plugin_error(
+                    409, "offset_conflict",
+                    "offset 与权威值不符（断线恢复：先 GET status 再续传）",
+                    details={"expected_offset": confirmed})
+            if confirmed + len(data) > int(imp["declared_size"]):
+                return _plugin_error(
+                    413, "size_exceeded",
+                    "超出 declared_size（先 POST …/topup 补占再重发块）",
+                    details={"declared_size": int(imp["declared_size"]),
+                             "confirmed_offset": confirmed})
+            if hashlib.sha256(data).hexdigest() != chunk_sha:
+                return _plugin_error(
+                    409, "checksum_mismatch",
+                    "块 sha256 不符（confirmed_offset 不动，块作废可重发）")
+            path = producer_import_store.staging_data_path(
+                import_id, imp["commit_token"], imp["format_ext"],
+                root=Path(UPLOAD_DIR))
+            try:
+                # 水位按上传根所在卷判定（staging 目录可能尚未创建；同卷）。
+                upload_guard.check_disk_watermark(
+                    Path(UPLOAD_DIR), need_bytes=len(data))
+            except upload_guard.DiskWatermarkExceeded:
+                return _plugin_error(507, "disk_watermark_exceeded",
+                                     "磁盘可用空间低于保留水位",
+                                     retryable=True)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # 定位写 + 截断：崩溃残留（fsync 前落盘但 DB offset 未推进）被
+            # 本块起点覆盖，无空洞无重复字节；fsync 后才推进权威 offset。
+            with open(path, "r+b" if path.exists() else "wb") as fh:
+                fh.seek(confirmed)
+                fh.write(data)
+                fh.truncate(confirmed + len(data))
+                fh.flush()
+                os.fsync(fh.fileno())
+            try:
+                imp2 = producer_import_store.confirm_write_chunk(
+                    import_id, confirmed, confirmed + len(data))
+            except producer_import_store.ProducerImportError as exc:
+                return _pi_error(exc)
+    except task_storage_lock.TaskStorageLockTimeout:
+        return _plugin_error(409, "conflict",
+                             "任务存储锁等待超时，请重试", retryable=True)
+    return jsonify(
+        confirmed_offset=int(imp2["confirmed_offset"]),
+        remaining_final_bytes=max(
+            0, int(imp2["declared_size"]) - int(imp2["confirmed_offset"])))
+
+
+@app.route("/api/plugin/v1/imports/<import_id>/commit", methods=["POST"])
+def plugin_v1_imports_commit(import_id):
+    """§1.4 commit（同步端点）：平台自证（sha256/大小/格式/查看能力）→
+    commit intent CAS → 唯一 slide_publish 发布结算 → 稳定回执（幂等）。"""
+    claims, err = _require_plugin_token("slide:import")
+    if err is not None:
+        return err
+    body = request.get_json(silent=True) or {}
+    write_token = ""
+    if isinstance(body, dict):
+        write_token = body.get("write_token") or ""
+    write_token = write_token or request.headers.get("X-Import-Token") or ""
+    imp, lerr = _pi_load_owned(import_id, claims)
+    if lerr:
+        return lerr
+    terr = _pi_write_token_ok(imp, write_token)
+    if terr:
+        return terr
+    if imp["state"] in producer_import_store.SETTLED_STATES:
+        return jsonify(_pi_receipt(imp))  # 回执幂等（响应丢失重试）
+    if imp["state"] in producer_import_store.TERMINAL_STATES:
+        # T10：取消先赢——commit 对终态任务一律 import_state_invalid（含当前
+        # state 供插件决策），先于字节/产物检查。
+        return _plugin_error(
+            409, "import_state_invalid",
+            "commit 要求 created/writing/committing（当前 %s）" % imp["state"],
+            details={"state": imp["state"]})
+    if imp["state"] != producer_import_store.COMMITTING:
+        # §2.4：提交建资产类操作重跑 grant/创建者链。
+        gerr = _pi_grant_ok(imp)
+        if gerr:
+            return gerr
+        if int(imp["confirmed_offset"]) != int(imp["declared_size"]):
+            return _plugin_error(
+                409, "incomplete_write",
+                "字节不齐（%d/%d）"
+                % (imp["confirmed_offset"], imp["declared_size"]))
+        path = producer_import_store.staging_data_path(
+            import_id, imp["commit_token"], imp["format_ext"],
+            root=Path(UPLOAD_DIR))
+        if not path.is_file():
+            return _plugin_error(409, "incomplete_write",
+                                 "交付物缺失（staging 无产物文件）")
+        try:
+            probe = producer_import_store.probe_deliverable(
+                path, imp["format_ext"], filename=imp["filename"])
+        except producer_import_store.ProducerImportError as exc:
+            # 查看能力不过 → 422 + 任务转 failed（走清理，§1.4 第 2 步）。
+            producer_import_store.fail_import(import_id, exc.code)
+            producer_import_store.maybe_finish_done(import_id)
+            return _pi_error(exc)
+        if probe["size"] != int(imp["declared_size"]):
+            producer_import_store.fail_import(import_id, "size_mismatch")
+            producer_import_store.maybe_finish_done(import_id)
+            return _plugin_error(422, "format_unsupported",
+                                 "交付物大小与 declared_size 不符")
+        declared_sha = str(body.get("declared_sha256") or "").strip().lower() \
+            if isinstance(body, dict) else ""
+        if declared_sha:
+            if not re.fullmatch(r"[0-9a-f]{64}", declared_sha):
+                return _plugin_error(400, "invalid_request",
+                                     "declared_sha256 需为 64 位 hex")
+            if declared_sha != probe["sha256"]:
+                # §8 裁决 6：不符 → 422，不持久化 intent、保持 writing。
+                return _plugin_error(
+                    422, "declared_checksum_mismatch",
+                    "声明哈希与平台自算值不符（核对后重 commit 或取消）",
+                    details={"declared": declared_sha})
+        entry = producer_import_store.staging_entry_name(imp["format_ext"])
+        manifest = slide_publish.build_manifest(
+            entry, probe["size"], probe["sha256"])
+        intent = slide_publish.build_intent(
+            imp["slide_id"], imp["owner_user_id"], manifest,
+            probe["sha256"], probe["size"])
+        intent.update({
+            "task_ref": import_id,
+            "generation": imp["commit_token"],
+            "commit_token": imp["commit_token"],
+            "filename": imp["filename"],
+        })
+        try:
+            producer_import_store.persist_commit_intent(import_id, intent)
+        except producer_import_store.ProducerImportError as exc:
+            return _pi_error(exc)
+    # intent 已持久化（新提交或崩溃恢复重入）→ 唯一发布编排收口；取消从此
+    # 被拒（CommitInProgress）。
+    try:
+        imp_after, _settled = producer_import_store.publish_import(
+            import_id,
+            upload_root=Path(UPLOAD_DIR))
+    except slide_publish.PublishConflict:
+        app.logger.error("producer 发布证据冲突（fail-closed，import=%s）",
+                         import_id)
+        producer_import_store.fail_import(import_id, "publish_conflict")
+        return _plugin_error(409, "conflict",
+                             "发布证据冲突（fail-closed，人工核对）")
+    except slide_publish.PublishError as exc:
+        if exc.deterministic:
+            producer_import_store.fail_import(
+                import_id, "publish_%s" % (exc.code or "error"))
+            return _plugin_error(409, "conflict",
+                                 "发布被拒（%s）" % exc.code)
+        return _plugin_error(503, "unavailable",
+                             "发布临时故障，请重试 commit（幂等）",
+                             retryable=True)
+    except upload_guard.ReservationInvalid:
+        return _plugin_error(503, "unavailable",
+                             "final 预约失效，请重试 commit（恢复路径收口）",
+                             retryable=True)
+    except producer_import_store.ProducerImportError as exc:
+        return _pi_error(exc)
+    # §2.5：结算后紧邻关联（失败不回滚产物，记 associate 状态）+ 平台 staging
+    # 树清理 duty 内联尽力推进（正式推进由 sweep/retry 编排——cos worker 同款
+    # 收口顺序）。
+    try:
+        imp_after = producer_import_store.associate_project(import_id)
+    except producer_import_store.ProducerImportError:
+        app.logger.warning("producer 项目关联收敛失败（import=%s）", import_id,
+                           exc_info=True)
+    try:
+        producer_import_store.run_local_cleanup(
+            import_id, upload_root=Path(UPLOAD_DIR))
+        producer_import_store.maybe_finish_done(import_id)
+    except producer_import_store.ProducerImportError:
+        pass
+    imp_after = producer_import_store.get_import(import_id) or imp_after
+    out = _pi_receipt(imp_after)
+    out.pop("chunk_max_bytes", None)
+    return jsonify(out)
+
+
+@app.route("/api/plugin/v1/imports/<import_id>/status", methods=["GET"])
+def plugin_v1_imports_status(import_id):
+    """§1.5 status：只读幂等；回执丢失按本端点读回，绝不重新 begin。"""
+    claims, err = _require_plugin_token("slide:import")
+    if err is not None:
+        return err
+    imp, lerr = _pi_load_owned(import_id, claims)
+    if lerr:
+        return lerr
+    return jsonify(_pi_receipt(imp))
+
+
+@app.route("/api/plugin/v1/imports/<import_id>/cancel", methods=["POST"])
+def plugin_v1_imports_cancel(import_id):
+    """§1.6 cancel：created/writing → cancelled + 终态作废 + 清理 duty；
+    committing → 409 commit_in_progress；已终态幂等返回现状。"""
+    claims, err = _require_plugin_token("slide:import")
+    if err is not None:
+        return err
+    body = request.get_json(silent=True) or {}
+    write_token = ""
+    if isinstance(body, dict):
+        write_token = body.get("write_token") or ""
+    write_token = write_token or request.headers.get("X-Import-Token") or ""
+    imp, lerr = _pi_load_owned(import_id, claims)
+    if lerr:
+        return lerr
+    terr = _pi_write_token_ok(imp, write_token)
+    if terr:
+        return terr
+    try:
+        imp = producer_import_store.cancel_import(import_id)
+    except producer_import_store.ProducerImportError as exc:
+        return _pi_error(exc)
+    # 平台 staging 树清理 duty 尽力推进（正式推进由 sweep 编排；final 预约
+    # 只在清理确认后释放）。
+    producer_import_store.run_local_cleanup(
+        import_id, upload_root=Path(UPLOAD_DIR))
+    producer_import_store.maybe_finish_done(import_id)
+    imp = producer_import_store.get_import(import_id) or imp
+    out = _pi_receipt(imp)
+    out.pop("chunk_max_bytes", None)
+    return jsonify(out)
+
+
+@app.route("/api/plugin/v1/imports/<import_id>/scratch", methods=["POST"])
+def plugin_v1_imports_scratch(import_id):
+    """§1.7 scratch 补占：{delta_bytes} 或 {total_bytes}（二选一，同值幂等）。"""
+    claims, err = _require_plugin_token("slide:import")
+    if err is not None:
+        return err
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return _plugin_error(400, "invalid_request", "request body 需为 JSON object")
+    write_token = body.get("write_token") or request.headers.get("X-Import-Token") or ""
+    delta = body.get("delta_bytes")
+    total = body.get("total_bytes")
+    if delta is None and total is None:
+        return _plugin_error(400, "invalid_request",
+                             "delta_bytes 与 total_bytes 二选一")
+    imp, lerr = _pi_load_owned(import_id, claims)
+    if lerr:
+        return lerr
+    terr = _pi_write_token_ok(imp, write_token)
+    if terr:
+        return terr
+    gerr = _pi_grant_ok(imp)
+    if gerr:
+        return gerr
+    try:
+        delta = int(delta) if delta is not None else None
+        total = int(total) if total is not None else None
+    except (TypeError, ValueError):
+        return _plugin_error(400, "invalid_request",
+                             "delta_bytes/total_bytes 需为整数")
+    try:
+        imp = producer_import_store.scratch_topup(
+            import_id, delta_bytes=delta, total_bytes=total)
+    except producer_import_store.ProducerImportError as exc:
+        return _pi_error(exc)
+    except upload_guard.QuotaExceeded:
+        return _plugin_error(413, "upload_quota_exceeded", "用户存储配额不足")
+    return jsonify(scratch_confirmed_bytes=int(
+        imp.get("scratch_confirmed_bytes") or 0))
+
+
+@app.route("/api/plugin/v1/imports/<import_id>/topup", methods=["POST"])
+def plugin_v1_imports_topup(import_id):
+    """§4.3 final 补占：{extra_bytes}（写前容量闸超界时先补占再重发块）。"""
+    claims, err = _require_plugin_token("slide:import")
+    if err is not None:
+        return err
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return _plugin_error(400, "invalid_request", "request body 需为 JSON object")
+    write_token = body.get("write_token") or request.headers.get("X-Import-Token") or ""
+    try:
+        extra = int(body.get("extra_bytes"))
+    except (TypeError, ValueError):
+        return _plugin_error(400, "invalid_request", "extra_bytes 需为整数")
+    imp, lerr = _pi_load_owned(import_id, claims)
+    if lerr:
+        return lerr
+    terr = _pi_write_token_ok(imp, write_token)
+    if terr:
+        return terr
+    gerr = _pi_grant_ok(imp)
+    if gerr:
+        return gerr
+    try:
+        imp = producer_import_store.final_topup(import_id, extra)
+    except producer_import_store.ProducerImportError as exc:
+        return _pi_error(exc)
+    except upload_guard.QuotaExceeded:
+        return _plugin_error(413, "upload_quota_exceeded", "用户存储配额不足")
+    return jsonify(declared_size=int(imp["declared_size"]),
+                   confirmed_offset=int(imp["confirmed_offset"]))
+
+
+@app.route("/api/plugin/v1/imports/<import_id>/cleanup-confirm", methods=["POST"])
+def plugin_v1_imports_cleanup_confirm(import_id):
+    """§1.7/§5 cleanup-confirm：受管根核验（平台派生路径非空性 + 近期写者
+    异动）通过后释放 scratch。§2.4：不需活跃 grant；插件 disable 后仍可用
+    （write_token 校验不查 enabled，只查安装行存在）。"""
+    claims, err = _require_plugin_token("slide:import", require_enabled=False)
+    if err is not None:
+        return err
+    body = request.get_json(silent=True) or {}
+    write_token = ""
+    if isinstance(body, dict):
+        write_token = body.get("write_token") or ""
+    write_token = write_token or request.headers.get("X-Import-Token") or ""
+    imp, lerr = _pi_load_owned(import_id, claims)
+    if lerr:
+        return lerr
+    terr = _pi_write_token_ok(imp, write_token)
+    if terr:
+        return terr
+    root = producer_import_store.managed_root(
+        imp["installation_id"], import_id)
+    ok, evidence = producer_import_store.managed_root_state(root)
+    if not ok:
+        reason = "受管根非空"
+        if evidence.get("error"):
+            reason = "受管根核验失败（%s）" % evidence["error"]
+        elif evidence.get("recent_activity"):
+            reason = "受管根仍有近期写者活动（先停写再确认）"
+        try:
+            producer_import_store.record_plugin_cleanup_failure(
+                import_id, reason)
+        except producer_import_store.ProducerImportError:
+            pass
+        return _plugin_error(
+            409, "cleanup_not_verified", reason,
+            details={"residual_bytes": evidence.get("residual_bytes") or 0,
+                     "recent_activity":
+                         bool(evidence.get("recent_activity"))})
+    try:
+        imp = producer_import_store.confirm_plugin_cleanup(
+            import_id, root_verified=True)
+        producer_import_store.maybe_finish_done(import_id)
+        imp = producer_import_store.get_import(import_id) or imp
+    except producer_import_store.ProducerImportError as exc:
+        return _pi_error(exc)
+    out = _pi_receipt(imp)
+    out.pop("chunk_max_bytes", None)
+    return jsonify(out)
+
+
+# --------------------------------------------------------------------------- #
+# C5 §2.2：用户导入委托 grant（人类入口，PT 用户面；Cookie session + CSRF）
+#
+# POST   /api/plugin/import-grants          {plugin_id, project_id, ttl_seconds?}
+# GET    /api/plugin/import-grants          列自己的活跃 grant
+# DELETE /api/plugin/import-grants/<id>     撤销（grant 创建者本人或 owner）
+#
+# 路径在 /api/plugin/ 前缀下（绕过 _require_auth 与 CSRF 豁免），故本组视图
+# 自带登录/激活/CSRF 纪律（_csrf_exempt_path 已显式收回豁免）。
+# --------------------------------------------------------------------------- #
+def _import_grant_user_or_error():
+    """登录用户上下文（/api/plugin/ 前缀绕过全局 _require_auth，这里显式
+    补齐：session 存在、用户存在未禁用、已激活）。返回 (user_id, None) 或
+    (None, error_response)。"""
+    if not AUTH_ENABLED:
+        ident = current_identity()
+        uid = (ident.get("user_id") or "").strip()
+        if not uid:
+            return None, (jsonify(
+                error="本地免登录模式无委托用户（导入委托需登录账号）"), 403)
+        return uid, None
+    if not session.get("auth_user"):
+        return None, (jsonify(error="登录状态已失效，请重新登录后再试",
+                              code="auth_required"), 401)
+    uid = session.get("user_id")
+    try:
+        user = user_store.get_user(uid)
+    except Exception:
+        app.logger.exception("import grant user lookup failed")
+        return None, (jsonify(error="登录状态已失效，请重新登录后再试",
+                              code="auth_required"), 401)
+    if user is None or user.get("disabled") or \
+            session.get("auth_version") != user.get("auth_version"):
+        return None, (jsonify(error="登录状态已失效，请重新登录后再试",
+                              code="auth_required"), 401)
+    if (user.get("activation_state") or "active") != "active":
+        return None, (jsonify(error="账号未激活", code="account_pending"), 403)
+    return user["user_id"], None
+
+
+@app.route("/api/plugin/import-grants", methods=["POST"])
+def api_plugin_import_grants_create():
+    """创建导入委托 grant（一次性 grant_id 展示给用户，由用户授权给插件）。"""
+    uid, uerr = _import_grant_user_or_error()
+    if uerr:
+        return uerr
+    body = request.get_json(silent=True) or {}
+    plugin_id = body.get("plugin_id")
+    project_id = body.get("project_id")
+    ttl_seconds = body.get("ttl_seconds")
+    if not isinstance(plugin_id, str) or not plugin_id.strip():
+        return jsonify(error="plugin_id 必填"), 400
+    if not isinstance(project_id, str) or not project_id.strip():
+        return jsonify(error="project_id 必填"), 400
+    if ttl_seconds is not None:
+        try:
+            ttl_seconds = int(ttl_seconds)
+        except (TypeError, ValueError):
+            return jsonify(error="ttl_seconds 需为整数"), 400
+        if not (0 < ttl_seconds <= 7 * 86400):
+            return jsonify(error="ttl_seconds 需在 (0, 7天] 区间"), 400
+    installation = None
+    for inst in share_store.list_plugin_installations():
+        if inst.get("plugin_id") == plugin_id.strip() and inst.get("enabled"):
+            installation = inst
+            break
+    if installation is None:
+        return jsonify(error="插件安装不存在或已停用"), 404
+    proj = share_store.get_project(project_id.strip())
+    if not proj or proj.get("archived"):
+        return jsonify(error="项目不存在或已归档"), 404
+    if (proj.get("owner_user_id") or "") != uid:
+        return jsonify(error="仅项目 owner 可创建导入委托"), 403
+    grant = producer_import_store.create_import_grant(
+        uid, installation["installation_id"], plugin_id.strip(),
+        project_id.strip(), ttl_seconds=ttl_seconds)
+    _audit("plugin.import_grant.create", target_type="plugin_import_grant",
+           target_id=grant["grant_id"],
+           detail={"plugin_id": plugin_id.strip(),
+                   "project_id": project_id.strip(),
+                   "installation_id": installation["installation_id"]})
+    # grant_id 一次性展示；不带任何秘密（write_token 是 begin 时另发的）。
+    return jsonify(grant_id=grant["grant_id"],
+                   installation_id=installation["installation_id"],
+                   plugin_id=plugin_id.strip(),
+                   project_id=project_id.strip(),
+                   expires_at=grant["expires_at"]), 201
+
+
+@app.route("/api/plugin/import-grants", methods=["GET"])
+def api_plugin_import_grants_list():
+    """列自己的活跃 grant（未撤销未过期）。"""
+    uid, uerr = _import_grant_user_or_error()
+    if uerr:
+        return uerr
+    grants = producer_import_store.list_import_grants_for_user(uid)
+    return jsonify(grants=[{
+        "grant_id": g["grant_id"],
+        "installation_id": g.get("installation_id"),
+        "plugin_id": g.get("plugin_id"),
+        "project_id": g.get("project_id"),
+        "created_at": g.get("created_at"),
+        "expires_at": g.get("expires_at"),
+    } for g in grants])
+
+
+@app.route("/api/plugin/import-grants/<grant_id>", methods=["DELETE"])
+def api_plugin_import_grants_revoke(grant_id):
+    """撤销自己的导入委托 grant（幂等；owner 平台角色可撤任意）。"""
+    uid, uerr = _import_grant_user_or_error()
+    if uerr:
+        return uerr
+    grant = producer_import_store.get_import_grant(grant_id)
+    if grant is None:
+        return jsonify(error="grant 不存在"), 404
+    if current_identity()["role"] != user_store.ROLE_OWNER and \
+            grant.get("user_id") != uid:
+        return jsonify(error="仅 grant 创建者本人可撤销"), 403
+    producer_import_store.revoke_import_grant(grant_id)
+    _audit("plugin.import_grant.revoke",
+           target_type="plugin_import_grant", target_id=grant_id)
+    return jsonify(ok=True, grant_id=grant_id)
+
+
+# --------------------------------------------------------------------------- #
+# C5 §6.3：平台↔百度插件驱动桥（机器通道：Bearer plugin JWT + slide:import
+# scope + 百度安装白名单——镜像 _USAGE_INGEST_PLUGIN_IDS 形态）。批次执行
+# 状态回写复用 baidu_import_store 既有 lease/fencing 原语（claim_batch /
+# heartbeat_batch / _update_item 租约 fence）：进程内 worker 与插件后端经
+# 同一 SKIP LOCKED + lease_token 互斥，不可能双双持批。条目发布不另开端点
+# ——插件对每个 item 走 §1 producer import（baidu_item_id 绑定在 begin 侧）。
+# --------------------------------------------------------------------------- #
+#: 允许驱动百度批次的插件白名单（plugin sub-agent 的 pathtogether-baidu-import
+#: manifest id；插件侧 manifest 必须使用该 id 才能过桥）。
+_BAIDU_IMPORT_PLUGIN_IDS = frozenset({"dev.pathtogether.baidu-import"})
+
+
+def _require_baidu_driver(claims):
+    if (claims.get("plugin_id") or "") not in _BAIDU_IMPORT_PLUGIN_IDS:
+        return _plugin_error(403, "forbidden",
+                             "仅百度导入插件安装可驱动批次执行")
+    return None
+
+
+@app.route("/api/plugin/v1/baidu/batches/claim", methods=["POST"])
+def plugin_v1_baidu_batches_claim():
+    """插件领取一条可执行批次（含条目与解密后的分享凭证 + 租约）。"""
+    import baidu_import_store
+    claims, err = _require_plugin_token("slide:import")
+    if err is not None:
+        return err
+    berr = _require_baidu_driver(claims)
+    if berr:
+        return berr
+    body = request.get_json(silent=True) or {}
+    lease_seconds = body.get("lease_seconds") if isinstance(body, dict) else None
+    worker_id = "plugin:%s" % (claims.get("sub") or "")
+    try:
+        claim = baidu_import_store.plugin_claim_batch(
+            worker_id, lease_seconds=lease_seconds)
+    except Exception:
+        app.logger.exception("baidu 插件 claim 失败")
+        return _plugin_error(500, "internal", "领取失败", retryable=True)
+    if claim is None:
+        return jsonify(claimed=False)
+    return jsonify(claimed=True, **claim)
+
+
+@app.route("/api/plugin/v1/baidu/batches/heartbeat", methods=["POST"])
+def plugin_v1_baidu_batches_heartbeat():
+    """插件续租（租约被夺/批终态 → ok=False，调用方安静放弃）。"""
+    import baidu_import_store
+    claims, err = _require_plugin_token("slide:import")
+    if err is not None:
+        return err
+    berr = _require_baidu_driver(claims)
+    if berr:
+        return berr
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return _plugin_error(400, "invalid_request", "request body 需为 JSON object")
+    batch_id = body.get("batch_id")
+    lease_token = body.get("lease_token")
+    if not isinstance(batch_id, str) or not batch_id or \
+            not isinstance(lease_token, str) or not lease_token:
+        return _plugin_error(400, "invalid_request",
+                             "batch_id 与 lease_token 必填")
+    lease_seconds = body.get("lease_seconds")
+    worker_id = "plugin:%s" % (claims.get("sub") or "")
+    try:
+        ok = baidu_import_store.plugin_heartbeat_batch(
+            batch_id, worker_id, lease_token, lease_seconds=lease_seconds)
+        cancel = bool(ok) and \
+            baidu_import_store.plugin_batch_cancel_requested(batch_id)
+    except Exception:
+        app.logger.exception("baidu 插件 heartbeat 失败")
+        return _plugin_error(500, "internal", "续租失败", retryable=True)
+    return jsonify(ok=bool(ok), cancel_requested=cancel)
+
+
+@app.route("/api/plugin/v1/baidu/items/<item_id>/report", methods=["POST"])
+def plugin_v1_baidu_items_report(item_id):
+    """插件写回条目状态（stage/error/ingest 引用；白名单列 + 租约 fence）。"""
+    import baidu_import_store
+    claims, err = _require_plugin_token("slide:import")
+    if err is not None:
+        return err
+    berr = _require_baidu_driver(claims)
+    if berr:
+        return berr
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return _plugin_error(400, "invalid_request", "request body 需为 JSON object")
+    batch_id = body.get("batch_id")
+    lease_token = body.get("lease_token")
+    if not isinstance(batch_id, str) or not batch_id or \
+            not isinstance(lease_token, str) or not lease_token:
+        return _plugin_error(400, "invalid_request",
+                             "batch_id 与 lease_token 必填")
+    fields = body.get("fields") or body.get("item") or {}
+    if not isinstance(fields, dict):
+        return _plugin_error(400, "invalid_request", "fields 需为 JSON object")
+    try:
+        item = baidu_import_store.plugin_report_item(
+            item_id, batch_id, lease_token, fields)
+    except baidu_import_store.LeaseLost:
+        return _plugin_error(
+            409, "conflict",
+            "批次租约已被重领，条目写回被拒（fencing）——安静放弃并重新 claim")
+    except baidu_import_store.ValidationError as exc:
+        return _plugin_error(400, "invalid_request", str(exc))
+    except Exception:
+        app.logger.exception("baidu 插件 item report 失败")
+        return _plugin_error(500, "internal", "写回失败", retryable=True)
+    return jsonify(item=item)
 
 
 # --------------------------------------------------------------------------- #

@@ -1,0 +1,26 @@
+........................................................................ [ 67%]
+..............................ssss                                       [100%]
+102 passed, 4 skipped in 48.04s
+删除任务领取失败（下一轮重试）
+Traceback (most recent call last):
+  File "/home/solarise/ZCodeProject/histopilot-suite/PathTogether/app.py", line 12234, in run_slide_delete_worker_once
+    job = slide_store.claim_due_delete_job(
+        wid,
+        lease_seconds=_SLIDE_DELETE_LEASE_SECONDS,
+        backoff_base_seconds=_SLIDE_DELETE_BACKOFF_BASE_SECONDS,
+        backoff_cap_seconds=_SLIDE_DELETE_BACKOFF_CAP_SECONDS)
+  File "/home/solarise/ZCodeProject/histopilot-suite/PathTogether/slide_store.py", line 929, in claim_due_delete_job
+    with _session(conn) as c:
+         ~~~~~~~~^^^^^^
+  File "/usr/lib/python3.14/contextlib.py", line 141, in __enter__
+    return next(self.gen)
+  File "/home/solarise/ZCodeProject/histopilot-suite/PathTogether/slide_store.py", line 143, in _session
+    c = _connect()
+  File "/home/solarise/ZCodeProject/histopilot-suite/PathTogether/slide_store.py", line 131, in _connect
+    conn = pg_store.connect()
+  File "/home/solarise/ZCodeProject/histopilot-suite/PathTogether/pg_store.py", line 89, in connect
+    return _pg.connect(get_conninfo(), autocommit=False)
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/solarise/ZCodeProject/histopilot-suite/PathTogether/.venv/lib/python3.14/site-packages/psycopg/connection.py", line 122, in connect
+    raise last_ex.with_traceback(None)
+psycopg.OperationalError: connection failed: connection to server on socket "/home/solarise/ZCodeProject/histopilot-suite/PathTogether/.gate-tmp/svs-pg-conftest-ox1d1w15/.s.PGSQL.5432" failed: FATAL:  the database system is shutting down

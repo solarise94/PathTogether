@@ -107,6 +107,12 @@ def collect(upload_root: Path):
                 cur, "SELECT id FROM baidu_import_items")}
             foreign_ids |= {r["slide_id"] for r in _q(
                 cur, "SELECT slide_id FROM slides WHERE slide_id IS NOT NULL")}
+            # C5 producer 导入（新通道，非旧链路责任）：audit 清单列出其暂存
+            # 树残留证据（逐成员扫描与核账同一实现），不裁决、不进 pending。
+            producers = _q(
+                cur, "SELECT import_id, state, owner_user_id, "
+                     "local_cleanup_status, plugin_cleanup_status "
+                     "FROM producer_imports ORDER BY import_id")
             recon_state = recon.collect(cur, upload_root)
     finally:
         conn.close()
@@ -119,6 +125,15 @@ def collect(upload_root: Path):
         if manifest:
             residue.append({"upload_id": t["upload_id"], "state": t["state"],
                             "files": nfiles, "bytes": nbytes})
+    producer_residue = []
+    for p in producers:
+        manifest, nfiles, nbytes = recon.scan_task_manifest(
+            upload_root, p["import_id"])
+        producer_residue.append({
+            "import_id": p["import_id"], "state": p["state"],
+            "local_cleanup": p["local_cleanup_status"],
+            "plugin_cleanup": p["plugin_cleanup_status"],
+            "files": nfiles, "bytes": nbytes})
     actions, blockers = recon.plan_actions(recon_state, repair_residuals=False)
     foreign_dirs = [b["id"] for b in blockers
                     if b.get("reason") == "unknown_staging_dir"
@@ -132,6 +147,7 @@ def collect(upload_root: Path):
         "reserved_holders": reserved_holders,
         "conversion_handoff": conversion_handoff,
         "old_task_residue": residue,
+        "producer_import_residue": producer_residue,
         "reconcile_blockers": blockers,
         "reconcile_actions": [{k: a[k] for k in ("action_key", "action",
                                                   "kind", "id")}
@@ -185,6 +201,15 @@ def _print_ops(data):
     if data["foreign_staging"]:
         print("\n非上传域暂存（转换/百度/切片生命周期，未裁决）：%d"
               % len(data["foreign_staging"]))
+    if data.get("producer_import_residue"):
+        print("\nproducer 导入暂存证据（新通道，逐成员扫描，未裁决）：%d"
+              % len(data["producer_import_residue"]))
+        for row in data["producer_import_residue"][:20]:
+            print("  - %s" % json.dumps(row, ensure_ascii=False,
+                                       default=str))
+        if len(data["producer_import_residue"]) > 20:
+            print("  …（其余 %d 项略，--json 输出全量）"
+                  % (len(data["producer_import_residue"]) - 20))
     print("\n运维核对项（无法服务端证明）：")
     for item in OPS_CHECKLIST:
         print("  [ ] %s" % item)
@@ -233,6 +258,7 @@ def cmd_report(args):
             "pending": {k: v for k, v in pending},
             "anomalies": {k: v for k, v in anomalies},
             "foreign_staging": data["foreign_staging"],
+            "producer_import_residue": data["producer_import_residue"],
             "ops_checklist": OPS_CHECKLIST,
         }, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         print("报告已写入 %s" % args.json)

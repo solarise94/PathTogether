@@ -1,0 +1,19 @@
+{
+  "manifestSchemaVersion": "1.2.0",
+  "id": "dev.pathtogether.baidu-import",
+  "name": "PathTogether Baidu Import",
+  "pluginVersion": "0.1.0",
+  "pluginContractVersion": "1.1.0",
+  "bridgeProtocolVersion": "1.0.0",
+  "ui": {
+    "entry": "/plugins/pathtogether-baidu-import/ui/main.js",
+    "slots": ["viewer.right-panel"]
+  },
+  "service": {
+    "baseUrl": "http://127.0.0.1:8062",
+    "health": "/healthz"
+  },
+  "permissions": [
+    "slide:import"
+  ]
+}

@@ -97,14 +97,20 @@ UPLOAD_RESERVATION_TTL_SECONDS = _env_int("UPLOAD_RESERVATION_TTL_SECONDS", 1800
 
 #: 持有者绑定枚举（0072；有限集合，不允许任意字符串）。跨表无外键，
 #: 创建/绑定必须同事务，审计双向核验（reconcile_upload_capacity.py）。
-HOLDER_KINDS = frozenset({"upload_task", "ingestion_job", "baidu_batch"})
+HOLDER_KINDS = frozenset({"upload_task", "ingestion_job", "baidu_batch",
+                          "producer_import"})
 
 #: 每种持有者的合法用途（通道内固定；需要多份预算的通道显式区分用途，
-#: 不新增通用工作流框架）。
+#: 不新增通用工作流框架）。producer_import（C5 合同 §4）同一 import_id 可持
+#: 两份不同用途的绑定预约：final（平台接收产物；发布 consume / 清理确认后
+#: release）与 scratch（插件下载+转换+本地输出副本责任；只经 cleanup-confirm
+#: 释放）——release/consume 的持有者上下文只比 (kind,id)，两份预约靠任务行的
+#: 两个 reservation_id 列区分用途。
 HOLDER_PURPOSES = {
     "upload_task": frozenset({"upload"}),          # V1/V2/ZIP 传输+发布
     "ingestion_job": frozenset({"ingest_local"}),  # COS 摄取本地容量
     "baidu_batch": frozenset({"baidu_import"}),    # 百度批次一次性预算
+    "producer_import": frozenset({"scratch", "final"}),  # C5 双用途
 }
 
 #: Werkzeug MAX_CONTENT_LENGTH = 单请求上限 + multipart 开销余量（表单

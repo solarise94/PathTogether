@@ -61,10 +61,20 @@ TOOL_VERSION = "r15.1"
 _ACTIVE_UPLOAD_TASK_STATES = ("active", "committing")
 _ACTIVE_INGESTION_STATES = ("preparing", "uploading", "completing", "queued",
                             "downloading", "validating")
+# C5 producer 导入：活跃 = 非 done 且有未收口责任（final/scratch 预约、双侧
+# 清理 duty、未裁决 commit intent——非 done 行至少持有其一；done 是双侧清理
+# 收口后的唯一终态）。
+_ACTIVE_PRODUCER_SQL = "state <> 'done'"
 _PURPOSE = {"upload_task": "upload", "ingestion_job": "ingest_local",
             "baidu_batch": "baidu_import"}
+# producer_import 同一 import_id 持 final/scratch 两份不同用途预约（C5 §4.1）
+# ——用途合法性按预约行逐份判定（classify_producer），不进单值 _PURPOSE。
+_KIND_PURPOSE_SETS = {
+    "producer_import": frozenset({"final", "scratch"}),
+}
 _HOLDER_ID_KEY = {"upload_task": "upload_id", "ingestion_job": "job_id",
-                  "baidu_batch": "batch_id"}
+                  "baidu_batch": "batch_id",
+                  "producer_import": "import_id"}
 _TARGET_SQL = {
     "upload_task": "SELECT state, reservation_id, owner_user_id,"
                    " quota_mode,"
@@ -77,6 +87,9 @@ _TARGET_SQL = {
                      " ingestion_jobs WHERE job_id=%s",
     "baidu_batch": "SELECT state, quota_reservation_id, owner_user_id FROM"
                    " baidu_import_batches WHERE id=%s",
+    "producer_import": "SELECT state, final_reservation_id,"
+                       " scratch_reservation_id, owner_user_id FROM"
+                       " producer_imports WHERE import_id=%s",
 }
 _RESERV_SQL = ("SELECT user_id, state, reserved_bytes, holder_kind,"
                " holder_id, purpose FROM upload_reservations WHERE"
@@ -204,6 +217,30 @@ def collect(cur, upload_dir):
         " b.quota_reservation_id ORDER BY b.id")
     batches = [dict(r) for r in cur.fetchall()]
 
+    # C5 producer 导入（双预约：final/scratch 各一份；豁免身份两者皆空）
+    cur.execute(
+        "SELECT p.import_id, p.owner_user_id, p.state,"
+        " p.final_reservation_id AS final_rid,"
+        " p.scratch_reservation_id AS scratch_rid,"
+        " (p.commit_intent_json IS NOT NULL) AS has_intent,"
+        " u.role AS owner_role,"
+        " fr.state AS final_rstate, fr.user_id AS final_ruser,"
+        " fr.reserved_bytes AS final_reserved, fr.holder_kind AS"
+        " final_holder_kind, fr.holder_id AS final_holder_id,"
+        " fr.purpose AS final_purpose,"
+        " sr.state AS scratch_rstate, sr.user_id AS scratch_ruser,"
+        " sr.reserved_bytes AS scratch_reserved, sr.holder_kind AS"
+        " scratch_holder_kind, sr.holder_id AS scratch_holder_id,"
+        " sr.purpose AS scratch_purpose"
+        " FROM producer_imports p"
+        " LEFT JOIN upload_reservations fr ON fr.reservation_id="
+        " p.final_reservation_id"
+        " LEFT JOIN upload_reservations sr ON sr.reservation_id="
+        " p.scratch_reservation_id"
+        " LEFT JOIN users u ON u.user_id=p.owner_user_id"
+        " WHERE p.state <> 'done' ORDER BY p.import_id")
+    producers = [dict(r) for r in cur.fetchall()]
+
     cur.execute("SELECT upload_id, reservation_id, attempts FROM "
                 "upload_cleanup_pending ORDER BY upload_id")
     pending_rows = [dict(r) for r in cur.fetchall()]
@@ -238,6 +275,12 @@ def collect(cur, upload_dir):
     for b in batches:
         if b["state"] in ("queued", "running"):
             items.append(("baidu_batch", b))
+    for p in producers:
+        # 豁免身份（owner/本地免登录）与 ingestion 同口径：role=user 才有
+        # 配额责任；两份预约皆空按身份合同识别，非异常。
+        duty = (p["owner_role"] == "user" and (p["owner_user_id"] or ""))
+        items.append(("producer_import" if duty else "producer_import_exempt",
+                      p))
 
     referenced = set()
     for t in tasks:
@@ -249,6 +292,11 @@ def collect(cur, upload_dir):
     for b in batches:
         if b["rid"]:
             referenced.add(b["rid"])
+    for p in producers:
+        if p["final_rid"]:
+            referenced.add(p["final_rid"])
+        if p["scratch_rid"]:
+            referenced.add(p["scratch_rid"])
     for p in pending_rows:
         if p["reservation_id"]:
             referenced.add(p["reservation_id"])
@@ -259,7 +307,8 @@ def collect(cur, upload_dir):
     dangling = [dict(r) for r in cur.fetchall()
                 if r["reservation_id"] not in referenced]
 
-    known_ids = {t["upload_id"] for t in tasks} | {j["job_id"] for j in jobs}
+    known_ids = {t["upload_id"] for t in tasks} | {j["job_id"] for j in jobs} \
+        | {p["import_id"] for p in producers}
     unknown_dirs = []
     sroot = os.path.join(str(upload_dir), ".staging")
     if os.path.isdir(sroot):
@@ -328,12 +377,41 @@ def collect(cur, upload_dir):
             "counts": {"upload_tasks": len(tasks),
                        "ingestion_jobs": len(jobs),
                        "baidu_import_batches": len(batches),
+                       "producer_imports": len(producers),
                        "upload_cleanup_pending": len(pending_rows)}}
 
 
 def _base_kind(kind):
     return kind.replace("_terminal", "").replace("_cleanup", "").replace(
         "_exempt", "")
+
+
+def classify_producer(row):
+    """producer_import 双预约核验：final/scratch 各自独立判定。
+
+    返回 "ok"（全部在场预约 reserved + holder/owner/用途一致）或首个异常
+    verdict（missing/released/consumed/mismatch_holder/mismatch_owner/
+    mismatch_purpose——与 classify 的词表兼容，供 plan_actions 阻断）。"""
+    verdict = "ok"
+    for prefix in ("final", "scratch"):
+        rid = row.get("%s_rid" % prefix)
+        if not rid:
+            continue  # scratch 可缺省（begin 申报 0 / 豁免身份）
+        if row.get("%s_rstate" % prefix) is None:
+            return "missing"
+        if row["%s_rstate" % prefix] != "reserved":
+            return row["%s_rstate" % prefix]
+        if (row["%s_holder_id" % prefix] or None) != row["import_id"] or \
+                (row["%s_holder_kind" % prefix] or None) != "producer_import":
+            if row["%s_holder_id" % prefix]:
+                return "mismatch_holder"
+            return "bind"
+        if row.get("%s_purpose" % prefix) not in \
+                _KIND_PURPOSE_SETS["producer_import"]:
+            return "mismatch_purpose"
+        if row["%s_ruser" % prefix] != row.get("owner_user_id"):
+            return "mismatch_owner"
+    return verdict
 
 
 def _upload_quota_duty(row):
@@ -386,7 +464,8 @@ def _commit_intent_open(kind, row):
     committing（发布临界态，清理会销毁恢复所需文件）。终态任务不在此列
     （committed 历史行的 intent json 按合同长期保留，属正常痕迹）。
     ingestion_job：已持久化 intent，或 state∈{completing, validating}
-    （验证/发布临界段）。"""
+    （验证/发布临界段）。producer_import：已持久化 intent 或 state=
+    committing（同步提交段——恢复路径重跑 publish 收口，不得 stop/repair）。"""
     if kind == "upload_task":
         return bool(row.get("commit_intent_json")) or \
             bool(row.get("commit_token")) or \
@@ -394,6 +473,9 @@ def _commit_intent_open(kind, row):
     if kind == "ingestion_job":
         return bool(row.get("commit_intent_json")) or \
             row.get("state") in ("completing", "validating")
+    if kind == "producer_import":
+        return bool(row.get("has_intent")) or \
+            row.get("state") == "committing"
     return False
 
 
@@ -406,10 +488,27 @@ def plan_actions(state, repair_residuals):
     actions, blockers = [], []
     for kind, row in state["items"]:
         base_kind = _base_kind(kind)
-        verdict = classify(kind, row)
         tid = row[_HOLDER_ID_KEY[base_kind]]
         rid = row.get("rid") or (row.get("pending") or
                                 {}).get("reservation_id")
+        if base_kind == "producer_import":
+            # C5：双预约逐份核验（classify_producer）；producer 持有者不自动
+            # stop/repair——committing/intent 是未裁决提交段（恢复路径收口），
+            # 取消/清理走通道自身编排；任何非 ok verdict 一律阻断人工核对。
+            verdict = classify_producer(row)
+            if verdict == "ok":
+                continue
+            blockers.append({
+                "kind": kind, "id": tid,
+                "reason": ("commit_intent_unresolved"
+                           if _commit_intent_open(base_kind, row)
+                           else "producer_reservation_%s" % verdict),
+                "state": row.get("state"),
+                "observed": verdict,
+                "reservation_id": row.get("final_rid")
+                or row.get("scratch_rid")})
+            continue
+        verdict = classify(kind, row)
         if kind.startswith("upload_task") and \
                 row.get("quota_duty") is None:
             # R15-1：非空 owner 无用户行——身份不可证明，不能凭 rid 缺失
@@ -525,7 +624,8 @@ def _prestate_for(cur, actions):
     金额）。"""
     pre = {"counts": {}, "pending_ids": [], "targets": {}, "reservations": {}}
     for table in ("upload_tasks", "ingestion_jobs", "baidu_import_batches",
-                  "upload_cleanup_pending", "upload_reservations"):
+                  "producer_imports", "upload_cleanup_pending",
+                  "upload_reservations"):
         cur.execute("SELECT COUNT(*)::int AS n FROM %s" % table)
         pre["counts"][table] = cur.fetchone()["n"]
     cur.execute("SELECT upload_id FROM upload_cleanup_pending"
@@ -570,7 +670,7 @@ def _verify_prestate(cur, plan, already_applied=frozenset(),
                              if a["action_key"] in already_applied
                              and a["action"] == "repair")
     for table in ("upload_tasks", "ingestion_jobs", "baidu_import_batches",
-                  "upload_reservations"):
+                  "producer_imports", "upload_reservations"):
         want = int(expect["counts"].get(table, 0))
         if table == "upload_reservations":
             want += delta_reservations
@@ -824,11 +924,22 @@ def _report_pending_work(state):
         return {k: v for k, v in r.items()
                 if k not in ("staging_manifest", "commit_intent_json",
                              "commit_token")}
+    def _producer_row(r):
+        return {"import_id": r.get("import_id"), "state": r.get("state"),
+                "owner": r.get("owner_user_id"),
+                "final_reservation_id": r.get("final_rid"),
+                "scratch_reservation_id": r.get("scratch_rid"),
+                "staging_files": r.get("staging_files"),
+                "staging_bytes": r.get("staging_bytes")}
     return {
         "upload_cleanup_pending": state["pending"],
         "ingestion_local_cleanup": [
             _row(r) for k, r in state["items"]
-            if k == "ingestion_job_cleanup"]}
+            if k == "ingestion_job_cleanup"],
+        "producer_import_cleanup": [
+            _producer_row(r) for k, r in state["items"]
+            if k.startswith("producer_import")],
+    }
 
 
 def _residual_without_duty(state, actions=()):
@@ -839,6 +950,13 @@ def _residual_without_duty(state, actions=()):
         base_kind = _base_kind(kind)
         if row.get(_HOLDER_ID_KEY[base_kind]) in planned_duty:
             continue  # 计划内补记责任（--repair-residuals）
+        if base_kind == "producer_import":
+            # producer：双预约核验（classify_producer）；无预约列（rid）可读，
+            # 责任判定以 verdict 为准——豁免身份已被 _exempt 跳过。
+            if int(row.get("staging_bytes") or 0) > 0 and \
+                    classify_producer(row) != "ok":
+                return True
+            continue
         if int(row.get("staging_bytes") or 0) > 0 and \
                 classify(kind, row) != "ok" and not (
                     row.get("rid")

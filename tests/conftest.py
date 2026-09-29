@@ -33,6 +33,10 @@ import pytest
 import pg_store
 import pgserver
 
+# producer 导入 sweep 常驻线程：跨用例写库会破坏 TRUNCATE 隔离；且部分用例
+# （真实 HTTP app 集成）不置 TESTING。语义由测试直调 sweep 覆盖。
+os.environ.setdefault("PRODUCER_IMPORT_SWEEP_INTERVAL_SECONDS", "0")
+
 # ----------------------------------------------------------------------- #
 # import 期：起 pgserver + 设 env + 应用 schema（先于任何测试模块 import app）
 # ----------------------------------------------------------------------- #
@@ -224,6 +228,11 @@ _BUSINESS_TABLES = (
     # 0073 起：R12 容量核账应用回执（无 FK，显式列出防跨用例残留回执
     # 干扰幂等/计数断言）
     "upload_capacity_repair_receipts",
+    # 0077 起：C5 producer 导入（任务/事件/用户导入委托 grant；无 FK，
+    # 显式列出防跨用例残留任务/租约/授权）
+    "producer_import_events",
+    "producer_imports",
+    "plugin_import_grants",
 )
 
 @pytest.fixture(scope="session")

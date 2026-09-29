@@ -1780,7 +1780,7 @@ def _apply_cancel(batch):
     return applied
 
 
-def _finalize_batch(batch, adapter, worker_id):
+def _finalize_batch(batch, adapter, worker_id, *, cleanup_copies=True):
     """聚合条目终态 → 批次终态；配额一次收口；本批副本清理。
 
     Fencing：事务先 FOR UPDATE 锁批次行并核对本次 claim 的 lease_token，
@@ -1853,7 +1853,8 @@ def _finalize_batch(batch, adapter, worker_id):
         conn.close()
     if not won:
         return False
-    _cleanup_copies(batch, adapter, state)
+    if cleanup_copies:
+        _cleanup_copies(batch, adapter, state)
     return True
 
 
@@ -1986,3 +1987,169 @@ def invalidate_items_for_slide(slide_id, *, error_code="slide_deleted"):
     finally:
         conn.close()
     return (inflight, marked)
+
+
+# --------------------------------------------------------------------------- #
+# C5 插件驱动桥（合同 §6.3）：claim 者从进程内 worker 换成插件后端。
+#
+# 复用既有 lease/fencing 原语（claim_batch 领取 CAS / heartbeat_batch /
+# _update_item 租约 fence——进程内 worker 与插件后端经同一 SKIP LOCKED +
+# lease_token 互斥，不可能双双持有同批）。share 凭证随 claim 解密下发
+# （下载/重试/限速归插件，§6.2）；条目发布不另开端点——插件对每个 item 走
+# producer import（item.slide_id 由平台 begin 侧绑定，§6.3）。
+# --------------------------------------------------------------------------- #
+#: 插件 claim 允许的租约秒数范围（缺省 BATCH_LEASE_SECONDS）。
+_PLUGIN_LEASE_MIN_SECONDS = 60
+_PLUGIN_LEASE_MAX_SECONDS = 4 * 3600
+
+#: 插件 report 允许写回的条目列（白名单；stage 枚举由 DB CHECK 兜底）。
+_PLUGIN_ITEM_REPORT_FIELDS = frozenset({
+    "stage", "error_code", "ingest_token", "source_sha256", "slide_name",
+    "project_associate_state", "transfer_task_id", "staging_path",
+})
+
+#: 条目 stage 枚举（0051 CHECK 同源；插件 report 只接受这些值）。
+_PLUGIN_ITEM_STAGES = frozenset({
+    "queued", "transferring", "downloading", "validating", "converting",
+    "ingesting", "ready", "failed", "cancelled",
+})
+
+
+#: 条目终态（批次收口判定口径，同 _finalize_batch 的 pending 统计）
+_ITEM_TERMINAL_STAGES = frozenset({"ready", "failed", "cancelled"})
+#: 一次插件 claim 最多顺带收口的「条目已全终态」批次数
+_PLUGIN_CLAIM_SETTLE_ROUNDS = 8
+
+
+def plugin_claim_batch(worker_id, *, lease_seconds=None):
+    """插件后端领取一条可执行批次（含条目与解密后的分享凭证）。
+
+    与进程内 run_batch 同一领取原语（FOR UPDATE SKIP LOCKED + 新
+    lease_token）——两执行者不可能同时持批。返回
+    ``{"batch": public_view + share 凭证 + lease, "items": [...]}``；
+    无可领批次返回 None。"""
+    lease = BATCH_LEASE_SECONDS if lease_seconds is None else int(lease_seconds)
+    lease = max(_PLUGIN_LEASE_MIN_SECONDS,
+                min(_PLUGIN_LEASE_MAX_SECONDS, lease))
+    for _ in range(_PLUGIN_CLAIM_SETTLE_ROUNDS):
+        claim = claim_batch(worker_id=worker_id, lease_seconds=lease)
+        if claim is None:
+            return None
+        if any(i["stage"] not in _ITEM_TERMINAL_STAGES
+               for i in claim["items"]):
+            break
+        # 条目已全终态、批次仍 running（末条 report 后、收口前崩溃）：
+        # 以本次新租约补做收口，继续找下一条可执行批次
+        _finalize_batch(claim["batch"], None, worker_id,
+                        cleanup_copies=False)
+    else:
+        return None
+    claim = _claim_with_secrets(claim)
+    batch = claim["batch"]
+    view = _batch_public_view(batch)
+    view["lease"] = {
+        "worker_id": worker_id,
+        "lease_token": batch["lease_token"],
+        "lease_expires_at": _iso(batch["lease_expires_at"]),
+    }
+    # 分享凭证只随 claim 下发给执行者（插件后端持有下载责任，§6.2）；
+    # 绝不进任何持久视图/日志（内存瞬态，与 in-process 路径同口径）。
+    view["share_url"] = batch.get("_share_url") or ""
+    view["extraction_code"] = batch.get("_extraction_code") or ""
+    items = [_plugin_item_view(i) for i in claim["items"]]
+    return {"batch": view, "items": items}
+
+
+def _plugin_item_view(row):
+    """条目插件视图（不含 staging_path 以外路径；slide_id 绑定可见）。"""
+    out = {
+        "id": row["id"],
+        "batch_id": row["batch_id"],
+        "name": row["name"],
+        "fs_id": row["fs_id"],
+        "stage": row["stage"],
+        "error_code": row["error_code"],
+        "slide_id": row["slide_id"],
+        "source_size": _dec_str(row["source_size"]),
+        "source_sha256": row["source_sha256"],
+        "ingest_token": row["ingest_token"],
+        "slide_name": row["slide_name"],
+        "project_associate_state": row["project_associate_state"],
+        "attempt": int(row["attempt"] or 0),
+    }
+    return out
+
+
+def plugin_heartbeat_batch(batch_id, worker_id, lease_token,
+                           *, lease_seconds=None):
+    """插件续租（heartbeat_batch 原语直通；租约被夺/批终态 → False）。"""
+    lease = BATCH_LEASE_SECONDS if lease_seconds is None else int(lease_seconds)
+    lease = max(_PLUGIN_LEASE_MIN_SECONDS,
+                min(_PLUGIN_LEASE_MAX_SECONDS, lease))
+    return heartbeat_batch(batch_id, worker_id, lease_token,
+                           lease_seconds=lease)
+
+
+def plugin_batch_cancel_requested(batch_id):
+    """续租成功后回带的取消信号（插件在条目之间据此收口）。"""
+    return _batch_cancel_requested(batch_id)
+
+
+def plugin_get_item(item_id):
+    """条目只读视图（插件 report 前对账用）。"""
+    row = _get_item(item_id)
+    if row is None:
+        return None
+    return _plugin_item_view(row)
+
+
+def plugin_report_item(item_id, batch_id, lease_token, fields):
+    """插件写回条目状态（stage/error/ingest 引用；白名单列）。
+
+    带 lease fence（_update_item 原语）：租约被其他执行者重领 →
+    :class:`LeaseLost`（绝不覆盖新 owner 的条目状态）。返回更新后的
+    插件视图。"""
+    clean = {}
+    for key, value in (fields or {}).items():
+        if key not in _PLUGIN_ITEM_REPORT_FIELDS:
+            raise ValidationError(
+                "条目 report 不接受字段 %r（白名单：%s）"
+                % (key, sorted(_PLUGIN_ITEM_REPORT_FIELDS)))
+        if value is None:
+            continue
+        if key == "stage":
+            if value not in _PLUGIN_ITEM_STAGES:
+                raise ValidationError("条目 stage 非法：%r" % (value,))
+        if not isinstance(value, (str, int)) or isinstance(value, bool):
+            raise ValidationError("条目字段 %r 类型非法" % key)
+        if isinstance(value, str):
+            value = value[:500]
+        clean[key] = value
+    if not clean:
+        raise ValidationError("report 载荷为空")
+    row = _update_item(item_id, clean, batch_id=batch_id,
+                       lease_token=lease_token)
+    if clean.get("stage") in _ITEM_TERMINAL_STAGES:
+        plugin_finalize_if_settled(batch_id, lease_token)
+    return _plugin_item_view(row)
+
+
+def plugin_finalize_if_settled(batch_id, lease_token):
+    """插件执行路径的批次收口：条目全终态 → 与进程内 worker 同一
+    :func:`_finalize_batch`（租约 fence + 批次终态与配额一次性 consume/
+    release 同事务）。源副本清理归插件（§6.2），平台不再调 adapter。
+    尚有条目在途 / 租约不符 → False（不动批次）。"""
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute("SELECT * FROM baidu_import_batches WHERE id=%s",
+                            (batch_id,))
+                batch = cur.fetchone()
+    finally:
+        conn.close()
+    if batch is None or batch["state"] != "running" \
+            or batch["lease_token"] != lease_token:
+        return False
+    return _finalize_batch(dict(batch), None, batch["lease_owner"],
+                           cleanup_copies=False)

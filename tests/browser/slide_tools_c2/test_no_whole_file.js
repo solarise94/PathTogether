@@ -14,6 +14,10 @@ const FILES = [
   'static/tools/slide-transform/engine.js',
   'static/tools/slide-transform/worker.js',
   'static/tools/slide-transform/runner.js',
+  // C4 upload path: the artifact goes to COS as per-part slice() blobs only
+  'static/upload/cos-uploader.js',
+  'static/tools/tools-slides-upload.js',
+  'static/tools/tools-slides.js',
 ];
 
 // [pattern, why-forbidden]

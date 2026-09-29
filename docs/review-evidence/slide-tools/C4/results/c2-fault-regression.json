@@ -1,0 +1,334 @@
+{
+  "passed": 26,
+  "failed": 0,
+  "results": [
+    {
+      "name": "kill-worker-payload-write",
+      "pass": true,
+      "ms": 2910,
+      "why": null
+    },
+    {
+      "name": "reload-page-payload-write",
+      "pass": true,
+      "ms": 2933,
+      "why": null
+    },
+    {
+      "name": "crash-after-flush-before-journal",
+      "pass": true,
+      "ms": 2919,
+      "why": null
+    },
+    {
+      "name": "crash-right-after-checkpoint",
+      "pass": true,
+      "ms": 2934,
+      "why": null
+    },
+    {
+      "name": "crash-during-ifd-backpatch-finalize",
+      "pass": true,
+      "ms": 2893,
+      "why": null
+    },
+    {
+      "name": "crash-during-validation",
+      "pass": true,
+      "ms": 2874,
+      "why": null
+    },
+    {
+      "name": "export-interrupted-artifact-kept",
+      "pass": true,
+      "ms": 576,
+      "why": null
+    },
+    {
+      "name": "export-reload-artifact-kept",
+      "pass": true,
+      "ms": 1184,
+      "why": null
+    },
+    {
+      "name": "injected-quota-error-recoverable",
+      "pass": true,
+      "ms": 472,
+      "why": null
+    },
+    {
+      "name": "output-handle-loss-recoverable",
+      "pass": true,
+      "ms": 530,
+      "why": null
+    },
+    {
+      "name": "staged-copy-tampered-refused",
+      "pass": true,
+      "ms": 5442,
+      "why": null
+    },
+    {
+      "name": "user-file-changed-after-staging-resume-ok",
+      "pass": true,
+      "ms": 2889,
+      "why": null
+    },
+    {
+      "name": "crash-during-staging-cleaned",
+      "pass": true,
+      "ms": 7432,
+      "why": null
+    },
+    {
+      "name": "unsupported-input-not-staged",
+      "pass": true,
+      "ms": 93,
+      "why": null
+    },
+    {
+      "name": "list-jobs-saved-settings-bare-resume",
+      "pass": true,
+      "ms": 2891,
+      "why": null
+    },
+    {
+      "name": "start-unjournaled-planned-job",
+      "pass": true,
+      "ms": 347,
+      "why": null
+    },
+    {
+      "name": "settings-change-refused",
+      "pass": true,
+      "ms": 2872,
+      "why": null
+    },
+    {
+      "name": "core-version-bump-refused",
+      "pass": true,
+      "ms": 343,
+      "why": null
+    },
+    {
+      "name": "two-tabs-web-lock",
+      "pass": true,
+      "ms": 323,
+      "why": null
+    },
+    {
+      "name": "opfs-jobdir-deleted-rejected",
+      "pass": true,
+      "ms": 3337,
+      "why": null
+    },
+    {
+      "name": "cancel-with-cleanup-failure-pending-record",
+      "pass": true,
+      "ms": 3226,
+      "why": null
+    },
+    {
+      "name": "cancel-latency-and-basic",
+      "pass": true,
+      "ms": 3894,
+      "why": null
+    },
+    {
+      "name": "repeated-terminate-reload-mixed",
+      "pass": true,
+      "ms": 5712,
+      "why": null
+    },
+    {
+      "name": "fl-resume-matches",
+      "pass": true,
+      "ms": 2875,
+      "why": null
+    },
+    {
+      "name": "fl-finalize-crash-resume",
+      "pass": true,
+      "ms": 2861,
+      "why": null
+    },
+    {
+      "name": "fl-reload-mid",
+      "pass": true,
+      "ms": 2924,
+      "why": null
+    }
+  ],
+  "details": [
+    {
+      "name": "kill-worker-payload-write",
+      "pass": true,
+      "sha": "592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5",
+      "detail": "{\"done\":{\"ok\":true,\"phase\":\"validated\",\"sha256\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"outputBytes\":547103,\"convertMs\":32,\"error\":null},\"sha\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"expect\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\"}",
+      "ms": 2910
+    },
+    {
+      "name": "reload-page-payload-write",
+      "pass": true,
+      "sha": "592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5",
+      "detail": "{\"done\":{\"ok\":true,\"phase\":\"validated\",\"sha256\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"outputBytes\":547103,\"convertMs\":31,\"error\":null},\"sha\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"expect\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\"}",
+      "ms": 2933
+    },
+    {
+      "name": "crash-after-flush-before-journal",
+      "pass": true,
+      "sha": "592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5",
+      "detail": "{\"done\":{\"ok\":true,\"phase\":\"validated\",\"sha256\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"outputBytes\":547103,\"convertMs\":38,\"error\":null},\"sha\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"expect\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\"}",
+      "ms": 2919
+    },
+    {
+      "name": "crash-right-after-checkpoint",
+      "pass": true,
+      "sha": "592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5",
+      "detail": "{\"done\":{\"ok\":true,\"phase\":\"validated\",\"sha256\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"outputBytes\":547103,\"convertMs\":38,\"error\":null},\"sha\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"expect\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\"}",
+      "ms": 2934
+    },
+    {
+      "name": "crash-during-ifd-backpatch-finalize",
+      "pass": true,
+      "sha": "592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5",
+      "detail": "{\"done\":{\"ok\":true,\"phase\":\"validated\",\"sha256\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"outputBytes\":547103,\"convertMs\":2,\"error\":null},\"sha\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"expect\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\"}",
+      "ms": 2893
+    },
+    {
+      "name": "crash-during-validation",
+      "pass": true,
+      "sha": "592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5",
+      "detail": "{\"done\":{\"ok\":true,\"phase\":\"validated\",\"sha256\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"outputBytes\":547103,\"convertMs\":31,\"error\":null},\"sha\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"expect\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\"}",
+      "ms": 2874
+    },
+    {
+      "name": "export-interrupted-artifact-kept",
+      "pass": true,
+      "errCode": "io_recoverable",
+      "detail": "{\"errCode\":\"io_recoverable\",\"kept\":{\"size\":547103},\"recState\":\"ready\",\"retry\":{\"exportedBytes\":547103,\"size\":547103},\"sha\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"expect\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\"}",
+      "ms": 576
+    },
+    {
+      "name": "export-reload-artifact-kept",
+      "pass": true,
+      "detail": "{\"artifactBytesAfterReload\":3066366,\"recState\":\"exported\",\"retry\":{\"exportedBytes\":3066366,\"size\":3066366},\"sha\":\"aecd213d3a852e82e6835b2874e4a3e4755d2db25416bbdf3384896b84a35fa2\",\"expect\":\"aecd213d3a852e82e6835b2874e4a3e4755d2db25416bbdf3384896b84a35fa2\"}",
+      "ms": 1184
+    },
+    {
+      "name": "injected-quota-error-recoverable",
+      "pass": true,
+      "detail": "{\"first\":{\"ok\":false,\"phase\":\"convert\",\"convertMs\":29,\"error\":{\"code\":\"quota_exceeded_recoverable\",\"message\":\"QuotaExceededError: injected (test)\"}},\"done2\":{\"ok\":true,\"phase\":\"validated\",\"sha256\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"outputBytes\":547103,\"convertMs\":35,\"error\":null},\"sha\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"expect\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\"}",
+      "ms": 472
+    },
+    {
+      "name": "output-handle-loss-recoverable",
+      "pass": true,
+      "firstCode": "io_error",
+      "detail": "{\"first\":{\"ok\":false,\"phase\":\"convert\",\"convertMs\":31,\"error\":{\"code\":\"io_error\",\"message\":\"Failed to execute 'write' on 'FileSystemSyncAccessHandle': The access handle was already closed\"}},\"done2\":{\"ok\":true,\"phase\":\"validated\",\"sha256\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"outputBytes\":547103,\"convertMs\":36,\"error\":null},\"sha\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"expect\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\"}",
+      "ms": 530
+    },
+    {
+      "name": "staged-copy-tampered-refused",
+      "pass": true,
+      "detail": "{\"flip\":{\"refused\":true,\"code\":\"source_changed_refuse_resume\",\"message\":\"源副本与记录不符（长度 561835/561835，哈希不同），拒绝续跑\"},\"trunc\":{\"refused\":true,\"code\":\"source_changed_refuse_resume\",\"message\":\"源副本与记录不符（长度 557739/561835），拒绝续跑\"}}",
+      "ms": 5442
+    },
+    {
+      "name": "user-file-changed-after-staging-resume-ok",
+      "pass": true,
+      "sha": "592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5",
+      "detail": "{\"done\":{\"ok\":true,\"phase\":\"validated\",\"sha256\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"outputBytes\":547103,\"convertMs\":33,\"error\":null},\"sha\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"expect\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\"}",
+      "ms": 2889
+    },
+    {
+      "name": "crash-during-staging-cleaned",
+      "pass": true,
+      "detail": "{\"jobIdB\":\"job-bd65038dcddb7d22\",\"startA\":{\"refused\":true,\"code\":\"io_recoverable\",\"message\":\"worker terminated\"},\"existsA\":false,\"existsBeforeSweep\":true,\"recState\":\"staging\",\"sweep1\":{\"swept\":0},\"pending1\":{\"jobs\":[{\"id\":\"job-bd65038dcddb7d22\",\"attempts\":0,\"lastError\":\"Failed to execute 'removeEntry' on 'FileSystemDirectoryHandle': An attempt was made to modify an object where modifications are not allowed.\",\"at\":\"2026-09-29T10:14:07.455Z\"}]},\"existsAfterSweep1\":true,\"existsAfterSweep\":false,\"resumeB\":{\"refused\":true,\"code\":\"job_dir_missing\",\"message\":\"任务目录缺失或不可读（可能被浏览器驱逐/删除）：A requested file or directory could not be found at the time an operation was processed.\"}}",
+      "ms": 7432
+    },
+    {
+      "name": "unsupported-input-not-staged",
+      "pass": true,
+      "detail": "{\"r\":{\"refused\":true,\"code\":\"unsupported_input\",\"message\":\"不是本工具支持的 KFB/KFBF 文件（文件头不符）\"},\"jobs\":[]}",
+      "ms": 93
+    },
+    {
+      "name": "list-jobs-saved-settings-bare-resume",
+      "pass": true,
+      "detail": "{\"listed\":{\"id\":\"job-df78c8918559ab45\",\"state\":\"planned\",\"nextAction\":\"resume\",\"active\":false,\"createdAt\":\"2026-09-29T10:14:11.759Z\",\"updatedAt\":\"2026-09-29T10:14:11.802Z\",\"source\":{\"name\":\"bf.kfb\",\"size\":561835,\"sha256\":\"e0a4e7286f290767a16d1eac36f6ae02b4056cc98ce4b21e97565ff9e73e487f\"},\"modality\":\"brightfield\",\"estimate\":{\"payload_bytes\":561451,\"tiles_present\":9,\"cells_total\":9,\"cells_missing\":0,\"edge_tiles\":7,\"ifds\":3,\"output_upper_bound_bytes\":3196422},\"settings\":{\"profileId\":\"balanced\",\"policy\":\"allow-edge\"},\"hasChannelJson\":false,\"committedBytes\":78703,\"result\":null,\"upload\":null,\"error\":null},\"done\":{\"ok\":true,\"phase\":\"validated\",\"sha256\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"outputBytes\":547103,\"convertMs\":35,\"error\":null},\"after\":{\"id\":\"job-df78c8918559ab45\",\"state\":\"ready\",\"nextAction\":\"export\",\"active\":false,\"createdAt\":\"2026-09-29T10:14:11.759Z\",\"updatedAt\":\"2026-09-29T10:14:14.484Z\",\"source\":{\"name\":\"bf.kfb\",\"size\":561835,\"sha256\":\"e0a4e7286f290767a16d1eac36f6ae02b4056cc98ce4b21e97565ff9e73e487f\"},\"modality\":\"brightfield\",\"estimate\":{\"payload_bytes\":561451,\"tiles_present\":9,\"cells_total\":9,\"cells_missing\":0,\"edge_tiles\":7,\"ifds\":3,\"output_upper_bound_bytes\":3196422},\"settings\":{\"profileId\":\"balanced\",\"policy\":\"allow-edge\"},\"hasChannelJson\":false,\"committedBytes\":0,\"result\":{\"outputBytes\":547103,\"sha256\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"format\":\"classic-bigtiff-jpeg-pyramid\",\"channels\":[]},\"upload\":null,\"error\":null},\"sha\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"expect\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\"}",
+      "ms": 2891
+    },
+    {
+      "name": "start-unjournaled-planned-job",
+      "pass": true,
+      "detail": "{\"listed\":{\"id\":\"job-0a3f8b5698a981b3\",\"state\":\"planned\",\"nextAction\":\"start\",\"active\":false,\"createdAt\":\"2026-09-29T10:14:14.671Z\",\"updatedAt\":\"2026-09-29T10:14:14.671Z\",\"source\":{\"name\":\"bf.kfb\",\"size\":561835,\"sha256\":\"e0a4e7286f290767a16d1eac36f6ae02b4056cc98ce4b21e97565ff9e73e487f\"},\"modality\":\"brightfield\",\"estimate\":{\"payload_bytes\":561451,\"tiles_present\":9,\"cells_total\":9,\"cells_missing\":0,\"edge_tiles\":7,\"ifds\":3,\"output_upper_bound_bytes\":3196422},\"settings\":{\"profileId\":\"saver\",\"policy\":\"allow-edge\"},\"hasChannelJson\":false,\"committedBytes\":0,\"result\":null,\"upload\":null,\"error\":null},\"done\":{\"ok\":true,\"phase\":\"validated\",\"sha256\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"outputBytes\":547103,\"convertMs\":38,\"error\":null},\"sha\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"expect\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\"}",
+      "ms": 347
+    },
+    {
+      "name": "settings-change-refused",
+      "pass": true,
+      "detail": "{\"profileChange\":{\"refused\":true,\"code\":\"resume_refused\",\"message\":\"资源档位已改变：任务 saver，请求 balanced\"},\"policyChange\":{\"refused\":true,\"code\":\"resume_refused\",\"message\":\"像素策略已改变：任务 allow-edge，请求 strict-lossless\"},\"done\":{\"ok\":true,\"phase\":\"validated\",\"sha256\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"outputBytes\":547103,\"convertMs\":31,\"error\":null},\"sha\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\",\"expect\":\"592da92527235bab248bcef18239f1e868854698a5b2e5209987cb5db6408fd5\"}",
+      "ms": 2872
+    },
+    {
+      "name": "core-version-bump-refused",
+      "pass": true,
+      "detail": "{\"coreBump\":{\"refused\":true,\"code\":\"resume_refused\",\"message\":\"核心版本不符：任务 99.0.0，当前 0.1.0\"}}",
+      "ms": 343
+    },
+    {
+      "name": "two-tabs-web-lock",
+      "pass": true,
+      "detail": "{\"secondTab\":{\"refused\":true,\"code\":\"job_locked_other_tab\",\"message\":\"另一个标签页正在执行重转换任务（Web Lock）\"},\"jobId\":\"job-df249e9be38e1bde\"}",
+      "ms": 323
+    },
+    {
+      "name": "opfs-jobdir-deleted-rejected",
+      "pass": true,
+      "detail": "{\"deletedDir\":{\"refused\":true,\"code\":\"job_dir_missing\",\"message\":\"任务目录缺失或不可读（可能被浏览器驱逐/删除）：A requested file or directory could not be found at the time an operation was processed.\"}}",
+      "ms": 3337
+    },
+    {
+      "name": "cancel-with-cleanup-failure-pending-record",
+      "pass": true,
+      "detail": "{\"pendingAfterCancel\":{\"jobs\":[{\"id\":\"job-9e86454237afcdf2\",\"attempts\":0,\"lastError\":\"injected cleanup failure (test)\",\"at\":\"2026-09-29T10:14:22.007Z\"}]},\"rawAfterCancel\":\"{\\\"jobs\\\":[{\\\"id\\\":\\\"job-9e86454237afcdf2\\\",\\\"attempts\\\":0,\\\"lastError\\\":\\\"injected cleanup failure (test)\\\",\\\"at\\\":\\\"2026-09-29T10:14:22.007Z\\\"}]}\",\"dirExistsAfterCancel\":true,\"pendingAfterRetry\":{\"jobs\":[]},\"dirExistsAfterRetry\":false}",
+      "ms": 3226
+    },
+    {
+      "name": "cancel-latency-and-basic",
+      "pass": true,
+      "latencyMs": 0.4,
+      "detail": "{\"latencyMs\":0.4,\"dirDeleted\":true,\"cancelResult\":{\"cancelled\":true,\"cleanup\":\"page-after-terminate\"}}",
+      "ms": 3894
+    },
+    {
+      "name": "repeated-terminate-reload-mixed",
+      "pass": true,
+      "sha": "aecd213d3a852e82e6835b2874e4a3e4755d2db25416bbdf3384896b84a35fa2",
+      "detail": "{\"done\":{\"ok\":true,\"phase\":\"validated\",\"sha256\":\"aecd213d3a852e82e6835b2874e4a3e4755d2db25416bbdf3384896b84a35fa2\",\"outputBytes\":3066366,\"convertMs\":63,\"error\":null},\"sha\":\"aecd213d3a852e82e6835b2874e4a3e4755d2db25416bbdf3384896b84a35fa2\",\"expect\":\"aecd213d3a852e82e6835b2874e4a3e4755d2db25416bbdf3384896b84a35fa2\"}",
+      "ms": 5712
+    },
+    {
+      "name": "fl-resume-matches",
+      "pass": true,
+      "sha": "910d170ecf66a9b3881d458d8c7d84554e9c5a7c68a365d5190547a035cd584b",
+      "detail": "{\"done\":{\"ok\":true,\"phase\":\"validated\",\"sha256\":\"910d170ecf66a9b3881d458d8c7d84554e9c5a7c68a365d5190547a035cd584b\",\"outputBytes\":134114,\"convertMs\":6,\"error\":null},\"sha\":\"910d170ecf66a9b3881d458d8c7d84554e9c5a7c68a365d5190547a035cd584b\",\"expect\":\"910d170ecf66a9b3881d458d8c7d84554e9c5a7c68a365d5190547a035cd584b\"}",
+      "ms": 2875
+    },
+    {
+      "name": "fl-finalize-crash-resume",
+      "pass": true,
+      "sha": "910d170ecf66a9b3881d458d8c7d84554e9c5a7c68a365d5190547a035cd584b",
+      "detail": "{\"done\":{\"ok\":true,\"phase\":\"validated\",\"sha256\":\"910d170ecf66a9b3881d458d8c7d84554e9c5a7c68a365d5190547a035cd584b\",\"outputBytes\":134114,\"convertMs\":2,\"error\":null},\"sha\":\"910d170ecf66a9b3881d458d8c7d84554e9c5a7c68a365d5190547a035cd584b\",\"expect\":\"910d170ecf66a9b3881d458d8c7d84554e9c5a7c68a365d5190547a035cd584b\"}",
+      "ms": 2861
+    },
+    {
+      "name": "fl-reload-mid",
+      "pass": true,
+      "sha": "910d170ecf66a9b3881d458d8c7d84554e9c5a7c68a365d5190547a035cd584b",
+      "detail": "{\"done\":{\"ok\":true,\"phase\":\"validated\",\"sha256\":\"910d170ecf66a9b3881d458d8c7d84554e9c5a7c68a365d5190547a035cd584b\",\"outputBytes\":134114,\"convertMs\":6,\"error\":null},\"sha\":\"910d170ecf66a9b3881d458d8c7d84554e9c5a7c68a365d5190547a035cd584b\",\"expect\":\"910d170ecf66a9b3881d458d8c7d84554e9c5a7c68a365d5190547a035cd584b\"}",
+      "ms": 2924
+    }
+  ]
+}

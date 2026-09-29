@@ -12,6 +12,7 @@
 
 import { SlideToolsRunner } from './slide-transform/runner.js';
 import * as E from './slide-transform/engine.js';
+import { createUploadController } from './tools-slides-upload.js';
 
 const CHANNEL_JSON_MAX_BYTES = 1 << 20; // 伴随文件读取上限 1 MiB（有界）
 
@@ -44,6 +45,9 @@ const els = {
   saveBtn: $('save-btn'),
   persistBtn: $('persist-btn'),
   saveStatus: $('save-status'),
+  uploadBtn: $('upload-btn'),
+  uploadCancelBtn: $('upload-cancel-btn'),
+  uploadStatus: $('upload-status'),
   jobsList: $('jobs-list'),
   pageError: $('page-error'),
   pageStatus: $('page-status'),
@@ -137,6 +141,7 @@ function dlRow(grid, term, definition, ddId) {
 
 const page = {
   runner: null,
+  uploadCtl: null,         // C4 上传控制器（tools-slides-upload.js）
   file: null,
   channelJson: null,       // string | null（≤1 MiB 读取结果）
   channelJsonName: null,
@@ -157,6 +162,7 @@ function rerenderForLang() {
   renderSaveStatus();
   renderResultPanel();
   renderJobs(page.lastJobs || []);
+  if (page.uploadCtl) page.uploadCtl.rerenderForLang();
   if (page.prep) renderProbeSummary();
   if (page.busyPhaseLabelKey) els.runStatus.textContent = t(page.busyPhaseLabelKey);
   if (stageMsg.key) els.stageStatus.textContent = t(stageMsg.key, stageMsg.vars);
@@ -238,6 +244,8 @@ function resetFlowPanels() {
   els.runProgress.hidden = true;
   els.runBytes.hidden = true;
   els.stageSection.hidden = true;
+  els.uploadStatus.textContent = '';
+  els.uploadCancelBtn.hidden = true;
 }
 
 async function onFilePicked() {
@@ -560,6 +568,7 @@ function renderResultPanel() {
         `result-channel-${i}`);
     });
   }
+  if (page.uploadCtl) page.uploadCtl.setResultJob(page.readyInfo.jobId);
 }
 
 function renderSaveStatus() {
@@ -721,6 +730,11 @@ function renderJobs(jobs) {
     del.addEventListener('click', () => onJobAction('discard', job));
     actions.appendChild(del);
     row.appendChild(actions);
+    // C4：行内上传状态/继续上传；上传进行中禁用删除（避免丢唯一本地产物）。
+    // 必须在 actions 挂到行之后再渲染（段内 insertBefore 以 actions 为锚点）。
+    if (page.uploadCtl && (job.state === 'ready' || job.state === 'exported')) {
+      page.uploadCtl.renderRowSegment(job, actions, del);
+    }
 
     els.jobsList.appendChild(row);
   }
@@ -731,7 +745,16 @@ async function onJobAction(action, job) {
   try {
     if (action === 'discard') {
       if (!window.confirm(t('tools.jobs.discard.confirm'))) return;
-      await page.runner.discardJob(job.id);
+      try {
+        await page.runner.discardJob(job.id);
+      } catch (e) {
+        const info = (e && e.error) || {};
+        // 遗留上传记录（没有任何标签在传）：再确认一次放弃上传才删除
+        if (errCode(e) !== 'upload_active' || info.lockHeld !== false) throw e;
+        if (!window.confirm(t('tools.upload.abandon.confirm'))) return;
+        await page.uploadCtl.abandon(job);
+        await page.runner.discardJob(job.id, { abandonUpload: true });
+      }
       refreshJobs();
       return;
     }
@@ -837,6 +860,11 @@ async function init() {
   }
   page.runner.on('progress', onProgress);
   page.runner.on('state', onRunnerState);
+  page.uploadCtl = createUploadController({
+    runner: page.runner,
+    t,
+    onJobsRefresh: refreshJobs,
+  });
   refreshJobs();
 
   els.fileInput.addEventListener('change', () => { onFilePicked(); });
@@ -845,6 +873,11 @@ async function init() {
   els.cancelBtn.addEventListener('click', () => { onCancel(); });
   els.saveBtn.addEventListener('click', () => { onSave(); });
   els.persistBtn.addEventListener('click', () => { onPersist(); });
+  // C4：上传是唯一主动外连入口（点击后先查能力，再判定登录/限额/格式）
+  els.uploadBtn.addEventListener('click', () => {
+    if (page.readyInfo) page.uploadCtl.startOrContinue(page.readyInfo.jobId);
+  });
+  els.uploadCancelBtn.addEventListener('click', () => { page.uploadCtl.cancel(); });
   // 测试/诊断可观测钩子（不承载任何逻辑）
   window.__stToolsReady = true;
 }

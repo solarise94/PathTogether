@@ -24,8 +24,15 @@
 //   const jobs = await runner.listJobs();   // [JobSummary], see _summary()
 //   const job  = await runner.getJob(jobId); // JobSummary | null
 //   await runner.cancelJob();                // the running job of this tab
-//   await runner.discardJob(jobId);          // delete copy + artifact
+//   await runner.discardJob(jobId, { abandonUpload }); // delete copy + artifact
 //   await runner.exportJob(jobId, () => savePicker.createWritable());
+//   // C4 upload hookup: merge a patch into record.upload (serialized per tab,
+//   // same slot record discipline as every other record change). The page owns
+//   // the shape; recommended: {ingestionId, filename, size, state,
+//   // confirmedParts, slideId, updatedAt, error}. discardJob refuses with a
+//   // typed `upload_active` while a tab holds E.uploadLockName(jobId), and for
+//   // a leftover non-terminal record unless { abandonUpload: true }.
+//   await runner.setJobUpload(jobId, patch);
 //
 // Disk gate: `disk_precheck_failed` with `uncertain: true` means the
 // browser's quota report is capped (usage + 10 GiB) and cannot prove the
@@ -304,6 +311,10 @@ export class SlideToolsRunner {
         if (handle.kind !== 'directory' || name.startsWith('.')) continue;
         let rec = null;
         try { rec = await E.readSlotRecord(handle, 'job'); } catch { rec = null; }
+        // C4: a job with an upload record is never sweepable — the record is the
+        // only durable link to a server-side ingestion still referencing these
+        // bytes (upload only starts from ready, so this is defensive).
+        if (rec && rec.upload) continue;
         if (!rec || rec.state === 'staging') victims.push(name);
       }
       for (const name of victims) {
@@ -387,7 +398,49 @@ export class SlideToolsRunner {
     });
   }
 
-  async discardJob(jobId) {
+  /// C4 upload record: merge `patch` into record.upload (read-merge-write on
+  /// the serialized record chain — the page must not write the slot itself).
+  /// Only ready/exported jobs accept an upload record: the artifact this
+  /// record refers to must exist.
+  async setJobUpload(jobId, patch) {
+    if (!patch || typeof patch !== 'object') {
+      throw E.stError(E.ERROR_CODES.IO_RECOVERABLE, 'upload 记录须为对象');
+    }
+    await this._serialRecord(async () => {
+      const rec = await this._readJobRecord(jobId);
+      if (!rec || (rec.state !== 'ready' && rec.state !== 'exported')) {
+        throw E.stError(E.ERROR_CODES.NOT_READY,
+          `任务状态 ${rec ? rec.state : 'missing'} 不可挂上传记录（仅 ready/exported）`);
+      }
+      const prev = rec.upload || {};
+      await this._writeJobRecordNow(jobId, {
+        ...rec,
+        upload: { ...prev, ...patch, updatedAt: E.nowIso() },
+      });
+    });
+  }
+
+  /// An upload in any tab holds E.uploadLockName(jobId) and reads the OPFS
+  /// artifact as its only source, so discard is refused while that lock is
+  /// held. A non-terminal upload record without a lock holder is a leftover
+  /// of a closed tab: it is refused too (`lockHeld: false`) unless the
+  /// caller passes { abandonUpload: true } after asking the user.
+  async discardJob(jobId, opts = {}) {
+    return navigator.locks.request(E.uploadLockName(jobId), { ifAvailable: true },
+      async (lock) => {
+        const rec = await this._readJobRecord(jobId).catch(() => null);
+        const up = rec && rec.upload;
+        const pending = !!(up && E.UPLOAD_ACTIVE_STATES.includes(up.state));
+        if (!lock || (pending && !opts.abandonUpload)) {
+          throw E.stError(E.ERROR_CODES.UPLOAD_ACTIVE,
+            `上传进行中（${up ? up.state : 'uploading'}），删除会丢失本地产物；请先取消或等待收口`,
+            { uploadState: up ? up.state : null, lockHeld: !lock });
+        }
+        await this._discardNow(jobId);
+      });
+  }
+
+  async _discardNow(jobId) {
     await this._request('release-source', {});
     const jobs = await this._jobsDir();
     try {
@@ -434,7 +487,7 @@ export class SlideToolsRunner {
       const estimate = probeResult.document.estimate || probeResult.estimate;
       this._diskGate(E.checkDiskBudget(estimate, await navigator.storage.estimate()), opts, 'post-probe');
     } catch (e) {
-      await this.discardJob(jobId).catch(() => { /* pending-cleanup recorded */ });
+      await this._discardNow(jobId).catch(() => { /* pending-cleanup recorded */ });
       throw e;
     }
     const doc = probeResult.document;
@@ -816,6 +869,8 @@ export class SlideToolsRunner {
   ///   settings: {profileId, policy, outputCapBytes, channelJson} | null,
   ///   hasChannelJson, committedBytes,
   ///   result: {outputBytes, sha256, channels: [{name, display_window, …}]} | null,
+  ///   upload: {ingestionId, filename, size, state, confirmedParts, slideId,
+  ///            updatedAt, error} | null (C4; page-managed shape),
   ///   error}
   /// nextAction: 'start' (prepared) | 'resume' (interrupted run) |
   ///   'export' (ready/exported) | 'wait' (running in this tab) | 'discard'.
@@ -857,9 +912,11 @@ export class SlideToolsRunner {
         ? {
           outputBytes: rec.result.output_bytes,
           sha256: rec.validation && rec.validation.sha256,
+          format: rec.result.format || null,
           channels: rec.result.channels || [],
         }
         : null,
+      upload: rec && rec.upload ? { ...rec.upload } : null,
       error: rec ? rec.error || null : null,
     };
   }
@@ -890,5 +947,19 @@ export class SlideToolsRunner {
   /// sync handle) — used by tests to compare against the native CLI.
   async hashArtifact(jobId) {
     return this._request('hash-opfs-file', { jobId, name: E.OUTPUT_NAME }, 60 * 60 * 1000);
+  }
+
+  /// C4: the finished artifact as a File view for the shared COS uploader
+  /// (ready/exported only). The caller reads it strictly via slice() per
+  /// part — never whole-file materialization (plan §3/§5).
+  async artifactView(jobId) {
+    const record = await this._readJobRecord(jobId);
+    if (!record || (record.state !== 'ready' && record.state !== 'exported')) {
+      throw E.stError(E.ERROR_CODES.NOT_READY,
+        `任务状态 ${record ? record.state : 'missing'} 无产物可读（仅 ready）`);
+    }
+    const dir = await this._jobDir(jobId);
+    const fh = await dir.getFileHandle(E.OUTPUT_NAME);
+    return fh.getFile();
   }
 }

@@ -21,7 +21,23 @@ export const ERROR_CODES = {
   SOURCE_CHANGED: 'source_changed_refuse_resume',
   UNSUPPORTED_INPUT: 'unsupported_input',
   CANCELLED: 'cancelled',
+  // C4：上传进行中（分块传输/等待服务端阶段）拒绝删除任务——本地产物在
+  // 上传收口前必须可继续读取，删除即丢失唯一副本。
+  UPLOAD_ACTIVE: 'upload_active',
 };
+
+// C4：upload 记录视为「进行中」的状态（活跃 = 删除被拒；页面据此禁用
+// discard 并展示继续上传）。published/failed/cancelled 是收口态。
+export const UPLOAD_ACTIVE_STATES = [
+  'created', 'waiting', 'uploading', 'awaiting_server', 'downloading',
+  'validating', 'processing', 'readiness', 'interrupted',
+];
+
+/// Held (Web Lock) by whichever tab is uploading this job's artifact; a
+/// discard only proceeds when it can take the same lock.
+export function uploadLockName(jobId) {
+  return `slide-transform:upload:${jobId}`;
+}
 
 export function stError(code, message, extra = {}) {
   return { error: { code, message, ...extra } };

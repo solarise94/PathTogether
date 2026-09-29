@@ -28,6 +28,10 @@ import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const appSrc = readFileSync(resolve(here, "../../static/app.js"), "utf8");
+// C4：COS 状态机抽出为共享引擎 static/upload/cos-uploader.js（index.html
+// 先于 app.js 加载）。harness 同序执行两个源码——只改加载方式，不改断言。
+const cosEngineSrc = readFileSync(
+	resolve(here, "../../static/upload/cos-uploader.js"), "utf8");
 const i18nSrc = readFileSync(resolve(here, "../../static/i18n.js"), "utf8");
 
 const THRESHOLD = 16 * 1024 * 1024;
@@ -196,6 +200,7 @@ function loadApp(fetchImpl?: typeof fetch, bootstrap?: unknown) {
 	(globalThis as { localStorage: typeof storage }).localStorage = storage;
 	vi.stubGlobal("XMLHttpRequest", FakeXHR);
 	vi.stubGlobal("localStorage", storage);
+	new Function("window", "document", "fetch", "location", cosEngineSrc)(w, doc, theFetch, loc);
 	new Function("window", "document", "fetch", "location", appSrc)(w, doc, theFetch, loc);
 	const up = w.HP_UPLOAD as Record<string, unknown>;
 	return {

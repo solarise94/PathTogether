@@ -23,6 +23,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import _bootstrap  # noqa: F401,E402  # noqa: F401
 import app as app_mod  # noqa: E402
+import cos_config  # noqa: E402
 from _pt_helpers import isolate_app  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -34,11 +35,24 @@ EXPECTED_CSP = (
     "form-action 'none'; frame-ancestors 'none'"
 )
 
+#: C4：COS 桶/区域都配置时，connect-src 追加唯一 COS origin（否则与 C3 相同）
+EXPECTED_CSP_WITH_COS = (
+    "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; "
+    "worker-src 'self'; connect-src 'self' "
+    "https://c4bucket-1250000000.cos.ap-c4fake.myqcloud.com; style-src 'self'; "
+    "img-src 'self' data:; base-uri 'none'; object-src 'none'; "
+    "form-action 'none'; frame-ancestors 'none'"
+)
+
 
 @pytest.fixture()
 def _iso(monkeypatch):
     isolate_app(monkeypatch, _bootstrap.SHARE_DATA_DIR, clear_stores=True)
     app_mod.AUTH_ENABLED = True
+    # C4 起 CSP 含条件性的 COS origin——显式清空桶/区域，基线断言不受
+    # 运行环境残留 env 影响（配 COS 的场景由专门用例 monkeypatch 注入）
+    monkeypatch.setattr(cos_config, "COS_BUCKET", "")
+    monkeypatch.setattr(cos_config, "COS_REGION", "")
     yield
 
 
@@ -64,6 +78,44 @@ def test_tools_slides_csp_exact(_iso):
     assert "unsafe-eval'" not in csp.replace("'wasm-unsafe-eval'", "")
     # 不放行外部 connect（工具页隐私承诺：除自身静态代码外零网络请求）
     assert "http" not in csp
+
+
+def test_tools_slides_csp_with_cos_origin(_iso, monkeypatch):
+    """C4：桶/区域都配置 → connect-src 恰好多一个唯一 COS origin。
+
+    逐 token 精确匹配（无通配、无 http、无第二个外源——分块 PUT 的唯一
+    目的地）；其余指令与基线完全一致。"""
+    monkeypatch.setattr(cos_config, "COS_BUCKET", "c4bucket-1250000000")
+    monkeypatch.setattr(cos_config, "COS_REGION", "ap-c4fake")
+    csp = _get("/tools/slides").headers.get("Content-Security-Policy")
+    assert csp == EXPECTED_CSP_WITH_COS
+    assert csp.count("myqcloud.com") == 1
+    assert "http://" not in csp
+    assert "*" not in csp
+
+
+def test_tools_slides_csp_cos_malformed_fail_closed(_iso, monkeypatch):
+    """桶/区域缺失或含非法字符 → 不追加任何 origin（宁可不放，fail-closed）；
+    只配一半同样不放。"""
+    for bucket, region in (("c4bucket-1250000000", ""),
+                           ("", "ap-c4fake"),
+                           ("c4 bucket", "ap-c4fake"),
+                           ("c4bucket-1250000000", "ap c4fake"),
+                           ("https://evil.example", "ap-c4fake"),
+                           ("c4bucket-1250000000", "rg/../../x"),
+                           ("*.wildcard", "ap-c4fake")):
+        monkeypatch.setattr(cos_config, "COS_BUCKET", bucket)
+        monkeypatch.setattr(cos_config, "COS_REGION", region)
+        csp = _get("/tools/slides").headers.get("Content-Security-Policy")
+        assert csp == EXPECTED_CSP, (bucket, region, csp)
+        assert "myqcloud" not in csp and "evil.example" not in csp
+
+
+def test_tools_slides_assets_exist_includes_shared_uploader():
+    """C4：工具页以 classic script 加载共享 COS 引擎（CSP 'self' 允许）。"""
+    html = (REPO_ROOT / "templates" / "tools_slides.html").read_text(encoding="utf-8")
+    assert 'src="/static/upload/cos-uploader.js' in html
+    assert (REPO_ROOT / "static" / "upload" / "cos-uploader.js").is_file()
 
 
 def test_tools_slides_no_coop_coep_page_headers(_iso):

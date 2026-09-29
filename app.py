@@ -3030,15 +3030,37 @@ def _apply_landing_security_headers(resp):
 #: C3 本地切片工具页（/tools/slides）的页面级 CSP：ADR 模式 C（计划
 #: docs/browser-slide-tools-and-baidu-plugin-agent-plan-20260929.md §6）加
 #: worker/wasm 实际需要的最小面。只作用于该页，不改全站头；无 COOP/COEP
-#: （worker 非共享内存型，不需要跨源隔离）。与登录页不同：无表单 →
-#: form-action 'none'；不追加 CSP_EXTRA_CONNECT_SOURCES（本页隐私承诺是
-#: 除自托管静态代码外零网络请求，见计划 §6）。
-_SLIDE_TOOLS_CSP = (
-    "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; "
-    "worker-src 'self'; connect-src 'self'; style-src 'self'; "
-    "img-src 'self' data:; base-uri 'none'; object-src 'none'; "
-    "form-action 'none'; frame-ancestors 'none'"
-)
+#:（worker 非共享内存型，不需要跨源隔离）。与登录页不同：无表单 →
+#: form-action 'none'；不追加 CSP_EXTRA_CONNECT_SOURCES。
+#:
+#: C4 上传接入：connect-src 除 'self' 外**只**在 COS 桶/区域都配置时追加
+#: 唯一 COS origin（https://<bucket>.cos.<region>.myqcloud.com——分块 PUT 的
+#: 唯一目的地）。无通配、无 http；桶/区域缺失或含非法字符时宁可不放
+#:（上传入口照常给出原因，本地产物不受影响）。上传前的隐私承诺不变：
+#: 点击上传前页面零网络请求（C3 场景 j/k 仍须通过）。
+_COS_ORIGIN_TOKEN_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$")
+
+
+def _slide_tools_cos_origin():
+    """配置完整的桶/区域 → 唯一 COS origin；否则 None（fail-closed）。"""
+    bucket = (cos_config.COS_BUCKET or "").strip().lower()
+    region = (cos_config.COS_REGION or "").strip().lower()
+    if _COS_ORIGIN_TOKEN_RE.match(bucket) and _COS_ORIGIN_TOKEN_RE.match(region):
+        return "https://%s.cos.%s.myqcloud.com" % (bucket, region)
+    return None
+
+
+def _slide_tools_csp():
+    connect = "'self'"
+    cos_origin = _slide_tools_cos_origin()
+    if cos_origin:
+        connect += " " + cos_origin
+    return (
+        "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; "
+        "worker-src 'self'; connect-src %s; style-src 'self'; "
+        "img-src 'self' data:; base-uri 'none'; object-src 'none'; "
+        "form-action 'none'; frame-ancestors 'none'" % connect
+    )
 
 
 def _apply_slide_tools_security_headers(resp):
@@ -3048,7 +3070,7 @@ def _apply_slide_tools_security_headers(resp):
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    resp.headers["Content-Security-Policy"] = _SLIDE_TOOLS_CSP
+    resp.headers["Content-Security-Policy"] = _slide_tools_csp()
     return resp
 
 
@@ -3170,9 +3192,45 @@ def tools_slides():
       不创建平台任务（计划 §6）。
     - 无登录（_require_auth 显式放行本路径）；页面级最小 CSP 由
       _apply_slide_tools_security_headers 设置（不改全站头）。
+
+    C4：ready 产物可选上传工作台（复用 COS 分块上传）。上传入口只由
+    /api/tools/slides/upload-capability（登录后、点击时才请求）驱动——
+    本页渲染路径仍零网络请求。
     """
     resp = make_response(render_template("tools_slides.html"))
     return _apply_slide_tools_security_headers(resp)
+
+
+#: C4：本地工具页产物可上传的输出格式表（按核心 result.format 字符串键控，
+#: **不是**扩展名）。计划 §1：「工具能导出」与「平台能查看」是不同能力——
+#: 只有 tests/test_slide_tools_upload_capability.py 用**平台读取器**
+#: （slide_io.open_slide，与查看器同一路径）实际打开过原生 CLI 合成产物
+#: （明场读区域、荧光另读通道）的格式才允许列入本表；该 pytest 把本表与
+#: 读取现实绑定——读取不通过时必须从表中移除，页面随之对该产物显示
+#: 「平台暂不支持查看」并禁用上传入口，本地保存不受影响。
+SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS = (
+    "classic-bigtiff-jpeg-pyramid",                      # 明场经典金字塔 BigTIFF
+    "ome-bigtiff-subifd-multichannel-jpeg-passthrough",  # 荧光多通道 OME-BigTIFF
+)
+
+
+@app.route("/api/tools/slides/upload-capability")
+def api_tools_slides_upload_capability():
+    """本地工具页上传能力（C4）：登录后才可查（/api/* 未登录 → 401）。
+
+    页面在用户点击「上传」之前不发任何请求（C3 隐私承诺）；本端点在点击后
+    拉取，供页面判定：登录态（401 → 登录提示，不自动跳转）、能力是否可用、
+    最终文件大小上限、产物格式平台能否查看。
+
+    - cos_upload：与工作台 bootstrap 同一权威 payload
+      （_cos_upload_capability_payload；available=false 也回 200——页面需要
+      明确原因，不是错误）；
+    - viewable_formats：SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS（见上）。
+    """
+    payload = _cos_upload_capability_payload(False)
+    return jsonify(
+        cos_upload=payload,
+        viewable_formats=list(SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS))
 
 
 def _plugin_ui_dir(plugin_id):

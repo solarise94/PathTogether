@@ -49,6 +49,9 @@
   <!-- 多通道通道着色（Batch 4）：三页面共用组件，须先于 app.js 加载 -->
   <script src="/static/viewer-encoding.js?v=20260907c"></script>
   <script src="/static/channel-controls.js?v=20260907c"></script>
-  <script src="/static/app.js?v=20260923"></script>
+  <!-- COS 直传共享引擎（C4）：工作台与 /tools/slides 共用；先于 app.js 加载，
+       提供 window.HP_COS_UPLOAD（无 DOM/无 i18n，依赖全部注入） -->
+  <script src="/static/upload/cos-uploader.js?v=20260929"></script>
+  <script src="/static/app.js?v=20260929"></script>
 </body>
 </html>

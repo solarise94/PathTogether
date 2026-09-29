@@ -257,3 +257,12 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; scroll-behavior: auto; }
 }
+
+/* C4 上传接入：结果面板上传块 + 任务行上传状态（文字为主，色调仅辅助） */
+.upload-block { margin-top: 14px; }
+.job-upload-state { margin: 6px 0 0; font-size: 13px; color: var(--muted); }
+.job-upload-state[data-upload-state] { min-height: 1em; }
+.job-upload-state.ok { color: var(--ok); }
+.job-upload-state.err { color: var(--danger); }
+.job-upload-state.run { color: var(--accent); }
+.job-upload-state a { color: var(--accent); }

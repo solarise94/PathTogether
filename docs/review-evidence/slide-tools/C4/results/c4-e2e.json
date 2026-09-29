@@ -1,0 +1,99 @@
+{
+  "a-bf": {
+    "pass": true,
+    "filename": "bf-580x300.tif",
+    "putBytes": 287803,
+    "slideLink": "/app",
+    "sha": "f265596a7662",
+    "size": 287803
+  },
+  "a-fl": {
+    "pass": true,
+    "filename": "fl-600x400.ome.tif",
+    "putBytes": 134114,
+    "slideLink": "/app",
+    "sha": "910d170ecf66",
+    "size": 134114
+  },
+  "b-401-continue": {
+    "pass": true,
+    "loginLink": "/login?next=/tools/slides",
+    "creates": 1,
+    "sha": "f265596a7662"
+  },
+  "c-refresh-continue": {
+    "pass": true,
+    "creates": 1,
+    "resumeSigned": [
+      [
+        3,
+        4
+      ]
+    ],
+    "resumePuts": [
+      3,
+      4
+    ],
+    "sha": "f265596a7662"
+  },
+  "d-repeated-clicks": {
+    "pass": true,
+    "creates": 1,
+    "sha": "f265596a7662"
+  },
+  "e-lost-complete": {
+    "pass": true,
+    "completeReqs": 2,
+    "sha": "f265596a7662"
+  },
+  "f-oversize": {
+    "pass": true,
+    "reason": "输出文件超过平台上限（1000 B 以内可上传）；已禁用上传，本地产物保留，仍可",
+    "creates": 0,
+    "savedSha": "f265596a7662"
+  },
+  "g-format-unsupported": {
+    "pass": true,
+    "reason": "平台暂不支持查看该输出格式；已禁用上传（导出能力不受影响），本地产物保留，仍可本",
+    "creates": 0,
+    "savedSha": "f265596a7662"
+  },
+  "h-cancel-terminal": {
+    "pass": true,
+    "cancels": 1,
+    "creates": 2,
+    "sha": "f265596a7662",
+    "discarded": true
+  },
+  "i-network-capture": {
+    "pass": true,
+    "preClickApi": 0,
+    "preClickCross": 0,
+    "postClickUrls": [
+      "GET /tools/slides",
+      "GET /static/tools/tools-slides.css",
+      "GET /static/i18n.js",
+      "GET /static/tools/tools-slides.js",
+      "GET /static/upload/cos-uploader.js",
+      "GET /static/tools/slide-transform/runner.js",
+      "GET /static/tools/slide-transform/engine.js",
+      "GET /static/tools/tools-slides-upload.js",
+      "GET /static/tools/slide-transform/worker.js",
+      "GET /static/tools/slide-transform/slide_transform.js"
+    ],
+    "putBytes": 287803
+  },
+  "j-real-session-loss": {
+    "pass": true,
+    "loginLink": "/login?next=/tools/slides",
+    "creates": 1,
+    "sha": "f265596a7662"
+  },
+  "k-cross-tab-abandon": {
+    "pass": true,
+    "jobId": "job-07f2c9cd3d7cc676",
+    "creates": 1,
+    "cancels": 1,
+    "dialogs": 3
+  }
+}

@@ -1,0 +1,154 @@
+{
+  "when": "2026-09-29T10:27:17.347Z",
+  "sequence": [
+    {
+      "method": "POST",
+      "path": "/api/ingestions",
+      "partNumber": null,
+      "partNumbers": null
+    },
+    {
+      "method": "GET",
+      "path": "/api/ingestions/inj_c4_1",
+      "partNumber": null,
+      "partNumbers": null
+    },
+    {
+      "method": "POST",
+      "path": "/api/ingestions/inj_c4_1/parts/sign",
+      "partNumber": null,
+      "partNumbers": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/incoming/inj_c4_1",
+      "partNumber": "1",
+      "partNumbers": null
+    },
+    {
+      "method": "PUT",
+      "path": "/incoming/inj_c4_1",
+      "partNumber": "2",
+      "partNumbers": null
+    },
+    {
+      "method": "PUT",
+      "path": "/incoming/inj_c4_1",
+      "partNumber": "3",
+      "partNumbers": null
+    },
+    {
+      "method": "PUT",
+      "path": "/incoming/inj_c4_1",
+      "partNumber": "4",
+      "partNumbers": null
+    },
+    {
+      "method": "PUT",
+      "path": "/incoming/inj_c4_1",
+      "partNumber": "5",
+      "partNumbers": null
+    },
+    {
+      "method": "PUT",
+      "path": "/incoming/inj_c4_1",
+      "partNumber": "6",
+      "partNumbers": null
+    },
+    {
+      "method": "PUT",
+      "path": "/incoming/inj_c4_1",
+      "partNumber": "7",
+      "partNumbers": null
+    },
+    {
+      "method": "PUT",
+      "path": "/incoming/inj_c4_1",
+      "partNumber": "8",
+      "partNumbers": null
+    },
+    {
+      "method": "POST",
+      "path": "/api/ingestions/inj_c4_1/upload-complete",
+      "partNumber": null,
+      "partNumbers": null
+    },
+    {
+      "method": "GET",
+      "path": "/api/ingestions/inj_c4_1",
+      "partNumber": null,
+      "partNumbers": null
+    },
+    {
+      "method": "GET",
+      "path": "/api/ingestions/inj_c4_1",
+      "partNumber": null,
+      "partNumbers": null
+    }
+  ],
+  "cosJobsAfter": [],
+  "fake": {
+    "creates": [
+      {
+        "filename": "wb-regression.tif",
+        "declared_size": 64
+      }
+    ],
+    "signs": [
+      [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ]
+    ],
+    "puts": [
+      {
+        "partNumber": 1,
+        "bytes": 8
+      },
+      {
+        "partNumber": 2,
+        "bytes": 8
+      },
+      {
+        "partNumber": 3,
+        "bytes": 8
+      },
+      {
+        "partNumber": 4,
+        "bytes": 8
+      },
+      {
+        "partNumber": 5,
+        "bytes": 8
+      },
+      {
+        "partNumber": 6,
+        "bytes": 8
+      },
+      {
+        "partNumber": 7,
+        "bytes": 8
+      },
+      {
+        "partNumber": 8,
+        "bytes": 8
+      }
+    ],
+    "completeReqs": 1
+  }
+}

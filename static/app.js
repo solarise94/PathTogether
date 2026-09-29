@@ -6542,42 +6542,16 @@
   var COS_JOBS_KEY = "pt.cos.jobs";
 
   function resolveCosConfig() {
-    // 仿 resolveUploadV2Threshold：唯一权威是 bootstrap.capabilities.cos_upload
+    // C4：校验/规范化逻辑在共享引擎 static/upload/cos-uploader.js（工作台与
+    // /tools/slides 同一份）；唯一权威仍是 bootstrap.capabilities.cos_upload
     //（app.py _cos_upload_capability_payload）。capability off 时只下发
     // {available:false,...}——available 非 true 直接 null，前端不得因文件大
     // 而自行启用 COS（§5）。缺字段/结构非法一律 null：宁可不走 COS，也不拿
     // 坏参数拼请求（D3：十进制字节整数原样使用，前端不自算另一份上限）。
+    if (!window.HP_COS_UPLOAD) return null;
     try {
       var caps = window.HP_APP_BOOTSTRAP && window.HP_APP_BOOTSTRAP.capabilities;
-      var c = caps && caps.cos_upload;
-      if (!c || c.available !== true) return null;
-      var nums = {
-        max_size_bytes: Number(c.max_size_bytes),
-        part_bytes: Number(c.part_bytes),
-        url_ttl_seconds: Number(c.url_ttl_seconds),
-        max_concurrent_parts: Number(c.max_concurrent_parts),
-        sign_batch_max_parts: Number(c.sign_batch_max_parts),
-      };
-      for (var k in nums) {
-        if (typeof nums[k] !== "number" || !isFinite(nums[k]) || nums[k] <= 0) {
-          return null;
-        }
-      }
-      if (!Array.isArray(c.formats) || !c.formats.length) return null;
-      var fmts = [];
-      for (var i = 0; i < c.formats.length; i++) {
-        if (typeof c.formats[i] !== "string" || !c.formats[i]) return null;
-        fmts.push(c.formats[i].toLowerCase());
-      }
-      return {
-        max_size_bytes: nums.max_size_bytes,
-        part_bytes: nums.part_bytes,
-        url_ttl_seconds: nums.url_ttl_seconds,
-        // 并发/批量夹到合理上界：服务端值异常大时别把浏览器与签名速率打爆
-        max_concurrent_parts: Math.max(1, Math.min(16, Math.floor(nums.max_concurrent_parts))),
-        sign_batch_max_parts: Math.max(1, Math.min(64, Math.floor(nums.sign_batch_max_parts))),
-        formats: fmts,
-      };
+      return window.HP_COS_UPLOAD.resolveConfig(caps && caps.cos_upload);
     } catch (e) {
       return null;
     }
@@ -6658,28 +6632,11 @@
     return null;
   }
 
-  // ---------- COS PUT 独立传输（§5/Phase 4-2） ----------
-  function cosPutPart(url, blob, abortCtl) {
-    // 绝不走 apiFetch——它会注入 X-CSRF-Token（对 COS 是污染头，
-    // 还会触发不必要的 CORS 预检）。credentials:"omit" 显式不带平台 Cookie；
-    // mode:"cors" 走 COS 暴露的响应头读 ETag（仅提示，§3.1）。Content-Length
-    // 由浏览器按 body 自动设置（与签名绑定值一致），手动设置既多余又会被
-    // CORS 拒绝，因此这里不设任何请求头。
-    return fetch(url, {
-      method: "PUT",
-      body: blob,
-      mode: "cors",
-      credentials: "omit",
-      signal: abortCtl ? abortCtl.signal : undefined,
-    }).then(function (resp) {
-      var etag = null;
-      try {
-        etag = (resp.headers && resp.headers.get) ? resp.headers.get("ETag") : null;
-      } catch (e) { /* ETag 读不到不影响成功判定（仅提示） */ }
-      if (!resp.ok) throw { status: resp.status, etag: etag };
-      return { etag: etag };
-    });
-  }
+  // ---------- COS PUT 独立传输 ----------
+  // C4：putPart/分块计划/状态机已原样移入共享引擎 static/upload/cos-uploader.js
+  //（window.HP_COS_UPLOAD；index.html 在 app.js 之前加载）。语义见引擎头注释：
+  // COS PUT 绝不经 apiFetch（CSRF 对 COS 是污染头），mode:"cors" +
+  // credentials:"omit"；控制 API 经 apiFetch 带双提交头。
 
   // ---------- 稳定机器码 → 可读文案（未知码保留原文的兜底模式） ----------
   function cosErrorMessage(status, data) {
@@ -6757,324 +6714,71 @@
     return btn;
   }
 
-  // 服务端冻结计划 {part_number,length} → 前端切片表：编号排序后按顺序
-  // 累加推导 offset（worker 按同一顺序初始化，编号连续；计划不含 offset）
-  function cosBuildPlan(parts) {
-    var byNum = {};
-    var nums = [];
-    for (var i = 0; i < parts.length; i++) {
-      byNum[parts[i].part_number] = parts[i];
-      nums.push(parts[i].part_number);
-    }
-    nums.sort(function (a, b) { return a - b; });
-    var out = [];
-    var offset = 0;
-    for (var j = 0; j < nums.length; j++) {
-      var p = byNum[nums[j]];
-      out.push({ part_number: p.part_number, offset: offset, length: p.length });
-      offset += p.length;
-    }
-    return out;
-  }
+  // 服务端冻结计划 {part_number,length} → 前端切片表：cosBuildPlan 已随状态机
+  // 移入共享引擎（HP_COS_UPLOAD.buildPlan，供测试直用）。
 
   function uploadFileCos(file, row, opts) {
+    // C4：本函数只是工作台侧行 UI 适配——状态机/请求序列在共享引擎
+    // static/upload/cos-uploader.js（window.HP_COS_UPLOAD.createUpload）。
+    // 持久化经注入适配器落到 localStorage pt.cos.jobs（§5：只存非秘密 job id
+    // 与文件提示；签名 URL 短 TTL 且属凭证，绝不落 localStorage）。
     opts = opts || {};
-    var cfg = COS_UPLOAD_CONFIG;   // 选路时已判可用（D8：进入即冻结为 COS）
-    var jobId = opts.resumeJobId || null;
-    var confirmedMap = {};         // part_number -> ETag|""（ETag 仅提示，§3.1）
-    var plan = null;               // [{part_number, offset, length}]
-    var totalConfirmed = 0;
-    var abortCtl = (typeof AbortController === "function") ? new AbortController() : null;
-    var stopped = false;           // 用户取消/行终结后停一切后续动作
-    var timerHandle = null;
+    if (!window.HP_COS_UPLOAD || !COS_UPLOAD_CONFIG) {
+      row.markError();
+      row.setStage("upload.stage.failed");
+      row.finish(10000);
+      return;
+    }
+    var jobId = opts.resumeJobId || null;   // created 事件回填（重试按钮用）
+    var upload = null;
 
     // —— 取消（§4 cancel 幂等）：停轮询 + abort 在途 PUT + POST cancel ——
     addRowButton(row, tt("upload.cos.cancel"), function () {
-      if (stopped) return;
-      stopped = true;
-      if (timerHandle) { clearTimeout(timerHandle); timerHandle = null; }
-      if (abortCtl) { try { abortCtl.abort(); } catch (e) {} }
-      cosJobRemove(jobId);
+      if (!upload) return;
       row.setStage("upload.cos.cancelled");
       row.finish(10000);
-      if (jobId) {
-        // 网络失败也照常停 UI：服务端等待超时/容量调度器会兜底清理
-        apiFetch("/api/ingestions/" + encodeURIComponent(jobId) + "/cancel",
-                 { method: "POST" }).catch(function () {});
-      }
+      upload.cancel();
     });
 
-    function delay(ms) {
-      // 所有等待统一走可 clearTimeout 的定时器：取消后不再推进状态机
-      return new Promise(function (resolve) {
-        timerHandle = setTimeout(function () { timerHandle = null; resolve(); }, ms);
-      });
-    }
+    upload = window.HP_COS_UPLOAD.createUpload({
+      source: file,
+      apiFetch: apiFetch,
+      config: COS_UPLOAD_CONFIG,
+      storage: {
+        save: cosJobSave,
+        complete: cosJobRemove,   // viewable/终态：本地恢复记录清理（§5）
+        remove: cosJobRemove,
+        findResumable: cosFindResumableJob,
+        readConfirmed: function (id) {
+          var jobs = cosJobsRead().filter(function (j) { return j.job_id === id; });
+          return jobs.length ? jobs[0].confirmed : [];
+        },
+      },
+      resumeJobId: jobId,
+      skipConfirm: !!opts.skipConfirm,
+      confirmResume: function () {
+        return window.confirm(tt("upload.cos.resume_confirm", { name: file.name }));
+      },
+      // 工作台保持抽出前行为：完成请求网络失败不自动重发（行级失败提示
+      // 重选同名文件续传）；工具页才开 retryCompleteOnNetworkError。
+      retryCompleteOnNetworkError: false,
+      useResumeEndpoint: false,
+      onEvent: function (ev) {
+        if (ev.type === "status") cosShowStage(row, ev.body);
+        else if (ev.type === "progress") {
+          row.setStage("upload.cos.stage.uploading", ev.frac);
+        } else if (ev.type === "created") jobId = ev.jobId;
+      },
+    });
 
-    function confirmedList() {
-      var out = [];
-      for (var k in confirmedMap) {
-        if (confirmedMap.hasOwnProperty(k)) out.push(parseInt(k, 10));
-      }
-      return out;
-    }
-
-    function confirmPart(n, etag) {
-      if (confirmedMap.hasOwnProperty(n)) return;
-      confirmedMap[n] = etag || "";
-      totalConfirmed++;
-      // 进度 = 已确认分块/总块数：只代表上传阶段（§5），重试不重复计数
-      if (plan && plan.length) {
-        row.setStage("upload.cos.stage.uploading", totalConfirmed / plan.length);
-      }
-      cosJobSave({ job_id: jobId, filename: file.name, size: file.size,
-                   confirmed: confirmedList() });
-    }
-
-    function loadConfirmedFromStorage() {
-      // 续传起点以本地记录为准（编号即已确认；worker ListParts 才是权威，
-      // 多传的分块只是同编号覆盖，绑定长度保证不越界——resume 语义）
-      var jobs = cosJobsRead().filter(function (j) { return j.job_id === jobId; });
-      var saved = jobs.length ? jobs[0] : null;
-      (saved && saved.confirmed || []).forEach(function (n) {
-        if (!confirmedMap.hasOwnProperty(n)) {
-          confirmedMap[n] = "";
-          totalConfirmed++;
-        }
-      });
-    }
-
-    function fetchStatus() {
-      return apiFetch("/api/ingestions/" + encodeURIComponent(jobId)).then(jsonBody);
-    }
-
-    function drive() {
-      // 统一状态机：waiting_space(5s 轮询) → uploading(拿计划传分块) →
-      // upload-complete → 服务端阶段(2s 轮询) → viewable/terminal
-      return fetchStatus().then(function (res) {
-        if (stopped) throw { cancelled: true };
-        if (!res.ok) throw { status: res.status, data: res.body };
-        var b = res.body || {};
-        // P2 合同 §5.3：status 响应出现 slide_id（随 slide 出现）即回填本地
-        // 记录（job_id 仍是匹配键）
-        if (b.slide_id && jobId) {
-          cosJobSave({ job_id: jobId, filename: file.name, size: file.size,
-                       slide_id: b.slide_id, confirmed: confirmedList() });
-        }
-        var st = b.stage;
-        if (st === "waiting_space") {
-          cosShowStage(row, b);
-          return delay(5000).then(drive);   // 等待期间可取消（行上按钮）
-        }
-        if (st === "uploading") {
-          if (b.parts && b.parts.length) {
-            plan = cosBuildPlan(b.parts);
-            return uploadPendingParts();
-          }
-          // preparing：worker 尚未初始化 multipart（无分块计划）→ 短间隔再查
-          row.setStage("upload.cos.stage.uploading", 0);
-          return delay(2000).then(drive);
-        }
-        if (st === "awaiting_server" || st === "downloading" ||
-            st === "validating" || st === "processing" ||
-            st === "readiness" || st === "viewable") {
-          if (st === "viewable") return succeed(b);
-          cosShowStage(row, b);
-          return delay(2000).then(drive);
-        }
-        if (st === "terminal") {
-          cosJobRemove(jobId);   // 等待超时/过期/失败：终态任务不再恢复
-          throw { terminal: true, data: b };
-        }
-        return delay(2000).then(drive);   // 未知 stage：以服务端为准再查
-      });
-    }
-
-    function signBatch(parts) {
-      // 按 sign_batch_max_parts 分批申请绑定长度的 UploadPart URL（A 合同
-      // 唯一授权接口）；429/503 退避重试同一批（同 uploadId 续签幂等）
-      var attempt = 0;
-      function go() {
-        attempt++;
-        return apiFetch("/api/ingestions/" + encodeURIComponent(jobId) + "/parts/sign", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            part_numbers: parts.map(function (p) { return p.part_number; }),
-          }),
-        }).then(jsonBody).then(function (res) {
-          if (res.ok && res.body && Array.isArray(res.body.urls)) {
-            var byNum = {};
-            res.body.urls.forEach(function (u) { byNum[u.part_number] = u; });
-            return parts.map(function (p) {
-              return { part: p, url: byNum[p.part_number] && byNum[p.part_number].url };
-            });
-          }
-          if ((res.status === 429 || res.status === 503) && attempt < 4) {
-            return delay(3000).then(go);
-          }
-          throw { status: res.status, data: res.body };
-        });
-      }
-      return go();
-    }
-
-    function putPartRobust(item, freshUrl) {
-      // 单片容错：同 URL 重试 ≤3 → 重新签名一次（短 TTL URL 可能过期/损坏）
-      // → 新 URL 再试 ≤3 → 仍失败抛给行级失败（confirmed 保留，可续传重试）
-      var url = freshUrl || item.url;
-      var attempt = 0;
-      function go() {
-        if (stopped) return Promise.reject({ cancelled: true });
-        attempt++;
-        if (!url) return Promise.reject({ status: 0, data: null });
-        return cosPutPart(url, file.slice(item.part.offset,
-                                          item.part.offset + item.part.length), abortCtl)
-          .then(function (r) { confirmPart(item.part.part_number, r.etag); })
-          .catch(function (err) {
-            if (stopped || (err && err.name === "AbortError")) {
-              return Promise.reject({ cancelled: true });
-            }
-            if (attempt < 3) return delay(600).then(go);
-            if (!freshUrl) {
-              return signBatch([item.part]).then(function (signed) {
-                return putPartRobust(item, signed[0] && signed[0].url);
-              });
-            }
-            throw { part: item.part.part_number, status: err && err.status,
-                    network: err instanceof TypeError };
-          });
-      }
-      return go();
-    }
-
-    function uploadPendingParts() {
-      // pending = 计划编号 − 已确认（服务端计划是权威；本地 confirmed 只用于
-      // 跳过，误判多传的分块会被同编号覆盖且长度受签名约束）
-      var pending = plan.filter(function (p) {
-        return !confirmedMap.hasOwnProperty(p.part_number);
-      });
-      var i = 0;
-      function nextBatch() {
-        if (stopped) return Promise.reject({ cancelled: true });
-        var batch = pending.slice(i, i + cfg.sign_batch_max_parts);
-        i += batch.length;
-        if (!batch.length) return requestComplete();
-        return signBatch(batch).then(function (signed) {
-          // 批内并发 max_concurrent_parts（默认 3）：签名批与并发解耦
-          var conc = cfg.max_concurrent_parts || 3;
-          var next = 0;
-          function lane() {
-            if (next >= signed.length) return Promise.resolve();
-            var item = signed[next++];
-            return putPartRobust(item).then(lane);
-          }
-          var lanes = [];
-          for (var k = 0; k < Math.min(conc, signed.length); k++) lanes.push(lane());
-          return Promise.all(lanes).then(nextBatch);
-        });
-      }
-      if (!pending.length) return requestComplete();
-      row.setStage("upload.cos.stage.uploading",
-        totalConfirmed / plan.length);
-      return nextBatch();
-    }
-
-    var completePosts = 0;   // upload-complete 回放计数（限速热循环）
-
-    function requestComplete() {
-      // 全部 confirmed → 幂等记录「浏览器侧完成」；409 状态冲突视为已完成过
-      //（服务端状态是唯一权威，直接转入阶段轮询）。重复回放（complete 后
-      // 状态仍停在 uploading，如 worker 尚未处理完成请求）做限速重放，避免
-      // 无延时的热循环打爆控制 API
-      function send() {
-        completePosts++;
-        return apiFetch("/api/ingestions/" + encodeURIComponent(jobId) +
-                        "/upload-complete", { method: "POST" })
-          .then(jsonBody)
-          .then(function (res) {
-            if (res.ok || (res.status === 409 && res.body &&
-                           res.body.code === "ingestion_state_conflict")) {
-              return drive();
-            }
-            throw { status: res.status, data: res.body };
-          });
-      }
-      if (completePosts > 0) return delay(1500).then(send);
-      return send();
-    }
-
-    function succeed(b) {
-      // viewable：照 V2 commit 后的跳转习惯（完成 → 刷新列表 → 关联 → 打开）。
-      // P2 合同 §5.2：打开目标 = 响应 slide_id（唯一）；缺字段才按名回落。
-      // U2 多结果：zip 打开首个已发布 item（其余经列表刷新可见）；
-      // conversion 产物 slide_id 在 conversion 子视图（ready 才出现）。
-      cosJobRemove(jobId);
-      var sid = b.slide_id || null;
-      if (!sid && b.items && b.items.length) {
-        for (var i = 0; i < b.items.length; i++) {
-          if (b.items[i].state === "published") { sid = b.items[i].slide_id; break; }
-        }
-      }
-      if (!sid && b.conversion && b.conversion.slide_id) {
-        sid = b.conversion.slide_id;
-      }
-      var target = uploadedTarget(b, file);
-      if (sid) target.id = sid;
-      row.setStage("upload.stage.done");
-      row.finish();
-      toast(t("upload.done", { name: target.name }), "success");
-      loadAll();
-      importAssociateUploaded(target.id, target.name);
-      openSlide(target.id || target.name);
-    }
-
-    Promise.resolve().then(function () {
-      if (jobId) return;   // 显式续传（重试按钮）：跳过询问直接进状态机
-      // 同名同大小未完任务 → 询问后续传（§5）；用户拒绝 = 换新任务语义，
-      // 按 D8 先取消旧任务再全新创建（不双占、不静默复用）
-      var prev = cosFindResumableJob(file);
-      if (!prev) return;
-      var doResume = opts.skipConfirm ||
-        window.confirm(tt("upload.cos.resume_confirm", { name: file.name }));
-      if (doResume) {
-        jobId = prev.job_id;
-        return;
-      }
-      var cancelPrev = apiFetch(
-        "/api/ingestions/" + encodeURIComponent(prev.job_id) + "/cancel",
-        { method: "POST" });
-      return cancelPrev.then(function () {
-        cosJobRemove(prev.job_id);
-      }, function () {
-        cosJobRemove(prev.job_id);
-      });
-    }).then(function () {
-      if (jobId) { loadConfirmedFromStorage(); return; }
-      return apiFetch("/api/ingestions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ filename: file.name, declared_size: file.size }),
-      }).then(jsonBody).then(function (res) {
-        if (res.ok && res.body && res.body.job_id) {
-          jobId = res.body.job_id;
-          cosJobSave({ job_id: jobId, filename: file.name, size: file.size,
-                       confirmed: [] });
-          // 创建响应自带初始阶段（waiting_capacity/preparing）：先照实展示
-          if (res.body.stage) cosShowStage(row, res.body);
-          return;
-        }
-        throw { status: res.status, data: res.body };   // 422/409 → 稳定码映射
-      });
-    }).then(function () {
-      return drive();
-    }).catch(function (err) {
-      if (stopped || (err && err.cancelled)) return;
-      var code = err && err.data && (err.data.code || err.data.error);
+    upload.done.then(function (r) {
+      if (!r || r.cancelled) return;
+      cosUploadSucceeded(row, r.body, file);
+    }, function (err) {
       var msg;
       if (err && err.terminal) {
         msg = cosErrorMessage(0, { code: (err.data && err.data.fail_code) || "" });
-      } else if (err instanceof TypeError || (err && err.network)) {
+      } else if (err && err.network) {
         // 网络层失败：任务与已确认分块保留，重选同名文件可续传（§5）
         msg = tt("upload.cos.resume_hint");
       } else {
@@ -7091,6 +6795,30 @@
       row.finish(10000);
       toast(t("upload.fail", { e: msg }), "error");
     });
+  }
+
+  function cosUploadSucceeded(row, b, file) {
+    // viewable：照 V2 commit 后的跳转习惯（完成 → 刷新列表 → 关联 → 打开）。
+    // P2 合同 §5.2：打开目标 = 响应 slide_id（唯一）；缺字段才按名回落。
+    // U2 多结果：zip 打开首个已发布 item（其余经列表刷新可见）；
+    // conversion 产物 slide_id 在 conversion 子视图（ready 才出现）。
+    var sid = b.slide_id || null;
+    if (!sid && b.items && b.items.length) {
+      for (var i = 0; i < b.items.length; i++) {
+        if (b.items[i].state === "published") { sid = b.items[i].slide_id; break; }
+      }
+    }
+    if (!sid && b.conversion && b.conversion.slide_id) {
+      sid = b.conversion.slide_id;
+    }
+    var target = uploadedTarget(b, file);
+    if (sid) target.id = sid;
+    row.setStage("upload.stage.done");
+    row.finish();
+    toast(t("upload.done", { name: target.name }), "success");
+    loadAll();
+    importAssociateUploaded(target.id, target.name);
+    openSlide(target.id || target.name);
   }
 
   // ---------- 启动：未完任务只读恢复（U3：手动开关退役） ----------

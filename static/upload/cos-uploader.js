@@ -18,8 +18,10 @@
                                                            // 只按分块 slice，绝不整体物化
           apiFetch:  (url, opts) => Promise<Response>     // 认证/CSRF 由调用方注入
           config:    resolveConfig(...) 的结果（进入即冻结）
-          storage: {                                      // 持久化适配器
+          storage: {                                      // 持久化适配器（可返回 Promise）
             save(rec)          // rec = {job_id, filename, size, slide_id?, confirmed}
+                               // 创建后的首次 save 失败 = 致命（不传输、取消新任务）；
+                               // 其后的续传提示写入失败忽略
             complete(id, out)  // out = {succeeded:true, slide_id?} | {terminal:true, fail_code?}
             remove(id)         // 取消/放弃续传旧任务
             findResumable(src) // 同名同大小候选 | null（不提供则跳过询问分支）
@@ -38,8 +40,10 @@
                                        //  | {type:'created', jobId, body}
         }
 
-        done：viewable → resolve {ok:true, body}；取消 → resolve {cancelled:true}；
-        失败 → reject {status, data} | {terminal, data} | {part, status, network}。
+        done：viewable → resolve {ok:true, body}；取消 → 立即 resolve {cancelled:true}
+        （进行中的等待随之结束，此后不再发控制请求）；失败 → reject {status, data} |
+        {terminal, data} | {part, status, network} |
+        {persist:true, ingestionId, reconciled}（记录未落盘；reconciled=服务端已确认取消）。
 
    请求语义（与抽出前的 app.js 逐条一致）：
    - 控制 API（/api/ingestions*）全部经注入的 apiFetch（CSRF/认证由它负责）；
@@ -145,19 +149,37 @@
     var totalConfirmed = 0;
     var abortCtl = (typeof AbortController === "function") ? new AbortController() : null;
     var stopped = false;           // 用户取消后停一切后续动作
-    var timers = new Set();        // 可 clearTimeout 的等待（取消后不再推进状态机）
+    var waits = new Set();         // 进行中的等待 {h, reject}：取消时立即以 cancelled 结束
     var completePosts = 0;         // upload-complete 回放计数（限速热循环）
+    var settleCancelled = null;
+    var cancelledOutcome = new Promise(function (r) { settleCancelled = r; });
 
     function delay(ms) {
-      return new Promise(function (resolve) {
-        var h = setTimeout(function () { timers.delete(h); resolve(); }, ms);
-        timers.add(h);
+      if (stopped) return Promise.reject({ cancelled: true });
+      return new Promise(function (resolve, reject) {
+        var w = { reject: reject };
+        w.h = setTimeout(function () { waits.delete(w); resolve(); }, ms);
+        waits.add(w);
       });
     }
 
     function stopTimers() {
-      timers.forEach(function (h) { clearTimeout(h); });
-      timers.clear();
+      waits.forEach(function (w) {
+        clearTimeout(w.h);
+        w.reject({ cancelled: true });
+      });
+      waits.clear();
+    }
+
+    // 取消之后状态机不得再发任何控制请求（取消请求本身除外，直接用 apiFetch）
+    function api(url, init) {
+      if (stopped) return Promise.reject({ cancelled: true });
+      return apiFetch(url, init);
+    }
+
+    // 续传提示类写入（已确认分块、slide_id）失败不致命：服务端 ListParts 才是权威
+    function quiet(p) {
+      if (p && typeof p.then === "function") p.then(null, function () {});
     }
 
     function confirmedList() {
@@ -184,7 +206,7 @@
       if (plan && plan.length) {
         emit({ type: "progress", frac: totalConfirmed / plan.length });
       }
-      saveRecord();
+      quiet(saveRecord());
     }
 
     function loadConfirmedFromStorage() {
@@ -203,7 +225,7 @@
     }
 
     function fetchStatus() {
-      return apiFetch("/api/ingestions/" + encodeURIComponent(jobId)).then(jsonBody);
+      return api("/api/ingestions/" + encodeURIComponent(jobId)).then(jsonBody);
     }
 
     function drive() {
@@ -214,7 +236,7 @@
         if (!res.ok) throw { status: res.status, data: res.body };
         var b = res.body || {};
         // status 响应出现 slide_id（随 slide 出现）即回填本地记录
-        if (b.slide_id && jobId) saveRecord({ slide_id: b.slide_id });
+        if (b.slide_id && jobId) quiet(saveRecord({ slide_id: b.slide_id }));
         var st = b.stage;
         if (st === "waiting_space") {
           emit({ type: "status", body: b });
@@ -238,7 +260,7 @@
         }
         if (st === "terminal") {
           // 等待超时/过期/失败：终态任务不再恢复
-          storage.complete(jobId, { terminal: true, fail_code: b.fail_code });
+          quiet(storage.complete(jobId, { terminal: true, fail_code: b.fail_code }));
           throw { terminal: true, data: b };
         }
         return delay(2000).then(drive);   // 未知 stage：以服务端为准再查
@@ -251,7 +273,7 @@
       var attempt = 0;
       function go() {
         attempt++;
-        return apiFetch("/api/ingestions/" + encodeURIComponent(jobId) + "/parts/sign", {
+        return api("/api/ingestions/" + encodeURIComponent(jobId) + "/parts/sign", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -346,9 +368,10 @@
       // drive 的结果当响应再判一遍——双重轮询）。
       function post() {
         completePosts++;
-        return apiFetch("/api/ingestions/" + encodeURIComponent(jobId) +
-                        "/upload-complete", { method: "POST" })
+        return api("/api/ingestions/" + encodeURIComponent(jobId) +
+                   "/upload-complete", { method: "POST" })
           .then(jsonBody, function (netErr) {
+            if (netErr && netErr.cancelled) throw netErr;
             if (opts.retryCompleteOnNetworkError && completePosts < 4) {
               return delay(1500).then(post);
             }
@@ -369,25 +392,42 @@
     }
 
     function succeed(b) {
-      storage.complete(jobId, { succeeded: true, slide_id: b.slide_id || null });
+      quiet(storage.complete(jobId, { succeeded: true, slide_id: b.slide_id || null }));
       return { ok: true, body: b };
     }
 
-    // —— 取消：停轮询 + abort 在途 PUT + 清记录 + POST cancel（幂等） ——
+    // 创建后的任务记录没能落盘：本次不得再发送任何东西；刚建的服务端任务
+    // 立即请求取消，结果（是否确认取消）随错误交给调用方，由它决定能否再建。
+    function abandonUnsaved(orphan, cause) {
+      return apiFetch("/api/ingestions/" + encodeURIComponent(orphan) + "/cancel",
+                      { method: "POST" })
+        .then(jsonBody)
+        .then(function (res) {
+          return res.ok || res.status === 404 || res.status === 409;
+        }, function () { return false; })
+        .then(function (reconciled) {
+          throw { persist: true, ingestionId: orphan, reconciled: reconciled,
+                  cause: cause && (cause.message || cause.name || String(cause)) };
+        });
+    }
+
+    // —— 取消：结束所有等待 + abort 在途 PUT + 清记录 + POST cancel（幂等）；
+    //    done 立即以 cancelled 收口（不等悬置的控制请求） ——
     function cancel() {
       if (stopped) return;
       stopped = true;
+      settleCancelled({ cancelled: true });
       stopTimers();
       if (abortCtl) { try { abortCtl.abort(); } catch (e) {} }
       if (jobId) {
-        storage.remove(jobId);
+        quiet(storage.remove(jobId));
         // 网络失败也照常停 UI：服务端等待超时/容量调度器会兜底清理
         apiFetch("/api/ingestions/" + encodeURIComponent(jobId) + "/cancel",
                  { method: "POST" }).catch(function () {});
       }
     }
 
-    var done = Promise.resolve().then(function () {
+    var main = Promise.resolve().then(function () {
       if (jobId) {
         // 显式续传（重试/继续按钮）：先读本地已确认分块；useResumeEndpoint
         //（工具页）时先核对服务端状态——已离开 uploading 而任务未收口（如
@@ -398,7 +438,7 @@
             return fetchStatus().then(function (res) {
               var st = res.ok && res.body && res.body.stage;
               if (st && st !== "uploading" && st !== "viewable" && st !== "terminal") {
-                return apiFetch("/api/ingestions/" + encodeURIComponent(jobId) + "/resume",
+                return api("/api/ingestions/" + encodeURIComponent(jobId) + "/resume",
                   { method: "POST" }).then(jsonBody).catch(function () { return null; });
               }
               return null;
@@ -417,17 +457,17 @@
         jobId = prev.job_id;
         return loadConfirmedFromStorage();
       }
-      var cancelPrev = apiFetch(
+      var cancelPrev = api(
         "/api/ingestions/" + encodeURIComponent(prev.job_id) + "/cancel",
         { method: "POST" });
       return cancelPrev.then(function () {
-        storage.remove(prev.job_id);
+        quiet(storage.remove(prev.job_id));
       }, function () {
-        storage.remove(prev.job_id);
+        quiet(storage.remove(prev.job_id));
       });
     }).then(function () {
       if (jobId) return null;
-      return apiFetch("/api/ingestions", {
+      return api("/api/ingestions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -436,13 +476,16 @@
       }).then(jsonBody).then(function (res) {
         if (res.ok && res.body && res.body.job_id) {
           jobId = res.body.job_id;
-          // 任何分块发出之前先持久化任务记录；异步适配器（OPFS）返回 Promise，
-          // 等它落盘——否则此刻刷新会留下无记录的服务端任务，再点就建第二个
-          return Promise.resolve(saveRecord()).then(function () {
+          // 任何请求之前先持久化任务记录；异步适配器（OPFS）返回 Promise，
+          // 等它落盘——否则此刻刷新会留下无记录的服务端任务，再点就建第二个。
+          // 落盘失败（含同步抛出）= 致命：不传输，取消刚建的服务端任务。
+          return Promise.resolve().then(function () { return saveRecord(); }).then(function () {
             emit({ type: "created", jobId: jobId, body: res.body });
             // 创建响应自带初始阶段（waiting_capacity/preparing）：先照实展示
             if (res.body.stage) emit({ type: "status", body: res.body });
             return null;
+          }, function (cause) {
+            return abandonUnsaved(jobId, cause);
           });
         }
         throw { status: res.status, data: res.body };   // 422/409 → 稳定码映射
@@ -455,6 +498,7 @@
       if (err instanceof TypeError) throw { network: true, status: 0, data: null };
       throw err;
     });
+    var done = Promise.race([main, cancelledOutcome]);
 
     return {
       cancel: cancel,

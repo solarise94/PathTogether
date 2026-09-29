@@ -515,6 +515,128 @@ async function main() {
     }
   }
 
+  // ---------------------------------------------------------------- (l) --
+  // 记录写入失败（真实工具页 OPFS 适配器：job.{a,b}.json 的 createWritable 被迫
+  // 失败）→ 不发任何分块、取消刚建的任务；取消未确认时不再新建，直到确认取消。
+  async function scenarioPersistFailure() {
+    const { context, page } = await L.launch('l-persist');
+    const fake = await L.fakeUploadRoutes(page, creds.cosOrigin, { partsCount: 2 });
+    const fakeStatus = () => ({ creates: fake.st.creates.length, cancels: fake.st.cancels,
+      signs: fake.st.signs.length, puts: fake.st.puts.length, gets: fake.st.statusGets });
+    try {
+      await L.login(page, PORT, creds, 'user');
+      await L.C3.openTools(page, PORT);
+      const { jobId } = await convertFixture(context, page, fake, bf);
+      const before = await L.opfsJobSha256(page, jobId);
+      await page.evaluate(() => {
+        const orig = FileSystemFileHandle.prototype.createWritable;
+        FileSystemFileHandle.prototype.createWritable = function (...a) {
+          if (window.__failRecords && /^job\.[ab]\.json$/.test(this.name)) {
+            return Promise.reject(new DOMException('forced record write failure', 'QuotaExceededError'));
+          }
+          return orig.apply(this, a);
+        };
+        window.__failRecords = true;
+      });
+      const noTransfer = () => {
+        const f = fakeStatus();
+        if (f.signs || f.puts || f.gets) throw new Error(`transmission after failed record write: ${JSON.stringify(f)}`);
+      };
+      const click = async () => {
+        await waitFor(async () => !(await page.$eval('#upload-btn', (b) => b.disabled)), 30000, 'upload enabled');
+        await page.click('#upload-btn');
+      };
+
+      await click();
+      await waitFor(() => fake.st.creates.length === 1 && fake.st.cancels === 1, 30000, 'attempt 1 cancelled');
+      await waitFor(async () => /已取消|was cancelled/.test(await textOf(page, '#upload-status')), 30000, 'persist.failed msg');
+      noTransfer();
+      await click();
+      await waitFor(() => fake.st.creates.length === 2 && fake.st.cancels === 2, 30000, 'attempt 2 cancelled');
+      noTransfer();
+
+      fake.behavior.onCancel = () => ({ status: 503, body: { code: 'unavailable' } });
+      await click();
+      await waitFor(async () => /还没能确认取消|not confirmed yet/.test(await textOf(page, '#upload-status')), 30000, 'orphan msg');
+      if (fake.st.creates.length !== 3) throw new Error(`creates=${fake.st.creates.length}`);
+      const orphanId = `inj_c4_3`;
+      const stored = await page.evaluate(() => localStorage.getItem('pt.tools.upload.orphans'));
+      if (!stored || !stored.includes(orphanId)) throw new Error(`orphan not remembered: ${stored}`);
+      await page.evaluate(() => { document.getElementById('upload-status').textContent = ''; });
+      await click();
+      await waitFor(async () => /确认取消之前|no new upload is created/.test(await textOf(page, '#upload-status')), 30000, 'orphan.pending msg');
+      if (fake.st.creates.length !== 3) throw new Error(`created while orphan unconfirmed: ${fake.st.creates.length}`);
+      if (fake.st.cancels !== 4) throw new Error(`orphan cancel not retried: cancels=${fake.st.cancels}`);
+      noTransfer();
+
+      fake.behavior.onCancel = null;
+      await page.evaluate(() => { window.__failRecords = false; });
+      await click();
+      await waitFor(async () => /已发布|Published/.test(await textOf(page, '#upload-status')), 60000, 'published after recovery');
+      if (fake.st.cancels !== 5) throw new Error(`orphan cancel before create: cancels=${fake.st.cancels}`);
+      if (fake.st.creates.length !== 4) throw new Error(`creates=${fake.st.creates.length}`);
+      const putBytes = fake.st.puts.reduce((n, x) => n + x.bytes, 0);
+      if (putBytes !== before.size) throw new Error(`PUT bytes ${putBytes} != artifact ${before.size}`);
+      const left = await page.evaluate(() => localStorage.getItem('pt.tools.upload.orphans'));
+      if (left) throw new Error(`orphan key left: ${left}`);
+      const after = await L.opfsJobSha256(page, jobId);
+      if (after.sha256 !== before.sha256) throw new Error('artifact sha changed');
+      record('l-record-write-failure', true, { ...fakeStatus(), putBytes, sha: before.sha256.slice(0, 12) });
+    } catch (e) {
+      record('l-record-write-failure', false, { error: String(e).slice(0, 400) });
+    } finally {
+      await context.close();
+    }
+  }
+
+  // ---------------------------------------------------------------- (m) --
+  // 轮询等待 / 签名退避期间取消：done 立即收口、上传锁释放（A 标签仍开着时，B 标签
+  // 可直接删除任务），取消之后不再有控制请求。
+  async function scenarioCancelDuringWait(kind) {
+    const id = kind === 'waiting' ? 'm1-cancel-during-poll' : 'm2-cancel-during-backoff';
+    const { context, page } = await L.launch(id);
+    const fake = await L.fakeUploadRoutes(context, creds.cosOrigin, { partsCount: 2 });
+    if (kind === 'waiting') fake.behavior.onStatus = () => 'waiting_space';
+    else fake.behavior.onSign = () => ({ status: 429, body: { code: 'rate_limited' } });
+    try {
+      await L.login(page, PORT, creds, 'user');
+      await L.C3.openTools(page, PORT);
+      const { jobId } = await convertFixture(context, page, fake, bf);
+      const before = await L.opfsJobSha256(page, jobId);
+      await page.click('#upload-btn');
+      await waitFor(() => (kind === 'waiting' ? fake.st.statusGets >= 1 : fake.st.signs.length >= 1), 30000, 'in wait');
+      await page.waitForTimeout(300);
+      const t0 = Date.now();
+      await page.click('#upload-cancel-btn');
+      await waitFor(async () => /已取消上传|Upload cancelled/.test(await textOf(page, '#upload-status')), 10000, 'cancelled msg');
+      await waitFor(async () => (await rowUploadState(page)) === 'cancelled', 10000, 'row cancelled');
+      const settleMs = Date.now() - t0;
+      const gets = fake.st.statusGets;
+      const signs = fake.st.signs.length;
+
+      const b = await context.newPage();
+      const dialogs = [];
+      b.on('dialog', (d) => { dialogs.push(d.message()); d.accept(); });
+      await L.C3.openTools(b, PORT);
+      await waitFor(async () => (await b.$('[data-job-discard]')) !== null, 30000, 'B row');
+      await b.click('[data-job-discard]');
+      await waitFor(async () => (await L.jobDirs(b)).length === 0, 30000, 'B discarded while A open');
+      if (dialogs.length !== 1) throw new Error(`dialogs=${dialogs.length} (want only the discard confirm)`);
+
+      await page.waitForTimeout(kind === 'waiting' ? 6000 : 4000);
+      if (fake.st.statusGets !== gets || fake.st.signs.length !== signs) {
+        throw new Error(`requests after cancel: gets ${gets}->${fake.st.statusGets} signs ${signs}->${fake.st.signs.length}`);
+      }
+      if (fake.st.cancels !== 1) throw new Error(`cancels=${fake.st.cancels}`);
+      if (fake.st.puts.length !== 0) throw new Error(`puts=${fake.st.puts.length}`);
+      record(id, true, { settleMs, cancels: 1, requestsAfterCancel: 0, sha: before.sha256.slice(0, 12) });
+    } catch (e) {
+      record(id, false, { error: String(e).slice(0, 400) });
+    } finally {
+      await context.close();
+    }
+  }
+
   const all = [
     ['a-bf', () => scenarioHappy('bf', bf)],
     ['a-fl', () => scenarioHappy('fl', fl)],
@@ -528,6 +650,9 @@ async function main() {
     ['i-network-capture', scenarioNetwork],
     ['j-real-session-loss', scenarioRealSessionLoss],
     ['k-cross-tab-abandon', scenarioCrossTab],
+    ['l-record-write-failure', scenarioPersistFailure],
+    ['m1-cancel-during-poll', () => scenarioCancelDuringWait('waiting')],
+    ['m2-cancel-during-backoff', () => scenarioCancelDuringWait('backoff')],
   ];
   for (const [id, fn] of all) {
     if (ONLY && id !== ONLY) continue;

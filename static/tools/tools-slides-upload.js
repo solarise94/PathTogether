@@ -69,16 +69,16 @@ export function createUploadController({ runner, t, onJobsRefresh }) {
     disabled: {},        // jobId -> true（超限/格式不支持：按钮保持禁用）
     statusKey: null, statusVars: null,
     writes: Promise.resolve(),   // record.upload 写入队列（刷新列表前冲刷）
+    orphans: {},                 // jobId -> 未确认取消的 ingestion id
   };
 
-  /// 引擎对 storage.save/complete/remove 不等待返回——这里把每次记录写入
-  /// 排进串行队列，收口后先冲刷再刷新列表，避免行状态落后于最终态。
+  /// 记录写入排进串行队列（收口后先冲刷再刷新列表）。返回的 Promise 如实
+  /// 反映这次写入的成败——引擎据此判断 ingestion id 是否已落盘；队列本身
+  /// 不因某次失败而中断。
   function queueWrite(fn) {
-    const run = () => Promise.resolve().then(fn).catch(() => {
-      /* 记录失败不阻断传输；continue 会重 PUT（幂等） */
-    });
-    state.writes = state.writes.then(run, run);
-    return state.writes;
+    const run = state.writes.then(() => fn());
+    state.writes = run.catch(() => {});
+    return run;
   }
 
   function setMsg(key, vars) {
@@ -139,19 +139,18 @@ export function createUploadController({ runner, t, onJobsRefresh }) {
       },
       complete(id, outcome) {
         if (outcome && outcome.succeeded) {
-          queueWrite(() => runner.setJobUpload(jobId, {
+          return queueWrite(() => runner.setJobUpload(jobId, {
             ingestionId: id, filename, size, state: 'published',
             slideId: (outcome && outcome.slide_id) || null, error: null,
           }));
-        } else {
-          queueWrite(() => runner.setJobUpload(jobId, {
-            ingestionId: id, filename, size, state: 'failed',
-            error: (outcome && outcome.fail_code) || 'terminal',
-          }));
         }
+        return queueWrite(() => runner.setJobUpload(jobId, {
+          ingestionId: id, filename, size, state: 'failed',
+          error: (outcome && outcome.fail_code) || 'terminal',
+        }));
       },
       remove(id) {
-        queueWrite(() => runner.setJobUpload(jobId, {
+        return queueWrite(() => runner.setJobUpload(jobId, {
           ingestionId: id, filename, size, state: 'cancelled',
         }));
       },
@@ -176,6 +175,15 @@ export function createUploadController({ runner, t, onJobsRefresh }) {
   }
 
   function handleFailure(err, jobId) {
+    if (err && err.persist) {
+      if (err.reconciled) {
+        setMsg('tools.upload.persist.failed');
+      } else {
+        rememberOrphan(jobId, err.ingestionId);
+        setMsg('tools.upload.persist.orphan');
+      }
+      return;
+    }
     if (isAuthError(err)) {
       setMsgWithLink('tools.upload.login.expired', LOGIN_URL, 'tools.upload.login.link');
       return;
@@ -195,6 +203,44 @@ export function createUploadController({ runner, t, onJobsRefresh }) {
     }
     const raw = E.errText(err);
     setMsg('tools.upload.failed', { e: raw });
+  }
+
+  // 创建后没能记下 id、且取消未获确认的服务端任务：同一任务再建之前必须先确认
+  // 取消它。本地记录写不进去时，内存 + localStorage 是仅剩的去处（尽力）。
+  const ORPHANS_KEY = 'pt.tools.upload.orphans';
+
+  function readOrphans() {
+    let stored = {};
+    try { stored = JSON.parse(localStorage.getItem(ORPHANS_KEY) || '{}') || {}; } catch { stored = {}; }
+    return { ...stored, ...state.orphans };
+  }
+
+  function writeOrphans(map) {
+    state.orphans = map;
+    try {
+      if (Object.keys(map).length) localStorage.setItem(ORPHANS_KEY, JSON.stringify(map));
+      else localStorage.removeItem(ORPHANS_KEY);
+    } catch { /* memory copy still guards this tab */ }
+  }
+
+  function rememberOrphan(jobId, ingestionId) {
+    writeOrphans({ ...readOrphans(), [jobId]: ingestionId });
+  }
+
+  async function settleOrphan(jobId) {
+    const map = readOrphans();
+    const id = map[jobId];
+    if (!id) return true;
+    let ok = false;
+    try {
+      const r = await pageApiFetch(`/api/ingestions/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
+      ok = r.ok || r.status === 404 || r.status === 409;
+    } catch { ok = false; }
+    if (ok) {
+      delete map[jobId];
+      writeOrphans(map);
+    }
+    return ok;
   }
 
   /// 上传/继续上传（唯一入口）。本标签 busy 守卫 + 跨标签 Web Lock：同一任务
@@ -264,6 +310,10 @@ export function createUploadController({ runner, t, onJobsRefresh }) {
         resumeJobId = prev.ingestionId;
         setMsg(resumeJobId ? 'tools.upload.resuming' : 'tools.upload.working');
       } else {
+        if (!(await settleOrphan(jobId))) {
+          setMsg('tools.upload.orphan.pending');
+          return;
+        }
         setMsg('tools.upload.working');
       }
 
@@ -356,23 +406,12 @@ export function createUploadController({ runner, t, onJobsRefresh }) {
     return `${n} B`;
   }
 
+  /// 引擎 cancel 会立即结束 done（进行中的等待一并结束），runLocked 随之
+  /// 走完 finally：清 busy、冲刷记录写入、释放上传锁、刷新列表。
   function cancel() {
     if (!state.handle) return;
-    const jobId = state.busyJobId;
-    // 引擎只 abort 在途 PUT；控制 API 调用可能悬置（done 不保证很快收口），
-    // UI 立即按取消收尾（与工作台行取消同语义），done 迟到即忽略。
     state.handle.cancel();
-    state.handle = null;
-    state.busyJobId = null;
     setMsg('tools.upload.cancelled');
-    const cancelBtn = document.getElementById('upload-cancel-btn');
-    if (cancelBtn) cancelBtn.hidden = true;
-    const btn = document.getElementById('upload-btn');
-    if (btn && page.currentJobId === jobId) btn.disabled = !!state.disabled[jobId];
-    // storage.remove 已把记录置 cancelled（排队写入）；冲刷后刷新列表
-    queueWrite(() => Promise.resolve()).then(() => {
-      if (onJobsRefresh) onJobsRefresh();
-    });
   }
 
   /// 任务列表行：上传状态 + 继续/上传按钮 + 删除禁用（上传进行中）。

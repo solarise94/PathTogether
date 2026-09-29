@@ -465,3 +465,121 @@ describe("createUpload：持久化顺序与取消收尾（C4 验收补充）", (
 		expect(st.saves.length).toBe(savesBefore);
 	});
 });
+
+describe("createUpload：记录落盘失败与取消收口（C4 复审 P1/P2）", () => {
+	type Call = [string, RequestInit?];
+	function recorder(handler: (url: string, method: string, init?: RequestInit) => Promise<Response>) {
+		const calls: Call[] = [];
+		const fn = vi.fn((url: string, init?: RequestInit) => {
+			calls.push([url, init]);
+			return handler(url, String((init && init.method) || "GET"), init);
+		}) as unknown as typeof fetch;
+		return { calls, fn };
+	}
+	const asApi = (f: typeof fetch) =>
+		(u: string, o?: RequestInit) => (f as unknown as (u2: string, o2?: RequestInit) => Promise<Response>)(u, o);
+
+	it("P1：创建后记录写入失败 → 不查状态/不签名/不 PUT，取消新任务，reject {persist, reconciled:true}", async () => {
+		const { calls, fn } = recorder((url, method) => {
+			if (url === "/api/ingestions" && method === "POST") {
+				return Promise.resolve(resp({ job_id: "inj_p", stage: "uploading" }, 202));
+			}
+			if (url === "/api/ingestions/inj_p/cancel") return Promise.resolve(resp({ stage: "terminal" }, 202));
+			return Promise.resolve(resp({ stage: "uploading", parts: [{ part_number: 1, length: 8 }] }));
+		});
+		const eng = loadEngine(fn);
+		const st = fakeStorage();
+		const adapter = { ...st.adapter, save: () => Promise.reject(new Error("QuotaExceededError")) };
+		const up = eng.createUpload({
+			source: fakeSource(8).view, apiFetch: asApi(fn),
+			config: eng.resolveConfig(CFG), storage: adapter,
+		});
+		await expect(up.done).rejects.toMatchObject({ persist: true, ingestionId: "inj_p", reconciled: true });
+		expect(calls.map(([u, i]) => `${(i && i.method) || "GET"} ${u}`)).toEqual([
+			"POST /api/ingestions", "POST /api/ingestions/inj_p/cancel",
+		]);
+	});
+
+	it("P1：同步抛出同样致命；取消未获确认 → reconciled:false", async () => {
+		const { calls, fn } = recorder((url, method) => {
+			if (url === "/api/ingestions" && method === "POST") {
+				return Promise.resolve(resp({ job_id: "inj_q", stage: "uploading" }, 202));
+			}
+			if (url.endsWith("/cancel")) return Promise.resolve(resp({}, 503));
+			return Promise.resolve(resp({ stage: "uploading", parts: [{ part_number: 1, length: 8 }] }));
+		});
+		const eng = loadEngine(fn);
+		const st = fakeStorage();
+		const adapter = { ...st.adapter, save: () => { throw new Error("broken"); } };
+		const up = eng.createUpload({
+			source: fakeSource(8).view, apiFetch: asApi(fn),
+			config: eng.resolveConfig(CFG), storage: adapter,
+		});
+		await expect(up.done).rejects.toMatchObject({ persist: true, ingestionId: "inj_q", reconciled: false });
+		expect(calls.filter(([u]) => u.startsWith("https://") || u.endsWith("/parts/sign"))).toHaveLength(0);
+	});
+
+	async function cancelDuringWait(kind: "waiting_space" | "sign_backoff") {
+		vi.useFakeTimers();
+		const { calls, fn } = recorder((url, method) => {
+			if (url === "/api/ingestions" && method === "POST") {
+				return Promise.resolve(resp({ job_id: "inj_w", stage: "uploading" }, 202));
+			}
+			if (url === "/api/ingestions/inj_w" && method === "GET") {
+				return Promise.resolve(resp(kind === "waiting_space"
+					? { stage: "waiting_space", queue_position: 0 }
+					: { stage: "uploading", parts: [{ part_number: 1, length: 8 }] }));
+			}
+			if (url.endsWith("/parts/sign")) return Promise.resolve(resp({ code: "busy" }, 429));
+			return Promise.resolve(resp({}, 202));
+		});
+		const eng = loadEngine(fn);
+		const st = fakeStorage();
+		const up = eng.createUpload({
+			source: fakeSource(8).view, apiFetch: asApi(fn),
+			config: eng.resolveConfig(CFG), storage: st.adapter,
+		});
+		const waitingOn = kind === "waiting_space" ? "/api/ingestions/inj_w" : "/parts/sign";
+		for (let i = 0; i < 50 && !calls.some(([u]) => u.endsWith(waitingOn)); i++) {
+			await vi.advanceTimersByTimeAsync(0);
+		}
+		expect(calls.some(([u]) => u.endsWith(waitingOn))).toBe(true);
+		let settled: unknown = null;
+		up.done.then((r) => { settled = r; });
+		up.cancel();
+		await vi.advanceTimersByTimeAsync(0);
+		expect(settled).toEqual({ cancelled: true });
+		const before = calls.length;
+		await vi.advanceTimersByTimeAsync(20000);
+		const after = calls.slice(before).map(([u]) => u);
+		expect(after).toEqual([]);
+		expect(calls.filter(([u]) => u.endsWith("/cancel"))).toHaveLength(1);
+		expect(st.removes).toEqual(["inj_w"]);
+	}
+
+	it("P2：waiting_space 5s 轮询等待中取消 → done 立即 cancelled，其后零请求", async () => {
+		await cancelDuringWait("waiting_space");
+	});
+
+	it("P2：签名 429 退避等待中取消 → done 立即 cancelled，其后零请求", async () => {
+		await cancelDuringWait("sign_backoff");
+	});
+
+	it("P2：控制请求悬置时取消 → done 仍立即 cancelled", async () => {
+		const { fn } = recorder((url, method) => {
+			if (url === "/api/ingestions" && method === "POST") {
+				return Promise.resolve(resp({ job_id: "inj_h", stage: "uploading" }, 202));
+			}
+			if (url.endsWith("/cancel")) return Promise.resolve(resp({}, 202));
+			return new Promise<Response>(() => {});
+		});
+		const eng = loadEngine(fn);
+		const up = eng.createUpload({
+			source: fakeSource(8).view, apiFetch: asApi(fn),
+			config: eng.resolveConfig(CFG), storage: fakeStorage().adapter,
+		});
+		await flush();
+		up.cancel();
+		await expect(up.done).resolves.toEqual({ cancelled: true });
+	});
+});

@@ -1,12 +1,12 @@
 
  RUN  v3.2.7 /home/solarise/ZCodeProject/histopilot-suite/PathTogether
 
- ✓ tests/js/account-email-change.test.ts (11 tests) 37ms
- ✓ tests/js/slide-row-layout.test.ts (9 tests) 48ms
- ✓ tests/js/research-viewer-telemetry.test.ts (34 tests) 46ms
- ✓ tests/js/sidebar-layout.test.ts (20 tests) 62ms
- ✓ tests/js/slide-opened-channel-reopen.test.ts (10 tests) 66ms
- ✓ tests/js/raster-image-compat.test.ts (15 tests) 86ms
+ ✓ tests/js/slide-row-layout.test.ts (9 tests) 39ms
+ ✓ tests/js/slide-opened-channel-reopen.test.ts (10 tests) 44ms
+ ✓ tests/js/viewer-get-viewport.test.ts (7 tests) 37ms
+ ✓ tests/js/research-viewer-telemetry.test.ts (34 tests) 40ms
+ ✓ tests/js/sidebar-layout.test.ts (20 tests) 54ms
+ ✓ tests/js/raster-image-compat.test.ts (15 tests) 80ms
  ✓ tests/js/admin-host-boot.test.ts (8 tests) 98ms
 stdout | tests/js/project-import-upgrade.test.ts > U06/U07：pollConversionJob（R5） > ready：完成（保持上传行原行为）；failed：按后端权威判失败
 [slide-id] 上传响应缺 slide_id，按名回落打开（旧后端兼容，P3 拆除）: x.tif
@@ -14,21 +14,20 @@ stdout | tests/js/project-import-upgrade.test.ts > U06/U07：pollConversionJob�
 stdout | tests/js/project-import-upgrade.test.ts > U06/U07：pollConversionJob（R5） > ready：完成（保持上传行原行为）；failed：按后端权威判失败
 [slide-id] 转换 ready 无 slide_id（响应与列表均未解析到），按名回落打开（旧后端兼容）: x.tif
 
- ✓ tests/js/project-import-upgrade.test.ts (34 tests) 98ms
- ✓ tests/js/admin-default-model.test.ts (13 tests) 163ms
- ✓ tests/js/viewer-get-viewport.test.ts (7 tests) 41ms
- ✓ tests/js/toolbar-account-upgrade.test.ts (22 tests) 306ms
- ✓ tests/js/channel-controls.test.ts (30 tests) 33ms
+ ✓ tests/js/project-import-upgrade.test.ts (34 tests) 111ms
+ ✓ tests/js/admin-default-model.test.ts (13 tests) 158ms
+ ✓ tests/js/account-email-change.test.ts (11 tests) 38ms
  ✓ tests/js/plugin-sdk-bridge.test.ts (16 tests) 39ms
- ✓ tests/js/conversation-attach-intent.test.ts (4 tests) 29ms
- ✓ tests/js/admin-identity-conflicts.test.ts (8 tests) 26ms
- ✓ tests/js/slide-opened-revision.test.ts (3 tests) 30ms
- ✓ tests/js/demo-ai.test.ts (35 tests) 36ms
- ✓ tests/js/slide-id-refactor.test.ts (4 tests) 36ms
- ✓ tests/js/admin-bridge.test.ts (60 tests) 403ms
- ✓ tests/js/share-raster-no-scale.test.ts (8 tests) 21ms
- ✓ tests/js/logout.test.ts (3 tests) 17ms
-18:34:36 [vite] (ssr) warning: Duplicate key "innerHTML" in object literal
+ ✓ tests/js/toolbar-account-upgrade.test.ts (22 tests) 301ms
+ ✓ tests/js/demo-ai.test.ts (35 tests) 35ms
+ ✓ tests/js/channel-controls.test.ts (30 tests) 36ms
+ ✓ tests/js/slide-opened-revision.test.ts (3 tests) 31ms
+ ✓ tests/js/slide-id-refactor.test.ts (4 tests) 38ms
+ ✓ tests/js/conversation-attach-intent.test.ts (4 tests) 44ms
+ ✓ tests/js/admin-bridge.test.ts (60 tests) 404ms
+ ✓ tests/js/admin-identity-conflicts.test.ts (8 tests) 25ms
+ ✓ tests/js/share-raster-no-scale.test.ts (8 tests) 27ms
+19:27:39 [vite] (ssr) warning: Duplicate key "innerHTML" in object literal
 79 |  			String(v).split(/\s+/).filter(Boolean).forEach((n) => classes.add(n));
 80 |  		},
 81 |  		get innerHTML() {
@@ -38,39 +37,40 @@ stdout | tests/js/project-import-upgrade.test.ts > U06/U07：pollConversionJob�
 
   Plugin: vite:esbuild
   File: /home/solarise/ZCodeProject/histopilot-suite/PathTogether/tests/js/demo-bilingual.test.ts
- ✓ tests/js/api-fetch-401.test.ts (4 tests) 18ms
- ✓ tests/js/demo-bilingual.test.ts (7 tests) 20ms
+ ✓ tests/js/admin-preview.test.ts (4 tests) 15ms
+ ✓ tests/js/demo-bilingual.test.ts (7 tests) 19ms
+ ✓ tests/js/api-fetch-401.test.ts (4 tests) 19ms
+ ✓ tests/js/toolbar-draw-roi.test.ts (16 tests) 13ms
  ✓ tests/js/entry-auth.test.ts (6 tests) 7ms
- ✓ tests/js/share-write.test.ts (11 tests) 15ms
- ✓ tests/js/draw-undo-i18n.test.ts (18 tests) 11ms
- ✓ tests/js/host-bridge-native.test.ts (4 tests) 13ms
- ✓ tests/js/toolbar-draw-roi.test.ts (16 tests) 18ms
- ✓ tests/js/admin-preview.test.ts (4 tests) 18ms
+ ✓ tests/js/draw-undo-i18n.test.ts (18 tests) 10ms
+ ✓ tests/js/host-bridge-native.test.ts (4 tests) 10ms
+ ✓ tests/js/logout.test.ts (3 tests) 17ms
+ ✓ tests/js/share-write.test.ts (11 tests) 21ms
+ ✓ tests/js/bundle-protocol-guard.test.ts (2 tests) 4ms
+ ✓ tests/js/bridge-version.test.ts (12 tests) 6ms
 stdout | tests/js/cos-upload.test.ts > COS 上传状态机：独立传输、分批签名、并发、进度、完成 > 单片失败：同 URL 重试后成功（不触发重新签名分支、不影响其余分块）
 [slide-id] 上传响应缺 slide_id，按名回落打开（旧后端兼容，P3 拆除）: big.svs
 
- ✓ tests/js/bridge-version.test.ts (12 tests) 7ms
+ ✓ tests/js/entry-whats-new.test.ts (4 tests) 4ms
  ✓ tests/js/activate-waiting.test.ts (6 tests) 5ms
- ✓ tests/js/bundle-protocol-guard.test.ts (2 tests) 7ms
- ✓ tests/js/entry-whats-new.test.ts (4 tests) 3ms
- ✓ tests/js/admin-plugin-ui.test.ts (78 tests) 890ms
+ ✓ tests/js/admin-plugin-ui.test.ts (78 tests) 884ms
 stdout | tests/js/cos-upload.test.ts > waiting_capacity：排队展示与轮询推进 > 等待期间显示阶段+排队位置（无 ETA）；5s 轮询 → preparing/uploading 继续 → 完成
 [slide-id] 上传响应缺 slide_id，按名回落打开（旧后端兼容，P3 拆除）: big.svs
 
 stdout | tests/js/cos-upload.test.ts > 刷新恢复：只读进度行与终态清理 > 重选同名同大小文件 + 存在未完任务 → 询问后续传（跳过已确认分块）
 [slide-id] 上传响应缺 slide_id，按名回落打开（旧后端兼容，P3 拆除）: big.svs
 
- ✓ tests/js/cos-upload.test.ts (12 tests) 923ms
-   ✓ COS 上传状态机：独立传输、分批签名、并发、进度、完成 > 单片失败：同 URL 重试后成功（不触发重新签名分支、不影响其余分块）  829ms
- ✓ tests/js/cos-uploader-shared.test.ts (9 tests) 1604ms
+ ✓ tests/js/cos-upload.test.ts (12 tests) 927ms
+   ✓ COS 上传状态机：独立传输、分批签名、并发、进度、完成 > 单片失败：同 URL 重试后成功（不触发重新签名分支、不影响其余分块）  832ms
+ ✓ tests/js/cos-uploader-shared.test.ts (14 tests) 1592ms
    ✓ createUpload（注入假依赖） > retryCompleteOnNetworkError：完成响应丢失 → 重发 → 409 冲突视为已完成 → 收口  1504ms
- ✓ tests/js/viewer-encoding.test.ts (10 tests) 4818ms
+ ✓ tests/js/viewer-encoding.test.ts (10 tests) 4816ms
    ✓ HP_ViewerEncoding > 409 恢复：合并并发失败（一次诊断）；第二次冲突停止自动重试  1604ms
-   ✓ HP_ViewerEncoding > 409 → open 重开不清零；第二次冲突停止  1604ms
+   ✓ HP_ViewerEncoding > 409 → open 重开不清零；第二次冲突停止  1602ms
    ✓ HP_ViewerEncoding > 版本化 tile-loaded 结束 episode，后续冲突可再恢复一次  1603ms
 
  Test Files  37 passed (37)
-      Tests  557 passed (557)
-   Start at  18:34:35
-   Duration  5.37s (transform 1.89s, setup 0ms, collect 3.51s, tests 10.10s, environment 6ms, prepare 2.71s)
+      Tests  562 passed (562)
+   Start at  19:27:38
+   Duration  5.32s (transform 1.72s, setup 0ms, collect 3.69s, tests 10.05s, environment 6ms, prepare 2.65s)
 

@@ -1,5 +1,5 @@
 {
-  "finishedAt": "2026-09-29T10:32:17.084Z",
+  "finishedAt": "2026-09-29T11:30:20.360Z",
   "pass": true,
   "results": {
     "a-bf-happy-path": {
@@ -79,7 +79,7 @@
     "e-cancel-250ms": {
       "pass": true,
       "syncMs": 0.2999999523162842,
-      "paintedMs": 3.799999952316284,
+      "paintedMs": 4.8999998569488525,
       "statusAfter": "已取消",
       "jobDirsAfter": []
     },

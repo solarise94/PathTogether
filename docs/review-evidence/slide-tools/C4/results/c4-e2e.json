@@ -91,9 +91,33 @@
   },
   "k-cross-tab-abandon": {
     "pass": true,
-    "jobId": "job-07f2c9cd3d7cc676",
+    "jobId": "job-17fcfa03f5dc9ed0",
     "creates": 1,
     "cancels": 1,
     "dialogs": 3
+  },
+  "l-record-write-failure": {
+    "pass": true,
+    "creates": 4,
+    "cancels": 5,
+    "signs": 1,
+    "puts": 2,
+    "gets": 3,
+    "putBytes": 287803,
+    "sha": "f265596a7662"
+  },
+  "m1-cancel-during-poll": {
+    "pass": true,
+    "settleMs": 226,
+    "cancels": 1,
+    "requestsAfterCancel": 0,
+    "sha": "f265596a7662"
+  },
+  "m2-cancel-during-backoff": {
+    "pass": true,
+    "settleMs": 228,
+    "cancels": 1,
+    "requestsAfterCancel": 0,
+    "sha": "f265596a7662"
   }
 }

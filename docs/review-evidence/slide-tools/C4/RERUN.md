@@ -37,19 +37,19 @@ vitest/playwright，无新下载）。
 
 - 基线（C4 改动**前**，`results/vitest-baseline.txt`）：
   `Test Files 36 passed (36)` / `Tests 548 passed (548)`。
-- 之后（`results/vitest.txt`，验收复跑）：`Test Files 37 passed (37)` / `Tests 557 passed (557)`
-  （子代理 555 + 验收新增 2：异步 save 落盘前不发请求、取消后迟到 PUT 不写回记录）。
+- 之后（`results/vitest.txt`，复审修复后复跑）：`Test Files 37 passed (37)` / `Tests 562 passed (562)`
+  （子代理 555 + 验收新增 2 + 复审 P1/P2 新增 5）。
 - 既有断言**零改动**；唯一 harness 改动是 `tests/js/cos-upload.test.ts` 的
   `loadApp` 先同 realm 执行 `static/upload/cos-uploader.js`（加载方式）。
-- 新增共享引擎单测：`tests/js/cos-uploader-shared.test.ts`（9 tests，注入假
-  apiFetch/storage/source）。
+- 新增共享引擎单测：`tests/js/cos-uploader-shared.test.ts`（14 tests，注入假
+  apiFetch/storage/source；复审 P1/P2 的 5 条已验证在 f69cc58 的引擎上失败）。
 
 ## 3. C4 浏览器 e2e（工具页上传）
 
-    node tests/browser/slide_tools_c4/run_e2e.js            # 全部 12 场景
+    node tests/browser/slide_tools_c4/run_e2e.js            # 全部 15 场景
     node tests/browser/slide_tools_c4/run_e2e.js --only a-bf   # 单场景
 
-预期：逐行 `PASS [a-bf] … PASS [k-cross-tab-abandon]`，末行 **E2E ALL PASS**；
+预期：逐行 `PASS [a-bf] … PASS [m2-cancel-during-backoff]`，末行 **E2E ALL PASS**；
 证据 `.gate-tmp/slide-tools-c4/e2e/results.json`（本目录 `results/c4-e2e.json`）。
 
 被测应用：`tests/browser/slide_tools_c4/server.py`（真实 Flask + 内嵌 PG +
@@ -95,8 +95,8 @@ partNumbers），`pt.cos.jobs` 收口为 `[]`。比较：
 |---|---|
 | `vitest-baseline.txt` | 改动前基线（36/548） |
 | `pytest.txt` | 最终 pytest 输出（112 passed） |
-| `vitest.txt` | 最终 vitest 输出（37 文件/557） |
-| `c4-e2e.json` | C4 工具页上传 e2e 12 场景（含验收新增 j 真实会话丢失、k 跨标签/放弃遗留上传） |
+| `vitest.txt` | 最终 vitest 输出（37 文件/562） |
+| `c4-e2e.json` | C4 工具页上传 e2e 15 场景（含验收新增 j/k 与复审新增 l 记录写入失败、m1/m2 等待中取消） |
 | `workbench-seq-before.json` / `-after.json` | 工作台请求序列（重构前/后） |
 | `c3-regression.json` | C3 套件 18/18 |
 | `c2-fault-regression.json` | C2 故障矩阵 26/26 |

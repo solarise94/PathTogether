@@ -5,6 +5,11 @@
 //! decoded → black cell-size canvas → re-encoded with the source quantization
 //! table (fallback std q95 + warning); sparse (missing) cells are filled with
 //! a cached black JPEG (std q90) and reported via `sparse_fill_black`.
+//!
+//! C2 resume: [`convert_kfbf_to_ome_resume`] reconstructs per-IFD writer
+//! state from a [`crate::resume::ResumePoint`] (level-major/channel-minor
+//! begin order) and fast-forwards committed cells, reconstructing report
+//! side effects from the index. Fresh path unchanged.
 
 use crate::companion::Companion;
 use crate::error::{CoreError, CoreResult};
@@ -19,6 +24,7 @@ use crate::report::{
     ValidationReport, WARN_EDGE_REENCODE_FALLBACK_Q95, WARN_EXPOSURE_UNIT_ASSUMED_MS,
     WARN_SPARSE_FILL_BLACK, level_stats_from_kfbf,
 };
+use crate::resume::ResumePoint;
 
 const TILE: u32 = 256;
 const TILE_PX: u64 = (TILE as u64) * (TILE as u64);
@@ -32,12 +38,112 @@ pub fn convert_kfbf_to_ome(
     job: &JobControl,
     companion: Option<&Companion>,
 ) -> CoreResult<TransformResult> {
+    convert_inner(src, sink, scratch, plan, job, companion, None)
+}
+
+/// Resume a fluorescence conversion from `resume` (level index into
+/// `doc.levels`, channel, first uncommitted cell of that IFD).
+#[allow(clippy::too_many_arguments)]
+pub fn convert_kfbf_to_ome_resume(
+    src: &dyn ByteSource,
+    sink: &mut dyn RandomAccessSink,
+    scratch: &mut dyn ScratchFactory,
+    plan: &TransformPlan,
+    job: &JobControl,
+    companion: Option<&Companion>,
+    resume: &ResumePoint,
+) -> CoreResult<TransformResult> {
+    convert_inner(src, sink, scratch, plan, job, companion, Some(resume))
+}
+
+/// Reconstruct report side effects of committed cells for one (level,
+/// channel) IFD without writing (payload read only for cropped cells).
+fn reconstruct_cells_fl(
+    src: &dyn ByteSource,
+    doc: &KfbfDocument,
+    lv: &crate::kfbf::KfbfLevel,
+    c: usize,
+    up_to: u64,
+    stats: &mut LevelStats,
+    edge_regions: &mut Vec<EdgeRegion>,
+    warnings: &mut Vec<String>,
+    filled: &mut u64,
+) -> CoreResult<()> {
+    let cells = lv.tiles_across() as u64 * lv.tiles_down() as u64;
+    for cell in 0..cells.min(up_to) {
+        let row = cell / lv.tiles_across() as u64;
+        let col = cell % lv.tiles_across() as u64;
+        let cell_w = TILE.min(lv.width - (col as u32 * TILE));
+        let cell_h = TILE.min(lv.height - (row as u32 * TILE));
+        match doc.cells.read_cell(lv.level, cell as u32)? {
+            None => {
+                stats.cells_filled_black += 1;
+                *filled += 1;
+            }
+            Some(rec) => {
+                if rec.jpeg_w == cell_w && rec.jpeg_h == cell_h {
+                    stats.tiles_raw_copied += 1;
+                } else {
+                    let (off, len) = doc.channel_payload(src, &rec, c)?;
+                    let payload = src.read_at(off, len as usize)?;
+                    let qtables =
+                        crate::jpeg::qtables_pillow_style(&payload).unwrap_or_default();
+                    let reused = !qtables.is_empty();
+                    if !reused {
+                        warnings.push(WARN_EDGE_REENCODE_FALLBACK_Q95.to_string());
+                    }
+                    edge_regions.push(EdgeRegion {
+                        level: lv.level,
+                        channel: Some(c),
+                        x: rec.x,
+                        y: rec.y,
+                        source_w: rec.jpeg_w,
+                        source_h: rec.jpeg_h,
+                        canvas_w: cell_w,
+                        canvas_h: cell_h,
+                        reused_qtables: reused,
+                    });
+                    stats.tiles_reencoded += 1;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn convert_inner(
+    src: &dyn ByteSource,
+    sink: &mut dyn RandomAccessSink,
+    scratch: &mut dyn ScratchFactory,
+    plan: &TransformPlan,
+    job: &JobControl,
+    companion: Option<&Companion>,
+    resume: Option<&ResumePoint>,
+) -> CoreResult<TransformResult> {
     let started = crate::job::WallInstant::now();
     let doc = parse_kfbf(src, scratch)?;
     if !doc.header.mpp.is_finite() || doc.header.mpp <= 0.0 {
         return Err(CoreError::metadata("MPP 缺失/非法"));
     }
     let nch = doc.header.channel_count;
+    if let Some(r) = resume {
+        r.validate()?;
+        if r.level >= doc.levels.len() || r.channel >= nch {
+            return Err(CoreError::validation("resume: level/channel 越界"));
+        }
+        let idx = r.level * nch + r.channel;
+        let expect = if r.cell > 0 { idx + 1 } else { idx };
+        if r.ifd_tiles.len() != expect {
+            return Err(CoreError::validation(format!(
+                "resume: ifd_tiles 长度 {} 与 (level={}, channel={}, cell={}) 不符",
+                r.ifd_tiles.len(),
+                r.level,
+                r.channel,
+                r.cell
+            )));
+        }
+    }
     let description = build_ome_xml(
         doc.header.objective,
         &doc.header.scanner_id,
@@ -60,7 +166,10 @@ pub fn convert_kfbf_to_ome(
         strict_lossless_precheck(src, &doc)?;
     }
 
-    let mut writer = OmeBigTiffWriter::new(sink)?;
+    let mut writer = match resume {
+        None => OmeBigTiffWriter::new(sink)?,
+        Some(r) => OmeBigTiffWriter::resume_new(sink, r.committed_output)?,
+    };
     let mut level_stats: Vec<LevelStats> = Vec::new();
     let mut edge_regions: Vec<EdgeRegion> = Vec::new();
     let mut warnings: Vec<String> = vec![WARN_EXPOSURE_UNIT_ASSUMED_MS.to_string()];
@@ -75,25 +184,74 @@ pub fn convert_kfbf_to_ome(
     // (We begin IFDs lazily per (level, channel) as the oracle adds them.)
     let mut ifd_index: Vec<(u32, usize)> = Vec::new(); // (level, channel) per IFD, in begin order
 
-    for lv in &doc.levels {
+    for (li, lv) in doc.levels.iter().enumerate() {
         job.check()?;
         let level_mpp = doc.header.mpp * (doc.header.width_px as f64 / lv.width as f64);
         let mut channel_stats_row: Vec<LevelStats> = Vec::new();
         for c in 0..nch {
-            writer.begin_ifd(
-                scratch,
-                lv.width,
-                lv.height,
-                lv.level > 0,
-                level_mpp,
-                if lv.level == 0 && c == 0 { Some(description.clone()) } else { None },
-            )?;
-            ifd_index.push((lv.level, c));
-            let mut stats = level_stats_from_kfbf(lv, c);
+            let resume_done = resume.is_some_and(|r| li < r.level || (li == r.level && c < r.channel));
+            let resume_current =
+                resume.is_some_and(|r| li == r.level && r.channel == c);
             let cells = lv.tiles_across() as u64 * lv.tiles_down() as u64;
-            let mut last_row_emitted: u64 = 0;
+            let mut stats = level_stats_from_kfbf(lv, c);
+            let mut last_row_emitted: u64;
+            if resume_done {
+                // fully committed IFD: rebuild writer state + side effects
+                let committed = resume.unwrap().ifd_tiles[li * nch + c];
+                if committed != cells {
+                    return Err(CoreError::validation(format!(
+                        "resume: 层 {} 通道 {c} 已提交 {} ≠ 总 cell 数 {}（journal 与输入不符）",
+                        lv.level, committed, cells
+                    )));
+                }
+                writer.begin_ifd_resume(
+                    scratch,
+                    lv.width,
+                    lv.height,
+                    lv.level > 0,
+                    level_mpp,
+                    if lv.level == 0 && c == 0 { Some(description.clone()) } else { None },
+                    committed,
+                )?;
+                ifd_index.push((lv.level, c));
+                reconstruct_cells_fl(src, &doc, lv, c, u64::MAX, &mut stats,
+                    &mut edge_regions, &mut warnings, &mut filled_total)?;
+                ifd_chain.push((lv.level, Some(c)));
+                channel_stats_row.push(stats);
+                continue;
+            }
+            let skip_until = if resume_current { resume.unwrap().cell } else { 0 };
+            if resume_current && skip_until > 0 {
+                let committed = resume.unwrap().ifd_tiles[li * nch + c];
+                writer.begin_ifd_resume(
+                    scratch,
+                    lv.width,
+                    lv.height,
+                    lv.level > 0,
+                    level_mpp,
+                    if lv.level == 0 && c == 0 { Some(description.clone()) } else { None },
+                    committed,
+                )?;
+                ifd_index.push((lv.level, c));
+                reconstruct_cells_fl(src, &doc, lv, c, skip_until, &mut stats,
+                    &mut edge_regions, &mut warnings, &mut filled_total)?;
+            } else {
+                writer.begin_ifd(
+                    scratch,
+                    lv.width,
+                    lv.height,
+                    lv.level > 0,
+                    level_mpp,
+                    if lv.level == 0 && c == 0 { Some(description.clone()) } else { None },
+                )?;
+                ifd_index.push((lv.level, c));
+            }
+            last_row_emitted = skip_until / lv.tiles_across() as u64;
             for cell in 0..cells {
                 job.check()?;
+                if resume_current && cell < skip_until {
+                    continue; // committed; side effects already reconstructed
+                }
                 let row = cell / lv.tiles_across() as u64;
                 let col = cell % lv.tiles_across() as u64;
                 let cell_w = TILE.min(lv.width - (col as u32 * TILE));
@@ -167,13 +325,21 @@ pub fn convert_kfbf_to_ome(
                         total: lv.tiles_down() as u64,
                         committed_bytes: writer.cursor(),
                     });
+                    if job.checkpoint_enabled() {
+                        job.emit_checkpoint(
+                            lv.level,
+                            Some(c),
+                            cell + 1,
+                            writer.cursor(),
+                            writer.ifd_tile_counts(),
+                        );
+                    }
                 }
             }
             if writer.cursor() > plan.limits.max_output_bytes {
                 return Err(CoreError::too_large(format!(
                     "输出已写 {} > {}",
-                    writer.cursor(),
-                    plan.limits.max_output_bytes
+                    writer.cursor(), plan.limits.max_output_bytes
                 )));
             }
             ifd_chain.push((lv.level, Some(c)));
@@ -380,4 +546,3 @@ pub fn probe_kfbf(
 ) -> CoreResult<KfbfDocument> {
     parse_kfbf(src, scratch)
 }
-

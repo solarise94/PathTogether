@@ -19,6 +19,7 @@ pub mod convert_bf;
 #[cfg(feature = "codecs")]
 pub mod convert_fl;
 pub mod error;
+pub mod estimate;
 pub mod io;
 pub mod job;
 pub mod kfb;
@@ -29,6 +30,8 @@ pub mod paged_index;
 pub mod pagereader;
 pub mod plan;
 pub mod report;
+pub mod resume;
+pub mod validate;
 pub mod bigtiff;
 
 #[cfg(feature = "codecs")]

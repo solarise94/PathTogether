@@ -16,3 +16,4 @@ codecs = ["slide-transform-core/codecs"]
 [dependencies]
 slide-transform-core = { path = "../core", default-features = false }
 wasm-bindgen = { workspace = true }
+sha2 = { workspace = true }

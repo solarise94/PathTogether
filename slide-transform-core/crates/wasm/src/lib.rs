@@ -1,48 +1,138 @@
-//! wasm32 bindings over the transform core: `probe` and `convert` driven by
-//! JS-provided IO callbacks with bounded chunks (≤1 MiB per host call).
+//! wasm32 bindings over the transform core: `probe`, `convert`, and the C2
+//! additions `convertResume`, `finalizeValidate`, `sha256Source`,
+//! `enableSourceHash`/`sourceSha256`, `coreVersion` — driven by JS-provided
+//! IO callbacks with bounded chunks (≤1 MiB per host call).
 //!
-//! The host supplies global functions:
-//!   stHostSourceSize(), stHostRead(offset, len), stHostWrite(offset, bytes),
-//!   stHostTruncate(len), stHostFlush(), stHostScratchOpen/Read/Write/
-//!   Truncate/Flush(name, ...), stHostProgress(json), stHostCancelled()
-//! (the browser runner in `static/tools/slide-transform/` implements them
-//! over File.slice / OPFS sync access handles).
+//! Host contract (globals; the browser runner in
+//! `static/tools/slide-transform/worker.js` implements them over
+//! FileReaderSync / OPFS sync access handles):
+//!
+//!   stHostSourceSize() -> number
+//!   stHostReadInto(offset, len, ptr) -> null/undefined ok | string error
+//!       (preferred: fills wasm linear memory directly, zero buffer crossing;
+//!        enabled via configure(1); ptr is a u32 offset into wasm memory)
+//!   stHostRead(offset, len) -> Uint8Array          (legacy fallback, C1)
+//!   stHostWrite(offset, bytes) -> null/undefined ok | string error
+//!   stHostTruncate(len) / stHostFlush() -> null/undefined ok | string error
+//!   stHostScratchOpen(name, preserve?)             (preserve=true keeps
+//!                                                   committed bytes: resume)
+//!   stHostScratchRead(name, offset, len) -> Uint8Array
+//!   stHostScratchWrite/Truncate/Flush(name, ...) -> null/undefined ok | error
+//!   stHostOutSize() -> number ; stHostOutReadInto(offset, len, ptr) -> err?
+//!       (output read-back for finalizeValidate)
+//!   stHostProgress(json) ; stHostCancelled() -> bool
+//!   stHostCheckpoint(json)   (committed-state tap; enable via
+//!                             enableCheckpoint())
+//!
+//! Error convention: a callback returning `null`/`undefined` (or nothing,
+//! which keeps C1 hosts source-compatible) means success; returning a truthy
+//! value is an error whose message is the value stringified. JS exceptions
+//! are caught (`catch`) and mapped to typed `io_error`s — a quota failure
+//! mid-write must be a recoverable error, never a wasm abort.
 
 use slide_transform_core::error::{CoreError, CoreResult};
 use slide_transform_core::io::{ByteSource, RandomAccessSink, ScratchFactory, ScratchSink};
 use slide_transform_core::job::{JobControl, Progress, ProgressCallback};
 use slide_transform_core::plan::{InputIdentity, TransformPlan};
+use slide_transform_core::resume::{parse_resume_json, ResumePoint};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use wasm_bindgen::prelude::*;
 
 /// Upper bound on a single host read/write chunk (1 MiB).
 pub const MAX_CHUNK: usize = 1 << 20;
 
+static READ_INTO: AtomicBool = AtomicBool::new(false);
+static CHECKPOINT_ENABLED: AtomicBool = AtomicBool::new(false);
+static SOURCE_HASH_ENABLED: AtomicBool = AtomicBool::new(false);
+
+fn hash_state() -> &'static Mutex<Option<sha2::Sha256>> {
+    static STATE: Mutex<Option<sha2::Sha256>> = Mutex::new(None);
+    &STATE
+}
+
+fn js_err(v: JsValue) -> Option<CoreError> {
+    let undef = v.is_undefined();
+    let null = v.is_null();
+    if undef || null {
+        return None;
+    }
+    if let Some(s) = v.as_string() {
+        return Some(CoreError::io(s));
+    }
+    Some(CoreError::io(format!("宿主回调错误: {v:?}")))
+}
+
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_name = "stHostSourceSize")]
     fn host_source_size() -> f64;
+    #[wasm_bindgen(js_name = "stHostReadInto", catch)]
+    fn host_read_into(offset: f64, len: u32, ptr: u32) -> Result<JsValue, JsValue>;
     #[wasm_bindgen(js_name = "stHostRead")]
     fn host_read(offset: f64, len: u32) -> Vec<u8>;
-    #[wasm_bindgen(js_name = "stHostWrite")]
-    fn host_write(offset: f64, data: &[u8]);
-    #[wasm_bindgen(js_name = "stHostTruncate")]
-    fn host_truncate(len: f64);
-    #[wasm_bindgen(js_name = "stHostFlush")]
-    fn host_flush();
-    #[wasm_bindgen(js_name = "stHostScratchOpen")]
-    fn host_scratch_open(name: &str);
+    #[wasm_bindgen(js_name = "stHostWrite", catch)]
+    fn host_write(offset: f64, data: &[u8]) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(js_name = "stHostTruncate", catch)]
+    fn host_truncate(len: f64) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(js_name = "stHostFlush", catch)]
+    fn host_flush() -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(js_name = "stHostScratchOpen", catch)]
+    fn host_scratch_open(name: &str, preserve: bool) -> Result<JsValue, JsValue>;
     #[wasm_bindgen(js_name = "stHostScratchRead")]
     fn host_scratch_read(name: &str, offset: f64, len: u32) -> Vec<u8>;
-    #[wasm_bindgen(js_name = "stHostScratchWrite")]
-    fn host_scratch_write(name: &str, offset: f64, data: &[u8]);
-    #[wasm_bindgen(js_name = "stHostScratchTruncate")]
-    fn host_scratch_truncate(name: &str, len: f64);
-    #[wasm_bindgen(js_name = "stHostScratchFlush")]
-    fn host_scratch_flush(name: &str);
+    #[wasm_bindgen(js_name = "stHostScratchWrite", catch)]
+    fn host_scratch_write(name: &str, offset: f64, data: &[u8]) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(js_name = "stHostScratchTruncate", catch)]
+    fn host_scratch_truncate(name: &str, len: f64) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(js_name = "stHostScratchFlush", catch)]
+    fn host_scratch_flush(name: &str) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(js_name = "stHostOutSize")]
+    fn host_out_size() -> f64;
+    #[wasm_bindgen(js_name = "stHostOutReadInto", catch)]
+    fn host_out_read_into(offset: f64, len: u32, ptr: u32) -> Result<JsValue, JsValue>;
     #[wasm_bindgen(js_name = "stHostProgress")]
     fn host_progress(json: &str);
     #[wasm_bindgen(js_name = "stHostCancelled")]
     fn host_cancelled() -> bool;
+    #[wasm_bindgen(js_name = "stHostCheckpoint")]
+    fn host_checkpoint(json: &str);
+}
+
+/// Host capability flags (call before convert): bit 0 = stHostReadInto.
+#[wasm_bindgen(js_name = "configure")]
+pub fn configure(read_into: bool) {
+    READ_INTO.store(read_into, Ordering::SeqCst);
+}
+
+#[wasm_bindgen(js_name = "enableCheckpoint")]
+pub fn enable_checkpoint() {
+    CHECKPOINT_ENABLED.store(true, Ordering::SeqCst);
+}
+
+/// Piggyback a sha256 over every source byte read through `ByteSource`
+/// during the next conversion (identity capture without an extra pass).
+#[wasm_bindgen(js_name = "enableSourceHash")]
+pub fn enable_source_hash() {
+    use sha2::Digest;
+    let mut st = hash_state().lock().unwrap();
+    *st = Some(sha2::Sha256::new());
+    SOURCE_HASH_ENABLED.store(true, Ordering::SeqCst);
+}
+
+#[wasm_bindgen(js_name = "sourceSha256")]
+pub fn source_sha256() -> String {
+    use sha2::Digest;
+    let mut st = hash_state().lock().unwrap();
+    match st.take() {
+        Some(h) => format!("{:x}", h.finalize()),
+        None => String::new(),
+    }
+}
+
+#[wasm_bindgen(js_name = "coreVersion")]
+pub fn core_version() -> String {
+    slide_transform_core::CORE_VERSION.to_string()
 }
 
 struct HostSource {
@@ -60,15 +150,56 @@ impl ByteSource for HostSource {
         self.size
     }
     fn read_at(&self, offset: u64, len: usize) -> CoreResult<Vec<u8>> {
-        let mut out = Vec::with_capacity(len);
+        let mut out = vec![0u8; len];
         let mut done = 0usize;
         while done < len {
             let want = MAX_CHUNK.min(len - done) as u32;
-            let chunk = host_read((offset + done as u64) as f64, want);
-            if chunk.len() != want as usize {
-                return Err(CoreError::oob("宿主 read 返回长度不足"));
+            if READ_INTO.load(Ordering::Relaxed) {
+                let ptr = out.as_mut_ptr() as usize + done;
+                let r = host_read_into((offset + done as u64) as f64, want, ptr as u32)
+                    .map_err(|e| CoreError::io(format!("宿主 read 异常: {e:?}")))?;
+                if let Some(err) = js_err(r) {
+                    return Err(err);
+                }
+            } else {
+                let chunk = host_read((offset + done as u64) as f64, want);
+                if chunk.len() != want as usize {
+                    return Err(CoreError::oob("宿主 read 返回长度不足"));
+                }
+                out[done..done + want as usize].copy_from_slice(&chunk);
             }
-            out.extend_from_slice(&chunk);
+            done += want as usize;
+        }
+        if SOURCE_HASH_ENABLED.load(Ordering::Relaxed) {
+            use sha2::Digest;
+            if let Some(h) = hash_state().lock().unwrap().as_mut() {
+                h.update(&out);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Read-back adapter over the output sink (validation phase).
+struct OutReader {
+    size: u64,
+}
+
+impl ByteSource for OutReader {
+    fn size(&self) -> u64 {
+        self.size
+    }
+    fn read_at(&self, offset: u64, len: usize) -> CoreResult<Vec<u8>> {
+        let mut out = vec![0u8; len];
+        let mut done = 0usize;
+        while done < len {
+            let want = MAX_CHUNK.min(len - done) as u32;
+            let ptr = out.as_mut_ptr() as usize + done;
+            let r = host_out_read_into((offset + done as u64) as f64, want, ptr as u32)
+                .map_err(|e| CoreError::io(format!("宿主 out-read 异常: {e:?}")))?;
+            if let Some(err) = js_err(r) {
+                return Err(err);
+            }
             done += want as usize;
         }
         Ok(out)
@@ -82,17 +213,29 @@ impl RandomAccessSink for HostSink {
         let mut done = 0usize;
         while done < data.len() {
             let end = (done + MAX_CHUNK).min(data.len());
-            host_write((offset + done as u64) as f64, &data[done..end]);
+            let r = host_write((offset + done as u64) as f64, &data[done..end])
+                .map_err(|e| CoreError::io(format!("宿主 write 异常: {e:?}")))?;
+            if let Some(err) = js_err(r) {
+                return Err(err);
+            }
             done = end;
         }
         Ok(())
     }
     fn truncate(&mut self, size: u64) -> CoreResult<()> {
-        host_truncate(size as f64);
+        let r = host_truncate(size as f64)
+            .map_err(|e| CoreError::io(format!("宿主 truncate 异常: {e:?}")))?;
+        if let Some(err) = js_err(r) {
+            return Err(err);
+        }
         Ok(())
     }
     fn flush(&mut self) -> CoreResult<()> {
-        host_flush();
+        let r = host_flush()
+            .map_err(|e| CoreError::io(format!("宿主 flush 异常: {e:?}")))?;
+        if let Some(err) = js_err(r) {
+            return Err(err);
+        }
         Ok(())
     }
 }
@@ -101,7 +244,19 @@ struct HostScratchFactory;
 
 impl ScratchFactory for HostScratchFactory {
     fn create(&mut self, name: &str) -> CoreResult<Box<dyn ScratchSink>> {
-        host_scratch_open(name);
+        let r = host_scratch_open(name, false)
+            .map_err(|e| CoreError::io(format!("宿主 scratch open 异常: {e:?}")))?;
+        if let Some(err) = js_err(r) {
+            return Err(err);
+        }
+        Ok(Box::new(HostScratchSink { name: name.to_string() }))
+    }
+    fn create_preserve(&mut self, name: &str) -> CoreResult<Box<dyn ScratchSink>> {
+        let r = host_scratch_open(name, true)
+            .map_err(|e| CoreError::io(format!("宿主 scratch open(preserve) 异常: {e:?}")))?;
+        if let Some(err) = js_err(r) {
+            return Err(err);
+        }
         Ok(Box::new(HostScratchSink { name: name.to_string() }))
     }
 }
@@ -112,15 +267,33 @@ struct HostScratchSink {
 
 impl RandomAccessSink for HostScratchSink {
     fn write_at(&mut self, offset: u64, data: &[u8]) -> CoreResult<()> {
-        host_scratch_write(&self.name, offset as f64, data);
+        let mut done = 0usize;
+        while done < data.len() {
+            let end = (done + MAX_CHUNK).min(data.len());
+            let r =
+                host_scratch_write(&self.name, (offset + done as u64) as f64, &data[done..end])
+                    .map_err(|e| CoreError::io(format!("宿主 scratch write 异常: {e:?}")))?;
+            if let Some(err) = js_err(r) {
+                return Err(err);
+            }
+            done = end;
+        }
         Ok(())
     }
     fn truncate(&mut self, size: u64) -> CoreResult<()> {
-        host_scratch_truncate(&self.name, size as f64);
+        let r = host_scratch_truncate(&self.name, size as f64)
+            .map_err(|e| CoreError::io(format!("宿主 scratch truncate 异常: {e:?}")))?;
+        if let Some(err) = js_err(r) {
+            return Err(err);
+        }
         Ok(())
     }
     fn flush(&mut self) -> CoreResult<()> {
-        host_scratch_flush(&self.name);
+        let r = host_scratch_flush(&self.name)
+            .map_err(|e| CoreError::io(format!("宿主 scratch flush 异常: {e:?}")))?;
+        if let Some(err) = js_err(r) {
+            return Err(err);
+        }
         Ok(())
     }
 }
@@ -163,6 +336,26 @@ impl ProgressCallback for HostProgress {
     }
 }
 
+struct HostCheckpoint;
+
+impl slide_transform_core::job::CheckpointCallback for HostCheckpoint {
+    fn on_checkpoint(&self, c: &slide_transform_core::job::CheckpointState) {
+        if !CHECKPOINT_ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+        let ifds: Vec<String> = c.ifd_tiles.iter().map(|t| t.to_string()).collect();
+        let json = format!(
+            "{{\"level\":{},\"channel\":{},\"cell\":{},\"out\":{},\"ifds\":[{}]}}",
+            c.level,
+            c.channel.map(|v| v.to_string()).unwrap_or_else(|| "0".into()),
+            c.cell_done,
+            c.committed_output,
+            ifds.join(",")
+        );
+        host_checkpoint(&json);
+    }
+}
+
 fn err_json(e: &CoreError) -> String {
     let msg = e
         .message
@@ -183,7 +376,8 @@ fn detect(src: &dyn ByteSource) -> CoreResult<[u8; 8]> {
     Ok(m)
 }
 
-/// Probe the input through host reads; returns a JSON string.
+/// Probe the input through host reads; returns a JSON string. Includes the
+/// C2 disk-precheck estimate (`estimate.output_upper_bound_bytes` etc.).
 #[wasm_bindgen(js_name = "probe")]
 pub fn probe() -> String {
     let src = HostSource::open();
@@ -194,6 +388,7 @@ pub fn probe() -> String {
     };
     let res = if magic == slide_transform_core::kfbf::KFBF_MAGIC {
         slide_transform_core::kfbf::parse_kfbf(&src, &mut scratch).map(|doc| {
+            let est = slide_transform_core::estimate::estimate_fl(&doc, src.size());
             let channels: Vec<String> = doc
                 .channels
                 .iter()
@@ -215,16 +410,19 @@ pub fn probe() -> String {
                 })
                 .collect();
             format!(
-                "{{\"format\":\"kfbf_kfbio_jpeg\",\"modality\":\"fluorescence\",\"width\":{},\"height\":{},\"mpp\":{},\"channels\":[{}],\"levels\":[{}]}}",
+                "{{\"format\":\"kfbf_kfbio_jpeg\",\"modality\":\"fluorescence\",\"width\":{},\"height\":{},\"mpp\":{},\"channels\":[{}],\"levels\":[{}],\"estimate\":{}}}",
                 doc.header.width_px,
                 doc.header.height_px,
                 doc.header.mpp,
                 channels.join(","),
-                levels.join(",")
+                levels.join(","),
+                estimate_json(&est)
             )
         })
     } else {
         slide_transform_core::kfb::parse_kfb(&src, &mut scratch).map(|doc| {
+            let est = slide_transform_core::estimate::estimate_bf(&doc, src.size())
+                .unwrap_or(DEFAULT_EST);
             let levels: Vec<String> = doc
                 .levels
                 .iter()
@@ -236,13 +434,14 @@ pub fn probe() -> String {
                 })
                 .collect();
             format!(
-                "{{\"format\":\"{}\",\"modality\":\"brightfield\",\"width\":{},\"height\":{},\"mpp_x\":{},\"mpp_y\":{},\"levels\":[{}]}}",
+                "{{\"format\":\"{}\",\"modality\":\"brightfield\",\"width\":{},\"height\":{},\"mpp_x\":{},\"mpp_y\":{},\"levels\":[{}],\"estimate\":{}}}",
                 if doc.header.version != 1 { "kfb_kfbio_jpeg" } else { "kfb_bf_v1" },
                 doc.header.width_px,
                 doc.header.height_px,
                 doc.header.mpp_x,
                 doc.header.mpp_y,
-                levels.join(",")
+                levels.join(","),
+                estimate_json(&est)
             )
         })
     };
@@ -257,10 +456,31 @@ pub fn probe() -> String {
     }
 }
 
-/// Run a conversion writing to the host sink. `strict_lossless` toggles the
-/// pixel policy; `channel_json` may be empty (no companion).
-#[wasm_bindgen(js_name = "convert")]
-pub fn convert(strict_lossless: bool, channel_json: &str) -> String {
+const DEFAULT_EST: slide_transform_core::estimate::OutputEstimate =
+    slide_transform_core::estimate::OutputEstimate {
+        payload_bytes: 0,
+        tiles_present: 0,
+        cells_total: 0,
+        cells_missing: 0,
+        edge_tiles: 0,
+        ifds: 0,
+        output_upper_bound_bytes: 0,
+    };
+
+fn estimate_json(e: &slide_transform_core::estimate::OutputEstimate) -> String {
+    format!(
+        "{{\"payload_bytes\":{},\"tiles_present\":{},\"cells_total\":{},\"cells_missing\":{},\"edge_tiles\":{},\"ifds\":{},\"output_upper_bound_bytes\":{}}}",
+        e.payload_bytes,
+        e.tiles_present,
+        e.cells_total,
+        e.cells_missing,
+        e.edge_tiles,
+        e.ifds,
+        e.output_upper_bound_bytes
+    )
+}
+
+fn run_convert(strict_lossless: bool, channel_json: &str, resume: Option<ResumePoint>) -> String {
     let src = HostSource::open();
     let magic = match detect(&src) {
         Ok(m) => m,
@@ -292,43 +512,102 @@ pub fn convert(strict_lossless: bool, channel_json: &str) -> String {
     let mut sink = HostSink;
     let mut scratch = HostScratchFactory;
     let progress = HostProgress;
-    let job = JobControl::new(&progress);
+    let checkpoint = HostCheckpoint;
+    let mut job = JobControl::new(&progress);
+    if CHECKPOINT_ENABLED.load(Ordering::Relaxed) {
+        job = job.with_checkpoint(&checkpoint);
+    }
     let result = if magic == slide_transform_core::kfbf::KFBF_MAGIC {
         let plan = TransformPlan::fluorescence(identity).with_policy(policy);
-        slide_transform_core::convert_fl::convert_kfbf_to_ome(
-            &src,
-            &mut sink,
-            &mut scratch,
-            &plan,
-            &job,
-            companion.as_ref(),
-        )
+        match resume.as_ref() {
+            Some(rp) => slide_transform_core::convert_fl::convert_kfbf_to_ome_resume(
+                &src, &mut sink, &mut scratch, &plan, &job, companion.as_ref(), rp,
+            ),
+            None => slide_transform_core::convert_fl::convert_kfbf_to_ome(
+                &src, &mut sink, &mut scratch, &plan, &job, companion.as_ref(),
+            ),
+        }
     } else {
         let plan = TransformPlan::brightfield(identity).with_policy(policy);
-        slide_transform_core::convert_bf::convert_kfb_to_bigtiff(
-            &src,
-            &mut sink,
-            &mut scratch,
-            &plan,
-            &job,
-        )
+        match resume.as_ref() {
+            Some(rp) => slide_transform_core::convert_bf::convert_kfb_to_bigtiff_resume(
+                &src, &mut sink, &mut scratch, &plan, &job, rp,
+            ),
+            None => slide_transform_core::convert_bf::convert_kfb_to_bigtiff(
+                &src, &mut sink, &mut scratch, &plan, &job,
+            ),
+        }
     };
+    // the job borrowed the checkpoint handle; drop it before reusing fields
+    drop(job);
     match result {
         Ok(r) => {
             let warnings: Vec<String> =
                 r.warnings.iter().map(|w| format!("\"{w}\"")).collect();
             format!(
-                "{{{}\"format\":\"{}\",\"output_bytes\":{},\"width\":{},\"height\":{},\"tiles_raw_copied\":{},\"tiles_reencoded\":{},\"warnings\":[{}]}}",
+                "{{{}\"format\":\"{}\",\"output_bytes\":{},\"width\":{},\"height\":{},\"ifd_count\":{},\"tiles_raw_copied\":{},\"tiles_reencoded\":{},\"resumed\":{},\"warnings\":[{}]}}",
                 companion_json_warning,
                 r.format,
                 r.output_bytes,
                 r.width,
                 r.height,
+                r.validation.ifd_count,
                 r.count_raw_copied(),
                 r.count_reencoded(),
+                resume.is_some(),
                 warnings.join(",")
             )
         }
+        Err(e) => err_json(&e),
+    }
+}
+
+/// Run a conversion writing to the host sink. `strict_lossless` toggles the
+/// pixel policy; `channel_json` may be empty (no companion).
+#[wasm_bindgen(js_name = "convert")]
+pub fn convert(strict_lossless: bool, channel_json: &str) -> String {
+    run_convert(strict_lossless, channel_json, None)
+}
+
+/// Resume a conversion from a checkpoint state (the same JSON
+/// `stHostCheckpoint` emits; journal-recorded by the runner).
+#[wasm_bindgen(js_name = "convertResume")]
+pub fn convert_resume(resume_json: &str, strict_lossless: bool, channel_json: &str) -> String {
+    match parse_resume_json(resume_json) {
+        Ok(rp) => run_convert(strict_lossless, channel_json, Some(rp)),
+        Err(e) => err_json(&e),
+    }
+}
+
+/// Re-open + validate the finished output (streamed sha256 + structural
+/// IFD walk) through the host read-back callbacks. Only a passing result
+/// may be marked `ready`. `expect_ifd` 0 skips the count equality (the FL
+/// walker counts the top-level chain; SubIFDs hang off tag 330).
+#[wasm_bindgen(js_name = "finalizeValidate")]
+pub fn finalize_validate(expect_ifd: u32) -> String {
+    let size = host_out_size() as u64;
+    let reader = OutReader { size };
+    let expect = if expect_ifd == 0 { None } else { Some(expect_ifd) };
+    match slide_transform_core::validate::validate_output(&reader, size, expect) {
+        Ok(v) => format!(
+            "{{\"ok\":true,\"sha256\":\"{}\",\"size\":{},\"ifd_count\":{},\"tile_records\":{},\"checks\":[{}]}}",
+            v.sha256,
+            v.size,
+            v.ifd_count,
+            v.tile_records,
+            v.checks.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(",")
+        ),
+        Err(e) => err_json(&e),
+    }
+}
+
+/// One dedicated pass: sha256 of the whole source through bounded host
+/// reads (resume identity verification; hashing flag stays off).
+#[wasm_bindgen(js_name = "sha256Source")]
+pub fn sha256_source() -> String {
+    let src = HostSource::open();
+    match slide_transform_core::validate::stream_sha256(&src, src.size()) {
+        Ok(h) => format!("{{\"sha256\":\"{}\",\"size\":{}}}", h, src.size()),
         Err(e) => err_json(&e),
     }
 }

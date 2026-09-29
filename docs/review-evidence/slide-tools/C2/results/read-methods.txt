@@ -1,0 +1,6 @@
+frs4m: delta peak 2539 MiB, 4763 ms read
+frs4m-yield: delta peak 1144 MiB, 3900 ms read
+frs1m: delta peak 2472 MiB, 5371 ms read
+async: delta peak 1147 MiB, 3624 ms read
+byob: delta peak 99 MiB, 1489 ms read
+opfs: delta peak 64 MiB, 2073 ms read, copy 1595 ms

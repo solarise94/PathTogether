@@ -1,0 +1,581 @@
+#!/usr/bin/env node
+// C2 fault-injection matrix (plan §10.3). Each scenario runs against the
+// production runner under the mode-C CSP; after every crash point the job
+// is resumed and the FINAL artifact sha256 must equal the uninterrupted
+// native CLI conversion of the same input. Deterministic crash points come
+// from the worker's test-only fault hooks (init{testMode:true}).
+//
+// node run_faults.js [--port 8942] [--only name-substring]
+'use strict';
+const path = require('path');
+const fs = require('fs');
+const { execFileSync } = require('child_process');
+const L = require('./lib.js');
+
+const PORT = Number(L.arg('port', '8942'));
+const ONLY = L.arg('only', '');
+
+async function waitFor(page, predFn, timeoutMs = 120000, what = 'cond') {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const v = await page.evaluate((p) => eval(p), `(${predFn})()`);
+    if (v) return v;
+    await page.waitForTimeout(100);
+  }
+  throw new Error(`waitFor(${what}) timeout`);
+}
+
+/// Wait for a fault event newer than `base` (an event-count baseline
+/// captured before the scenario started) — stale fault events from earlier
+/// scenarios must never satisfy the wait.
+async function waitForFault(page, which, base = 0, jobId = null) {
+  const jid = JSON.stringify(jobId);
+  return waitFor(page, `() => {
+    const f = window.__c2.faultsSince(${base}).find((x) => {
+      if (${!!which} && x.data.fault !== ${JSON.stringify(which)}) return false;
+      if (${jid} !== null && x.data.jobId !== ${jid}) return false;
+      return true;
+    });
+    return f ? f.data : null;
+  }`, 120000, `fault ${which}`);
+}
+
+async function shaOf(page, jobId) {
+  const h = await page.evaluate((id) => window.__c2.hashArtifact(id), jobId);
+  if (!h || !h.sha256) throw new Error('hashArtifact failed: ' + JSON.stringify(h).slice(0, 200));
+  return h.sha256;
+}
+
+async function prepareFixtures() {
+  const dir = path.join(L.GATE, 'faults-fixtures');
+  fs.mkdirSync(dir, { recursive: true });
+  const bf = path.join(dir, 'bf.kfb');
+  const bf2 = path.join(dir, 'bf-big.kfb'); // bigger for export/cancel tests
+  const fl = path.join(dir, 'fl.kfbf');
+  if (!fs.existsSync(bf)) execFileSync(L.CLI, ['gen-kfb', bf, '--width', '700', '--height', '500']);
+  if (!fs.existsSync(bf2)) execFileSync(L.CLI, ['gen-kfb', bf2, '--width', '1600', '--height', '1200']);
+  if (!fs.existsSync(fl)) execFileSync(L.CLI, ['gen-kfbf', fl, '--width', '600', '--height', '400']);
+  const native = {};
+  for (const [k, p] of [['bf', bf], ['bf2', bf2], ['fl', fl]]) {
+    const out = path.join(dir, `${k}-native.tif`);
+    execFileSync(L.CLI, ['convert', p, out, '--overwrite']);
+    native[k] = await L.sha256File(out);
+  }
+  return { bf, bf2, fl, native, dir };
+}
+
+// ---------------------------------------------------------------- scenarios
+
+function makeScenarios(F) {
+  const S = [];
+
+  // fresh page state + input + start, returns jobId
+  async function begin(page, fixture, startOpts) {
+    await L.setFile(page, fixture);
+    await L.setFile(page, fixture);
+    const base = await page.evaluate(() => window.__c2.eventCount());
+    const jobId = await page.evaluate((o) => window.__c2.start(o), startOpts);
+    return { jobId, base };
+  }
+
+  S.push(['kill-worker-payload-write', async (page) => {
+    const b = await begin(page, F.bf, { profileId: 'saver', faults: { crashAtWrite: 5 } }); const jobId = b.jobId; const base = b.base;
+    await waitForFault(page, 'crashAtWrite', base, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    await page.evaluate((id) => window.__c2.resume({ jobId: id }), jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    return { done, sha: await shaOf(page, jobId), expect: F.native.bf };
+  }]);
+
+  S.push(['reload-page-payload-write', async (page) => {
+    const b = await begin(page, F.bf, { profileId: 'saver', faults: { crashAtWrite: 8 } }); const jobId = b.jobId; const base = b.base;
+    await waitForFault(page, 'crashAtWrite', base, jobId);
+    await page.reload({ waitUntil: 'load' });
+    await L.open(page, PORT);
+    await L.setFile(page, F.bf);
+    const rr = await page.evaluate(async (id) => {
+      try { return { ok: await window.__c2.resume({ jobId: id }) }; }
+      catch (e) { return { name: e && e.name, msg: e && e.message, stack: String((e && e.stack) || '').split('\n').slice(0, 6), errObj: e && e.error }; }
+    }, jobId);
+    if (!rr.ok) throw new Error('reload-resume-failed: ' + JSON.stringify(rr).slice(0, 300));
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    return { done, sha: await shaOf(page, jobId), expect: F.native.bf };
+  }]);
+
+  S.push(['crash-after-flush-before-journal', async (page) => {
+    const b = await begin(page, F.bf, { profileId: 'saver', faults: { crashAfterFlushBeforeJournal: true, journalIntervalBytes: 1024 } }); const jobId = b.jobId; const base = b.base;
+    await waitForFault(page, 'crashAfterFlushBeforeJournal', base, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    await page.evaluate((id) => window.__c2.resume({ jobId: id }), jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    return { done, sha: await shaOf(page, jobId), expect: F.native.bf };
+  }]);
+
+  S.push(['crash-right-after-checkpoint', async (page) => {
+    const b = await begin(page, F.bf, { profileId: 'saver', faults: { crashAfterCheckpoint: true, journalIntervalBytes: 1024 } }); const jobId = b.jobId; const base = b.base;
+    await waitForFault(page, 'crashAfterCheckpoint', base, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    await page.evaluate((id) => window.__c2.resume({ jobId: id }), jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    return { done, sha: await shaOf(page, jobId), expect: F.native.bf };
+  }]);
+
+  S.push(['crash-during-ifd-backpatch-finalize', async (page) => {
+    const b = await begin(page, F.bf, { profileId: 'saver', faults: { crashInFinalize: true, journalIntervalBytes: 1024, finalizeWriteThreshold: 4 } }); const jobId = b.jobId; const base = b.base;
+    await waitForFault(page, 'crashInFinalize', base, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    await page.evaluate((id) => window.__c2.resume({ jobId: id }), jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    return { done, sha: await shaOf(page, jobId), expect: F.native.bf };
+  }]);
+
+  S.push(['crash-during-validation', async (page) => {
+    const b = await begin(page, F.bf, { profileId: 'saver', faults: { crashInValidate: true } }); const jobId = b.jobId; const base = b.base;
+    await waitForFault(page, 'crashInValidate', base, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    await page.evaluate((id) => window.__c2.resume({ jobId: id }), jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    return { done, sha: await shaOf(page, jobId), expect: F.native.bf };
+  }]);
+
+  S.push(['export-interrupted-artifact-kept', async (page) => {
+    const bk = await begin(page, F.bf, { profileId: 'saver' }); const jobId = bk.jobId;
+    await page.evaluate(() => window.__c2.awaitDone());
+    await page.waitForTimeout(200);
+    // injected mid-export failure: the writable throws at the 3rd chunk
+    const errCode = await page.evaluate(async () => {
+      await window.__c2.ready();
+      const root = await navigator.storage.getDirectory();
+      const fh = await root.getFileHandle('export-copy.bin', { create: true });
+      const w = await fh.createWritable();
+      const orig = w.write.bind(w);
+      let n = 0;
+      try {
+        await window.__runner.exportJob(window.__c2.jobId(), async () => ({
+          write: async (x) => { if (++n === 1) throw new Error('injected export failure'); return orig(x); },
+          close: async () => w.close(), abort: async () => w.abort(),
+        }));
+        return null;
+      } catch (e) {
+        return e && e.error ? e.error.code : String(e);
+      }
+    });
+    const kept = await page.evaluate((id) => window.__c2.outputInfo(id), jobId);
+    const rec = await page.evaluate((id) => window.__c2.jobRecord(id), jobId);
+    // clean retry export succeeds
+    const retry = await page.evaluate(() => window.__c2.exportToOpfs());
+    const sha = await shaOf(page, jobId);
+    return { errCode, kept, recState: rec.state, retry, sha, expect: F.native.bf };
+  }]);
+
+  S.push(['export-reload-artifact-kept', async (page) => {
+    // bigger artifact + slowed writable → reload mid-export
+    await L.clearJobs(page);
+    await L.setFile(page, F.bf2);
+    const jobId = await page.evaluate(() => window.__c2.start({ profileId: 'saver' }));
+    await page.evaluate(() => window.__c2.awaitDone());
+    await page.waitForTimeout(200);
+    // slow export started in background, reload after it begins
+    const exportPromise = page.evaluate(() => new Promise(async (resolve) => {
+      const root = await navigator.storage.getDirectory();
+      const fh = await root.getFileHandle('export-copy.bin', { create: true });
+      const w = await fh.createWritable();
+      const orig = w.write.bind(w);
+      let n = 0;
+      try {
+        await window.__runner.exportJob(window.__c2.jobId(), async () => ({
+          write: async (x) => { await new Promise((r) => setTimeout(r, 120)); if (++n === 4) throw new Error('reload'); return orig(x); },
+          close: async () => w.close(), abort: async () => w.abort(),
+        }));
+        resolve({ ok: true });
+      } catch (e) { resolve({ ok: false }); }
+    }));
+    await page.waitForTimeout(500);
+    await page.reload({ waitUntil: 'load' });
+    await L.open(page, PORT);
+    await exportPromise.catch(() => { /* page may have torn it down */ });
+    const info = await page.evaluate(async (id) => {
+      const root = await navigator.storage.getDirectory();
+      const jobs = await root.getDirectoryHandle('slide-jobs');
+      const dir = await jobs.getDirectoryHandle(id);
+      const fh = await dir.getFileHandle('output.tif');
+      return (await fh.getFile()).size;
+    }, jobId);
+    // after reload: state readable, artifact intact, export can retry
+    await page.evaluate((id) => window.__c2.setJobId(id), jobId);
+    const rec = await page.evaluate((id) => window.__c2.jobRecord(id), jobId);
+    const retry = await page.evaluate(() => window.__c2.exportToOpfs());
+    const sha = await shaOf(page, jobId);
+    return { artifactBytesAfterReload: info, recState: rec.state, retry, sha, expect: F.native.bf2 };
+  }]);
+
+  S.push(['injected-quota-error-recoverable', async (page) => {
+    const b = await begin(page, F.bf, { profileId: 'saver', faults: { quotaErrorAtWrite: 8 } }); const jobId = b.jobId; const base = b.base;
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    await page.evaluate(() => window.__c2.terminateWorker()).catch(() => { /* */ });
+    await page.evaluate((id) => window.__c2.resume({ jobId: id }), jobId);
+    const done2 = await page.evaluate(() => window.__c2.awaitDone());
+    return { first: done, done2, sha: await shaOf(page, jobId), expect: F.native.bf };
+  }]);
+
+  S.push(['output-handle-loss-recoverable', async (page) => {
+    const b = await begin(page, F.bf, { profileId: 'saver', faults: { closeOutputAtWrite: 7 } }); const jobId = b.jobId; const base = b.base;
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    await page.evaluate(() => window.__c2.terminateWorker()).catch(() => { /* */ });
+    await page.evaluate((id) => window.__c2.resume({ jobId: id }), jobId);
+    const done2 = await page.evaluate(() => window.__c2.awaitDone());
+    return { first: done, done2, sha: await shaOf(page, jobId), expect: F.native.bf };
+  }]);
+
+  S.push(['staged-copy-tampered-refused', async (page) => {
+    // same-length byte flip in the job's source.bin → hash refusal;
+    // truncated copy → length refusal (resume never trusts the copy blindly)
+    const b0 = await begin(page, F.bf, { profileId: 'saver', faults: { crashAtWrite: 6 } });
+    await waitForFault(page, 'crashAtWrite', b0.base, b0.jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    await page.evaluate((id) => window.__c2.tamperSource(id, 'flip'), b0.jobId);
+    const flip = await page.evaluate((id) => window.__c2.tryResume({ jobId: id }), b0.jobId);
+    const b1 = await begin(page, F.bf, { profileId: 'saver', faults: { crashAtWrite: 4 } });
+    await waitForFault(page, 'crashAtWrite', b1.base, b1.jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    await page.evaluate((id) => window.__c2.tamperSource(id, 'truncate'), b1.jobId);
+    const trunc = await page.evaluate((id) => window.__c2.tryResume({ jobId: id }), b1.jobId);
+    return { flip, trunc };
+  }]);
+
+  S.push(['user-file-changed-after-staging-resume-ok', async (page) => {
+    // resume reads the staged copy: editing (or losing) the user's original
+    // after staging must not change the result
+    const b = await begin(page, F.bf, { profileId: 'saver', faults: { crashAtWrite: 6 } });
+    await waitForFault(page, 'crashAtWrite', b.base, b.jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    const stat = fs.statSync(F.bf);
+    const fd = fs.openSync(F.bf, 'r+');
+    fs.writeSync(fd, Buffer.from([0x41, 0x42, 0x43, 0x44]), 0, 4, 120000);
+    fs.closeSync(fd);
+    try {
+      await page.evaluate((id) => window.__c2.resume({ jobId: id }), b.jobId);
+      const done = await page.evaluate(() => window.__c2.awaitDone());
+      return { done, sha: await shaOf(page, b.jobId), expect: F.native.bf };
+    } finally {
+      execFileSync(L.CLI, ['gen-kfb', F.bf, '--width', '700', '--height', '500']);
+      fs.utimesSync(F.bf, stat.atime, stat.mtime);
+    }
+  }]);
+
+  S.push(['crash-during-staging-cleaned', async (page) => {
+    // (a) worker dies mid-copy, page alive: the runner discards the job itself
+    await L.clearJobs(page);
+    await L.setFile(page, F.bf2);
+    let base = await page.evaluate(() => window.__c2.eventCount());
+    const startP = page.evaluate(() => window.__c2.tryStart({ profileId: 'saver', faults: { crashInStage: 1 } }));
+    const fa = await waitForFault(page, 'crashInStage', base, null);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    const startA = await startP;
+    const existsA = await page.evaluate((id) => window.__c2.jobDirExists(id), fa.jobId);
+    // (b) page reload mid-copy: the dir survives with a `staging` record and
+    // the next runner entry sweeps it; it can never be resumed
+    await L.setFile(page, F.bf2);
+    base = await page.evaluate(() => window.__c2.eventCount());
+    page.evaluate(() => window.__c2.tryStart({ profileId: 'saver', faults: { crashInStage: 1 } })).catch(() => null);
+    const fb = await waitForFault(page, 'crashInStage', base, null);
+    await page.reload({ waitUntil: 'load' });
+    await L.open(page, PORT);
+    const existsBeforeSweep = await page.evaluate((id) => window.__c2.jobDirExists(id), fb.jobId);
+    const recState = existsBeforeSweep
+      ? await page.evaluate((id) => window.__c2.jobRecord(id).then((r) => r && r.state), fb.jobId) : null;
+    const sweep1 = await page.evaluate(() => window.__c2.newRunner().then(() => window.__runner._sweepIncompleteStaging()));
+    const pending1 = await page.evaluate(() => window.__c2.pendingCleanups());
+    const existsAfterSweep1 = await page.evaluate((id) => window.__c2.jobDirExists(id), fb.jobId);
+    await page.waitForTimeout(4000);
+    await page.evaluate(() => window.__c2.newRunner());
+    const existsAfterSweep = await page.evaluate((id) => window.__c2.jobDirExists(id), fb.jobId);
+    const resumeB = await page.evaluate((id) => window.__c2.tryResume({ jobId: id }), fb.jobId);
+    return { jobIdB: fb.jobId, startA, existsA, existsBeforeSweep, recState, sweep1, pending1, existsAfterSweep1, existsAfterSweep, resumeB };
+  }]);
+
+  S.push(['unsupported-input-not-staged', async (page) => {
+    await L.clearJobs(page);
+    const junk = path.join(F.dir, 'not-a-slide.bin');
+    fs.writeFileSync(junk, Buffer.alloc(1 << 20, 7));
+    await L.setFile(page, junk);
+    const r = await page.evaluate(() => window.__c2.tryStart({ profileId: 'saver' }));
+    const jobs = await page.evaluate(() => window.__c2.listJobs());
+    return { r, jobs };
+  }]);
+
+  S.push(['settings-change-refused', async (page) => {
+    const b = await begin(page, F.bf, { profileId: 'saver', faults: { crashAtWrite: 6 } }); const jobId = b.jobId; const base = b.base;
+    await waitForFault(page, 'crashAtWrite', base, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    const prof = await page.evaluate((id) => window.__c2.tryResume({ jobId: id, profileId: 'balanced' }), jobId);
+    const pol = await page.evaluate((id) => window.__c2.tryResume({ jobId: id, policy: 'strict-lossless' }), jobId);
+    // and the unchanged resume still works
+    await page.evaluate((id) => window.__c2.resume({ jobId: id }), jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    return { profileChange: prof, policyChange: pol, done, sha: await shaOf(page, jobId), expect: F.native.bf };
+  }]);
+
+  S.push(['core-version-bump-refused', async (page) => {
+    const b = await begin(page, F.bf, { profileId: 'saver', faults: { crashAtWrite: 6 } }); const jobId = b.jobId; const base = b.base;
+    await waitForFault(page, 'crashAtWrite', base, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    await page.evaluate(() => window.__c2.tamperJobRecord({ core: '99.0.0' }));
+    const r = await page.evaluate((id) => window.__c2.tryResume({ jobId: id }), jobId);
+    return { coreBump: r };
+  }]);
+
+  S.push(['two-tabs-web-lock', async (page, ctx) => {
+    await L.clearJobs(page);
+    await L.setFile(page, F.bf2);
+    const jobId = (await page.evaluate(() => window.__c2.start({ profileId: 'saver', faults: { writeDelayMs: 150 } })));
+    const page2 = await ctx.newPage();
+    await page2.goto(`http://127.0.0.1:${PORT}/harness.html`, { waitUntil: 'load' });
+    await page2.waitForFunction(() => window.__c2);
+    await L.setFile(page2, F.bf);
+    const r = await page2.evaluate(() => window.__c2.tryStart({ profileId: 'saver' }));
+    await page2.close();
+    await page.evaluate(() => window.__c2.terminateWorker());
+    return { secondTab: r, jobId };
+  }]);
+
+  S.push(['opfs-jobdir-deleted-rejected', async (page) => {
+    const b = await begin(page, F.bf, { profileId: 'saver', faults: { crashAtWrite: 6 } }); const jobId = b.jobId; const base = b.base;
+    await waitForFault(page, 'crashAtWrite', base, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    await page.evaluate((id) => window.__c2.deleteJobDir(id), jobId);
+    const r = await page.evaluate((id) => window.__c2.tryResume({ jobId: id }), jobId);
+    return { deletedDir: r };
+  }]);
+
+  S.push(['cancel-with-cleanup-failure-pending-record', async (page) => {
+    await L.clearJobs(page);
+    await L.setFile(page, F.bf2);
+    const jobId = await page.evaluate(() => window.__c2.start({ profileId: 'saver', faults: { failCleanup: true, writeDelayMs: 150 } }));
+    await page.evaluate(() => window.__c2.waitState('running', 60000));
+    await page.evaluate(() => window.__c2.cancel());
+    // wait until either the dir is gone or a pending record exists (retry path)
+    await waitFor(page, `() => true`, 15000, 'settle').catch(() => null);
+    await page.waitForTimeout(2500);
+    const probe = await page.evaluate(async (id) => {
+      const viaApi = await window.__c2.pendingCleanups();
+      let raw = null;
+      try {
+        const root = await navigator.storage.getDirectory();
+        const jobs = await root.getDirectoryHandle('slide-jobs');
+        const fh = await jobs.getFileHandle('pending-cleanup.json');
+        const f = await fh.getFile();
+        raw = new TextDecoder().decode(await f.slice(0, 2000).arrayBuffer());
+      } catch (e) { raw = 'ERR ' + String(e); }
+      return { viaApi, raw, exists: await window.__c2.jobDirExists(id) };
+    }, jobId);
+    // new runner entry retries the cleanup
+    await page.evaluate(() => window.__c2.newRunner());
+    await page.waitForTimeout(400);
+    const pending2 = await page.evaluate(() => window.__c2.pendingCleanups());
+    const exists2 = await page.evaluate((id) => window.__c2.jobDirExists(id), jobId);
+    return { pendingAfterCancel: probe.viaApi, rawAfterCancel: probe.raw,
+      dirExistsAfterCancel: probe.exists,
+      pendingAfterRetry: pending2, dirExistsAfterRetry: exists2 };
+  }]);
+
+  S.push(['cancel-latency-and-basic', async (page) => {
+    await L.clearJobs(page);
+    await L.setFile(page, F.bf2);
+    const jobId = (await page.evaluate(() => window.__c2.start({ profileId: 'saver', faults: { writeDelayMs: 150 } })));
+    await page.evaluate(() => window.__c2.waitState('running', 60000));
+    await page.evaluate(() => window.__c2.cancel());
+    await page.waitForTimeout(600);
+    const latency = await page.evaluate(() => window.__c2.cancelLatency());
+    const exists = await page.evaluate((id) => window.__c2.jobDirExists(id), jobId);
+    const events = await page.evaluate(() => window.__c2.events.filter((e) => e.kind === 'cancel-result').map((e) => e.data));
+    return { latencyMs: latency, dirDeleted: !exists, cancelResult: events[0] || null };
+  }]);
+
+  S.push(['repeated-terminate-reload-mixed', async (page) => {
+    const b = await begin(page, F.bf2, { profileId: 'saver', faults: { crashAtWrite: 4 } }); const jobId = b.jobId; const base = b.base;
+    await waitForFault(page, 'crashAtWrite', base, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    const basem2 = await page.evaluate(() => window.__c2.eventCount());
+    await page.evaluate((id) => window.__c2.resume({ jobId: id, faults: { crashAtWrite: 9 } }), jobId);
+    await waitForFault(page, 'crashAtWrite', base, jobId);
+    await page.reload({ waitUntil: 'load' });
+    await L.open(page, PORT);
+    await L.setFile(page, F.bf2);
+    const basem3 = await page.evaluate(() => window.__c2.eventCount());
+    await page.evaluate((id) => window.__c2.resume({ jobId: id, faults: { crashAfterCheckpoint: true, journalIntervalBytes: 1024 } }), jobId);
+    await waitForFault(page, 'crashAfterCheckpoint', basem3, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    await page.evaluate((id) => window.__c2.resume({ jobId: id }), jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    return { done, sha: await shaOf(page, jobId), expect: F.native.bf2 };
+  }]);
+
+  S.push(['fl-resume-matches', async (page) => {
+    const b = await begin(page, F.fl, { profileId: 'saver', faults: { crashAtWrite: 6 } }); const jobId = b.jobId; const base = b.base;
+    await waitForFault(page, 'crashAtWrite', base, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    await page.evaluate((id) => window.__c2.resume({ jobId: id }), jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    return { done, sha: await shaOf(page, jobId), expect: F.native.fl };
+  }]);
+
+  S.push(['fl-finalize-crash-resume', async (page) => {
+    const b = await begin(page, F.fl, { profileId: 'saver', faults: { crashInFinalize: true, journalIntervalBytes: 1024, finalizeWriteThreshold: 4 } }); const jobId = b.jobId; const base = b.base;
+    await waitForFault(page, 'crashInFinalize', base, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    await page.evaluate((id) => window.__c2.resume({ jobId: id }), jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    return { done, sha: await shaOf(page, jobId), expect: F.native.fl };
+  }]);
+
+  S.push(['fl-reload-mid', async (page) => {
+    const b = await begin(page, F.fl, { profileId: 'saver', faults: { crashAtWrite: 10 } }); const jobId = b.jobId; const base = b.base;
+    await waitForFault(page, 'crashAtWrite', base, jobId);
+    await page.reload({ waitUntil: 'load' });
+    await L.open(page, PORT);
+    await L.setFile(page, F.fl);
+    await page.evaluate((id) => window.__c2.resume({ jobId: id }), jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    return { done, sha: await shaOf(page, jobId), expect: F.native.fl };
+  }]);
+
+  return S;
+}
+
+// ---------------------------------------------------------------- verdicts
+
+function verdict(name, r) {
+  const fail = (why) => ({ name, pass: false, why, detail: safeJson(r) });
+  const ok = (extra = {}) => ({ name, pass: true, ...extra, detail: safeJson(r) });
+  switch (name) {
+    case 'staged-copy-tampered-refused': {
+      const c1 = r.flip && r.flip.code, c2 = r.trunc && r.trunc.code;
+      return c1 === 'source_changed_refuse_resume' && c2 === 'source_changed_refuse_resume'
+        ? ok() : fail(`flip=${c1} trunc=${c2}`);
+    }
+    case 'crash-during-staging-cleaned':
+      return r.startA && r.startA.refused && r.existsA === false
+        && r.existsBeforeSweep === true && r.recState === 'staging'
+        // first sweep right after reload may hit the dying worker's handle
+        // lock → must leave a pending-cleanup record, never silently skip
+        && (r.existsAfterSweep1 === false || (r.pending1 && r.pending1.jobs.some((j) => j.id === r.jobIdB)))
+        && r.existsAfterSweep === false && r.resumeB && r.resumeB.refused
+        ? ok() : fail(safeJson(r));
+    case 'unsupported-input-not-staged':
+      return r.r && r.r.refused && r.r.code === 'unsupported_input' && Array.isArray(r.jobs) && r.jobs.length === 0
+        ? ok() : fail(safeJson(r));
+    case 'settings-change-refused':
+      const pc = r.profileChange && r.profileChange.code, lc = r.policyChange && r.policyChange.code;
+      return pc === 'resume_refused' && lc === 'resume_refused' && r.done && r.done.ok && r.sha === r.expect
+        ? ok() : fail(`profile=${pc} policy=${lc} done=${JSON.stringify(r.done && r.done.ok)} sha=${r.sha && r.sha.slice(0, 8)}`);
+    case 'core-version-bump-refused':
+      const cb = r.coreBump && r.coreBump.code;
+      return cb === 'resume_refused' ? ok() : fail(`coreBump=${cb}`);
+    case 'two-tabs-web-lock':
+      return r.secondTab && r.secondTab.refused && r.secondTab.code === 'job_locked_other_tab' ? ok() : fail(`secondTab=${JSON.stringify(r.secondTab)}`);
+    case 'opfs-jobdir-deleted-rejected':
+      return r.deletedDir && r.deletedDir.refused && r.deletedDir.code === 'job_dir_missing' ? ok() : fail(`deletedDir=${JSON.stringify(r.deletedDir)}`);
+    case 'cancel-with-cleanup-failure-pending-record':
+      const viaRaw = r.rawAfterCancel && r.rawAfterCancel.includes('"attempts"');
+      const p1ok = (r.pendingAfterCancel && r.pendingAfterCancel.jobs.length === 1) || viaRaw;
+      return p1ok && r.dirExistsAfterCancel === true
+        && r.pendingAfterRetry && r.pendingAfterRetry.jobs.length === 0 && r.dirExistsAfterRetry === false
+        ? ok() : fail(safeJson({ p1: r.pendingAfterCancel, raw: String(r.rawAfterCancel).slice(0, 120), e1: r.dirExistsAfterCancel, p2: r.pendingAfterRetry, e2: r.dirExistsAfterRetry }));
+    case 'cancel-latency-and-basic':
+      return typeof r.latencyMs === 'number' && r.latencyMs <= 250 && r.dirDeleted === true
+        ? ok({ latencyMs: r.latencyMs }) : fail(`latency=${r.latencyMs} dirDeleted=${r.dirDeleted}`);
+    case 'export-interrupted-artifact-kept': {
+      const kept = r.kept && r.kept.size > 0 && (r.recState === 'ready') && r.retry && r.sha === r.expect;
+      return r.errCode === 'io_recoverable' && kept
+        ? ok({ errCode: r.errCode }) : fail(`errCode=${r.errCode} kept=${JSON.stringify(r.kept)} state=${r.recState} retry=${JSON.stringify(r.retry)}`);
+    }
+    case 'export-reload-artifact-kept':
+      return r.artifactBytesAfterReload > 0 && (r.recState === 'ready' || r.recState === 'exported')
+        && r.retry && r.retry.exportedBytes === r.artifactBytesAfterReload && r.sha === r.expect
+        ? ok() : fail(JSON.stringify({ a: r.artifactBytesAfterReload, s: r.recState, retry: r.retry }));
+    case 'injected-quota-error-recoverable':
+      return r.first && r.first.error && r.first.error.code === 'quota_exceeded_recoverable'
+        && r.done2 && r.done2.ok && r.sha === r.expect
+        ? ok() : fail(`first=${JSON.stringify(r.first && r.first.error)} done2=${safeJson(r.done2)}`);
+    case 'output-handle-loss-recoverable':
+      return r.first && r.first.error && r.done2 && r.done2.ok && r.sha === r.expect
+        ? ok({ firstCode: r.first.error.code }) : fail(`first=${JSON.stringify(r.first && r.first.error)}`);
+    default: {
+      // resume-correctness scenarios: done.ok + sha equality
+      if (!r.done || !r.done.ok) return fail(`done=${JSON.stringify(r.done).slice(0, 200)}`);
+      if (r.sha !== r.expect) return fail(`sha ${r.sha} != native ${r.expect}`);
+      return ok({ sha: r.sha });
+    }
+  }
+}
+
+function safeJson(v) {
+  if (typeof v === 'string') return v;
+  try {
+    const s = JSON.stringify(v, (k, x) => (typeof x === 'bigint' ? String(x) : x));
+    return typeof s === 'string' ? s : String(v);
+  } catch { return String(v); }
+}
+
+// ------------------------------------------------------------------ main
+
+async function main() {
+  fs.mkdirSync(L.GATE, { recursive: true });
+  const F = await prepareFixtures();
+  console.log('native references:', JSON.stringify({
+    bf: F.native.bf.slice(0, 12), bf2: F.native.bf2.slice(0, 12), fl: F.native.fl.slice(0, 12) }));
+
+  const server = await L.startServer(PORT);
+  process.on('exit', () => { try { server.kill('SIGKILL'); } catch { /* */ } });
+  const { context, page } = await L.launch({ label: 'faults' });
+  const results = [];
+  try {
+    for (const [name, fn] of makeScenarios(F)) {
+      if (ONLY && !name.includes(ONLY)) continue;
+      const t0 = Date.now();
+      let r;
+      let scenarioPage = null;
+      try {
+        // a fresh page per scenario isolates harness/runner/worker/UI state;
+        // OPFS job dirs are shared (same origin) as intended
+        scenarioPage = await context.newPage();
+        await L.open(scenarioPage, PORT);
+        r = await fn(scenarioPage, context);
+      } catch (e) {
+        let evts = [];
+        try {
+          evts = await scenarioPage.evaluate(() => window.__c2.events.slice(-30));
+        } catch { /* page gone */ }
+        results.push({ name, pass: false,
+          why: 'exception: ' + String((e && e.message) || e).slice(0, 300),
+          errJson: safeJson(e), events: safeJson(evts) });
+        console.log(`- ${name}: EXCEPTION ${String((e && e.message) || e).slice(0, 200)}`);
+        console.log('   last events:', JSON.stringify(evts.slice(-8)).slice(0, 600));
+        continue;
+      }
+      const v = verdict(name, r);
+      v.ms = Date.now() - t0;
+      if (!v.pass) {
+        try { v.events = safeJson(await scenarioPage.evaluate(() => window.__c2.events.slice(-25))); }
+        catch { /* */ }
+      }
+      results.push(v);
+      try { await scenarioPage.close(); } catch { /* */ }
+      console.log(`${v.pass ? 'PASS' : 'FAIL'} ${name} (${v.ms}ms)${v.pass ? '' : ' — ' + safeJson(v.why).slice(0, 220)}`);
+    }
+  } finally {
+    await context.close().catch(() => { /* */ });
+    server.kill('SIGTERM');
+  }
+  const summary = {
+    passed: results.filter((r) => r.pass).length,
+    failed: results.filter((r) => !r.pass).length,
+    results: results.map((r) => ({ name: r.name, pass: r.pass, ms: r.ms, why: r.why || null })),
+  };
+  L.writeJson('faults/results.json', { ...summary, details: results });
+  console.log(`\nFAULT MATRIX: ${summary.passed}/${results.length} passed`);
+  process.exitCode = summary.failed ? 1 : 0;
+}
+
+main().catch((e) => { console.error(e); process.exit(1); });

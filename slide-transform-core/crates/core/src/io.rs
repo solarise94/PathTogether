@@ -38,7 +38,13 @@ pub trait RandomAccessSink {
 /// Scratch sinks must be readable back (the converter streams spilled index
 /// records), so they implement both write and read.
 pub trait ScratchFactory {
+    /// Create fresh (truncate any prior content).
     fn create(&mut self, name: &str) -> CoreResult<Box<dyn ScratchSink>>;
+    /// Open WITHOUT truncating (resume: keep already-committed bytes).
+    /// Memory-backed factories have no persistence and simply create empty.
+    fn create_preserve(&mut self, name: &str) -> CoreResult<Box<dyn ScratchSink>> {
+        self.create(name)
+    }
 }
 
 /// A sink that can also be read back at explicit offsets.
@@ -212,6 +218,17 @@ impl FileSink {
             .map_err(|e| CoreError::io(format!("create {} 失败: {e}", path.display())))?;
         Ok(FileSink { file: Mutex::new(file) })
     }
+    /// Open without truncating (resume path: committed bytes stay).
+    pub fn open_preserve(path: &Path) -> CoreResult<Self> {
+        let file = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|e| CoreError::io(format!("open {} 失败: {e}", path.display())))?;
+        Ok(FileSink { file: Mutex::new(file) })
+    }
 }
 
 impl RandomAccessSink for FileSink {
@@ -252,6 +269,12 @@ impl ScratchFactory for FileScratch {
     fn create(&mut self, name: &str) -> CoreResult<Box<dyn ScratchSink>> {
         let path = self.dir.join(format!(".kfb2tiff-scratch-{name}"));
         let sink = FileSink::create(&path)?;
+        self.created.push(path);
+        Ok(Box::new(sink))
+    }
+    fn create_preserve(&mut self, name: &str) -> CoreResult<Box<dyn ScratchSink>> {
+        let path = self.dir.join(format!(".kfb2tiff-scratch-{name}"));
+        let sink = FileSink::open_preserve(&path)?;
         self.created.push(path);
         Ok(Box::new(sink))
     }

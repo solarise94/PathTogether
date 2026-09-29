@@ -71,6 +71,51 @@ impl<'a> OmeBigTiffWriter<'a> {
         Ok(OmeBigTiffWriter { sink, cursor: 16, ifds: Vec::new() })
     }
 
+    /// Resume variant: adopt the committed cursor without rewriting the
+    /// header (the host truncated the sink to `committed_output`).
+    pub fn resume_new(sink: &'a mut dyn RandomAccessSink, committed_output: u64) -> CoreResult<Self> {
+        if committed_output < 16 {
+            return Err(CoreError::validation("resume: committed_output < 16"));
+        }
+        Ok(OmeBigTiffWriter { sink, cursor: committed_output, ifds: Vec::new() })
+    }
+
+    /// Begin an IFD whose offcnt stream is partially committed in scratch
+    /// (preserve-open + adopt `committed_tiles`).
+    pub fn begin_ifd_resume(
+        &mut self,
+        scratch: &mut dyn ScratchFactory,
+        width: u32,
+        height: u32,
+        reduced: bool,
+        level_mpp: f64,
+        description: Option<Vec<u8>>,
+        committed_tiles: u64,
+    ) -> CoreResult<()> {
+        let sink = scratch
+            .create_preserve(&format!("ome-offcnt-{}", self.ifds.len()))?;
+        let bytes = committed_tiles
+            .checked_mul(OFFCNT_REC)
+            .ok_or_else(|| CoreError::validation("resume: offcnt 长度溢出"))?;
+        self.ifds.push(IfdSpec {
+            width,
+            height,
+            reduced,
+            level_mpp,
+            description,
+            sub_idx: Vec::new(),
+            offcnt: sink,
+            offcnt_bytes: bytes,
+            tile_count: committed_tiles,
+        });
+        Ok(())
+    }
+
+    /// Committed tile counts per begun IFD, in begin order.
+    pub fn ifd_tile_counts(&self) -> Vec<u64> {
+        self.ifds.iter().map(|l| l.tile_count).collect()
+    }
+
     /// Begin an IFD (`key` order is the caller's responsibility: level-major,
     /// channel-minor). All tiles must be written before `begin_ifd` again.
     pub fn begin_ifd(

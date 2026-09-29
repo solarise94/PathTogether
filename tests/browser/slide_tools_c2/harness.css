@@ -1,0 +1,5 @@
+
+  body { font: 13px/1.45 monospace; margin: 16px; color: #111; }
+  #log { white-space: pre-wrap; margin-top: 8px; }
+  button { margin-right: 6px; }
+  .st-selected::after { content: " selected"; }

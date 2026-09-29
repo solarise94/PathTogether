@@ -13,7 +13,8 @@ This software is based in part on the work of the Independent JPEG Group.
 
 Rust dependencies
 -----------------
-sha2 (CLI only), wasm-bindgen =0.2.129 (wasm only) and their transitive
+sha2 (core: output validation and source hashing, native and wasm),
+wasm-bindgen =0.2.129 (wasm only) and their transitive
 crates are licensed MIT OR Apache-2.0 (unicode-ident additionally
 Unicode-3.0). The exact list with versions is recorded in
 static/tools/slide-transform/build-manifest.json at build time.

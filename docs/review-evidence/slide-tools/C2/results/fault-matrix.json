@@ -1,0 +1,151 @@
+{
+ "date": "2026-09-29",
+ "passed": 24,
+ "total": 24,
+ "results": [
+  {
+   "name": "kill-worker-payload-write",
+   "pass": true,
+   "ms": 2902,
+   "why": null
+  },
+  {
+   "name": "reload-page-payload-write",
+   "pass": true,
+   "ms": 2920,
+   "why": null
+  },
+  {
+   "name": "crash-after-flush-before-journal",
+   "pass": true,
+   "ms": 2898,
+   "why": null
+  },
+  {
+   "name": "crash-right-after-checkpoint",
+   "pass": true,
+   "ms": 2918,
+   "why": null
+  },
+  {
+   "name": "crash-during-ifd-backpatch-finalize",
+   "pass": true,
+   "ms": 2865,
+   "why": null
+  },
+  {
+   "name": "crash-during-validation",
+   "pass": true,
+   "ms": 2866,
+   "why": null
+  },
+  {
+   "name": "export-interrupted-artifact-kept",
+   "pass": true,
+   "ms": 559,
+   "why": null
+  },
+  {
+   "name": "export-reload-artifact-kept",
+   "pass": true,
+   "ms": 1177,
+   "why": null
+  },
+  {
+   "name": "injected-quota-error-recoverable",
+   "pass": true,
+   "ms": 461,
+   "why": null
+  },
+  {
+   "name": "output-handle-loss-recoverable",
+   "pass": true,
+   "ms": 421,
+   "why": null
+  },
+  {
+   "name": "staged-copy-tampered-refused",
+   "pass": true,
+   "ms": 5421,
+   "why": null
+  },
+  {
+   "name": "user-file-changed-after-staging-resume-ok",
+   "pass": true,
+   "ms": 2866,
+   "why": null
+  },
+  {
+   "name": "crash-during-staging-cleaned",
+   "pass": true,
+   "ms": 7433,
+   "why": null
+  },
+  {
+   "name": "unsupported-input-not-staged",
+   "pass": true,
+   "ms": 88,
+   "why": null
+  },
+  {
+   "name": "settings-change-refused",
+   "pass": true,
+   "ms": 2858,
+   "why": null
+  },
+  {
+   "name": "core-version-bump-refused",
+   "pass": true,
+   "ms": 326,
+   "why": null
+  },
+  {
+   "name": "two-tabs-web-lock",
+   "pass": true,
+   "ms": 323,
+   "why": null
+  },
+  {
+   "name": "opfs-jobdir-deleted-rejected",
+   "pass": true,
+   "ms": 3338,
+   "why": null
+  },
+  {
+   "name": "cancel-with-cleanup-failure-pending-record",
+   "pass": true,
+   "ms": 3206,
+   "why": null
+  },
+  {
+   "name": "cancel-latency-and-basic",
+   "pass": true,
+   "ms": 3879,
+   "why": null
+  },
+  {
+   "name": "repeated-terminate-reload-mixed",
+   "pass": true,
+   "ms": 5688,
+   "why": null
+  },
+  {
+   "name": "fl-resume-matches",
+   "pass": true,
+   "ms": 2862,
+   "why": null
+  },
+  {
+   "name": "fl-finalize-crash-resume",
+   "pass": true,
+   "ms": 2844,
+   "why": null
+  },
+  {
+   "name": "fl-reload-mid",
+   "pass": true,
+   "ms": 2911,
+   "why": null
+  }
+ ]
+}

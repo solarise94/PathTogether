@@ -2,25 +2,73 @@
 /* eslint-disable */
 
 /**
+ * Host capability flags (call before convert): bit 0 = stHostReadInto.
+ */
+export function configure(read_into: boolean): void;
+
+/**
  * Run a conversion writing to the host sink. `strict_lossless` toggles the
  * pixel policy; `channel_json` may be empty (no companion).
  */
 export function convert(strict_lossless: boolean, channel_json: string): string;
 
 /**
- * Probe the input through host reads; returns a JSON string.
+ * Resume a conversion from a checkpoint state (the same JSON
+ * `stHostCheckpoint` emits; journal-recorded by the runner).
+ */
+export function convertResume(resume_json: string, strict_lossless: boolean, channel_json: string): string;
+
+export function coreVersion(): string;
+
+export function enableCheckpoint(): void;
+
+/**
+ * Piggyback a sha256 over every source byte read through `ByteSource`
+ * during the next conversion (identity capture without an extra pass).
+ */
+export function enableSourceHash(): void;
+
+/**
+ * Re-open + validate the finished output (streamed sha256 + structural
+ * IFD walk) through the host read-back callbacks. Only a passing result
+ * may be marked `ready`. `expect_ifd` 0 skips the count equality (the FL
+ * walker counts the top-level chain; SubIFDs hang off tag 330).
+ */
+export function finalizeValidate(expect_ifd: number): string;
+
+/**
+ * Probe the input through host reads; returns a JSON string. Includes the
+ * C2 disk-precheck estimate (`estimate.output_upper_bound_bytes` etc.).
  */
 export function probe(): string;
+
+/**
+ * One dedicated pass: sha256 of the whole source through bounded host
+ * reads (resume identity verification; hashing flag stays off).
+ */
+export function sha256Source(): string;
+
+export function sourceSha256(): string;
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
+    readonly configure: (a: number) => void;
     readonly convert: (a: number, b: number, c: number) => [number, number];
+    readonly convertResume: (a: number, b: number, c: number, d: number, e: number) => [number, number];
+    readonly coreVersion: () => [number, number];
+    readonly enableCheckpoint: () => void;
+    readonly enableSourceHash: () => void;
+    readonly finalizeValidate: (a: number) => [number, number];
     readonly probe: () => [number, number];
+    readonly sha256Source: () => [number, number];
+    readonly sourceSha256: () => [number, number];
     readonly __wbindgen_malloc: (a: number, b: number) => number;
-    readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
+    readonly __wbindgen_exn_store: (a: number) => void;
+    readonly __externref_table_alloc: () => number;
+    readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __wbindgen_free: (a: number, b: number, c: number) => void;
     readonly __wbindgen_start: () => void;
 }

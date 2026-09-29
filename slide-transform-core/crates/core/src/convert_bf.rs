@@ -5,6 +5,13 @@
 //! (fallback: std q95 + warning) — byte-equal to the Pillow oracle. Under
 //! `StrictLossless` any re-encode requirement is a typed policy error raised
 //! before the first output byte is written.
+//!
+//! C2 resume: [`convert_kfb_to_bigtiff_resume`] reconstructs the writer from
+//! a [`crate::resume::ResumePoint`] (committed output cursor + per-IFD
+//! committed tile counts, offcnt streams preserve-opened from scratch) and
+//! fast-forwards already-committed cells, reconstructing their report side
+//! effects (stats / edge regions / warnings) from the index without writing.
+//! The fresh path is untouched and stays byte-identical.
 
 use crate::bigtiff::BigTiffPyramidWriter;
 use crate::error::{CoreError, CoreResult};
@@ -17,6 +24,7 @@ use crate::report::{
     EdgeRegion, LevelStats, TransformResult, WARN_EDGE_REENCODE_FALLBACK_Q95,
     level_stats_from_kfb,
 };
+use crate::resume::ResumePoint;
 
 const TILE: u32 = 256;
 /// Sampling tuple (h1,v1,h2,v2,h3,v3) → (pillow-equivalent enum, TIFF (h,v)).
@@ -41,8 +49,8 @@ fn json_escape_ascii(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0C}' => out.push_str("\\f"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
             c if (c as u32) < 0x20 || (c as u32) >= 0x7F => {
                 out.push_str(&format!("\\u{:04x}", c as u32));
             }
@@ -133,6 +141,126 @@ fn strict_lossless_precheck(
     Ok(())
 }
 
+/// Per-level JPEG sampling. Full mode scans every full tile for consistency
+/// (the original oracle-parity behavior). Quick mode (resume of an already
+/// fully-committed level, whose input the host re-verified by content hash)
+/// probes only the first full tile.
+fn level_sampling(
+    src: &dyn ByteSource,
+    doc: &KfbDocument,
+    lv: &KfbLevel,
+    full_check: bool,
+) -> CoreResult<(u8, u8, u8, u8, u8, u8)> {
+    let mut sampling: Option<(u8, u8, u8, u8, u8, u8)> = None;
+    doc.grids.for_each_cell(lv.level, |_cell, rec| {
+        if !full_check && sampling.is_some() {
+            return Ok(());
+        }
+        if let Some(rec) = rec {
+            if rec.is_full_tile() || !full_check {
+                let payload = src.read_at(rec.payload_offset, rec.payload_length as usize)?;
+                let probe = crate::jpeg::scan_jpeg(&payload)?;
+                let s = probe
+                    .sampling
+                    .ok_or_else(|| CoreError::validation(format!(
+                        "层 {} tile({},{}) 不是三分量 JPEG",
+                        lv.level, rec.y / TILE, rec.x / TILE
+                    )))?;
+                match sampling {
+                    None => sampling = Some(s),
+                    Some(prev) if prev != s => {
+                        return Err(CoreError::validation(format!(
+                            "层 {} tile 采样不一致：{:?} vs {:?}",
+                            lv.level, prev, s
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    })?;
+    if sampling.is_none() {
+        doc.grids.for_each_cell(lv.level, |_cell, rec| {
+            if sampling.is_some() {
+                return Ok(());
+            }
+            if let Some(rec) = rec {
+                let payload = src.read_at(rec.payload_offset, rec.payload_length as usize)?;
+                if let Ok(probe) = crate::jpeg::scan_jpeg(&payload) {
+                    sampling = probe.sampling;
+                }
+            }
+            Ok(())
+        })?;
+    }
+    sampling.ok_or_else(|| {
+        CoreError::validation(format!("层 {} 无法确定 JPEG 采样", lv.level))
+    })
+}
+
+/// Reconstruct the report side effects of already-committed cells (stats,
+/// edge regions, warnings) from the index — payload is read only for edge
+/// tiles (to recover the quantization-table reuse flag exactly like the
+/// write path). `up_to` bounds the cells; `u64::MAX` = whole level.
+fn reconstruct_cells_bf(
+    src: &dyn ByteSource,
+    doc: &KfbDocument,
+    lv: &KfbLevel,
+    up_to: u64,
+    stats: &mut LevelStats,
+    edge_regions: &mut Vec<EdgeRegion>,
+    warnings: &mut Vec<String>,
+) -> CoreResult<()> {
+    doc.grids.for_each_cell(lv.level, |cell, rec| {
+        if cell as u64 >= up_to {
+            return Ok(());
+        }
+        let row = cell as u64 / lv.tiles_across() as u64;
+        let col = cell as u64 % lv.tiles_across() as u64;
+        let want_w = TILE.min(lv.width - (col as u32 * TILE));
+        let want_h = TILE.min(lv.height - (row as u32 * TILE));
+        let rec = match rec {
+            Some(r) => r,
+            None => {
+                return Err(CoreError::validation(format!(
+                    "层 {} 网格覆盖不全：缺 ({row},{col})（明场不允许稀疏）",
+                    lv.level
+                )));
+            }
+        };
+        if rec.jpeg_w as u32 > want_w || rec.jpeg_h as u32 > want_h {
+            return Err(CoreError::validation(format!(
+                "层 {} tile({row},{col}) 尺寸 {}×{} 超出网格 {want_w}×{want_h}",
+                lv.level, rec.jpeg_w, rec.jpeg_h
+            )));
+        }
+        if rec.is_full_tile() {
+            stats.tiles_raw_copied += 1;
+        } else {
+            let payload = src.read_at(rec.payload_offset, rec.payload_length as usize)?;
+            let qtables = crate::jpeg::qtables_pillow_style(&payload).unwrap_or_default();
+            let reused = qtables.len() >= 2;
+            if !reused {
+                warnings.push(WARN_EDGE_REENCODE_FALLBACK_Q95.to_string());
+            }
+            edge_regions.push(EdgeRegion {
+                level: lv.level,
+                channel: None,
+                x: rec.x,
+                y: rec.y,
+                source_w: rec.jpeg_w as u32,
+                source_h: rec.jpeg_h as u32,
+                canvas_w: TILE,
+                canvas_h: TILE,
+                reused_qtables: reused,
+            });
+            stats.tiles_reencoded += 1;
+        }
+        Ok(())
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn convert_kfb_to_bigtiff(
     src: &dyn ByteSource,
@@ -140,6 +268,31 @@ pub fn convert_kfb_to_bigtiff(
     scratch: &mut dyn ScratchFactory,
     plan: &TransformPlan,
     job: &JobControl,
+) -> CoreResult<TransformResult> {
+    convert_inner(src, sink, scratch, plan, job, None)
+}
+
+/// Resume a brightfield conversion from `resume` (see [`crate::resume`]).
+#[allow(clippy::too_many_arguments)]
+pub fn convert_kfb_to_bigtiff_resume(
+    src: &dyn ByteSource,
+    sink: &mut dyn RandomAccessSink,
+    scratch: &mut dyn ScratchFactory,
+    plan: &TransformPlan,
+    job: &JobControl,
+    resume: &ResumePoint,
+) -> CoreResult<TransformResult> {
+    convert_inner(src, sink, scratch, plan, job, Some(resume))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn convert_inner(
+    src: &dyn ByteSource,
+    sink: &mut dyn RandomAccessSink,
+    scratch: &mut dyn ScratchFactory,
+    plan: &TransformPlan,
+    job: &JobControl,
+    resume: Option<&ResumePoint>,
 ) -> CoreResult<TransformResult> {
     let started = crate::job::WallInstant::now();
     let doc = parse_kfb(src, scratch)?;
@@ -156,6 +309,21 @@ pub fn convert_kfb_to_bigtiff(
         return Err(CoreError::metadata("MPP 缺失/非法"));
     }
     let levels = select_levels(&doc)?;
+    if let Some(r) = resume {
+        if r.level >= levels.len() {
+            return Err(CoreError::validation("resume: level 越界"));
+        }
+        // (level, 0) states are never journalled, but accept them defensively.
+        let expect = if r.cell > 0 { r.level + 1 } else { r.level };
+        if r.ifd_tiles.len() != expect {
+            return Err(CoreError::validation(format!(
+                "resume: ifd_tiles 长度 {} 与 (level={}, cell={}) 不符",
+                r.ifd_tiles.len(),
+                r.level,
+                r.cell
+            )));
+        }
+    }
     if plan.pixel_policy == PixelPolicy::StrictLossless {
         strict_lossless_precheck(src, &doc, &levels)?;
     }
@@ -164,7 +332,10 @@ pub fn convert_kfb_to_bigtiff(
         description_bytes(source_format, &doc.header.scanner_id, doc.header.mpp_x,
             doc.header.mpp_y, doc.header.objective);
 
-    let mut writer = BigTiffPyramidWriter::new(sink)?;
+    let mut writer = match resume {
+        None => BigTiffPyramidWriter::new(sink)?,
+        Some(r) => BigTiffPyramidWriter::resume_new(sink, r.committed_output)?,
+    };
     let mut level_stats: Vec<LevelStats> = Vec::new();
     let mut edge_regions: Vec<EdgeRegion> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -172,50 +343,11 @@ pub fn convert_kfb_to_bigtiff(
 
     for (li, lv) in levels.iter().enumerate() {
         job.check()?;
-        // ---- level sampling: first full tile's SOF; all full tiles must agree
-        let mut sampling: Option<(u8, u8, u8, u8, u8, u8)> = None;
-        doc.grids.for_each_cell(lv.level, |_cell, rec| {
-            if let Some(rec) = rec {
-                if rec.is_full_tile() {
-                    let payload = src.read_at(rec.payload_offset, rec.payload_length as usize)?;
-                    let probe = crate::jpeg::scan_jpeg(&payload)?;
-                    let s = probe
-                        .sampling
-                        .ok_or_else(|| CoreError::validation(format!(
-                            "层 {} tile({},{}) 不是三分量 JPEG",
-                            lv.level, rec.y / TILE, rec.x / TILE
-                        )))?;
-                    match sampling {
-                        None => sampling = Some(s),
-                        Some(prev) if prev != s => {
-                            return Err(CoreError::validation(format!(
-                                "层 {} tile 采样不一致：{:?} vs {:?}",
-                                lv.level, prev, s
-                            )));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Ok(())
-        })?;
-        if sampling.is_none() {
-            doc.grids.for_each_cell(lv.level, |_cell, rec| {
-                if sampling.is_some() {
-                    return Ok(());
-                }
-                if let Some(rec) = rec {
-                    let payload = src.read_at(rec.payload_offset, rec.payload_length as usize)?;
-                    if let Ok(probe) = crate::jpeg::scan_jpeg(&payload) {
-                        sampling = probe.sampling;
-                    }
-                }
-                Ok(())
-            })?;
-        }
-        let sampling = sampling.ok_or_else(|| {
-            CoreError::validation(format!("层 {} 无法确定 JPEG 采样", lv.level))
-        })?;
+        let resume_done = resume.is_some_and(|r| li < r.level);
+        let resume_current = resume.is_some_and(|r| li == r.level);
+
+        // ---- level sampling (full consistency unless resuming past this level)
+        let sampling = level_sampling(src, &doc, lv, !resume_done)?;
         let (enc_sampling, tiff_sub) = supported_sampling(sampling).ok_or_else(|| {
             CoreError::validation(format!(
                 "层 {} JPEG 采样 {sampling:?} 不在支持集（4:4:4/4:2:2/4:2:0）",
@@ -225,10 +357,48 @@ pub fn convert_kfb_to_bigtiff(
 
         // ---- pass 1: any edge tiles? (progress + policy already done)
         let mut stats = level_stats_from_kfb(lv);
-        writer.begin_level(scratch)?;
-        let mut row_done: u64 = 0;
+        if resume_done {
+            // Fully committed level: rebuild IFD state + report side effects.
+            let committed = resume.unwrap().ifd_tiles[li];
+            let total = lv.tiles_across() as u64 * lv.tiles_down() as u64;
+            if committed != total {
+                return Err(CoreError::validation(format!(
+                    "resume: 层 {} 已提交 {} ≠ 总 tile 数 {}（journal 与输入不符）",
+                    lv.level, committed, total
+                )));
+            }
+            writer.begin_level_resume(scratch, committed)?;
+            reconstruct_cells_bf(src, &doc, lv, u64::MAX, &mut stats, &mut edge_regions,
+                &mut warnings)?;
+            writer.end_level(
+                lv.width,
+                lv.height,
+                tiff_sub,
+                doc.header.mpp_x,
+                doc.header.mpp_y,
+                &description,
+                li > 0,
+            )?;
+            ifd_chain.push((lv.level, None));
+            level_stats.push(stats);
+            continue;
+        }
+
+        let skip_until = if resume_current { resume.unwrap().cell } else { 0 };
+        if resume_current && skip_until > 0 {
+            let committed = resume.unwrap().ifd_tiles[li];
+            writer.begin_level_resume(scratch, committed)?;
+            reconstruct_cells_bf(src, &doc, lv, skip_until, &mut stats, &mut edge_regions,
+                &mut warnings)?;
+        } else {
+            writer.begin_level(scratch)?;
+        }
+        let mut row_done: u64 = skip_until / lv.tiles_across() as u64;
         doc.grids.for_each_cell(lv.level, |cell, rec| {
             job.check()?;
+            if resume_current && (cell as u64) < skip_until {
+                return Ok(()); // already committed; side effects reconstructed
+            }
             let row = cell as u64 / lv.tiles_across() as u64;
             let col = cell as u64 % lv.tiles_across() as u64;
             let want_w = TILE.min(lv.width - (col as u32 * TILE));
@@ -288,6 +458,15 @@ pub fn convert_kfb_to_bigtiff(
                     total: lv.tiles_down() as u64,
                     committed_bytes: writer.cursor(),
                 });
+                if job.checkpoint_enabled() {
+                    job.emit_checkpoint(
+                        lv.level,
+                        None,
+                        cell as u64 + 1,
+                        writer.cursor(),
+                        writer.ifd_tile_counts(),
+                    );
+                }
             }
             Ok(())
         })?;

@@ -32,6 +32,7 @@ fn main() -> ExitCode {
     let result = match args[0].as_str() {
         "probe" => cmd_probe(&args[1..]),
         "convert" => cmd_convert(&args[1..]),
+        "validate" => cmd_validate(&args[1..]),
         #[cfg(feature = "synth-gen")]
         "gen-kfb" => cmd_gen_kfb(&args[1..]),
         #[cfg(feature = "synth-gen")]
@@ -268,13 +269,71 @@ fn cmd_probe(args: &[String]) -> Result<String, CoreError> {
     } else {
         "null".to_string()
     };
+    // disk-precheck estimate (same shape as the wasm probe's)
+    let estimate = if magic == KFBF_MAGIC {
+        let doc = slide_transform_core::kfbf::parse_kfbf(&src, &mut scratch)?;
+        slide_transform_core::estimate::estimate_fl(&doc, src.size())
+    } else {
+        let doc = slide_transform_core::kfb::parse_kfb(&src, &mut scratch)?;
+        slide_transform_core::estimate::estimate_bf(&doc, src.size())?
+    };
+    let est_json = obj(&[
+        ju("payload_bytes", estimate.payload_bytes),
+        ju("tiles_present", estimate.tiles_present),
+        ju("cells_total", estimate.cells_total),
+        ju("cells_missing", estimate.cells_missing),
+        ju("edge_tiles", estimate.edge_tiles),
+        ju("ifds", estimate.ifds),
+        ju("output_upper_bound_bytes", estimate.output_upper_bound_bytes),
+    ]);
     Ok(obj(&[
         jstr("tool", "slide-transform"),
         jstr("core_version", slide_transform_core::CORE_VERSION),
         jstr("path", path),
         ju("size", src.size()),
         jraw("document", &doc_json),
+        jraw("estimate", &est_json),
         jraw("sha256", &hash),
+    ]))
+}
+
+// --------------------------------------------------------------------------- //
+// validate (C2): streamed sha256 + structural BigTIFF walk over a finished
+// output; mirrors the wasm finalizeValidate path for evidence parity.
+// --------------------------------------------------------------------------- //
+
+fn cmd_validate(args: &[String]) -> Result<String, CoreError> {
+    let mut expect_ifd: Option<u32> = None;
+    let mut path: Option<&String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--expect-ifd" => {
+                i += 1;
+                expect_ifd = Some(
+                    args.get(i)
+                        .ok_or_else(|| CoreError::validation("--expect-ifd 缺值"))?
+                        .parse()
+                        .map_err(|_| CoreError::validation("--expect-ifd 非数值"))?,
+                );
+            }
+            _ => path = Some(&args[i]),
+        }
+        i += 1;
+    }
+    let path = path.ok_or_else(|| CoreError::validation("validate 需要 <input>"))?;
+    let src = FileSource::open(Path::new(path))?;
+    let out = slide_transform_core::validate::validate_output(&src, src.size(), expect_ifd)?;
+    Ok(obj(&[
+        jb("ok", true),
+        jstr("sha256", &out.sha256),
+        ju("size", out.size),
+        ju("ifd_count", out.ifd_count as u64),
+        ju("tile_records", out.tile_records),
+        jarr(
+            "checks",
+            &out.checks.iter().map(|c| json_str(c)).collect::<Vec<_>>(),
+        ),
     ]))
 }
 

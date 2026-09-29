@@ -100,7 +100,9 @@ pub fn parse_vendor(
     for i in 0..tile_count as u64 {
         let rec_off = index_offset + i * TILE_REC;
         let want = ((INDEX_PAGE_ENTRIES as u64) * TILE_REC).min(region_end - rec_off) as usize;
-        pager.ensure(rec_off, want)?;
+        if !pager.covers(rec_off, TILE_REC) {
+            pager.ensure(rec_off, want)?;
+        }
         let e = pager.slice(rec_off, TILE_REC as usize);
         let x_px = read_u32(e, 4);
         let y_px = read_u32(e, 8);

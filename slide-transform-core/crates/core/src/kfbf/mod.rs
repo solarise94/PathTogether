@@ -343,7 +343,9 @@ pub fn parse_kfbf(
             let rec_off = index_offset + i * TILE_REC;
             let want =
                 ((PAGE_ENTRIES * TILE_REC) as u64).min(region_end - rec_off) as usize;
-            pager.ensure(rec_off, want)?;
+            if !pager.covers(rec_off, TILE_REC) {
+                pager.ensure(rec_off, want)?;
+            }
             let e = pager.slice(rec_off, TILE_REC as usize);
             if e[0..4] != [0xF1, 0x04, 0xEE, 0xEE]
                 || e[60..64] != [0xFF, 0x04, 0xEE, 0xEE]

@@ -138,7 +138,9 @@ pub fn parse_synth(
         let rec_off = index_offset + i * TILE_ENTRY;
         let want = ((INDEX_PAGE_ENTRIES as u64) * TILE_ENTRY)
             .min(region_end - rec_off) as usize;
-        pager.ensure(rec_off, want)?;
+        if !pager.covers(rec_off, TILE_ENTRY) {
+            pager.ensure(rec_off, want)?;
+        }
         let e = pager.slice(rec_off, TILE_ENTRY as usize);
         let lvl = read_u32(e, 0);
         let x_px = read_u32(e, 4);
@@ -198,7 +200,9 @@ pub fn parse_synth(
         let rec_off = index_offset + i * TILE_ENTRY;
         let want =
             ((INDEX_PAGE_ENTRIES as u64) * TILE_ENTRY).min(region_end - rec_off) as usize;
-        pager2.ensure(rec_off, want)?;
+        if !pager2.covers(rec_off, TILE_ENTRY) {
+            pager2.ensure(rec_off, want)?;
+        }
         let e = pager2.slice(rec_off, TILE_ENTRY as usize);
         let payload_offset = read_u64(e, 16);
         let payload_length = read_u32(e, 24);

@@ -15,6 +15,14 @@ impl<'a> PageReader<'a> {
         PageReader { src, page: Vec::new(), page_start: 0 }
     }
 
+    /// Whether `[off, off+len)` is already inside the current page.
+    pub fn covers(&self, off: u64, len: u64) -> bool {
+        let end = off + len as u64;
+        !self.page.is_empty()
+            && off >= self.page_start
+            && end <= self.page_start + self.page.len() as u64
+    }
+
     /// Make sure `[off, off+len)` is inside the current page, refilling the
     /// page (exactly covering the request, sized by the caller) if not.
     pub fn ensure(&mut self, off: u64, len: usize) -> CoreResult<()> {

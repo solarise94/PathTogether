@@ -56,6 +56,29 @@ impl ProgressCallback for NullProgress {
     fn on_progress(&self, _p: &Progress) {}
 }
 
+/// Committed-state snapshot emitted at safe boundaries (end of a committed
+/// tile row): everything up to and including `cell_done` cells of IFD
+/// `(level, channel)` is durable provided the host flushed after this
+/// callback returns. `ifd_tiles[i]` = committed tiles of the i-th begun IFD.
+#[derive(Debug, Clone)]
+pub struct CheckpointState {
+    pub level: u32,
+    pub channel: Option<usize>,
+    pub cell_done: u64,
+    pub committed_output: u64,
+    pub ifd_tiles: Vec<u64>,
+}
+
+pub trait CheckpointCallback: Send + Sync {
+    fn on_checkpoint(&self, c: &CheckpointState);
+}
+
+/// No-op checkpoint sink.
+pub struct NullCheckpoint;
+impl CheckpointCallback for NullCheckpoint {
+    fn on_checkpoint(&self, _c: &CheckpointState) {}
+}
+
 /// Shared cooperative-cancel handle.
 #[derive(Clone, Default)]
 pub struct CancelFlag {
@@ -78,6 +101,8 @@ impl CancelFlag {
 pub struct JobControl<'a> {
     pub progress: &'a dyn ProgressCallback,
     pub cancel: CancelFlag,
+    /// Optional committed-state tap (C2 checkpointing). `None` = disabled.
+    pub checkpoint: Option<&'a dyn CheckpointCallback>,
     started: Instant,
     timeout_seconds: f64,
 }
@@ -87,6 +112,7 @@ impl<'a> JobControl<'a> {
         JobControl {
             progress,
             cancel: CancelFlag::new(),
+            checkpoint: None,
             started: Instant::now(),
             timeout_seconds: f64::INFINITY,
         }
@@ -95,6 +121,45 @@ impl<'a> JobControl<'a> {
     pub fn with_timeout(mut self, seconds: f64) -> Self {
         self.timeout_seconds = seconds;
         self
+    }
+
+    /// Share a cancel flag with the caller (tests cancel at a checkpoint;
+    /// hosts flip their own flag and poll it through `stHostCancelled`).
+    pub fn with_cancel(mut self, cancel: CancelFlag) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    pub fn with_checkpoint(mut self, cb: &'a dyn CheckpointCallback) -> Self {
+        self.checkpoint = Some(cb);
+        self
+    }
+
+    /// Whether a checkpoint tap is attached (converters build the per-IFD
+    /// tile-count vector only when this is true).
+    pub fn checkpoint_enabled(&self) -> bool {
+        self.checkpoint.is_some()
+    }
+
+    /// Emit a committed-state snapshot (converters call this right after a
+    /// row-progress event, when the writers are at a consistent boundary).
+    pub fn emit_checkpoint(
+        &self,
+        level: u32,
+        channel: Option<usize>,
+        cell_done: u64,
+        committed_output: u64,
+        ifd_tiles: Vec<u64>,
+    ) {
+        if let Some(cb) = self.checkpoint {
+            cb.on_checkpoint(&CheckpointState {
+                level,
+                channel,
+                cell_done,
+                committed_output,
+                ifd_tiles,
+            });
+        }
     }
 
     /// Tick: cancellation + wall-clock budget. Called between tiles.

@@ -83,6 +83,49 @@ impl<'a> BigTiffPyramidWriter<'a> {
         Ok(BigTiffPyramidWriter { sink, cursor: 16, ifds: Vec::new() })
     }
 
+    /// Resume variant: the host already truncated the sink to
+    /// `committed_output` (the 16-byte header is part of it); do NOT rewrite
+    /// the header, just adopt the cursor.
+    pub fn resume_new(sink: &'a mut dyn RandomAccessSink, committed_output: u64) -> CoreResult<Self> {
+        if committed_output < 16 {
+            return Err(CoreError::validation("resume: committed_output < 16"));
+        }
+        Ok(BigTiffPyramidWriter { sink, cursor: committed_output, ifds: Vec::new() })
+    }
+
+    /// Begin a level whose offset/count stream is partially committed in
+    /// scratch: preserve-open the scratch sink and adopt `committed_tiles`.
+    pub fn begin_level_resume(
+        &mut self,
+        scratch: &mut dyn ScratchFactory,
+        committed_tiles: u64,
+    ) -> CoreResult<()> {
+        let sink = scratch
+            .create_preserve(&format!("offcnt-l{}", self.ifds.len()))?;
+        let bytes = committed_tiles
+            .checked_mul(OFFCNT_REC)
+            .ok_or_else(|| CoreError::validation("resume: offcnt 长度溢出"))?;
+        self.ifds.push(LevelIfd {
+            width: 0,
+            height: 0,
+            sampling: (1, 1),
+            mpp_x: 0.0,
+            mpp_y: 0.0,
+            description: Vec::new(),
+            reduced: false,
+            offcnt: sink,
+            offcnt_bytes: bytes,
+            tile_count: committed_tiles,
+        });
+        Ok(())
+    }
+
+    /// Committed tile counts per begun IFD, in begin order (checkpoint
+    /// emission; O(levels) bytes).
+    pub fn ifd_tile_counts(&self) -> Vec<u64> {
+        self.ifds.iter().map(|l| l.tile_count).collect()
+    }
+
     /// Begin a level: creates the per-level offcnt scratch sink. All tiles
     /// of the level must be written before the next `begin_level`.
     pub fn begin_level(&mut self, scratch: &mut dyn ScratchFactory) -> CoreResult<()> {

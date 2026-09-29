@@ -1,0 +1,83 @@
+{
+ "date": "2026-09-29",
+ "ok": true,
+ "inputs": {
+  "KFB-1": {
+   "bytes": 221189354,
+   "sha256": "17fe1cfde1a6d1f1d8778ea5854db5fd353f657e51003c606b404b60300aab71"
+  },
+  "KFBF-A": {
+   "bytes": 946972112,
+   "sha256": "1d10e48fa6e7a7da96dfe5ada5d4c55199fd77ac29560b537fa9e31a888c78f6"
+  },
+  "KFBF-B": {
+   "bytes": 530063959,
+   "sha256": "0ad51d3dce5d6fcdb5db5a4ea220dd452c9c2d220d590a6cde4d76d83e0e2c94"
+  },
+  "KFBF-C": {
+   "bytes": 481661346,
+   "sha256": "8fe031ad72534a82325ffc56100bbe7bf275ae9808250f9f523ea0ce63a58963"
+  },
+  "KFBF-D": {
+   "bytes": 806456145,
+   "sha256": "4aa66d2fda0d7a9a9f5509063f695a8b9c53b59dcfa9f723d0819b8329f03013"
+  }
+ },
+ "runs": [
+  {
+   "alias": "KFB-1",
+   "modality": "brightfield",
+   "browserSha256": "385a59c6c69478c26fcac9f4232d065137864f5be47aa398f6222c6e818657fd",
+   "nativeSha256": "385a59c6c69478c26fcac9f4232d065137864f5be47aa398f6222c6e818657fd",
+   "equal": true,
+   "outputBytes": 220055311,
+   "convertMs": 2119,
+   "wallMs": 5509
+  },
+  {
+   "alias": "KFBF-A",
+   "modality": "fluorescence",
+   "browserSha256": "6f8a1e3b0e9dd455868a8b940d23daa5fc8e8cf11f5ecd0758ee91ef35a583ea",
+   "nativeSha256": "6f8a1e3b0e9dd455868a8b940d23daa5fc8e8cf11f5ecd0758ee91ef35a583ea",
+   "equal": true,
+   "outputBytes": 944993326,
+   "convertMs": 9426,
+   "wallMs": 20679
+  },
+  {
+   "alias": "KFBF-B",
+   "modality": "fluorescence",
+   "browserSha256": "40cb12fa1acbaf60b1b3f97fac69bd020b15c705d5ea430136e7ede40eb75492",
+   "nativeSha256": "40cb12fa1acbaf60b1b3f97fac69bd020b15c705d5ea430136e7ede40eb75492",
+   "equal": true,
+   "outputBytes": 528681508,
+   "convertMs": 6670,
+   "wallMs": 13894
+  },
+  {
+   "alias": "KFBF-C",
+   "modality": "fluorescence",
+   "browserSha256": "5d6b1b21389805901bb5dfa8c9da6e4a412b23bc59c0f7528014b2ad98a45dcf",
+   "nativeSha256": "5d6b1b21389805901bb5dfa8c9da6e4a412b23bc59c0f7528014b2ad98a45dcf",
+   "equal": true,
+   "outputBytes": 480045368,
+   "convertMs": 5404,
+   "wallMs": 11676
+  },
+  {
+   "alias": "KFBF-D",
+   "modality": "fluorescence",
+   "browserSha256": "872fe3b65a962aeb495d7ee6192c7522dd6983d324e544f6aed77610d8541c9f",
+   "nativeSha256": "872fe3b65a962aeb495d7ee6192c7522dd6983d324e544f6aed77610d8541c9f",
+   "equal": true,
+   "outputBytes": 804752099,
+   "convertMs": 8526,
+   "wallMs": 18533
+  }
+ ],
+ "export": {
+  "exportedBytes": 220055311,
+  "size": 220055311,
+  "artifactSize": 220055311
+ }
+}

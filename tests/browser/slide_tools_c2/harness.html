@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>C2 runner harness (test-only)</title>
+<link rel="stylesheet" href="./harness.css">
+</head>
+<body>
+  <!--
+    C2 test harness page. NOT the product UI (/tools/slides is C3): the
+    minimum needed to drive the production runner (static/tools/slide-transform)
+    from Playwright. Served with ADR mode-C CSP by server.js.
+  -->
+  <input id="file" type="file">
+  <div>
+    <label>profile
+      <select id="profile">
+        <option value="saver">节省</option>
+        <option value="balanced">均衡</option>
+        <option value="faster">较快</option>
+        <option value="auto">auto (deviceMemory)</option>
+      </select>
+    </label>
+    <label>policy
+      <select id="policy">
+        <option value="allow-edge">allow-edge</option>
+        <option value="strict-lossless">strict-lossless</option>
+      </select>
+    </label>
+    <button id="start">start</button>
+    <button id="resume">resume</button>
+    <button id="cancel">cancel</button>
+    <button id="export">export→OPFS</button>
+  </div>
+  <div id="state">idle</div>
+  <div id="log"></div>
+  <script type="module" src="./harness.js"></script>
+</body>
+</html>

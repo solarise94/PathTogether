@@ -1,0 +1,3 @@
+<input type=file id=f><script>
+window.run = (ye) => new Promise((res) => { const w = new Worker('w.js'); w.onmessage = (e) => { w.terminate(); res(e.data); }; w.postMessage({ file: document.getElementById('f').files[0], mode: ye }); });
+</script>

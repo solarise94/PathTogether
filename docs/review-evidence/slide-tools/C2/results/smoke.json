@@ -1,0 +1,25 @@
+{
+ "ok": true,
+ "jobId": "job-aedf1297566c732a",
+ "browserSha256": "f265596a7662ca7e6c260fa9a4650d30a5d894791bcac11029a1e28235113679",
+ "nativeSha256": "f265596a7662ca7e6c260fa9a4650d30a5d894791bcac11029a1e28235113679",
+ "state": "exported",
+ "validation": {
+  "ok": true,
+  "sha256": "f265596a7662ca7e6c260fa9a4650d30a5d894791bcac11029a1e28235113679",
+  "size": 287803,
+  "ifd_count": 3,
+  "tile_records": 9,
+  "checks": [
+   "sha256-streamed",
+   "bigtiff-header",
+   "ifd-chain",
+   "tile-bounds"
+  ]
+ },
+ "export": {
+  "exportedBytes": 287803,
+  "size": 287803
+ },
+ "coreVersion": "0.1.0"
+}

@@ -1,5 +1,5 @@
 {
-  "built_at_utc": "2026-09-28T20:38:58Z",
+  "built_at_utc": "2026-09-29T05:08:38Z",
   "toolchain": {
     "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
     "wasm_bindgen_cli": "wasm-bindgen 0.2.129",
@@ -7,20 +7,57 @@
     "pinned_bindgen": "0.2.129"
   },
   "artifacts": {
-    "slide_transform_bg.wasm": "4b5a5091909c76ea750475f14b079a1517824ffdc0474923c27f13749f4d0933",
-    "slide_transform.js": "9f065123831e318c9d1e1d737768e2358069cfb5be47bd9c8b6b6b2b08c77b5e",
-    "runner.js": "44f110914e3dc468388b133829a5789f6a93e7ba85b3f413f80ff30078c59a80",
-    "slide-transform": "11abfa9887cf1176c8f77e6d6bf87450af2d6ab926a209494647bdefd9f34a62"
+    "slide_transform_bg.wasm": "46f2f6fe1e46f69a9a2390652a30d180e9124658150598f60634a42901374a4e",
+    "slide_transform.js": "51842f82a06fb082a52851e73455c9b31b785779333c053913e187a9f89ffe0b",
+    "runner.js": "46fa43fabd7534a7b507c10acd5838135fa0a54d434f9e1ff04feb948f8137ae",
+    "engine.js": "2bfa5f0708f20199211cf9a8202b1a2fa1a891a93196cb4b2ea09726d119d786",
+    "worker.js": "9b1a42f373cddbe08536e4ee2f3806adeb4e530a2c1a916446c100ba532cff6d",
+    "slide-transform": "cded7483ca1337c327f4f55528a3877055a425ad6d9edb56ad9a38b79a882e18"
   },
   "dependencies": [
     {
-      "crate": "wasm-bindgen",
-      "version": "0.2.129",
+      "crate": "sha2",
+      "version": "0.10.9",
       "license": "MIT OR Apache-2.0"
     },
     {
       "crate": "cfg-if",
       "version": "1.0.5",
+      "license": "MIT OR Apache-2.0"
+    },
+    {
+      "crate": "cpufeatures",
+      "version": "0.2.17",
+      "license": "MIT OR Apache-2.0"
+    },
+    {
+      "crate": "digest",
+      "version": "0.10.7",
+      "license": "MIT OR Apache-2.0"
+    },
+    {
+      "crate": "block-buffer",
+      "version": "0.10.4",
+      "license": "MIT OR Apache-2.0"
+    },
+    {
+      "crate": "generic-array",
+      "version": "0.14.7",
+      "license": "MIT"
+    },
+    {
+      "crate": "typenum",
+      "version": "1.20.1",
+      "license": "MIT OR Apache-2.0"
+    },
+    {
+      "crate": "crypto-common",
+      "version": "0.1.7",
+      "license": "MIT OR Apache-2.0"
+    },
+    {
+      "crate": "wasm-bindgen",
+      "version": "0.2.129",
       "license": "MIT OR Apache-2.0"
     },
     {

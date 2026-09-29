@@ -13,6 +13,7 @@ import io
 import ipaddress
 import json
 import math
+import mimetypes
 import os
 import queue
 import re
@@ -187,6 +188,12 @@ from plugins.sdk.manifest import (  # noqa: E402
 )
 
 app = Flask(__name__)
+
+# C3 本地切片工具：/static/tools/slide-transform/*.wasm 必须以
+# application/wasm 提供（compileStreaming 的严格前提；页面 CSP 见
+# _apply_slide_tools_security_headers）。本机 /etc/mime.types 已含该映射，
+# 此处防御性注册——部署镜像缺省 mime 数据库时行为不漂移。
+mimetypes.add_type("application/wasm", ".wasm")
 
 
 # --------------------------------------------------------------------------- #
@@ -1007,7 +1014,8 @@ ENROLLMENT_SESSION_KEY = "enrollment"
 def _require_auth():
     """启用认证时拦截未登录 / 已禁用 / 已删除 / **未激活**用户的请求。
 
-    放行 /login、/register、/demo、/verify-email、/api/registration/{start,
+    放行 /login、/register、/demo、/tools/slides（C3 本地工具页，无账号本地
+    转换）、/verify-email、/api/registration/{start,
     verify,resend}、/api/demo/*、/static/、/plugins/、/healthz、/internal/、
     /api/plugin/；其余请求检查 session，并按 user_id 回查用户是否仍存在且
     enabled（禁用或删除立即失效，不等 cookie 过期）。
@@ -1031,7 +1039,8 @@ def _require_auth():
         return None
     # 公开路径不回查用户（避免每个静态资源打一次存储）
     path = request.path
-    if (path in ("/login", "/register", "/demo") or path.startswith("/static/")
+    if (path in ("/login", "/register", "/demo", "/tools/slides")
+            or path.startswith("/static/")
             or path.startswith("/plugins/")):
         return None
     # P0 协议底座（docs §3.2）：版本化协议页面公开只读——未登录/未激活
@@ -3018,6 +3027,31 @@ def _apply_landing_security_headers(resp):
     return resp
 
 
+#: C3 本地切片工具页（/tools/slides）的页面级 CSP：ADR 模式 C（计划
+#: docs/browser-slide-tools-and-baidu-plugin-agent-plan-20260929.md §6）加
+#: worker/wasm 实际需要的最小面。只作用于该页，不改全站头；无 COOP/COEP
+#: （worker 非共享内存型，不需要跨源隔离）。与登录页不同：无表单 →
+#: form-action 'none'；不追加 CSP_EXTRA_CONNECT_SOURCES（本页隐私承诺是
+#: 除自托管静态代码外零网络请求，见计划 §6）。
+_SLIDE_TOOLS_CSP = (
+    "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; "
+    "worker-src 'self'; connect-src 'self'; style-src 'self'; "
+    "img-src 'self' data:; base-uri 'none'; object-src 'none'; "
+    "form-action 'none'; frame-ancestors 'none'"
+)
+
+
+def _apply_slide_tools_security_headers(resp):
+    """本地切片工具页：页面级最小 CSP（无 inline script/style，无外部源）。"""
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    resp.headers["Content-Security-Policy"] = _SLIDE_TOOLS_CSP
+    return resp
+
+
 def _registration_dialog_mode() -> str:
     """注册弹窗视图模式（模板层简化命名）：
 
@@ -3125,6 +3159,20 @@ def index():
 def workbench():
     """协作工作台。未登录由 _require_auth 302 到 /login?next=/app；可收藏本地址跳过主页。"""
     return _workbench_response()
+
+
+@app.route("/tools/slides")
+def tools_slides():
+    """本地切片工具（C3）：无账号的本地转换页（KFB/KFBF → BigTIFF/OME）。
+
+    - 全部识别/转换/校验/保存在用户浏览器内完成（WASM + OPFS，见
+      static/tools/slide-transform/）；页面除自托管静态代码外不发任何网络请求，
+      不创建平台任务（计划 §6）。
+    - 无登录（_require_auth 显式放行本路径）；页面级最小 CSP 由
+      _apply_slide_tools_security_headers 设置（不改全站头）。
+    """
+    resp = make_response(render_template("tools_slides.html"))
+    return _apply_slide_tools_security_headers(resp)
 
 
 def _plugin_ui_dir(plugin_id):

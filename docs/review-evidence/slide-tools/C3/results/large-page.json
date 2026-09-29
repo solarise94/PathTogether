@@ -1,0 +1,12 @@
+{
+ "ok": true,
+ "inputBytes": 10512547212,
+ "dialogShown": true,
+ "savedSha256": "2084a33385b02657cd424b5a7281e4232af06c04a6efcf9897de2c6431dd5a29",
+ "savedBytes": 10509701385,
+ "resultSha256": "2084a33385b02657cd424b5a7281e4232af06c04a6efcf9897de2c6431dd5a29",
+ "nativeSha256": "2084a33385b02657cd424b5a7281e4232af06c04a6efcf9897de2c6431dd5a29",
+ "stageProbeMs": 53218,
+ "convertMs": 67592,
+ "totalMs": 288226
+}

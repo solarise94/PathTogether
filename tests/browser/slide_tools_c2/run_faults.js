@@ -320,6 +320,19 @@ function makeScenarios(F) {
     return { listed, done, after, sha: await shaOf(page, b.jobId), expect: F.native.bf };
   }]);
 
+  S.push(['start-unjournaled-planned-job', async (page) => {
+    // crash window between the planned record and the worker's journal:
+    // listJobs says 'start' and startJob(null, {jobId}) must run from the copy
+    await L.clearJobs(page);
+    await L.setFile(page, F.bf);
+    const prep = await page.evaluate(() => window.__c2.probe());
+    await page.evaluate((id) => window.__c2.tamperJobRecord({ state: 'planned', profile: 'saver', policy: 'allow-edge' }, id), prep.jobId);
+    const listed = await page.evaluate((id) => window.__c2.getJob(id), prep.jobId);
+    await page.evaluate((id) => window.__runner.startJob(null, { jobId: id, profileId: 'saver' }).then(() => true), prep.jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    return { listed, done, sha: await shaOf(page, prep.jobId), expect: F.native.bf };
+  }]);
+
   S.push(['settings-change-refused', async (page) => {
     const b = await begin(page, F.bf, { profileId: 'saver', faults: { crashAtWrite: 6 } }); const jobId = b.jobId; const base = b.base;
     await waitForFault(page, 'crashAtWrite', base, jobId);
@@ -490,6 +503,9 @@ function verdict(name, r) {
       return okList && r.done && r.done.ok && r.sha === r.expect && okAfter
         ? ok() : fail(safeJson({ listed: l, done: r.done && r.done.ok, after: r.after }));
     }
+    case 'start-unjournaled-planned-job':
+      return r.listed && r.listed.nextAction === 'start' && r.done && r.done.ok && r.sha === r.expect
+        ? ok() : fail(safeJson({ listed: r.listed && r.listed.nextAction, done: r.done }));
     case 'settings-change-refused':
       const pc = r.profileChange && r.profileChange.code, lc = r.policyChange && r.policyChange.code;
       return pc === 'resume_refused' && lc === 'resume_refused' && r.done && r.done.ok && r.sha === r.expect

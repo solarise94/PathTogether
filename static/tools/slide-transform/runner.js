@@ -462,7 +462,19 @@ export class SlideToolsRunner {
         throw E.stError(E.ERROR_CODES.JOB_DIR_MISSING, '任务记录缺失（目录被删除/驱逐）');
       }
     }
-    if (!resumeJobId && (!record || record.state !== 'prepared')) {
+    // a staged copy whose run never journaled (prepared, or crashed before
+    // the worker opened its journal) can start fresh from the copy; once a
+    // journal exists only resumeJob may continue it
+    let reusable = !!(record && record.identity &&
+      ['prepared', 'planned', 'paused'].includes(record.state));
+    if (!resumeJobId && reusable && record.state !== 'prepared') {
+      const dir = await this._jobDir(jobId);
+      const journaled = await dir.getFileHandle(E.JOURNAL_FILE).then(() => true, () => false);
+      if (journaled) {
+        throw E.stError(E.ERROR_CODES.RESUME_REFUSED, '该任务已有进度记录，请使用续跑', { kind: 'use-resume' });
+      }
+    }
+    if (!resumeJobId && !reusable) {
       if (!file) throw E.stError(E.ERROR_CODES.IO_RECOVERABLE, '缺少输入文件');
       await this._prepare(file, { ...opts, jobId: jobId || undefined });
       jobId = this.jobId;
@@ -576,11 +588,16 @@ export class SlideToolsRunner {
     return { jobId, done: doneP };
   }
 
+  /// `done` settles only after the job record is updated and the heavy lock
+  /// released, so a caller that lists jobs right after sees the final state.
   _onDone(m) {
-    if (this._doneResolve) {
-      this._doneResolve(m);
-      this._doneResolve = null;
-    }
+    const resolve = this._doneResolve;
+    this._doneResolve = null;
+    const finish = () => {
+      this._emit('done', m);
+      this._releaseHeavyLock();
+      if (resolve) resolve(m);
+    };
     if (m.ok) {
       this._updateJobRecord(this.jobId, {
         state: 'ready',
@@ -591,20 +608,16 @@ export class SlideToolsRunner {
         journalBytes: m.journalBytes,
       }).then(() => {
         this._setState('ready', { sha256: m.validation && m.validation.sha256 });
-        this._emit('done', m);
-        this._releaseHeavyLock();
-      }).catch(() => this._releaseHeavyLock());
+      }).catch(() => { /* record stays as it was; result still returned */ })
+        .finally(finish);
     } else {
       const isCancel = m.error && m.error.code === E.ERROR_CODES.CANCELLED;
-      if (!isCancel) {
-        this._updateJobRecord(this.jobId, {
-          state: 'failed',
-          error: m.error || (m.result && m.result.error) || null,
-        }).catch(() => { /* keep going */ });
-        this._setState('failed', { error: m.error });
-      }
-      this._emit('done', m);
-      this._releaseHeavyLock();
+      const rec = isCancel ? Promise.resolve() : this._updateJobRecord(this.jobId, {
+        state: 'failed',
+        error: m.error || (m.result && m.result.error) || null,
+      }).catch(() => { /* keep going */ });
+      if (!isCancel) this._setState('failed', { error: m.error });
+      rec.finally(finish);
     }
   }
 

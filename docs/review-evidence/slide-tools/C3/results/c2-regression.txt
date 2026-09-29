@@ -1,0 +1,2 @@
+C2 smoke (final run, after C3): SMOKE PASS — browser sha256 f265596a7662ca7e6c260fa9a4650d30a5d894791bcac11029a1e28235113679 == native; export 287803 B; state exported
+C2 fault matrix: FAULT MATRIX: 25/25 passed

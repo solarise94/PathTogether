@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page="tools-slides">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>本地切片工具 · HistoPilot</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/static/tools/tools-slides.css?v=20260929" />
+  <script defer src="/static/i18n.js?v=20260929"></script>
+  <script type="module" src="/static/tools/tools-slides.js?v=20260929"></script>
+</head>
+<body id="top">
+  <a class="skip-link" href="#main" data-i18n="tools.skip">跳到主要内容</a>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand-block">
+        <p class="brand-tag" data-i18n="tools.brand">HistoPilot · 本地工具</p>
+        <h1 data-i18n="tools.title">本地切片工具</h1>
+        <p class="subtitle" data-i18n="tools.subtitle">在本机浏览器内完成 KFB / KFBF 切片的识别、转换与保存（BigTIFF / OME-TIFF）</p>
+      </div>
+      <div class="topbar-actions">
+        <a class="btn btn-secondary" href="/" data-i18n="tools.back.home">返回主页</a>
+        <button type="button" class="lang-toggle" data-i18n-aria="lang.toggle.aria" aria-label="切换为英文">EN</button>
+      </div>
+    </div>
+  </header>
+
+  <main id="main">
+    <!-- 本地与隐私说明（计划 §6） -->
+    <section class="card privacy" aria-labelledby="privacy-title">
+      <h2 id="privacy-title" data-i18n="tools.privacy.title">本地与隐私</h2>
+      <ul class="privacy-list">
+        <li data-i18n="tools.privacy.note">识别与转换全部在本机浏览器内完成；除加载本页自身的静态代码外，本页不发送任何网络请求。</li>
+        <li data-i18n="tools.privacy.data">文件内容、文件名、哈希与缩略图都不会离开这台设备；不创建任何平台任务。</li>
+        <li data-i18n="tools.privacy.account">无需登录或注册。</li>
+        <li data-i18n="tools.privacy.offline">本页与引擎加载完成后即可离线使用。</li>
+      </ul>
+    </section>
+
+    <p id="page-error" class="error-panel" role="alert" hidden></p>
+    <p id="page-status" class="status-panel" role="status" aria-live="polite"></p>
+
+    <!-- 1 · 选择文件 -->
+    <section class="card" aria-labelledby="input-title">
+      <h2 id="input-title" data-i18n="tools.input.title">1 · 选择文件</h2>
+      <div class="field">
+        <label for="file-input" data-i18n="tools.input.file.label">切片文件（KFB / KFBF）</label>
+        <input id="file-input" name="file" type="file" accept=".kfb,.kfbf" />
+        <p class="hint" data-i18n="tools.input.file.hint">仅支持已验证的 KFB（明场）与 KFBF（荧光）变体；其他格式会在复制前被拒绝。</p>
+      </div>
+      <div class="field">
+        <label for="channel-input" data-i18n="tools.input.channel.label">伴随 channel.json（可选，仅 KFBF）</label>
+        <input id="channel-input" name="channelJson" type="file" accept=".json,application/json" />
+        <p class="hint" data-i18n="tools.input.channel.hint">KFBF 的通道伴随文件（&lt;名称&gt;_kfbf/Annotations/channel.json）。只在本地读取前 1 MiB，不上传。</p>
+      </div>
+    </section>
+
+    <!-- 2 · 复制与探测 -->
+    <section class="card" id="stage-section" aria-labelledby="stage-title" hidden>
+      <h2 id="stage-title" data-i18n="tools.stage.title">2 · 复制与探测</h2>
+      <p id="stage-status" class="stage-status"></p>
+      <div id="stage-progress" class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"
+           aria-labelledby="stage-title">
+        <div class="progress-bar" id="stage-bar"></div>
+      </div>
+      <p id="stage-bytes" class="progress-bytes"></p>
+    </section>
+
+    <!-- 3 · 文件信息（探测摘要） -->
+    <section class="card" id="probe-section" aria-labelledby="probe-title" hidden>
+      <h2 id="probe-title" data-i18n="tools.probe.title">3 · 文件信息</h2>
+      <dl class="probe-grid" id="probe-grid"></dl>
+    </section>
+
+    <!-- 4 · 临时空间预估 -->
+    <section class="card" id="estimate-section" aria-labelledby="estimate-title" hidden>
+      <h2 id="estimate-title" data-i18n="tools.estimate.title">4 · 临时空间预估</h2>
+      <p class="hint" data-i18n="tools.estimate.note">临时空间约为「源文件副本 + 输出文件」：转换前会把源文件完整复制进浏览器临时存储，之后再生成输出文件；两者在任务完成并删除前同时占用。</p>
+      <dl class="probe-grid" id="estimate-grid"></dl>
+    </section>
+
+    <!-- 5 · 资源档位 -->
+    <section class="card" id="profile-section" aria-labelledby="profile-title" hidden>
+      <h2 id="profile-title" data-i18n="tools.profile.title">5 · 资源档位</h2>
+      <p id="profile-suggest" class="hint"></p>
+      <fieldset class="radio-row" id="profile-fieldset">
+        <legend class="visually-hidden" data-i18n="tools.profile.title">资源档位</legend>
+        <div class="radio-option">
+          <input type="radio" id="profile-saver" name="profile" value="saver" />
+          <label for="profile-saver"><span class="opt-title" data-i18n="tools.profile.saver">节省</span>
+            <span class="opt-desc" data-i18n="tools.profile.saver.desc">内存预算最小（192 MiB）；适合 4 GB 设备或未知设备</span></label>
+        </div>
+        <div class="radio-option">
+          <input type="radio" id="profile-balanced" name="profile" value="balanced" />
+          <label for="profile-balanced"><span class="opt-title" data-i18n="tools.profile.balanced">均衡</span>
+            <span class="opt-desc" data-i18n="tools.profile.balanced.desc">内存预算 384 MiB；适合 8 GB 桌面设备</span></label>
+        </div>
+        <div class="radio-option">
+          <input type="radio" id="profile-faster" name="profile" value="faster" />
+          <label for="profile-faster"><span class="opt-title" data-i18n="tools.profile.faster">较快</span>
+            <span class="opt-desc" data-i18n="tools.profile.faster.desc">内存预算最大（768 MiB）；建议 ≥16 GB 设备主动选择</span></label>
+        </div>
+      </fieldset>
+    </section>
+
+    <!-- 6 · 像素策略 -->
+    <section class="card" id="policy-section" aria-labelledby="policy-title" hidden>
+      <h2 id="policy-title" data-i18n="tools.policy.title">6 · 像素策略</h2>
+      <fieldset class="radio-row" id="policy-fieldset">
+        <legend class="visually-hidden" data-i18n="tools.policy.title">像素策略</legend>
+        <div class="radio-option">
+          <input type="radio" id="policy-allow-edge" name="policy" value="allow-edge" checked />
+          <label for="policy-allow-edge"><span class="opt-title" data-i18n="tools.policy.allow.edge">保留编码（允许边缘重编码）</span>
+            <span class="opt-desc" data-i18n="tools.policy.allow.edge.desc">完整 tile 原压缩字节直接搬运；边缘不完整 tile 会被重编码（该部分有损）</span></label>
+        </div>
+        <div class="radio-option">
+          <input type="radio" id="policy-strict" name="policy" value="strict-lossless" />
+          <label for="policy-strict"><span class="opt-title" data-i18n="tools.policy.strict">像素严格无损</span>
+            <span class="opt-desc" data-i18n="tools.policy.strict.desc">只要存在需要重编码/填充的 tile，核心会直接拒绝转换，绝不输出“名义无损”</span></label>
+        </div>
+      </fieldset>
+      <p id="policy-strict-warn" class="warn-panel" role="note" hidden></p>
+    </section>
+
+    <!-- 7 · 转换 -->
+    <section class="card" id="run-section" aria-labelledby="run-title" hidden>
+      <h2 id="run-title" data-i18n="tools.run.title">7 · 转换</h2>
+      <div class="run-actions">
+        <button type="button" id="convert-btn" class="btn btn-primary" data-i18n="tools.run.start">开始转换</button>
+        <button type="button" id="cancel-btn" class="btn btn-danger" data-i18n="tools.run.cancel" hidden>取消</button>
+      </div>
+      <p id="run-status" class="stage-status" aria-live="polite"></p>
+      <div id="run-progress" class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"
+           aria-labelledby="run-title" hidden>
+        <div class="progress-bar" id="run-bar"></div>
+      </div>
+      <p id="run-bytes" class="progress-bytes" hidden></p>
+    </section>
+
+    <!-- 8 · 结果与保存 -->
+    <section class="card" id="result-section" aria-labelledby="result-title" hidden>
+      <h2 id="result-title" data-i18n="tools.result.title">8 · 结果与保存</h2>
+      <p class="warn-panel" data-i18n="tools.result.not.saved.warn">注意：结果保存在浏览器内部存储（OPFS）中，还不是“已保存到磁盘”——在导出前它只是临时产物，且可能被浏览器在空间不足时清理（驱逐）。</p>
+      <dl class="probe-grid" id="result-grid"></dl>
+      <div class="run-actions">
+        <button type="button" id="save-btn" class="btn btn-primary" data-i18n="tools.result.save">保存到磁盘</button>
+        <button type="button" id="persist-btn" class="btn btn-secondary" data-i18n="tools.result.persist">申请持久存储</button>
+      </div>
+      <p id="save-status" class="status-panel" role="status"></p>
+    </section>
+
+    <!-- 任务列表 -->
+    <section class="card" aria-labelledby="jobs-title">
+      <h2 id="jobs-title" data-i18n="tools.jobs.title">任务列表（刷新后可续跑）</h2>
+      <p class="hint" data-i18n="tools.jobs.hint">续跑使用浏览器临时存储中的源副本，无需重新选择文件；保存设置（档位/策略）与上次一致。</p>
+      <div id="jobs-list" class="jobs-list"></div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <p class="footer-note" data-i18n="tools.footer">本地工具不会替你判断医学结论；输出文件请自行妥善保管。</p>
+  </footer>
+
+  <!-- 磁盘不可证明 / 不足确认（C2 §4.7：uncertain 需用户显式确认） -->
+  <dialog id="disk-dialog" aria-labelledby="disk-dialog-title">
+    <form method="dialog" class="dialog-form" id="disk-dialog-form">
+      <h2 id="disk-dialog-title"></h2>
+      <p id="disk-dialog-body"></p>
+      <div class="dialog-actions">
+        <button type="submit" id="disk-deny-btn" class="btn btn-secondary" value="cancel"
+                data-i18n="tools.disk.cancel">取消</button>
+        <button type="submit" id="disk-confirm-btn" class="btn btn-primary" value="confirm"
+                data-i18n="tools.disk.confirm">仍要继续</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

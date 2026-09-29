@@ -1,72 +1,72 @@
 {
  "date": "2026-09-29",
- "passed": 25,
- "total": 25,
+ "passed": 26,
+ "total": 26,
  "results": [
   {
    "name": "kill-worker-payload-write",
    "pass": true,
-   "ms": 2912,
+   "ms": 2918,
    "why": null
   },
   {
    "name": "reload-page-payload-write",
    "pass": true,
-   "ms": 2912,
+   "ms": 2927,
    "why": null
   },
   {
    "name": "crash-after-flush-before-journal",
    "pass": true,
-   "ms": 2899,
+   "ms": 2868,
    "why": null
   },
   {
    "name": "crash-right-after-checkpoint",
    "pass": true,
-   "ms": 2922,
+   "ms": 2928,
    "why": null
   },
   {
    "name": "crash-during-ifd-backpatch-finalize",
    "pass": true,
-   "ms": 2862,
+   "ms": 2872,
    "why": null
   },
   {
    "name": "crash-during-validation",
    "pass": true,
-   "ms": 2855,
+   "ms": 2880,
    "why": null
   },
   {
    "name": "export-interrupted-artifact-kept",
    "pass": true,
-   "ms": 567,
+   "ms": 575,
    "why": null
   },
   {
    "name": "export-reload-artifact-kept",
    "pass": true,
-   "ms": 1179,
+   "ms": 1197,
    "why": null
   },
   {
    "name": "injected-quota-error-recoverable",
    "pass": true,
-   "ms": 459,
+   "ms": 476,
    "why": null
   },
   {
    "name": "output-handle-loss-recoverable",
    "pass": true,
-   "ms": 419,
+   "ms": 470,
    "why": null
   },
   {
    "name": "staged-copy-tampered-refused",
    "pass": true,
-   "ms": 5414,
+   "ms": 5464,
    "why": null
   },
   {
@@ -78,79 +78,85 @@
   {
    "name": "crash-during-staging-cleaned",
    "pass": true,
-   "ms": 7435,
+   "ms": 7434,
    "why": null
   },
   {
    "name": "unsupported-input-not-staged",
    "pass": true,
-   "ms": 90,
+   "ms": 88,
    "why": null
   },
   {
    "name": "list-jobs-saved-settings-bare-resume",
    "pass": true,
-   "ms": 2972,
+   "ms": 2974,
+   "why": null
+  },
+  {
+   "name": "start-unjournaled-planned-job",
+   "pass": true,
+   "ms": 347,
    "why": null
   },
   {
    "name": "settings-change-refused",
    "pass": true,
-   "ms": 2867,
+   "ms": 2890,
    "why": null
   },
   {
    "name": "core-version-bump-refused",
    "pass": true,
-   "ms": 329,
+   "ms": 325,
    "why": null
   },
   {
    "name": "two-tabs-web-lock",
    "pass": true,
-   "ms": 322,
+   "ms": 333,
    "why": null
   },
   {
    "name": "opfs-jobdir-deleted-rejected",
    "pass": true,
-   "ms": 3346,
+   "ms": 3347,
    "why": null
   },
   {
    "name": "cancel-with-cleanup-failure-pending-record",
    "pass": true,
-   "ms": 3209,
+   "ms": 3215,
    "why": null
   },
   {
    "name": "cancel-latency-and-basic",
    "pass": true,
-   "ms": 3882,
+   "ms": 3890,
    "why": null
   },
   {
    "name": "repeated-terminate-reload-mixed",
    "pass": true,
-   "ms": 5698,
+   "ms": 5713,
    "why": null
   },
   {
    "name": "fl-resume-matches",
    "pass": true,
-   "ms": 2841,
+   "ms": 2850,
    "why": null
   },
   {
    "name": "fl-finalize-crash-resume",
    "pass": true,
-   "ms": 2850,
+   "ms": 2864,
    "why": null
   },
   {
    "name": "fl-reload-mid",
    "pass": true,
-   "ms": 2916,
+   "ms": 2940,
    "why": null
   }
  ]

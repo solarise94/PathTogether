@@ -42,12 +42,12 @@ finalize 阶段崩溃恢复、wire JSON 往返、撒谎 journal 拒绝、validat
 期望末行 `SMOKE PASS`；结果 `.gate-tmp/slide-tools-c2/browser/smoke/result.json`
 （browserSha256 == nativeSha256）。
 
-## 5. 故障矩阵（§10.3，25 项）
+## 5. 故障矩阵（§10.3，26 项）
 
     node tests/browser/slide_tools_c2/run_faults.js            # 全部
     node tests/browser/slide_tools_c2/run_faults.js --only kill-worker   # 单项
 
-期望：`FAULT MATRIX: 25/25 passed`；明细 `.gate-tmp/slide-tools-c2/browser/faults/results.json`
+期望：`FAULT MATRIX: 26/26 passed`；明细 `.gate-tmp/slide-tools-c2/browser/faults/results.json`
 （每项含 sha 与原生对照）。每个场景独立新开页面；确定性崩溃点来自 worker 的
 testMode fault 注入（`init{testMode:true}` 才生效，生产路径不经过）。
 

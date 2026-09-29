@@ -1,0 +1,863 @@
+// tools-slides.js — /tools/slides 本地切片工具页（C3）。
+// 页面唯一职责：UI、文件授权、设置选择与结果展示；全部转换逻辑经
+// C2 运行器（slide-transform/runner.js，页面唯一 API 面）。零第三方依赖。
+//
+// 隐私（计划 §6）：除本页自托管静态代码外不发任何网络请求；文件字节/
+// 文件名/哈希/缩略图不出浏览器；不创建平台任务。离线可用（引擎加载后）。
+//
+// 可访问性：progress 用 role=progressbar + aria-valuenow；状态文本走
+// aria-live；对话框 <dialog showModal> 原生焦点圈 + 打开者焦点还原；
+// 所有状态同时有文字，不只靠颜色。
+'use strict';
+
+import { SlideToolsRunner } from './slide-transform/runner.js';
+import * as E from './slide-transform/engine.js';
+
+const CHANNEL_JSON_MAX_BYTES = 1 << 20; // 伴随文件读取上限 1 MiB（有界）
+
+const $ = (id) => document.getElementById(id);
+const els = {
+  fileInput: $('file-input'),
+  channelInput: $('channel-input'),
+  stageSection: $('stage-section'),
+  stageStatus: $('stage-status'),
+  stageProgress: $('stage-progress'),
+  stageBar: $('stage-bar'),
+  stageBytes: $('stage-bytes'),
+  probeSection: $('probe-section'),
+  probeGrid: $('probe-grid'),
+  estimateSection: $('estimate-section'),
+  estimateGrid: $('estimate-grid'),
+  profileSection: $('profile-section'),
+  profileSuggest: $('profile-suggest'),
+  policySection: $('policy-section'),
+  policyStrictWarn: $('policy-strict-warn'),
+  runSection: $('run-section'),
+  convertBtn: $('convert-btn'),
+  cancelBtn: $('cancel-btn'),
+  runStatus: $('run-status'),
+  runProgress: $('run-progress'),
+  runBar: $('run-bar'),
+  runBytes: $('run-bytes'),
+  resultSection: $('result-section'),
+  resultGrid: $('result-grid'),
+  saveBtn: $('save-btn'),
+  persistBtn: $('persist-btn'),
+  saveStatus: $('save-status'),
+  jobsList: $('jobs-list'),
+  pageError: $('page-error'),
+  pageStatus: $('page-status'),
+  diskDialog: $('disk-dialog'),
+  diskTitle: $('disk-dialog-title'),
+  diskBody: $('disk-dialog-body'),
+  diskConfirm: $('disk-confirm-btn'),
+  diskDeny: $('disk-deny-btn'),
+};
+
+const t = (key, vars) => window.HP_I18N.t(key, vars);
+
+// ---------------------------------------------------------------- utils --
+
+function fmtBytes(n) {
+  if (!Number.isFinite(n)) return '—';
+  if (n >= 2 ** 30) return `${(n / 2 ** 30).toFixed(2)} GiB`;
+  if (n >= 2 ** 20) return `${(n / 2 ** 20).toFixed(1)} MiB`;
+  if (n >= 2 ** 10) return `${(n / 2 ** 10).toFixed(1)} KiB`;
+  return `${n} B`;
+}
+
+function errCode(e) {
+  // stError 形状 {error:{code}} 与 worker done 的裸 {code,message} 都要认
+  const c = E.errCode(e);
+  return c || (e && typeof e.code === 'string' ? e.code : null);
+}
+
+function errRawText(e) {
+  if (e && typeof e.code === 'string' && e.message) return `${e.code}: ${e.message}`;
+  return E.errText(e);
+}
+
+function friendlyError(e) {
+  const code = errCode(e);
+  const raw = errRawText(e);
+  const base = code ? t(`tools.err.${code}`) : null;
+  // t() 回退返回 key 本身 —— 视为无翻译，退回原文
+  const friendly = base && base !== `tools.err.${code}` ? base : null;
+  if (code === 'disk_precheck_failed') return raw; // 磁盘缺口由对话框/数字呈现
+  if (friendly) return `${friendly}\n(${raw})`;
+  return raw;
+}
+
+function showError(e) {
+  const text = friendlyError(e);
+  els.pageError.hidden = false;
+  els.pageError.textContent = text;
+}
+
+function clearError() {
+  els.pageError.hidden = true;
+  els.pageError.textContent = '';
+}
+
+/// 带 i18n 键的动态文案（语言切换时按保存的键重渲染，避免残留旧语言）
+function dynText(el, store, key, vars) {
+  if (key === null) {
+    store.key = null;
+    el.textContent = '';
+    return;
+  }
+  store.key = key;
+  store.vars = vars || null;
+  el.textContent = t(key, store.vars);
+}
+const stageMsg = { key: null, vars: null };
+const statusMsg = { key: null, vars: null };
+function setStageMsg(key, vars) { dynText(els.stageStatus, stageMsg, key, vars); }
+function setPageMsg(key, vars) { dynText(els.pageStatus, statusMsg, key, vars); }
+
+function setProgress(progressEl, barEl, bytesEl, frac, bytesText) {
+  const pct = Math.max(0, Math.min(100, Math.round((frac || 0) * 100)));
+  progressEl.setAttribute('aria-valuenow', String(pct));
+  barEl.style.width = `${pct}%`;
+  if (bytesEl) bytesEl.textContent = bytesText || '';
+}
+
+function dlRow(grid, term, definition, ddId) {
+  const dt = document.createElement('dt');
+  dt.textContent = term;
+  const dd = document.createElement('dd');
+  dd.textContent = definition;
+  if (ddId) dd.id = ddId;
+  grid.appendChild(dt);
+  grid.appendChild(dd);
+  return dd;
+}
+
+// ---------------------------------------------------------------- state --
+
+const page = {
+  runner: null,
+  file: null,
+  channelJson: null,       // string | null（≤1 MiB 读取结果）
+  channelJsonName: null,
+  prep: null,              // { jobId, probe, identity }
+  running: false,
+  readyInfo: null,         // { jobId, outputBytes, sha256, modality, sourceName }
+  saveSupported: typeof window.showSaveFilePicker === 'function',
+  beforeunloadOn: false,
+};
+
+// ------------------------------------------------------------ i18n glue --
+
+document.addEventListener('hp-lang-change', rerenderForLang);
+
+function rerenderForLang() {
+  document.title = t('tools.doc.title');
+  updateProfileSuggestText();
+  renderSaveStatus();
+  renderResultPanel();
+  renderJobs(page.lastJobs || []);
+  if (page.prep) renderProbeSummary();
+  if (page.busyPhaseLabelKey) els.runStatus.textContent = t(page.busyPhaseLabelKey);
+  if (stageMsg.key) els.stageStatus.textContent = t(stageMsg.key, stageMsg.vars);
+  if (statusMsg.key) els.pageStatus.textContent = t(statusMsg.key, statusMsg.vars);
+  if (runBytesMsg.key && !els.runBytes.hidden) els.runBytes.textContent = t(runBytesMsg.key, runBytesMsg.vars);
+  updateStrictWarning();
+}
+
+// ------------------------------------------------------------- dialogs --
+
+/// uncertain 磁盘确认：返回 true（确认继续）/ false（取消）。焦点进入对话框，
+/// 关闭后还原到打开者（键盘可达；Esc = 取消）。
+function askDiskConfirm({ title, body, confirmLabel }) {
+  return new Promise((resolve) => {
+    const opener = document.activeElement;
+    els.diskTitle.textContent = title;
+    els.diskBody.textContent = body;
+    els.diskConfirm.textContent = confirmLabel || t('tools.disk.confirm');
+    els.diskDeny.textContent = t('tools.disk.cancel');
+    const done = (answer) => {
+      els.diskDialog.removeEventListener('close', onClose);
+      els.diskDialog.close();
+      els.diskDialog.removeEventListener('cancel', onCancel);
+      if (opener && opener.focus) opener.focus();
+      resolve(answer);
+    };
+    const onClose = () => {
+      const a = els.diskDialog.returnValue === 'confirm';
+      els.diskDialog.removeEventListener('cancel', onCancel);
+      if (opener && opener.focus) opener.focus();
+      resolve(a);
+    };
+    const onCancel = (ev) => { ev.preventDefault(); done(false); };
+    els.diskDialog.addEventListener('close', onClose);
+    els.diskDialog.addEventListener('cancel', onCancel);
+    els.diskDialog.showModal();
+    els.diskDeny.focus();
+  });
+}
+
+async function probeWithDiskFlow(file, opts = {}) {
+  const confirmOverride = opts.confirmUncertainDisk || false;
+  try {
+    return await page.runner.probe(file, { confirmUncertainDisk: confirmOverride });
+  } catch (e) {
+    if (errCode(e) === 'disk_precheck_failed') {
+      const info = (e && e.error) || {};
+      if (info.uncertain) {
+        const ok = await askDiskConfirm({
+          title: t('tools.disk.title'),
+          body: t('tools.disk.body', {
+            need: fmtBytes(info.need && info.need.total),
+            available: fmtBytes(info.available),
+          }),
+        });
+        if (!ok) throw e;
+        return await page.runner.probe(file, { confirmUncertainDisk: true });
+      }
+    }
+    throw e;
+  }
+}
+
+// --------------------------------------------------------------- probe --
+
+function resetFlowPanels() {
+  clearError();
+  page.prep = null;
+  page.readyInfo = null;
+  for (const el of [els.probeSection, els.estimateSection, els.profileSection,
+    els.policySection, els.resultSection]) el.hidden = true;
+  els.runSection.hidden = true;
+  els.convertBtn.disabled = true;
+  els.runStatus.textContent = '';
+  els.runProgress.hidden = true;
+  els.runBytes.hidden = true;
+  els.stageSection.hidden = true;
+}
+
+async function onFilePicked() {
+  const file = els.fileInput.files && els.fileInput.files[0];
+  if (!file) return;
+  // 离开上一个未完成任务：留在任务列表里可续跑/删除
+  resetFlowPanels();
+  page.file = file;
+  await readChannelJsonInput();
+  await runProbeFlow();
+}
+
+async function readChannelJsonInput() {
+  page.channelJson = null;
+  page.channelJsonName = null;
+  const f = els.channelInput.files && els.channelInput.files[0];
+  if (!f) return;
+  if (f.size > CHANNEL_JSON_MAX_BYTES) {
+    setPageMsg('tools.channel.too.large');
+    return;
+  }
+  try {
+    page.channelJson = await f.slice(0, CHANNEL_JSON_MAX_BYTES).text();
+    page.channelJsonName = f.name;
+  } catch {
+    page.channelJson = null;
+    setPageMsg('tools.channel.read.failed');
+  }
+}
+
+async function runProbeFlow() {
+  clearError();
+  els.stageSection.hidden = false;
+  setStageMsg('tools.stage.status');
+  setProgress(els.stageProgress, els.stageBar, els.stageBytes, 0, `0 / ${fmtBytes(page.file.size)}`);
+  setBeforeunload(true);
+  try {
+    const prep = await probeWithDiskFlow(page.file);
+    page.prep = prep;
+    renderProbeSummary();
+  } catch (e) {
+    setBeforeunload(false);
+    setStageMsg(null);
+    const code = errCode(e);
+    const info = (e && e.error) || {};
+    if (code === 'disk_precheck_failed') {
+      els.pageError.hidden = false;
+      els.pageError.textContent = (info.uncertain
+        ? t('tools.disk.cancelled.note')
+        : t('tools.disk.hard.title') + '\n' + t('tools.disk.hard.body', {
+          need: fmtBytes(info.need && info.need.total),
+          available: fmtBytes(info.available),
+        })) + `\n(${E.errText(e)})`;
+    } else {
+      showError(e);
+    }
+    if (code === 'unsupported_input') els.stageSection.hidden = true;
+    refreshJobs();
+    return;
+  }
+  setBeforeunload(false);
+  setStageMsg('tools.stage.done');
+  setProgress(els.stageProgress, els.stageBar, els.stageBytes, 1,
+    `${fmtBytes(page.file.size)} / ${fmtBytes(page.file.size)}`);
+  els.probeSection.hidden = false;
+  els.estimateSection.hidden = false;
+  els.profileSection.hidden = false;
+  els.policySection.hidden = false;
+  els.runSection.hidden = false;
+  els.convertBtn.disabled = false;
+  applyProfileSuggestion();
+  updateStrictWarning();
+  refreshJobs();
+}
+
+function probeDoc() {
+  return page.prep && page.prep.probe ? (page.prep.probe.document || {}) : {};
+}
+
+function probeEstimate() {
+  const p = page.prep && page.prep.probe;
+  if (!p) return {};
+  return p.document && p.document.estimate ? p.document.estimate : (p.estimate || {});
+}
+
+function renderProbeSummary() {
+  if (!page.prep) return;
+  const doc = probeDoc();
+  const est = probeEstimate();
+  const isFL = doc.modality === 'fluorescence';
+  const grid = els.probeGrid;
+  grid.textContent = '';
+  dlRow(grid, t('tools.probe.format'), doc.format || '—', 'probe-format');
+  dlRow(grid, t('tools.probe.modality'), isFL ? t('tools.probe.modality.fl') : t('tools.probe.modality.bf'));
+  dlRow(grid, t('tools.probe.dims'), `${doc.width || '?'} × ${doc.height || '?'} px`);
+  const levels = (doc.levels || []).length;
+  dlRow(grid, t('tools.probe.levels'), String(levels));
+  if (isFL) {
+    const names = (doc.channels || []).map((c) => c.name || `#${c.index}`).join('、');
+    dlRow(grid, t('tools.probe.channels'), `${(doc.channels || []).length}（${names}）`);
+  } else {
+    dlRow(grid, t('tools.probe.channels'), t('tools.probe.channels.bf'));
+  }
+  // MPP：本体缺失就显示未知，绝不从 objective 猜测（计划 §2）
+  const mppX = Number(doc.mpp_x);
+  const mppY = Number(doc.mpp_y);
+  const mpp = Number(doc.mpp);
+  let mppText = t('tools.probe.mpp.unknown');
+  if (isFL) {
+    if (mpp > 0) mppText = `${mpp.toFixed(4)} µm/px`;
+  } else if (mppX > 0 && mppY > 0) {
+    mppText = mppX === mppY
+      ? `${mppX.toFixed(4)} µm/px`
+      : `${mppX.toFixed(4)} × ${mppY.toFixed(4)} µm/px`;
+  }
+  dlRow(grid, t('tools.probe.mpp'), mppText, 'probe-mpp');
+  const edge = Number(est.edge_tiles || 0);
+  dlRow(grid, t('tools.probe.edge'), edge > 0
+    ? t('tools.probe.edge.note', { n: edge })
+    : t('tools.probe.edge.none'), 'probe-edge');
+  const missing = Number(est.cells_missing || 0);
+  if (missing > 0) {
+    dlRow(grid, t('tools.probe.missing'), t('tools.probe.missing.note', { n: missing }));
+  }
+  dlRow(grid, t('tools.probe.identity.sha'), String(page.prep.identity.sha256 || '—'));
+
+  // 空间预估：源副本 + 输出（上界）+ 索引/日志（来自 engine.diskNeedBytes）
+  const need = E.diskNeedBytes(est, { sourceBytes: page.prep.identity.size });
+  const eg = els.estimateGrid;
+  eg.textContent = '';
+  dlRow(eg, t('tools.estimate.source'), fmtBytes(need.source), 'estimate-source');
+  dlRow(eg, t('tools.estimate.output'), fmtBytes(need.output), 'estimate-output');
+  dlRow(eg, t('tools.estimate.scratch'), fmtBytes(need.scratch + need.journal));
+  dlRow(eg, t('tools.estimate.total'), fmtBytes(need.total), 'estimate-total');
+}
+
+// ------------------------------------------------------- profile/policy --
+
+function applyProfileSuggestion() {
+  const suggested = E.defaultProfileId(navigator.deviceMemory, navigator.hardwareConcurrency);
+  const radio = document.getElementById(`profile-${suggested}`);
+  if (radio) radio.checked = true;
+  updateProfileSuggestText();
+}
+
+function updateProfileSuggestText() {
+  const suggested = E.defaultProfileId(navigator.deviceMemory, navigator.hardwareConcurrency);
+  els.profileSuggest.textContent = t('tools.profile.suggest', {
+    name: t(`tools.profile.${suggested}`),
+    dm: navigator.deviceMemory === undefined ? '—' : String(navigator.deviceMemory),
+  });
+}
+
+function selectedProfileId() {
+  const checked = document.querySelector('input[name="profile"]:checked');
+  return checked ? checked.value : E.defaultProfileId(navigator.deviceMemory);
+}
+
+function selectedPolicy() {
+  const checked = document.querySelector('input[name="policy"]:checked');
+  return checked ? checked.value : 'allow-edge';
+}
+
+function updateStrictWarning() {
+  const est = probeEstimate();
+  const willRefuse = Number(est.edge_tiles || 0) > 0;
+  els.policyStrictWarn.hidden = !willRefuse;
+  if (willRefuse) {
+    els.policyStrictWarn.textContent = t('tools.policy.strict.warn', {
+      n: Number(est.edge_tiles || 0),
+    });
+  }
+}
+
+document.querySelectorAll('input[name="policy"]').forEach((r) => {
+  r.addEventListener('change', updateStrictWarning);
+});
+
+// -------------------------------------------------------------- convert --
+
+const PHASE_LABEL_KEY = {
+  selected: 'tools.phase.selected',
+  probing: 'tools.phase.probing',
+  planned: 'tools.phase.planned',
+  running: 'tools.phase.running',
+  paused: 'tools.phase.paused',
+  finalizing: 'tools.phase.finalizing',
+  validating: 'tools.phase.validating',
+  ready: 'tools.phase.ready',
+  exported: 'tools.phase.exported',
+  failed: 'tools.phase.failed',
+  cancelled: 'tools.phase.cancelled',
+  cleanup_pending: 'tools.phase.cleanup_pending',
+};
+
+function phaseText(state) {
+  const key = PHASE_LABEL_KEY[state];
+  page.busyPhaseLabelKey = key;
+  return key ? t(key) : state;
+}
+
+async function onConvert() {
+  if (!page.prep || !page.file) return;
+  clearError();
+  els.convertBtn.disabled = true;
+  els.fileInput.disabled = true;
+  els.channelInput.disabled = true;
+  els.cancelBtn.hidden = false;
+  els.runProgress.hidden = false;
+  els.runBytes.hidden = false;
+  setProgress(els.runProgress, els.runBar, els.runBytes, 0, '');
+  els.runStatus.textContent = phaseText('planned');
+  setBeforeunload(true);
+  page.running = true;
+  try {
+    const { jobId, done } = await page.runner.startJob(page.file, {
+      jobId: page.prep.jobId,
+      profileId: selectedProfileId(),
+      policy: selectedPolicy(),
+      channelJson: page.channelJson || undefined,
+    });
+    page.prep.jobId = jobId;
+    const result = await done;
+    page.running = false;
+    setBeforeunload(false);
+    els.cancelBtn.hidden = true;
+    els.fileInput.disabled = false;
+    els.channelInput.disabled = false;
+    if (result && result.ok) {
+      els.runStatus.textContent = phaseText('ready');
+      setProgress(els.runProgress, els.runBar, els.runBytes, 1, '');
+      setRunBytes('tools.run.done.bytes', { bytes: fmtBytes(result.result.output_bytes) });
+      page.readyInfo = {
+        jobId,
+        outputBytes: result.result.output_bytes,
+        sha256: result.validation && result.validation.sha256,
+        modality: probeDoc().modality,
+        sourceName: page.file.name,
+      };
+      renderResultPanel();
+      renderSaveStatus();
+    } else if (result && result.type === 'cancelled') {
+      els.runStatus.textContent = phaseText('cancelled');
+      setPageMsg('tools.run.cancelled.note');
+      els.convertBtn.disabled = false;
+    } else {
+      const err = (result && result.error) || { code: 'io_recoverable', message: 'unknown' };
+      els.runStatus.textContent = phaseText('failed');
+      showError(err);
+      els.convertBtn.disabled = false;
+    }
+  } catch (e) {
+    page.running = false;
+    setBeforeunload(false);
+    els.cancelBtn.hidden = true;
+    els.fileInput.disabled = false;
+    els.channelInput.disabled = false;
+    els.runStatus.textContent = phaseText('failed');
+    showError(e);
+    els.convertBtn.disabled = false;
+  }
+  refreshJobs();
+}
+
+async function onCancel() {
+  // ≤250ms 反馈：cancelJob 同步翻转状态并终止 worker，随后清理任务目录
+  els.runStatus.textContent = phaseText('cancelled');
+  els.cancelBtn.disabled = true;
+  try {
+    const r = await page.runner.cancelJob();
+    setPageMsg('tools.run.cancel.cleanup', { state: r.cleanup });
+  } finally {
+    els.cancelBtn.disabled = false;
+    els.cancelBtn.hidden = true;
+    els.convertBtn.disabled = false;
+    els.runProgress.hidden = true;
+    els.runBytes.hidden = true;
+  }
+  refreshJobs();
+}
+
+// ---------------------------------------------------------------- ready --
+
+function suggestedOutputName() {
+  if (!page.readyInfo) return 'output.tif';
+  const base = (page.readyInfo.sourceName || 'slide').replace(/\.(kfb|kfbf)$/i, '');
+  return page.readyInfo.modality === 'fluorescence' ? `${base}.ome.tif` : `${base}.tif`;
+}
+
+function renderResultPanel() {
+  if (!page.readyInfo) { els.resultSection.hidden = true; return; }
+  els.resultSection.hidden = false;
+  const g = els.resultGrid;
+  g.textContent = '';
+  dlRow(g, t('tools.result.size'), fmtBytes(page.readyInfo.outputBytes), 'result-size');
+  dlRow(g, t('tools.result.sha256'), String(page.readyInfo.sha256 || '—'), 'result-sha');
+}
+
+function renderSaveStatus() {
+  const supported = typeof window.showSaveFilePicker === 'function';
+  els.saveBtn.disabled = !supported || !page.readyInfo;
+  els.saveBtn.setAttribute('aria-disabled', String(els.saveBtn.disabled));
+  if (!supported) {
+    els.saveStatus.textContent = t('tools.result.save.unsupported');
+    return;
+  }
+  if (page.saveMsg) {
+    els.saveStatus.textContent = t(page.saveMsg.key, page.saveMsg.vars || {});
+  } else if (els.saveStatus.dataset.busy !== '1') {
+    els.saveStatus.textContent = '';
+  }
+}
+
+async function onSave() {
+  if (typeof window.showSaveFilePicker !== 'function') return;
+  clearError();
+  els.saveBtn.disabled = true;
+  els.saveStatus.dataset.busy = '1';
+  page.saveMsg = null;
+  els.saveStatus.textContent = t('tools.result.save.working');
+  try {
+    // 必须在用户手势内请求 picker（Chromium 手势约束）
+    const handle = await window.showSaveFilePicker({
+      suggestedName: suggestedOutputName(),
+      types: [{
+        description: 'TIFF',
+        accept: { 'image/tiff': ['.tif', '.tiff'] },
+      }],
+    });
+    const r = await page.runner.exportJob(page.readyInfo.jobId, () => handle.createWritable());
+    page.saveMsg = { key: 'tools.result.save.done', vars: { bytes: fmtBytes(r.exportedBytes) } };
+    els.saveStatus.textContent = t('tools.result.save.done', { bytes: fmtBytes(r.exportedBytes) });
+    setPageMsg(null);
+  } catch (e) {
+    if (e && e.name === 'AbortError') {
+      els.saveStatus.textContent = t('tools.result.save.aborted');
+    } else {
+      els.saveStatus.textContent = t('tools.result.save.failed');
+      showError(e);
+    }
+  } finally {
+    delete els.saveStatus.dataset.busy;
+    renderSaveStatus();
+    refreshJobs();
+  }
+}
+
+async function onPersist() {
+  // 仅在用户手势内请求；如实报告结果（可能被拒绝）
+  els.persistBtn.disabled = true;
+  let granted = false;
+  try {
+    granted = await navigator.storage.persist();
+  } catch {
+    granted = false;
+  }
+  els.saveStatus.textContent = granted
+    ? t('tools.result.persist.granted')
+    : t('tools.result.persist.denied');
+  els.persistBtn.disabled = false;
+}
+
+// ------------------------------------------------------------- job list --
+
+const STATE_TONE = {
+  ready: 'ok', exported: 'ok',
+  failed: 'err', cancelled: 'err', cleanup_pending: 'warn',
+  running: 'run', validating: 'run', finalizing: 'run', paused: 'warn',
+  staging: 'warn', prepared: 'ok', planned: 'run', probing: 'run',
+};
+
+function stateLabel(state) {
+  const key = `tools.jobs.state.${state}`;
+  const s = t(key);
+  return s === key ? state : s;
+}
+
+const JOB_ACTION_LABEL_KEY = {
+  start: 'tools.jobs.action.start',
+  resume: 'tools.jobs.action.resume',
+  export: 'tools.jobs.action.export',
+  wait: 'tools.jobs.action.wait',
+  discard: 'tools.jobs.action.discard',
+};
+
+function renderJobs(jobs) {
+  page.lastJobs = jobs;
+  els.jobsList.textContent = '';
+  if (!jobs.length) {
+    const p = document.createElement('p');
+    p.className = 'jobs-empty';
+    p.textContent = t('tools.jobs.empty');
+    els.jobsList.appendChild(p);
+    return;
+  }
+  for (const job of jobs) {
+    const row = document.createElement('article');
+    row.className = 'job-row';
+    row.dataset.jobId = job.id;
+    row.dataset.nextAction = job.nextAction;
+
+    const head = document.createElement('div');
+    head.className = 'job-row-head';
+    const name = document.createElement('p');
+    name.className = 'job-name';
+    name.textContent = (job.source && job.source.name) || job.id;
+    const st = document.createElement('span');
+    st.className = 'job-state';
+    // the record says planned/paused while this tab's worker is converting
+    const shownState = job.active ? 'running' : job.state;
+    st.dataset.tone = STATE_TONE[shownState] || '';
+    st.textContent = stateLabel(shownState);
+    head.appendChild(name);
+    head.appendChild(st);
+    row.appendChild(head);
+
+    const meta = document.createElement('p');
+    meta.className = 'job-meta';
+    const size = job.source ? fmtBytes(job.source.size) : '—';
+    // committed progress only means something for a run that can continue
+    meta.textContent = (job.nextAction === 'resume' || job.nextAction === 'wait')
+      ? t('tools.jobs.meta', { size, committed: fmtBytes(job.committedBytes || 0) })
+      : t('tools.jobs.meta.source', { size });
+    if (job.result && job.result.outputBytes) {
+      meta.textContent += ` · ${t('tools.jobs.result.size', { bytes: fmtBytes(job.result.outputBytes) })}`;
+    }
+    if (job.settings && job.settings.profileId) {
+      meta.textContent += ` · ${t('tools.jobs.settings', {
+        profile: t(`tools.profile.${job.settings.profileId}`),
+        policy: t(`tools.jobs.policy.${job.settings.policy}`),
+      })}`;
+    }
+    row.appendChild(meta);
+
+    const actions = document.createElement('div');
+    actions.className = 'job-actions';
+    const primary = job.nextAction;
+    if (primary !== 'discard') {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = primary === 'export' ? 'btn btn-primary' : 'btn btn-secondary';
+      btn.dataset.action = primary;
+      btn.textContent = t(JOB_ACTION_LABEL_KEY[primary]);
+      btn.disabled = primary === 'export' && typeof window.showSaveFilePicker !== 'function';
+      btn.addEventListener('click', () => onJobAction(primary, job));
+      actions.appendChild(btn);
+    }
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'btn btn-danger';
+    del.dataset.action = 'discard';
+    del.textContent = t('tools.jobs.action.discard');
+    del.setAttribute('data-job-discard', job.id);
+    del.addEventListener('click', () => onJobAction('discard', job));
+    actions.appendChild(del);
+    row.appendChild(actions);
+
+    els.jobsList.appendChild(row);
+  }
+}
+
+async function onJobAction(action, job) {
+  clearError();
+  try {
+    if (action === 'discard') {
+      if (!window.confirm(t('tools.jobs.discard.confirm'))) return;
+      await page.runner.discardJob(job.id);
+      refreshJobs();
+      return;
+    }
+    if (action === 'export') {
+      if (typeof window.showSaveFilePicker !== 'function') return;
+      const base = (job.source && job.source.name || 'slide').replace(/\.(kfb|kfbf)$/i, '');
+      const handle = await window.showSaveFilePicker({
+        suggestedName: job.modality === 'fluorescence' ? `${base}.ome.tif` : `${base}.tif`,
+        types: [{ description: 'TIFF', accept: { 'image/tiff': ['.tif', '.tiff'] } }],
+      });
+      const r = await page.runner.exportJob(job.id, () => handle.createWritable());
+      page.saveMsg = { key: 'tools.result.save.done', vars: { bytes: fmtBytes(r.exportedBytes) } };
+      renderSaveStatus();
+      refreshJobs();
+      return;
+    }
+    if (action === 'start' || action === 'resume') {
+      // prepared/paused 任务：源副本已在浏览器临时存储，无需重选文件。
+      // resume 不传设置 → 沿用任务保存的档位/策略；start（prepared）用当前界面选择。
+      els.runSection.hidden = false;
+      els.cancelBtn.hidden = false;
+      els.runProgress.hidden = false;
+      els.runBytes.hidden = false;
+      els.runStatus.textContent = phaseText(action === 'resume' ? 'paused' : 'planned');
+      setBeforeunload(true);
+      const started = action === 'resume'
+        ? await page.runner.resumeJob(job.id)
+        : await page.runner.startJob(null, {
+          jobId: job.id,
+          profileId: selectedProfileId(),
+          policy: selectedPolicy(),
+          channelJson: (job.settings && job.settings.channelJson) || undefined,
+        });
+      const result = await started.done;
+      setBeforeunload(false);
+      els.cancelBtn.hidden = true;
+      els.runProgress.hidden = true;
+      els.runBytes.hidden = true;
+      if (result && result.ok) {
+        els.runStatus.textContent = phaseText('ready');
+        page.readyInfo = {
+          jobId: job.id,
+          outputBytes: result.result.output_bytes,
+          sha256: result.validation && result.validation.sha256,
+          modality: job.modality,
+          sourceName: job.source && job.source.name,
+        };
+        page.saveMsg = null;
+        renderResultPanel();
+        renderSaveStatus();
+      } else if (result && result.type === 'cancelled') {
+        els.runStatus.textContent = phaseText('cancelled');
+      } else {
+        els.runStatus.textContent = phaseText('failed');
+        showError((result && result.error) || { code: 'io_recoverable', message: 'job failed' });
+      }
+      refreshJobs();
+    }
+  } catch (e) {
+    showError(e);
+    setBeforeunload(false);
+    els.cancelBtn.hidden = true;
+    els.runProgress.hidden = true;
+    els.runBytes.hidden = true;
+    refreshJobs();
+  }
+}
+
+async function refreshJobs() {
+  try {
+    const jobs = await page.runner.listJobs();
+    renderJobs(jobs);
+  } catch (e) {
+    console.warn('listJobs failed', e);
+  }
+}
+
+// --------------------------------------------------------- beforeunload --
+
+function setBeforeunload(on) {
+  page.beforeunloadOn = on;
+}
+
+window.addEventListener('beforeunload', (ev) => {
+  if (page.beforeunloadOn) {
+    ev.preventDefault();
+    ev.returnValue = '';
+  }
+});
+
+// ---------------------------------------------------------------- init --
+
+async function init() {
+  document.title = t('tools.doc.title');
+  renderSaveStatus();
+  try {
+    page.runner = await SlideToolsRunner.create();
+  } catch (e) {
+    setPageMsg('tools.init.failed');
+    showError(e);
+    return;
+  }
+  page.runner.on('progress', onProgress);
+  page.runner.on('state', onRunnerState);
+  refreshJobs();
+
+  els.fileInput.addEventListener('change', () => { onFilePicked(); });
+  els.convertBtn.addEventListener('click', () => { onConvert(); });
+  els.cancelBtn.addEventListener('click', () => { onCancel(); });
+  els.saveBtn.addEventListener('click', () => { onSave(); });
+  els.persistBtn.addEventListener('click', () => { onPersist(); });
+  // 测试/诊断可观测钩子（不承载任何逻辑）
+  window.__stToolsReady = true;
+}
+
+const runBytesMsg = { key: null, vars: null };
+function setRunBytes(key, vars) {
+  runBytesMsg.key = key;
+  runBytesMsg.vars = vars;
+  els.runBytes.textContent = t(key, vars);
+}
+
+function onProgress(p) {
+  if (p.unit === 'stage') {
+    const frac = p.total ? p.done / p.total : 0;
+    els.stageSection.hidden = false;
+    setProgress(els.stageProgress, els.stageBar, els.stageBytes, frac,
+      `${fmtBytes(p.done)} / ${fmtBytes(p.total)}`);
+    return;
+  }
+  if (p.unit === 'level') {
+    const frac = p.total ? p.done / p.total : 0;
+    setProgress(els.runProgress, els.runBar, els.runBytes, frac, '');
+    setRunBytes('tools.run.progress.level', {
+      done: p.done, total: p.total,
+      bytes: fmtBytes(p.committed_bytes || 0),
+    });
+  } else if (p.unit === 'tile-row') {
+    setRunBytes('tools.run.progress.row', {
+      level: p.level, done: p.done, total: p.total,
+      bytes: fmtBytes(p.committed_bytes || 0),
+    });
+  }
+}
+
+function onRunnerState(s) {
+  if (!s || !s.to) return;
+  if (['running', 'finalizing', 'validating', 'probing', 'planned'].includes(s.to)) {
+    els.runStatus.textContent = phaseText(s.to);
+  }
+  if (s.to === 'running' || s.to === 'finalizing' || s.to === 'validating') {
+    refreshJobs();
+  }
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', init);
+} else {
+  init();
+}

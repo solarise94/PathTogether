@@ -6,15 +6,15 @@ PASS [csp-real-app] {"csp":"default-src 'none'; script-src 'self' 'wasm-unsafe-e
 PASS [b-kfbf-happy-path] {"savedSha256":"910d170ecf66a9b3881d458d8c7d84554e9c5a7c68a365d5190547a035cd584b","nativeSha256":"910d170ecf66a9b3881d458d8c7d84554e9c5a7c68a365d5190547a035cd584b","savedBytes":134114,"displayWindows":{"ch0":"13–227（来自 channel.json）","ch1":"16–175（来自 channel.json）"}}
 [b] 0.6s
 PASS [c-refresh-resume] {"savedSha256":"cefec34e8786ef1a36d87423fc70eb86500322e46244f3059fffc923c6788be5","nativeSha256":"cefec34e8786ef1a36d87423fc70eb86500322e46244f3059fffc923c6788be5","beforeunloadSeen":true}
-[c] 65.5s
+[c] 65.8s
 PASS [d1-uncertain-disk] {"dialogNumbers":true,"focusInDialog":true,"focusRestored":true,"cancelLeftNoDir":true,"confirmProceeded":true,"dirsAfterReloadSweep":[]}
 PASS [d2-uncertain-real-quota] {"note":"fresh profile, real estimate hits reporting cap"}
 PASS [d3-hard-shortage] {"errText":"临时空间不足\n需要约 4.02 GiB，浏览器报告可用 1.00 GiB。请释放空间或更换磁盘后再试。\n(disk_precheck_failed: 空间不足：需要 ~4113 MiB，可用 ~1024 MiB（pre-stage）)","dialogOpen":false,"jobDirs":0}
-[d] 2.6s
-PASS [e-cancel-250ms] {"syncMs":0.2999999523162842,"paintedMs":5,"statusAfter":"已取消","jobDirsAfter":[]}
-[e] 7.2s
+[d] 2.5s
+PASS [e-cancel-250ms] {"syncMs":0.20000004768371582,"paintedMs":4.599999904632568,"statusAfter":"已取消","jobDirsAfter":[]}
+[e] 9.2s
 PASS [f-discard-and-list-start] {"startFromListShaOk":true,"jobDirsAfterDiscard":[]}
-[f] 0.7s
+[f] 0.6s
 PASS [g-strict-lossless-refusal] {"preWarningShown":true,"errText":"核心拒绝了本次转换：该输入包含需要重编码/填充的 tile，无法在“像素严格无损”策略下输出。可改用“保留编码（允许边缘重编码）”策略。\n(pixel_policy_violation: 层 0 有 4 个需要重编码/填充的非完整 tile（StrictLossless）)","jobStateAfter":"失败"}
 [g] 0.5s
 PASS [h-unsupported-input] {"jobDirs":[]}

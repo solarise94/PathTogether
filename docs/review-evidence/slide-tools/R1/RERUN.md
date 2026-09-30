@@ -9,18 +9,21 @@ scripts/build_slide_transform.sh`）；`.venv` 可用；node ≥20（仓内 node
 vitest/playwright，无新下载）。浏览器测试彼此独立起服务/浏览器，但**不要与全量
 pytest 并行**（CPU 争抢会让转换类场景超时）。
 
-## 1. R1 浏览器 e2e（本报告主证据；21 场景对齐 §3.1 验收 a–j + 审查回归 i5）
+## 1. R1 浏览器 e2e（本报告主证据；24 场景：§3.1 验收 a–j + 审查回归 i5 + 二轮修复 d4/d5/k1）
 
-    node tests/browser/slide_tools_r1/run_e2e.js              # 全部 21 场景（约 27 min）
+    node tests/browser/slide_tools_r1/run_e2e.js              # 全部 24 场景（约 30 min）
     node tests/browser/slide_tools_r1/run_e2e.js --only a-oneclick-order-network
     node tests/browser/slide_tools_r1/run_e2e.js --only i5-assoc-failure-retry   # 审查回归
+    node tests/browser/slide_tools_r1/run_e2e.js --only k1-published-repeat-clicks
+    node tests/browser/slide_tools_r1/run_e2e.js --only d4-two-users-separate-upload
+    node tests/browser/slide_tools_r1/run_e2e.js --only d5-two-users-return-to-original
     node tests/browser/slide_tools_r1/run_e2e.js --reuse-server   # 复用已在 :8963 的服务
 
 预期：逐行 `PASS [a-oneclick-order-network] … PASS [j-disk-confirm-gates-oneclick]`，
-末行 **E2E ALL PASS**（21/21）；证据 `.gate-tmp/slide-tools-r1/e2e/results.json`
+末行 **E2E ALL PASS**（24/24）；证据 `.gate-tmp/slide-tools-r1/e2e/results.json`
 （本目录 `results/r1-e2e.{txt,json}`）。
 
-被测应用：`tests/browser/slide_tools_c4/server.py` 原样复用（真实 Flask + 内嵌 PG +
+被测应用：`tests/browser/slide_tools_c4/server.py`（R1 启动时加 `--fake-cos-worker --seed-ready-slide`：第二个普通用户、进程内只做 Initiate 的假 COS 让真实 ingestion 到 uploading、一个真实 ready 切片供真实项目关联；C4 套件不带这些参数）（真实 Flask + 内嵌 PG +
 AUTH_ENABLED=True + 假 COS_BUCKET/COS_REGION/SECRET + 产品上限 900,000,000 → capability
 available）。ingestion 控制 API 与 COS 分块 PUT 由 page.route 的**有状态假后端**承担
 （R1 lib 为 C4 的字节保留版：PUT 体按分块缓冲，场景重组后与 OPFS 产物 sha256 逐字节
@@ -53,7 +56,7 @@ j-network-capture 零 `/api/`、k-offline-full-flow 离线转换+保存 sha==原
 
     TMPDIR=$PWD/.gate-tmp npx vitest run tests/js
 
-预期 **Test Files 38 passed (38) / Tests 595 passed (595)**
+预期 **Test Files 38 passed (38) / Tests 607 passed (607)**
 （`results/vitest.txt`；新增 `tests/js/r1-convert-upload.test.ts` 33 条——工作台
 KFB 入口/零请求、弹窗拦截回退、popup 交接消息形状、i18n zh/en 键契约）。
 注意：不要用裸 `npx vitest run`——会收集 `tests/e2e/*.spec.ts`（Playwright 用例，
@@ -66,8 +69,9 @@ KFB 入口/零请求、弹窗拦截回退、popup 交接消息形状、i18n zh/e
       tests/test_r1_conversion_gate.py \
       tests/test_ingestion_api.py -p no:cacheprovider -q
 
-预期 **37 passed**（`results/pytest.txt`；含新增
-`test_capability_endpoint_exposes_account`。分跑亦过：
+预期 **37 passed**（`results/pytest.txt`；含
+`test_capability_endpoint_exposes_account`（二轮起另断言 `account_label`）；加上
+`tests/test_slide_tools_page.py` 共 50 passed。分跑亦过：
 capability 单文件 10 passed；gate+ingestion 27 passed）。
 
 全量门禁（审查修复后，串行、不与浏览器测试并行）：

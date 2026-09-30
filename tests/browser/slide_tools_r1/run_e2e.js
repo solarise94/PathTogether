@@ -6,7 +6,9 @@
 //   b  转换失败 / 转换中取消：零 ingestion
 //   c  超限 / 不可查看：自动上传在创建 ingestion 前停止，产物保留可保存
 //   d  登录过期（点击前 / 上传中刷新恢复）+ 重开只显示继续动作、不自动传输
-//      + 换账号须重新确认（不确认零上传）
+//      + 换账号：上传归属原账号，不续传他人的 ingestion——选择框只给
+//        「用原账号登录」或「当前账号另起上传」（d3 管理员；d4/d5 两个普通
+//        用户走真实 ingestion 归属/授权，仅 COS 分块 PUT 被拦截）
 //   e  复制 / 转换各阶段刷新恢复（上传阶段刷新在 d2：同一 ingestion，creates==1）
 //   f  重复点击 / 第二标签 / 完成回调重放：恰一个 ingestion
 //   g  转换后、上传前取消：撤销自动上传意图（无 ingestion、产物保留）
@@ -15,6 +17,8 @@
 //      （i4 含「新项目」目标：仅发布后建项目 + 幂等键）、原生 TIFF 直传、
 //      弹窗被拦截回退
 //   j  大文件磁盘确认仍在一键链前置
+//   k  已发布任务重复触发上传：不再建 ingestion/不传字节（关联未完成只重试关联：i5）
+// i/i4 的目标关联走真实 /api/project 端点（发布的是测试库里真实的 ready 切片）。
 // 复跑：node tests/browser/slide_tools_r1/run_e2e.js（服务复用 C4 server.py）。
 'use strict';
 const path = require('path');
@@ -316,6 +320,7 @@ async function main() {
       await waitFor(async () => (await page.$('[data-action="upload-continue"]')) !== null, 60000, 'continue button');
       const createsAtReopen = fake.st.creates.length;
       const getsAtReopen = fake.st.statusGets;
+      const signsAtReopen = fake.st.signs.length;
       await page.waitForTimeout(2500);
       if (fake.st.creates.length !== createsAtReopen || fake.st.statusGets !== getsAtReopen) {
         throw new Error(`auto-transmit on load: creates=${fake.st.creates.length} gets=${fake.st.statusGets}`);
@@ -327,44 +332,220 @@ async function main() {
       await L.login(page, PORT, creds, who);
       await page.waitForFunction(() => !!window.__stToolsReady, null, { timeout: 30000 });
       await waitFor(async () => (await page.$('[data-action="upload-continue"]')) !== null, 60000, 'continue after login');
-      // 换账号场景：第一个确认对话框拒绝（不换绑、不上传），其后接受
-      let firstDialogDismissed = false;
-      const dialogs = [];
-      page.on('dialog', async (d) => {
-        dialogs.push(String(d.message()).slice(0, 24));
-        if (who !== 'user' && !firstDialogDismissed) {
-          firstDialogDismissed = true;
-          await d.dismiss().catch(() => {});
-          return;
-        }
-        await d.accept().catch(() => {});
-      });
+      // 换账号（此处为管理员 owner：服务端允许其访问他人任务，但归属与记账
+      // 仍属原用户）：不静默续传。先在选择框里取消 → 零请求；再点选择
+      // 「另起上传」→ 新 ingestion，原上传原样记入 superseded、归属不变。
+      const nativeDialogs = [];
+      page.on('dialog', async (d) => { nativeDialogs.push(d.type()); await d.dismiss().catch(() => {}); });
+      let firstIngestion = null;
       if (who !== 'user') {
+        const recBefore = (await jobRecords(page)).find((r) => r.id === jobId);
+        firstIngestion = recBefore.upload.ingestionId;
+        if (!recBefore.upload.account || recBefore.upload.account !== intent0.account) {
+          throw new Error(`upload record not bound to account: ${JSON.stringify(recBefore.upload)}`);
+        }
         await page.click('[data-action="upload-continue"]');
-        await waitFor(async () => /授权账号|authoriz/i.test(await textOf(page, '#upload-status')), 30000, 'account-changed msg');
-        if (fake.st.statusGets !== getsAtReopen) {
-          throw new Error(`upload proceeded without confirm: gets=${fake.st.statusGets}`);
+        await waitFor(async () => (await page.$('#account-dialog[open]')) !== null, 30000, 'account dialog');
+        const body = await textOf(page, '#account-dialog-body');
+        if (!body.includes(creds.userLogin) || !body.includes(creds.ownerLogin)) {
+          throw new Error(`dialog labels: ${body}`);
+        }
+        await page.click('#account-cancel-btn');
+        await waitFor(async () => /另一个账号|another account/i.test(await textOf(page, '#upload-status')), 30000, 'account-changed msg');
+        if (fake.st.statusGets !== getsAtReopen || fake.st.signs.length !== signsAtReopen) {
+          throw new Error(`upload proceeded without a choice: gets=${fake.st.statusGets}`);
         }
         await waitFor(async () => (await page.$('[data-action="upload-continue"]')) !== null, 30000, 'continue again');
+        await page.click('[data-action="upload-continue"]');
+        await waitFor(async () => (await page.$('#account-dialog[open]')) !== null, 30000, 'account dialog 2');
+        await page.click('#account-separate-btn');
+      } else {
+        await page.click('[data-action="upload-continue"]');
       }
-      await page.click('[data-action="upload-continue"]');
       await waitFor(async () => /已发布|Published/.test(await textOf(page, '#upload-status')), 120000, 'published');
-      if (fake.st.creates.length !== 1) throw new Error(`creates=${fake.st.creates.length}`);
-      const intent1 = await intentOf(page, jobId);
+      const wantCreates = who === 'user' ? 1 : 2;
+      if (fake.st.creates.length !== wantCreates) throw new Error(`creates=${fake.st.creates.length}`);
+      const rec1 = (await jobRecords(page)).find((r) => r.id === jobId);
+      const intent1 = rec1.intent;
       if (!intent1 || intent1.state !== 'done') throw new Error(`intent: ${JSON.stringify(intent1)}`);
-      if (who !== 'user' && intent1.account === intent0.account) {
-        throw new Error(`account not rebound: ${intent1.account}`);
+      if (nativeDialogs.length) throw new Error(`native dialogs: ${nativeDialogs}`);
+      let superseded = [];
+      if (who !== 'user') {
+        superseded = rec1.upload.superseded || [];
+        if (superseded.length !== 1 || superseded[0].ingestionId !== firstIngestion
+            || superseded[0].account !== intent0.account || superseded[0].state !== 'open') {
+          throw new Error(`superseded ${JSON.stringify(superseded)}`);
+        }
+        if (rec1.upload.ingestionId === firstIngestion) throw new Error('resumed the original ingestion');
+        if (intent1.account === intent0.account) throw new Error(`intent not rebound: ${intent1.account}`);
       }
       const after = await L.opfsJobSha256(page, jobId);
       if (after.sha256 !== before.sha256) throw new Error('artifact sha changed');
       record(id, true, {
-        creates: 1, accountRebound: intent1.account !== intent0.account,
-        reconfirmDialogs: dialogs.length, dismissedFirst: firstDialogDismissed,
+        creates: wantCreates, originalKeptInSuperseded: superseded.length === 1,
+        accountRebound: intent1.account !== intent0.account, nativeDialogs: 0,
       });
     } catch (e) {
       record(id, false, { error: String(e).slice(0, 400) });
     } finally {
       hold = false;
+      await context.close();
+    }
+  }
+
+  // ----------------------------------------------- (k1) 发布后重复点击 --
+  // 已发布且意图 done：结果面板不再给上传按钮；即使直接触发上传动作（含隐藏
+  // 按钮的 DOM click），也不再拉能力、不建 ingestion、不传字节。
+  async function scenarioPublishedRepeatClicks() {
+    const id = 'k1-published-repeat-clicks';
+    const { context, page } = await L.launch(id, [L.READ_JOB_RECORDS]);
+    const fake = await L.fakeUploadRoutes(page, creds.cosOrigin, { partsCount: 2 });
+    let capGets = 0;
+    page.on('request', (r) => { if (r.url().includes('/api/tools/slides/upload-capability')) capGets++; });
+    try {
+      await L.login(page, PORT, creds, 'user');
+      await L.openTools(page, PORT);
+      const jobId = await convertFixture(page, bf);
+      await page.click('#convert-upload-btn');
+      await waitFor(async () => /已发布|Published/.test(await textOf(page, '#upload-status')), 120000, 'published');
+      await waitFor(async () => { const it = await intentOf(page, jobId); return it && it.state === 'done'; }, 30000, 'intent done');
+      await waitFor(async () => page.$eval('#upload-btn', (b) => b.hidden), 30000, 'upload button replaced');
+      const base = { creates: fake.st.creates.length, puts: fake.st.puts.length, caps: capGets };
+      await page.evaluate(() => {
+        const b = document.getElementById('upload-btn');
+        b.click(); b.click(); b.click();
+      });
+      await page.waitForTimeout(2500);
+      if (fake.st.creates.length !== base.creates || fake.st.puts.length !== base.puts) {
+        throw new Error(`re-uploaded: creates=${fake.st.creates.length} puts=${fake.st.puts.length}`);
+      }
+      if (capGets !== base.caps) throw new Error(`capability fetched again: ${capGets - base.caps}`);
+      if (!/已发布|Published/.test(await textOf(page, '#upload-status'))) throw new Error('published result not shown');
+      // 列表行：已发布、无上传/继续按钮
+      await page.reload({ waitUntil: 'load' });
+      await page.waitForFunction(() => !!window.__stToolsReady, null, { timeout: 30000 });
+      await waitFor(async () => (await page.$(`.job-row[data-job-id="${jobId}"] [data-upload-state="published"]`)) !== null, 30000, 'row published');
+      const rowButtons = await page.$$eval(`.job-row[data-job-id="${jobId}"] [data-job-upload]`, (bs) => bs.length);
+      if (rowButtons) throw new Error(`row still offers upload: ${rowButtons}`);
+      record(id, true, { creates: fake.st.creates.length, extraCreates: 0, extraPuts: 0, extraCapability: 0, rowUploadButtons: 0 });
+    } catch (e) {
+      record(id, false, { error: String(e).slice(0, 400) });
+    } finally {
+      await context.close();
+    }
+  }
+
+  // ------------------------------------ (d4/d5) 两个普通用户 × 真实授权 --
+  // ingestion 控制 API 走真实 Flask（真实 _ingestion_fetch 归属检查 +
+  // 进程内假 COS 仅做 Initiate）；只拦截 COS 分块 PUT。用户 A 上传中断，
+  // 用户 B 登录后继续：d4 选「另起上传」、d5 选「用原账号登录」。
+  async function scenarioTwoUsersRealAuthz(mode) {
+    const id = mode === 'separate' ? 'd4-two-users-separate-upload' : 'd5-two-users-return-to-original';
+    const { context, page } = await L.launch(id, [L.READ_JOB_RECORDS]);
+    const cos = await L.fakeCosPuts(context, creds.cosOrigin);
+    let who = 'user';
+    const reqs = [];
+    context.on('request', (r) => {
+      const u = new URL(r.url());
+      if (u.pathname.startsWith('/api/ingestions')) reqs.push({ who, method: r.method(), path: u.pathname });
+    });
+    try {
+      await L.login(page, PORT, creds, 'user');
+      await L.openTools(page, PORT);
+      const jobId = await convertFixture(page, bf);
+      cos.hold = true;
+      await page.click('#convert-upload-btn');
+      await waitFor(() => cos.attempts >= 1, 90000, 'first PUT attempt (real sign)');
+      const recA = (await jobRecords(page)).find((r) => r.id === jobId);
+      const idA = recA.upload && recA.upload.ingestionId;
+      if (!idA || !recA.upload.account) throw new Error(`A record ${JSON.stringify(recA.upload)}`);
+      const accountA = recA.upload.account;
+      // 上传中断（会话失效 + 重开），用户 B 登录
+      await context.clearCookies();
+      await page.reload({ waitUntil: 'load' });
+      cos.hold = false;
+      who = 'user2';
+      await L.login(page, PORT, creds, 'user2');
+      await page.waitForFunction(() => !!window.__stToolsReady, null, { timeout: 30000 });
+      await waitFor(async () => (await page.$('[data-action="upload-continue"]')) !== null, 60000, 'continue (B)');
+      await page.click('[data-action="upload-continue"]');
+      await waitFor(async () => (await page.$('#account-dialog[open]')) !== null, 30000, 'account dialog');
+      const body = await textOf(page, '#account-dialog-body');
+      if (!body.includes(creds.userLogin) || !body.includes(creds.user2Login)) throw new Error(`dialog: ${body}`);
+      const touchedA = () => reqs.filter((q) => q.who === 'user2' && q.path.includes(idA));
+      if (touchedA().length) throw new Error(`B touched A's ingestion before choosing: ${JSON.stringify(touchedA())}`);
+      if (mode === 'separate') {
+        await page.click('#account-separate-btn');
+        let idB = null;
+        await waitFor(async () => {
+          const r = (await jobRecords(page)).find((x) => x.id === jobId);
+          idB = r && r.upload && r.upload.ingestionId;
+          return idB && idB !== idA;
+        }, 60000, 'separate ingestion');
+        await waitFor(() => reqs.some((q) => q.who === 'user2' && q.method === 'POST'
+          && q.path === `/api/ingestions/${idB}/upload-complete`), 90000, 'B upload-complete');
+        if (touchedA().length) throw new Error(`B touched A's ingestion: ${JSON.stringify(touchedA())}`);
+        const recB = (await jobRecords(page)).find((x) => x.id === jobId);
+        const sup = recB.upload.superseded || [];
+        if (sup.length !== 1 || sup[0].ingestionId !== idA || sup[0].account !== accountA || sup[0].state !== 'open') {
+          throw new Error(`superseded ${JSON.stringify(sup)}`);
+        }
+        if (recB.upload.account === accountA) throw new Error('new upload bound to A');
+        // 真实授权：B 读 A 的任务 403、读自己的 200
+        const bOnA = await L.apiGet(page, `/api/ingestions/${idA}`);
+        const bOnB = await L.apiGet(page, `/api/ingestions/${idB}`);
+        if (bOnA.status !== 403 || bOnB.status !== 200) throw new Error(`B authz A=${bOnA.status} B=${bOnB.status}`);
+        await page.click('#upload-cancel-btn').catch(() => {});
+        // A 登录：原任务仍归 A、仍在 uploading；A 读 B 的任务 403；A 取消旧上传
+        await context.clearCookies();
+        who = 'user';
+        await L.login(page, PORT, creds, 'user');
+        await page.waitForFunction(() => !!window.__stToolsReady, null, { timeout: 30000 });
+        const aOnA = await L.apiGet(page, `/api/ingestions/${idA}`);
+        const aOnB = await L.apiGet(page, `/api/ingestions/${idB}`);
+        if (aOnA.status !== 200 || aOnA.body.state !== 'uploading' || aOnB.status !== 403) {
+          throw new Error(`A authz A=${aOnA.status}/${aOnA.body && aOnA.body.state} B=${aOnB.status}`);
+        }
+        const cancelBtn = `.job-row[data-job-id="${jobId}"] [data-action="superseded-cancel"]`;
+        await waitFor(async () => (await page.$(cancelBtn)) !== null, 30000, 'superseded cancel button');
+        await page.click(cancelBtn);
+        await waitFor(async () => /旧上传已取消|earlier upload was cancelled/i.test(await textOf(page, '#upload-status')), 30000, 'superseded cancelled');
+        const aOnA2 = await L.apiGet(page, `/api/ingestions/${idA}`);
+        if (aOnA2.body.state !== 'cancelled') throw new Error(`A's ingestion state ${aOnA2.body.state}`);
+        await waitFor(async () => (await page.$(cancelBtn)) === null, 30000, 'superseded note gone');
+        const creates = reqs.filter((q) => q.method === 'POST' && q.path === '/api/ingestions').length;
+        record(id, true, {
+          creates, bReadA: bOnA.status, aReadB: aOnB.status, originalStateAfterB: aOnA.body.state,
+          originalCancelledByA: true, bTouchedA: 0,
+        });
+      } else {
+        await Promise.all([
+          page.waitForURL(/\/login/, { timeout: 30000 }),
+          page.click('#account-original-btn'),
+        ]);
+        if (touchedA().length) throw new Error(`B touched A's ingestion: ${JSON.stringify(touchedA())}`);
+        const recStill = (await jobRecords(page)).find((x) => x.id === jobId);
+        if (!recStill || recStill.upload.ingestionId !== idA || (recStill.upload.superseded || []).length) {
+          throw new Error(`record changed: ${JSON.stringify(recStill && recStill.upload)}`);
+        }
+        who = 'user';
+        await L.login(page, PORT, creds, 'user');
+        await page.waitForFunction(() => !!window.__stToolsReady, null, { timeout: 30000 });
+        await waitFor(async () => (await page.$('[data-action="upload-continue"]')) !== null, 60000, 'continue (A)');
+        await page.click('[data-action="upload-continue"]');
+        await waitFor(() => reqs.some((q) => q.who === 'user' && q.method === 'POST'
+          && q.path === `/api/ingestions/${idA}/upload-complete`), 90000, 'A upload-complete on original');
+        if (await page.$('#account-dialog[open]')) throw new Error('same-account resume asked for a choice');
+        const creates = reqs.filter((q) => q.method === 'POST' && q.path === '/api/ingestions').length;
+        if (creates !== 1) throw new Error(`creates=${creates}`);
+        const aOnA = await L.apiGet(page, `/api/ingestions/${idA}`);
+        if (aOnA.status !== 200 || aOnA.body.state === 'uploading') throw new Error(`A state ${aOnA.body && aOnA.body.state}`);
+        record(id, true, { creates, resumedSameIngestion: true, stateAfterComplete: aOnA.body.state, bTouchedA: 0 });
+      }
+    } catch (e) {
+      record(id, false, { error: String(e).slice(0, 400) });
+    } finally {
+      cos.hold = false;
       await context.close();
     }
   }
@@ -652,10 +833,11 @@ async function main() {
 
   async function scenarioWorkbenchHandoff() {
     const { context, page } = await L.launch('i-workbench');
-    const fake = await L.fakeUploadRoutes(context, creds.cosOrigin, { partsCount: 3 });
-    // 目标关联端点假实现：假后端发布的 slide_id 不在真实库里，真实解析必然
-    // 404——此处记录请求（pid + slide_ids 载荷）并回成功；权限/解析语义由
-    // 服务端 pytest（tests/test_project_share*.py 等）覆盖。
+    // 假 ingestion 发布的是测试库里真实存在的 ready 切片（server.py
+    // --seed-ready-slide 合成资产）；目标关联走真实 /api/project/<pid>/slides
+    // （路由只旁观记录后放行）。
+    const fake = await L.fakeUploadRoutes(context, creds.cosOrigin,
+      { partsCount: 3, slideId: creds.readySlideId });
     const assocReqs = [];
     const handleProjectSlides = async (route) => {
       const req = route.request();
@@ -663,8 +845,7 @@ async function main() {
       const m = u.pathname.match(/^\/api\/project\/([^/]+)\/slides$/);
       if (!m || req.method() !== 'POST') return route.fallback();
       assocReqs.push({ pid: decodeURIComponent(m[1]), body: req.postDataJSON() });
-      return route.fulfill({ status: 200, contentType: 'application/json',
-        body: JSON.stringify({ pid: m[1], slides: [], slide_ids: req.postDataJSON().slide_ids || [] }) });
+      return route.fallback();
     };
     await context.route('**/api/project/*/slides', handleProjectSlides);
     try {
@@ -705,11 +886,18 @@ async function main() {
       if (assocReqs.length !== 1) throw new Error(`assoc reqs=${JSON.stringify(assocReqs)}`);
       if (assocReqs[0].pid !== pid) throw new Error(`assoc pid ${assocReqs[0].pid} != ${pid}`);
       const assocIds = (assocReqs[0].body && assocReqs[0].body.slide_ids) || [];
-      if (assocIds.length !== 1) throw new Error(`assoc slide_ids ${JSON.stringify(assocReqs[0].body)}`);
+      if (assocIds.length !== 1 || assocIds[0] !== creds.readySlideId) {
+        throw new Error(`assoc slide_ids ${JSON.stringify(assocReqs[0].body)}`);
+      }
+      // 真实项目：服务端项目详情里确有该切片
+      const proj = await L.apiGet(page, `/api/project/${encodeURIComponent(pid)}`);
+      if (proj.status !== 200 || !JSON.stringify(proj.body).includes(creds.readySlideId)) {
+        throw new Error(`real project lacks slide: ${proj.status} ${JSON.stringify(proj.body).slice(0, 200)}`);
+      }
       // 工作台收到通知（toast）
       await waitFor(async () => /本机转换并上传完成|convert-and-upload finished/.test(await textOf(page, '#toast-container')), 30000, 'workbench toast');
       record('i-workbench-handoff', true, {
-        creates: 1, projectId: pid, assocSlideIds: assocIds,
+        creates: 1, projectId: pid, assocSlideIds: assocIds, realProjectHasSlide: true,
         popupReselected: false, offerText: offerText.trim().slice(0, 20),
       });
     } catch (e) {
@@ -749,7 +937,8 @@ async function main() {
   // ------------------------------------------------------- (i4) 新项目目标 --
   async function scenarioHandoffNewProject() {
     const { context, page } = await L.launch('i4-new-project');
-    const fake = await L.fakeUploadRoutes(context, creds.cosOrigin, { partsCount: 3 });
+    const fake = await L.fakeUploadRoutes(context, creds.cosOrigin,
+      { partsCount: 3, slideId: creds.readySlideId });
     const assocReqs = [];
     let createdProjects = [];
     const handleProjectSlides = async (route) => {
@@ -758,8 +947,7 @@ async function main() {
       const m = u.pathname.match(/^\/api\/project\/([^/]+)\/slides$/);
       if (!m || req.method() !== 'POST') return route.fallback();
       assocReqs.push({ pid: decodeURIComponent(m[1]), body: req.postDataJSON() });
-      return route.fulfill({ status: 200, contentType: 'application/json',
-        body: JSON.stringify({ pid: m[1], slides: [], slide_ids: req.postDataJSON().slide_ids || [] }) });
+      return route.fallback();
     };
     const handleProjectCreate = async (route) => {
       const req = route.request();
@@ -769,9 +957,7 @@ async function main() {
         body: req.postDataJSON(),
         idem: req.headers()['idempotency-key'] || '',
       });
-      const pid = `prj_r1new_${createdProjects.length}`;
-      return route.fulfill({ status: 200, contentType: 'application/json',
-        body: JSON.stringify({ pid, name: createdProjects[0].body.name }) });
+      return route.fallback();
     };
     await context.route('**/api/project/*/slides', handleProjectSlides);
     await context.route('**/api/project/create', handleProjectCreate);
@@ -801,10 +987,16 @@ async function main() {
       if (assocReqs.length !== 1) throw new Error(`assoc reqs=${JSON.stringify(assocReqs)}`);
       if (!createdProjects[0].idem) throw new Error('create without idempotency key');
       if (createdProjects[0].body.name !== 'r1-新项目目标') throw new Error(`name ${createdProjects[0].body.name}`);
+      // 真实项目：新建项目名正确、含已发布切片
+      const proj = await L.apiGet(page, `/api/project/${encodeURIComponent(assocReqs[0].pid)}`);
+      const pj = JSON.stringify(proj.body || {});
+      if (proj.status !== 200 || !pj.includes('r1-新项目目标') || !pj.includes(creds.readySlideId)) {
+        throw new Error(`real new project: ${proj.status} ${pj.slice(0, 200)}`);
+      }
       record('i4-handoff-new-project-target', true, {
         creates: fake.st.creates.length, projectCreatedAfterPublish: true,
         idemKey: createdProjects[0].idem.slice(0, 8) + '…',
-        assocPid: assocReqs[0].pid,
+        assocPid: assocReqs[0].pid, realProjectHasSlide: true,
       });
     } catch (e) {
       record('i4-handoff-new-project-target', false, { error: String(e).slice(0, 400) });
@@ -829,7 +1021,7 @@ async function main() {
       const m = u.pathname.match(/^\/api\/project\/([^/]+)\/slides$/);
       if (!m || req.method() !== 'POST') return route.fallback();
       assocReqs.push({ pid: decodeURIComponent(m[1]), body: req.postDataJSON() });
-      if (assocReqs.length === 1) {
+      if (assocReqs.length <= 2) {
         return route.fulfill({ status: 500, contentType: 'application/json',
           body: JSON.stringify({ error: 'r1-injected-assoc-failure' }) });
       }
@@ -871,12 +1063,22 @@ async function main() {
       if (!failed.target || failed.target.project !== 'prj_r1retry_1') {
         throw new Error(`created pid not persisted: ${JSON.stringify(failed.target)}`);
       }
+      // 已发布任务上重复触发上传动作：只重试关联（第 2 次关联，仍失败），
+      // 不建 ingestion、不再建项目
+      const putsAt = fake.st.puts.length;
+      await popup.evaluate(() => document.getElementById('upload-btn').click());
+      await waitFor(() => assocReqs.length === 2, 30000, 'assoc retried by repeat click');
+      await popup.waitForTimeout(1500);
+      if (fake.st.creates.length !== 1 || fake.st.puts.length !== putsAt) {
+        throw new Error(`repeat click re-uploaded: creates=${fake.st.creates.length} puts=${fake.st.puts.length}`);
+      }
+      if (createdProjects.length !== 1) throw new Error(`repeat click created project: ${createdProjects.length}`);
       // 标签关闭/刷新后：已发布行给出重试（页面加载不自动发请求）
       await popup.reload();
       await popup.waitForFunction(() => !!window.__stToolsReady, null, { timeout: 30000 });
       const retry = popup.locator(`.job-row[data-job-id="${jobId}"] button[data-action="assoc-retry"]`);
       await waitFor(async () => (await retry.count()) === 1, 30000, 'retry button');
-      if (assocReqs.length !== 1) throw new Error(`auto-retried on load: ${assocReqs.length}`);
+      if (assocReqs.length !== 2) throw new Error(`auto-retried on load: ${assocReqs.length}`);
       await retry.click();
       await waitFor(async () => {
         const it = await intentOf(popup, jobId);
@@ -885,13 +1087,13 @@ async function main() {
       await waitFor(async () => /已发布并加入目标项目|added to the target project/.test(await textOf(popup, '#page-status')), 30000, 'associated');
       await waitFor(async () => (await retry.count()) === 0, 30000, 'retry button gone');
       const done = await intentOf(popup, jobId);
-      if (assocReqs.length !== 2) throw new Error(`assoc reqs=${assocReqs.length}`);
+      if (assocReqs.length !== 3) throw new Error(`assoc reqs=${assocReqs.length}`);
       if (assocReqs.some((r) => r.pid !== 'prj_r1retry_1')) throw new Error(`assoc pids ${JSON.stringify(assocReqs.map((r) => r.pid))}`);
       if (createdProjects.length !== 1) throw new Error(`projects created=${createdProjects.length}`);
       if (fake.st.creates.length !== 1) throw new Error(`creates=${fake.st.creates.length}`);
       if (done.projectId !== 'prj_r1retry_1' || done.assocError) throw new Error(`done intent ${JSON.stringify(done)}`);
       record('i5-assoc-failure-retry', true, {
-        creates: 1, projectsCreated: 1, assocAttempts: 2,
+        creates: 1, projectsCreated: 1, assocAttempts: 3, repeatClickRetriedAssocOnly: true,
         pendingAfterFailure: true, retryAfterReload: true, finalState: done.state,
       });
     } catch (e) {
@@ -968,6 +1170,8 @@ async function main() {
     ['d1-login-expired-before-click', scenarioLoginExpiredBefore],
     ['d2-session-loss-reopen-continue', () => scenarioSessionLossAndReopen({ who: 'user' })],
     ['d3-different-account-reconfirm', () => scenarioSessionLossAndReopen({ who: 'owner' })],
+    ['d4-two-users-separate-upload', () => scenarioTwoUsersRealAuthz('separate')],
+    ['d5-two-users-return-to-original', () => scenarioTwoUsersRealAuthz('original')],
     ['e1-refresh-during-convert', scenarioRefreshDuringConvert],
     ['e3-refresh-during-copy', scenarioRefreshDuringCopy],
     ['f1-repeated-clicks-one-ingestion', scenarioRepeatedClicks],
@@ -981,6 +1185,7 @@ async function main() {
     ['i4-handoff-new-project-target', scenarioHandoffNewProject],
     ['i5-assoc-failure-retry', scenarioAssocRetry],
     ['j-disk-confirm-gates-oneclick', scenarioDiskConfirmGates],
+    ['k1-published-repeat-clicks', scenarioPublishedRepeatClicks],
   ];
   for (const [id, fn] of all) {
     if (ONLY && id !== ONLY) continue;

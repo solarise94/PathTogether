@@ -235,6 +235,8 @@ def test_capability_endpoint_exposes_account(_iso, _cos_on, owner_client):
     r2 = owner_client.get("/api/tools/slides/upload-capability")
     assert r2.status_code == 200
     assert r2.get_json()["account"] == "user-c4b"
+    # 换账号选择框要告诉用户原上传属于哪个登录名
+    assert r2.get_json()["account_label"] == "user-c4b@x"
 
 
 def test_capability_endpoint_off_still_200_with_reason(_iso, owner_client):

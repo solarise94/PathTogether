@@ -3272,13 +3272,24 @@ def api_tools_slides_upload_capability():
     - account：当前登录 user_id（R1 一键转换并上传，drain 计划 §3.1——
       本地任务记录把上传意图绑定到授权用户；重新登录为另一账号时页面据此
       要求重新确认，不静默换账号上传。内网免登录态为空串，绑定语义退化为
-      「同一（唯一）账号」，不构成换账号绕过）。
+      「同一（唯一）账号」，不构成换账号绕过）；
+    - account_label：该账号的登录名（换账号时告诉用户原上传属于谁、该用
+      哪个账号登录回去；查不到时为空串）。
     """
     payload = _cos_upload_capability_payload(False)
+    uid = current_identity().get("user_id") or ""
+    label = ""
+    if uid:
+        try:
+            u = user_store.get_user(uid) or {}
+            label = str(u.get("login_id") or u.get("email") or "")
+        except Exception:  # noqa: BLE001 — 标签只作展示，不影响能力判定
+            label = ""
     return jsonify(
         cos_upload=payload,
         viewable_formats=list(SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS),
-        account=(current_identity().get("user_id") or ""))
+        account=uid,
+        account_label=label)
 
 
 def _plugin_ui_dir(plugin_id):

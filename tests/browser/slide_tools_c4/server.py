@@ -14,6 +14,15 @@
   该 origin 内（page.route 晚于 CSP 检查，CSP 写错即测试失败）。
 
 运行：python3 tests/browser/slide_tools_c4/server.py --port 8953 --creds <json>
+
+R1 可选项（C4 套件不用）：
+- 第二个普通用户 c4-user2（跨账号授权用例：真实 _ingestion_fetch 403）；
+- --fake-cos-worker：进程内线程把真实 ingestion 从 preparing 推进到
+  uploading（cos_ingest_worker.process_preparing + 本地假 COS 的 Initiate，
+  仅此一步——分块 PUT 仍由 page.route 拦截；completing 之后不推进）；
+- --seed-ready-slide：为 c4-user 分配一个真实 ready 切片（合成 TIFF 写入
+  id_bundle 存储路径 + mark_ready），ID 写入 creds（readySlideId），供真实
+  项目关联端点测试。
 """
 import argparse
 import atexit
@@ -33,10 +42,58 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pg_reap  # noqa: E402
 
 
+def _seed_ready_slide(owner_user_id):
+    """真实 ready 切片：allocate → 合成 TIFF 落到 id_bundle 路径 → mark_ready。"""
+    import numpy as np
+    import tifffile
+    import slide_storage
+    import slide_store
+    desc = slide_store.allocate_slide(owner_user_id, "r1-assoc-real.tif", "tif")
+    path = str(slide_storage.resolve_descriptor_path(desc))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tifffile.imwrite(path, np.full((256, 256, 3), 200, dtype=np.uint8),
+                     tile=(256, 256), photometric="rgb")
+    assert slide_store.mark_ready(desc.slide_id,
+                                  accounted_bytes=os.path.getsize(path))
+    return desc.slide_id
+
+
+class _FakeCosInitiate:
+    """只实现 Initiate（preparing → uploading 所需的唯一远端调用）。"""
+
+    def __init__(self):
+        self._n = 0
+
+    def initiate_multipart(self, key):
+        self._n += 1
+        return "fake-up-%d" % self._n
+
+
+def _start_fake_cos_preparing_worker():
+    import threading
+    import time
+    import cos_ingest_worker
+
+    fake = _FakeCosInitiate()
+
+    def loop():
+        while True:
+            try:
+                while cos_ingest_worker.process_preparing(cos=fake):
+                    pass
+            except Exception as exc:  # noqa: BLE001 — 测试服务：记录后继续
+                print("fake-cos-worker error: %r" % (exc,), file=sys.stderr)
+            time.sleep(0.2)
+
+    threading.Thread(target=loop, name="fake-cos-preparing", daemon=True).start()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8953)
     parser.add_argument("--creds", default="")
+    parser.add_argument("--fake-cos-worker", action="store_true")
+    parser.add_argument("--seed-ready-slide", action="store_true")
     args = parser.parse_args()
 
     tmp = tempfile.mkdtemp(prefix="pt-c4-tools-")
@@ -100,6 +157,16 @@ def main():
     import user_store_pg
     user_store_pg.create_user_with_total_allowance(
         "c4-user@pt.test", user_pw, display_name="C4 普通用户")
+    user2_pw = secrets.token_urlsafe(24)
+    user_store_pg.create_user_with_total_allowance(
+        "c4-user2@pt.test", user2_pw, display_name="C4 普通用户二")
+
+    ready_slide_id = ""
+    if args.seed_ready_slide:
+        ready_slide_id = _seed_ready_slide(
+            user_store_pg.get_user_by_login_id("c4-user@pt.test")["user_id"])
+    if args.fake_cos_worker:
+        _start_fake_cos_preparing_worker()
 
     creds_path = args.creds or os.path.join(
         tempfile.gettempdir(), "pt-c4-creds-%d.json" % args.port)
@@ -109,6 +176,9 @@ def main():
         "ownerPassword": owner_pw,
         "userLogin": "c4-user@pt.test",
         "userPassword": user_pw,
+        "user2Login": "c4-user2@pt.test",
+        "user2Password": user2_pw,
+        "readySlideId": ready_slide_id,
         "cosOrigin": "https://c4fake-1250000000.cos.ap-fake.myqcloud.com",
     }), encoding="utf-8")
 

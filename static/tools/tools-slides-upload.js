@@ -74,6 +74,7 @@ export function createUploadController({
     statusKey: null, statusVars: null,
     writes: Promise.resolve(),   // record.upload 写入队列（刷新列表前冲刷）
     orphans: {},                 // jobId -> 未确认取消的 ingestion id
+    publishedView: null,         // 结果面板当前显示的发布结果（语言切换重放）
   };
 
   /// 记录写入排进串行队列（收口后先冲刷再刷新列表）。返回的 Promise 如实
@@ -131,7 +132,7 @@ export function createUploadController({
 
   /// OPFS 任务记录持久化适配器：把引擎的 save/complete/remove 映射为
   /// record.upload（经 runner.setJobUpload，双槽记录串行写）。
-  function opfsStorage(jobId, filename, size) {
+  function opfsStorage(jobId, filename, size, acct) {
     return {
       save(rec) {
         if (!rec || !rec.job_id) return undefined;
@@ -139,6 +140,7 @@ export function createUploadController({
           ingestionId: rec.job_id, filename, size, state: 'uploading',
           confirmedParts: rec.confirmed || [],
           slideId: rec.slide_id || null, error: null,
+          account: acct.account, accountLabel: acct.label,
         }));
       },
       complete(id, outcome) {
@@ -247,6 +249,126 @@ export function createUploadController({
     return ok;
   }
 
+  /// 已发布任务的结果面板：上传按钮换成发布结果（slide id + 工作台链接）；
+  /// 目标项目关联未完成时附「重试加入项目」（只重试关联）。
+  function showPublished(jobId, slideId, intent, { assocRetry = true } = {}) {
+    state.publishedView = { jobId, slideId, intent };
+    const btn = document.getElementById('upload-btn');
+    if (btn && page.currentJobId === jobId) btn.hidden = true;
+    const el = document.getElementById('upload-status');
+    if (!el) return;
+    el.textContent = '';
+    el.appendChild(document.createTextNode(
+      t('tools.upload.published', { id: slideId || '—' })));
+    el.appendChild(document.createTextNode(' '));
+    const a = document.createElement('a');
+    a.href = '/app';
+    a.textContent = t('tools.upload.open.workbench');
+    el.appendChild(a);
+    state.statusKey = null;
+    if (assocRetry && intent && intent.state === 'pending' && intent.target && onPublished) {
+      el.appendChild(document.createTextNode(' '));
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'btn btn-secondary';
+      b.id = 'upload-assoc-retry-btn';
+      b.dataset.action = 'assoc-retry';
+      b.textContent = t('tools.upload.assoc.retry');
+      b.addEventListener('click', () => { startOrContinue(jobId); });
+      el.appendChild(b);
+    }
+  }
+
+  /// 无归属字段的遗留上传记录：按服务端归属探测（他人的任务 403）。
+  async function probeIngestionAccess(ingestionId) {
+    try {
+      const r = await pageApiFetch(`/api/ingestions/${encodeURIComponent(ingestionId)}`);
+      if (r.status === 403) return 'forbidden';
+      if (r.status === 401) return 'auth';
+    } catch { /* 网络问题交给续传路径处理 */ }
+    return 'ok';
+  }
+
+  /// 账号不一致时的显式选择：'original'（退出后用原账号登录）/
+  /// 'separate'（为当前账号另起上传）/ 'cancel'。
+  function chooseAccountAction({ ownerLabel, currentLabel, inflight }) {
+    const dlg = document.getElementById('account-dialog');
+    if (!dlg || typeof dlg.showModal !== 'function') return Promise.resolve('cancel');
+    const vars = {
+      owner: ownerLabel || t('tools.account.unknown'),
+      current: currentLabel || t('tools.account.unknown'),
+    };
+    const title = document.getElementById('account-dialog-title');
+    const body = document.getElementById('account-dialog-body');
+    if (title) title.textContent = t('tools.account.title');
+    if (body) {
+      body.textContent = t(inflight ? 'tools.account.body.upload'
+        : 'tools.account.body.intent', vars);
+    }
+    return new Promise((resolve) => {
+      const onClose = () => {
+        dlg.removeEventListener('close', onClose);
+        resolve(dlg.returnValue || 'cancel');
+      };
+      dlg.returnValue = '';
+      dlg.addEventListener('close', onClose);
+      dlg.showModal();
+    });
+  }
+
+  /// 「用原账号登录」：先退出当前会话（登录页对已登录会话直接跳走），
+  /// 本地任务与上传记录都保留，登录后在任务列表继续。
+  async function signOutForOriginal() {
+    try {
+      await pageApiFetch('/logout', { method: 'POST', redirect: 'manual' });
+    } catch { /* 登录页仍可手动退出 */ }
+    window.location.assign(LOGIN_URL);
+  }
+
+  /// 取消被另起上传取代的旧 ingestion——只有它的原账号有权取消（服务端
+  /// 归属检查）；成功（或服务端已无/已终态）后从待清理列表里标记完成。
+  async function cancelSuperseded(jobId, ingestionId) {
+    let cap;
+    try {
+      cap = await fetchCapability();
+    } catch {
+      setMsg('tools.upload.offline');
+      return;
+    }
+    if (cap.authRequired) {
+      setMsgWithLink('tools.upload.login.required', LOGIN_URL, 'tools.upload.login.link');
+      return;
+    }
+    const job = await runner.getJob(jobId).catch(() => null);
+    const list = (job && job.upload && job.upload.superseded) || [];
+    const entry = list.find((s) => s.ingestionId === ingestionId);
+    if (!entry) return;
+    const owner = entry.accountLabel || t('tools.account.unknown');
+    if (entry.account && cap.account !== entry.account) {
+      setMsg('tools.upload.superseded.wrong', { owner });
+      return;
+    }
+    let ok = false;
+    let status = 0;
+    try {
+      const r = await pageApiFetch(
+        `/api/ingestions/${encodeURIComponent(ingestionId)}/cancel`, { method: 'POST' });
+      status = r.status;
+      ok = r.ok || r.status === 404 || r.status === 409;
+    } catch { ok = false; }
+    if (!ok) {
+      setMsg(status === 403 ? 'tools.upload.superseded.wrong'
+        : 'tools.upload.superseded.failed', { owner });
+      return;
+    }
+    await queueWrite(() => runner.setJobUpload(jobId, {
+      superseded: list.map((s) => (s.ingestionId === ingestionId
+        ? { ...s, state: 'cancelled', cancelledAt: E.nowIso() } : s)),
+    })).catch(() => { /* 下次再点 */ });
+    setMsg('tools.upload.superseded.cancelled');
+    if (onJobsRefresh) onJobsRefresh();
+  }
+
   /// 上传/继续上传（唯一入口）。本标签 busy 守卫 + 跨标签 Web Lock：同一任务
   /// 任何时刻只有一处在上传，重复点击/多标签都不会并发创建 ingestion。
   async function startOrContinue(jobId) {
@@ -275,6 +397,21 @@ export function createUploadController({
       const job = await runner.getJob(jobId);
       if (!job || !['ready', 'exported'].includes(job.state)) return;
 
+      // ⓪ 已发布的任务绝不再建 ingestion、再传文件（在锁内读记录：另一标签
+      //    刚发布的也算）。目标项目关联仍未完成时只重试关联。
+      if (job.upload && job.upload.state === 'published') {
+        const sid = job.upload.slideId || null;
+        const it = job.intent;
+        const assocPending = !!(it && it.state === 'pending' && it.target && onPublished);
+        showPublished(jobId, sid, it, { assocRetry: !assocPending });
+        if (assocPending) {
+          try { await onPublished(jobId, sid); } catch { /* 原因已由回调显示 */ }
+          const after = await runner.getJob(jobId).catch(() => null);
+          showPublished(jobId, sid, after && after.intent);
+        }
+        return { ok: true, slideId: sid, alreadyPublished: true };
+      }
+
       // ① 能力（点击后才拉取——之前零 /api/ 请求）
       let cap;
       try {
@@ -287,20 +424,72 @@ export function createUploadController({
         setMsgWithLink('tools.upload.login.required', LOGIN_URL, 'tools.upload.login.link');
         return;
       }
-      // ①b R1 意图绑定账号核对：任务挂着待执行的上传意图，但当前登录已是
-      //     另一账号——绝不静默换账号上传；须显式确认后才重绑并继续（drain
-      //     计划 §3.1「重新登录为另一账号……须重新确认，不能自动替换」）。
+      // ①b 账号归属。进行中的上传属于创建它的账号——服务端 ingestion 的
+      //     归属与容量记账都在那个账号上，换账号续传要么被拒（403），要么
+      //     （管理员）替别人续传。待执行的自动上传意图同样绑定授权账号。
+      //     当前登录不同：不续传、不改旧上传的归属，只能退出后用原账号登录，
+      //     或显式为当前账号另起一个上传（旧上传原样记入 superseded，
+      //     由原账号取消或到期由服务端清理）。
+      const acct = {
+        account: typeof cap.account === 'string' ? cap.account : '',
+        label: typeof cap.account_label === 'string' ? cap.account_label : '',
+      };
+      let prev = job.upload;
       const intent = job.intent;
-      if (intent && intent.state === 'pending' && typeof cap.account === 'string'
-          && intent.account && cap.account !== intent.account) {
-        const ok = window.confirm(t('tools.upload.account.changed.confirm'));
-        if (!ok) {
-          setMsg('tools.upload.account.changed');
+      const inflight = !!(prev && prev.ingestionId
+        && !TERMINAL_UPLOAD_STATES.includes(prev.state));
+      let owner = null;
+      let ownerLabel = '';
+      if (inflight && prev.account) {
+        owner = prev.account;
+        ownerLabel = prev.accountLabel || '';
+      } else if (!inflight && intent && intent.state === 'pending' && intent.account) {
+        owner = intent.account;
+        ownerLabel = intent.accountLabel || '';
+      }
+      let mismatch = owner !== null && owner !== acct.account;
+      if (!mismatch && inflight && !prev.account) {
+        // 归属字段之前的记录：以服务端归属为准（他人的任务 403）
+        const probe = await probeIngestionAccess(prev.ingestionId);
+        if (probe === 'auth') {
+          setMsgWithLink('tools.upload.login.required', LOGIN_URL, 'tools.upload.login.link');
           return;
         }
-        await runner.setJobIntent(jobId, {
-          account: cap.account, reconfirmedAt: E.nowIso(),
+        mismatch = probe === 'forbidden';
+      }
+      if (mismatch) {
+        const choice = await chooseAccountAction({
+          ownerLabel, currentLabel: acct.label, inflight,
         });
+        if (choice === 'original') {
+          await signOutForOriginal();
+          return { ok: false, reason: 'account-original' };
+        }
+        if (choice !== 'separate') {
+          setMsg('tools.upload.account.changed');
+          return { ok: false, reason: 'account-mismatch' };
+        }
+        if (inflight) {
+          const superseded = (prev.superseded || []).concat([{
+            ingestionId: prev.ingestionId,
+            account: prev.account || owner || '',
+            accountLabel: prev.accountLabel || ownerLabel || '',
+            state: 'open',
+            supersededAt: E.nowIso(),
+          }]);
+          await queueWrite(() => runner.setJobUpload(jobId, {
+            ingestionId: null, state: null, confirmedParts: [], slideId: null,
+            error: null, account: acct.account, accountLabel: acct.label,
+            superseded,
+          }));
+          prev = null;
+        }
+        if (intent && intent.state === 'pending') {
+          await runner.setJobIntent(jobId, {
+            account: acct.account, accountLabel: acct.label,
+            reconfirmedAt: E.nowIso(),
+          });
+        }
       }
       const cfg = window.HP_COS_UPLOAD
         ? window.HP_COS_UPLOAD.resolveConfig(cap.cos_upload) : null;
@@ -325,7 +514,6 @@ export function createUploadController({
 
       // ④ 复用既有 ingestion：仅在无记录或非终态时续传；终态（含取消/失败）
       //    后的新建只能来自这里的显式点击
-      const prev = job.upload;
       let resumeJobId = null;
       if (prev && prev.ingestionId &&
           !TERMINAL_UPLOAD_STATES.includes(prev.state)) {
@@ -351,7 +539,7 @@ export function createUploadController({
         source,
         apiFetch: pageApiFetch,
         config: cfg,
-        storage: opfsStorage(jobId, name, file.size),
+        storage: opfsStorage(jobId, name, file.size, acct),
         resumeJobId,
         skipConfirm: true,
         confirmResume: () => true,
@@ -384,25 +572,15 @@ export function createUploadController({
       // onPublished 回调里做——那里按意图当前状态幂等处理
       await Promise.race([state.writes, new Promise((r) => setTimeout(r, 3000))]);
       const after = await runner.getJob(jobId);
-      const sid = after && after.upload && after.upload.slideId;
-      const el = document.getElementById('upload-status');
-      if (el) {
-        el.textContent = '';
-        el.appendChild(document.createTextNode(
-          t('tools.upload.published', { id: sid || '—' })));
-        el.appendChild(document.createTextNode(' '));
-        const a = document.createElement('a');
-        a.href = '/app';
-        a.textContent = t('tools.upload.open.workbench');
-        el.appendChild(a);
-      }
-      state.statusKey = 'tools.upload.published';
-      state.statusVars = { id: sid || '—' };
+      const sid = (after && after.upload && after.upload.slideId) || null;
+      showPublished(jobId, sid, after && after.intent, { assocRetry: false });
       // R1：发布收口回调（页面用它做工作台目标的关联与打开者通知）
       if (onPublished) {
-        try { await onPublished(jobId, sid || null); } catch { /* 关联失败已明示 */ }
+        try { await onPublished(jobId, sid); } catch { /* 关联失败已明示 */ }
+        const settled = await runner.getJob(jobId).catch(() => null);
+        showPublished(jobId, sid, settled && settled.intent);
       }
-      return { ok: true, slideId: sid || null };
+      return { ok: true, slideId: sid };
     } catch (err) {
       handleFailure(err, jobId);
     } finally {
@@ -450,8 +628,11 @@ export function createUploadController({
     if (!jobId) return;
     runner.getJob(jobId).then((job) => {
       const pendingIntent = job && job.intent && job.intent.state === 'pending';
-      const uploadSettled = !job || !job.upload
-        || TERMINAL_UPLOAD_STATES.includes(job.upload.state);
+      const up = job && job.upload;
+      // 已发布的任务没有「后续自动上传」可撤销（关联重试不在此列）
+      if (up && up.state === 'published') return;
+      const uploadSettled = !up || !up.ingestionId
+        || TERMINAL_UPLOAD_STATES.includes(up.state);
       if (!pendingIntent || !uploadSettled) return;
       return runner.setJobIntent(jobId, {
         state: 'revoked', revokedReason: 'user_cancel', revokedAt: E.nowIso(),
@@ -471,6 +652,7 @@ export function createUploadController({
       discardBtn.disabled = isActive;
       discardBtn.title = isActive ? t('tools.upload.discard.blocked') : '';
     }
+    renderSuperseded(job, actionsEl);
     if (up && up.state === 'published') {
       const p = document.createElement('p');
       p.className = 'job-upload-state ok';
@@ -503,7 +685,7 @@ export function createUploadController({
       }
       return;
     }
-    if (!up || TERMINAL_UPLOAD_STATES.includes(up.state)) {
+    if (!up || !up.ingestionId || TERMINAL_UPLOAD_STATES.includes(up.state)) {
       if (up && (up.state === 'failed' || up.state === 'cancelled')) {
         const p = document.createElement('p');
         p.className = 'job-upload-state err';
@@ -545,24 +727,79 @@ export function createUploadController({
     actionsEl.appendChild(btn);
   }
 
+  /// 被另起上传取代、仍未确认清理的旧 ingestion：提示归属账号 + 取消入口
+  /// （只有原账号能取消；否则服务端到期清理）。
+  function renderSuperseded(job, actionsEl) {
+    const open = ((job.upload && job.upload.superseded) || [])
+      .filter((s) => s.state === 'open');
+    for (const s of open) {
+      const p = document.createElement('p');
+      p.className = 'job-upload-state warn';
+      p.dataset.superseded = s.ingestionId;
+      p.textContent = t('tools.upload.superseded', {
+        owner: s.accountLabel || t('tools.account.unknown'),
+      });
+      p.appendChild(document.createTextNode(' '));
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'btn btn-secondary';
+      b.dataset.action = 'superseded-cancel';
+      b.dataset.ingestion = s.ingestionId;
+      b.textContent = t('tools.upload.superseded.cancel');
+      b.addEventListener('click', async () => {
+        b.disabled = true;
+        await cancelSuperseded(job.id, s.ingestionId);
+        b.disabled = false;
+      });
+      p.appendChild(b);
+      actionsEl.parentNode.insertBefore(p, actionsEl);
+    }
+  }
+
   /// 放弃遗留的未收口上传（其标签已关闭）：尽力通知服务端取消（未登录/离线
-  /// 时失败即忽略，服务端等待超时会兜底），本地随后可删除。
+  /// 时失败即忽略，服务端等待超时会兜底），本地随后可删除。被取代的旧上传
+  /// 一并尽力取消（非其账号时服务端拒绝，到期清理兜底）。
   async function abandon(job) {
-    const id = job.upload && job.upload.ingestionId;
-    if (!id) return;
-    try {
-      await pageApiFetch(`/api/ingestions/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
-    } catch { /* best effort */ }
+    const up = job.upload || {};
+    const ids = [];
+    if (up.ingestionId && !TERMINAL_UPLOAD_STATES.includes(up.state)) ids.push(up.ingestionId);
+    for (const s of (up.superseded || [])) {
+      if (s.state === 'open' && s.ingestionId) ids.push(s.ingestionId);
+    }
+    for (const id of ids) {
+      try {
+        await pageApiFetch(`/api/ingestions/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
+      } catch { /* best effort */ }
+    }
   }
 
   function rerenderForLang() {
+    const pv = state.publishedView;
+    if (pv && state.statusKey === null && pv.jobId === page.currentJobId) {
+      showPublished(pv.jobId, pv.slideId, pv.intent);
+      return;
+    }
     if (state.statusKey) setMsg(state.statusKey, state.statusVars);
   }
 
+  /// 结果面板切到某任务：已发布的任务不给上传按钮，只显示发布结果。
   function setResultJob(jobId) {
+    const changed = page.currentJobId !== jobId;
     page.currentJobId = jobId;
     const btn = document.getElementById('upload-btn');
-    if (btn) btn.disabled = state.busyJobId !== null;
+    if (btn) {
+      btn.disabled = state.busyJobId !== null;
+      if (changed) btn.hidden = false;
+    }
+    return runner.getJob(jobId).then((job) => {
+      if (page.currentJobId !== jobId || !job) return;
+      const up = job.upload;
+      if (up && up.state === 'published') {
+        showPublished(jobId, up.slideId || null, job.intent);
+      } else if (btn) {
+        btn.hidden = false;
+      }
+    }).catch(() => { /* 记录读不到：保持按钮，控制器内仍有发布守卫 */ });
   }
 
   return {

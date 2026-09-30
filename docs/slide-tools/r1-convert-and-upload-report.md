@@ -17,7 +17,8 @@
 | 超限 / 不可查看：停止自动上传、保留产物、可本地保存 | **通过** | c1/c2：creates=0、statusGets=0，原因明示，意图 pending，产物 sha 不变，保存 sha == 产物 |
 | 登录过期（点击前）：不开始转换、登录链接 | **通过** | d1：清 cookie 后点击 → 「需要登录」+ `/login?next=/tools/slides`，结果面板未出现，零意图 |
 | 登录过期（上传中）+ 刷新恢复 + 不自动传输 | **通过** | d2：重开只显示「继续上传」；再等 2.5s creates/gets 不变（加载不自动传输）；继续 → 真实 401 登录提示 → 重新登录 → **同一 ingestion**（creates=1） |
-| 换账号须重新确认 | **通过** | d3：owner 账号点「继续上传」→ 确认对话框拒绝 → 零上传（gets 不变）；再次点击接受 → 重绑账号 → 同一 ingestion 发布（creates=1） |
+| 换账号不转移上传归属（二轮修复，§8） | **通过** | d4/d5：两个普通用户、真实 ingestion 归属检查——B 续 A 的任务只能选「用原账号登录」（A 登录后续传同一 ingestion，creates=1）或「另起上传」（B 新建自己的 ingestion；A 的原任务仍归 A、仍 uploading，B 读它 403、A 读 B 的 403，A 可在列表里取消原任务）；d3：管理员同样不能静默续传他人任务 |
+| 已发布任务不再上传（二轮修复，§8） | **通过** | k1：发布且意图 done 后，结果面板上传按钮被发布结果取代；直接触发上传动作 3 次：零能力请求、零 ingestion、零 PUT；列表行无上传按钮。i5：关联未完成时重复触发只重试关联 |
 | 各阶段刷新恢复 | **通过** | e1（转换中刷新 → 「继续转换并上传」→ 发布，creates=1）；e3（复制中刷新 → 启动清扫，零 ingestion）；上传中刷新在 d2 |
 | 重复点击 / 第二标签 / 完成回调重放：恰一个 ingestion | **通过** | f1（三连击 creates=1）、f2（B 标签被 Web Lock 拒，creates=1）、f3（complete 丢失重放 completeReqs=2，creates=1） |
 | 转换后、上传前取消：撤销意图、产物保留 | **通过** | g：超限停止态点取消 → 意图 `revoked`、重开后回普通「上传到工作台」（无继续动作）、creates=0、产物 sha 不变 |
@@ -97,13 +98,22 @@ pending`（账号重绑，`account`/`reconfirmedAt` 更新）。写经 `runner.s
 语义不变）；「已发布意图视为完成」＝ intent.done，重复回调/多标签不会二建（C4 的
 Web Lock + 续传语义承接，e2e f1/f2/f3 复证）。
 
-### 2.3 账号绑定与换账号重新确认
+### 2.3 上传归属与换账号（二轮修复后，见 §8）
 
-服务端唯一改动：能力端点回 `account`（当前 user_id）。预检时把它写进意图；任何
-「继续上传」都重新拉能力并比对：不同账号 → `window.confirm` 明示「授权账号与当前
-登录不同」，拒绝即停（零上传），接受才重绑并继续（e2e d3：拒绝时 gets 不变）。
-内网免登录态 account 为空串——绑定语义退化为「同一（唯一）账号」，不构成换账号
-绕过。
+能力端点回 `account`（当前 user_id）与 `account_label`（登录名）。意图与每条上传
+记录（`record.upload.account/accountLabel`）都绑定创建它的账号——服务端 ingestion
+的归属与容量记账都在那个账号上。任何「继续上传」都重新拉能力并比对：
+
+- 同账号 → 续传同一 ingestion；
+- 不同账号 → `<dialog id="account-dialog">`：「退出并用原账号登录」（POST /logout
+  后到登录页，记录不动）/「用当前账号另起上传」（旧上传原样记入
+  `record.upload.superseded`，为当前账号新建 ingestion）/ 取消（零请求）。
+  **绝不**用新账号续传旧 ingestion、也不改旧上传的归属；
+- 缺归属字段的旧记录：续传前 GET 该 ingestion，403 即按不同账号处理。
+
+被取代的旧上传在任务列表显示归属登录名与「取消旧上传」——只有原账号能取消（服务端
+归属检查），否则服务端按 `job_deadline_at` 到期取消并清理（ingestion_store 超期
+扫描）。内网免登录态 account 为空串——绑定语义退化为「同一（唯一）账号」。
 
 ### 2.4 工作台 → 工具页交接（handoff）方案
 
@@ -217,12 +227,14 @@ Web Lock + 续传语义承接，e2e f1/f2/f3 复证）。
    Playwright 有状态假后端承担（真实 Flask 承担登录、页面、静态与 C2 转换内核）。
    服务端 ingestion 状态机/容量/权限语义由 pytest 覆盖（`tests/test_ingestion_api.py`
    等），不在浏览器 e2e 内重复。
-2. **目标关联端点在 e2e i/i4 中被假实现**：假后端发布的 slide_id（`sld_r1fake…`）
-   在真实库中不存在，真实 `POST /api/project/<pid>/slides` 必然解析失败；e2e 断言
-   的是**正确的端点、正确的 pid、正确的 slide_ids 载荷**（i4 另断言 `/api/project/create`
-   的名称与 Idempotency-Key）。权限/解析语义由既有项目 pytest 覆盖。
-3. **换账号确认用的是原生 `confirm()`**（一次点击=重新授权）。语义满足「须重新确
-   认、不静默替换」；如需与磁盘确认一致的 `<dialog>` 视觉，属后续打磨。
+2. **目标关联（二轮修复后）**：i/i4 走真实 `POST /api/project/create` 与
+   `POST /api/project/<pid>/slides`，发布的是测试库里真实的 ready 切片（测试服务
+   `--seed-ready-slide`：合成 TIFF 落 id_bundle 路径 + `mark_ready`），并用真实
+   `GET /api/project/<pid>` 核对项目里确有该切片。i5 的关联失败仍是注入的 500
+   （故障注入，不是端点替身）。COS 传输与 ingestion 发布仍是假后端。
+3. **两个普通用户的真实授权**（d4/d5）只覆盖到 `upload-complete`（服务端进入
+   `completing`）：测试服务只有进程内假 COS 的 Initiate，不推进 completing 之后
+   的远端核验与发布。
 4. **e2e a 的顺序证明**依赖 gateCreate 闸（放行时读 OPFS 记录为 ready）+ 请求日志
    （能力预检先于一切 `/api/ingestions`）；未做逐毫秒 UI 事件时间线（小夹具阶段切换
    亚秒，轮询不可靠）。
@@ -261,3 +273,38 @@ Web Lock + 续传语义承接，e2e f1/f2/f3 复证）。
 
 修复后全部复跑：R1 21/21、C4 15/15 + 工作台序列逐条一致、C3 18/18、vitest 595/595、
 C2 门禁 PASS、全量 pytest 2868 passed / 8 skipped（见 RERUN §5）。
+
+## 8. 二轮修复：已发布任务重复上传、换账号归属（2026-09-30 用户复现）
+
+用户对 339e06c 复现两处（均为现有测试未覆盖的路径）：
+
+1. **已发布任务可再次上传**：上传控制器把 `published` 当作终态中的「可新建」，
+   结果面板的上传动作在发布且意图 done 之后又建了第二个 ingestion 并重传文件。
+2. **换账号确认不转移 ingestion 归属**：确认后只改了意图的账号，仍续传旧
+   ingestion——另一普通用户收到真实服务端 403；管理员能访问，但归属与记账仍在原
+   用户。
+
+修复（`static/tools/tools-slides-upload.js`）：
+
+- 发布守卫在 `runLocked` 内、任何网络请求之前：记录已 `published` → 显示发布结果，
+  不拉能力、不建 ingestion；意图仍 pending 且有目标 → 只重试关联。结果面板
+  （`setResultJob`/`showPublished`）对已发布任务隐藏上传按钮，换成发布结果（关联
+  未完成时附「重试加入项目」）；停止态「取消」不再撤销已发布任务的意图。
+- 归属：见 §2.3。`app.py` 能力端点增加 `account_label`；模板增加 `#account-dialog`；
+  i18n 删除 `tools.upload.account.changed.confirm`，新增 `tools.account.*`、
+  `tools.upload.superseded*`。
+
+测试（先证明能抓到旧缺陷）：
+
+| 场景 | 旧控制器（339e06c）上 | 修复后 |
+|---|---|---|
+| `k1-published-repeat-clicks` | FAIL：`re-uploaded: creates=2 puts=4`（去掉 UI 断言的探针副本） | PASS |
+| `d4-two-users-separate-upload`（真实授权） | FAIL：B 对 A 的 ingestion `GET → 403` ×2（接受 confirm 的探针副本） | PASS |
+| `d5-two-users-return-to-original`（真实授权） | — | PASS（A 续传同一 ingestion 至 completing，creates=1） |
+| `d3-different-account-reconfirm`（管理员） | 原断言「同一 ingestion」即缺陷本身，已改 | PASS（creates=2，原上传留在 superseded） |
+| `i5-assoc-failure-retry` | — | PASS（关联未完成时重复触发只重试关联） |
+| `i-workbench-handoff` / `i4-handoff-new-project-target` | — | PASS（真实项目端点 + 真实切片） |
+
+测试服务（`tests/browser/slide_tools_c4/server.py`）新增：第二个普通用户、
+`--fake-cos-worker`（进程内只做 Initiate 的假 COS，真实 ingestion 可到 uploading）、
+`--seed-ready-slide`。C4 套件不带这些参数，行为不变。

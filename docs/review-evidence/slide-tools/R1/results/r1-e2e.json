@@ -46,16 +46,32 @@
   "d2-session-loss-reopen-continue": {
     "pass": true,
     "creates": 1,
+    "originalKeptInSuperseded": false,
     "accountRebound": false,
-    "reconfirmDialogs": 0,
-    "dismissedFirst": false
+    "nativeDialogs": 0
   },
   "d3-different-account-reconfirm": {
     "pass": true,
-    "creates": 1,
+    "creates": 2,
+    "originalKeptInSuperseded": true,
     "accountRebound": true,
-    "reconfirmDialogs": 2,
-    "dismissedFirst": true
+    "nativeDialogs": 0
+  },
+  "d4-two-users-separate-upload": {
+    "pass": true,
+    "creates": 2,
+    "bReadA": 403,
+    "aReadB": 403,
+    "originalStateAfterB": "uploading",
+    "originalCancelledByA": true,
+    "bTouchedA": 0
+  },
+  "d5-two-users-return-to-original": {
+    "pass": true,
+    "creates": 1,
+    "resumedSameIngestion": true,
+    "stateAfterComplete": "completing",
+    "bTouchedA": 0
   },
   "e1-refresh-during-convert": {
     "pass": true,
@@ -90,15 +106,16 @@
     "pass": true,
     "apiCalls": 0,
     "crossOrigin": 0,
-    "jobId": "job-25fd450e5e1ba3ab"
+    "jobId": "job-f201c2aec923a5c1"
   },
   "i-workbench-handoff": {
     "pass": true,
     "creates": 1,
-    "projectId": "prj_c7DY_cZrliXrog",
+    "projectId": "prj_wBZemrbQwS5xaQ",
     "assocSlideIds": [
-      "sld_r1fake00000000000000001"
+      "sld_TE2jL9mpABGW"
     ],
+    "realProjectHasSlide": true,
     "popupReselected": false,
     "offerText": "在本机转换并上传"
   },
@@ -117,14 +134,16 @@
     "pass": true,
     "creates": 1,
     "projectCreatedAfterPublish": true,
-    "idemKey": "2a11ef41…",
-    "assocPid": "prj_r1new_1"
+    "idemKey": "cb1ee8a8…",
+    "assocPid": "prj_z8PriEb8V6oG0w",
+    "realProjectHasSlide": true
   },
   "i5-assoc-failure-retry": {
     "pass": true,
     "creates": 1,
     "projectsCreated": 1,
-    "assocAttempts": 2,
+    "assocAttempts": 3,
+    "repeatClickRetriedAssocOnly": true,
     "pendingAfterFailure": true,
     "retryAfterReload": true,
     "finalState": "done"
@@ -135,5 +154,13 @@
     "convertEnabledBeforeConfirm": false,
     "creates": 0,
     "jobDirs": 0
+  },
+  "k1-published-repeat-clicks": {
+    "pass": true,
+    "creates": 1,
+    "extraCreates": 0,
+    "extraPuts": 0,
+    "extraCapability": 0,
+    "rowUploadButtons": 0
   }
 }

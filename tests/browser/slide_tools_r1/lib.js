@@ -109,7 +109,7 @@ async function fakeUploadRoutes(target, cosOrigin, opts = {}) {
       const job = {
         id: jid, filename: body.filename, size: body.declared_size,
         stage: 'uploading', parts: planFor(body.declared_size),
-        confirmed: new Set(), slideId: null,
+        confirmed: new Set(), slideId: opts.slideId || null,
       };
       st.jobs.set(jid, job);
       const respBody = { job_id: jid, state: 'uploading', stage: 'uploading', declared_size: job.size };
@@ -206,6 +206,73 @@ async function fakeUploadRoutes(target, cosOrigin, opts = {}) {
   return { st, behavior };
 }
 
+/// 只拦截 COS 分块 PUT（ingestion 控制 API 走真实 Flask：真实归属/授权）。
+/// hold=true 时 PUT 挂起不回（模拟上传中断）；其余回 200 + ETag。
+async function fakeCosPuts(target, cosOrigin) {
+  const st = { puts: [], attempts: 0, hold: false };
+  await target.route(`${cosOrigin}/**`, async (route) => {
+    const req = route.request();
+    if (req.method() !== 'PUT') return route.fallback();
+    st.attempts += 1;
+    if (st.hold) return new Promise(() => {});
+    const u = new URL(req.url());
+    const buf = req.postDataBuffer();
+    st.puts.push({ partNumber: Number(u.searchParams.get('partNumber')),
+      bytes: buf ? buf.length : 0, key: u.pathname });
+    return route.fulfill({ status: 200, headers: { ETag: `"etag-${st.puts.length}"` }, body: '' });
+  });
+  return st;
+}
+
+/// R1 测试服务：C4 server.py + 第二个普通用户、进程内假 COS preparing
+/// worker（真实 ingestion 可走到 uploading）、一个真实 ready 切片。
+async function startServer(port, credsPath) {
+  const { spawn } = require('child_process');
+  const server = spawn(
+    process.env.C4_PY || '.venv/bin/python3',
+    [path.join(REPO, 'tests/browser/slide_tools_c4/server.py'), '--port', String(port),
+      '--creds', credsPath, '--fake-cos-worker', '--seed-ready-slide'],
+    { cwd: REPO, stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  let buf = '';
+  await new Promise((res, rej) => {
+    const t = setTimeout(() => rej(new Error(`server start timeout; log: ${buf}`)), 120000);
+    const on = (d) => { buf += d; if (buf.includes('Running on')) { clearTimeout(t); res(); } };
+    server.stdout.on('data', on);
+    server.stderr.on('data', on);
+    server.on('exit', (code) => rej(new Error(`server exited ${code}: ${buf}`)));
+  });
+  server.stderr.on('data', (d) => {
+    const line = String(d);
+    if (/fake-cos-worker error|Traceback/.test(line) && !/shutting down|No such file or directory/.test(line)) process.stderr.write(`[server] ${line}`);
+  });
+  return server;
+}
+
+/// 登录（who: 'owner' | 'user' | 'user2'）。
+async function login(page, port, creds, who = 'user', next = '/tools/slides') {
+  if (who !== 'user2') return C4.login(page, port, creds, who, next);
+  await page.goto(`http://127.0.0.1:${port}/login?next=${encodeURIComponent(next)}`,
+    { waitUntil: 'load' });
+  await page.fill('#login-dialog-username', creds.user2Login);
+  await page.fill('#login-dialog-password', creds.user2Password);
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: 'load', timeout: 30000 }),
+    page.click('#login-dialog-form button[type="submit"]'),
+  ]);
+  return page.url();
+}
+
+/// 以页面当前会话调真实 API（GET 读 JSON；返回 {status, body}）。
+async function apiGet(page, url) {
+  return page.evaluate(async (u) => {
+    const r = await fetch(u, { credentials: 'same-origin' });
+    let body = null;
+    try { body = await r.json(); } catch { body = null; }
+    return { status: r.status, body };
+  }, url);
+}
+
 /// 重组上传对象（按分块编号排序拼接）→ sha256（验收 1：上传的是产物）。
 function uploadedSha256(st) {
   const sorted = st.puts.slice().sort((a, b) => a.partNumber - b.partNumber);
@@ -230,9 +297,9 @@ const READ_JOB_RECORDS = `window.__readJobRecords = async () => {
 };`;
 
 module.exports = {
-  fakeUploadRoutes, uploadedSha256, READ_JOB_RECORDS,
+  fakeUploadRoutes, fakeCosPuts, uploadedSha256, READ_JOB_RECORDS, apiGet,
   GATE, REPO,
-  startServer: C4.startServer, readCreds: C4.readCreds, login: C4.login,
+  startServer, readCreds: C4.readCreds, login,
   arg: C3.arg, launch: C3.launch, openTools: C3.openTools,
   savePickerStub: C3.savePickerStub, downloadGuard: C3.downloadGuard,
   setFile: C3.setFile, ensureFixture: C3.ensureFixture, sparseLargeKfb: C3.sparseLargeKfb,

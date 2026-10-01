@@ -335,9 +335,11 @@ def test_b10_cleanup_failure_keeps_ready(monkeypatch, tmp_path):
 
 
 def test_b10_flags_disabled_503_existing_rows_visible(monkeypatch, tmp_path):
-    # 先用可用适配器建一条已 ready 的枚举
+    # 先用可用适配器建一条已 ready 的枚举，并在开关关闭前已受理一个批次
     fake, enum_id, by_path = make_ready_enumeration(
         monkeypatch, owner=OWNER, entries=ENTRIES)
+    batch = store.create_import(
+        OWNER, enum_id, [by_path["a.tif"]["id"]], idempotency_key="k4")
     # 开关关闭（capabilities 不可用）：新建枚举 503
     class DisabledAdapter:
         def capabilities(self):
@@ -358,9 +360,12 @@ def test_b10_flags_disabled_503_existing_rows_visible(monkeypatch, tmp_path):
     # capabilities 透传同样原因
     body2, status2 = http.capabilities(IDENT)
     assert status2 == 200 and body2["reason_code"] == "enumeration_disabled"
-    # fake 仍可继续导入既有枚举（已接受任务收口）
-    batch = store.create_import(
-        OWNER, enum_id, [by_path["a.tif"]["id"]], idempotency_key="k4")
+    # R1：开关关闭后不再从既有枚举建新批次（新的待执行工作一律拒绝）
+    with pytest.raises(store.UnavailableError) as ei:
+        store.create_import(
+            OWNER, enum_id, [by_path["a.tif"]["id"]], idempotency_key="k5")
+    assert ei.value.code == "enumeration_disabled"
+    # 关闭前已受理的批次照常收口
     view2 = store.run_batch(batch["id"], fake, staging_root=tmp_path)
     assert view2["state"] == "succeeded"
 

@@ -1,0 +1,18 @@
+FAILED tests/test_admin_preview.py::test_subject_visibility_applies_during_preview - AssertionError: assert set() == {'owner.svs'}
+FAILED tests/test_admin_preview.py::test_write_guard_blocks_all_unsafe_methods - AssertionError: POST /api/upload -> 404
+FAILED tests/test_admin_preview.py::test_cannot_preview_disabled_user - AssertionError: assert set() == {'o.svs'}
+FAILED tests/test_conversion_drain.py::test_compare_prints_reservation_change_count - FileNotFoundError: [Errno 2] No such file or directory: '/home/solarise/ZCodeProject/histopilot-suite/PathToget...
+FAILED tests/test_spend_total_allowances.py::test_settle_release_expire_projection_accurate - assert 1016384000 == 2032768000
+5 failed, 2830 passed, 34 skipped, 1 deselected, 252 warnings in 1559.66s (0:25:59)
+
+处置（2026-10-01，主代理）：
+- test_admin_preview.py 3 例：在干净的 r1-rc1 检出上同样失败（已提交的测试文件过时；修正它的是
+  用户在主工作区未提交的改动）——非本次回归。
+- test_compare_prints_reservation_change_count：测试写 <repo>/.gate-tmp，工作树里该目录不存在
+  （环境）；建目录后通过。
+- test_settle_release_expire_projection_accurate：已知墙钟峰谷边界 flake，单独复跑仍随时段失败，
+  与百度门无关。
+- 34 skipped 中 25 个是工作树缺原生转换器构建（slide-transform-core/target 为忽略的构建产物）；
+  链接同源构建（r1-rc1..HEAD 的 slide-transform-core 无差异）后重跑这些文件：234 passed, 2 skipped；
+  其余 skip 为真实样本/真实百度/C1_BIG 外部门禁。
+- R1 浏览器 e2e：24/24（E2E ALL PASS）。

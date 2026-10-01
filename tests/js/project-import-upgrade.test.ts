@@ -849,6 +849,25 @@ describe("U08：百度页签能力探测", () => {
 		expect(h.els["baidu-input-block"].hidden).toBe(false);
 	});
 
+	it("R1 导入暂时关闭：失败批次的重试按钮禁用并说明原因，点击不发请求", async () => {
+		const h = bootApp();
+		h.routes.set("/api/remote-imports/baidu/capabilities", () => ({
+			status: 200,
+			body: { enumeration_available: false, import_available: false, reason_code: "enumeration_disabled" },
+		}));
+		await h.UI.baidu.refreshCapabilities();
+		await flush();
+		expect(h.els["baidu-cap-status"].textContent).toContain("bd.cap.reason.enumeration_disabled");
+		h.UI.baidu.renderImport({ id: "bib_1", state: "failed", items: [{ id: "it_1", stage: "failed", name: "a.svs" }] });
+		const retry = h.els["baidu-import-items"].children.find((c) => c.textContent.includes("bd.import.retry.failed"));
+		expect(retry).toBeTruthy();
+		expect(retry!.disabled).toBe(true);
+		expect(retry!.title).toContain("bd.cap.reason.enumeration_disabled");
+		retry!.dispatch("click");
+		await flush();
+		expect(h.calls.some((c) => c.url.includes("/retry"))).toBe(false);
+	});
+
 	it("能力接口 503 / 网络故障：按不可用降级，不出现无响应假成功", async () => {
 		const h = bootApp();
 		h.routes.set("/api/remote-imports/baidu/capabilities", () => ({

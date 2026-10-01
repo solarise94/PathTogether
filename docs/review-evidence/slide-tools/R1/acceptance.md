@@ -49,6 +49,31 @@ C2 门禁 PASS——与报告一致。
 | C4 15/15、工作台序列一致、C3 18/18、C2 PASS、vitest 607/607 | 全绿 |
 | pytest 全量 | 见 `results/pytest-full.txt` |
 
+## 3c. r1-rc2：R1 全程关闭百度导入（2026-10-01 用户裁决）
+
+r1-rc1 的插件不能枚举分享，关掉旧 worker 后平台没有枚举执行者；而 `BAIDU_IMPORT_WORKER=0` 不阻止
+API 受理请求。核实 r1-rc1：新建枚举已受 `BAIDU_ENUMERATION_ENABLED` 门控，但**从既有 ready 枚举建
+批次、重试失败批次都不检查 `BAIDU_IMPORT_ENABLED`**——生产盘点中的 failed 批次一经重试就会变回
+queued，没有执行者处理。
+
+修复（`release/r1`，标签 `r1-rc2`）：
+- `baidu_import_store._require_import_available()`：`create_import` 与 `retry_items` 在任何写入/
+  容量预约之前检查能力，不可用即 503（原因码沿用能力端点：`enumeration_disabled` /
+  `import_disabled` / 连接器原因）。已在关闭前受理的批次照常收口（b10 改为此语义）。
+- 页面：原因文案改为「功能暂时关闭（维护中）」，不再显示配置名；失败批次的「重试失败项」按钮在
+  导入不可用时禁用并说明原因，点击不发请求。
+
+| 证据 | 结果 |
+|---|---|
+| `tests/test_r1_baidu_disabled.py`（真实 HTTP 路由 + 生产适配器，原因只来自开关） | 两开关 0：能力端点 `enumeration_disabled`；新建枚举、既有枚举建批次、重试 failed 批次全部 503；枚举/批次/条目/queued 行与容量预约计数不变；failed 批次与条目原样；只关导入同样拒绝（`import_disabled`） |
+| 同测试在 r1-rc1 的 `baidu_import_store.py` 上 | 失败：建批次返回 **202**（新建 queued 批次） |
+| vitest 新用例（重试按钮禁用、点击零请求）在去掉门控的 app.js 上 | 失败；修复后 606/606 |
+| 百度相关 pytest（含 b10） | 125 passed, 7 skipped |
+| pytest 全量 | 见 `results/pytest-full-rc2.txt` |
+
+发布 env 必须显式 `BAIDU_ENUMERATION_ENABLED=0`、`BAIDU_IMPORT_ENABLED=0`（与两个 worker 开关同为
+G1 门禁项），上线后按 runbook §A4 实测拒绝且零新增待执行行。R1 窗口不安装百度插件。
+
 ## 4. 已知缺口（不阻塞 R1，已写入报告 §6）
 
 1. ingestion 控制 API 与 COS 分块 PUT 在浏览器 e2e 中由有状态假后端承担；服务端语义由 pytest 覆盖。

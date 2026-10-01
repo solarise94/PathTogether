@@ -308,3 +308,11 @@ C2 门禁 PASS、全量 pytest 2868 passed / 8 skipped（见 RERUN §5）。
 测试服务（`tests/browser/slide_tools_c4/server.py`）新增：第二个普通用户、
 `--fake-cos-worker`（进程内只做 Initiate 的假 COS，真实 ingestion 可到 uploading）、
 `--seed-ready-slide`。C4 套件不带这些参数，行为不变。
+
+## 9. r1-rc2：R1 期间关闭百度导入（2026-10-01）
+
+用户裁决：R1 全程关闭新的百度导入（R1 的插件不能枚举分享，关掉旧 worker 后没有执行者）。r1-rc1 只有
+新建枚举受 `BAIDU_ENUMERATION_ENABLED` 门控；从既有 ready 枚举建批次、重试失败批次不检查
+`BAIDU_IMPORT_ENABLED`，会产生无人执行的 queued 批次。r1-rc2 让两者在写入与容量预约之前按能力 503，
+页面显示「功能暂时关闭（维护中）」并禁用失败批次的重试按钮。发布 env 显式 `BAIDU_ENUMERATION_ENABLED=0`、
+`BAIDU_IMPORT_ENABLED=0`。证据见验收记录 §3c。

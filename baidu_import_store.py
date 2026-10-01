@@ -231,6 +231,15 @@ def capabilities():
     return get_adapter().capabilities()
 
 
+def _require_import_available():
+    """正式导入开关门：建批次与重试都会产生待执行工作，开关关闭（或
+    连接器/密钥不可用）时 503 拒绝，零写入、零预约。"""
+    caps = get_adapter().capabilities()
+    if not caps.get("import_available"):
+        reason = caps.get("reason_code") or "import_disabled"
+        raise UnavailableError("百度导入暂不可用（%s）" % reason, code=reason)
+
+
 # --------------------------------------------------------------------------- #
 # 枚举：创建 / 查询 / 候选
 # --------------------------------------------------------------------------- #
@@ -755,6 +764,7 @@ def create_import(owner_user_id, enumeration_id, candidate_ids,
         raise ValidationError("candidate_ids 不能为空", code="empty_selection")
     # 去重保序
     candidate_ids = list(dict.fromkeys(candidate_ids))
+    _require_import_available()
 
     conn = _connect()
     extra_reservation = None
@@ -978,6 +988,7 @@ def retry_items(batch_id, owner_user_id, item_ids, idempotency_key=None):
             or not all(isinstance(x, str) for x in item_ids):
         raise ValidationError("item_ids 不能为空", code="empty_selection")
     item_ids = list(dict.fromkeys(item_ids))
+    _require_import_available()
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:

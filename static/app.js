@@ -7966,7 +7966,12 @@
         retryBtn.type = "button";
         retryBtn.className = "btn secondary small";
         retryBtn.textContent = t("bd.import.retry.failed", { n: failedIds.length });
+        if (!baiduState.importAvailable) {
+          retryBtn.disabled = true;
+          retryBtn.title = baiduCapReasonText(baiduState.reasonCode || "import_disabled");
+        }
         retryBtn.addEventListener("click", function () {
+          if (!baiduState.importAvailable) return;
           retryBtn.disabled = true;
           apiFetch("/api/remote-imports/baidu/imports/" +
                    encodeURIComponent(batch.id) + "/retry", {
@@ -9466,6 +9471,7 @@
         loadCandidates: loadBaiduCandidates,
         toggleCandidate: toggleBaiduCandidate,
         startImport: startBaiduImport,
+        renderImport: renderBaiduImport,
         formatDecBytes: formatDecBytes,
       },
       // Wave 3（普通图片兼容）测试入口：accept 派生/无物理标尺单位区/像素标注保存。

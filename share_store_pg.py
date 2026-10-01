@@ -733,6 +733,26 @@ def revoke_slide_view(user_id, slide_name):
         conn.close()
 
 
+def revoke_slide_view_by_id(user_id, slide_id):
+    """按资产 ID 收回某主体的 view 授权（幂等；无唯一名的新资产用此口径）。"""
+    if not isinstance(user_id, str) or not user_id:
+        raise ValueError("user_id 不能为空")
+    if not isinstance(slide_id, str) or not slide_id:
+        raise ValueError("slide_id 不能为空")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM slide_view_grants "
+                    "WHERE user_id=%s AND slide_id=%s",
+                    (user_id, slide_id),
+                )
+                return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
 def revoke_slide_view_grants_for_slide(slide_name, slide_id=None):
     """资产生命周期收口（升级 B R7）：删除某切片的全部 view 授权行。
 

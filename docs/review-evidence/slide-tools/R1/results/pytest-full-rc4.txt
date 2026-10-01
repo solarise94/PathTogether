@@ -1,0 +1,14 @@
+FAILED tests/test_admin_preview.py::test_subject_visibility_applies_during_preview - AssertionError: assert set() == {'owner.svs'}
+FAILED tests/test_admin_preview.py::test_write_guard_blocks_all_unsafe_methods - AssertionError: POST /api/upload -> 404
+FAILED tests/test_admin_preview.py::test_cannot_preview_disabled_user - AssertionError: assert set() == {'o.svs'}
+FAILED tests/test_slide_transform_core.py::test_real_kfbf_differential[KFBF-B] - AssertionError: = 256 x 256
+4 failed, 2868 passed, 10 skipped, 1 deselected, 252 warnings in 1610.96s (0:26:50)
+
+处置（2026-10-02，r1-rc4 候选；在 rc3 基础上只改管理端切片清单/授权）：
+- test_admin_preview.py 3 例：与 rc2/rc3 相同的过时测试文件失败，非本次回归。
+- test_real_kfbf_differential：真实 KFBF 样本与外部参照工具的逐瓦片对比，变体间随机失败
+  （失败时参照工具输出 Thumbnail size = 1 x 1）。在未改动的 rc3 代码上连跑两次：
+  一次 1 failed / 3 passed、一次 4 passed——测试本身不稳定，与本次改动（app.py 管理端点、
+  share_store）无关。
+- 新增回归 tests/test_admin_slide_visibility_by_id.py 4 例：修复前 4 例全失败、修复后全过。
+- HistoPilot 2423dfe 对 PT release/r1 工作树：build 通过；unit+integration 1487；contract 49。

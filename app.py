@@ -10367,6 +10367,38 @@ def _admin_v1_owner_uid():
     return actor_identity().get("user_id")
 
 
+def _admin_v1_entry_stat(desc):
+    """入口文件 (存在, 字节)：id_bundle 按 descriptor 路径，legacy 按平铺名。"""
+    try:
+        if desc.storage_layout == slide_store.StorageLayout.ID_BUNDLE:
+            path = slide_storage.resolve_descriptor_path(desc, root=UPLOAD_DIR)
+        elif desc.legacy_filename:
+            path = UPLOAD_DIR / desc.legacy_filename
+        else:
+            return False, 0
+        st = path.stat()
+        return True, st.st_size
+    except (OSError, ValueError):
+        return False, 0
+
+
+def _admin_v1_desc_servable(desc):
+    """资产可服务 = ready + id_bundle + 入口在盘（与用户可见集同口径）。"""
+    return _desc_state_readable(desc) and _admin_v1_entry_stat(desc)[0]
+
+
+def _admin_v1_resolve_slide(ref):
+    """管理面切片寻址：slide_id（新资产无唯一名）或冻结 legacy 名。"""
+    desc = None
+    if ref.startswith("sld_"):
+        desc = slide_store.resolve_slide_id(ref)
+    if desc is None:
+        safe = _sanitize_name(ref)
+        if safe and safe == ref:
+            desc = slide_store.resolve_legacy_alias(safe)
+    return desc
+
+
 @app.route("/api/admin/v1/slides/inventory", methods=["GET"])
 def admin_v1_slides_inventory():
     """全量切片清单（管理台唯一「看全部」出口；不含切片图像内容）。
@@ -10406,17 +10438,13 @@ def admin_v1_slides_inventory():
         return _admin_v1_error(500, "internal", "切片清单读取失败")
     by_name = {}
     for desc in descs:
-        name = desc.legacy_filename
-        if not name:
-            continue  # 无 legacy 名的 id_bundle 行不在按名清单（P2 单独呈现）
-        try:
-            st = (UPLOAD_DIR / name).stat()
-            file_exists, size = True, st.st_size
-        except OSError:
-            file_exists, size = False, 0
+        # 行键：冻结 legacy 名（旧资产）或 slide_id（新资产无唯一名——原始
+        # 文件名可重复）；visibility 端点两种寻址都接受
+        name = desc.legacy_filename or desc.slide_id
+        file_exists, size = _admin_v1_entry_stat(desc)
         by_name[name] = {
             "slide_id": desc.slide_id,
-            "legacy_filename": name,
+            "legacy_filename": desc.legacy_filename,
             "original_filename": desc.original_filename,
             "display_name": desc.display_name,
             "alias": (alias_all.get(name) or {}).get("alias", ""),
@@ -10428,6 +10456,7 @@ def admin_v1_slides_inventory():
             "public": desc.public,
             "file_exists": file_exists,
             "size_bytes": size,
+            "servable": _admin_v1_desc_servable(desc),
         }
 
     # 2) 目录扫描——仅产出 orphan_files（无 slides 行的文件；只报告不认领），
@@ -10467,22 +10496,18 @@ def admin_v1_slides_inventory():
 
     archived = _archived_slide_names()
     owner_uid = _admin_v1_owner_uid()
-    # 升级 B R7：included 状态与实际收录同口径——slide_view_grants_for_user
-    # 已按资产生代（slide_id）过滤，同名资产替换后失效的授权不再算已收录。
+    # included 与实际收录同口径：授权行绑定的 slide_id 等于该资产当前 ID，
+    # 且资产可服务（ready + id_bundle + 入口在盘）——可见集只认这一形态
+    # （slide_store.visible_ready_slide_ids）。授权行在、资产不可服务时
+    # granted_to_owner=false、grant_recorded=true（不把无效授权报成已加入）。
+    grants_by_sid = {}
     try:
-        granted_names = share_store.slide_view_grants_for_user(owner_uid)
+        for g in share_store.list_slide_view_grants():
+            if owner_uid and g.get("user_id") == owner_uid and g.get("slide_id"):
+                grants_by_sid.setdefault(g["slide_id"], g)
     except Exception:
         app.logger.exception("admin v1 slides inventory 授权标注读取失败")
         return _admin_v1_error(500, "internal", "切片清单读取失败")
-    # granted_at 仅在授权真实生效（included）时展示
-    grants_rows = {}
-    try:
-        for g in share_store.list_slide_view_grants():
-            if owner_uid and g.get("user_id") == owner_uid:
-                grants_rows.setdefault(g["slide_name"], g)
-    except Exception:
-        app.logger.warning("admin v1 slides inventory 授权时间读取失败",
-                           exc_info=True)
 
     # 归属展示名/掩码 login_id（无归属/未知用户 → null；与用户列表同口径
     # 掩码，inventory 只用于清点，不额外放大 login_id 明文）
@@ -10507,7 +10532,9 @@ def admin_v1_slides_inventory():
         owner_email = (str(owner_user.get("email_normalized")
                            or owner_user.get("email") or "")
                        if owner_user else "")
-        included = name in granted_names
+        grant = grants_by_sid.get(meta.get("slide_id")) \
+            if meta.get("slide_id") else None
+        included = bool(grant) and bool(meta.get("servable"))
         item = {
             "name": name,
             "size_bytes": meta.get("size_bytes") or 0,
@@ -10526,8 +10553,8 @@ def admin_v1_slides_inventory():
             "note": meta.get("note", ""),
             "archived": name in archived,
             "granted_to_owner": included,
-            "granted_at": (grants_rows.get(name) or {}).get("granted_at")
-            if included else None,
+            "granted_at": grant.get("granted_at") if included else None,
+            "grant_recorded": bool(grant),
             # P1-B2 新字段（旧字段原样保留）
             "slide_id": meta.get("slide_id"),
             "asset_state": meta.get("asset_state"),
@@ -10536,6 +10563,7 @@ def admin_v1_slides_inventory():
             "original_filename": meta.get("original_filename"),
             "display_name": meta.get("display_name"),
             "format_ext": meta.get("format_ext"),
+            "servable": bool(meta.get("servable")),
         }
         if meta.get("unregistered"):
             item["unregistered"] = True
@@ -10760,21 +10788,30 @@ def admin_v1_staging_residue_cleanup():
 def admin_v1_slide_visibility(name):
     """给 owner 建立/收回某切片的 view 授权（幂等）。body: {granted: bool}。
 
-    - granted=true：建立（已存在则幂等成功，audit 标 already_granted）；
-      granted=false：收回（无授权亦幂等成功，audit 标 existed）。
+    - 寻址：slide_id 或冻结 legacy 名（清单 items[].name 原样回传即可）；
+      无 slides 行的盘上文件不建行、不授权（404）。
+    - granted=true：资产须可服务（ready + id_bundle + 入口在盘），否则 409
+      slide_not_servable——授权不会生效时不报成功（未迁移的旧布局、已删除）。
+      已存在则幂等成功（audit 标 already_granted）。
+    - granted=false：按 slide_id 收回（无授权亦幂等成功，audit 标 existed），
+      不要求可服务。
     - 授权对象是当前 actor-owner（自授权；本地免认证开发态 owner 无稳定
       user_id → 400 owner_uid_missing，可见集为空属预期形态）。
-    - 无主切片经此授权后恢复可见（孤儿切片可管理，不因读隔离失联）。
     - audit：admin.slide_visibility.grant / revoke（best-effort，业务写后）。
     """
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    safe = _sanitize_name(name)
-    if not safe or safe != name:
-        return _admin_v1_error(400, "invalid_request", "非法文件名")
-    if safe.split(".")[-1].lower() not in SUPPORTED_EXTS \
-            or not (UPLOAD_DIR / safe).is_file():
+    if not name.startswith("sld_"):
+        safe = _sanitize_name(name)
+        if not safe or safe != name:
+            return _admin_v1_error(400, "invalid_request", "非法文件名")
+    try:
+        desc = _admin_v1_resolve_slide(name)
+    except Exception:
+        app.logger.exception("admin visibility 切片解析失败：%s", name)
+        return _admin_v1_error(500, "internal", "切片解析失败")
+    if desc is None:
         return _admin_v1_error(404, "slide_not_found", "切片不存在")
     body = request.get_json(silent=True) or {}
     granted = body.get("granted")
@@ -10787,45 +10824,45 @@ def admin_v1_slide_visibility(name):
             400, "owner_uid_missing",
             "当前部署 owner 无稳定 user_id（本地免认证开发态），"
             "无法建立/收回显式授权")
+    sid = desc.slide_id
+    legacy_name = desc.legacy_filename
+    grant_key = legacy_name or sid
     if granted:
-        # 升级 B R7：授权行绑定当前资产生代（slide_id）
-        cur_slide_id = share_store.get_slide_id(safe)
-        if cur_slide_id is None:
-            # P1-B2：盘上无 slides 行的孤儿文件在显式授权时建行（与 demo
-            # 目录 PUT 同款迁移兼容语义）——authorize_read 只认 slide_id 级
-            # 授权，且 DB 驱动的可见集/清单自此能呈现该切片（孤儿可管理）。
-            # 【P4-app §7 核对】admin visibility 是 set_slide_meta 的**允许
-            # 残留位**（管理面把 legacy 孤儿纳入管理；P6 迁移排空后收口）。
-            try:
-                share_store.set_slide_meta(safe)
-                cur_slide_id = share_store.get_slide_id(safe)
-            except Exception:
-                app.logger.warning("admin visibility 建行失败：%s", safe,
-                                   exc_info=True)
-        if cur_slide_id is None:
-            return _admin_v1_error(500, "internal", "无法建立切片稳定身份")
+        if not _admin_v1_desc_servable(desc):
+            if desc.asset_state in (slide_store.SlideState.DELETED,
+                                    slide_store.SlideState.DELETING):
+                msg = "切片已删除，无法加入工作区"
+            elif desc.storage_layout != slide_store.StorageLayout.ID_BUNDLE:
+                msg = "切片尚未迁移到新存储布局，加入后也不会显示；请先完成存量迁移"
+            else:
+                msg = "切片当前不可读取（状态 %s），加入后也不会显示" % desc.asset_state
+            return _admin_v1_error(409, "slide_not_servable", msg)
         result = share_store.grant_slide_view(
-            owner_uid, safe, granted_by=owner_uid, slide_id=cur_slide_id)
+            owner_uid, grant_key, granted_by=owner_uid, slide_id=sid)
         _audit("admin.slide_visibility.grant", target_type="slide",
-               target_id=safe, slide=safe,
+               target_id=sid, slide=grant_key,
                detail={"granted_to": owner_uid,
-                       "slide_id": cur_slide_id,
+                       "slide_id": sid,
                        "already_granted": bool(result.get("already_granted"))})
-        return jsonify(name=safe, granted=True,
+        return jsonify(name=name, slide_id=sid, granted=True,
                        already_granted=bool(result.get("already_granted")))
-    existed = share_store.revoke_slide_view(owner_uid, safe)
+    existed = share_store.revoke_slide_view_by_id(owner_uid, sid)
+    if legacy_name:
+        existed = share_store.revoke_slide_view(owner_uid, legacy_name) or existed
     # 升级 B R6d：撤销联动——失效该切片上已失去收录关系的 run grants，并对
     # 仍在运行的相关 run 走既有取消/收尾机制（不把前端关流当取消成功；费用
-    # hold 按既有结算机制处理，不提前释放）。
+    # hold 按既有结算机制处理，不提前释放）。sidecar 会话按 legacy 名查询，
+    # 无名资产只走 run grant 复查（与删除编排同口径）。
     cancelled = _cancel_sidecar_runs_for_owners(
-        safe, [owner_uid], reason="visibility_revoked")
-    _revoke_stale_run_grants(slide=safe, reason="visibility_revoked")
+        legacy_name, [owner_uid], reason="visibility_revoked") \
+        if legacy_name else []
+    _revoke_stale_run_grants(slide=legacy_name, reason="visibility_revoked")
     _audit("admin.slide_visibility.revoke", target_type="slide",
-           target_id=safe, slide=safe,
-           detail={"revoked_from": owner_uid, "existed": bool(existed),
-                   "runs_cancelled": cancelled})
-    return jsonify(name=safe, granted=False, existed=bool(existed),
-                   runs_cancelled=cancelled)
+           target_id=sid, slide=grant_key,
+           detail={"revoked_from": owner_uid, "slide_id": sid,
+                   "existed": bool(existed), "runs_cancelled": cancelled})
+    return jsonify(name=name, slide_id=sid, granted=False,
+                   existed=bool(existed), runs_cancelled=cancelled)
 
 
 @app.route("/api/admin/v1/ai/unowned-sessions", methods=["GET"])

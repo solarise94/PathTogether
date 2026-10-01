@@ -97,5 +97,5 @@ R1 上线后没有删除过任何旧布局切片（上线后的 `slide.delete` �
 
 ## 8. 清理（窗口后）
 
-- 演练副本（homepc `/mnt/hdd/pathtogether-rehearsal-20261002`，约 93 GB，含用户数据）在窗口结束后删除。
+- 演练副本（homepc `/mnt/hdd/pathtogether-rehearsal-20261002`，约 88 GB，含用户数据）在窗口结束后删除。
 - 旧平铺源文件：迁移后保留，满保留期后按独立 manifest 逐项清理（禁止递归删除）。

@@ -687,3 +687,93 @@ def test_verify_pass_end_to_end_and_tombstone(world):
     assert slide_store.authorize_read(
         "sld_drill_svs01", actor_user_id=drill.BOB) is True  # 旧分享照常
     assert verif["tombstones"]["crossread_violations"] == []
+
+
+# --------------------------------------------------------------------------- #
+# 内容 revision（2026-10-02 生产回归：迁移资产无 slide_assets 行 → 渲染令牌/
+# render-context/Demo/AI 快照对其全部拒绝，AI slide_info 500）
+# --------------------------------------------------------------------------- #
+import record_migrated_revisions as revisions  # noqa: E402
+
+
+def _migrated_ids(world):
+    out = []
+    for line in world["plan"].read_text(encoding="utf-8").splitlines()[1:]:
+        rec = json.loads(line)
+        if rec.get("action") == "migrate":
+            out.append(rec["item_id"])
+    assert out
+    return out
+
+
+def _expected_revision(world, sid):
+    m = json.loads((world["up"] / "objects" / sid / "manifest.json").read_text())
+    sha = next(f["sha256"] for f in m["files"] if f["path"] == m["entry"])
+    return "sha256:%s" % sha.lower()[:16]
+
+
+def test_migrated_assets_get_content_revision(world):
+    full_apply(world)
+    for sid in _migrated_ids(world):
+        desc = slide_store.resolve_slide_id(sid)
+        assert desc.storage_layout == "id_bundle"
+        assert desc.revision == _expected_revision(world, sid), sid
+
+
+def test_verify_flags_missing_content_revision(world):
+    full_apply(world)
+    sid = _migrated_ids(world)[0]
+    conn = world["conn"]
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM slide_assets WHERE slide_id=%s", (sid,))
+    conn.commit()
+    verif = run_verify(world, out_name="verify-norev")
+    hits = [v for v in verif["violations"] if v["check"] == "content_revision_missing"]
+    assert [v["detail"]["slide_id"] for v in hits] == [sid]
+    assert verif["go_no_go"] == "no-go"
+
+
+def test_record_migrated_revisions_backfills_production_shape(world):
+    """生产形态：已迁移（postverified）但无 slide_assets 行 → 工具按 bundle
+    manifest + journal 证据补写；dry-run 无写；可重跑。"""
+    full_apply(world)
+    ids = _migrated_ids(world)
+    conn = world["conn"]
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM slide_assets WHERE slide_id = ANY(%s)", (ids,))
+    conn.commit()
+    with pytest.raises(SystemExit):
+        revisions.run(apply=True, upload_dir=str(world["up"]), database_url=world["uri"])
+    dry = revisions.run(upload_dir=str(world["up"]), database_url=world["uri"],
+                        journal=str(world["journal"]))
+    migrated_with_alias = [s for s in ids if row_of(conn, s)["legacy_filename"]]
+    assert dry["would_record"] == len(migrated_with_alias) and dry["recorded"] == 0
+    assert dry["skipped"] == []
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM slide_assets WHERE slide_id = ANY(%s)", (ids,))
+        assert cur.fetchone()["n"] == 0
+    conn.commit()
+    rep = revisions.run(apply=True, upload_dir=str(world["up"]), database_url=world["uri"],
+                        journal=str(world["journal"]))
+    assert rep["recorded"] == len(migrated_with_alias) and rep["skipped"] == []
+    for sid in migrated_with_alias:
+        assert slide_store.resolve_slide_id(sid).revision == _expected_revision(world, sid)
+    again = revisions.run(apply=True, upload_dir=str(world["up"]), database_url=world["uri"],
+                          journal=str(world["journal"]))
+    assert again["candidates"] == 0 and again["recorded"] == 0
+
+
+def test_record_migrated_revisions_requires_postverified_evidence(world):
+    full_apply(world)
+    sid = _migrated_ids(world)[0]
+    conn = world["conn"]
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM slide_assets WHERE slide_id=%s", (sid,))
+    conn.commit()
+    empty_journal = world["plan"].parent / "empty-journal.jsonl"
+    empty_journal.write_text("")
+    rep = revisions.run(apply=True, upload_dir=str(world["up"]), database_url=world["uri"],
+                        journal=str(empty_journal))
+    assert rep["recorded"] == 0
+    assert [s["reason"] for s in rep["skipped"]] == ["not_postverified_in_journal"]
+    assert slide_store.resolve_slide_id(sid).revision in (None, "")

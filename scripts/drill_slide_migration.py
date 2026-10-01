@@ -231,6 +231,9 @@ def _seed_reborn(conn, upload_dir: Path) -> str:
                 "UPDATE slides SET asset_state='ready', published_at=now(), "
                 "accounted_bytes=%s WHERE slide_id=%s AND asset_state=%s",
                 (len(payload), desc.slide_id, "staging"))
+            slide_store.record_revision(
+                desc.slide_id, "sha256:%s" % manifest["files"][0]["sha256"][:16],
+                conn=conn)
     return desc.slide_id
 
 

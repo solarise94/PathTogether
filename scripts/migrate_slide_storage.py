@@ -630,9 +630,12 @@ def migrate_one_item(conn, journal: Journal, item, *, upload_dir: Path,
                     slide_id, target["storage_relpath"],
                     accounted_bytes=accounted,
                     expected_state=slide_store.SlideState.READY, conn=conn)
+                revision_recorded = ensure_content_revision(
+                    conn, slide_id, manifest)
         journal.emit(item_id, "bound", "ok", detail={
             "storage_relpath": target["storage_relpath"],
-            "accounted_bytes": accounted, "bind_outcome": outcome})
+            "accounted_bytes": accounted, "bind_outcome": outcome,
+            "revision_recorded": revision_recorded})
         _crash_maybe(crash_after, item_id, "bound")
     else:
         # 已 bound（重跑只补 postverify）：行必须已是同参 id_bundle
@@ -644,6 +647,11 @@ def migrate_one_item(conn, journal: Journal, item, *, upload_dir: Path,
             raise ItemFailure("bound_row_drift", {
                 "layout": row2["storage_layout"],
                 "relpath": row2["storage_relpath"]})
+        if apply:
+            with pg_store.transaction(conn):
+                with conn.cursor() as cur:
+                    slide_store.acquire_slide_lock(cur, slide_id)
+                    ensure_content_revision(conn, slide_id, manifest)
 
     # ---- postverified：独立重读 DB+磁盘 ----
     if not apply:
@@ -773,6 +781,28 @@ def settle_non_migrate(conn, journal: Journal, item, *, apply: bool,
 # --------------------------------------------------------------------------- #
 # 编排
 # --------------------------------------------------------------------------- #
+def ensure_content_revision(conn, slide_id, manifest):
+    """id_bundle 资产的内容 revision（P3 合同 §4：slide_assets 最新行）。
+
+    与发布路径同口径 ``sha256:<入口文件 sha256 前 16 位>``；运行时的渲染
+    令牌、render-context、Demo 与 AI 快照都按它绑定，缺失即这些通道拒绝。
+    已有行不重写（返回 False）。调用方在 bind 短事务内调用。
+    """
+    entry_sha = next((f.get("sha256") for f in manifest["files"]
+                      if f.get("path") == manifest["entry"]), None)
+    if not entry_sha:
+        raise ItemFailure("manifest_entry_sha_missing",
+                          {"entry": manifest.get("entry")})
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM slide_assets WHERE slide_id=%s LIMIT 1",
+                    (slide_id,))
+        if cur.fetchone() is not None:
+            return False
+    slide_store.record_revision(
+        slide_id, "sha256:%s" % str(entry_sha).lower()[:16], conn=conn)
+    return True
+
+
 def run_migrate(*, plan_path, apply=False, plan_digest=None, env=None,
                 quiesce_proof=None, upload_dir=None, journal_path=None,
                 database_url=None, free_margin_bytes=DEFAULT_FREE_MARGIN_BYTES,

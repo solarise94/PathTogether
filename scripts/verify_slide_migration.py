@@ -293,6 +293,13 @@ class Verifier:
                     "slide_id": desc.slide_id,
                     "storage_relpath": desc.storage_relpath,
                     "manifest_entry": norm["entry"]})
+            # 内容 revision（P3 合同 §4）：渲染令牌/render-context/Demo/AI 快照
+            # 均按 slide_assets 最新行绑定——缺失时这些通道对该资产全部拒绝
+            if not (getattr(desc, "revision", None) or ""):
+                entry["ok"] = False
+                self._violation("content_revision_missing", {
+                    "slide_id": desc.slide_id,
+                    "note": "ready+id_bundle 资产无 slide_assets 内容 revision"})
             # 交叉证据（可选）：bundle manifest 与 journal 记录的 manifest
             if desc.slide_id in self.journal_manifests:
                 jm = self.journal_manifests[desc.slide_id]

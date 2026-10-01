@@ -805,6 +805,55 @@ def test_cleanup_rejects_key_outside_incoming():
     assert fake.deleted == [] and fake.aborted == []  # 未发任何 COS 删除
 
 
+class _ResidualVersionCos(FakeCos):
+    """DELETE 返回成功但版本列举仍见残留（删后复核不通过的形态）。"""
+
+    def delete_object_version(self, key, version_id):
+        if self.delete_fault:
+            raise self.delete_fault
+        self.deleted.append((key, version_id))  # 记录但对象仍在列表
+
+
+class _LingeringUploadCos(FakeCos):
+    """Abort 返回成功但未完成 multipart 仍在列举（复核不通过的形态）。"""
+
+    def abort_multipart(self, key, upload_id):
+        self.aborted.append((key, upload_id))  # 记录但不移除
+
+
+def test_cleanup_holds_reservation_until_removal_confirmed():
+    """R3：池预约释放以「删后复核三空」（版本/删除标记清空 + uploadId 不在
+    multipart 列表）为前提——任一不满足即不 finalize，退避重试且预约保持。"""
+    # a) 版本残留：删完全部版本后列举仍非空 → 不释放
+    fake, st = _ResidualVersionCos(), {}
+    job, payload = _prepare(fake, st)
+    _put_plan_parts(fake, job, payload)
+    ist.request_upload_complete(job["job_id"])
+    ciw.process_completing(cos=fake, state=st)
+    fake.put_object_version(ist.get_job(job["job_id"])["object_key"],
+                            b"historical")
+    ist.cancel_job(job["job_id"])
+    assert ciw.process_cleanup(cos=fake, state=st) is None
+    out = ist.get_job(job["job_id"])
+    assert out["cleanup_status"] == ist.CLEANUP_PENDING
+    assert out["cleanup_attempts"] == 1
+    assert "版本" in (out["cleanup_last_error"] or "")
+    assert out["pool_reserved_bytes"] == 150  # 预约未释放
+    assert cos_pool_store.get_pool_state()["reserved_bytes"] == 150
+
+    # b) 未完成 multipart 仍在列表（Abort 后复核不通过）→ 不释放
+    fake2, st2 = _LingeringUploadCos(), {}
+    job2, payload2 = _prepare(fake2, st2)
+    _put_plan_parts(fake2, job2, payload2)  # 在途 multipart（未 Complete）
+    ist.cancel_job(job2["job_id"])
+    assert ciw.process_cleanup(cos=fake2, state=st2) is None
+    out2 = ist.get_job(job2["job_id"])
+    assert out2["cleanup_status"] == ist.CLEANUP_PENDING
+    assert "multipart" in (out2["cleanup_last_error"] or "")
+    assert out2["pool_reserved_bytes"] == 150
+    assert cos_pool_store.get_pool_state()["reserved_bytes"] == 300
+
+
 # --------------------------------------------------------------------------- #
 # 7) reconcile：observed 对账 + 孤儿识别 + fail-closed
 # --------------------------------------------------------------------------- #
@@ -849,6 +898,39 @@ def test_reconcile_listing_failure_pauses_fail_closed():
     ciw.reconcile_tick(cos=fake, state=st, force=True)
     assert cos_pool_store.get_pool_state()["reconcile_status"] == \
         "reconcile_required"  # 观测不可信时不得 fail-open
+
+
+def test_reconcile_never_marks_or_deletes_active_job_objects():
+    """R2：在途任务（uploading、近期活跃、multipart 在飞）的 COS 对象绝不
+    被对账标记清理或删除——孤儿回收只针对已终态且未清理的 job；容量不足/
+    漂移时新任务 waiting / 暂停准入，不存在驱逐在途任务腾空间的路径。"""
+    fake, st = FakeCos(), {}
+    job, payload = _prepare(fake, st)     # → uploading（key/uploadId 已冻结）
+    _put_plan_parts(fake, job, payload)   # 在途 multipart 分块
+    key, upload_id = job["object_key"], job["upload_id"]
+    # 对照组：终态且 cleanup_status=none 的孤儿 → 对账置 pending（回收排队）
+    orphan = _mkjob(owner="o2", size=200, name="b.svs")
+    _admit(orphan["job_id"])
+    ist.cancel_job(orphan["job_id"])
+    okey = "incoming/o2/%s/r1" % orphan["job_id"]
+
+    def op(cur):
+        cur.execute(
+            "UPDATE ingestion_jobs SET cleanup_status='none', object_key=%s "
+            "WHERE job_id=%s", (okey, orphan["job_id"]))
+    _sql(op)
+    fake.put_object_version(okey, b"x" * 500)
+
+    assert ciw.reconcile_tick(cos=fake, state=st, force=True) is True
+    # 在途任务原样：不标记、不删除、不 Abort
+    out = ist.get_job(job["job_id"])
+    assert out["state"] == ist.UPLOADING
+    assert out["cleanup_status"] == ist.CLEANUP_NONE
+    assert fake.deleted == [] and fake.aborted == []
+    assert upload_id in fake.uploads.get(key, {})  # multipart 未被动过
+    # 对照组按合同回收（证明对账在工作，只是不碰活跃任务）
+    assert ist.get_job(orphan["job_id"])["cleanup_status"] == \
+        ist.CLEANUP_PENDING
 
 
 # --------------------------------------------------------------------------- #

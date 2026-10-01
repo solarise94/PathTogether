@@ -264,6 +264,40 @@ def test_capability_endpoint_never_demo(_iso, owner_client, monkeypatch):
     assert seen["demo"] is False
 
 
+def test_capability_endpoint_release_limit_numbers(
+        _iso, owner_client, monkeypatch):
+    """R7（发布配置精确数值）：COS_POOL_CAPACITY_BYTES=1e10 / SAFETY=5e8 /
+    UPLOAD_MAX_REQUEST_BYTES=9.5e9（→ UPLOAD_PRODUCT_MAX_BYTES=9.5e9）——
+    工具页能力端点报 max_size_bytes=9,500,000,000 且 COS 可用（结构门禁
+    9.5e9 == 产品上限，不因 cos_pool_below_product_limit 关闭）。"""
+    monkeypatch.setattr(cos_config, "COS_POOL_CAPACITY_BYTES", 10_000_000_000)
+    monkeypatch.setattr(cos_config, "COS_POOL_SAFETY_BYTES", 500_000_000)
+    monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)
+    monkeypatch.setattr(app_mod, "UPLOAD_PRODUCT_MAX_BYTES", 9_500_000_000)
+    monkeypatch.setenv("COS_BUCKET", "bucket-appid")
+    monkeypatch.setenv("COS_REGION", "ap-shanghai")
+    monkeypatch.setenv("COS_SECRET_ID", "AKIDtest")
+    monkeypatch.setenv("COS_SECRET_KEY", "k" * 20)
+    monkeypatch.setattr(cos_config, "COS_BUCKET", "bucket-appid")
+    monkeypatch.setattr(cos_config, "COS_REGION", "ap-shanghai")
+    monkeypatch.setattr(cos_config, "COS_UPLOAD_CAPABILITY", "on")
+    cos_pool_store.ensure_pool_state()
+    r = owner_client.get("/api/tools/slides/upload-capability")
+    assert r.status_code == 200
+    caps = r.get_json()["cos_upload"]
+    assert caps["available"] is True
+    assert caps["max_size_bytes"] == 9_500_000_000
+
+
+def test_product_limit_derives_from_request_max():
+    """R6/R7：产品上限唯一派生自 upload_guard.UPLOAD_MAX_REQUEST_BYTES
+    （app.py ``UPLOAD_PRODUCT_MAX_BYTES = upload_guard.UPLOAD_MAX_REQUEST_BYTES``）
+    ——发布 env UPLOAD_MAX_REQUEST_BYTES=9500000000 即产品上限 9.5e9；
+    create 的 413 与 capability 的 max_size_bytes 都只消费这一权威值。"""
+    assert app_mod.UPLOAD_PRODUCT_MAX_BYTES == \
+        upload_guard.UPLOAD_MAX_REQUEST_BYTES
+
+
 # --------------------------------------------------------------------------- #
 # 上传文件名的受理（注册表按后缀判定；荧光需完整 .ome.tif 后缀）
 # --------------------------------------------------------------------------- #

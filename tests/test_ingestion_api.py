@@ -151,6 +151,33 @@ def test_exact_admission_boundary_creates(owner_client):
     assert r.status_code == 202
 
 
+def test_release_config_boundary_9p5e9(owner_client, monkeypatch):
+    """R6（发布配置精确数值）：capacity=1e10 / safety=5e8 / 产品上限=9.5e9
+    （UPLOAD_PRODUCT_MAX_BYTES ← UPLOAD_MAX_REQUEST_BYTES=9500000000）——
+    9,500,000,000 声明进准入（202 preparing，不是 503
+    cos_pool_below_product_limit，池准入上限==产品上限）；9,500,000,001 →
+    413 upload_too_large（max_size_bytes=9.5e9），且不建行/不占预约。"""
+    monkeypatch.setattr(cos_config, "COS_POOL_CAPACITY_BYTES", 10_000_000_000)
+    monkeypatch.setattr(cos_config, "COS_POOL_SAFETY_BYTES", 500_000_000)
+    cos_pool_store.ensure_pool_state()
+    monkeypatch.setattr(app_mod, "UPLOAD_PRODUCT_MAX_BYTES", 9_500_000_000)
+    r = _create(owner_client, filename="rel-a.svs", size=9_500_000_000,
+                idempotency_key="REL9")
+    assert r.status_code == 202
+    body = r.get_json()
+    assert body["state"] == ist.PREPARING  # 结构性门禁过（非 503/非等待）
+    assert "code" not in body or body["code"] != "cos_pool_below_product_limit"
+    assert cos_pool_store.get_pool_state()["reserved_bytes"] == 9_500_000_000
+    # 多 1 字节即超产品上限：413，不建行、不占预约（无任何新副作用）
+    r2 = _create(owner_client, filename="rel-b.svs", size=9_500_000_001,
+                 idempotency_key="REL10")
+    assert r2.status_code == 413
+    assert r2.get_json()["code"] == "upload_too_large"
+    assert r2.get_json()["max_size_bytes"] == 9_500_000_000
+    assert len(ist.list_jobs_for_owner("owner-1")) == 1  # 拒绝未建行
+    assert cos_pool_store.get_pool_state()["reserved_bytes"] == 9_500_000_000
+
+
 def test_format_acceptance_derived_from_registry(owner_client):
     # U2（§3.2）：受理词表从注册表派生——原生单文件（含此前被 COS 白名单
     # 排除的 bmp/jpg）、zip（包）、kfb（conversion）均建任务；裸 bundle
@@ -416,3 +443,20 @@ def test_capability_payload_shapes(monkeypatch):
                             lambda: {"role": "user", "user_id": "u9"})
         assert app_mod._cos_upload_capability_payload(demo=False)[
             "available"] is False
+
+
+def test_capability_payload_release_numbers(monkeypatch):
+    """R7（发布配置精确数值）：pool=1e10−5e8、产品上限=9.5e9（=
+    UPLOAD_MAX_REQUEST_BYTES=9500000000，派生见 app.UPLOAD_PRODUCT_MAX_BYTES）
+    → capability 可用且 max_size_bytes=9,500,000,000（结构门禁 9.5e9 ==
+    产品上限，不触发 cos_pool_below_product_limit 关闭）。"""
+    monkeypatch.setattr(app_mod, "current_identity",
+                        lambda: {"role": "owner", "user_id": "owner-1"})
+    monkeypatch.setattr(cos_config, "COS_POOL_CAPACITY_BYTES", 10_000_000_000)
+    monkeypatch.setattr(cos_config, "COS_POOL_SAFETY_BYTES", 500_000_000)
+    cos_pool_store.ensure_pool_state()
+    monkeypatch.setattr(app_mod, "UPLOAD_PRODUCT_MAX_BYTES", 9_500_000_000)
+    with app_mod.app.test_request_context("/"):
+        p = app_mod._cos_upload_capability_payload(demo=False)
+    assert p["available"] is True
+    assert p["max_size_bytes"] == 9_500_000_000

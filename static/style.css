@@ -4034,6 +4034,24 @@ button {
   overflow-wrap: anywhere;
 }
 
+/* 抽屉内待本机转换的 KFB/KFBF（侧栏上传行在遮罩下不可点） */
+.import-convert-offers {
+  border: 1px solid var(--accent-fill);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.import-convert-offers-title { font-size: 12px; color: var(--text-2); }
+.import-convert-offer { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.import-convert-offer-name {
+  flex: 1 1 100%;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
 /* 申请新格式支持（次级入口） */
 .format-req-form {
   display: flex;

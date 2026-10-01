@@ -18,6 +18,9 @@
 //      弹窗被拦截回退
 //   j  大文件磁盘确认仍在一键链前置
 //   k  已发布任务重复触发上传：不再建 ingestion/不传字节（关联未完成只重试关联：i5）
+//   l  上线 dogfood 回归：刷新后从项目打开 id_bundle 切片（按 slide_id 取 info）、
+//      普通用户界面删除走 ID 端点（两张同原始文件名，只删所点那张）；
+//      KFB 入口 >60s 不自动消失；导入抽屉打开时抽屉内入口可点
 // i/i4 的目标关联走真实 /api/project 端点（发布的是测试库里真实的 ready 切片）。
 // 复跑：node tests/browser/slide_tools_r1/run_e2e.js（服务复用 C4 server.py）。
 'use strict';
@@ -1131,6 +1134,145 @@ async function main() {
     }
   }
 
+  // ---------------------------------------------------------------- (l) --
+  /// 生产 dogfood P1：项目内 id_bundle 切片（name 为空）按文件名打开 → 404、
+  /// 按旧名端点删除 → 403。两张同原始文件名切片：打开/删除都须按所点行的
+  /// slide_id，另一张不受影响。
+  async function scenarioProjectOpenAndUiDelete() {
+    const { context, page } = await L.launch('l1-project-open-delete');
+    const [keepId, delId] = creds.dupSlideIds || [];
+    const infoReqs = [];
+    const delReqs = [];
+    page.on('response', (r) => {
+      const u = new URL(r.url());
+      if (/\/info$/.test(u.pathname) && /^\/api\/slides?\//.test(u.pathname)) {
+        infoReqs.push({ path: u.pathname, status: r.status() });
+      }
+      if (r.request().method() === 'DELETE' && u.pathname.startsWith('/api/slide')) {
+        delReqs.push({ path: u.pathname, status: r.status() });
+      }
+    });
+    try {
+      if (!keepId || !delId || keepId === delId) throw new Error(`dupSlideIds ${JSON.stringify(creds.dupSlideIds)}`);
+      await workbenchReady(page);
+      const pid = await page.evaluate(async (ids) => {
+        const m = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
+        const r = await fetch('/api/project/create', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': m ? decodeURIComponent(m[1]) : '' },
+          body: JSON.stringify({ name: 'r1-同名双片项目', note: '', slide_ids: ids }),
+        });
+        const b = await r.json();
+        if (!r.ok) throw new Error(b.error || r.status);
+        return b.pid;
+      }, [keepId, delId]);
+      // 刷新后从项目进入（与真实用户路径一致：列表来自服务端，而非本页内存）
+      await page.reload();
+      await page.waitForFunction(() => !!window.HP_UPLOAD, null, { timeout: 30000 });
+      if (!(await page.isVisible('#import-slides-btn'))) await page.click('#menu-btn');
+      const projSel = `.proj-row[data-pid="${pid}"]`;
+      await page.waitForSelector(projSel, { timeout: 30000 });
+      await page.click(`${projSel} .proj-name`);
+      await page.waitForSelector(`${projSel}.expanded .slide-row`, { timeout: 10000 });
+      const rows = await page.$$eval(`${projSel} .slide-row`, (els) => els.map((e) => ({
+        id: e.dataset.slideId, name: (e.querySelector('.slide-name') || {}).textContent || '',
+      })));
+      const rowIds = rows.map((r) => r.id).sort();
+      if (JSON.stringify(rowIds) !== JSON.stringify([keepId, delId].sort())) {
+        throw new Error(`project row ids ${JSON.stringify(rows)}`);
+      }
+      const failedRows = rows.filter((r) => /读取失败|read failed/.test(r.name));
+      if (failedRows.length) throw new Error(`rows marked read-failed: ${JSON.stringify(rows)}`);
+      // 打开：info 请求必须按所点行的 slide_id，200
+      infoReqs.length = 0;
+      await page.click(`${projSel} .slide-row[data-slide-id="${keepId}"] .slide-name`);
+      await waitFor(async () => infoReqs.some((r) => r.status === 200), 30000, 'slide info 200');
+      const badInfo = infoReqs.filter((r) => r.status !== 200 || r.path !== `/api/slides/${keepId}/info`);
+      if (badInfo.length) throw new Error(`info reqs ${JSON.stringify(infoReqs)}`);
+      // 界面删除另一张：确认框 → DELETE /api/slides/<id> 200 → 行消失
+      page.once('dialog', (d) => d.accept());
+      const delRow = page.locator(`${projSel} .slide-row[data-slide-id="${delId}"]`);
+      await delRow.hover();
+      await delRow.locator('.slide-del').click();
+      await waitFor(async () => delReqs.length > 0, 30000, 'delete request');
+      if (delReqs.length !== 1 || delReqs[0].path !== `/api/slides/${delId}` || delReqs[0].status !== 200) {
+        throw new Error(`delete reqs ${JSON.stringify(delReqs)}`);
+      }
+      await waitFor(async () => /已删除|deleted/i.test(await textOf(page, '#toast-container')), 30000, 'delete toast');
+      const toastText = await textOf(page, '#toast-container');
+      if (/无权访问|删除失败|delete failed/i.test(toastText)) throw new Error(`toast ${toastText}`);
+      // 删除不解除项目归属（既有语义）：列表刷新后该行变为不可读，同名另一张仍可读
+      await waitFor(async () => /读取失败|read failed/.test(await textOf(page,
+        `${projSel} .slide-row[data-slide-id="${delId}"] .slide-name`)), 30000, 'deleted row unreadable');
+      const keptName = await textOf(page, `${projSel} .slide-row[data-slide-id="${keepId}"] .slide-name`);
+      if (/读取失败|read failed/.test(keptName)) throw new Error(`kept row unreadable: ${keptName}`);
+      const gone = await L.apiGet(page, `/api/slides/${encodeURIComponent(delId)}/info`);
+      const kept = await L.apiGet(page, `/api/slides/${encodeURIComponent(keepId)}/info`);
+      if (![403, 404, 410].includes(gone.status) || kept.status !== 200) {
+        throw new Error(`after delete: deleted=${gone.status} kept=${kept.status}`);
+      }
+      record('l1-project-open-and-ui-delete', true, {
+        projectRows: rows.length, readFailedRows: 0, infoPath: '/api/slides/<id>/info',
+        deletePath: '/api/slides/<id>', deleteStatus: 200, deletedRowUnreadable: true, otherSameNameKept: true,
+      });
+    } catch (e) {
+      record('l1-project-open-and-ui-delete', false, { error: String(e).slice(0, 400) });
+    } finally {
+      await context.close();
+    }
+  }
+
+  /// 生产 dogfood P2：KFB 入口 60s 后自动消失 → 用户回来时选择已丢失。
+  async function scenarioConvertOfferPersists() {
+    const { context, page } = await L.launch('l2-offer-persists');
+    try {
+      await workbenchReady(page);
+      await page.clock.install();
+      await openImportDrawer(page);
+      await setWorkbenchFile(page, bf);
+      await closeImportDrawer(page);
+      await waitFor(async () => (await convertOfferLocator(page).count()) === 1, 30000, 'convert offer');
+      await page.clock.fastForward(70000);
+      await page.clock.runFor(1000);
+      const offers = await convertOfferLocator(page).count();
+      const rowsLeft = await page.locator('.upload-item').count();
+      if (offers !== 1 || rowsLeft < 1) throw new Error(`after 71s: offers=${offers} rows=${rowsLeft}`);
+      record('l2-convert-offer-persists-past-60s', true, { fastForwardMs: 71000, offers, rows: rowsLeft });
+    } catch (e) {
+      record('l2-convert-offer-persists-past-60s', false, { error: String(e).slice(0, 400) });
+    } finally {
+      await context.close();
+    }
+  }
+
+  /// 生产 dogfood P2：导入抽屉遮罩盖住侧栏入口。抽屉不关，抽屉内入口须可点
+  /// （Playwright 点击前做遮挡检查）并完成 popup 交接。
+  async function scenarioDrawerOfferClickable() {
+    const { context, page } = await L.launch('l3-drawer-offer');
+    try {
+      await workbenchReady(page);
+      await openImportDrawer(page);
+      await setWorkbenchFile(page, bf);
+      const drawerBtn = page.locator('#import-drawer .import-convert-offer-btn');
+      await waitFor(async () => (await drawerBtn.count()) === 1, 30000, 'drawer convert offer');
+      if (!(await page.isVisible('#import-drawer'))) throw new Error('drawer closed');
+      const [popup] = await Promise.all([
+        context.waitForEvent('page', { timeout: 30000 }),
+        drawerBtn.click({ timeout: 10000 }),
+      ]);
+      await popup.waitForFunction(() => !!window.__stToolsReady, null, { timeout: 30000 });
+      await waitFor(async () => /已接收工作台|Received the file/.test(await textOf(popup, '#page-status')),
+        60000, 'handoff banner');
+      const left = await drawerBtn.count();
+      if (left !== 0) throw new Error(`drawer offer not cleared after handoff: ${left}`);
+      record('l3-drawer-offer-clickable', true, { drawerOpen: true, popup: true, drawerOfferCleared: true });
+    } catch (e) {
+      record('l3-drawer-offer-clickable', false, { error: String(e).slice(0, 400) });
+    } finally {
+      await context.close();
+    }
+  }
+
   // ---------------------------------------------------------------- (j) --
   async function scenarioDiskConfirmGates() {
     const big = L.sparseLargeKfb('r1-sparse-5g2.kfb', Math.ceil(5.2 * 2 ** 30));
@@ -1186,6 +1328,9 @@ async function main() {
     ['i5-assoc-failure-retry', scenarioAssocRetry],
     ['j-disk-confirm-gates-oneclick', scenarioDiskConfirmGates],
     ['k1-published-repeat-clicks', scenarioPublishedRepeatClicks],
+    ['l1-project-open-and-ui-delete', scenarioProjectOpenAndUiDelete],
+    ['l2-convert-offer-persists-past-60s', scenarioConvertOfferPersists],
+    ['l3-drawer-offer-clickable', scenarioDrawerOfferClickable],
   ];
   for (const [id, fn] of all) {
     if (ONLY && id !== ONLY) continue;

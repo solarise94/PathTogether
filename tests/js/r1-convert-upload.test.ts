@@ -185,11 +185,64 @@ describe("R1 工作台入口（真实 app.js）", () => {
 		const row = h.container.children[0] as ReturnType<typeof el>;
 		const status = rowPart(row, "upload-item-status");
 		expect(status && status.textContent).toMatch(/upload\.kfb\.hint|需在本机转换后上传/);
-		// 唯一按钮 = 本机转换入口（无取消按钮——没有开始上传）
+		// 本机转换入口 + 忽略（无取消按钮——没有开始上传）
 		const btns = rowButtons(row);
-		expect(btns.length).toBe(1);
+		expect(btns.length).toBe(2);
 		expect(btns[0].textContent).toMatch(/upload\.kfb\.btn|在本机转换并上传/);
 		expect(btns[0].className).toBe("upload-item-btn");
+		expect(btns[1].textContent).toMatch(/upload\.kfb\.dismiss|忽略/);
+	});
+
+	/// 行移除计时 = makeUploadRow.finish 的 setTimeout（toast 计时另计，按延时区分）
+	function removalDelays(spy: vi.SpyInstance) {
+		return spy.mock.calls.map((c) => Number(c[1])).filter((d) => d === 0 || d >= 6000);
+	}
+
+	it("待操作入口不定时移除：未点击时不安排任何移除计时", () => {
+		const spy = vi.spyOn(globalThis, "setTimeout");
+		try {
+			const h = loadApp({ mode: "official", capabilities: { cos_upload: cosCaps() } });
+			spy.mockClear();
+			h.up.uploadFile(kfbFile());
+			expect(removalDelays(spy)).toEqual([]);
+			const row = h.container.children[0] as ReturnType<typeof el>;
+			expect(rowButtons(row).length).toBe(2);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it("忽略 → 立即安排移除该行（不打开 popup）", () => {
+		const spy = vi.spyOn(globalThis, "setTimeout");
+		try {
+			const h = loadApp({ mode: "official", capabilities: { cos_upload: cosCaps() } });
+			h.up.uploadFile(kfbFile());
+			const row = h.container.children[0] as ReturnType<typeof el>;
+			spy.mockClear();
+			fire(rowButtons(row)[1], "click");
+			expect(removalDelays(spy)).toEqual([0]);
+			expect(h.w.open as vi.Mock).not.toHaveBeenCalled();
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it("弹窗被拦截 → 行保留可重试（不安排移除），重按仍尝试打开", () => {
+		const spy = vi.spyOn(globalThis, "setTimeout");
+		try {
+			const h = loadApp({ mode: "official", capabilities: { cos_upload: cosCaps() } }, null);
+			h.up.uploadFile(kfbFile());
+			const row = h.container.children[0] as ReturnType<typeof el>;
+			spy.mockClear();
+			fire(rowButtons(row)[0], "click");
+			fire(rowButtons(row)[0], "click");
+			expect(removalDelays(spy)).toEqual([]);
+			expect((h.w.open as vi.Mock).mock.calls.length).toBe(2);
+			const links = row.children.filter((c) => (c as ReturnType<typeof el>).tagName === "A");
+			expect(links.length).toBe(1);
+		} finally {
+			spy.mockRestore();
+		}
 	});
 
 	it("原生 .tif → 无本机转换入口，照常创建 ingestion（直传不回退）", async () => {

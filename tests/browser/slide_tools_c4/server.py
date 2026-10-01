@@ -22,7 +22,9 @@ R1 可选项（C4 套件不用）：
   仅此一步——分块 PUT 仍由 page.route 拦截；completing 之后不推进）；
 - --seed-ready-slide：为 c4-user 分配一个真实 ready 切片（合成 TIFF 写入
   id_bundle 存储路径 + mark_ready），ID 写入 creds（readySlideId），供真实
-  项目关联端点测试。
+  项目关联端点测试；另分配两张原始文件名相同的 ready 切片（dupSlideIds），
+  供「从项目打开 / 界面删除」按 slide_id 寻址的回归（id_bundle 资产 name 为
+  空，按文件名打开/删除会 404/403）。
 """
 import argparse
 import atexit
@@ -42,13 +44,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pg_reap  # noqa: E402
 
 
-def _seed_ready_slide(owner_user_id):
+def _seed_ready_slide(owner_user_id, filename="r1-assoc-real.tif"):
     """真实 ready 切片：allocate → 合成 TIFF 落到 id_bundle 路径 → mark_ready。"""
     import numpy as np
     import tifffile
     import slide_storage
     import slide_store
-    desc = slide_store.allocate_slide(owner_user_id, "r1-assoc-real.tif", "tif")
+    desc = slide_store.allocate_slide(owner_user_id, filename, "tif")
     path = str(slide_storage.resolve_descriptor_path(desc))
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tifffile.imwrite(path, np.full((256, 256, 3), 200, dtype=np.uint8),
@@ -162,9 +164,11 @@ def main():
         "c4-user2@pt.test", user2_pw, display_name="C4 普通用户二")
 
     ready_slide_id = ""
+    dup_slide_ids = []
     if args.seed_ready_slide:
-        ready_slide_id = _seed_ready_slide(
-            user_store_pg.get_user_by_login_id("c4-user@pt.test")["user_id"])
+        uid = user_store_pg.get_user_by_login_id("c4-user@pt.test")["user_id"]
+        ready_slide_id = _seed_ready_slide(uid)
+        dup_slide_ids = [_seed_ready_slide(uid, "r1-dup-same.tif") for _ in range(2)]
     if args.fake_cos_worker:
         _start_fake_cos_preparing_worker()
 
@@ -179,6 +183,7 @@ def main():
         "user2Login": "c4-user2@pt.test",
         "user2Password": user2_pw,
         "readySlideId": ready_slide_id,
+        "dupSlideIds": dup_slide_ids,
         "cosOrigin": "https://c4fake-1250000000.cos.ap-fake.myqcloud.com",
     }), encoding="utf-8")
 

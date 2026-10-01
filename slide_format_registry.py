@@ -9,7 +9,7 @@
 capability 语义（docs/kfb-ingestion-converter-review.md §3.1/§4）：
   - ``native-single-file``：OpenSlide/现有 reader 直接读单文件，原样保留；
   - ``native-bundle``：主文件 + 同名伴随目录（MRXS），不能当单文件入口；
-  - ``convert-required``：需后台转换为 canonical 格式（明场 KFB → 经典
+  - ``convert-required``：需转换为 canonical 格式（R1 起在本机浏览器转换；明场 KFB → 经典
     多 IFD BigTIFF；荧光 KFBF → 多通道 OME-TIFF）；
   - ``unsupported``：明确不支持，fail-closed（未知扩展名）。
 
@@ -311,7 +311,7 @@ _CATALOG_DISPLAY = (
         "canonical_format": "bigtiff",
         "bundle_required": False,
         "import_mode": "convert",
-        "limits": ["上传后后台转换为 BigTIFF（明场）"],
+        "limits": ["在本机浏览器中转换为 BigTIFF（明场）后上传"],
         "selectable_for_upload": True,
     },
     {
@@ -322,7 +322,7 @@ _CATALOG_DISPLAY = (
         "canonical_format": "ome-tiff",
         "bundle_required": False,
         "import_mode": "convert",
-        "limits": ["上传后后台转换为多通道 OME-TIFF（荧光）"],
+        "limits": ["在本机浏览器中转换为多通道 OME-TIFF（荧光）后上传"],
         "selectable_for_upload": True,
     },
 )

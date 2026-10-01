@@ -1,0 +1,11 @@
+FAILED tests/test_admin_preview.py::test_subject_visibility_applies_during_preview - AssertionError: assert set() == {'owner.svs'}
+FAILED tests/test_admin_preview.py::test_write_guard_blocks_all_unsafe_methods - AssertionError: POST /api/upload -> 404
+FAILED tests/test_admin_preview.py::test_cannot_preview_disabled_user - AssertionError: assert set() == {'o.svs'}
+3 failed, 2865 passed, 10 skipped, 1 deselected, 252 warnings in 1606.93s (0:26:46)
+plugins/pathtogether-baidu-import/tests: 83 passed
+
+处置（2026-10-02，r1-rc3 候选）：
+- test_admin_preview.py 3 例：与 r1-rc2 记录（pytest-full-rc2.txt）相同的过时测试文件失败；
+  在未改动的 release/r1 HEAD（daac63d）上逐例复现同样失败——非本次回归。
+- 新增回归（tests/test_slide_id_relations_pg.py）：slide_refs 行对齐、按 ID 建项目（带/不带
+  Idempotency-Key）保留同原始文件名的 id_bundle 切片——均在修复前失败、修复后通过。

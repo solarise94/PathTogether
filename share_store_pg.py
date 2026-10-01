@@ -2349,6 +2349,9 @@ def _fetch_project(cur, pid):
     d["pid"] = pid
     d["slides"] = [r["slide"] for r in prows]
     d["slide_ids"] = [r["slide_id"] for r in prows if r["slide_id"]]
+    # Row-aligned pairs: slide_ids drops rows without an ID, so it cannot be zipped with
+    # slides. id_bundle assets have no unique name; clients must address them by slide_id.
+    d["slide_refs"] = [{"slide": r["slide"], "slide_id": r["slide_id"]} for r in prows]
     return d
 
 

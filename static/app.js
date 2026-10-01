@@ -88,6 +88,8 @@
     "upload.kfb.handoff.sent": { zh: "已交给本机转换工具（新窗口）：在那里继续转换与上传", en: "Handed off to the local conversion tool (new window); conversion and upload continue there" },
     "upload.kfb.popup.blocked": { zh: "弹窗被浏览器拦截：请允许本站弹出窗口后重试，或打开本地切片工具手动选择文件", en: "The popup was blocked: allow popups for this site and retry, or open the local slide tool and select the file manually" },
     "upload.kfb.tools.link": { zh: "打开本地切片工具", en: "Open the local slide tool" },
+    "upload.kfb.dismiss": { zh: "忽略", en: "Dismiss" },
+    "upload.kfb.drawer.title": { zh: "以下文件需在本机转换后上传：", en: "These files must be converted on this machine before uploading:" },
     "upload.kfb.done": { zh: "本机转换并上传完成：{name} 已按目标位置入库", en: "Local convert-and-upload finished: {name} stored under the chosen target" },
 
     // 升级 C（§6.1）：矩形工具文案（i18n.js 为主源；此处兜底）
@@ -2647,8 +2649,12 @@
       // 展开体：切片行
       var body = document.createElement("div");
       body.className = "proj-body";
-      (p.slides || []).forEach(function (sname) {
-        body.appendChild(renderSlideRow(sname, false));
+      // 行身份 = slide_id（slide_refs 与项目行逐行对齐）：id_bundle 资产 name 为
+      // null，原始文件名可重复，不能当身份。无 slide_refs 的旧后端回落按名。
+      projectSlideRefs(p).forEach(function (ref) {
+        var sinfo = ref.slide_id ? findSlideInfoById(ref.slide_id) : findSlideInfo(ref.slide);
+        var label = (sinfo && (sinfo.name || sinfo.original_filename)) || ref.slide || ref.slide_id;
+        body.appendChild(renderSlideRow(label, false, sinfo, ref.slide_id));
       });
       row.appendChild(body);
 
@@ -2669,11 +2675,13 @@
   // 切片行（项目展开体内 / 未归类）。unfiled=true 时显示复选框。
   // sname 是行的显示/列表定位名；操作键 sid = slide_id（P2 合同 §5.1；
   // 列表外资产/旧后端回落 name——与 data-slide-id 同源）。
-  function renderSlideRow(sname, unfiled, sinfoHint) {
+  function renderSlideRow(sname, unfiled, sinfoHint, idHint) {
     // sinfoHint：调用方已持有列表项（renderUnfiled）时直用，省一次线性查找，
-    // 也覆盖 P3 起 id_bundle 行（name=None，按名查不到）——操作键仍取 slide_id
-    var sinfo = sinfoHint || findSlideInfo(sname);
-    var sid = (sinfo && sinfo.slide_id) || sname;
+    // 也覆盖 P3 起 id_bundle 行（name=None，按名查不到）——操作键仍取 slide_id。
+    // idHint：项目行的 slide_id（列表外资产也按 ID 打开/删除，不回落到文件名）
+    var sinfo = sinfoHint || (idHint ? findSlideInfoById(idHint) : findSlideInfo(sname));
+    var sid = (sinfo && sinfo.slide_id) || idHint || sname;
+    var assetId = (sinfo && sinfo.slide_id) || idHint || null;
     var row = document.createElement("div");
     row.className = "slide-row";
     // 操作键：data-slide-id（ID 通道=slide_id；旧后端=name）。
@@ -2774,17 +2782,25 @@
     });
     row.appendChild(shareBtn);
 
-    // 删除按钮（hover 浮现）。删除 P2 仍按名（DELETE /api/slide/<name> 是
-    // 旧路由；ID 删除 P5 才出——本阶段不动，见合同阶段划分）
+    // 删除按钮（hover 浮现）：有 slide_id 走权威 ID 端点（id_bundle 资产按名
+    // 不可寻址，旧名端点对其返回 403/404）；仅旧后端/无 ID 行回落按名
     var delBtn = document.createElement("button");
     delBtn.className = "slide-del";
     delBtn.textContent = "×";
     delBtn.title = t("slide.op.del");
-    delBtn.addEventListener("click", function (ev) { ev.stopPropagation(); deleteSlide(sname); });
+    delBtn.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      deleteSlide(dispName || sname, assetId, sinfo ? sinfo.name : sname);
+    });
     row.appendChild(delBtn);
 
     // Demo 目录按钮（仅 owner；加入后无需登录即可从互联网访问，docs §5.1）。
-    // admin demo-catalog 写通道 P2 保持按名（不动管理写通道）
+    // admin demo-catalog 写通道按名：无唯一名的 id_bundle 资产不提供（按原始
+    // 文件名会定位到别的同名切片）
+    if (sinfo ? !sinfo.name : !!idHint) {
+      row.addEventListener("click", function () { openSlide(sid); });
+      return row;
+    }
     var demoBtn = document.createElement("button");
     demoBtn.className = "slide-demo";
     demoBtn.type = "button";
@@ -2939,6 +2955,22 @@
       }
     }
     return null;
+  }
+
+  function findSlideInfoById(slideId) {
+    if (!slideId) return null;
+    for (var i = 0; i < allSlides.length; i++) {
+      if (allSlides[i].slide_id === slideId) return allSlides[i];
+    }
+    return null;
+  }
+
+  // 项目行引用（与项目内顺序逐行对齐）：新后端 slide_refs；旧后端只有 slides(名)
+  function projectSlideRefs(p) {
+    if (p && Array.isArray(p.slide_refs)) {
+      return p.slide_refs.filter(function (r) { return r && (r.slide_id || r.slide); });
+    }
+    return ((p && p.slides) || []).map(function (n) { return { slide: n, slide_id: null }; });
   }
 
   // ---------- 未归类切片 ----------
@@ -6314,13 +6346,23 @@
   // ---------- 删除切片 ----------
   // P2：删除仍按名（DELETE /api/slide/<name> 是旧路由；ID 删除 P5 才出——
   // 本阶段不动，sname 来自列表行的 legacy 名）
-  function deleteSlide(name) {
+  // label：确认/提示用显示名；slideId：权威身份（有则走 ID 端点）；
+  // legacyName：仅无 ID 时的旧名端点键
+  function deleteSlide(label, slideId, legacyName) {
+    var name = label;
     if (!confirm(t("del.slide.confirm", { name: name }))) return;
-    apiFetch("/api/slide/" + encodeURIComponent(name), { method: "DELETE" })
+    var byId = !!slideId && slideIdApiOn();
+    if (!byId && !legacyName) {
+      toast(t("del.slide.fail", { e: t("slide.not.found") }), "error");
+      return;
+    }
+    var url = byId ? "/api/slides/" + encodeURIComponent(slideId)
+                   : "/api/slide/" + encodeURIComponent(legacyName);
+    apiFetch(url, { method: "DELETE" })
       .then(function (r) {
         if (!r.ok) return r.json().then(function (j) { throw new Error(j.error); });
-        if (state.slide && (state.slide.name === name ||
-                            (state.slide.id && state.slide.id === name))) {
+        if (state.slide && (byId ? state.slide.id === slideId
+                                 : state.slide.name === legacyName)) {
           state.slide = null; state.mppX = null; state.roiMode = null;
           updateDocTitle(null);
           updateMppSetterVisibility();
@@ -6639,10 +6681,13 @@
       link.target = "_blank";
       link.rel = "noopener";
       link.textContent = tt("upload.kfb.tools.link");
-      if (row._row && row._row.appendChild) row._row.appendChild(link);
-      row.finish(60000);
+      if (row._row && row._row.appendChild && !row._toolsLink) {
+        row._row.appendChild(link);
+        row._toolsLink = link;
+      }
+      // 行保留：允许弹窗后重按同一按钮重试
       toast(tt("upload.kfb.popup.blocked"), "error");
-      return;
+      return false;
     }
     convertHandoff.popup = popup;
     convertHandoff.acked = false;
@@ -6670,15 +6715,81 @@
       } catch (e) { /* retry next tick */ }
     }, 400);
     row.finish(60000);
+    return true;
+  }
+
+  /// 抽屉内的待转换区（抽屉遮罩盖住侧栏上传行，侧栏在窄屏/收起时也不可见）
+  function drawerConvertOfferHost() {
+    var panel = els.importPanelLocal;
+    if (!panel || !panel.insertBefore) return null;
+    var host = document.getElementById("import-convert-offers");
+    if (!host) {
+      host = document.createElement("div");
+      host.id = "import-convert-offers";
+      host.className = "import-convert-offers";
+      host.setAttribute("role", "status");
+      var title = document.createElement("div");
+      title.className = "import-convert-offers-title";
+      title.textContent = tt("upload.kfb.drawer.title");
+      host.appendChild(title);
+      panel.insertBefore(host, panel.firstChild);
+    }
+    return host;
   }
 
   /// KFB/KFBF 行：不判失败——给出「在本机转换并上传」入口（能力词表内）。
+  /// 待操作入口不是完成通知：保留到用户点击或忽略，不定时移除。
   function offerBrowserConvert(file, row) {
     row.setStage("upload.kfb.hint");
-    addRowButton(row, tt("upload.kfb.btn"), function () {
-      openConvertHandoff(file, row);
-    });
-    row.finish(60000);
+    var drawerItem = null;
+    var drawerHost = null;
+    var buttons = [];
+    function removeDrawerItem() {
+      if (!drawerItem) return;
+      if (drawerItem.parentNode) drawerItem.parentNode.removeChild(drawerItem);
+      drawerItem = null;
+      if (drawerHost && drawerHost.parentNode &&
+          drawerHost.querySelectorAll(".import-convert-offer").length === 0) {
+        drawerHost.parentNode.removeChild(drawerHost);
+      }
+    }
+    function start() {
+      if (openConvertHandoff(file, row)) {
+        removeDrawerItem();
+        buttons.forEach(function (b) { if (b && b.parentNode) b.parentNode.removeChild(b); });
+      }
+    }
+    function dismiss() {
+      removeDrawerItem();
+      row.finish(0);
+    }
+    buttons.push(addRowButton(row, tt("upload.kfb.btn"), start));
+    buttons.push(addRowButton(row, tt("upload.kfb.dismiss"), dismiss));
+    if (importDrawerState.open) {
+      var host = drawerHost = drawerConvertOfferHost();
+      if (host) {
+        drawerItem = document.createElement("div");
+        drawerItem.className = "import-convert-offer";
+        var label = document.createElement("div");
+        label.className = "import-convert-offer-name";
+        label.textContent = (file && file.name) || "";
+        drawerItem.appendChild(label);
+        var go = document.createElement("button");
+        go.type = "button";
+        go.className = "btn primary small import-convert-offer-btn";
+        go.textContent = tt("upload.kfb.btn");
+        go.addEventListener("click", function (e) { if (e) e.preventDefault(); start(); });
+        var no = document.createElement("button");
+        no.type = "button";
+        no.className = "btn secondary small import-convert-offer-dismiss";
+        no.textContent = tt("upload.kfb.dismiss");
+        no.addEventListener("click", function (e) { if (e) e.preventDefault(); dismiss(); });
+        drawerItem.appendChild(go);
+        drawerItem.appendChild(no);
+        host.appendChild(drawerItem);
+        try { go.focus(); } catch (e) { /* 聚焦失败不影响操作 */ }
+      }
+    }
   }
 
 
@@ -7208,10 +7319,10 @@
     { id: "raster-image", display_name: "普通图片（BMP / JPEG）",
       extensions: [".bmp", ".jpg", ".jpeg"], import_mode: "direct",
       limits: ["普通图片、支持像素坐标、无物理标尺"] },
-    { display_name: "KFB / KFBF", extensions: [".kfb", ".kfbf"],
+    { id: "kfb-kfbf", display_name: "KFB / KFBF", extensions: [".kfb", ".kfbf"],
       import_mode: "convert",
-      limits: ["KFB 上传后后台转换为 BigTIFF（明场）；KFBF 转换为多通道 OME-TIFF（荧光）"] },
-    { display_name: "MRXS", extensions: [".mrxs"], import_mode: "bundle",
+      limits: ["在本机浏览器中转换后上传：KFB 转为 BigTIFF（明场），KFBF 转为多通道 OME-TIFF（荧光）"] },
+    { id: "mrxs", display_name: "MRXS", extensions: [".mrxs"], import_mode: "bundle",
       limits: ["需要完整包（主文件 + 同名伴随目录），请打包 zip 上传"] },
   ];
 
@@ -7250,6 +7361,12 @@
     if (a) els.fileInput.accept = a;
   }
 
+  function catalogText(key, fallback) {
+    if (!key || /\.(undefined|null)$/.test(key)) return fallback;
+    var s = t(key);
+    return (s && s !== key) ? s : fallback;
+  }
+
   function formatModeLabel(mode) {
     if (mode === "convert") return t("imp.formats.mode.convert");
     if (mode === "bundle") return t("imp.formats.mode.bundle");
@@ -7266,14 +7383,17 @@
       head.className = "imp-format-head";
       var nm = document.createElement("span");
       nm.className = "imp-format-name";
-      nm.textContent = (f.display_name || f.id || "") + "  " + (f.extensions || []).join(" / ");
+      nm.textContent = catalogText("imp.formats.name." + f.id, f.display_name || f.id || "") +
+        "  " + (f.extensions || []).join(" / ");
       var badge = document.createElement("span");
       badge.className = "imp-format-badge mode-" + (f.import_mode || "direct");
       badge.textContent = formatModeLabel(f.import_mode);
       head.appendChild(nm);
       head.appendChild(badge);
       row.appendChild(head);
-      (f.limits || []).forEach(function (lim) {
+      // 目录文案随界面语言：有本地化条目用本地化，否则用服务端原文
+      var localLimit = catalogText("imp.formats.limits." + f.id, null);
+      (localLimit ? [localLimit] : (f.limits || [])).forEach(function (lim) {
         var l = document.createElement("div");
         l.className = "imp-format-limit";
         l.textContent = lim;

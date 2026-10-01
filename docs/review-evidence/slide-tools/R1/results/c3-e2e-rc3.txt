@@ -1,0 +1,33 @@
+c3 e2e server on :8943
+PASS [a-bf-happy-path] {"savedSha256":"f265596a7662ca7e6c260fa9a4650d30a5d894791bcac11029a1e28235113679","nativeSha256":"f265596a7662ca7e6c260fa9a4650d30a5d894791bcac11029a1e28235113679","savedBytes":287803,"notSavedWarnShown":true,"persistMsg":"浏览器未授予持久存储——结果仍可能被清理，请尽快保存到磁盘。"}
+PASS [j-network-capture] {"totalRequests":13,"nonSameOrigin":0,"nonGet":[],"apiCalls":0,"nameLeak":0,"shaLeak":0,"nonPageStatic":[],"downloads":[],"requestPaths":["/tools/slides","/static/tools/tools-slides.css","/static/i18n.js","/static/upload/cos-uploader.js","/static/tools/tools-slides.js","/static/tools/slide-transform
+PASS [csp-real-app] {"csp":"default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self'; style-src 'self'; img-src 'self' data:; base-uri 'none'; object-src 'none'; form-action 'none'; frame-ancestors 'none'","wasmType":"application/wasm","wasmStatus":200,"cspViolations":[]}
+[a] 1.0s
+PASS [b-kfbf-happy-path] {"savedSha256":"910d170ecf66a9b3881d458d8c7d84554e9c5a7c68a365d5190547a035cd584b","nativeSha256":"910d170ecf66a9b3881d458d8c7d84554e9c5a7c68a365d5190547a035cd584b","savedBytes":134114,"displayWindows":{"ch0":"13–227（来自 channel.json）","ch1":"16–175（来自 channel.json）"}}
+[b] 0.6s
+PASS [c-refresh-resume] {"savedSha256":"cefec34e8786ef1a36d87423fc70eb86500322e46244f3059fffc923c6788be5","nativeSha256":"cefec34e8786ef1a36d87423fc70eb86500322e46244f3059fffc923c6788be5","beforeunloadSeen":true}
+[c] 67.9s
+PASS [d1-uncertain-disk] {"dialogNumbers":true,"focusInDialog":true,"focusRestored":true,"cancelLeftNoDir":true,"confirmProceeded":true,"dirsAfterReloadSweep":[]}
+PASS [d2-uncertain-real-quota] {"note":"fresh profile, real estimate hits reporting cap"}
+PASS [d3-hard-shortage] {"errText":"临时空间不足\n需要约 4.02 GiB，浏览器报告可用 1.00 GiB。请释放空间或更换磁盘后再试。\n(disk_precheck_failed: 空间不足：需要 ~4113 MiB，可用 ~1024 MiB（pre-stage）)","dialogOpen":false,"jobDirs":0}
+[d] 6.6s
+PASS [e-cancel-250ms] {"syncMs":0.2999999523162842,"paintedMs":7.099999904632568,"statusAfter":"已取消","jobDirsAfter":[]}
+[e] 9.2s
+PASS [f-discard-and-list-start] {"startFromListShaOk":true,"jobDirsAfterDiscard":[]}
+[f] 0.6s
+PASS [g-strict-lossless-refusal] {"preWarningShown":true,"errText":"核心拒绝了本次转换：该输入包含需要重编码/填充的 tile，无法在“像素严格无损”策略下输出。可改用“保留编码（允许边缘重编码）”策略。\n(pixel_policy_violation: 层 0 有 4 个需要重编码/填充的非完整 tile（StrictLossless）)","jobStateAfter":"失败"}
+[g] 0.4s
+PASS [h-unsupported-input] {"jobDirs":[]}
+[h] 0.2s
+PASS [i-save-unavailable] {"saveDisabled":true,"message":"当前浏览器不支持“保存到磁盘”（缺少文件系统访问能力）。请使用受支持的浏览器（如 Chrome / Edge）；本工具不会退回整文件下载。","downloads":[],"anchorDownloads":0}
+[i] 0.5s
+PASS [k-offline-full-flow] {"savedSha256":"f265596a7662ca7e6c260fa9a4650d30a5d894791bcac11029a1e28235113679","nativeSha256":"f265596a7662ca7e6c260fa9a4650d30a5d894791bcac11029a1e28235113679","networkAttemptsWhileOffline":[]}
+[k] 0.6s
+PASS [l-zh-en-toggle] {"rawKeys":[],"cjkSample":"","saveDisabled":false,"saveLabel":"Save to disk","saveSupported":true,"backZhH1":"本地切片工具","backZhSave":"保存到磁盘"}
+[l] 0.7s
+PASS [m-keyboard-only] {"profileBefore":"faster","profileChangedTo":"balanced","savedSha256":"f265596a7662ca7e6c260fa9a4650d30a5d894791bcac11029a1e28235113679"}
+[m] 0.5s
+PASS [n1-channel-json-refresh-list-start] {"displayWindows":{"ch0":"13–227（来自 channel.json）","ch1":"16–175（来自 channel.json）"},"report":{"520":[16,175],"DAPI":[13,227]}}
+PASS [n2-channel-json-refresh-list-start] {"displayWindows":{"ch0":"13–227（来自 channel.json）","ch1":"16–175（来自 channel.json）"},"report":{"520":[16,175],"DAPI":[13,227]}}
+[n] 1.4s
+E2E ALL PASS

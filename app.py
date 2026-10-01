@@ -21642,10 +21642,11 @@ def api_project_create():
     names, sids, err = _resolve_slide_refs_for_project(entries, field="create")
     if err is not None:
         return err
-    # legacy 名成员走幂等创建（store 侧名→ID 解析双写）；id_bundle 成员
-    # （无冻结别名、名为空）创建后按 ID 追加；带 Idempotency-Key 的路径由
-    # project_idempotency_store 原样写入（无 ID 列）——创建成功后用
-    # update_project 补写双列（同一成员集，位置语义不变）。
+    # 有名快照的成员走幂等创建；id_bundle 成员（名快照为空）创建后按 ID
+    # 追加。创建路径只按名落行（名→ID 只认冻结 legacy 名；id_bundle 资产的
+    # 名快照是可重复的原始文件名，按名会丢 ID、同名并成一行）——带不带
+    # Idempotency-Key，创建成功后都用 update_project 以 ID 为权威补写双列
+    # （同一成员集，位置语义不变）。
     legacy_names = [n for n in names if n]
     legacy_sids = [sid for n, sid in zip(names, sids) if n]
     id_bundle_ids = [sid for n, sid in zip(names, sids) if not n]
@@ -21656,7 +21657,7 @@ def api_project_create():
         pid = (payload or {}).get("pid")
         if pid:
             try:
-                if key and legacy_names:
+                if legacy_names:
                     share_store.update_project(pid, slides=legacy_names,
                                                slide_ids=legacy_sids)
                 if id_bundle_ids:

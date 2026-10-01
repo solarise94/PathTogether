@@ -224,6 +224,61 @@ def test_project_same_name_different_ids_coexist():
     assert c.delete("/api/project/%s/slides/sld_unknown00" % pid).status_code == 404
 
 
+def test_project_slide_refs_are_row_aligned_with_ids():
+    """项目行按 (slide, slide_id) 逐行下发：slide_ids 会剔除无 ID 的行，与
+    slides 不能按下标配对；客户端以 slide_refs 的 slide_id 为行身份（id_bundle
+    资产 name 为空、原始文件名可重复，按名打开/删除会落到 404/403）。"""
+    import pg_store
+    owner, _a, _b = _setup_users()
+    c, n1, n2, id1, id2 = _two_same_display(owner)
+    r = c.post("/api/project/create", json={"name": "P", "slide_ids": [id1, id2]})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    pid = r.get_json()["pid"]
+    conn = pg_store.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO project_slides (project_id, slide, slide_id, position) "
+                        "VALUES (%s, 'legacy-only.svs', NULL, 0)", (pid,))
+        conn.commit()
+    finally:
+        conn.close()
+    item = [p for p in c.get("/api/projects").get_json() if p["pid"] == pid][0]
+    refs = item["slide_refs"]
+    assert len(refs) == len(item["slides"]) == 3
+    assert [r["slide"] for r in refs] == item["slides"]
+    assert {r["slide_id"] for r in refs} == {id1, id2, None}
+    assert sorted(item["slide_ids"]) == sorted([id1, id2])
+    for ref in refs:
+        if ref["slide_id"]:
+            assert c.get("/api/slides/%s/info" % ref["slide_id"]).status_code == 200
+    detail = c.get("/api/project/%s" % pid).get_json()["project"]
+    assert detail["slide_refs"] == refs
+
+
+@pytest.mark.parametrize("idem_key", [None, "k-dup-same"])
+def test_project_create_by_ids_keeps_same_filename_id_bundle_slides(idem_key):
+    """id_bundle 资产无 legacy 名（名快照=原始文件名，可重复）：按 slide_ids
+    建项目——无论带不带 Idempotency-Key——两张同原始文件名切片都须以各自
+    slide_id 成行（生产 dogfood：按文件名落行 → 并成一行、ID 丢失、读取失败）。"""
+    from _pt_helpers import publish_test_slide
+    owner, _a, _b = _setup_users()
+    id1 = publish_test_slide("dup-same.tif", make_tiff_bytes(),
+                             owner_user_id=owner["user_id"])
+    id2 = publish_test_slide("dup-same.tif", make_tiff_bytes(),
+                             owner_user_id=owner["user_id"])
+    assert id1 != id2
+    c = _client()
+    _login(c, "owner@x.com", "ownerpass123456")
+    headers = {"Idempotency-Key": idem_key} if idem_key else {}
+    r = c.post("/api/project/create", headers=headers,
+               json={"name": "P", "slide_ids": [id1, id2]})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    pid = r.get_json()["pid"]
+    proj = c.get("/api/project/%s" % pid).get_json()["project"]
+    assert [ref["slide_id"] for ref in proj["slide_refs"]] == [id1, id2]
+    assert proj["slide_ids"] == [id1, id2]
+
+
 # =========================================================================== #
 # 2. 改名不动 ID/授权（§8-1）
 # =========================================================================== #

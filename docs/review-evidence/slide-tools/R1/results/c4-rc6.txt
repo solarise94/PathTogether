@@ -1,0 +1,17 @@
+PASS [a-bf] {"filename":"bf-580x300.ome.tif","putBytes":288881,"slideLink":"/app","sha":"6e8744f9437b","size":288881}
+PASS [a-fl] {"filename":"fl-600x400.ome.tif","putBytes":134114,"slideLink":"/app","sha":"910d170ecf66","size":134114}
+PASS [b-401-continue] {"loginLink":"/login?next=/tools/slides","creates":1,"sha":"6e8744f9437b"}
+PASS [c-refresh-continue] {"creates":1,"resumeSigned":[[3,4]],"resumePuts":[3,4],"sha":"6e8744f9437b"}
+PASS [d-repeated-clicks] {"creates":1,"sha":"6e8744f9437b"}
+PASS [e-lost-complete] {"completeReqs":2,"sha":"6e8744f9437b"}
+PASS [f-oversize] {"reason":"输出文件超过平台上限（1000 B 以内可上传）；已禁用上传，本地产物保留，仍可","creates":0,"savedSha":"6e8744f9437b"}
+PASS [g-format-unsupported] {"reason":"平台暂不支持查看该输出格式；已禁用上传（导出能力不受影响），本地产物保留，仍可本","creates":0,"savedSha":"6e8744f9437b"}
+PASS [h-cancel-terminal] {"cancels":1,"creates":2,"sha":"6e8744f9437b","discarded":true}
+PASS [i-network-capture] {"preClickApi":0,"preClickCross":0,"postClickUrls":["GET /tools/slides","GET /static/tools/tools-slides.css","GET /static/i18n.js","GET /static/tools/tools-slides.js","GET /static/upload/cos-uploader.js","GET /static/tools/slide-transf
+PASS [j-real-session-loss] {"loginLink":"/login?next=/tools/slides","creates":1,"sha":"6e8744f9437b"}
+PASS [k-cross-tab-abandon] {"jobId":"job-b303ceb7af9273ba","creates":1,"cancels":1,"dialogs":3}
+PASS [l-record-write-failure] {"creates":4,"cancels":5,"signs":1,"puts":2,"gets":3,"putBytes":288881,"sha":"6e8744f9437b"}
+PASS [m1-cancel-during-poll] {"settleMs":223,"cancels":1,"requestsAfterCancel":0,"sha":"6e8744f9437b"}
+PASS [m2-cancel-during-backoff] {"settleMs":225,"cancels":1,"requestsAfterCancel":0,"sha":"6e8744f9437b"}
+PASS [n-classic-upload] {"filename":"bf-580x300.tif","putBytes":287803,"sha":"f265596a7662","nativeSha":"f265596a7662","formatRow":"经典金字塔 TIFF（.tif；面向 OpenSlide 系"}
+E2E ALL PASS

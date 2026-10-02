@@ -1,0 +1,22 @@
+# rc6 gates on 7365b2c (serial); C3 re-run on 8127ecb
+01:59:38 HEAD 7365b2c
+01:59:42 cargo rc=0 4s
+02:00:46 plugin rc=0 64s
+02:00:52 vitest rc=0 6s
+02:29:16 pytest rc=1 1704s
+02:29:19 probe-real-rc5 rc=0 3s
+02:29:23 probe-real-v070 rc=0 4s
+02:29:23 c2-smoke rc=0 0s
+02:30:41 c2-faults rc=0 78s
+02:33:36 c3-zh rc=0 175s
+02:36:28 c3-en rc=0 172s
+02:39:46 c3-en-page rc=1 198s
+02:40:46 c4 rc=0 60s
+02:41:05 bfome-viewer-synth rc=0 19s
+02:41:29 bfome-viewer-real rc=0 24s
+02:41:45 real-sample rc=0 16s
+02:43:35 parity rc=0 110s
+02:48:45 large-page rc=0 310s
+02:50:59 r1 rc=0 134s
+02:50:59 ALL GATES DONE
+c3 re-run on 8127ecb: default 24/24, --locale en-US 24/24

@@ -1,0 +1,25 @@
+== c2-smoke
+SMOKE PASS
+== real-sample
+REAL SAMPLE PASS
+== parity
+KFB-1: browser 374c70c8e9d778de… native 374c70c8e9d778de… equal=true
+KFBF-A: browser 6f8a1e3b0e9dd455… native 6f8a1e3b0e9dd455… equal=true convert 9428 ms wall 20917 ms
+KFBF-B: browser 40cb12fa1acbaf60… native 40cb12fa1acbaf60… equal=true convert 6667 ms wall 14025 ms
+KFBF-C: browser 5d6b1b2138980590… native 5d6b1b2138980590… equal=true convert 5370 ms wall 11772 ms
+KFBF-D: browser 872fe3b65a962aeb… native 872fe3b65a962aeb… equal=true convert 8397 ms wall 18525 ms
+PARITY PASS
+== large-page
+LARGE PAGE PASS
+== bfome-viewer-synth
+PASS -> .gate-tmp/rc6-gates/viewer-synth/result.json
+== bfome-viewer-real
+PASS -> .gate-tmp/rc6-gates/viewer-real/result.json
+== probe-real-rc5
+check_probe: OK: <repo>/.gate-tmp/rc6-gates/qp-rc5/probe.json: resolutions=9 levels=9 region_reads=36 server=qupath.lib.images.servers.bioformats.BioFormatsImageServer
+run_probe: OK: evidence validated in <repo>/.gate-tmp/rc6-gates/qp-rc5
+regions 36 textured 16 worst_max_abs_diff 0 ok True
+== probe-real-v070
+check_probe: OK: <repo>/.gate-tmp/rc6-gates/qp-v070/probe.json: resolutions=9 levels=9 region_reads=36 server=qupath.lib.images.servers.bioformats.BioFormatsImageServer
+run_probe: OK: evidence validated in <repo>/.gate-tmp/rc6-gates/qp-v070
+regions 36 textured 16 worst_max_abs_diff 0 ok True

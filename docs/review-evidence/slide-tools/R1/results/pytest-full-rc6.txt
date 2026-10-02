@@ -1,0 +1,13 @@
+FAILED tests/test_admin_preview.py::test_subject_visibility_applies_during_preview - AssertionError: assert set() == {'owner.svs'}
+FAILED tests/test_admin_preview.py::test_write_guard_blocks_all_unsafe_methods - AssertionError: POST /api/upload -> 404
+FAILED tests/test_admin_preview.py::test_cannot_preview_disabled_user - AssertionError: assert set() == {'o.svs'}
+FAILED tests/test_ai_budget_wiring.py::test_ui_budget_card_and_max_steps_sync_present - AssertionError: assert '0.4.14' == '0.4.12'
+4 failed, 2917 passed, 10 skipped, 378 warnings in 1634.71s (0:27:14)
+waiting for server to shut down............................................................... failed
+--- baseline: same 4 tests at c914f23 (release/r1 tip before merge, untouched)
+test_admin_preview.py: 3 failed, 12 passed (POST /api/upload -> 404; set() == {'owner.svs'} / {'o.svs'})
+test_ai_budget_wiring.py::test_ui_budget_card_and_max_steps_sync_present: AssertionError: assert '0.4.14' == '0.4.12'
+--- plugin (baidu-import)
+83 passed in 64.32s (0:01:04)
+--- cargo (workspace, --features fixtures)
+76 passed, 0 failed

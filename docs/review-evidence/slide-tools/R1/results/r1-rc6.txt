@@ -1,0 +1,32 @@
+PASS [a-oneclick-order-network] {"preClickApi":0,"preClickCross":0,"creates":1,"filename":"bf-580x300.ome.tif","productSha":"6e8744f9437b","uploadedSha":"6e8744f9437b","putBytes":288881,"intentState":"done","intentAccountBound":true}
+PASS [b1-convert-fail-zero-ingestion] {"creates":0,"jobState":"failed","intentState":"revoked"}
+PASS [b2-cancel-during-convert-zero-ingestion] {"creates":0,"jobDirs":0}
+PASS [c1-oversize-stops] {"creates":0,"reason":"输出文件超过平台上限（1000 B 以内可上传）；已禁用上传","intentState":"pending","productSha":"6e8744f9437b"}
+PASS [c2-not-viewable-stops] {"creates":0,"reason":"平台暂不支持查看该输出格式；已禁用上传（导出能力不受影响），","intentState":"pending","productSha":"6e8744f9437b"}
+PASS [d1-login-expired-before-click] {"loginLink":"/login?next=/tools/slides","creates":0,"conversionStarted":false,"intent":null}
+PASS [d2-session-loss-reopen-continue] {"creates":1,"originalKeptInSuperseded":false,"accountRebound":false,"nativeDialogs":0}
+PASS [d3-different-account-reconfirm] {"creates":2,"originalKeptInSuperseded":true,"accountRebound":true,"nativeDialogs":0}
+PASS [d4-two-users-separate-upload] {"creates":2,"bReadA":403,"aReadB":403,"originalStateAfterB":"uploading","originalCancelledByA":true,"bTouchedA":0}
+PASS [d5-two-users-return-to-original] {"creates":1,"resumedSameIngestion":true,"stateAfterComplete":"completing","bTouchedA":0}
+PASS [e1-refresh-during-convert] {"creates":1,"intentLabel":"继续转换并上传"}
+PASS [e3-refresh-during-copy] {"creates":0,"rowsAfterSweep":[]}
+PASS [f1-repeated-clicks-one-ingestion] {"creates":1}
+PASS [f2-second-tab-one-ingestion] {"creates":1}
+PASS [f3-replayed-complete-one-ingestion] {"completeReqs":2,"creates":1}
+PASS [g-cancel-after-convert-revokes-intent] {"creates":0,"intentState":"revoked","productKept":true}
+PASS [h-local-only-zero-network] {"apiCalls":0,"crossOrigin":0,"jobId":"job-be8eeda62062e817"}
+PASS [i-workbench-handoff] {"creates":1,"projectId":"prj_ONA3Knic6IPqsg","assocSlideIds":["sld_LshCyF6YjsMt"],"realProjectHasSlide":true,"popupReselected":false,"offerText":"在本机转换并上传"}
+PASS [i2-native-direct-upload] {"creates":1,"convertOffers":0}
+PASS [i3-popup-blocked-fallback] {"toolsLink":"/tools/slides","pages":1,"retryKept":true}
+PASS [i4-handoff-new-project-target] {"creates":1,"projectCreatedAfterPublish":true,"idemKey":"2532015a…","assocPid":"prj_YXT6FU6wDmVk7w","realProjectHasSlide":true}
+PASS [i5-assoc-failure-retry] {"creates":1,"projectsCreated":1,"assocAttempts":3,"repeatClickRetriedAssocOnly":true,"pendingAfterFailure":true,"retryAfterReload":true,"finalState":"done"}
+PASS [j-disk-confirm-gates-oneclick] {"dialogShown":true,"convertEnabledBeforeConfirm":false,"creates":0,"jobDirs":0}
+PASS [k1-published-repeat-clicks] {"creates":1,"extraCreates":0,"extraPuts":0,"extraCapability":0,"rowUploadButtons":0}
+PASS [l1-project-open-and-ui-delete] {"projectRows":2,"readFailedRows":0,"infoPath":"/api/slides/<id>/info","deletePath":"/api/slides/<id>","deleteStatus":200,"rowsAfterRefresh":1,"countAfter":"1 切片 · 0 标注","deletedReadStatus":403,"otherSameNameKept":
+PASS [l2-convert-offer-persists-past-60s] {"fastForwardMs":71000,"offers":1,"rows":1}
+PASS [l3-drawer-offer-clickable] {"drawerOpen":true,"popup":true,"drawerOfferCleared":true}
+PASS [m1-refresh-anon-login-return-upload] {"loginLink":"/login?next=/tools/slides","loginVisible":true,"progressVisible":"正在上传 75%","creates":1,"publishedVisible":true}
+PASS [m2-refresh-failure-cancel-retry] {"failureText":"上传失败（HTTP 500，代码 —）；本地产物已保留，可稍后重试。","cancelVisible":true,"creates":3,"published":true}
+PASS [m3-waiting-limit-real-endpoint] {"secondQueued":true,"probe409":"cos_waiting_limit","mainPanel":"你的账号已有一个上传在排队等待开始，同一时间只能排队一个。请","refreshedRow":"你的账号已有一个上传在排队等待开�
+PASS [n1-admin-slides-display-grant] {"newUploadLabel":"r1-dup-same.tif + ID","deletedState":"已删除","deletedAddDisabled":true,"deletedServerRefusal":"slide_not_servable","readBefore":403,"readAfterGrant":200,"revoked":true}
+E2E ALL PASS

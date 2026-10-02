@@ -1,0 +1,25 @@
+PASS [a-bf-happy-path] {"savedSha256":"6e8744f9437b0542e30ddcf95287b9f533614adcb05891c83912036672a7aa09","nativeSha256":"6e8744f9437b0542e30ddcf95287b9f533614adcb05891c83912036672a7aa09","savedBytes":288881,"suggestedName":"bf-580x300.ome.tif","formatRow":"OME
+PASS [j-network-capture] {"totalRequests":13,"nonSameOrigin":0,"nonGet":[],"apiCalls":0,"nameLeak":0,"shaLeak":0,"nonPageStatic":[],"downloads":[],"requestPaths":["/tools/slides","/static/tools/tools-slides.css","/static/i18n.js","/static/upload/cos-uploader.j
+PASS [csp-real-app] {"csp":"default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self'; style-src 'self'; img-src 'self' data:; base-uri 'none'; object-src 'none'; form-action 'none'; frame-ancestors 'none'","wasmType":"app
+PASS [b-kfbf-happy-path] {"savedSha256":"910d170ecf66a9b3881d458d8c7d84554e9c5a7c68a365d5190547a035cd584b","nativeSha256":"910d170ecf66a9b3881d458d8c7d84554e9c5a7c68a365d5190547a035cd584b","savedBytes":134114,"displayWindows":{"ch0":"13–227 (from channel.jso
+PASS [c-refresh-resume] {"savedSha256":"a7ca0fa012769d2ef5310c045bfeef26a6c2f91d8d1b581d89fa9b3b26e701b0","nativeSha256":"a7ca0fa012769d2ef5310c045bfeef26a6c2f91d8d1b581d89fa9b3b26e701b0","beforeunloadSeen":true}
+PASS [d1-uncertain-disk] {"dialogNumbers":true,"focusInDialog":true,"focusRestored":true,"cancelLeftNoDir":true,"confirmProceeded":true,"dirsAfterReloadSweep":[]}
+PASS [d2-uncertain-real-quota] {"note":"fresh profile, real estimate hits reporting cap"}
+PASS [d3-hard-shortage] {"errText":"Not enough temporary space\nAbout 4.02 GiB is needed but the browser reports 1.00 GiB available. Free up space or use another disk, then retry.\n(disk_precheck_failed: 空间不足：需要 ~4113 MiB，可用 ~1024 MiB（pre
+PASS [e-cancel-250ms] {"syncMs":0.20000004768371582,"paintedMs":7.599999904632568,"statusAfter":"Cancelled","jobDirsAfter":[]}
+PASS [f-discard-and-list-start] {"startFromListShaOk":true,"jobDirsAfterDiscard":[]}
+PASS [g-strict-lossless-refusal] {"preWarningShown":true,"errText":"The core refused this conversion: the input contains tiles that would need re-encoding or filling, which cannot be output under the “strictly pixel-lossless” policy. Switch to “Keep enco
+PASS [h-unsupported-input] {"jobDirs":[]}
+PASS [i-save-unavailable] {"saveDisabled":true,"message":"This browser cannot “save to disk” (no File System Access capability). Please use a supported browser (e.g. Chrome / Edge); this tool will never fall back to a ","downloads":[],"anchorDownloads":0}
+PASS [k-offline-full-flow] {"savedSha256":"6e8744f9437b0542e30ddcf95287b9f533614adcb05891c83912036672a7aa09","nativeSha256":"6e8744f9437b0542e30ddcf95287b9f533614adcb05891c83912036672a7aa09","networkAttemptsWhileOffline":[]}
+PASS [l-zh-en-toggle] {"rawKeys":[],"cjkSample":"","saveDisabled":false,"saveLabel":"Save to disk","saveSupported":true,"backZhH1":"本地切片工具","backZhSave":"保存到磁盘"}
+PASS [m-keyboard-only] {"profileBefore":"faster","profileChangedTo":"balanced","savedSha256":"6e8744f9437b0542e30ddcf95287b9f533614adcb05891c83912036672a7aa09"}
+PASS [n1-channel-json-refresh-list-start] {"displayWindows":{"ch0":"13–227 (from channel.json)","ch1":"16–175 (from channel.json)"},"report":{"520":[16,175],"DAPI":[13,227]}}
+PASS [n2-channel-json-refresh-list-start] {"displayWindows":{"ch0":"13–227 (from channel.json)","ch1":"16–175 (from channel.json)"},"report":{"520":[16,175],"DAPI":[13,227]}}
+PASS [o-bf-classic-choice] {"savedSha256":"f265596a7662ca7e6c260fa9a4650d30a5d894791bcac11029a1e28235113679","nativeSha256":"f265596a7662ca7e6c260fa9a4650d30a5d894791bcac11029a1e28235113679","suggestedName":"bf-580x300.tif","filter":"TIFF","formatRow":"Classic
+PASS [p-classic-refresh-resume] {"savedSha256":"cefec34e8786ef1a36d87423fc70eb86500322e46244f3059fffc923c6788be5","nativeSha256":"cefec34e8786ef1a36d87423fc70eb86500322e46244f3059fffc923c6788be5","rowFormatShown":true}
+PASS [q-list-start-uses-selection] {"sha":"f265596a7662ca7e6c260fa9a4650d30a5d894791bcac11029a1e28235113679","nativeClassicSha":"f265596a7662ca7e6c260fa9a4650d30a5d894791bcac11029a1e28235113679","recordedProfile":"bf-classic"}
+PASS [r-fl-no-choice-fl-ome] {"sectionHidden":true,"formatRow":"Multichannel OME-TIFF (.ome.tif)","suggestedName":"fl-600x400.ome.tif","recordedProfile":"fl-ome"}
+PASS [s-classic-persist-reload-list-start] {"sha":"f265596a7662ca7e6c260fa9a4650d30a5d894791bcac11029a1e28235113679","radioAfterReload":"bf-ome","rowFormatShown":true,"recordedProfile":"bf-classic","suggestedName":"bf-580x300.tif"}
+PASS [t-record-wins-after-reload] {"sha":"6e8744f9437b0542e30ddcf95287b9f533614adcb05891c83912036672a7aa09","recordedProfile":"bf-ome","suggestedName":"bf-580x300.ome.tif"}
+E2E ALL PASS

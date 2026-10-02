@@ -377,7 +377,14 @@ the platform-chain tests above, and the C2 profile scenarios.
 | `0591075` | report, c1/c4 doc updates, `scripts/qupath-probe/` |
 | `46eaad6` | strict QuPath gate: exit status, evidence checker, strict comparator, 31 negative/positive tests |
 | `9909779` | tool page output-format choice (OME-TIFF / classic), saved to the job record, locked at start; browser + C2 + vitest coverage |
-| (this) | report round 2; R1 harness waits for the job row |
+| `02a27b6` | report round 2; R1 harness waits for the job row |
+| `efb0936` | browser harness pins the test locale; format labels read from the page's i18n table |
+| `e326e5a` | macOS ARM64 evidence; pending manual checks |
+| `02e7624` | merge of `bf-ome-tiff` into `release/r1` |
+| `7365b2c` | build-manifest refresh: rebuild was byte-identical; the manifest's `runner.js`/`engine.js` hashes were stale |
+| `8127ecb` (tag `r1-rc6`) | C3 language-toggle scenario starts from zh explicitly |
+
+Release-candidate gates on the integrated tree: `docs/review-evidence/slide-tools/R1/rc6-bf-ome-release-20261003.md`.
 
 ## 11. Commands (worktree root; `TMPDIR=$PWD/.gate-tmp COLUMNS=200`)
 

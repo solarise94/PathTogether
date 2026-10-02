@@ -34,9 +34,11 @@ async function main() {
       null, { timeout: 60 * 60000 });
     const saved = await L.opfsSha256(page);
     const resultSha = (await page.textContent('#result-sha')).trim();
+    const suggestedName = await page.evaluate(() => window.__pickerSuggested);
+    const resultFormat = (await page.textContent('#result-format')).replace(/\s+/g, ' ').trim();
     const ok = resultSha === saved.sha256 && (!NATIVE_SHA || saved.sha256 === NATIVE_SHA);
     const out = {
-      ok, inputBytes: fs.statSync(INPUT).size, dialogShown: true, dialogText,
+      ok, inputBytes: fs.statSync(INPUT).size, dialogShown: true, dialogText, suggestedName, resultFormat,
       savedSha256: saved.sha256, savedBytes: saved.size, resultSha256: resultSha, nativeSha256: NATIVE_SHA || null,
       stageProbeMs: tProbe - t0, convertMs: tConv - tProbe, totalMs: Date.now() - t0,
     };

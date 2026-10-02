@@ -1,7 +1,11 @@
 //! wasm32 bindings over the transform core: `probe`, `convert`, and the C2
 //! additions `convertResume`, `finalizeValidate`, `sha256Source`,
-//! `enableSourceHash`/`sourceSha256`, `coreVersion` — driven by JS-provided
-//! IO callbacks with bounded chunks (≤1 MiB per host call).
+//! `enableSourceHash`/`sourceSha256`, `coreVersion`, and the output-profile
+//! entry points `convertProfile`/`convertResumeProfile` — driven by
+//! JS-provided IO callbacks with bounded chunks (≤1 MiB per host call).
+//!
+//! `convert`/`convertResume` keep their original meaning (KFB → classic,
+//! KFBF → fluorescence OME) for hosts that predate output profiles.
 //!
 //! Host contract (globals; the browser runner in
 //! `static/tools/slide-transform/worker.js` implements them over
@@ -33,7 +37,7 @@
 use slide_transform_core::error::{CoreError, CoreResult};
 use slide_transform_core::io::{ByteSource, RandomAccessSink, ScratchFactory, ScratchSink};
 use slide_transform_core::job::{JobControl, Progress, ProgressCallback};
-use slide_transform_core::plan::{InputIdentity, TransformPlan};
+use slide_transform_core::plan::{InputIdentity, OutputProfile, TransformPlan};
 use slide_transform_core::resume::{parse_resume_json, ResumePoint};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -336,7 +340,11 @@ impl ProgressCallback for HostProgress {
     }
 }
 
-struct HostCheckpoint;
+/// Emits committed states; the output profile travels with every state so
+/// a journal can never be resumed under a different layout.
+struct HostCheckpoint {
+    profile: OutputProfile,
+}
 
 impl slide_transform_core::job::CheckpointCallback for HostCheckpoint {
     fn on_checkpoint(&self, c: &slide_transform_core::job::CheckpointState) {
@@ -345,12 +353,13 @@ impl slide_transform_core::job::CheckpointCallback for HostCheckpoint {
         }
         let ifds: Vec<String> = c.ifd_tiles.iter().map(|t| t.to_string()).collect();
         let json = format!(
-            "{{\"level\":{},\"channel\":{},\"cell\":{},\"out\":{},\"ifds\":[{}]}}",
+            "{{\"level\":{},\"channel\":{},\"cell\":{},\"out\":{},\"ifds\":[{}],\"profile\":\"{}\"}}",
             c.level,
             c.channel.map(|v| v.to_string()).unwrap_or_else(|| "0".into()),
             c.cell_done,
             c.committed_output,
-            ifds.join(",")
+            ifds.join(","),
+            self.profile.id()
         );
         host_checkpoint(&json);
     }
@@ -535,11 +544,70 @@ fn estimate_json(e: &slide_transform_core::estimate::OutputEstimate) -> String {
     )
 }
 
-fn run_convert(strict_lossless: bool, channel_json: &str, resume: Option<ResumePoint>) -> String {
+/// `"profile":"…"` of a checkpoint state; absent in states journalled
+/// before output profiles existed.
+fn resume_profile_field(resume_json: &str) -> Option<String> {
+    let key = "\"profile\"";
+    let at = resume_json.find(key)? + key.len();
+    let rest = resume_json[at..].trim_start().strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    Some(rest[..rest.find('"')?].to_string())
+}
+
+/// Resolve the requested profile against the input kind. `None` = the
+/// pre-profile default for the input (classic / fluorescence OME).
+fn resolve_profile(is_fl: bool, requested: Option<&str>) -> CoreResult<OutputProfile> {
+    let p = match requested {
+        None | Some("") => {
+            if is_fl { OutputProfile::OmeBigTiffSubifd } else { OutputProfile::ClassicJpegBigTiff }
+        }
+        Some(id) => OutputProfile::from_id(id)
+            .ok_or_else(|| CoreError::validation(format!("未知输出 profile {id}")))?,
+    };
+    if p.is_brightfield() == is_fl {
+        return Err(CoreError::variant(format!(
+            "输出 profile {} 与输入类型（{}）不符",
+            p.id(),
+            if is_fl { "荧光 KFBF" } else { "明场 KFB" }
+        )));
+    }
+    Ok(p)
+}
+
+fn run_convert(
+    profile: Option<&str>,
+    strict_lossless: bool,
+    channel_json: &str,
+    resume: Option<(ResumePoint, Option<String>)>,
+) -> String {
     let src = HostSource::open();
     let magic = match detect(&src) {
         Ok(m) => m,
         Err(e) => return err_json(&e),
+    };
+    let is_fl = magic == slide_transform_core::kfbf::KFBF_MAGIC;
+    let out_profile = match resolve_profile(is_fl, profile) {
+        Ok(p) => p,
+        Err(e) => return err_json(&e),
+    };
+    // a committed state belongs to the layout that wrote it: never continue
+    // a partial output under another profile (legacy states = the default)
+    let resume = match resume {
+        None => None,
+        Some((rp, journalled)) => {
+            let committed_under = match resolve_profile(is_fl, journalled.as_deref()) {
+                Ok(p) => p,
+                Err(e) => return err_json(&e),
+            };
+            if committed_under != out_profile {
+                return err_json(&CoreError::validation(format!(
+                    "resume: 已提交进度属于输出 profile {}，拒绝以 {} 续跑",
+                    committed_under.id(),
+                    out_profile.id()
+                )));
+            }
+            Some(rp)
+        }
     };
     let identity = InputIdentity {
         name: "browser-input".to_string(),
@@ -567,12 +635,12 @@ fn run_convert(strict_lossless: bool, channel_json: &str, resume: Option<ResumeP
     let mut sink = HostSink;
     let mut scratch = HostScratchFactory;
     let progress = HostProgress;
-    let checkpoint = HostCheckpoint;
+    let checkpoint = HostCheckpoint { profile: out_profile };
     let mut job = JobControl::new(&progress);
     if CHECKPOINT_ENABLED.load(Ordering::Relaxed) {
         job = job.with_checkpoint(&checkpoint);
     }
-    let result = if magic == slide_transform_core::kfbf::KFBF_MAGIC {
+    let result = if is_fl {
         let plan = TransformPlan::fluorescence(identity).with_policy(policy);
         match resume.as_ref() {
             Some(rp) => slide_transform_core::convert_fl::convert_kfbf_to_ome_resume(
@@ -583,7 +651,8 @@ fn run_convert(strict_lossless: bool, channel_json: &str, resume: Option<ResumeP
             ),
         }
     } else {
-        let plan = TransformPlan::brightfield(identity).with_policy(policy);
+        let mut plan = TransformPlan::brightfield(identity).with_policy(policy);
+        plan.profile = out_profile;
         match resume.as_ref() {
             Some(rp) => slide_transform_core::convert_bf::convert_kfb_to_bigtiff_resume(
                 &src, &mut sink, &mut scratch, &plan, &job, rp,
@@ -600,9 +669,10 @@ fn run_convert(strict_lossless: bool, channel_json: &str, resume: Option<ResumeP
             let warnings: Vec<String> =
                 r.warnings.iter().map(|w| format!("\"{w}\"")).collect();
             format!(
-                "{{{}\"format\":\"{}\",\"output_bytes\":{},\"width\":{},\"height\":{},\"ifd_count\":{},\"tiles_raw_copied\":{},\"tiles_reencoded\":{},\"resumed\":{},\"channels\":{},\"warnings\":[{}]}}",
+                "{{{}\"format\":\"{}\",\"output_profile\":\"{}\",\"output_bytes\":{},\"width\":{},\"height\":{},\"ifd_count\":{},\"tiles_raw_copied\":{},\"tiles_reencoded\":{},\"resumed\":{},\"channels\":{},\"warnings\":[{}]}}",
                 companion_json_warning,
                 r.format,
+                out_profile.id(),
                 r.output_bytes,
                 r.width,
                 r.height,
@@ -622,7 +692,34 @@ fn run_convert(strict_lossless: bool, channel_json: &str, resume: Option<ResumeP
 /// pixel policy; `channel_json` may be empty (no companion).
 #[wasm_bindgen(js_name = "convert")]
 pub fn convert(strict_lossless: bool, channel_json: &str) -> String {
-    run_convert(strict_lossless, channel_json, None)
+    run_convert(None, strict_lossless, channel_json, None)
+}
+
+/// Run a conversion with an explicit output profile id (`bf-classic`,
+/// `bf-ome`, `fl-ome`; empty = the input's pre-profile default).
+#[wasm_bindgen(js_name = "convertProfile")]
+pub fn convert_profile(profile: &str, strict_lossless: bool, channel_json: &str) -> String {
+    run_convert(Some(profile), strict_lossless, channel_json, None)
+}
+
+/// Resume under an explicit output profile; refused when the checkpoint
+/// state was committed under a different one.
+#[wasm_bindgen(js_name = "convertResumeProfile")]
+pub fn convert_resume_profile(
+    resume_json: &str,
+    profile: &str,
+    strict_lossless: bool,
+    channel_json: &str,
+) -> String {
+    match parse_resume_json(resume_json) {
+        Ok(rp) => run_convert(
+            Some(profile),
+            strict_lossless,
+            channel_json,
+            Some((rp, resume_profile_field(resume_json))),
+        ),
+        Err(e) => err_json(&e),
+    }
 }
 
 /// Resume a conversion from a checkpoint state (the same JSON
@@ -630,15 +727,20 @@ pub fn convert(strict_lossless: bool, channel_json: &str) -> String {
 #[wasm_bindgen(js_name = "convertResume")]
 pub fn convert_resume(resume_json: &str, strict_lossless: bool, channel_json: &str) -> String {
     match parse_resume_json(resume_json) {
-        Ok(rp) => run_convert(strict_lossless, channel_json, Some(rp)),
+        Ok(rp) => run_convert(
+            None,
+            strict_lossless,
+            channel_json,
+            Some((rp, resume_profile_field(resume_json))),
+        ),
         Err(e) => err_json(&e),
     }
 }
 
 /// Re-open + validate the finished output (streamed sha256 + structural
 /// IFD walk) through the host read-back callbacks. Only a passing result
-/// may be marked `ready`. `expect_ifd` 0 skips the count equality (the FL
-/// walker counts the top-level chain; SubIFDs hang off tag 330).
+/// may be marked `ready`. `expect_ifd` is the converter's `ifd_count` (main
+/// chain + SubIFDs, every profile); 0 skips the equality.
 #[wasm_bindgen(js_name = "finalizeValidate")]
 pub fn finalize_validate(expect_ifd: u32) -> String {
     let size = host_out_size() as u64;
@@ -646,10 +748,12 @@ pub fn finalize_validate(expect_ifd: u32) -> String {
     let expect = if expect_ifd == 0 { None } else { Some(expect_ifd) };
     match slide_transform_core::validate::validate_output(&reader, size, expect) {
         Ok(v) => format!(
-            "{{\"ok\":true,\"sha256\":\"{}\",\"size\":{},\"ifd_count\":{},\"tile_records\":{},\"checks\":[{}]}}",
+            "{{\"ok\":true,\"sha256\":\"{}\",\"size\":{},\"ifd_count\":{},\"main_ifds\":{},\"sub_ifds\":{},\"tile_records\":{},\"checks\":[{}]}}",
             v.sha256,
             v.size,
             v.ifd_count,
+            v.main_ifds,
+            v.sub_ifds,
             v.tile_records,
             v.checks.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(",")
         ),
@@ -665,5 +769,29 @@ pub fn sha256_source() -> String {
     match slide_transform_core::validate::stream_sha256(&src, src.size()) {
         Ok(h) => format!("{{\"sha256\":\"{}\",\"size\":{}}}", h, src.size()),
         Err(e) => err_json(&e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn journalled_profile_is_read_from_checkpoint_states() {
+        let st = r#"{"level":1,"channel":0,"cell":3,"out":4096,"ifds":[9,3],"profile":"bf-ome"}"#;
+        assert_eq!(resume_profile_field(st).as_deref(), Some("bf-ome"));
+        // states journalled before output profiles existed carry none
+        let legacy = r#"{"level":1,"channel":0,"cell":3,"out":4096,"ifds":[9,3]}"#;
+        assert_eq!(resume_profile_field(legacy), None);
+    }
+
+    #[test]
+    fn legacy_states_resolve_to_the_pre_profile_layouts() {
+        assert_eq!(resolve_profile(false, None).unwrap(), OutputProfile::ClassicJpegBigTiff);
+        assert_eq!(resolve_profile(true, None).unwrap(), OutputProfile::OmeBigTiffSubifd);
+        assert_eq!(resolve_profile(false, Some("bf-ome")).unwrap(), OutputProfile::OmeBigTiffRgbSubifd);
+        assert!(resolve_profile(false, Some("fl-ome")).is_err());
+        assert!(resolve_profile(true, Some("bf-ome")).is_err());
+        assert!(resolve_profile(false, Some("ome")).is_err());
     }
 }

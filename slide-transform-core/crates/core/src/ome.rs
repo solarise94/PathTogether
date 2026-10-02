@@ -152,6 +152,76 @@ pub fn build_ome_xml(
     out
 }
 
+/// Metadata of a brightfield RGB OME image. Every value comes from the
+/// source header; absent values (objective ≤ 0, empty scanner id) are
+/// omitted rather than filled in.
+pub struct OmeRgbImage<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub mpp_x: f64,
+    pub mpp_y: f64,
+    pub objective: f64,
+    /// Provenance key/value pairs (written as one MapAnnotation, in order).
+    pub provenance: &'a [(&'a str, String)],
+}
+
+/// Namespace of the provenance MapAnnotation.
+pub const PROVENANCE_NS: &str = "pathtogether.slide-transform/provenance";
+
+/// OME-XML (2016-06) for one interleaved RGB plane stored in IFD 0 with the
+/// reduced levels as its SubIFDs: one `Channel` with `SamplesPerPixel=3`
+/// (not three channels), `Interleaved="true"`. Trailing NUL included.
+pub fn build_ome_xml_rgb(img: &OmeRgbImage) -> Vec<u8> {
+    let has_objective = img.objective.is_finite() && img.objective > 0.0;
+    let instrument = if has_objective {
+        format!(
+            "<Instrument ID=\"Instrument:0\"><Objective ID=\"Objective:0:0\" NominalMagnification=\"{}\"/></Instrument>",
+            py_g17(img.objective)
+        )
+    } else {
+        String::new()
+    };
+    let refs = if has_objective {
+        "<InstrumentRef ID=\"Instrument:0\"/><ObjectiveSettings ID=\"Objective:0:0\"/>"
+    } else {
+        ""
+    };
+    let (ann_ref, ann) = if img.provenance.is_empty() {
+        (String::new(), String::new())
+    } else {
+        let mut kv = String::new();
+        for (k, v) in img.provenance {
+            kv.push_str(&format!("<M K=\"{}\">{}</M>", xml_escape(k), xml_escape(v)));
+        }
+        (
+            "<AnnotationRef ID=\"Annotation:0\"/>".to_string(),
+            format!(
+                "<StructuredAnnotations><MapAnnotation ID=\"Annotation:0\" Namespace=\"{PROVENANCE_NS}\"><Value>{kv}</Value></MapAnnotation></StructuredAnnotations>"
+            ),
+        )
+    };
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<OME xmlns=\"http://www.openmicroscopy.org/Schemas/OME/2016-06\" \
+xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" \
+xsi:schemaLocation=\"http://www.openmicroscopy.org/Schemas/OME/2016-06 http://www.openmicroscopy.org/Schemas/OME/2016-06/ome.xsd\">\
+{instrument}<Image ID=\"Image:0\">{refs}\
+<Pixels ID=\"Pixels:0\" DimensionOrder=\"XYCZT\" Type=\"uint8\" SignificantBits=\"8\" Interleaved=\"true\" \
+SizeX=\"{}\" SizeY=\"{}\" SizeC=\"3\" SizeZ=\"1\" SizeT=\"1\" \
+PhysicalSizeX=\"{}\" PhysicalSizeXUnit=\"µm\" PhysicalSizeY=\"{}\" PhysicalSizeYUnit=\"µm\">\
+<Channel ID=\"Channel:0:0\" SamplesPerPixel=\"3\"/>\
+<TiffData IFD=\"0\" PlaneCount=\"1\"/>\
+</Pixels>{ann_ref}</Image>{ann}</OME>",
+        img.width,
+        img.height,
+        py_repr_f64(img.mpp_x),
+        py_repr_f64(img.mpp_y),
+    );
+    let mut out = xml.into_bytes();
+    out.push(0);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +258,50 @@ mod tests {
         assert!(!s.contains("Channel ID=\"Channel:0:0\" Name=\"DAPI\" Color=\"-16776317\" SamplesPerPixel=\"1\" ExposureTime="));
         assert!(s.contains("ExposureTimeUnit=\"ms\""));
         assert!(s.contains("NominalMagnification=\"40\""));
+    }
+
+    fn rgb_xml(objective: f64, provenance: &[(&str, String)]) -> String {
+        let xml = build_ome_xml_rgb(&OmeRgbImage {
+            width: 34043,
+            height: 45101,
+            mpp_x: 0.4841048716,
+            mpp_y: 0.4841048716,
+            objective,
+            provenance,
+        });
+        assert_eq!(*xml.last().unwrap(), 0);
+        String::from_utf8(xml[..xml.len() - 1].to_vec()).unwrap()
+    }
+
+    #[test]
+    fn rgb_ome_is_one_interleaved_three_sample_channel() {
+        let s = rgb_xml(20.0, &[("source_format", "kfb_kfbio_jpeg".into())]);
+        assert!(s.contains("SizeC=\"3\""));
+        assert!(s.contains("Interleaved=\"true\""));
+        assert!(s.contains("DimensionOrder=\"XYCZT\""));
+        assert_eq!(s.matches("<Channel ").count(), 1);
+        assert!(s.contains("<Channel ID=\"Channel:0:0\" SamplesPerPixel=\"3\"/>"));
+        assert!(s.contains("<TiffData IFD=\"0\" PlaneCount=\"1\"/>"));
+        assert!(s.contains("PhysicalSizeX=\"0.4841048716\" PhysicalSizeXUnit=\"µm\""));
+        assert!(s.contains("PhysicalSizeY=\"0.4841048716\" PhysicalSizeYUnit=\"µm\""));
+        assert!(s.contains("NominalMagnification=\"20\""));
+        // schema order inside Image: InstrumentRef, ObjectiveSettings, Pixels, AnnotationRef
+        let ir = s.find("<InstrumentRef").unwrap();
+        let os = s.find("<ObjectiveSettings").unwrap();
+        let px = s.find("<Pixels").unwrap();
+        let ar = s.find("<AnnotationRef").unwrap();
+        assert!(ir < os && os < px && px < ar);
+        assert!(s.find("</Image>").unwrap() < s.find("<StructuredAnnotations>").unwrap());
+        assert!(s.contains("<M K=\"source_format\">kfb_kfbio_jpeg</M>"));
+    }
+
+    #[test]
+    fn rgb_ome_omits_absent_metadata() {
+        let s = rgb_xml(0.0, &[]);
+        assert!(!s.contains("Instrument"));
+        assert!(!s.contains("Objective"));
+        assert!(!s.contains("StructuredAnnotations"));
+        assert!(!s.contains("AnnotationRef"));
+        assert!(!s.contains("Name="));
     }
 }

@@ -52,7 +52,7 @@ async function main() {
   // native references (cli), aliased
   {
     const n1 = path.join(outDir, 'kfb1-native.tif');
-    execFileSync(L.CLI, ['convert', kfb, n1, '--overwrite']);
+    execFileSync(L.CLI, ['convert', kfb, n1, '--overwrite', '--profile', 'bf-ome']);
     nativeOf['KFB-1'] = await L.sha256File(n1);
     results.alias['KFB-1'] = { bytes: fs.statSync(kfb).size, sha256: await L.sha256File(kfb) };
     for (const [i, f] of (WITH_FL || FL_ALL ? kfbfs : []).entries()) {

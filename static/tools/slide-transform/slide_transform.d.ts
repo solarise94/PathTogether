@@ -13,10 +13,22 @@ export function configure(read_into: boolean): void;
 export function convert(strict_lossless: boolean, channel_json: string): string;
 
 /**
+ * Run a conversion with an explicit output profile id (`bf-classic`,
+ * `bf-ome`, `fl-ome`; empty = the input's pre-profile default).
+ */
+export function convertProfile(profile: string, strict_lossless: boolean, channel_json: string): string;
+
+/**
  * Resume a conversion from a checkpoint state (the same JSON
  * `stHostCheckpoint` emits; journal-recorded by the runner).
  */
 export function convertResume(resume_json: string, strict_lossless: boolean, channel_json: string): string;
+
+/**
+ * Resume under an explicit output profile; refused when the checkpoint
+ * state was committed under a different one.
+ */
+export function convertResumeProfile(resume_json: string, profile: string, strict_lossless: boolean, channel_json: string): string;
 
 export function coreVersion(): string;
 
@@ -31,8 +43,8 @@ export function enableSourceHash(): void;
 /**
  * Re-open + validate the finished output (streamed sha256 + structural
  * IFD walk) through the host read-back callbacks. Only a passing result
- * may be marked `ready`. `expect_ifd` 0 skips the count equality (the FL
- * walker counts the top-level chain; SubIFDs hang off tag 330).
+ * may be marked `ready`. `expect_ifd` is the converter's `ifd_count` (main
+ * chain + SubIFDs, every profile); 0 skips the equality.
  */
 export function finalizeValidate(expect_ifd: number): string;
 
@@ -56,7 +68,9 @@ export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly configure: (a: number) => void;
     readonly convert: (a: number, b: number, c: number) => [number, number];
+    readonly convertProfile: (a: number, b: number, c: number, d: number, e: number) => [number, number];
     readonly convertResume: (a: number, b: number, c: number, d: number, e: number) => [number, number];
+    readonly convertResumeProfile: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number];
     readonly coreVersion: () => [number, number];
     readonly enableCheckpoint: () => void;
     readonly enableSourceHash: () => void;

@@ -131,6 +131,12 @@ window.HP_COS_UPLOAD.createUpload({
 - 上传文件名：明场 `<base>.tif`、荧光 `<base>.ome.tif`（注册表要求完整复合后缀；
   `_cos_ingestion_kind_for` 对两者均 native 受理，pytest 断言）。
 
+> **2026-10-02 更新**（`bf-ome-acceptance-report.md`）：`viewable_formats` 新增
+> `ome-bigtiff-subifd-rgb-jpeg-pyramid`（明场 OME 金字塔，新明场任务默认）；文件名由
+> 任务的输出 profile 决定——`bf-ome`/`fl-ome` → `<base>.ome.tif`，`bf-classic`（含无
+> profile 字段的旧任务）→ `<base>.tif`。读取器证明增加明场 OME 一项（TiffFileSlide，
+> YCbCr-JPEG 按原生 RGB 解码，非三通道）。
+
 ### 2.3 上传记录与不丢产物（Item 4）
 
 - `record.upload = {ingestionId, filename, size, state, confirmedParts, slideId, updatedAt, error}`，

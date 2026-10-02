@@ -20,7 +20,8 @@
 - axes 处理（Batch 2 起）：
   * series 选择按 ``Y*X`` 主空间面积 + 有效金字塔层数（不再按含 C/T/Z 的
     全 shape 乘积，避免小空间高通道辅助 series 抢主图）；
-  * ``S`` 仅在 photometric=RGB 且 samples=3/4 时当原生 RGB(A)；逻辑 ``C``
+  * ``S`` 仅在 photometric=RGB（或 JPEG 压缩的 YCbCr——解码即 RGB）且
+    samples=3/4 时当原生 RGB(A)；逻辑 ``C``
     单独处理，多通道读取走 :meth:`TiffFileSlide.read_region_channels`
     （zarr 索引保留 Y/X slice 与所选通道标量，不整面加载）；
   * 旧 :meth:`TiffFileSlide.read_region` 保持 OpenSlide duck-type 与
@@ -479,6 +480,10 @@ class TiffFileSlide:
 
     #: TIFF PHOTOMETRIC.RGB（tifffile Photometric.RGB 的整数值）
     _PHOTOMETRIC_RGB = 2
+    #: PHOTOMETRIC.YCBCR + COMPRESSION.JPEG：tifffile 解码 JPEG 时即转为
+    #: RGB（明场 KFB 转出的 JPEG tile 都是这种），解码结果与 RGB 同语义
+    _PHOTOMETRIC_YCBCR = 6
+    _COMPRESSION_JPEG = 7
 
     def __init__(self, path):
         import tifffile  # lazy import
@@ -538,8 +543,8 @@ class TiffFileSlide:
             self._axes, self._shape,
             list(zip(self._level_axes, self._level_shapes)))
 
-        # 原生 RGB 判定：S 仅在 photometric=RGB 且 samples=3/4 时当原生
-        # RGB(A)；逻辑 C 单独处理（§7.2）。
+        # 原生 RGB 判定：S 仅在 photometric=RGB（或 JPEG 压缩的 YCbCr）且
+        # samples=3/4 时当原生 RGB(A)；逻辑 C 单独处理（§7.2）。
         has_c = "C" in self._axes
         has_s = "S" in self._axes
         samples = 1
@@ -548,10 +553,13 @@ class TiffFileSlide:
                 samples = int(self._shape[self._axes.index("S")])
             except (IndexError, TypeError, ValueError):
                 samples = 1
-        photometric = self._series_photometric()
+        photometric, compression = self._series_photometric()
+        decodes_to_rgb = (
+            photometric == self._PHOTOMETRIC_RGB
+            or (photometric == self._PHOTOMETRIC_YCBCR
+                and compression == self._COMPRESSION_JPEG))
         self._is_native_rgb = (
-            (not has_c) and has_s and samples in (3, 4)
-            and photometric == self._PHOTOMETRIC_RGB)
+            (not has_c) and has_s and samples in (3, 4) and decodes_to_rgb)
         # 逻辑通道轴：优先 C；无 C 且非原生 RGB 的 S 退化按逻辑通道处理；
         # 原生 RGB 无逻辑通道（count=0），纯灰度 YX 视为单通道。
         if has_c:
@@ -648,12 +656,13 @@ class TiffFileSlide:
         return 1
 
     def _series_photometric(self):
-        """所选 series 首页的 photometric 整数（不可得返回 0）。"""
+        """所选 series 首页的 (photometric, compression) 整数（不可得记 0）。"""
         try:
             page = self._series.pages[0]
-            return int(getattr(page, "photometric", 0) or 0)
+            return (int(getattr(page, "photometric", 0) or 0),
+                    int(getattr(page, "compression", 0) or 0))
         except Exception:  # noqa: BLE001
-            return 0
+            return 0, 0
 
     def _check_multifile_ome(self):
         """检测 multi-file OME（外部 UUID FileName 引用）并稳定拒绝。
@@ -738,7 +747,8 @@ class TiffFileSlide:
 
     @property
     def is_native_rgb(self):
-        """是否原生 RGB(A)（photometric=RGB 且 S=3/4 且无逻辑 C）。"""
+        """是否原生 RGB(A)（photometric=RGB 或 JPEG 压缩的 YCbCr，且 S=3/4、
+        无逻辑 C）。"""
         return self._is_native_rgb
 
     @property

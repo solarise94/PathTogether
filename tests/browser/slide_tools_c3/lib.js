@@ -16,6 +16,14 @@ function arg(name, dflt) {
   return i >= 0 ? process.argv[i + 1] : dflt;
 }
 
+/// 浏览器语言钉死：UI 文案断言按 i18n 的 zh 表书写（static/i18n.js 的
+/// detectLang 在无存储偏好时取 navigator.language，而 Playwright 不设
+/// locale 时 Chromium 会跟着进程 LANG/LC_ALL 走 → 套件否则环境相关）。
+/// 覆盖口：`--locale <tag>` 或 PT_TEST_LOCALE（仅影响测试浏览器）。
+function testLocale() {
+  return arg('locale', process.env.PT_TEST_LOCALE || 'zh-CN');
+}
+
 const CLI = path.join(REPO, 'slide-transform-core/target/release/slide-transform');
 
 // ---------------------------------------------------------------- server --
@@ -40,6 +48,8 @@ async function startServer(port) {
 // ---------------------------------------------------------------- browser --
 
 /// 独立 profile（每个场景一个；结束删除）。showSaveFilePicker stub 写 OPFS。
+/// locale 钉 zh-CN（见 testLocale）：否则英文环境下 i18n 检测会让整页变
+/// 英文，按 zh 文案书写的断言随之失败。
 async function launch(label, initScripts = []) {
   const profiles = path.join(GATE, 'profiles');
   fs.mkdirSync(profiles, { recursive: true });
@@ -48,6 +58,7 @@ async function launch(label, initScripts = []) {
   const context = await chromium.launchPersistentContext(userDataDir, {
     headless: true,
     viewport: { width: 1120, height: 900 },
+    locale: testLocale(), // 同时决定 navigator.language 与 Accept-Language
     args: ['--disable-dev-shm-usage'],
   });
   for (const s of initScripts) await context.addInitScript(s);
@@ -64,6 +75,7 @@ function savePickerStub() {
       value: async (opts) => {
         window.__pickerCalled = (window.__pickerCalled || 0) + 1;
         window.__pickerSuggested = opts && opts.suggestedName || null;
+        window.__pickerTypes = opts && opts.types || null;
         const root = await navigator.storage.getDirectory();
         return root.getFileHandle('__saved-output.bin', { create: true });
       },
@@ -120,8 +132,12 @@ async function sha256File(p) {
   });
 }
 
+/// Native reference for the page's default output: brightfield inputs use
+/// bf-ome (the browser default for new jobs) unless `extra` names a profile.
 function nativeConvert(input, output, extra = []) {
-  execFileSync(CLI, ['convert', input, output, '--overwrite', ...extra]);
+  const profile = extra.includes('--profile') ? []
+    : ['--profile', /\.kfbf$/i.test(input) ? 'fl-ome' : 'bf-ome'];
+  execFileSync(CLI, ['convert', input, output, '--overwrite', ...profile, ...extra]);
   return output;
 }
 
@@ -254,7 +270,7 @@ async function shot(page, name) {
 }
 
 module.exports = {
-  arg, startServer, launch, openTools, savePickerStub, downloadGuard, setFile,
+  arg, testLocale, startServer, launch, openTools, savePickerStub, downloadGuard, setFile,
   ensureFixture, sparseLargeKfb, sha256File, nativeConvert, opfsSha256,
   clearJobs, jobDirs, writeJson, shot,
   GATE, REPO, CLI, SCREENS, chromium,

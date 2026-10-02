@@ -172,10 +172,10 @@ export function createUploadController({
   // 当前结果面板指向的任务（tools-slides.js 维护）
   const page = { currentJobId: null, modality: null, baseName: null };
 
+  // `.ome.tif` for both OME profiles: the platform registry keys OME-TIFF on
+  // the full compound suffix
   function uploadFileName(job) {
-    const base = (job.source && job.source.name || 'slide')
-      .replace(/\.(kfb|kfbf)$/i, '');
-    return (job.modality === 'fluorescence') ? `${base}.ome.tif` : `${base}.tif`;
+    return E.outputFileName(job.source && job.source.name, job);
   }
 
   /// OPFS 任务记录持久化适配器：把引擎的 save/complete/remove 映射为

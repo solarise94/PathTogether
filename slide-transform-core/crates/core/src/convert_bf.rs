@@ -12,14 +12,22 @@
 //! fast-forwards already-committed cells, reconstructing their report side
 //! effects (stats / edge regions / warnings) from the index without writing.
 //! The fresh path is untouched and stays byte-identical.
+//!
+//! Output profiles (`plan.profile`): [`OutputProfile::ClassicJpegBigTiff`]
+//! (one IFD per level in the main chain, JSON description) and
+//! [`OutputProfile::OmeBigTiffRgbSubifd`] (full-resolution IFD with OME-XML,
+//! reduced levels only as its SubIFDs). Both write the identical tile
+//! payload sequence — the profile only changes the IFD metadata at finish.
 
 use crate::bigtiff::BigTiffPyramidWriter;
+use crate::ome::{OmeRgbImage, build_ome_xml_rgb};
+use crate::ome_writer::OmeBigTiffWriter;
 use crate::error::{CoreError, CoreResult};
 use crate::io::{ByteSource, RandomAccessSink, ScratchFactory};
 use crate::job::{JobControl, NullProgress, Progress, ProgressUnit};
 use crate::kfb::{KfbDocument, KfbLevel, parse_kfb};
 use crate::ome::py_repr_f64;
-use crate::plan::{PixelPolicy, TransformPlan};
+use crate::plan::{OutputProfile, PixelPolicy, TransformPlan};
 use crate::report::{
     EdgeRegion, LevelStats, TransformResult, WARN_EDGE_REENCODE_FALLBACK_Q95,
     level_stats_from_kfb,
@@ -27,6 +35,92 @@ use crate::report::{
 use crate::resume::ResumePoint;
 
 const TILE: u32 = 256;
+
+/// `TransformResult.format` of the classic brightfield profile.
+pub const FORMAT_CLASSIC: &str = "classic-bigtiff-jpeg-pyramid";
+/// `TransformResult.format` of the brightfield RGB OME-BigTIFF profile.
+pub const FORMAT_OME_RGB: &str = "ome-bigtiff-subifd-rgb-jpeg-pyramid";
+
+/// IFD metadata of one selected level.
+struct LevelMeta {
+    width: u32,
+    height: u32,
+    sampling: (u16, u16),
+    reduced: bool,
+}
+
+/// The two brightfield layouts share the tile stream; they differ only in
+/// when IFD metadata is declared and how IFDs are linked at finish.
+enum BfWriter<'a> {
+    Classic { w: BigTiffPyramidWriter<'a>, description: Vec<u8>, mpp: (f64, f64) },
+    Ome { w: OmeBigTiffWriter<'a>, ome_xml: Option<Vec<u8>>, mpp: (f64, f64), levels: usize },
+}
+
+impl BfWriter<'_> {
+    fn begin(
+        &mut self,
+        scratch: &mut dyn ScratchFactory,
+        m: &LevelMeta,
+        committed_tiles: Option<u64>,
+    ) -> CoreResult<()> {
+        match self {
+            BfWriter::Classic { w, .. } => match committed_tiles {
+                None => w.begin_level(scratch),
+                Some(t) => w.begin_level_resume(scratch, t),
+            },
+            BfWriter::Ome { w, ome_xml, mpp, levels } => {
+                // only the full-resolution IFD carries the OME-XML
+                let desc = if m.reduced { None } else { ome_xml.take() };
+                *levels += 1;
+                w.begin_rgb_ifd(scratch, m.width, m.height, m.reduced, *mpp, m.sampling, desc,
+                    committed_tiles)
+            }
+        }
+    }
+
+    fn end(&mut self, m: &LevelMeta) -> CoreResult<()> {
+        match self {
+            BfWriter::Classic { w, description, mpp } => {
+                w.end_level(m.width, m.height, m.sampling, mpp.0, mpp.1, description, m.reduced)
+            }
+            BfWriter::Ome { .. } => Ok(()),
+        }
+    }
+
+    fn write_tile(&mut self, data: &[u8]) -> CoreResult<(u64, u32)> {
+        match self {
+            BfWriter::Classic { w, .. } => w.write_tile(data),
+            BfWriter::Ome { w, .. } => w.write_tile(data),
+        }
+    }
+
+    fn cursor(&self) -> u64 {
+        match self {
+            BfWriter::Classic { w, .. } => w.cursor(),
+            BfWriter::Ome { w, .. } => w.cursor(),
+        }
+    }
+
+    fn ifd_tile_counts(&self) -> Vec<u64> {
+        match self {
+            BfWriter::Classic { w, .. } => w.ifd_tile_counts(),
+            BfWriter::Ome { w, .. } => w.ifd_tile_counts(),
+        }
+    }
+
+    fn finish(&mut self) -> CoreResult<u64> {
+        match self {
+            BfWriter::Classic { w, .. } => w.finish(),
+            BfWriter::Ome { w, levels, .. } => {
+                // IFD 0 is the only main-chain IFD; levels 1.. hang off it
+                if *levels > 1 {
+                    w.set_subifds_for(0, (1..*levels).collect())?;
+                }
+                w.finish(0, &[0])
+            }
+        }
+    }
+}
 /// Sampling tuple (h1,v1,h2,v2,h3,v3) → (pillow-equivalent enum, TIFF (h,v)).
 fn supported_sampling(
     s: (u8, u8, u8, u8, u8, u8),
@@ -328,14 +422,31 @@ fn convert_inner(
         strict_lossless_precheck(src, &doc, &levels)?;
     }
     let source_format = if doc.header.version != 1 { "kfb_kfbio_jpeg" } else { "kfb_bf_v1" };
-    let description =
-        description_bytes(source_format, &doc.header.scanner_id, doc.header.mpp_x,
-            doc.header.mpp_y, doc.header.objective);
-
-    let mut writer = match resume {
-        None => BigTiffPyramidWriter::new(sink)?,
-        Some(r) => BigTiffPyramidWriter::resume_new(sink, r.committed_output)?,
+    let mpp = (doc.header.mpp_x, doc.header.mpp_y);
+    let mut writer = match plan.profile {
+        OutputProfile::ClassicJpegBigTiff => BfWriter::Classic {
+            w: match resume {
+                None => BigTiffPyramidWriter::new(sink)?,
+                Some(r) => BigTiffPyramidWriter::resume_new(sink, r.committed_output)?,
+            },
+            description: description_bytes(source_format, &doc.header.scanner_id,
+                doc.header.mpp_x, doc.header.mpp_y, doc.header.objective),
+            mpp,
+        },
+        OutputProfile::OmeBigTiffRgbSubifd => BfWriter::Ome {
+            w: match resume {
+                None => OmeBigTiffWriter::new_rgb(sink)?,
+                Some(r) => OmeBigTiffWriter::resume_new_rgb(sink, r.committed_output)?,
+            },
+            ome_xml: Some(ome_rgb_description(&doc, &levels, source_format, plan)),
+            mpp,
+            levels: 0,
+        },
+        OutputProfile::OmeBigTiffSubifd => {
+            return Err(CoreError::variant("荧光 OME profile 不适用于明场 KFB"));
+        }
     };
+    let format = if matches!(writer, BfWriter::Classic { .. }) { FORMAT_CLASSIC } else { FORMAT_OME_RGB };
     let mut level_stats: Vec<LevelStats> = Vec::new();
     let mut edge_regions: Vec<EdgeRegion> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -355,6 +466,13 @@ fn convert_inner(
             ))
         })?;
 
+        let meta = LevelMeta {
+            width: lv.width,
+            height: lv.height,
+            sampling: tiff_sub,
+            reduced: li > 0,
+        };
+
         // ---- pass 1: any edge tiles? (progress + policy already done)
         let mut stats = level_stats_from_kfb(lv);
         if resume_done {
@@ -367,18 +485,10 @@ fn convert_inner(
                     lv.level, committed, total
                 )));
             }
-            writer.begin_level_resume(scratch, committed)?;
+            writer.begin(scratch, &meta, Some(committed))?;
             reconstruct_cells_bf(src, &doc, lv, u64::MAX, &mut stats, &mut edge_regions,
                 &mut warnings)?;
-            writer.end_level(
-                lv.width,
-                lv.height,
-                tiff_sub,
-                doc.header.mpp_x,
-                doc.header.mpp_y,
-                &description,
-                li > 0,
-            )?;
+            writer.end(&meta)?;
             ifd_chain.push((lv.level, None));
             level_stats.push(stats);
             continue;
@@ -387,11 +497,11 @@ fn convert_inner(
         let skip_until = if resume_current { resume.unwrap().cell } else { 0 };
         if resume_current && skip_until > 0 {
             let committed = resume.unwrap().ifd_tiles[li];
-            writer.begin_level_resume(scratch, committed)?;
+            writer.begin(scratch, &meta, Some(committed))?;
             reconstruct_cells_bf(src, &doc, lv, skip_until, &mut stats, &mut edge_regions,
                 &mut warnings)?;
         } else {
-            writer.begin_level(scratch)?;
+            writer.begin(scratch, &meta, None)?;
         }
         let mut row_done: u64 = skip_until / lv.tiles_across() as u64;
         doc.grids.for_each_cell(lv.level, |cell, rec| {
@@ -476,15 +586,7 @@ fn convert_inner(
                 writer.cursor(), plan.limits.max_output_bytes
             )));
         }
-        writer.end_level(
-            lv.width,
-            lv.height,
-            tiff_sub,
-            doc.header.mpp_x,
-            doc.header.mpp_y,
-            &description,
-            li > 0,
-        )?;
+        writer.end(&meta)?;
         ifd_chain.push((lv.level, None));
         job.progress.on_progress(&Progress {
             unit: ProgressUnit::Level,
@@ -501,7 +603,7 @@ fn convert_inner(
     let mut result = TransformResult {
         plan_version: plan.plan_version,
         core_version: plan.core_version.clone(),
-        format: "classic-bigtiff-jpeg-pyramid",
+        format,
         output_bytes,
         output_sha256: None,
         width: doc.header.width_px,
@@ -514,10 +616,11 @@ fn convert_inner(
             ifd_count: ifd_chain.len() as u32,
             tile_records_emitted: 0,
             output_bytes,
-            checks_passed: vec![
-                "bigtiff-header".into(),
-                "ifd-chain".into(),
-            ],
+            checks_passed: if format == FORMAT_CLASSIC {
+                vec!["bigtiff-header".into(), "ifd-chain".into()]
+            } else {
+                vec!["bigtiff-header".into(), "ome-xml-present".into(), "subifd-chain".into()]
+            },
         },
         ifd_chain,
         associated: doc
@@ -536,6 +639,50 @@ fn convert_inner(
     result.validation.tile_records_emitted =
         result.levels.iter().map(|l| l.tiles_total).sum();
     Ok(result)
+}
+
+/// OME-XML of the RGB profile: geometry and calibration from the header,
+/// objective only when the header carries one, provenance without any
+/// source file name.
+fn ome_rgb_description(
+    doc: &KfbDocument,
+    levels: &[&KfbLevel],
+    source_format: &str,
+    plan: &TransformPlan,
+) -> Vec<u8> {
+    let mut provenance: Vec<(&str, String)> = vec![
+        ("converter", "slide-transform-core".to_string()),
+        ("converter_version", plan.core_version.clone()),
+        ("output_profile", OutputProfile::OmeBigTiffRgbSubifd.id().to_string()),
+        ("source_format", source_format.to_string()),
+    ];
+    if !doc.header.scanner_id.is_empty() {
+        provenance.push(("scanner_id", doc.header.scanner_id.clone()));
+    }
+    provenance.push(("pyramid_levels", levels.len().to_string()));
+    provenance.push((
+        "tile_payloads",
+        "source JPEG tiles copied byte-for-byte; edge tiles decoded, placed on a white \
+         256x256 canvas and re-encoded with the source quantization tables"
+            .to_string(),
+    ));
+    provenance.push((
+        "pixel_policy",
+        match plan.pixel_policy {
+            PixelPolicy::AllowEdgeReencode => "allow-edge-reencode",
+            PixelPolicy::StrictLossless => "strict-lossless",
+        }
+        .to_string(),
+    ));
+    // the Pixels size describes IFD 0, i.e. the first selected level
+    build_ome_xml_rgb(&OmeRgbImage {
+        width: levels[0].width,
+        height: levels[0].height,
+        mpp_x: doc.header.mpp_x,
+        mpp_y: doc.header.mpp_y,
+        objective: doc.header.objective,
+        provenance: &provenance,
+    })
 }
 
 struct ReencodeOutcome {

@@ -15,6 +15,13 @@ function arg(name, dflt) {
   return i >= 0 ? process.argv[i + 1] : dflt;
 }
 
+/// 浏览器语言钉死（同 slide_tools_c3/lib.js）：不设 locale 的 Playwright 会
+/// 跟着宿主 LANG/LC_ALL 走。C2 harness 自身无 i18n 文案断言，钉住是为了让
+/// 共用的产品脚本（i18n.js 等）行为不随环境漂移。覆盖：--locale / PT_TEST_LOCALE。
+function testLocale() {
+  return arg('locale', process.env.PT_TEST_LOCALE || 'zh-CN');
+}
+
 async function startServer(port, csp = 'C') {
   const server = spawn(process.execPath, [path.join(HERE, 'server.js'),
     '--port', String(port), '--csp', csp],
@@ -37,6 +44,7 @@ async function launch(opts = {}) {
   const launchOpts = {
     headless: !opts.headed,
     viewport: { width: 1000, height: 800 },
+    locale: testLocale(), // 钉 zh-CN：见 testLocale 注释（navigator.language + Accept-Language）
     // NOTE (C0 lesson): never pass `env` — Chrome stable self-closes.
     // /dev/shm usage counts toward the memcg and Chromium aborts when it
     // cannot grow shm segments under the cap (classic headless crash);
@@ -108,6 +116,6 @@ function writeJson(rel, obj) {
 const CLI = path.join(REPO, 'slide-transform-core/target/release/slide-transform');
 
 module.exports = {
-  arg, startServer, launch, open, ready, clearJobs, setFile, sha256File, writeJson,
+  arg, testLocale, startServer, launch, open, ready, clearJobs, setFile, sha256File, writeJson,
   GATE, REPO, CLI, chromium,
 };

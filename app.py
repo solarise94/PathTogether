@@ -3253,6 +3253,7 @@ def tools_slides():
 #: 「平台暂不支持查看」并禁用上传入口，本地保存不受影响。
 SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS = (
     "classic-bigtiff-jpeg-pyramid",                      # 明场经典金字塔 BigTIFF
+    "ome-bigtiff-subifd-rgb-jpeg-pyramid",               # 明场 RGB OME-BigTIFF（SubIFD）
     "ome-bigtiff-subifd-multichannel-jpeg-passthrough",  # 荧光多通道 OME-BigTIFF
 )
 

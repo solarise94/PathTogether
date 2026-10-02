@@ -15,6 +15,34 @@ pub enum OutputProfile {
     /// Multi-channel OME-BigTIFF with SubIFD pyramid (fluorescence;
     /// `kfb/converter_fl.py` structure, ExposureTime on `<Plane>`).
     OmeBigTiffSubifd,
+    /// Brightfield RGB OME-BigTIFF: one interleaved 3-sample plane (the
+    /// source JPEG YCbCr tiles, copied), reduced levels only as SubIFDs of
+    /// the full-resolution IFD.
+    OmeBigTiffRgbSubifd,
+}
+
+impl OutputProfile {
+    /// Stable wire id (CLI `--profile`, browser job records, journals).
+    pub fn id(self) -> &'static str {
+        match self {
+            OutputProfile::ClassicJpegBigTiff => "bf-classic",
+            OutputProfile::OmeBigTiffRgbSubifd => "bf-ome",
+            OutputProfile::OmeBigTiffSubifd => "fl-ome",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "bf-classic" => Some(OutputProfile::ClassicJpegBigTiff),
+            "bf-ome" => Some(OutputProfile::OmeBigTiffRgbSubifd),
+            "fl-ome" => Some(OutputProfile::OmeBigTiffSubifd),
+            _ => None,
+        }
+    }
+
+    pub fn is_brightfield(self) -> bool {
+        !matches!(self, OutputProfile::OmeBigTiffSubifd)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +107,11 @@ impl TransformPlan {
             pixel_policy: PixelPolicy::AllowEdgeReencode,
             limits: ResourceLimits::default(),
         }
+    }
+
+    /// Plan for a brightfield conversion to the RGB OME-BigTIFF profile.
+    pub fn brightfield_ome(input: InputIdentity) -> Self {
+        TransformPlan { profile: OutputProfile::OmeBigTiffRgbSubifd, ..Self::brightfield(input) }
     }
 
     /// Plan for a fluorescence conversion (OME-SubIFD).

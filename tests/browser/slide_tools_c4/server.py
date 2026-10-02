@@ -24,7 +24,9 @@ R1 可选项（C4 套件不用）：
   id_bundle 存储路径 + mark_ready），ID 写入 creds（readySlideId），供真实
   项目关联端点测试；另分配两张原始文件名相同的 ready 切片（dupSlideIds），
   供「从项目打开 / 界面删除」按 slide_id 寻址的回归（id_bundle 资产 name 为
-  空，按文件名打开/删除会 404/403）。
+  空，按文件名打开/删除会 404/403）；
+- --seed-bfome <path>：以给定文件的真实字节为 c4-user 播种一个 ready 切片
+  （ID 写入 creds 的 bfomeSlideId；bf-ome 查看器浏览器回归用，默认关）。
 """
 import argparse
 import atexit
@@ -44,17 +46,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pg_reap  # noqa: E402
 
 
-def _seed_ready_slide(owner_user_id, filename="r1-assoc-real.tif"):
-    """真实 ready 切片：allocate → 合成 TIFF 落到 id_bundle 路径 → mark_ready。"""
-    import numpy as np
-    import tifffile
+def _seed_ready_slide(owner_user_id, filename="r1-assoc-real.tif", src_path=None):
+    """真实 ready 切片：allocate → 合成 TIFF 写入 id_bundle 路径 → mark_ready。
+
+    src_path（--seed-bfome）：以给定文件的**真实字节**落盘（如 bf-ome 发布
+    包），后续读取走真实 slide_io.open_slide（不 patch 读取器）。
+    """
+    import shutil
     import slide_storage
     import slide_store
     desc = slide_store.allocate_slide(owner_user_id, filename, "tif")
     path = str(slide_storage.resolve_descriptor_path(desc))
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tifffile.imwrite(path, np.full((256, 256, 3), 200, dtype=np.uint8),
-                     tile=(256, 256), photometric="rgb")
+    if src_path:
+        shutil.copyfile(src_path, path)
+    else:
+        import numpy as np
+        import tifffile
+        tifffile.imwrite(path, np.full((256, 256, 3), 200, dtype=np.uint8),
+                         tile=(256, 256), photometric="rgb")
     assert slide_store.mark_ready(desc.slide_id,
                                   accounted_bytes=os.path.getsize(path))
     return desc.slide_id
@@ -96,6 +106,9 @@ def main():
     parser.add_argument("--creds", default="")
     parser.add_argument("--fake-cos-worker", action="store_true")
     parser.add_argument("--seed-ready-slide", action="store_true")
+    parser.add_argument("--seed-bfome", default="", metavar="PATH",
+                        help="以该文件真实字节为 c4-user 播种一个 ready 切片"
+                             "（bf-ome 查看器浏览器回归；默认关）")
     args = parser.parse_args()
 
     tmp = tempfile.mkdtemp(prefix="pt-c4-tools-")
@@ -169,6 +182,12 @@ def main():
         uid = user_store_pg.get_user_by_login_id("c4-user@pt.test")["user_id"]
         ready_slide_id = _seed_ready_slide(uid)
         dup_slide_ids = [_seed_ready_slide(uid, "r1-dup-same.tif") for _ in range(2)]
+    bfome_slide_id = ""
+    if args.seed_bfome:
+        bfome_uid = user_store_pg.get_user_by_login_id(
+            "c4-user@pt.test")["user_id"]
+        bfome_slide_id = _seed_ready_slide(
+            bfome_uid, "bfome-seed.ome.tif", src_path=args.seed_bfome)
     if args.fake_cos_worker:
         _start_fake_cos_preparing_worker()
 
@@ -184,6 +203,7 @@ def main():
         "user2Password": user2_pw,
         "readySlideId": ready_slide_id,
         "dupSlideIds": dup_slide_ids,
+        "bfomeSlideId": bfome_slide_id,
         "cosOrigin": "https://c4fake-1250000000.cos.ap-fake.myqcloud.com",
     }), encoding="utf-8")
 

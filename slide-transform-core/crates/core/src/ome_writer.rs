@@ -5,6 +5,11 @@
 //! (0,0)..(0,C−1), (1,0)..(1,C−1), … Tile payloads stream first; offset/count
 //! arrays stream from per-IFD scratch records (12 B/tile) at finish time, so
 //! memory stays O(levels × channels), not O(tiles).
+//!
+//! The same writer emits the brightfield RGB profile ([`SampleLayout::YCbCr`]):
+//! a single top-level IFD (full resolution, 3 interleaved samples, JPEG
+//! YCbCr tiles) whose SubIFDs are the reduced levels. Only the per-IFD
+//! sample tags differ; the layout algorithm is shared.
 
 use crate::error::{CoreError, CoreResult};
 use crate::io::{RandomAccessSink, ScratchFactory, ScratchSink};
@@ -41,11 +46,24 @@ pub fn px_per_cm_rational(mpp: f64) -> CoreResult<[u8; 8]> {
     Err(CoreError::metadata(format!("mpp={mpp} 超出 RATIONAL 范围")))
 }
 
+/// Pixel sample layout of every IFD a writer emits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleLayout {
+    /// One 8-bit sample per pixel (fluorescence channel planes).
+    Gray,
+    /// Three interleaved 8-bit samples in JPEG-compressed YCbCr tiles
+    /// (brightfield; PhotometricInterpretation 6 + YCbCrSubSampling).
+    YCbCr,
+}
+
 struct IfdSpec {
     width: u32,
     height: u32,
     reduced: bool,
     level_mpp: f64,
+    level_mpp_y: f64,
+    /// YCbCrSubSampling (h, v); only emitted for [`SampleLayout::YCbCr`].
+    ycbcr_sub: (u16, u16),
     description: Option<Vec<u8>>,
     /// SubIFD target IFD indices (into the ifds vector).
     sub_idx: Vec<usize>,
@@ -59,25 +77,113 @@ pub struct OmeBigTiffWriter<'a> {
     sink: &'a mut dyn RandomAccessSink,
     cursor: u64,
     ifds: Vec<IfdSpec>,
+    layout: SampleLayout,
+    /// Scratch name prefix of the per-IFD offset/count streams (the browser
+    /// host pre-opens these exact names).
+    scratch_prefix: &'static str,
 }
 
 impl<'a> OmeBigTiffWriter<'a> {
     pub fn new(sink: &'a mut dyn RandomAccessSink) -> CoreResult<Self> {
+        Self::create(sink, SampleLayout::Gray, "ome-offcnt-")
+    }
+
+    /// Brightfield RGB writer. Scratch streams keep the brightfield names
+    /// (`offcnt-l{i}`, one per level) so the host's scratch set does not
+    /// depend on the output profile.
+    pub fn new_rgb(sink: &'a mut dyn RandomAccessSink) -> CoreResult<Self> {
+        Self::create(sink, SampleLayout::YCbCr, "offcnt-l")
+    }
+
+    fn create(
+        sink: &'a mut dyn RandomAccessSink,
+        layout: SampleLayout,
+        scratch_prefix: &'static str,
+    ) -> CoreResult<Self> {
         sink.write_at(0, b"II")?;
         let mut hdr = [0u8; 14];
         hdr[0..2].copy_from_slice(&43u16.to_le_bytes());
         hdr[2..4].copy_from_slice(&8u16.to_le_bytes());
         sink.write_at(2, &hdr)?;
-        Ok(OmeBigTiffWriter { sink, cursor: 16, ifds: Vec::new() })
+        Ok(OmeBigTiffWriter { sink, cursor: 16, ifds: Vec::new(), layout, scratch_prefix })
     }
 
     /// Resume variant: adopt the committed cursor without rewriting the
     /// header (the host truncated the sink to `committed_output`).
     pub fn resume_new(sink: &'a mut dyn RandomAccessSink, committed_output: u64) -> CoreResult<Self> {
+        Self::resume_create(sink, committed_output, SampleLayout::Gray, "ome-offcnt-")
+    }
+
+    pub fn resume_new_rgb(
+        sink: &'a mut dyn RandomAccessSink,
+        committed_output: u64,
+    ) -> CoreResult<Self> {
+        Self::resume_create(sink, committed_output, SampleLayout::YCbCr, "offcnt-l")
+    }
+
+    fn resume_create(
+        sink: &'a mut dyn RandomAccessSink,
+        committed_output: u64,
+        layout: SampleLayout,
+        scratch_prefix: &'static str,
+    ) -> CoreResult<Self> {
         if committed_output < 16 {
             return Err(CoreError::validation("resume: committed_output < 16"));
         }
-        Ok(OmeBigTiffWriter { sink, cursor: committed_output, ifds: Vec::new() })
+        Ok(OmeBigTiffWriter {
+            sink,
+            cursor: committed_output,
+            ifds: Vec::new(),
+            layout,
+            scratch_prefix,
+        })
+    }
+
+    pub fn layout(&self) -> SampleLayout {
+        self.layout
+    }
+
+    /// Begin a brightfield RGB IFD (fresh or, with `committed_tiles`,
+    /// adopting a partially committed offcnt stream).
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_rgb_ifd(
+        &mut self,
+        scratch: &mut dyn ScratchFactory,
+        width: u32,
+        height: u32,
+        reduced: bool,
+        mpp: (f64, f64),
+        ycbcr_sub: (u16, u16),
+        description: Option<Vec<u8>>,
+        committed_tiles: Option<u64>,
+    ) -> CoreResult<()> {
+        if self.layout != SampleLayout::YCbCr {
+            return Err(CoreError::validation("begin_rgb_ifd 仅用于 RGB 写出器"));
+        }
+        let name = format!("{}{}", self.scratch_prefix, self.ifds.len());
+        let (sink, bytes, tiles) = match committed_tiles {
+            None => (scratch.create(&name)?, 0, 0),
+            Some(t) => {
+                let bytes = t
+                    .checked_mul(OFFCNT_REC)
+                    .ok_or_else(|| CoreError::validation("resume: offcnt 长度溢出"))?;
+                (scratch.create_preserve(&name)?, bytes, t)
+            }
+        };
+        self.ifds.push(IfdSpec {
+            width,
+            height,
+            reduced,
+            level_mpp: mpp.0,
+            level_mpp_y: mpp.1,
+            ycbcr_sub,
+            description,
+            sub_idx: Vec::new(),
+            offcnt: sink,
+            offcnt_bytes: bytes,
+            tile_count: tiles,
+        });
+        Ok(())
     }
 
     /// Begin an IFD whose offcnt stream is partially committed in scratch
@@ -93,7 +199,7 @@ impl<'a> OmeBigTiffWriter<'a> {
         committed_tiles: u64,
     ) -> CoreResult<()> {
         let sink = scratch
-            .create_preserve(&format!("ome-offcnt-{}", self.ifds.len()))?;
+            .create_preserve(&format!("{}{}", self.scratch_prefix, self.ifds.len()))?;
         let bytes = committed_tiles
             .checked_mul(OFFCNT_REC)
             .ok_or_else(|| CoreError::validation("resume: offcnt 长度溢出"))?;
@@ -102,6 +208,8 @@ impl<'a> OmeBigTiffWriter<'a> {
             height,
             reduced,
             level_mpp,
+            level_mpp_y: level_mpp,
+            ycbcr_sub: (1, 1),
             description,
             sub_idx: Vec::new(),
             offcnt: sink,
@@ -127,12 +235,14 @@ impl<'a> OmeBigTiffWriter<'a> {
         level_mpp: f64,
         description: Option<Vec<u8>>,
     ) -> CoreResult<()> {
-        let sink = scratch.create(&format!("ome-offcnt-{}", self.ifds.len()))?;
+        let sink = scratch.create(&format!("{}{}", self.scratch_prefix, self.ifds.len()))?;
         self.ifds.push(IfdSpec {
             width,
             height,
             reduced,
             level_mpp,
+            level_mpp_y: level_mpp,
+            ycbcr_sub: (1, 1),
             description,
             sub_idx: Vec::new(),
             offcnt: sink,
@@ -198,7 +308,7 @@ impl<'a> OmeBigTiffWriter<'a> {
         let mut positions: Vec<u64> = Vec::with_capacity(self.ifds.len());
         let mut pos = self.cursor;
         for ifd in &self.ifds {
-            let size = 8 + 20 * entry_count(ifd) as u64 + 8;
+            let size = 8 + 20 * entry_count(ifd, self.layout) as u64 + 8;
             positions.push(pos);
             pos += size + ext_bytes(ifd);
         }
@@ -220,7 +330,8 @@ impl<'a> OmeBigTiffWriter<'a> {
                 return Err(CoreError::validation("IFD 布局错位"));
             }
             let n = ifd.tile_count;
-            let ec = entry_count(ifd);
+            let ec = entry_count(ifd, self.layout);
+            let rgb = self.layout == SampleLayout::YCbCr;
             let size = 8 + 20 * ec as u64 + 8;
             let mut head: Vec<u8> = Vec::with_capacity(size as usize);
             head.extend_from_slice(&(ec as u64).to_le_bytes());
@@ -263,12 +374,17 @@ impl<'a> OmeBigTiffWriter<'a> {
                 Some(&ifd.width.to_le_bytes()), None);
             emit(&mut head, &mut segs, &mut ext_cursor, 257, TIFF_LONG, 1,
                 Some(&ifd.height.to_le_bytes()), None);
-            emit(&mut head, &mut segs, &mut ext_cursor, 258, TIFF_SHORT, 1,
-                Some(&8u16.to_le_bytes()), None);
+            if rgb {
+                emit(&mut head, &mut segs, &mut ext_cursor, 258, TIFF_SHORT, 3,
+                    Some(&[8u8, 0, 8, 0, 8, 0]), None);
+            } else {
+                emit(&mut head, &mut segs, &mut ext_cursor, 258, TIFF_SHORT, 1,
+                    Some(&8u16.to_le_bytes()), None);
+            }
             emit(&mut head, &mut segs, &mut ext_cursor, 259, TIFF_SHORT, 1,
                 Some(&7u16.to_le_bytes()), None);
             emit(&mut head, &mut segs, &mut ext_cursor, 262, TIFF_SHORT, 1,
-                Some(&1u16.to_le_bytes()), None);
+                Some(&(if rgb { 6u16 } else { 1u16 }).to_le_bytes()), None);
             if let Some(d) = ifd.description.as_ref() {
                 if d.len() <= 8 {
                     let mut d8 = d.clone();
@@ -281,11 +397,21 @@ impl<'a> OmeBigTiffWriter<'a> {
                 }
             }
             emit(&mut head, &mut segs, &mut ext_cursor, 277, TIFF_SHORT, 1,
-                Some(&1u16.to_le_bytes()), None);
+                Some(&(if rgb { 3u16 } else { 1u16 }).to_le_bytes()), None);
+            // RGB resolution tags are byte-equal to the classic brightfield
+            // profile's (same rounding), so both outputs carry one calibration.
+            let (res_x, res_y) = if rgb {
+                (
+                    crate::bigtiff::px_per_cm_rational(ifd.level_mpp)?,
+                    crate::bigtiff::px_per_cm_rational(ifd.level_mpp_y)?,
+                )
+            } else {
+                (px_per_cm_rational(ifd.level_mpp)?, px_per_cm_rational(ifd.level_mpp)?)
+            };
             emit(&mut head, &mut segs, &mut ext_cursor, 282, TIFF_RATIONAL, 1,
-                Some(&px_per_cm_rational(ifd.level_mpp)?), None);
+                Some(&res_x), None);
             emit(&mut head, &mut segs, &mut ext_cursor, 283, TIFF_RATIONAL, 1,
-                Some(&px_per_cm_rational(ifd.level_mpp)?), None);
+                Some(&res_y), None);
             emit(&mut head, &mut segs, &mut ext_cursor, 284, TIFF_SHORT, 1,
                 Some(&1u16.to_le_bytes()), None);
             emit(&mut head, &mut segs, &mut ext_cursor, 296, TIFF_SHORT, 1,
@@ -324,6 +450,14 @@ impl<'a> OmeBigTiffWriter<'a> {
                         ifd.sub_idx.len() as u64, None, Some(Seg::Bytes(sub)));
                 }
             }
+            if rgb {
+                let (h, v) = ifd.ycbcr_sub;
+                let mut b = [0u8; 4];
+                b[..2].copy_from_slice(&h.to_le_bytes());
+                b[2..].copy_from_slice(&v.to_le_bytes());
+                emit(&mut head, &mut segs, &mut ext_cursor, 530, TIFF_SHORT, 2,
+                    Some(&b), None);
+            }
 
             head.extend_from_slice(&next_of[i].to_le_bytes());
             self.sink.write_at(ifd_pos, &head)?;
@@ -352,23 +486,29 @@ impl<'a> OmeBigTiffWriter<'a> {
     }
 }
 
-fn entry_count(ifd: &IfdSpec) -> usize {
-    15 + usize::from(ifd.description.is_some()) + usize::from(!ifd.sub_idx.is_empty())
+fn entry_count(ifd: &IfdSpec, layout: SampleLayout) -> usize {
+    15 + usize::from(ifd.description.is_some())
+        + usize::from(!ifd.sub_idx.is_empty())
+        + usize::from(layout == SampleLayout::YCbCr)
 }
 
 fn ext_bytes(ifd: &IfdSpec) -> u64 {
     let n = ifd.tile_count;
     let mut ext = 0u64;
+    // values of ≤ 8 bytes sit inline in the entry (finish() emits them so);
+    // counting them here misplaced every later IFD of a single-SubIFD tree
     if let Some(d) = &ifd.description {
         let l = d.len() as u64;
-        ext += l + l % 2;
+        if l > 8 {
+            ext += l + l % 2;
+        }
     }
     if n * 8 > 8 {
         let l = n * 8;
         ext += 2 * (l + l % 2);
     }
-    if !ifd.sub_idx.is_empty() {
-        let l = (ifd.sub_idx.len() * 8) as u64;
+    let l = (ifd.sub_idx.len() * 8) as u64;
+    if l > 8 {
         ext += l + l % 2;
     }
     ext

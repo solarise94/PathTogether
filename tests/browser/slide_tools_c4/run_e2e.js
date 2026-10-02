@@ -36,6 +36,14 @@ async function textOf(page, sel) {
   return String((await page.textContent(sel)) || '');
 }
 
+/// UI 文案断言的期望值取自页面 i18n 表当前键值（见 C3 run_e2e.js 同名助手）：
+/// 断言不随浏览器语言漂移，且键缺失（t 回显键本身）时直接判错。
+async function i18nLabel(page, key) {
+  const s = await page.evaluate((k) => window.HP_I18N.t(k), key);
+  if (!s || s === key || s.startsWith('tools.')) throw new Error(`i18n ${key} unresolved: "${s}"`);
+  return s;
+}
+
 async function currentJobId(page) {
   return page.$eval('.job-row', (r) => r.dataset.jobId);
 }
@@ -79,7 +87,8 @@ async function main() {
       await waitFor(async () => /已发布|Published/.test(await textOf(page, '#upload-status')), 60000, 'published');
       if (fake.st.creates.length !== 1) throw new Error(`creates=${fake.st.creates.length}`);
       const name = fake.st.creates[0].filename;
-      const wantExt = modality === 'fl' ? '.ome.tif' : '.tif';
+      // both modalities now produce OME (brightfield: RGB OME profile)
+      const wantExt = '.ome.tif';
       if (!name.endsWith(wantExt)) throw new Error(`filename ${name} should end ${wantExt}`);
       const putBytes = fake.st.puts.reduce((s, p) => s + p.bytes, 0);
       if (putBytes !== before.size) throw new Error(`PUT bytes ${putBytes} != ${before.size}`);
@@ -269,6 +278,7 @@ async function main() {
             max_concurrent_parts: 2, sign_batch_max_parts: 4, policy_version: 'v1-manual',
           },
           viewable_formats: ['classic-bigtiff-jpeg-pyramid',
+            'ome-bigtiff-subifd-rgb-jpeg-pyramid',
             'ome-bigtiff-subifd-multichannel-jpeg-passthrough'],
         },
       });
@@ -637,6 +647,58 @@ async function main() {
     }
   }
 
+  // ---------------------------------------------------------------- (n) --
+  // 明场输出格式选「经典金字塔 TIFF」：上传创建的是 <base>.tif（非 .ome.tif），
+  // PUT 字节 == 产物大小，产物 sha256 == 原生 CLI --profile bf-classic。
+  async function scenarioClassicUpload() {
+    const { context, page } = await L.launch('n-classic', [L.savePickerStub(), L.downloadGuard()]);
+    const fake = await L.fakeUploadRoutes(page, creds.cosOrigin, { partsCount: 4 });
+    try {
+      await L.login(page, PORT, creds, 'user');
+      await L.C3.openTools(page, PORT);
+      await L.setFile(page, bf);
+      await waitFor(async () => (await page.$('#probe-section:not([hidden])')) !== null, 60000, 'probe');
+      await waitFor(async () => (await page.$('#format-section:not([hidden])')) !== null, 30000, 'format choice');
+      await page.check('#format-classic');
+      await page.click('#convert-btn');
+      await waitFor(async () => (await page.$('#result-section:not([hidden])')) !== null, 120000, 'ready');
+      const jobId = await currentJobId(page);
+      const before = await L.opfsJobSha256(page, jobId);
+      const nativeDir = path.join(L.GATE, 'fixtures');
+      fs.mkdirSync(nativeDir, { recursive: true });
+      const native = L.nativeConvert(bf,
+        path.join(nativeDir, 'bf-580x300-native-classic.tif'), ['--profile', 'bf-classic']);
+      const nativeSha = await L.sha256File(native);
+      if (before.sha256 !== nativeSha) {
+        throw new Error(`classic artifact sha ${before.sha256} != native ${nativeSha}`);
+      }
+      // 格式行断言用 i18n 表值；「是哪个格式」另有稳定标识（上传创建的
+      // 文件名后缀 + 产物 sha == 原生 --profile bf-classic）。
+      const classicName = await i18nLabel(page, 'tools.result.format.bf-classic');
+      const fmtRow = await textOf(page, '#result-format');
+      if (!fmtRow.includes(classicName)) throw new Error(`format row "${fmtRow}"`);
+      await page.click('#upload-btn');
+      await waitFor(async () => /已发布|Published/.test(await textOf(page, '#upload-status')), 60000, 'published');
+      if (fake.st.creates.length !== 1) throw new Error(`creates=${fake.st.creates.length}`);
+      const name = fake.st.creates[0].filename;
+      if (!name.endsWith('.tif') || name.endsWith('.ome.tif')) {
+        throw new Error(`filename ${name} should be <base>.tif (classic)`);
+      }
+      const putBytes = fake.st.puts.reduce((s, p) => s + p.bytes, 0);
+      if (putBytes !== before.size) throw new Error(`PUT bytes ${putBytes} != ${before.size}`);
+      const after = await L.opfsJobSha256(page, jobId);
+      if (after.sha256 !== before.sha256) throw new Error('artifact sha changed');
+      record('n-classic-upload', true, {
+        filename: name, putBytes, sha: before.sha256.slice(0, 12),
+        nativeSha: nativeSha.slice(0, 12), formatRow: fmtRow.trim().slice(0, 30),
+      });
+    } catch (e) {
+      record('n-classic-upload', false, { error: String(e).slice(0, 400) });
+    } finally {
+      await context.close();
+    }
+  }
+
   const all = [
     ['a-bf', () => scenarioHappy('bf', bf)],
     ['a-fl', () => scenarioHappy('fl', fl)],
@@ -653,6 +715,7 @@ async function main() {
     ['l-record-write-failure', scenarioPersistFailure],
     ['m1-cancel-during-poll', () => scenarioCancelDuringWait('waiting')],
     ['m2-cancel-during-backoff', () => scenarioCancelDuringWait('backoff')],
+    ['n-classic-upload', scenarioClassicUpload],
   ];
   for (const [id, fn] of all) {
     if (ONLY && id !== ONLY) continue;

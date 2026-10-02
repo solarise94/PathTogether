@@ -34,6 +34,9 @@ const els = {
   profileSuggest: $('profile-suggest'),
   policySection: $('policy-section'),
   policyStrictWarn: $('policy-strict-warn'),
+  formatSection: $('format-section'),
+  formatFieldset: $('format-fieldset'),
+  formatLocked: $('format-locked'),
   runSection: $('run-section'),
   convertBtn: $('convert-btn'),
   convertUploadBtn: $('convert-upload-btn'),
@@ -150,7 +153,8 @@ const page = {
   channelJsonName: null,
   prep: null,              // { jobId, probe, identity }
   running: false,
-  readyInfo: null,         // { jobId, outputBytes, sha256, modality, sourceName }
+  readyInfo: null,        // { jobId, outputBytes, sha256, modality, sourceName }
+  outputLockedProfile: null, // 明场输出格式：任务一旦开始即锁定（见 lockOutputProfile）
   saveSupported: typeof window.showSaveFilePicker === 'function',
   beforeunloadOn: false,
   lastJobs: [],
@@ -163,6 +167,7 @@ document.addEventListener('hp-lang-change', rerenderForLang);
 function rerenderForLang() {
   document.title = t('tools.doc.title');
   updateProfileSuggestText();
+  renderOutputFormatSection();
   renderSaveStatus();
   renderResultPanel();
   renderJobs(page.lastJobs || []);
@@ -229,6 +234,7 @@ async function probeWithDiskFlow(file, opts = {}) {
   try {
     return await page.runner.probe(file, {
       confirmUncertainDisk: confirmOverride, channelJson: page.channelJson,
+      outputProfile: opts.outputProfile,
     });
   } catch (e) {
     if (errCode(e) === 'disk_precheck_failed') {
@@ -244,6 +250,7 @@ async function probeWithDiskFlow(file, opts = {}) {
         if (!ok) throw e;
         return await page.runner.probe(file, {
           confirmUncertainDisk: true, channelJson: page.channelJson,
+          outputProfile: opts.outputProfile,
         });
       }
     }
@@ -257,8 +264,9 @@ function resetFlowPanels() {
   clearError();
   page.prep = null;
   page.readyInfo = null;
+  page.outputLockedProfile = null;
   for (const el of [els.probeSection, els.estimateSection, els.profileSection,
-    els.policySection, els.resultSection]) el.hidden = true;
+    els.policySection, els.formatSection, els.resultSection]) el.hidden = true;
   els.runSection.hidden = true;
   els.convertBtn.disabled = true;
   if (els.convertUploadBtn) els.convertUploadBtn.disabled = true;
@@ -330,7 +338,14 @@ async function runProbeFlow() {
   setBeforeunload(true);
   try {
     const cjAtProbe = page.channelJson;
-    const prep = await probeWithDiskFlow(page.file);
+    // 输出格式选择在准备时就传给运行器（prepared 记录的 outputProfile 反映
+    // 用户选择）。模态在复制+探测后才能确认，这里用文件头嗅探（与核心同源
+    // 的魔数表）预判：只有明场才传，荧光固定 fl-ome（运行器按模态默认）。
+    const head = new Uint8Array(await page.file.slice(0, 8).arrayBuffer());
+    const sniffedModality = E.magicModality(head);
+    const prep = await probeWithDiskFlow(page.file, {
+      outputProfile: sniffedModality === 'brightfield' ? selectedOutputProfile() : undefined,
+    });
     page.prep = prep;
     // 伴随文件在复制/探测期间改选过：补写进任务记录
     if (page.channelJson !== cjAtProbe) {
@@ -365,6 +380,7 @@ async function runProbeFlow() {
   els.estimateSection.hidden = false;
   els.profileSection.hidden = false;
   els.policySection.hidden = false;
+  renderOutputFormatSection();
   els.runSection.hidden = false;
   els.convertBtn.disabled = false;
   if (els.convertUploadBtn) els.convertUploadBtn.disabled = false;
@@ -461,6 +477,43 @@ function selectedPolicy() {
   return checked ? checked.value : 'allow-edge';
 }
 
+// ---------------------------------------------------- output format (bf) --
+
+/// 当前 UI 的明场输出格式选择（模板默认勾选 bf-ome；无 DOM 时也回落默认）。
+function selectedOutputProfile() {
+  const checked = document.querySelector('input[name="outputFormat"]:checked');
+  return checked ? checked.value : E.OUTPUT_PROFILES.BF_OME;
+}
+
+/// 传给运行器的 outputProfile：只有确定是明场才传当前选择；荧光（以及模态
+/// 未知的记录）传 undefined → 运行器按模态默认 fl-ome / 记录值，绝不把明场
+/// 选择塞给荧光任务（runner 会以 kind=output-profile 拒绝）。
+function outputProfileForModality(modality) {
+  return modality === 'brightfield' ? selectedOutputProfile() : undefined;
+}
+
+/// 任务一旦开始（写入输出），该任务的输出格式不可再改：字段组禁用，改以
+/// 文案展示任务实际格式。换选新文件（新任务）时在 resetFlowPanels 解锁。
+function lockOutputProfile(profile) {
+  page.outputLockedProfile = profile || null;
+  renderOutputFormatSection();
+}
+
+function renderOutputFormatSection() {
+  // 荧光输入不提供选择：固定多通道 OME-TIFF（fl-ome），整节隐藏。
+  const show = !!page.prep && probeDoc().modality !== 'fluorescence';
+  els.formatSection.hidden = !show;
+  if (!show) return;
+  const locked = page.outputLockedProfile;
+  els.formatFieldset.disabled = !!locked;
+  els.formatLocked.hidden = !locked;
+  if (locked) {
+    els.formatLocked.textContent = t('tools.format.locked', {
+      name: t(`tools.result.format.${locked}`),
+    });
+  }
+}
+
 function updateStrictWarning() {
   const est = probeEstimate();
   const willRefuse = Number(est.edge_tiles || 0) > 0;
@@ -474,6 +527,23 @@ function updateStrictWarning() {
 
 document.querySelectorAll('input[name="policy"]').forEach((r) => {
   r.addEventListener('change', updateStrictWarning);
+});
+
+/// 准备后改选明场输出格式：立即写回 prepared 记录（刷新后从任务列表「开始」
+/// 仍带上该选择）。已开始的任务 radio 已禁用（锁定），不会到达这里；万一
+/// 到达（运行器侧同样只允许 prepared），错误照常展示且记录不变。
+async function onOutputFormatChange(ev) {
+  if (!page.prep || page.outputLockedProfile || els.formatSection.hidden) return;
+  try {
+    await page.runner.setPreparedOutputProfile(page.prep.jobId, ev.target.value);
+    refreshJobs();
+  } catch (e) {
+    showError(e);
+  }
+}
+
+document.querySelectorAll('input[name="outputFormat"]').forEach((r) => {
+  r.addEventListener('change', onOutputFormatChange);
 });
 
 // -------------------------------------------------------------- convert --
@@ -516,12 +586,16 @@ async function driveConversion() {
   setBeforeunload(true);
   page.running = true;
   try {
+    // 开始即用当前 UI 选择（明场；荧光不传 → fl-ome）；任务从此锁定该格式。
+    const outputProfile = outputProfileForModality(probeDoc().modality);
     const { jobId, done } = await page.runner.startJob(page.file, {
       jobId: page.prep.jobId,
       profileId: selectedProfileId(),
       policy: selectedPolicy(),
       channelJson: page.channelJson,
+      outputProfile,
     });
+    lockOutputProfile(outputProfile || E.defaultOutputProfile(probeDoc().modality));
     page.prep.jobId = jobId;
     const result = await done;
     page.running = false;
@@ -538,6 +612,8 @@ async function driveConversion() {
         outputBytes: result.result.output_bytes,
         sha256: result.validation && result.validation.sha256,
         modality: probeDoc().modality,
+        outputProfile: result.result.output_profile || null,
+        result: { format: result.result.format || null },
         sourceName: page.file.name,
         channels: result.result.channels || [],
       };
@@ -609,8 +685,7 @@ async function onCancel() {
 
 function suggestedOutputName() {
   if (!page.readyInfo) return 'output.tif';
-  const base = (page.readyInfo.sourceName || 'slide').replace(/\.(kfb|kfbf)$/i, '');
-  return page.readyInfo.modality === 'fluorescence' ? `${base}.ome.tif` : `${base}.tif`;
+  return E.outputFileName(page.readyInfo.sourceName, page.readyInfo);
 }
 
 function renderResultPanel() {
@@ -618,6 +693,8 @@ function renderResultPanel() {
   els.resultSection.hidden = false;
   const g = els.resultGrid;
   g.textContent = '';
+  dlRow(g, t('tools.result.format'),
+    t(`tools.result.format.${E.jobOutputProfile(page.readyInfo)}`), 'result-format');
   dlRow(g, t('tools.result.size'), fmtBytes(page.readyInfo.outputBytes), 'result-size');
   dlRow(g, t('tools.result.sha256'), String(page.readyInfo.sha256 || '—'), 'result-sha');
   if (page.readyInfo.modality === 'fluorescence') {
@@ -646,6 +723,8 @@ async function selectResultJob(jobId) {
       outputBytes: job.result.outputBytes,
       sha256: job.result.sha256,
       modality: job.modality,
+      outputProfile: job.outputProfile || null,
+      result: { format: job.result.format || null },
       sourceName: job.source && job.source.name,
       channels: job.result.channels || [],
     };
@@ -684,10 +763,7 @@ async function onSave() {
     // 必须在用户手势内请求 picker（Chromium 手势约束）
     const handle = await window.showSaveFilePicker({
       suggestedName: suggestedOutputName(),
-      types: [{
-        description: 'TIFF',
-        accept: { 'image/tiff': ['.tif', '.tiff'] },
-      }],
+      types: E.saveFileTypes(page.readyInfo),
     });
     const r = await page.runner.exportJob(page.readyInfo.jobId, () => handle.createWritable());
     page.saveMsg = { key: 'tools.result.save.done', vars: { bytes: fmtBytes(r.exportedBytes) } };
@@ -799,6 +875,12 @@ function renderJobs(jobs) {
         policy: t(`tools.jobs.policy.${job.settings.policy}`),
       })}`;
     }
+    // 输出格式（prepared 起记录里就有；含旧任务回退出的 classic/fl-ome）
+    if (job.outputProfile) {
+      meta.textContent += ` · ${t('tools.jobs.format', {
+        name: t(`tools.jobs.format.${job.outputProfile}`),
+      })}`;
+    }
     if (job.hasChannelJson) meta.textContent += ` · ${t('tools.jobs.channel')}`;
     row.appendChild(meta);
 
@@ -875,10 +957,9 @@ async function onJobAction(action, job) {
     }
     if (action === 'export') {
       if (typeof window.showSaveFilePicker !== 'function') return;
-      const base = (job.source && job.source.name || 'slide').replace(/\.(kfb|kfbf)$/i, '');
       const handle = await window.showSaveFilePicker({
-        suggestedName: job.modality === 'fluorescence' ? `${base}.ome.tif` : `${base}.tif`,
-        types: [{ description: 'TIFF', accept: { 'image/tiff': ['.tif', '.tiff'] } }],
+        suggestedName: E.outputFileName(job.source && job.source.name, job),
+        types: E.saveFileTypes(job),
       });
       const r = await page.runner.exportJob(job.id, () => handle.createWritable());
       page.saveMsg = { key: 'tools.result.save.done', vars: { bytes: fmtBytes(r.exportedBytes) } };
@@ -888,21 +969,30 @@ async function onJobAction(action, job) {
     }
     if (action === 'start' || action === 'resume') {
       // prepared/paused 任务：源副本已在浏览器临时存储，无需重选文件。
-      // resume 不传设置 → 沿用任务保存的档位/策略；start（prepared）用当前界面选择，
-      // channel.json 沿用准备时保存在任务记录里的那份。
+      // resume 不传设置（含输出格式）→ 沿用任务记录；start（prepared）只有当
+      // 可见的输出格式节属于该任务（本会话刚准备、未锁定）时才传当前界面选择，
+      // 否则（刷新后 / 设置节属于别的任务）不传 → 运行器用任务记录里保存的
+      // 格式——记录值优先于隐藏的 radio 默认值。channel.json 一律沿用准备时
+      // 保存在任务记录里的那份。两种动作开始后格式都锁定为任务实际格式。
       els.runSection.hidden = false;
       els.cancelBtn.hidden = false;
       els.runProgress.hidden = false;
       els.runBytes.hidden = false;
       els.runStatus.textContent = phaseText(action === 'resume' ? 'paused' : 'planned');
       setBeforeunload(true);
+      const startOutputProfile = (action === 'start'
+        && page.prep && page.prep.jobId === job.id && !els.formatSection.hidden)
+        ? outputProfileForModality(job.modality) : undefined;
       const started = action === 'resume'
         ? await page.runner.resumeJob(job.id)
         : await page.runner.startJob(null, {
           jobId: job.id,
           profileId: selectedProfileId(),
           policy: selectedPolicy(),
+          outputProfile: startOutputProfile,
         });
+      lockOutputProfile(startOutputProfile || job.outputProfile
+        || E.defaultOutputProfile(job.modality));
       const result = await started.done;
       setBeforeunload(false);
       els.cancelBtn.hidden = true;
@@ -915,6 +1005,8 @@ async function onJobAction(action, job) {
           outputBytes: result.result.output_bytes,
           sha256: result.validation && result.validation.sha256,
           modality: job.modality,
+          outputProfile: result.result.output_profile || job.outputProfile || null,
+          result: { format: result.result.format || null },
           sourceName: job.source && job.source.name,
           channels: result.result.channels || [],
         };

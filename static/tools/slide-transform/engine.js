@@ -375,6 +375,82 @@ export function magicSupported(head) {
   return SUPPORTED_MAGICS.some((m) => m.every((b, i) => head[i] === b));
 }
 
+/// Container magic → modality ('brightfield' KFB | 'fluorescence' KFBF;
+/// null = not a supported container). The core decides the variant from the
+/// same magic, so the page can offer the brightfield output-format choice
+/// (or withhold it for fluorescence) before the copy+probe round-trip.
+export function magicModality(head) {
+  if (SUPPORTED_MAGICS[1].every((b, i) => head[i] === b)) return 'fluorescence';
+  if (SUPPORTED_MAGICS[0].every((b, i) => head[i] === b)) return 'brightfield';
+  return null;
+}
+
+// ------------------------------------------------------ output profiles --
+
+/// Output layouts the core can write (`--profile` ids; persisted in job
+/// records as `outputProfile` and in every journal generation).
+export const OUTPUT_PROFILES = {
+  BF_CLASSIC: 'bf-classic', // classic multi-IFD JPEG BigTIFF (.tif)
+  BF_OME: 'bf-ome',         // RGB OME-BigTIFF, SubIFD pyramid (.ome.tif)
+  FL_OME: 'fl-ome',         // multichannel OME-BigTIFF (.ome.tif)
+};
+
+/// Core `result.format` → output profile.
+export const FORMAT_PROFILES = {
+  'classic-bigtiff-jpeg-pyramid': OUTPUT_PROFILES.BF_CLASSIC,
+  'ome-bigtiff-subifd-rgb-jpeg-pyramid': OUTPUT_PROFILES.BF_OME,
+  'ome-bigtiff-subifd-multichannel-jpeg-passthrough': OUTPUT_PROFILES.FL_OME,
+};
+
+/// Profile for a NEW job of `modality`.
+export function defaultOutputProfile(modality) {
+  return modality === 'fluorescence' ? OUTPUT_PROFILES.FL_OME : OUTPUT_PROFILES.BF_OME;
+}
+
+/// Profile a job record was written with. Records without the field
+/// predate output profiles: their (partial) outputs are classic brightfield
+/// or fluorescence OME — never reinterpret them as the new default.
+export function recordOutputProfile(rec) {
+  if (rec && rec.outputProfile) return rec.outputProfile;
+  return rec && rec.modality === 'fluorescence'
+    ? OUTPUT_PROFILES.FL_OME : OUTPUT_PROFILES.BF_CLASSIC;
+}
+
+export function profileFitsModality(profile, modality) {
+  if (modality === 'fluorescence') return profile === OUTPUT_PROFILES.FL_OME;
+  return profile === OUTPUT_PROFILES.BF_CLASSIC || profile === OUTPUT_PROFILES.BF_OME;
+}
+
+/// Output profile of a finished/summarized job: the core-reported format
+/// wins; then the recorded profile; then the legacy default for modality.
+export function jobOutputProfile(job) {
+  const fmt = job && job.result && job.result.format;
+  if (fmt && FORMAT_PROFILES[fmt]) return FORMAT_PROFILES[fmt];
+  if (job && job.outputProfile) return job.outputProfile;
+  return recordOutputProfile(job);
+}
+
+export function isOmeProfile(profile) {
+  return profile === OUTPUT_PROFILES.BF_OME || profile === OUTPUT_PROFILES.FL_OME;
+}
+
+/// Local/uploaded file name for a job's artifact: `.ome.tif` for both OME
+/// profiles (Bio-Formats and the platform registry key OME on it), `.tif`
+/// for the classic pyramid.
+export function outputFileName(sourceName, job) {
+  const base = String(sourceName || 'slide').replace(/\.(kfb|kfbf)$/i, '') || 'slide';
+  return isOmeProfile(jobOutputProfile(job)) ? `${base}.ome.tif` : `${base}.tif`;
+}
+
+/// showSaveFilePicker `types` for a job's artifact (the suggested
+/// `.ome.tif` name ends in `.tif`, so it matches the accept list as is).
+export function saveFileTypes(job) {
+  return [{
+    description: isOmeProfile(jobOutputProfile(job)) ? 'OME-TIFF' : 'TIFF',
+    accept: { 'image/tiff': ['.tif', '.tiff'] },
+  }];
+}
+
 // ---------------------------------------------------------------- misc --
 
 export function nowIso() {

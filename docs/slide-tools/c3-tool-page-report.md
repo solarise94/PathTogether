@@ -205,3 +205,53 @@ en-locale`。
 - Firefox（snap 故障）/ Safari / Edge（OPFS 同步句柄、BYOB、导出能力分别实测）。
 - 真实/整机 4 GB 与 8 GB 设备（C2 内存指标真机复测 = C7 门禁）。
 - >4.9 GiB 真实厂商样本（本机只有合成大文件；合成 9.8 GiB 的全量页面流程已由验收方跑通，§4.5）。
+
+## 9. 明场输出格式选择（2026-10-01 补充）
+
+新任务默认 `bf-ome`（RGB OME-BigTIFF，`.ome.tif`）后，页面为明场输入提供
+用户可见的输出格式选择（`#format-section`，第 7 节；与既有档位/策略节同一
+radio 视觉与键盘模式）：
+
+- **OME-TIFF（推荐，QuPath / Bio-Formats）**（默认勾选，`bf-ome`）：
+  QuPath 默认读取器即可打开全部金字塔层级，Bio-Formats 生态（ImageJ 等）通用；
+- **经典金字塔 TIFF（OpenSlide 工具）**（`bf-classic`）：面向 ASAP/OpenSlide
+  等 OpenSlide 系软件（OpenSlide 只见 level 0）；QuPath 默认读取器只见单一分辨率。
+
+**荧光输入不提供选择**：整节隐藏，输出固定多通道 OME-TIFF（`fl-ome`）。
+
+**持久化与锁定规则**（页面 `static/tools/tools-slides.js` + 运行器
+`slide-transform/runner.js`）：
+
+- **准备时**：`runProbeFlow` 先读文件头 8 B（`engine.magicModality`，与核心同一
+  魔数表）判定模态；明场才把当前 UI 选择作为 `outputProfile` 传给
+  `runner.probe()`，prepared 记录的 `outputProfile` 即反映用户选择。荧光不传
+  → 运行器按模态默认 `fl-ome`。
+- **准备后改选**：radio `change` 立即经 `runner.setPreparedOutputProfile(jobId,
+  profile)` 写回 prepared 记录（任务列表行随之显示新格式）——刷新后从任务
+  列表「开始」仍带上该选择。运行器侧仅允许 `prepared` 状态：任务一旦离开
+  prepared（已 planned/running/paused…）拒绝（`resume_refused`，kind
+  `output-profile`）；与模态不符的值（荧光 × 明场 profile）拒绝
+  （`unsupported_input`，kind `output-profile`）。
+- **开始时**：顶部「仅转换并保存」/「转换并上传」（共用 `driveConversion`，
+  开始的就是当前准备的任务）传 `outputProfile: 当前 UI 选择`。任务列表里
+  prepared 任务的「开始」**只有当可见的输出格式节属于该任务**（`page.prep`
+  存在且 `page.prep.jobId === job.id` 且节未隐藏）才传当前界面选择——刷新后
+  （`page.prep` 为空、节隐藏、radio 回模板默认）或节属于别的任务时不传，
+  运行器用任务记录里保存的 `outputProfile`：**记录值优先于隐藏的 radio
+  默认值**，绝不会把已保存的 `bf-classic` 静默改回 `bf-ome`。
+- **续跑（resume）**：不传任何设置，沿用任务记录的格式；换格式续跑由运行器
+  以 `resume_refused`（kind `output-profile`）拒绝。
+- **锁定**：任务一旦开始（超出 prepared/planned，输出已开始写入），
+  页面不再提供更改：字段组禁用并展示任务实际格式（`#format-locked`，取
+  `startOutputProfile || job.outputProfile || 模态默认`）；换选新文件（新任务）
+  时解锁。任务列表行新增「格式 …」标记（prepared 起即有）。
+
+验证：vitest `tests/js/tools-output-profile.test.ts`（15 用例：引擎 helper +
+页面/运行器接线）；C3 e2e 场景 o（经典选择全链路 sha == 原生
+`--profile bf-classic`）、p（经典 + 转换中刷新续跑仍经典）、q（同会话列表开始
+用当前选择并记录）、r（荧光无选择、fl-ome）、s（改选经典落盘 → 刷新 → 列表
+开始仍经典：记录值胜过隐藏 radio 的默认 bf-ome）、t（默认 prepared → 刷新 →
+列表开始仍 bf-ome）；C4 e2e `n-classic-upload`（经典选择上传 `<base>.tif`，
+PUT 字节 == 产物 == 原生经典字节）；C2 fault matrix `prepared-output-profile-
+set-rules`（setPreparedOutputProfile：prepared 记录写入成功、开始后拒绝、
+荧光 × 明场 profile 拒绝）。

@@ -518,6 +518,33 @@ def test_structured_metadata_native_rgb_flag():
         slide.close()
 
 
+def test_ycbcr_jpeg_ome_is_native_rgb_not_three_channels():
+    """明场 OME（JPEG 压缩的 YCbCr tile，S=3）：tifffile 解码即 RGB，必须按
+    原生 RGB 显示——不得被当成 3 个独立荧光通道进入 multichannel 流程。"""
+    import numpy as np
+
+    import slide_render
+    from _tiff_fixtures import _gradient_rgb, make_ome_ycbcr_jpeg_pyramid_bytes
+
+    slide = slide_io.TiffFileSlide(io.BytesIO(
+        make_ome_ycbcr_jpeg_pyramid_bytes()))
+    try:
+        assert slide.axes == "YXS"
+        assert slide.is_native_rgb is True
+        assert slide.channel_count == 0
+        assert slide.channel_axis is None
+        assert slide_render.slide_image_mode(slide) == "native_rgb"
+        assert slide.level_count == 2  # SubIFD 降采样层可见
+        assert slide.level_dimensions == ((96, 64), (48, 32))
+        # 解码颜色：与源 RGB 渐变一致（JPEG q95 4:4:4 的量化误差内），
+        # 证明 YCbCr→RGB 只转了一次
+        got = np.asarray(slide.read_region((0, 0), 0, (96, 64)).convert("RGB"))
+        diff = np.abs(got.astype(int) - _gradient_rgb().astype(int))
+        assert diff.max() <= 8, diff.max()
+    finally:
+        slide.close()
+
+
 def test_read_region_channels_reads_only_selected_planes():
     """通道区域读取：返回所选通道 plane，其余不解码（§7.2）。"""
     import numpy as np

@@ -12,12 +12,22 @@
 //   // channelJson (≤1 MiB string) is saved on the prepared record so a
 //   // start after a page refresh keeps it; replace it before starting with
 //   await runner.setPreparedChannelJson(prep.jobId, channelJson | null);
+//   // replace the output-format choice saved on a job that has not started
+//   // yet (the page radio); refused (resume_refused/output-profile) once the
+//   // job left `prepared`, and a profile that does not fit the modality is
+//   // rejected (unsupported_input/output-profile)
+//   await runner.setPreparedOutputProfile(prep.jobId, 'bf-classic');
 //   // the FIRST argument is still the File; passing a `prepared` jobId
 //   // reuses its copy (no second copy), otherwise probe() runs first.
 //   // channelJson: undefined = the saved one, null = none, string = this one
 //   const { jobId, done } = await runner.startJob(file, {
 //     jobId: prep.jobId, profileId, policy, outputCapBytes, channelJson,
-//     confirmUncertainDisk });
+//     outputProfile, confirmUncertainDisk });
+//   // outputProfile (E.OUTPUT_PROFILES): omitted = the record's, else the
+//   // default for the modality (brightfield → 'bf-ome', fluorescence →
+//   // 'fl-ome'); 'bf-classic' stays available for compatibility checks.
+//   // A started job keeps its profile for life: resume under another one is
+//   // refused, and records from before profiles existed resume as classic.
 //   // resume never needs the File; omitted settings default to the saved
 //   // ones, explicitly different ones are refused (`resume_refused`)
 //   const { done } = await runner.resumeJob(jobId);
@@ -63,7 +73,17 @@ function savedSettings(rec) {
     policy: rec.policy || 'allow-edge',
     outputCapBytes: rec.cap || undefined,
     channelJson: rec.channelJson || undefined,
+    outputProfile: E.recordOutputProfile(rec),
   };
+}
+
+function checkedOutputProfile(profile, modality) {
+  if (!E.profileFitsModality(profile, modality)) {
+    throw E.stError(E.ERROR_CODES.UNSUPPORTED_INPUT,
+      `输出格式 ${profile} 不适用于${modality === 'fluorescence' ? '荧光' : '明场'}切片`,
+      { kind: 'output-profile' });
+  }
+  return profile;
 }
 const EXPORT_CHUNK = 4 * 2 ** 20;
 const CHANNEL_JSON_MAX = 2 ** 20;
@@ -403,6 +423,26 @@ export class SlideToolsRunner {
     });
   }
 
+  /// Replace the output profile saved on a job that has not started yet (the
+  /// page's output-format radio). Mirrors setPreparedChannelJson: only a
+  /// `prepared` record accepts the change — anything planned/run/paused has
+  /// its profile fixed for life (resume_refused, kind output-profile) — and
+  /// the value must fit the probed modality (checkedOutputProfile →
+  /// unsupported_input, kind output-profile).
+  async setPreparedOutputProfile(jobId, profile) {
+    await this._serialRecord(async () => {
+      const rec = await this._readJobRecord(jobId);
+      if (!rec || rec.state !== 'prepared') {
+        throw E.stError(E.ERROR_CODES.RESUME_REFUSED, '任务已开始，不能再更改输出格式',
+          { kind: 'output-profile' });
+      }
+      const outputProfile = checkedOutputProfile(profile, rec.modality);
+      await this._writeJobRecordNow(jobId, {
+        ...rec, outputProfile, updatedAt: E.nowIso(),
+      });
+    });
+  }
+
   /// C4 upload record: merge `patch` into record.upload (read-merge-write on
   /// the serialized record chain — the page must not write the slot itself).
   /// Only ready/exported jobs accept an upload record: the artifact this
@@ -521,6 +561,14 @@ export class SlideToolsRunner {
       throw e;
     }
     const doc = probeResult.document;
+    let outputProfile;
+    try {
+      outputProfile = checkedOutputProfile(
+        opts.outputProfile || E.defaultOutputProfile(doc.modality), doc.modality);
+    } catch (e) {
+      await this._discardNow(jobId).catch(() => { /* pending-cleanup recorded */ });
+      throw e;
+    }
     await this._writeJobRecord(jobId, {
       state: 'prepared',
       // NOTE: the plain file name stays local (OPFS job record); reports
@@ -529,6 +577,7 @@ export class SlideToolsRunner {
       core: this.coreVersion,
       estimate: doc.estimate || probeResult.estimate,
       modality: doc.modality,
+      outputProfile,
       channelJson,
       channelJsonHash: channelJsonHash(channelJson),
       createdAt: E.nowIso(),
@@ -650,6 +699,12 @@ export class SlideToolsRunner {
       if ((record.channelJsonHash || null) !== channelJsonHash(opts.channelJson)) {
         refuse('伴随 channel.json 设置已改变', { kind: 'channel-json' });
       }
+      // the committed bytes belong to the layout that wrote them
+      const committedProfile = E.recordOutputProfile(record);
+      if (opts.outputProfile && opts.outputProfile !== committedProfile) {
+        refuse(`输出格式已改变：任务 ${committedProfile}，请求 ${opts.outputProfile}`,
+          { kind: 'output-profile' });
+      }
       // the staged copy must still be exactly the bytes hashed at staging
       const id = record.identity;
       const v = await this._request('verify-source', { jobId, size: id.size }, 60 * 60 * 1000);
@@ -664,6 +719,12 @@ export class SlideToolsRunner {
         throw E.stError(E.ERROR_CODES.JOB_DIR_MISSING, 'journal 无有效代次记录');
       }
       nextGen = st.gen.gen + 1;
+      const journalled = st.gen.outputProfile || E.recordOutputProfile({ modality: record.modality });
+      if (journalled !== E.recordOutputProfile(record) ||
+          (st.lastCommit && st.lastCommit.st.profile &&
+           st.lastCommit.st.profile !== journalled)) {
+        refuse(`进度记录的输出格式（${journalled}）与任务记录不符`, { kind: 'output-profile' });
+      }
       if (st.lastCommit) {
         resume = { st: st.lastCommit.st };
       }
@@ -686,6 +747,12 @@ export class SlideToolsRunner {
     const channels = modality === 'fluorescence' ? (doc.channels || []).length : 1;
     const estimate = doc.estimate || probeResult.estimate;
     const identity = record.identity;
+    // fresh runs write nothing they reuse, so a prepared/never-journalled
+    // record without the field takes today's default; resumes keep theirs
+    const outputProfile = checkedOutputProfile(resumeJobId
+      ? E.recordOutputProfile(record)
+      : (opts.outputProfile || record.outputProfile || E.defaultOutputProfile(modality)),
+    modality);
 
     await this._updateJobRecord(jobId, {
       state: resume ? 'paused' : 'planned',
@@ -700,6 +767,7 @@ export class SlideToolsRunner {
       cap: opts.outputCapBytes || null,
       estimate,
       modality,
+      outputProfile,
     });
 
     this._setState('planned');
@@ -712,6 +780,7 @@ export class SlideToolsRunner {
         resume, nextGen, identity,
         coreVersion: this.coreVersion,
         modality,
+        outputProfile,
         scratchLevels: levels,
         scratchIfdCount: levels * channels,
       },
@@ -896,6 +965,7 @@ export class SlideToolsRunner {
 
   /// JobSummary: {id, state, nextAction, active, createdAt, updatedAt,
   ///   source: {name, size, sha256} | null, modality, estimate,
+///   outputProfile (null until a run is planned; legacy records → classic),
   ///   settings: {profileId, policy, outputCapBytes, channelJson} | null,
   ///   hasChannelJson, committedBytes,
   ///   result: {outputBytes, sha256, channels: [{name, display_window, …}]} | null,
@@ -936,6 +1006,8 @@ export class SlideToolsRunner {
       updatedAt: rec ? rec.updatedAt : null,
       source: id0 ? { name: id0.name, size: id0.size, sha256: id0.sha256 } : null,
       modality: rec ? rec.modality || null : null,
+      outputProfile: rec && !['staging', 'prepared'].includes(state)
+        ? E.recordOutputProfile(rec) : (rec && rec.outputProfile) || null,
       estimate: rec ? rec.estimate || null : null,
       settings: rec && rec.profile ? savedSettings(rec) : null,
       hasChannelJson: !!(rec && rec.channelJson),

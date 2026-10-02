@@ -33,6 +33,7 @@ CLI = REPO_ROOT / "slide-transform-core" / "target" / "release" / "slide-transfo
 
 #: 核心结果 format 字符串（convert_bf.rs / convert_fl.rs 的 `format:` 值）
 FORMAT_BF = "classic-bigtiff-jpeg-pyramid"
+FORMAT_BF_OME = "ome-bigtiff-subifd-rgb-jpeg-pyramid"
 FORMAT_FL = "ome-bigtiff-subifd-multichannel-jpeg-passthrough"
 
 
@@ -49,23 +50,27 @@ def native_fixtures(tmp_path_factory):
     bf_kfb = d / "bf.kfb"
     fl_kfbf = d / "fl.kfbf"
     bf_tif = d / "bf.tif"
+    bf_ome = d / "bf.ome.tif"
     fl_ome = d / "fl.ome.tif"
     subprocess.run([str(CLI), "gen-kfb", str(bf_kfb),
                     "--width", "580", "--height", "300"], check=True)
-    # 600x400：与 C2/C3 夹具同参（部分小尺寸的合成 KFBF 会触发核心校验
-    # 拒绝 IFD 布局错位——不用那些尺寸做读取证明）
+    # 600x400：与 C2/C3 夹具同参
     subprocess.run([str(CLI), "gen-kfbf", str(fl_kfbf),
                     "--width", "600", "--height", "400"], check=True)
     reports = {}
-    for key, src, out in (("bf", bf_kfb, bf_tif), ("fl", fl_kfbf, fl_ome)):
+    # bf / fl：CLI 默认 profile（auto）；bf_ome：显式 bf-ome（浏览器新任务默认）
+    for key, src, out, extra in (("bf", bf_kfb, bf_tif, []),
+                                 ("bf_ome", bf_kfb, bf_ome,
+                                  ["--profile", "bf-ome"]),
+                                 ("fl", fl_kfbf, fl_ome, [])):
         done = subprocess.run([str(CLI), "convert", str(src), str(out),
-                               "--overwrite"], check=True,
+                               "--overwrite", *extra], check=True,
                               capture_output=True, text=True)
         reports[key] = json.loads(done.stdout)
-    return {"bf": bf_tif, "fl": fl_ome, "reports": reports}
+    return {"bf": bf_tif, "bf_ome": bf_ome, "fl": fl_ome, "reports": reports}
 
 
-def _open_and_read_region(path, *, channels=False):
+def _open_and_read_region(path, *, channels=False, native_rgb=False):
     """平台读取器路径：open_slide → read_region（荧光另 read_region_channels）。
 
     返回 (reader 类型名, 描述 dict)；打开/读取抛异常即证明失败。"""
@@ -75,6 +80,11 @@ def _open_and_read_region(path, *, channels=False):
         assert img.size == (64, 64), "read_region 返回尺寸不符"
         out = {"reader": type(osr).__name__,
                "levels": getattr(osr, "level_count", None)}
+        if native_rgb:
+            import slide_render
+            # 明场 RGB：查看器必须走原生 RGB，不得拆成 3 个荧光通道
+            assert slide_render.slide_image_mode(osr) == "native_rgb", \
+                "明场 RGB 被当成多通道"
         if channels:
             n = int(osr.channel_count)
             assert n >= 1, "荧光通道数为 0"
@@ -101,6 +111,21 @@ def test_reader_proof_brightfield(native_fixtures):
     assert info["levels"] and info["levels"] >= 2, "金字塔层级未读到"
 
 
+def test_reader_proof_brightfield_ome(native_fixtures):
+    """明场 RGB OME-BigTIFF（SubIFD 金字塔）：平台读取器打开、全部层级可见、
+    原生 RGB 显示、标定来自 OME-XML。"""
+    info = _open_and_read_region(native_fixtures["bf_ome"], native_rgb=True)
+    rep = native_fixtures["reports"]["bf_ome"]
+    assert info["reader"] == "TiffFileSlide"
+    assert info["levels"] == len(rep["levels"]) >= 2, "SubIFD 降采样层未读到"
+    osr = slide_io.open_slide(native_fixtures["bf_ome"])
+    try:
+        assert float(osr.properties["openslide.mpp-x"]) > 0
+        assert float(osr.properties["openslide.mpp-y"]) > 0
+    finally:
+        osr.close()
+
+
 def test_reader_proof_fluorescence(native_fixtures):
     """荧光 OME-BigTIFF 产物：TiffFileSlide 打开 + 读区域 + 逐通道读取。"""
     info = _open_and_read_region(native_fixtures["fl"], channels=True)
@@ -112,6 +137,7 @@ def test_format_constants_match_core_reports(native_fixtures):
     def fmt(report):
         return (report.get("result") or report).get("format")
     assert fmt(native_fixtures["reports"]["bf"]) == FORMAT_BF
+    assert fmt(native_fixtures["reports"]["bf_ome"]) == FORMAT_BF_OME
     assert fmt(native_fixtures["reports"]["fl"]) == FORMAT_FL
 
 
@@ -122,6 +148,8 @@ def test_viewable_formats_bound_to_proof(native_fixtures):
     页面会显示不支持查看并禁用上传（本地保存不受影响）——不得虚列。"""
     proven = set()
     for fmt, path, kw in ((FORMAT_BF, native_fixtures["bf"], {}),
+                          (FORMAT_BF_OME, native_fixtures["bf_ome"],
+                           {"native_rgb": True}),
                           (FORMAT_FL, native_fixtures["fl"],
                            {"channels": True})):
         try:
@@ -302,7 +330,8 @@ def test_product_limit_derives_from_request_max():
 # 上传文件名的受理（注册表按后缀判定；荧光需完整 .ome.tif 后缀）
 # --------------------------------------------------------------------------- #
 def test_upload_filenames_accepted_by_registry():
-    """明场 `<base>.tif` 与荧光 `<base>.ome.tif` 都按 native 单文件受理；
+    """明场经典 `<base>.tif`、明场 OME 与荧光 `<base>.ome.tif` 都按 native
+    单文件受理；
     平台侧 OME 识别要求完整 .ome.tif 复合后缀（注册表单列）。"""
     for name in ("x.tif", "x.ome.tif"):
         assert app_mod._cos_ingestion_kind_for(name) == ("native", None), name

@@ -62,6 +62,7 @@ async function textOf(page, sel) {
 }
 
 async function currentJobId(page) {
+  await page.waitForSelector('.job-row', { timeout: 30000 });
   return page.$eval('.job-row', (r) => r.dataset.jobId);
 }
 
@@ -131,7 +132,8 @@ async function main() {
       await waitFor(async () => /已发布|Published/.test(await textOf(page, '#upload-status')), 120000, 'published');
       if (fake.st.creates.length !== 1) throw new Error(`creates=${fake.st.creates.length}`);
       const name = fake.st.creates[0].filename;
-      if (!name.endsWith('.tif') || name.endsWith('.ome.tif')) throw new Error(`filename ${name}`);
+      // new brightfield jobs write the RGB OME profile → <base>.ome.tif
+      if (!name.endsWith('.ome.tif')) throw new Error(`filename ${name}`);
       const product = await L.opfsJobSha256(page, jobId);
       const uploaded = L.uploadedSha256(fake.st);
       if (uploaded.sha256 !== product.sha256) {
@@ -228,6 +230,7 @@ async function main() {
             max_concurrent_parts: 2, sign_batch_max_parts: 4, policy_version: 'v1-manual',
           },
           viewable_formats: ['classic-bigtiff-jpeg-pyramid',
+            'ome-bigtiff-subifd-rgb-jpeg-pyramid',
             'ome-bigtiff-subifd-multichannel-jpeg-passthrough'],
         },
       });
@@ -575,7 +578,9 @@ async function main() {
       await waitFor(async () => (await page.$(resumeBtn)) !== null, 60000, 'resume row');
       const intentMarked = await page.$eval(resumeBtn, (b) => b.dataset.intent || '');
       if (intentMarked !== '1') throw new Error('resume button lacks intent marker');
-      if ((await textOf(page, resumeBtn)).indexOf('上传') < 0) throw new Error('label not convert-and-upload');
+      // 文案断言双语（zh「继续转换并上传」/ en "Continue converting and uploading"）；
+      // 意图本身已有稳定标识 data-intent="1"。
+      if (!/上传|upload/i.test(await textOf(page, resumeBtn))) throw new Error('label not convert-and-upload');
       if (fake.st.creates.length !== 0) throw new Error(`creates during convert=${fake.st.creates.length}`);
       const intentLabel = await textOf(page, resumeBtn);   // 发布后行会重渲，先取
       await page.click(resumeBtn);
@@ -720,7 +725,7 @@ async function main() {
           max_size_bytes: 1000, part_bytes: 8, url_ttl_seconds: 600,
           max_concurrent_parts: 2, sign_batch_max_parts: 4, policy_version: 'v1-manual',
         },
-        viewable_formats: ['classic-bigtiff-jpeg-pyramid'],
+        viewable_formats: ['classic-bigtiff-jpeg-pyramid', 'ome-bigtiff-subifd-rgb-jpeg-pyramid'],
       },
     });
     try {

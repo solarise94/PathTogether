@@ -578,7 +578,9 @@ async function main() {
       await waitFor(async () => (await page.$(resumeBtn)) !== null, 60000, 'resume row');
       const intentMarked = await page.$eval(resumeBtn, (b) => b.dataset.intent || '');
       if (intentMarked !== '1') throw new Error('resume button lacks intent marker');
-      if ((await textOf(page, resumeBtn)).indexOf('上传') < 0) throw new Error('label not convert-and-upload');
+      // 文案断言双语（zh「继续转换并上传」/ en "Continue converting and uploading"）；
+      // 意图本身已有稳定标识 data-intent="1"。
+      if (!/上传|upload/i.test(await textOf(page, resumeBtn))) throw new Error('label not convert-and-upload');
       if (fake.st.creates.length !== 0) throw new Error(`creates during convert=${fake.st.creates.length}`);
       const intentLabel = await textOf(page, resumeBtn);   // 发布后行会重渲，先取
       await page.click(resumeBtn);

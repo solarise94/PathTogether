@@ -36,6 +36,14 @@ async function textOf(page, sel) {
   return String((await page.textContent(sel)) || '');
 }
 
+/// UI 文案断言的期望值取自页面 i18n 表当前键值（见 C3 run_e2e.js 同名助手）：
+/// 断言不随浏览器语言漂移，且键缺失（t 回显键本身）时直接判错。
+async function i18nLabel(page, key) {
+  const s = await page.evaluate((k) => window.HP_I18N.t(k), key);
+  if (!s || s === key || s.startsWith('tools.')) throw new Error(`i18n ${key} unresolved: "${s}"`);
+  return s;
+}
+
 async function currentJobId(page) {
   return page.$eval('.job-row', (r) => r.dataset.jobId);
 }
@@ -664,8 +672,11 @@ async function main() {
       if (before.sha256 !== nativeSha) {
         throw new Error(`classic artifact sha ${before.sha256} != native ${nativeSha}`);
       }
+      // 格式行断言用 i18n 表值；「是哪个格式」另有稳定标识（上传创建的
+      // 文件名后缀 + 产物 sha == 原生 --profile bf-classic）。
+      const classicName = await i18nLabel(page, 'tools.result.format.bf-classic');
       const fmtRow = await textOf(page, '#result-format');
-      if (!/经典金字塔 TIFF/.test(fmtRow)) throw new Error(`format row "${fmtRow}"`);
+      if (!fmtRow.includes(classicName)) throw new Error(`format row "${fmtRow}"`);
       await page.click('#upload-btn');
       await waitFor(async () => /已发布|Published/.test(await textOf(page, '#upload-status')), 60000, 'published');
       if (fake.st.creates.length !== 1) throw new Error(`creates=${fake.st.creates.length}`);

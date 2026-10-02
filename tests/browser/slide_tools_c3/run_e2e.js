@@ -31,6 +31,15 @@ async function waitText(page, sel, re, timeout = 60000) {
   }, [sel, re], { timeout });
 }
 
+/// UI 文案断言的期望值取自页面 i18n 表的当前键值（而非手写正则）：断言在
+/// 任何 locale 下都成立，同时仍校验「这个概念/profile 用了正确的键」。
+/// 键缺失时 HP_I18N.t 会回显键本身——直接判错，不让断言退化成恒真。
+async function i18nLabel(page, key) {
+  const s = await page.evaluate((k) => window.HP_I18N.t(k), key);
+  if (!s || s === key || s.startsWith('tools.')) throw new Error(`i18n ${key} unresolved: "${s}"`);
+  return s;
+}
+
 /// 主流程：选文件 → probe 摘要 → 转换 → ready。返回 {saved?} 由调用方扩展。
 async function runConvertFlow(page, file, { profile = null } = {}) {
   await L.setFile(page, file);
@@ -119,12 +128,14 @@ async function scenarioA() {
     const resultSha = await shaOfResult(page);
     if (resultSha !== nativeSha) throw new Error(`result sha ${resultSha} != native`);
     // new brightfield jobs: RGB OME profile → .ome.tif name, OME-TIFF filter,
-    // and the result panel names the format
+    // and the result panel names the format (label expected from the i18n
+    // table, so the check holds in whichever language the page renders)
     const picker = await page.evaluate(() => ({ name: window.__pickerSuggested, types: window.__pickerTypes }));
     if (picker.name !== 'bf-580x300.ome.tif') throw new Error(`suggested name ${picker.name}`);
     if (!picker.types || picker.types[0].description !== 'OME-TIFF') throw new Error(`picker types ${JSON.stringify(picker.types)}`);
+    const omeName = await i18nLabel(page, 'tools.result.format.bf-ome');
     const fmtRow = (await page.textContent('#result-format')) || '';
-    if (!/OME-TIFF/.test(fmtRow)) throw new Error(`result format row "${fmtRow}"`);
+    if (!fmtRow.includes(omeName)) throw new Error(`result format row "${fmtRow}"`);
 
     // persist()：手势内请求，如实回报（granted 或 denied 都接受，只要有明确文案）
     await page.click('#persist-btn');
@@ -717,17 +728,21 @@ async function scenarioO() {
     await page.check('#format-classic');
     await page.click('#convert-btn');
     await waitVisible(page, '#result-section:not([hidden])');
+    // 格式名断言用 i18n 表值（哪个格式另有稳定标识：radio 值/记录
+    // outputProfile/建议名/picker 过滤器），不随浏览器语言漂移。
+    const classicName = await i18nLabel(page, 'tools.result.format.bf-classic');
+    const rowFmtName = await i18nLabel(page, 'tools.jobs.format.bf-classic');
     // 开始后不可再改：字段组禁用，改为展示任务实际格式
     const lockedUi = await page.evaluate(() => ({
       disabled: document.getElementById('format-fieldset').disabled,
       noteHidden: document.getElementById('format-locked').hidden,
       note: document.getElementById('format-locked').textContent,
     }));
-    if (!lockedUi.disabled || lockedUi.noteHidden || !/经典金字塔 TIFF/.test(lockedUi.note)) {
+    if (!lockedUi.disabled || lockedUi.noteHidden || !lockedUi.note.includes(classicName)) {
       throw new Error(`lock UI ${JSON.stringify(lockedUi)}`);
     }
     const fmtRow = (await page.textContent('#result-format')) || '';
-    if (!/经典金字塔 TIFF/.test(fmtRow)) throw new Error(`format row "${fmtRow}"`);
+    if (!fmtRow.includes(classicName)) throw new Error(`format row "${fmtRow}"`);
     await page.click('#save-btn');
     await waitText(page, '#save-status', /已保存|Saved/);
     const saved = await L.opfsSha256(page);
@@ -740,11 +755,11 @@ async function scenarioO() {
     const rec = (await page.evaluate(() => window.__readJobRecords()))[0];
     if (rec.outputProfile !== 'bf-classic') throw new Error(`record outputProfile ${rec.outputProfile}`);
     const rowMeta = await page.textContent('.job-row');
-    if (!/经典 TIFF/.test(rowMeta)) throw new Error(`job row lacks format marker: ${rowMeta}`);
+    if (!rowMeta.includes(rowFmtName)) throw new Error(`job row lacks format marker: ${rowMeta}`);
     await L.shot(page, 'bf-classic-ready');
     record('o-bf-classic-choice', true, { savedSha256: saved.sha256, nativeSha256: nativeSha,
       suggestedName: picker.name, filter: picker.types[0].description, formatRow: fmtRow.trim(),
-      rowFormatShown: /经典 TIFF/.test(rowMeta), lockedNote: lockedUi.note.trim() });
+      rowFormatShown: rowMeta.includes(rowFmtName), lockedNote: lockedUi.note.trim() });
   } catch (e) {
     record('o-bf-classic-choice', false, { error: String(e).slice(0, 400) });
   } finally {
@@ -778,14 +793,16 @@ async function scenarioP() {
     // 刷新后不提供更改（设置节隐藏）；行内显示任务格式；resume 不带设置
     const fmtHidden = await page.evaluate(() => document.getElementById('format-section').hidden);
     if (!fmtHidden) throw new Error('format choice offered after reload of a started job');
+    const rowFmtName = await i18nLabel(page, 'tools.jobs.format.bf-classic');
+    const classicName = await i18nLabel(page, 'tools.result.format.bf-classic');
     const rowMeta = await page.textContent('.job-row');
-    if (!/经典 TIFF/.test(rowMeta)) throw new Error(`row lacks classic marker: ${rowMeta}`);
+    if (!rowMeta.includes(rowFmtName)) throw new Error(`row lacks classic marker: ${rowMeta}`);
     const resumeBtn = '.job-row[data-next-action="resume"] button[data-action="resume"]';
     await waitVisible(page, resumeBtn);
     await page.click(resumeBtn);
     await waitVisible(page, '#result-section:not([hidden])', 300000);
     const fmtRow = (await page.textContent('#result-format')) || '';
-    if (!/经典金字塔 TIFF/.test(fmtRow)) throw new Error(`format row "${fmtRow}"`);
+    if (!fmtRow.includes(classicName)) throw new Error(`format row "${fmtRow}"`);
     await page.click('#save-btn');
     await waitText(page, '#save-status', /已保存|Saved/, 120000);
     const saved = await L.opfsSha256(page);
@@ -793,7 +810,7 @@ async function scenarioP() {
     const rec = (await page.evaluate(() => window.__readJobRecords()))[0];
     if (rec.outputProfile !== 'bf-classic') throw new Error(`record outputProfile ${rec.outputProfile}`);
     record('p-classic-refresh-resume', true, { savedSha256: saved.sha256, nativeSha256: nativeSha,
-      rowFormatShown: /经典 TIFF/.test(rowMeta) });
+      rowFormatShown: rowMeta.includes(rowFmtName) });
   } catch (e) {
     record('p-classic-refresh-resume', false, { error: String(e).slice(0, 400) });
   } finally {
@@ -845,8 +862,9 @@ async function scenarioR() {
     if (!fmt.hidden) throw new Error('output-format choice offered for a fluorescence input');
     await page.click('#convert-btn');
     await waitVisible(page, '#result-section:not([hidden])');
+    const flName = await i18nLabel(page, 'tools.result.format.fl-ome');
     const fmtRow = (await page.textContent('#result-format')) || '';
-    if (!/多通道 OME-TIFF/.test(fmtRow)) throw new Error(`format row "${fmtRow}"`);
+    if (!fmtRow.includes(flName)) throw new Error(`format row "${fmtRow}"`);
     await page.click('#save-btn');
     await waitText(page, '#save-status', /已保存|Saved/);
     const picker = await page.evaluate(() => ({ name: window.__pickerSuggested }));
@@ -897,8 +915,9 @@ async function scenarioS() {
     if (radioAfterReload !== 'bf-ome') throw new Error(`radio after reload ${radioAfterReload}`);
     const startBtn = '.job-row[data-next-action="start"] button[data-action="start"]';
     await waitVisible(page, startBtn);
+    const rowFmtName = await i18nLabel(page, 'tools.jobs.format.bf-classic');
     const rowMeta = await page.textContent('.job-row');
-    if (!/经典 TIFF/.test(rowMeta)) throw new Error(`row lacks classic marker: ${rowMeta}`);
+    if (!rowMeta.includes(rowFmtName)) throw new Error(`row lacks classic marker: ${rowMeta}`);
     await page.click(startBtn);
     await waitVisible(page, '#result-section:not([hidden])', 120000);
     const sha = await shaOfResult(page);
@@ -912,7 +931,7 @@ async function scenarioS() {
       throw new Error(`suggested ${picker.name}`);
     }
     record('s-classic-persist-reload-list-start', true, { sha,
-      radioAfterReload, rowFormatShown: /经典 TIFF/.test(rowMeta),
+      radioAfterReload, rowFormatShown: rowMeta.includes(rowFmtName),
       recordedProfile: rec.outputProfile, suggestedName: picker.name });
   } catch (e) {
     record('s-classic-persist-reload-list-start', false, { error: String(e).slice(0, 400) });

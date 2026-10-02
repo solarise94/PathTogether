@@ -57,6 +57,41 @@ def make_ome_tiff_bytes(h=64, w=96):
     return buf.getvalue()
 
 
+def make_ome_ycbcr_jpeg_pyramid_bytes(h=64, w=96, tile=32):
+    """明场形态的 OME-TIFF：RGB 渐变以 Pillow 编码为 JPEG（YCbCr）tile，
+    写成 photometric=YCbCr + compression=JPEG，第二级为 SubIFD 降采样层
+    （与 slide-transform bf-ome 产物同一 TIFF 语义；无患者数据）。
+
+    tifffile 自带的 JPEG 写出会把输入当 YCbCr 原样存储，因此这里自己编码
+    tile 再按预压缩数据写入。"""
+    _require_tifffile()
+    import numpy as np
+    import tifffile
+    from PIL import Image as _Image
+
+    def tiles(img):
+        th, tw = tile, tile
+        for ty in range(0, img.shape[0], th):
+            for tx in range(0, img.shape[1], tw):
+                t = np.full((th, tw, 3), 255, np.uint8)
+                part = img[ty:ty + th, tx:tx + tw]
+                t[:part.shape[0], :part.shape[1]] = part
+                b = io.BytesIO()
+                _Image.fromarray(t).save(b, "JPEG", quality=95, subsampling=0)
+                yield b.getvalue()
+
+    base = _gradient_rgb(h, w)
+    half = base[::2, ::2]
+    buf = io.BytesIO()
+    with tifffile.TiffWriter(buf, bigtiff=True, ome=True) as tw:
+        common = dict(dtype="uint8", tile=(tile, tile), compression="jpeg",
+                      photometric="ycbcr", subsampling=(1, 1))
+        tw.write(tiles(base), shape=base.shape, subifds=1,
+                 metadata={"axes": "YXS"}, **common)
+        tw.write(tiles(half), shape=half.shape, subfiletype=1, **common)
+    return buf.getvalue()
+
+
 # --------------------------------------------------------------------------- #
 # Batch 2：合成多通道 OME fixture（无患者数据；确定性生成）
 # --------------------------------------------------------------------------- #

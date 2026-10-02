@@ -62,6 +62,7 @@ async function textOf(page, sel) {
 }
 
 async function currentJobId(page) {
+  await page.waitForSelector('.job-row', { timeout: 30000 });
   return page.$eval('.job-row', (r) => r.dataset.jobId);
 }
 

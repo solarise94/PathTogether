@@ -21,7 +21,8 @@ are committed; raw evidence stays under the git-ignored-by-convention `.gate-tmp
 | C. Browser flows (local convert/export, refresh/resume, cancel, interrupted finalize, one-click convert-and-upload, >4 GiB, low memory, oversize save) | **PASS** (cgroup-simulated memory, see caveats) | §6 |
 | Platform reader + real ingestion + viewer + project reopen | **PASS** | §7 |
 | D. Rust / Python / JS / browser regression | **PASS** except 3 pre-existing, unrelated pytest failures | §8 |
-| OpenSlide-based tools on `bf-ome` | **Compatibility change** — 1 level only | §3 |
+| OpenSlide-based tools on `bf-ome` | **Compatibility change** — 1 level only; classic output selectable on the tool page | §2, §3 |
+| QuPath acceptance helpers fail on failed checks (round 2) | **PASS** | §4.1 strict gate |
 
 Unit tests alone were not used as acceptance; every A/B/C item above was
 exercised on real or full-size outputs.
@@ -60,9 +61,23 @@ invented; no source file name is written.
 
 | Profile id | Format id | File name | Where it is the default |
 |---|---|---|---|
-| `bf-ome` | `ome-bigtiff-subifd-rgb-jpeg-pyramid` | `<base>.ome.tif` | **new** brightfield jobs in the browser tool |
-| `bf-classic` | `classic-bigtiff-jpeg-pyramid` | `<base>.tif` | CLI `--profile auto` for KFB; every legacy brightfield job |
+| `bf-ome` | `ome-bigtiff-subifd-rgb-jpeg-pyramid` | `<base>.ome.tif` | **new** brightfield jobs in the browser tool (page choice 「OME-TIFF（推荐，QuPath / Bio-Formats）」) |
+| `bf-classic` | `classic-bigtiff-jpeg-pyramid` | `<base>.tif` | page choice 「经典金字塔 TIFF（OpenSlide 工具）」; CLI `--profile auto` for KFB; every legacy brightfield job |
 | `fl-ome` | `ome-bigtiff-subifd-multichannel-jpeg-passthrough` | `<base>.ome.tif` | fluorescence (unchanged) |
+
+Page choice (section 「7 · 输出格式」, brightfield only; fluorescence has no
+choice and stays `fl-ome`):
+
+* The selection is passed when the job is prepared; changing it afterwards
+  saves it to the prepared record (`runner.setPreparedOutputProfile`, accepted
+  only while the job is `prepared`, and only for a profile that fits the
+  modality).
+* Starting a job passes the on-screen selection only when the visible section
+  belongs to that job; after a reload, or for another job in the list, the
+  record's profile is used, so a saved classic choice is never replaced by the
+  default radio.
+* Once a job starts, the section is locked and shows the job's format; resume
+  always uses the record. Job-list rows show the format.
 
 Persistence and resume rules (runner + worker + wasm):
 
@@ -93,7 +108,8 @@ Persistence and resume rules (runner + worker + wasm):
    not read SubIFD pyramids): KFB-Q 1 level vs 9 for classic; 9.8 GiB synthetic
    1 level. Pixels are correct but there is no pyramid for OpenSlide-based tools
    (and for QuPath only if a user forces the OpenSlide reader). Users of such
-   tools should choose `bf-classic`. QuPath's default path is unaffected (§4).
+   tools should choose 「经典金字塔 TIFF（OpenSlide 工具）」 on the tool page (`bf-classic`).
+   QuPath's default path is unaffected (§4).
 3. The platform reader now treats YCbCr-JPEG OME tiles as native RGB
    (previously such a file would be classified as 3-channel "multichannel").
    The platform opens `bf-ome` with `TiffFileSlide` (OME sniff), not OpenSlide.
@@ -127,6 +143,38 @@ compared with a tifffile decode of the classic output.
 
 Baseline (2026-10-02 QuPath report): the classic output opens with 1 resolution
 under the same default reader.
+
+**Strict gate (round 2).** The first version of the harness could report
+success for a failed check (review finding: `run_probe.sh` returned 0 after a
+failed launch; `compare_regions.py` returned 0 with max diff 150 and cropped
+mismatched shapes). Now:
+
+* `run_probe.sh` returns QuPath's/timeout's status (127 launcher missing, 124
+  timeout, any QuPath failure as-is) and, after a zero exit, 2 unless
+  `check_probe.py` accepts the evidence: resolutions = levels, four region
+  PNGs per level with exactly the box size, boxes inside the level, Bio-Formats
+  grouping and project reopen present with the same resolution count; optional
+  `--expect-resolutions/--expect-server-substring/--expect-rgb`.
+* `compare_regions.py` exits nonzero on any pixel difference (default
+  tolerance 0), missing PNG, shape ≠ box, box outside the reference level (no
+  cropping), a level with no compared region, reference level count ≠ probe
+  resolutions, fewer regions than `--expect-regions`, or fewer textured
+  regions than `--min-textured`.
+* `tests/test_qupath_probe_scripts.py` (31 tests, no QuPath needed) covers a
+  missing launcher, a launcher exiting 3, a launcher that writes nothing or
+  incomplete evidence, one-pixel-off, all-pixels-wrong, wrong shape,
+  out-of-bounds box, missing PNG, uncovered level, level-count mismatch and
+  too few textured regions. The old scripts returned 0 for the launch, silent
+  and all-wrong cases; the reviewer's own all-wrong fixture now fails
+  (`max_abs_diff 150 > 0`, exit 1), a real QuPath launch on a corrupt file
+  fails with exit 1.
+* Re-check with the strict gate: the reviewer's file (sha `14b71b61…`, same
+  bytes as KFB-Q bf-ome) on QuPath 0.6.0-rc5 and 0.7.0 — `run_probe.sh … 0.0603
+  0.9716 --expect-resolutions 9 --expect-server-substring BioFormats
+  --expect-rgb` exit 0; `compare_regions.py --expect-regions 36 --min-textured
+  12` exit 0, 36 regions, 16 textured, max diff 0. All earlier evidence
+  (KFB-Q on rc5/0.6.0/0.7.0, 9.8 GiB on rc5/0.7.0) passes the strict checks
+  unchanged.
 
 Bio-Formats grouping (all rows): `loci.formats.in.OMETiffReader`, 1 series,
 resolution count = levels above, `isRGB` true, effective SizeC 1, one channel
@@ -249,11 +297,12 @@ covered by the platform-chain pytest above.
 | Core parity (real samples vs Python oracle) | `pytest tests/test_slide_transform_core.py` | 16 passed, 1 skipped |
 | Browser real-sample parity | `node tests/browser/slide_tools_c2/run_parity.js --samples <dir> --fl --fl-all` | KFB-1 `374c70c8…`; KFBF-A `6f8a1e3b…`, B `40cb12fa…`, C `5d6b1b21…` (= C2-pinned values, fluorescence unchanged), D `872fe3b6…` — all browser = native |
 | Full pytest (serial, nothing else running) | `pytest tests -q --deselect tests/test_ai_budget_wiring.py::test_ui_budget_card_and_max_steps_sync_present` | 2886 passed, 10 skipped, **3 failed** — the known stale `tests/test_admin_preview.py` cases (`/api/upload` removed by the COS-only upload work; file untouched by this branch, fails identically on its own) |
-| vitest | `npx vitest run --dir tests/js` | 41 files, 630 passed |
-| C2 smoke / faults | `run_smoke.js`, `run_faults.js` | PASS / 29/29 |
-| C3 e2e | `node tests/browser/slide_tools_c3/run_e2e.js` | 18/18 |
-| C4 e2e | `node tests/browser/slide_tools_c4/run_e2e.js` | 15/15 |
-| R1 e2e | `node tests/browser/slide_tools_r1/run_e2e.js` | 31/31 |
+| vitest | `npx vitest run --dir tests/js` | 41 files, 637 passed (round 2; was 630) |
+| C2 smoke / faults | `run_smoke.js`, `run_faults.js` | PASS / 30/30 (round 2 adds `prepared-output-profile-set-rules`) |
+| C3 e2e | `node tests/browser/slide_tools_c3/run_e2e.js` | 24/24 (round 2 adds o classic choice, p classic reload+resume, q list start, r fluorescence no choice, s classic kept across reload, t record wins after reload; s shown to fail without the reload guard) |
+| C4 e2e | `node tests/browser/slide_tools_c4/run_e2e.js` | 16/16 (adds n classic upload: `bf-580x300.tif`, bytes = native classic) |
+| R1 e2e | `node tests/browser/slide_tools_r1/run_e2e.js` | 31/31 (round 2 rerun; one e1 failure in the first rerun was a harness race reading `.job-row` before it rendered — 3/3 alone, fixed by waiting for the row, full rerun 31/31) |
+| QuPath helper tests | `pytest tests/test_qupath_probe_scripts.py` | 31 passed |
 | Classic byte compatibility | native classic on 9.8 GiB / KFB-1 | `2084a333…` / `385a59c6…` = pre-change values |
 
 Regression tests shown to fail on old code: Rust `ext_bytes` layout test
@@ -262,9 +311,16 @@ the platform-chain tests above, and the C2 profile scenarios.
 
 ## 9. Remaining external checks (not passes)
 
-1. QuPath on **macOS ARM64** (0.6.0-rc5 and 0.7.0): open a `bf-ome` file with
-   default settings, confirm Bio-Formats is chosen, N resolutions, regions at
-   every level, project save/reopen. Not runnable on this Linux host.
+1. QuPath on **macOS ARM64** (0.6.0-rc5 and 0.7.0), on the installation where
+   the problem was first seen, with the reviewer's file `user-bfome.ome.tif`
+   (sha256 `14b71b615c6ad7fc6553d3e5cc7b3e9e72f9bd79111803527cd1c41550e56021`).
+   Without changing preferences: drag the file into a new project → Image tab
+   shows server Bio-Formats, 9 pyramid levels (Image › Server / pyramid
+   info), pixel size ≈ 0.4841 µm, magnification 20; zoom from overview to
+   full resolution on tissue, colors normal H&E; save, close and reopen the
+   project and repeat. If QuPath is scriptable there, the same
+   `scripts/qupath-probe/run_probe.sh <QuPath.app/Contents> …` gate can run
+   (launcher path differs on macOS). Not runnable on this Linux host.
 2. QuPath on Windows (same steps).
 3. Real OS save dialog: the tests stub `showSaveFilePicker`; the filter text
    "OME-TIFF (.ome.tif)" and the suggested name must be checked by hand in
@@ -281,7 +337,10 @@ the platform-chain tests above, and the C2 profile scenarios.
 | `0528d57` | browser runner/page: default profile, persistence, legacy jobs, refusals, names/filters, wasm rebuild, JS/browser tests |
 | `85df877` | platform-chain pytest; real-sample and large-page gates expect bf-ome |
 | `6a1e696` | browser viewer gate (`run_bfome_viewer.js`, `server.py --seed-bfome`) |
-| (this) | report, c1/c4 doc updates, `scripts/qupath-probe/` |
+| `0591075` | report, c1/c4 doc updates, `scripts/qupath-probe/` |
+| `46eaad6` | strict QuPath gate: exit status, evidence checker, strict comparator, 31 negative/positive tests |
+| `9909779` | tool page output-format choice (OME-TIFF / classic), saved to the job record, locked at start; browser + C2 + vitest coverage |
+| (this) | report round 2; R1 harness waits for the job row |
 
 ## 11. Commands (worktree root; `TMPDIR=$PWD/.gate-tmp COLUMNS=200`)
 
@@ -289,8 +348,8 @@ the platform-chain tests above, and the C2 profile scenarios.
 bash scripts/build_slide_transform.sh
 slide-transform convert <in.kfb> <out.ome.tif> --profile bf-ome --overwrite
 slide-transform validate <out.ome.tif>
-bash scripts/qupath-probe/run_probe.sh <QuPath root> <out-dir> <image.ome.tif> [fx fy]
-.venv/bin/python scripts/qupath-probe/compare_regions.py <out-dir>/probe.json <out-dir>/regions <classic.tif> <out-dir>/region-compare.json
+bash scripts/qupath-probe/run_probe.sh <QuPath root> <out-dir> <image.ome.tif> [fx fy] --expect-resolutions N --expect-server-substring BioFormats --expect-rgb   # nonzero = fail
+.venv/bin/python scripts/qupath-probe/compare_regions.py <out-dir>/probe.json <out-dir>/regions <classic.tif> <out-dir>/region-compare.json --expect-regions 4N --min-textured K   # nonzero = fail
 <QuPath root>/bin/QuPath script scripts/qupath-probe/xsd-validate.groovy -a <ome 2016-06 ome.xsd> -a <ome.xml>
 node tests/browser/slide_tools_c3/run_large_page.js --input <bf-10g.kfb> --native-sha <sha>
 bash tests/browser/slide_tools_c2/run_mem_cgroup.sh <label> <4G|8G> <1g|4g|10g> <saver|balanced>

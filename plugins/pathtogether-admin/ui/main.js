@@ -3189,7 +3189,47 @@
     if (item.public && item.granted_to_owner) return "公开 + 已加入工作区";
     if (item.public) return "公开（仅普通用户默认可见）";
     if (item.granted_to_owner) return "已加入我的工作区";
+    if (item.grant_recorded) return "有授权记录（资产当前不可用，未生效）";
     return "未加入";
+  }
+
+  // 切片行的人类可读名：展示名 → 原始文件名 → 冻结 legacy 名 → slide_id。
+  // 名称只用于展示；一切操作都按 slide_id 寻址（无 ID 的未登记文件除外）。
+  function slideLabel(item) {
+    var legacyName = item.name && item.name !== item.slide_id ? item.name : "";
+    return item.display_name || item.original_filename || legacyName ||
+      item.slide_id || "—";
+  }
+
+  // 资产状态 → {text, ok, reason}；reason 是「为什么不能加入」的说明。
+  function slideAssetState(item) {
+    if (item.unregistered) {
+      return { text: "未登记文件", ok: false,
+        reason: "磁盘上的文件没有资产记录，不能直接加入；需先迁移登记" };
+    }
+    var st = item.asset_state;
+    if (st === "deleted") {
+      return { text: "已删除", ok: false, reason: "资产已删除（墓碑保留），不能加入" };
+    }
+    if (st === "deleting") {
+      return { text: "删除中", ok: false, reason: "资产正在删除，不能加入" };
+    }
+    if (st === "failed") {
+      return { text: "处理失败", ok: false, reason: "资产处理失败，不可读取，不能加入" };
+    }
+    if (st === "staging") {
+      return { text: "上传处理中", ok: false, reason: "资产尚未发布，完成后才能加入" };
+    }
+    if (st === "legacy" || item.storage_layout === "legacy") {
+      return { text: "旧资产（未迁移）", ok: false,
+        reason: "旧布局资产尚未迁移，迁移后才能加入" };
+    }
+    if (st === "ready" && !item.file_exists) {
+      return { text: "文件缺失", ok: false, reason: "资产记录在，但存储中找不到文件，不能加入" };
+    }
+    if (st === "ready" && item.servable) return { text: "可用", ok: true, reason: "" };
+    return { text: "不可用（" + (st || "未知") + "）", ok: false,
+      reason: "资产当前不可读取，不能加入" };
   }
 
   function loadSlides(append) {
@@ -3233,7 +3273,26 @@
     var tbody = $("adm-slides-tbody");
     if (!tbody) return;
     var tr = document.createElement("tr");
-    tr.appendChild(td(item.name));
+    var label = slideLabel(item);
+    var nameCell = document.createElement("td");
+    nameCell.appendChild(document.createTextNode(label));
+    var sub = [];
+    if (item.original_filename && item.original_filename !== label) {
+      sub.push("原始文件名 " + item.original_filename);
+    }
+    if (item.slide_id) sub.push("ID " + item.slide_id);
+    if (sub.length) {
+      var subEl = document.createElement("div");
+      subEl.className = "adm-sub";
+      subEl.textContent = sub.join(" · ");
+      nameCell.appendChild(subEl);
+    }
+    tr.appendChild(nameCell);
+    var asset = slideAssetState(item);
+    var stateCell = td(asset.text);
+    stateCell.setAttribute("data-asset-state", item.unregistered
+      ? "unregistered" : String(item.asset_state || "unknown"));
+    tr.appendChild(stateCell);
     tr.appendChild(td(ownerCellText(item)));
     tr.appendChild(td(item.public ? "是" : "—"));
     tr.appendChild(td(item.archived ? "是" : "—"));
@@ -3241,29 +3300,46 @@
     tr.appendChild(td(grantStatusText(item)));
     var cell = document.createElement("td");
     cell.className = "adm-actions-cell";
-    var granted = !!item.granted_to_owner;
-    cell.appendChild(actionBtn(granted ? "移除" : "加入", function () {
-      if (granted) {
+    // 移除对任何已记录的授权都可做（含资产已不可用的失效授权）；加入只对
+    // 可用资产开放，不可用时按钮禁用并写明原因。
+    var revocable = !!(item.granted_to_owner || item.grant_recorded);
+    if (revocable) {
+      cell.appendChild(actionBtn(item.granted_to_owner ? "移除" : "移除授权记录", function () {
         askConfirm($("adm-slides-confirm"),
-          "确认将 " + item.name + " 移出我的工作区？移除后新请求立即拒绝，" +
-          "进行中的 AI 任务会被取消，后续工具访问被拒（归属者与公开状态不受影响）。",
+          "确认将 " + label + "（" + (item.slide_id || item.name) + "）移出我的工作区？" +
+          "移除后新请求立即拒绝，进行中的 AI 任务会被取消，后续工具访问被拒" +
+          "（归属者与公开状态不受影响）。",
           function () { setSlideVisibility(item, false); });
-      } else {
+      }, "danger-outline"));
+    } else {
+      var addBtn = actionBtn("加入", function () {
         setSlideVisibility(item, true);
+      }, "secondary");
+      if (!asset.ok) {
+        addBtn.disabled = true;
+        addBtn.title = asset.reason;
+        var why = document.createElement("div");
+        why.className = "adm-sub";
+        why.textContent = asset.reason;
+        cell.appendChild(addBtn);
+        cell.appendChild(why);
+      } else {
+        cell.appendChild(addBtn);
       }
-    }, granted ? "danger-outline" : "secondary"));
+    }
     tr.appendChild(cell);
     tbody.appendChild(tr);
   }
 
   function setSlideVisibility(item, granted) {
+    var label = slideLabel(item);
     request("admin.slides.setVisibility",
-            { name: item.name, granted: granted })
+            { name: item.slide_id || item.name, granted: granted })
       .then(function (res) {
         var already = res && granted && res.already_granted;
         var cancelled = (res && res.runs_cancelled || []).length;
         setStatus("adm-slides-status",
-          (granted ? "已加入工作区 " : "已移出工作区 ") + item.name +
+          (granted ? "已加入工作区 " : "已移出工作区 ") + label +
           (already ? "（此前已加入，幂等成功）" : "") +
           (!granted && cancelled
             ? "（已请求取消 " + cancelled + " 个运行中任务）" : ""));

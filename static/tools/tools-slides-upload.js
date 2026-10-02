@@ -64,17 +64,46 @@ function isAuthError(err) {
 
 const TERMINAL_UPLOAD_STATES = ['published', 'failed', 'cancelled'];
 
+/// 服务端结构化错误（{status, data:{error, code, …}}）→ 文案键。只认稳定码
+/// 与 HTTP 状态，绝不把原始对象/响应体拼进文案（[object Object]、内部细节）。
+const STABLE_CODE_RE = /^[a-z][a-z0-9_]{0,63}$/;
+
+export function describeUploadError(err) {
+  const data = err && typeof err.data === 'object' && err.data ? err.data : null;
+  const rawCode = data && typeof data.code === 'string' ? data.code : '';
+  const code = STABLE_CODE_RE.test(rawCode) ? rawCode : '';
+  const status = err && Number.isInteger(err.status) ? err.status : 0;
+  if (code === 'cos_waiting_limit') return { key: 'tools.upload.err.waiting_limit' };
+  if (code === 'upload_too_large' || status === 413) {
+    const max = data && Number.isFinite(data.max_size_bytes) ? data.max_size_bytes : null;
+    return { key: 'tools.upload.too.large', max, disable: true };
+  }
+  if (code === 'cos_pool_below_product_limit') return { key: 'tools.upload.err.pool_config' };
+  if (code === 'cos_format_unsupported') return { key: 'tools.upload.format.unsupported', disable: true };
+  if (code === 'ingestion_state_conflict') return { key: 'tools.upload.err.state' };
+  if (code === 'cos_sign_rate_limited' || status === 429) return { key: 'tools.upload.err.rate' };
+  if (code === 'cos_capacity_reconcile_required') return { key: 'tools.upload.err.reconcile' };
+  if (code === 'cos_unavailable') return { key: 'tools.upload.capability.off' };
+  if (status === 403) return { key: 'tools.upload.err.forbidden' };
+  if (status === 503 || status === 502 || status === 504) return { key: 'tools.upload.err.unavailable' };
+  if (status) return { key: 'tools.upload.err.http', vars: { status, code: code || '—' } };
+  if (err instanceof Error && err.message) return { key: 'tools.upload.failed', vars: { e: err.message } };
+  return { key: 'tools.upload.err.unknown' };
+}
+
 export function createUploadController({
-  runner, t, onJobsRefresh, onPublished,
+  runner, t, onJobsRefresh, onPublished, onSelectJob,
 }) {
   const state = {
     busyJobId: null,     // 本标签唯一进行中的上传
     handle: null,        // 引擎句柄（取消用）
     disabled: {},        // jobId -> true（超限/格式不支持：按钮保持禁用）
-    statusKey: null, statusVars: null,
+    // jobId -> 该任务最近一条上传反馈（{key,vars,link} | {text} | {published}）。
+    // 只有结果面板当前指向的任务会画进 #upload-status：别的任务的进度/失败
+    // 不会出现在这个面板里，切回该任务时重放。
+    msgs: {},
     writes: Promise.resolve(),   // record.upload 写入队列（刷新列表前冲刷）
     orphans: {},                 // jobId -> 未确认取消的 ingestion id
-    publishedView: null,         // 结果面板当前显示的发布结果（语言切换重放）
   };
 
   /// 记录写入排进串行队列（收口后先冲刷再刷新列表）。返回的 Promise 如实
@@ -86,29 +115,47 @@ export function createUploadController({
     return run;
   }
 
-  function setMsg(key, vars) {
-    state.statusKey = key;
-    state.statusVars = vars || null;
+  /// 把某任务的反馈画进 #upload-status（仅当结果面板正指向它）。链接/按钮
+  /// 用 DOM 构造，不用 innerHTML。
+  function paint(jobId) {
+    if (!jobId || jobId !== page.currentJobId) return;
     const el = document.getElementById('upload-status');
     if (!el) return;
     el.textContent = '';
-    if (key === null) return;
-    el.textContent = t(key, vars || {});
-  }
-
-  /// 登录链接 / 工作台链接是消息的一部分（DOM 构造，不用 innerHTML）。
-  function setMsgWithLink(key, linkHref, linkKey, vars) {
-    const el = document.getElementById('upload-status');
-    if (!el) return;
-    el.textContent = '';
-    el.appendChild(document.createTextNode(t(key, vars || {})));
+    const m = state.msgs[jobId];
+    if (!m) return;
+    if (m.published) {
+      paintPublished(el, jobId, m.published);
+      return;
+    }
+    if (typeof m.text === 'string') {
+      el.textContent = m.text;
+      return;
+    }
+    if (!m.link) {
+      el.textContent = t(m.key, m.vars || {});
+      return;
+    }
+    el.appendChild(document.createTextNode(t(m.key, m.vars || {})));
     el.appendChild(document.createTextNode(' '));
     const a = document.createElement('a');
-    a.href = linkHref;
-    a.textContent = t(linkKey);
+    a.href = m.link.href;
+    a.textContent = t(m.link.key);
     el.appendChild(a);
-    state.statusKey = key;
-    state.statusVars = vars || null;
+  }
+
+  function setMsg(jobId, key, vars) {
+    if (!jobId) return;
+    if (key === null) delete state.msgs[jobId];
+    else state.msgs[jobId] = { key, vars: vars || null };
+    paint(jobId);
+  }
+
+  /// 登录链接 / 工作台链接是消息的一部分。
+  function setMsgWithLink(jobId, key, linkHref, linkKey, vars) {
+    if (!jobId) return;
+    state.msgs[jobId] = { key, vars: vars || null, link: { href: linkHref, key: linkKey } };
+    paint(jobId);
   }
 
   function setBusy(jobId, busy) {
@@ -118,7 +165,8 @@ export function createUploadController({
     if (btn && page.currentJobId === jobId) {
       btn.disabled = busy || !!state.disabled[jobId];
     }
-    if (cancelBtn) cancelBtn.hidden = !busy;
+    // 取消按钮只跟随结果面板当前指向的任务（不替别的任务的上传给出取消入口）
+    if (cancelBtn && page.currentJobId === jobId) cancelBtn.hidden = !busy;
   }
 
   // 当前结果面板指向的任务（tools-slides.js 维护）
@@ -183,32 +231,43 @@ export function createUploadController({
   function handleFailure(err, jobId) {
     if (err && err.persist) {
       if (err.reconciled) {
-        setMsg('tools.upload.persist.failed');
+        setMsg(jobId, 'tools.upload.persist.failed');
       } else {
         rememberOrphan(jobId, err.ingestionId);
-        setMsg('tools.upload.persist.orphan');
+        setMsg(jobId, 'tools.upload.persist.orphan');
       }
       return;
     }
     if (isAuthError(err)) {
-      setMsgWithLink('tools.upload.login.expired', LOGIN_URL, 'tools.upload.login.link');
+      setMsgWithLink(jobId, 'tools.upload.login.expired', LOGIN_URL, 'tools.upload.login.link');
       return;
     }
     if (err && err.network) {
-      setMsg('tools.upload.resume.hint');
+      setMsg(jobId, 'tools.upload.resume.hint');
       return;
     }
     if (err && err.terminal) {
       const code = (err.data && err.data.fail_code) || '';
-      setMsg('tools.upload.failed.terminal', { code: code || '—' });
+      setMsg(jobId, 'tools.upload.failed.terminal', {
+        code: (typeof code === 'string' && STABLE_CODE_RE.test(code)) ? code : '—',
+      });
       return;
     }
     if (err && typeof err.part === 'number') {
-      setMsg('tools.upload.failed.part', { n: err.part });
+      setMsg(jobId, 'tools.upload.failed.part', { n: err.part });
       return;
     }
-    const raw = E.errText(err);
-    setMsg('tools.upload.failed', { e: raw });
+    const d = describeUploadError(err);
+    if (d.disable) {
+      state.disabled[jobId] = true;
+      const btn = document.getElementById('upload-btn');
+      if (btn && page.currentJobId === jobId) btn.disabled = true;
+    }
+    if (d.key === 'tools.upload.too.large') {
+      setMsg(jobId, d.key, { max: d.max === null ? '—' : fmtBytes(d.max) });
+      return;
+    }
+    setMsg(jobId, d.key, d.vars);
   }
 
   // 创建后没能记下 id、且取消未获确认的服务端任务：同一任务再建之前必须先确认
@@ -252,12 +311,13 @@ export function createUploadController({
   /// 已发布任务的结果面板：上传按钮换成发布结果（slide id + 工作台链接）；
   /// 目标项目关联未完成时附「重试加入项目」（只重试关联）。
   function showPublished(jobId, slideId, intent, { assocRetry = true } = {}) {
-    state.publishedView = { jobId, slideId, intent };
+    state.msgs[jobId] = { published: { slideId, intent, assocRetry } };
     const btn = document.getElementById('upload-btn');
     if (btn && page.currentJobId === jobId) btn.hidden = true;
-    const el = document.getElementById('upload-status');
-    if (!el) return;
-    el.textContent = '';
+    paint(jobId);
+  }
+
+  function paintPublished(el, jobId, { slideId, intent, assocRetry }) {
     el.appendChild(document.createTextNode(
       t('tools.upload.published', { id: slideId || '—' })));
     el.appendChild(document.createTextNode(' '));
@@ -265,7 +325,6 @@ export function createUploadController({
     a.href = '/app';
     a.textContent = t('tools.upload.open.workbench');
     el.appendChild(a);
-    state.statusKey = null;
     if (assocRetry && intent && intent.state === 'pending' && intent.target && onPublished) {
       el.appendChild(document.createTextNode(' '));
       const b = document.createElement('button');
@@ -328,15 +387,16 @@ export function createUploadController({
   /// 取消被另起上传取代的旧 ingestion——只有它的原账号有权取消（服务端
   /// 归属检查）；成功（或服务端已无/已终态）后从待清理列表里标记完成。
   async function cancelSuperseded(jobId, ingestionId) {
+    await selectJob(jobId);
     let cap;
     try {
       cap = await fetchCapability();
     } catch {
-      setMsg('tools.upload.offline');
+      setMsg(jobId, 'tools.upload.offline');
       return;
     }
     if (cap.authRequired) {
-      setMsgWithLink('tools.upload.login.required', LOGIN_URL, 'tools.upload.login.link');
+      setMsgWithLink(jobId, 'tools.upload.login.required', LOGIN_URL, 'tools.upload.login.link');
       return;
     }
     const job = await runner.getJob(jobId).catch(() => null);
@@ -345,7 +405,7 @@ export function createUploadController({
     if (!entry) return;
     const owner = entry.accountLabel || t('tools.account.unknown');
     if (entry.account && cap.account !== entry.account) {
-      setMsg('tools.upload.superseded.wrong', { owner });
+      setMsg(jobId, 'tools.upload.superseded.wrong', { owner });
       return;
     }
     let ok = false;
@@ -357,7 +417,7 @@ export function createUploadController({
       ok = r.ok || r.status === 404 || r.status === 409;
     } catch { ok = false; }
     if (!ok) {
-      setMsg(status === 403 ? 'tools.upload.superseded.wrong'
+      setMsg(jobId, status === 403 ? 'tools.upload.superseded.wrong'
         : 'tools.upload.superseded.failed', { owner });
       return;
     }
@@ -365,15 +425,23 @@ export function createUploadController({
       superseded: list.map((s) => (s.ingestionId === ingestionId
         ? { ...s, state: 'cancelled', cancelledAt: E.nowIso() } : s)),
     })).catch(() => { /* 下次再点 */ });
-    setMsg('tools.upload.superseded.cancelled');
+    setMsg(jobId, 'tools.upload.superseded.cancelled');
     if (onJobsRefresh) onJobsRefresh();
   }
 
   /// 上传/继续上传（唯一入口）。本标签 busy 守卫 + 跨标签 Web Lock：同一任务
   /// 任何时刻只有一处在上传，重复点击/多标签都不会并发创建 ingestion。
   async function startOrContinue(jobId) {
-    if (state.busyJobId) return null;
-    if (state.disabled[jobId]) return null;
+    // 反馈写在结果面板里：从任务列表（含刷新后）发起时先把面板切到该任务
+    await selectJob(jobId);
+    if (state.busyJobId) {
+      if (state.busyJobId !== jobId) setMsg(jobId, 'tools.upload.busy.other');
+      return null;
+    }
+    if (state.disabled[jobId]) {
+      paint(jobId);
+      return null;
+    }
     state.busyJobId = jobId;
     let outcome = null;
     const ran = await navigator.locks.request(E.uploadLockName(jobId), { ifAvailable: true },
@@ -384,10 +452,16 @@ export function createUploadController({
       });
     if (!ran) {
       state.busyJobId = null;
-      setMsg('tools.upload.other.tab');
+      setMsg(jobId, 'tools.upload.other.tab');
       return { ok: false, reason: 'other-tab' };
     }
     return outcome || { ok: false };
+  }
+
+  /// 结果面板切到该任务（页面回调负责显示面板）；已指向时不动。
+  async function selectJob(jobId) {
+    if (page.currentJobId === jobId || !onSelectJob) return;
+    try { await onSelectJob(jobId); } catch { /* 面板切不过去时反馈仍按任务保存 */ }
   }
 
   async function runLocked(jobId) {
@@ -417,11 +491,11 @@ export function createUploadController({
       try {
         cap = await fetchCapability();
       } catch (e) {
-        setMsg('tools.upload.offline');
+        setMsg(jobId, 'tools.upload.offline');
         return;
       }
       if (cap.authRequired) {
-        setMsgWithLink('tools.upload.login.required', LOGIN_URL, 'tools.upload.login.link');
+        setMsgWithLink(jobId, 'tools.upload.login.required', LOGIN_URL, 'tools.upload.login.link');
         return;
       }
       // ①b 账号归属。进行中的上传属于创建它的账号——服务端 ingestion 的
@@ -452,7 +526,7 @@ export function createUploadController({
         // 归属字段之前的记录：以服务端归属为准（他人的任务 403）
         const probe = await probeIngestionAccess(prev.ingestionId);
         if (probe === 'auth') {
-          setMsgWithLink('tools.upload.login.required', LOGIN_URL, 'tools.upload.login.link');
+          setMsgWithLink(jobId, 'tools.upload.login.required', LOGIN_URL, 'tools.upload.login.link');
           return;
         }
         mismatch = probe === 'forbidden';
@@ -466,7 +540,7 @@ export function createUploadController({
           return { ok: false, reason: 'account-original' };
         }
         if (choice !== 'separate') {
-          setMsg('tools.upload.account.changed');
+          setMsg(jobId, 'tools.upload.account.changed');
           return { ok: false, reason: 'account-mismatch' };
         }
         if (inflight) {
@@ -494,21 +568,21 @@ export function createUploadController({
       const cfg = window.HP_COS_UPLOAD
         ? window.HP_COS_UPLOAD.resolveConfig(cap.cos_upload) : null;
       if (!cfg) {
-        setMsg('tools.upload.capability.off');
+        setMsg(jobId, 'tools.upload.capability.off');
         return;
       }
       // ② 限额按最终文件（不是源文件）
       const outBytes = (job.result && job.result.outputBytes) || 0;
       if (outBytes > cfg.max_size_bytes) {
         state.disabled[jobId] = true;
-        setMsg('tools.upload.too.large', { max: fmtBytes(cfg.max_size_bytes) });
+        setMsg(jobId, 'tools.upload.too.large', { max: fmtBytes(cfg.max_size_bytes) });
         return;
       }
       // ③ 平台能否查看该输出（按核心 result.format 键控，非扩展名）
       const fmt = (job.result && job.result.format) || '';
       if (!fmt || !(cap.viewable_formats || []).includes(fmt)) {
         state.disabled[jobId] = true;
-        setMsg('tools.upload.format.unsupported');
+        setMsg(jobId, 'tools.upload.format.unsupported');
         return;
       }
 
@@ -518,13 +592,13 @@ export function createUploadController({
       if (prev && prev.ingestionId &&
           !TERMINAL_UPLOAD_STATES.includes(prev.state)) {
         resumeJobId = prev.ingestionId;
-        setMsg(resumeJobId ? 'tools.upload.resuming' : 'tools.upload.working');
+        setMsg(jobId, resumeJobId ? 'tools.upload.resuming' : 'tools.upload.working');
       } else {
         if (!(await settleOrphan(jobId))) {
-          setMsg('tools.upload.orphan.pending');
+          setMsg(jobId, 'tools.upload.orphan.pending');
           return;
         }
-        setMsg('tools.upload.working');
+        setMsg(jobId, 'tools.upload.working');
       }
 
       // ⑤ 产物只经 slice() 分块读取（引擎内绝不整体物化）
@@ -550,11 +624,11 @@ export function createUploadController({
         onEvent: (ev) => {
           if (ev.type === 'status') {
             const txt = stageText(ev.body);
-            if (txt) setStageTxt(txt);
+            if (txt) setStageTxt(jobId, txt);
           } else if (ev.type === 'progress' && typeof ev.frac === 'number') {
-            setStageTxt(`${t('upload.cos.stage.uploading')} ${Math.round(ev.frac * 100)}%`);
+            setStageTxt(jobId, `${t('upload.cos.stage.uploading')} ${Math.round(ev.frac * 100)}%`);
           } else if (ev.type === 'created') {
-            setStageTxt(t('upload.cos.stage.uploading'));
+            setStageTxt(jobId, t('upload.cos.stage.uploading'));
             // 记录已排队写入：列表行切到“上传中/继续上传”形态
             queueRefresh();
           }
@@ -564,7 +638,7 @@ export function createUploadController({
       const r = await upload.done;
       state.handle = null;
       if (r && r.cancelled) {
-        setMsg('tools.upload.cancelled');
+        setMsg(jobId, 'tools.upload.cancelled');
         return;
       }
       // published：先冲刷记录写入（storage.complete 已排队），再读回填的
@@ -592,10 +666,9 @@ export function createUploadController({
     }
   }
 
-  function setStageTxt(txt) {
-    const el = document.getElementById('upload-status');
-    if (el) el.textContent = txt;
-    state.statusKey = null;
+  function setStageTxt(jobId, txt) {
+    state.msgs[jobId] = { text: txt };
+    paint(jobId);
   }
 
   /// 记录写入落盘后刷新列表（行上传状态/继续按钮跟随）。
@@ -619,13 +692,13 @@ export function createUploadController({
   /// 的自动上传意图（无 ingestion、本地产物保留）——「取消停止当前阶段并
   /// 撤销后续自动上传意图」（drain 计划 §3.1）。
   function cancel() {
-    if (state.handle) {
-      state.handle.cancel();
-      setMsg('tools.upload.cancelled');
-      return;
-    }
     const jobId = page.currentJobId;
     if (!jobId) return;
+    if (state.handle && state.busyJobId === jobId) {
+      state.handle.cancel();
+      setMsg(jobId, 'tools.upload.cancelled');
+      return;
+    }
     runner.getJob(jobId).then((job) => {
       const pendingIntent = job && job.intent && job.intent.state === 'pending';
       const up = job && job.upload;
@@ -637,7 +710,7 @@ export function createUploadController({
       return runner.setJobIntent(jobId, {
         state: 'revoked', revokedReason: 'user_cancel', revokedAt: E.nowIso(),
       }).then(() => {
-        setMsg('tools.upload.intent.revoked');
+        setMsg(jobId, 'tools.upload.intent.revoked');
         if (onJobsRefresh) onJobsRefresh();
       });
     }).catch(() => { /* 记录写不进去时按钮仍可用（下次再试） */ });
@@ -705,7 +778,8 @@ export function createUploadController({
       btn.dataset.jobUpload = job.id;
       btn.textContent = t(intentPending
         ? 'tools.upload.continue' : 'tools.upload.btn');
-      btn.disabled = !!state.disabled[job.id] || isActive;
+      btn.disabled = !!state.disabled[job.id] || state.busyJobId !== null;
+      if (state.busyJobId !== null && !isActive) btn.title = t('tools.upload.busy.other');
       btn.addEventListener('click', () => { startOrContinue(job.id); });
       actionsEl.appendChild(btn);
       return;
@@ -722,9 +796,20 @@ export function createUploadController({
     btn.dataset.action = 'upload-continue';
     btn.dataset.jobUpload = job.id;
     btn.textContent = t('tools.upload.continue');
-    btn.disabled = isActive;
+    btn.disabled = state.busyJobId !== null;
+    if (state.busyJobId !== null && !isActive) btn.title = t('tools.upload.busy.other');
     btn.addEventListener('click', () => { startOrContinue(job.id); });
     actionsEl.appendChild(btn);
+    if (isActive) {
+      // 进行中：进度与取消在结果面板里——给出切过去的入口
+      const show = document.createElement('button');
+      show.type = 'button';
+      show.className = 'btn btn-secondary';
+      show.dataset.action = 'upload-show';
+      show.textContent = t('tools.upload.show.progress');
+      show.addEventListener('click', () => { selectJob(job.id); });
+      actionsEl.appendChild(show);
+    }
   }
 
   /// 被另起上传取代、仍未确认清理的旧 ingestion：提示归属账号 + 取消入口
@@ -774,12 +859,7 @@ export function createUploadController({
   }
 
   function rerenderForLang() {
-    const pv = state.publishedView;
-    if (pv && state.statusKey === null && pv.jobId === page.currentJobId) {
-      showPublished(pv.jobId, pv.slideId, pv.intent);
-      return;
-    }
-    if (state.statusKey) setMsg(state.statusKey, state.statusVars);
+    paint(page.currentJobId);
   }
 
   /// 结果面板切到某任务：已发布的任务不给上传按钮，只显示发布结果。
@@ -788,9 +868,10 @@ export function createUploadController({
     page.currentJobId = jobId;
     const btn = document.getElementById('upload-btn');
     if (btn) {
-      btn.disabled = state.busyJobId !== null;
+      btn.disabled = state.busyJobId !== null || !!state.disabled[jobId];
       if (changed) btn.hidden = false;
     }
+    if (changed) paint(jobId);
     return runner.getJob(jobId).then((job) => {
       if (page.currentJobId !== jobId || !job) return;
       const up = job.upload;
@@ -805,6 +886,7 @@ export function createUploadController({
   return {
     startOrContinue, cancel, abandon, renderRowSegment, rerenderForLang, setResultJob,
     isBusy: () => state.busyJobId !== null,
+    busyJobId: () => state.busyJobId,
     isDisabled: (jobId) => !!state.disabled[jobId],
   };
 }

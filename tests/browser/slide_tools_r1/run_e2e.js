@@ -20,7 +20,11 @@
 //   k  已发布任务重复触发上传：不再建 ingestion/不传字节（关联未完成只重试关联：i5）
 //   l  上线 dogfood 回归：刷新后从项目打开 id_bundle 切片（按 slide_id 取 info）、
 //      普通用户界面删除走 ID 端点（两张同原始文件名，只删所点那张）；
-//      KFB 入口 >60s 不自动消失；导入抽屉打开时抽屉内入口可点
+//      KFB 入口 >60s 不自动消失；导入抽屉打开时抽屉内入口可点；删除后项目
+//      活动视图（行+计数）不再含被删切片
+//   m  R1 跟进：刷新后从任务列表上传的反馈可见（登录/进度/失败/取消/重试），
+//      真实端点的账号等待上限 409 与池满排队文案（主面板与列表入口）
+//   n  管理插件切片页：可读名/资产状态/不可用说明 + 加入后真实可读
 // i/i4 的目标关联走真实 /api/project 端点（发布的是测试库里真实的 ready 切片）。
 // 复跑：node tests/browser/slide_tools_r1/run_e2e.js（服务复用 C4 server.py）。
 'use strict';
@@ -1201,11 +1205,25 @@ async function main() {
       await waitFor(async () => /已删除|deleted/i.test(await textOf(page, '#toast-container')), 30000, 'delete toast');
       const toastText = await textOf(page, '#toast-container');
       if (/无权访问|删除失败|delete failed/i.test(toastText)) throw new Error(`toast ${toastText}`);
-      // 删除不解除项目归属（既有语义）：列表刷新后该行变为不可读，同名另一张仍可读
-      await waitFor(async () => /读取失败|read failed/.test(await textOf(page,
-        `${projSel} .slide-row[data-slide-id="${delId}"] .slide-name`)), 30000, 'deleted row unreadable');
-      const keptName = await textOf(page, `${projSel} .slide-row[data-slide-id="${keepId}"] .slide-name`);
-      if (/读取失败|read failed/.test(keptName)) throw new Error(`kept row unreadable: ${keptName}`);
+      // R1 跟进：被删的那张退出项目的活动视图（行与计数一致），刷新后也不回来；
+      // 同名另一张照常可开（历史成员行在服务端保留——pytest 断言）。
+      const metaBefore = await textOf(page, `${projSel} .proj-meta`);
+      await page.reload();
+      await page.waitForFunction(() => !!window.HP_UPLOAD, null, { timeout: 30000 });
+      if (!(await page.isVisible('#import-slides-btn'))) await page.click('#menu-btn');
+      await page.waitForSelector(projSel, { timeout: 30000 });
+      await page.click(`${projSel} .proj-name`);
+      await page.waitForSelector(`${projSel}.expanded .slide-row`, { timeout: 10000 });
+      const after = await page.$$eval(`${projSel} .slide-row`, (els) => els.map((e) => ({
+        id: e.dataset.slideId, name: (e.querySelector('.slide-name') || {}).textContent || '',
+      })));
+      if (after.length !== 1 || after[0].id !== keepId) throw new Error(`rows after refresh ${JSON.stringify(after)}`);
+      if (after.some((r) => /读取失败|read failed/.test(r.name))) throw new Error(`read-failed row ${JSON.stringify(after)}`);
+      const metaAfter = await textOf(page, `${projSel} .proj-meta`);
+      if (!/^1\s*切片|^1 slide/.test(metaAfter.trim())) throw new Error(`count after delete: "${metaAfter}" (before "${metaBefore}")`);
+      infoReqs.length = 0;
+      await page.click(`${projSel} .slide-row[data-slide-id="${keepId}"] .slide-name`);
+      await waitFor(async () => infoReqs.some((r) => r.status === 200 && r.path === `/api/slides/${keepId}/info`), 30000, 'kept opens');
       const gone = await L.apiGet(page, `/api/slides/${encodeURIComponent(delId)}/info`);
       const kept = await L.apiGet(page, `/api/slides/${encodeURIComponent(keepId)}/info`);
       if (![403, 404, 410].includes(gone.status) || kept.status !== 200) {
@@ -1213,7 +1231,8 @@ async function main() {
       }
       record('l1-project-open-and-ui-delete', true, {
         projectRows: rows.length, readFailedRows: 0, infoPath: '/api/slides/<id>/info',
-        deletePath: '/api/slides/<id>', deleteStatus: 200, deletedRowUnreadable: true, otherSameNameKept: true,
+        deletePath: '/api/slides/<id>', deleteStatus: 200, rowsAfterRefresh: after.length,
+        countAfter: metaAfter.trim().slice(0, 20), deletedReadStatus: gone.status, otherSameNameKept: true,
       });
     } catch (e) {
       record('l1-project-open-and-ui-delete', false, { error: String(e).slice(0, 400) });
@@ -1303,6 +1322,254 @@ async function main() {
     }
   }
 
+
+  // ------------------------------------------- (m) R1 跟进：任务列表上传反馈 --
+  /// 断言某选择器对用户真实可见（自身与祖先都未隐藏、有布局盒）。
+  async function visibleText(page, sel) {
+    if (!(await page.isVisible(sel))) return '';
+    return textOf(page, sel);
+  }
+
+  async function convertOnly(page, file) {
+    const jobId = await convertFixture(page, file);
+    await page.click('#convert-btn');
+    await waitFor(async () => (await page.$('#result-section:not([hidden])')) !== null, 120000, 'converted');
+    return jobId;
+  }
+
+  async function reloadTools(page) {
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForFunction(() => !!window.__stToolsReady, null, { timeout: 30000 });
+  }
+
+  /// m1：未登录本地转换 → 刷新 → 任务列表「上传到工作台」→ 可见的登录说明与
+  /// 链接 → 点链接登录 → 回到工具页 → 同一行上传 → 可见进度 → 可见发布结果。
+  async function scenarioRefreshAnonLoginUpload() {
+    const id = 'm1-refresh-anon-login-return-upload';
+    const { context, page } = await L.launch(id, [L.READ_JOB_RECORDS]);
+    const fake = await L.fakeUploadRoutes(page, creds.cosOrigin, { partsCount: 4 });
+    let release = null;
+    fake.behavior.gatePut = async (n) => { if (n === 3 && release === null) await new Promise((r) => { release = r; }); };
+    try {
+      await L.openTools(page, PORT);
+      const jobId = await convertOnly(page, bf);
+      await reloadTools(page);
+      if (await page.isVisible('#result-section')) throw new Error('result panel visible right after refresh');
+      const rowBtn = `.job-row[data-job-id="${jobId}"] [data-action="upload"]`;
+      await page.waitForSelector(rowBtn, { timeout: 30000 });
+      await page.click(rowBtn);
+      await waitFor(async () => /需要登录|sign in/i.test(await visibleText(page, '#upload-status')), 30000, 'visible login prompt');
+      if (!(await page.isVisible('#upload-status a'))) throw new Error('login link not visible');
+      const href = await page.$eval('#upload-status a', (a) => a.getAttribute('href'));
+      if (fake.st.creates.length) throw new Error('created while signed out');
+      await Promise.all([page.waitForURL(/\/login/, { timeout: 30000 }), page.click('#upload-status a')]);
+      await page.fill('#login-dialog-username', creds.userLogin);
+      await page.fill('#login-dialog-password', creds.userPassword);
+      await Promise.all([
+        page.waitForURL(/\/tools\/slides/, { timeout: 30000 }),
+        page.click('#login-dialog-form button[type="submit"]'),
+      ]);
+      await page.waitForFunction(() => !!window.__stToolsReady, null, { timeout: 30000 });
+      await page.waitForSelector(rowBtn, { timeout: 30000 });
+      if (await page.isVisible('#result-section')) throw new Error('panel visible before choosing a job');
+      await page.click(rowBtn);
+      await waitFor(() => release !== null, 60000, 'upload in progress');
+      const progress = await visibleText(page, '#upload-status');
+      if (!/上传中|Uploading|%/.test(progress)) throw new Error(`progress not visible: "${progress}"`);
+      if (!(await page.isVisible('#upload-cancel-btn'))) throw new Error('cancel not visible during upload');
+      release();
+      await waitFor(async () => /已发布|Published/.test(await visibleText(page, '#upload-status')), 120000, 'visible published');
+      if (fake.st.creates.length !== 1) throw new Error(`creates=${fake.st.creates.length}`);
+      record(id, true, { loginLink: href, loginVisible: true, progressVisible: progress.slice(0, 24), creates: 1, publishedVisible: true });
+    } catch (e) {
+      record(id, false, { error: String(e).slice(0, 400) });
+    } finally {
+      await context.close();
+    }
+  }
+
+  /// m2：刷新后的任务列表上传 → 服务端未知错误（error 为对象）→ 可读失败文案 +
+  /// 可见重试；重试中取消 → 可见取消；再从列表重试 → 发布。
+  async function scenarioRefreshFailureRetry() {
+    const id = 'm2-refresh-failure-cancel-retry';
+    const { context, page } = await L.launch(id, [L.READ_JOB_RECORDS]);
+    const fake = await L.fakeUploadRoutes(page, creds.cosOrigin, { partsCount: 4 });
+    let nCreate = 0;
+    fake.behavior.onCreate = () => {
+      nCreate += 1;
+      return nCreate === 1 ? { status: 500, body: { error: { internal: 'boom' } } } : null;
+    };
+    let hold = false;
+    fake.behavior.gatePut = async () => { if (hold) await new Promise(() => {}); };
+    try {
+      await L.login(page, PORT, creds, 'user');
+      await L.openTools(page, PORT);
+      const jobId = await convertOnly(page, bf);
+      await reloadTools(page);
+      const rowBtn = `.job-row[data-job-id="${jobId}"] [data-action="upload"]`;
+      await page.waitForSelector(rowBtn, { timeout: 30000 });
+      await page.click(rowBtn);
+      await waitFor(async () => /上传失败|Upload failed/.test(await visibleText(page, '#upload-status')), 30000, 'visible failure');
+      const failText = await visibleText(page, '#upload-status');
+      if (/object Object/.test(failText) || !/500/.test(failText)) throw new Error(`failure text "${failText}"`);
+      if (!(await page.isEnabled('#upload-btn')) || !(await page.isVisible('#upload-btn'))) throw new Error('panel retry not available');
+      await page.waitForSelector(`${rowBtn}:not([disabled])`, { timeout: 30000 });
+      hold = true;
+      await page.click('#upload-btn');
+      await waitFor(() => fake.st.puts.length === 0 && fake.st.creates.length === 2, 30000, 'second create');
+      await waitFor(async () => page.isVisible('#upload-cancel-btn'), 30000, 'cancel visible');
+      await page.click('#upload-cancel-btn');
+      await waitFor(async () => /已取消上传|Upload cancelled/.test(await visibleText(page, '#upload-status')), 30000, 'visible cancelled');
+      await waitFor(async () => (await page.$(`.job-row[data-job-id="${jobId}"] [data-upload-state="cancelled"]`)) !== null, 30000, 'row cancelled');
+      hold = false;
+      await reloadTools(page);
+      await page.waitForSelector(rowBtn, { timeout: 30000 });
+      await page.click(rowBtn);
+      await waitFor(async () => /已发布|Published/.test(await visibleText(page, '#upload-status')), 120000, 'published after retry');
+      record(id, true, { failureText: failText.slice(0, 40), cancelVisible: true, creates: fake.st.creates.length, published: true });
+    } catch (e) {
+      record(id, false, { error: String(e).slice(0, 400) });
+    } finally {
+      await context.close();
+    }
+  }
+
+  async function apiPost(page, url, body) {
+    return page.evaluate(async ([u, b]) => {
+      const m = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
+      const r = await fetch(u, {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': m ? decodeURIComponent(m[1]) : '' },
+        body: JSON.stringify(b || {}),
+      });
+      let j = null;
+      try { j = await r.json(); } catch { j = null; }
+      return { status: r.status, body: j };
+    }, [url, body]);
+  }
+
+  /// m3：真实 Flask ingestion 合同（仅 COS 分块 PUT 被拦截）。本账号已有一个
+  /// 进行中的上传时，再建的上传正常排队（202 waiting）；再上传：账号等待上限
+  /// 409 cos_waiting_limit 在主面板与刷新后的任务列表入口都显示可读文案；撤掉
+  /// 排队任务后，工具页上传正常排队（可见等待暂存空间）并可取消。
+  async function scenarioWaitingLimitReal() {
+    const id = 'm3-waiting-limit-real-endpoint';
+    const { context, page } = await L.launch(id, [L.READ_JOB_RECORDS]);
+    await L.fakeCosPuts(context, creds.cosOrigin);
+    const apiIds = [];
+    try {
+      await L.login(page, PORT, creds, 'user');
+      // 账号已有进行中的上传（本用例自建，或前序场景遗留）时，新建的上传排队
+      let q = null;
+      for (let i = 0; i < 2 && !q; i++) {
+        const r = await apiPost(page, '/api/ingestions', { filename: `m3-${i}.tif`, declared_size: 900000000 });
+        if (r.status !== 202) throw new Error(`create ${i}: ${r.status} ${JSON.stringify(r.body).slice(0, 200)}`);
+        apiIds.push(r.body.job_id);
+        if (r.body.code === 'cos_waiting_capacity') q = r;
+      }
+      if (!q || q.body.stage !== 'waiting_space') throw new Error(`no queued upload: ${JSON.stringify(q && q.body).slice(0, 200)}`);
+      const probe = await apiPost(page, '/api/ingestions', { filename: 'm3-probe.tif', declared_size: 1000 });
+      if (probe.status !== 409 || probe.body.code !== 'cos_waiting_limit') throw new Error(`contract ${probe.status} ${JSON.stringify(probe.body)}`);
+      await L.openTools(page, PORT);
+      const jobId = await convertOnly(page, bf);
+      await page.click('#upload-btn');
+      await waitFor(async () => /排队|queued/i.test(await visibleText(page, '#upload-status')), 30000, 'main panel waiting-limit');
+      const mainText = await visibleText(page, '#upload-status');
+      if (/object Object/.test(mainText)) throw new Error(`raw object: ${mainText}`);
+      await reloadTools(page);
+      const rowBtn = `.job-row[data-job-id="${jobId}"] [data-action="upload"]`;
+      await page.waitForSelector(rowBtn, { timeout: 30000 });
+      await page.click(rowBtn);
+      await waitFor(async () => /排队|queued/i.test(await visibleText(page, '#upload-status')), 30000, 'row waiting-limit');
+      const rowText = await visibleText(page, '#upload-status');
+      if (/object Object/.test(rowText)) throw new Error(`raw object (row): ${rowText}`);
+      // 撤掉排队的那个：工具页上传正常排队（可见等待暂存空间），可取消
+      const c = await apiPost(page, `/api/ingestions/${q.body.job_id}/cancel`, {});
+      if (![200, 202].includes(c.status)) throw new Error(`cancel queued ${c.status}`);
+      await page.waitForSelector(`${rowBtn}:not([disabled])`, { timeout: 30000 });
+      await page.click(rowBtn);
+      await waitFor(async () => /等待暂存空间|Waiting for staging space/.test(await visibleText(page, '#upload-status')), 60000, 'visible waiting_space');
+      const waitText = await visibleText(page, '#upload-status');
+      if (!(await page.isVisible('#upload-cancel-btn'))) throw new Error('cancel not visible while queued');
+      await page.click('#upload-cancel-btn');
+      await waitFor(async () => /已取消上传|Upload cancelled/.test(await visibleText(page, '#upload-status')), 30000, 'cancelled');
+      record(id, true, {
+        secondQueued: true, probe409: probe.body.code, mainPanel: mainText.slice(0, 30),
+        refreshedRow: rowText.slice(0, 30), queuedStage: waitText.slice(0, 20), cancelled: true,
+      });
+    } catch (e) {
+      record(id, false, { error: String(e).slice(0, 400) });
+    } finally {
+      for (const aid of apiIds) await apiPost(page, `/api/ingestions/${aid}/cancel`, {}).catch(() => {});
+      await context.close();
+    }
+  }
+
+  /// n1：管理插件切片页（0.4.14）——新上传显示原始文件名 + slide_id、资产
+  /// 状态可读；同名两片各自一行；已删除资产「加入」禁用并说明，服务端对它的
+  /// 加入请求给出明确拒绝；对可用资产点「加入」后 owner 工作区真正可见可读。
+  async function scenarioAdminSlidesDisplayGrant() {
+    const id = 'n1-admin-slides-display-grant';
+    const userCtx = await L.launch(`${id}-user`);
+    const { context, page } = await L.launch(id);
+    const [keepId, delId] = creds.dupSlideIds || [];
+    try {
+      await L.login(userCtx.page, PORT, creds, 'user', '/app');
+      const del = await userCtx.page.evaluate(async (sid) => {
+        const m = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
+        const r = await fetch(`/api/slides/${sid}`, { method: 'DELETE', credentials: 'same-origin',
+          headers: { 'X-CSRF-Token': m ? decodeURIComponent(m[1]) : '' } });
+        return r.status;
+      }, delId);
+      if (del !== 200) throw new Error(`user delete ${del}`);
+      await L.login(page, PORT, creds, 'owner', '/admin');
+      const before = await L.apiGet(page, `/api/slides/${keepId}/info`);
+      if (before.status === 200) throw new Error('owner could already read the user slide before grant');
+      const frame = page.frameLocator('#admin-plugin-frame');
+      await frame.locator('.adm-nav-btn[data-page="slides"]').click();
+      const keepRow = frame.locator('#adm-slides-tbody tr', { hasText: `ID ${keepId}` });
+      const delRow = frame.locator('#adm-slides-tbody tr', { hasText: `ID ${delId}` });
+      await keepRow.waitFor({ timeout: 30000 });
+      const keepText = await keepRow.innerText();
+      const delText = await delRow.innerText();
+      if (!/r1-dup-same\.tif/.test(keepText) || !/可用/.test(keepText)) throw new Error(`keep row: ${keepText}`);
+      if (!/r1-dup-same\.tif/.test(delText) || !/已删除/.test(delText)) throw new Error(`deleted row: ${delText}`);
+      const delAdd = delRow.getByRole('button', { name: '加入' });
+      if (await delAdd.isEnabled()) throw new Error('add enabled for deleted asset');
+      const reason = await delAdd.getAttribute('title');
+      if (!/已删除/.test(reason || '')) throw new Error(`reason ${reason}`);
+      const refusal = await page.evaluate(async (sid) => {
+        const m = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
+        const r = await fetch(`/api/admin/v1/slides/${sid}/visibility`, {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': m ? decodeURIComponent(m[1]) : '' },
+          body: JSON.stringify({ granted: true }),
+        });
+        return { status: r.status, body: await r.json().catch(() => null) };
+      }, delId);
+      if (refusal.status !== 409) throw new Error(`deleted grant refusal ${JSON.stringify(refusal)}`);
+      await keepRow.getByRole('button', { name: '加入' }).click();
+      await waitFor(async () => /已加入工作区 r1-dup-same\.tif/.test(await frame.locator('#adm-slides-status').innerText()), 30000, 'grant status');
+      const after = await L.apiGet(page, `/api/slides/${keepId}/info`);
+      const list = await L.apiGet(page, '/api/slides');
+      const listed = JSON.stringify(list.body || '').includes(keepId);
+      if (after.status !== 200 || !listed) throw new Error(`after grant info=${after.status} listed=${listed}`);
+      await keepRow.waitFor({ timeout: 30000 });
+      await frame.locator('#adm-slides-tbody tr', { hasText: `ID ${keepId}` }).getByRole('button', { name: '移除' }).click();
+      await frame.locator('#adm-slides-confirm').getByRole('button', { name: '确认执行' }).click();
+      await waitFor(async () => /已移出工作区/.test(await frame.locator('#adm-slides-status').innerText()), 30000, 'revoke status');
+      record(id, true, {
+        newUploadLabel: 'r1-dup-same.tif + ID', deletedState: '已删除', deletedAddDisabled: true,
+        deletedServerRefusal: refusal.body && (refusal.body.code || (refusal.body.error && refusal.body.error.code)), readBefore: before.status, readAfterGrant: after.status, revoked: true,
+      });
+    } catch (e) {
+      record(id, false, { error: String(e).slice(0, 400) });
+    } finally {
+      await userCtx.context.close();
+      await context.close();
+    }
+  }
+
   const all = [
     ['a-oneclick-order-network', scenarioOneClick],
     ['b1-convert-fail-zero-ingestion', scenarioConvertFail],
@@ -1331,9 +1598,13 @@ async function main() {
     ['l1-project-open-and-ui-delete', scenarioProjectOpenAndUiDelete],
     ['l2-convert-offer-persists-past-60s', scenarioConvertOfferPersists],
     ['l3-drawer-offer-clickable', scenarioDrawerOfferClickable],
+    ['m1-refresh-anon-login-return-upload', scenarioRefreshAnonLoginUpload],
+    ['m2-refresh-failure-cancel-retry', scenarioRefreshFailureRetry],
+    ['m3-waiting-limit-real-endpoint', scenarioWaitingLimitReal],
+    ['n1-admin-slides-display-grant', scenarioAdminSlidesDisplayGrant],
   ];
   for (const [id, fn] of all) {
-    if (ONLY && id !== ONLY) continue;
+    if (ONLY && !ONLY.split(',').includes(id)) continue;
     await fn();
   }
 

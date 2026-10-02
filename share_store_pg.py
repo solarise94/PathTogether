@@ -2357,13 +2357,23 @@ _PROJ_SEL = (
 )
 
 
+# 用户删除（deleting/deleted）的资产不属于项目的活动视图：列表、计数与
+# 选择都不再出现它。project_slides 的成员行与切片墓碑原样保留（历史/审计），
+# 只是不投影。missing/failed 等其它状态照常列出（由前端如实显示不可读）。
+_PROJECT_HIDDEN_ASSET_STATES = ("deleting", "deleted")
+
+
 def _fetch_project(cur, pid):
     cur.execute("SELECT " + _PROJ_SEL + " FROM projects WHERE project_id=%s", (pid,))
     row = cur.fetchone()
     if row is None:
         return None
-    cur.execute("SELECT slide, slide_id FROM project_slides WHERE project_id=%s "
-                "ORDER BY position", (pid,))
+    cur.execute("SELECT ps.slide, ps.slide_id FROM project_slides ps "
+                "LEFT JOIN slides s ON s.slide_id = ps.slide_id "
+                "WHERE ps.project_id=%s "
+                "AND (s.asset_state IS NULL OR NOT (s.asset_state = ANY(%s))) "
+                "ORDER BY ps.position",
+                (pid, list(_PROJECT_HIDDEN_ASSET_STATES)))
     prows = cur.fetchall()
     d = dict(row)
     d["pid"] = pid
@@ -2426,6 +2436,18 @@ def update_project(pid, *, name=None, note=None, slides=None, slide_ids=None):
                 if slides is not None:
                     rows = _project_slide_rows(cur, list(slides or []),
                                                slide_ids)
+                    # 整表替换只针对活动视图：已删除资产的历史成员行不在
+                    # 客户端看到的列表里，替换后按原相对顺序接在末尾保留。
+                    cur.execute(
+                        "SELECT ps.slide, ps.slide_id FROM project_slides ps "
+                        "JOIN slides s ON s.slide_id = ps.slide_id "
+                        "WHERE ps.project_id=%s AND s.asset_state = ANY(%s) "
+                        "ORDER BY ps.position",
+                        (pid, list(_PROJECT_HIDDEN_ASSET_STATES)))
+                    new_ids = {sid for _s, sid in rows if sid}
+                    rows = rows + [(r["slide"], r["slide_id"])
+                                   for r in cur.fetchall()
+                                   if r["slide_id"] not in new_ids]
                     cur.execute("DELETE FROM project_slides WHERE project_id=%s", (pid,))
                     for i, (s, sid) in enumerate(rows):
                         cur.execute(

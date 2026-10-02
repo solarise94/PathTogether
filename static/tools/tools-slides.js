@@ -630,6 +630,32 @@ function renderResultPanel() {
     });
   }
   if (page.uploadCtl) page.uploadCtl.setResultJob(page.readyInfo.jobId);
+  updateUploadCancelVisibility();
+}
+
+/// 任务列表里的上传/继续/取消旧上传：反馈都写在结果面板（#upload-status）
+/// 里——先把面板切到该任务并显示出来（刷新后面板本是隐藏的）。只用该任务
+/// 自己的记录填面板，别的任务的上传状态不会带进来。
+async function selectResultJob(jobId) {
+  let job = (page.lastJobs || []).find((j) => j.id === jobId) || null;
+  if (!job || !job.result) job = await page.runner.getJob(jobId).catch(() => null);
+  if (!job || !job.result || !['ready', 'exported'].includes(job.state)) return;
+  if (!page.readyInfo || page.readyInfo.jobId !== jobId) {
+    page.readyInfo = {
+      jobId,
+      outputBytes: job.result.outputBytes,
+      sha256: job.result.sha256,
+      modality: job.modality,
+      sourceName: job.source && job.source.name,
+      channels: job.result.channels || [],
+    };
+    page.saveMsg = null;
+  }
+  renderResultPanel();
+  renderSaveStatus();
+  if (typeof els.resultSection.scrollIntoView === 'function') {
+    els.resultSection.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
 }
 
 function renderSaveStatus() {
@@ -825,7 +851,8 @@ function updateUploadCancelVisibility() {
     pending = !!(job && job.intent && job.intent.state === 'pending'
       && (!job.upload || job.upload.state !== 'published'));
   }
-  els.uploadCancelBtn.hidden = !(page.uploadCtl.isBusy() || pending);
+  const busyHere = !!page.readyInfo && page.uploadCtl.busyJobId() === page.readyInfo.jobId;
+  els.uploadCancelBtn.hidden = !(busyHere || pending);
 }
 
 async function onJobAction(action, job) {
@@ -959,6 +986,7 @@ async function init() {
     onJobsRefresh: refreshJobs,
     onPublished: (jobId, slideId) => (page.convertUploadCtl
       ? page.convertUploadCtl.handlePublished(jobId, slideId) : undefined),
+    onSelectJob: selectResultJob,
   });
   page.convertUploadCtl = createConvertUploadController({
     runner: page.runner,

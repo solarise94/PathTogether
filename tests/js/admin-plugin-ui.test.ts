@@ -2725,3 +2725,84 @@ describe("访问统计刷新", () => {
     expect(bus2.els["adm-site-card"].hidden).toBe(true);
   });
 });
+
+// --------------------------------------------------------------------------- //
+// R1 跟进（0.4.14）：切片页显示人类可读名 + 资产状态；加入只对可用资产开放，
+// 不可用资产按钮禁用并说明原因；一切操作按 slide_id 寻址。
+// --------------------------------------------------------------------------- //
+describe("切片页：可读名 + 资产状态 + 按 slide_id 操作", () => {
+	const NONCE = "5e".repeat(32);
+	const items = [
+		{ name: "sld_newA", slide_id: "sld_newA", original_filename: "dup.tif", display_name: "",
+			asset_state: "ready", storage_layout: "id_bundle", file_exists: true, servable: true,
+			owner_user_id: "u1", size_bytes: 10, granted_to_owner: false, grant_recorded: false },
+		{ name: "sld_newB", slide_id: "sld_newB", original_filename: "dup.tif", display_name: "",
+			asset_state: "ready", storage_layout: "id_bundle", file_exists: true, servable: true,
+			owner_user_id: "u1", size_bytes: 10, granted_to_owner: true, grant_recorded: true },
+		{ name: "old.svs", slide_id: "sld_old", original_filename: null, display_name: "",
+			asset_state: "legacy", storage_layout: "legacy", file_exists: true, servable: false,
+			owner_user_id: "u1", size_bytes: 10, granted_to_owner: false, grant_recorded: false },
+		{ name: "sld_del", slide_id: "sld_del", original_filename: "gone.tif", display_name: "",
+			asset_state: "deleted", storage_layout: "id_bundle", file_exists: false, servable: false,
+			owner_user_id: "u1", size_bytes: 0, granted_to_owner: false, grant_recorded: false },
+		{ name: "sld_miss", slide_id: "sld_miss", original_filename: "miss.tif", display_name: "",
+			asset_state: "ready", storage_layout: "id_bundle", file_exists: false, servable: false,
+			owner_user_id: "u1", size_bytes: 0, granted_to_owner: false, grant_recorded: true },
+		{ name: "orphan.svs", slide_id: null, asset_state: null, unregistered: true,
+			file_exists: true, servable: false, size_bytes: 5, granted_to_owner: false, grant_recorded: false },
+	];
+
+	async function bootSlides() {
+		const bus = loadPluginUiWithBus();
+		bus.dispatch(bus.parent, {
+			kind: "init", bridge: "admin", protocolVersion: "1.0.0", nonce: NONCE,
+			adminPermissions: ["admin:overview:read", "admin:slides:read", "admin:slides:write"],
+		});
+		bus.client!.showPage("slides");
+		await ticks(4);
+		replyMethod(bus, NONCE, "admin.slides.inventory", {
+			ok: true, result: { items, next_cursor: null },
+		});
+		await ticks(4);
+		return bus;
+	}
+
+	it("表格显示原始文件名与 slide_id、各类资产状态；不只是裸 sld_ 标识", async () => {
+		const bus = await bootSlides();
+		const tbody = bus.els["adm-slides-tbody"].textContent;
+		expect(tbody).toContain("dup.tif");
+		expect(tbody).toContain("ID sld_newA");
+		expect(tbody).toContain("ID sld_newB");
+		expect(tbody).toContain("old.svs");
+		for (const s of ["可用", "旧资产（未迁移）", "已删除", "文件缺失", "未登记文件"]) {
+			expect(tbody).toContain(s);
+		}
+		expect(tbody).toContain("有授权记录（资产当前不可用，未生效）");
+		expect(htmlSrc).toMatch(/<th>切片名<\/th>\s*<th>资产状态<\/th>/);
+	});
+
+	it("加入只对可用资产开放；不可用资产按钮禁用并写明原因；加入按 slide_id 发请求", async () => {
+		const bus = await bootSlides();
+		const btns = bus.created.filter((e) => e.tagName === "BUTTON");
+		const add = btns.filter((b) => b.textContent === "加入");
+		const enabled = add.filter((b) => !b.disabled);
+		const disabled = add.filter((b) => b.disabled);
+		expect(enabled).toHaveLength(1);                      // sld_newA
+		expect(disabled).toHaveLength(3);                     // legacy / deleted / unregistered
+		const titles = disabled.map((b) => (b as unknown as { title: string }).title);
+		expect(titles.some((t) => t.includes("尚未迁移"))).toBe(true);
+		expect(titles.some((t) => t.includes("已删除"))).toBe(true);
+		expect(titles.some((t) => t.includes("没有资产记录"))).toBe(true);
+		expect(bus.els["adm-slides-tbody"].textContent).toContain("尚未迁移，迁移后才能加入");
+		// 已加入的可移除；失效授权（文件缺失）可移除授权记录
+		expect(btns.some((b) => b.textContent === "移除")).toBe(true);
+		expect(btns.some((b) => b.textContent === "移除授权记录")).toBe(true);
+
+		enabled[0]._fire("click");
+		await ticks(2);
+		const req = bus.parentPosted
+			.filter((p) => p.env.kind === "request" && p.env.method === "admin.slides.setVisibility")
+			.at(-1);
+		expect(req!.env.payload).toEqual({ name: "sld_newA", granted: true });
+	});
+});

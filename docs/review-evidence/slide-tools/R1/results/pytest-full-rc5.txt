@@ -1,0 +1,6 @@
+FAILED tests/test_admin_preview.py::test_subject_visibility_applies_during_preview - AssertionError: assert set() == {'owner.svs'}
+FAILED tests/test_admin_preview.py::test_write_guard_blocks_all_unsafe_methods - AssertionError: POST /api/upload -> 404
+FAILED tests/test_admin_preview.py::test_cannot_preview_disabled_user - AssertionError: assert set() == {'o.svs'}
+3 failed, 2877 passed, 10 skipped, 1 deselected, 252 warnings in 1933.01s (0:32:13)
+--- plugin (baidu-import)
+83 passed in 63.70s (0:01:03)

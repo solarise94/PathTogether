@@ -14,7 +14,7 @@ use slide_transform_core::io::{
 };
 use slide_transform_core::job::{CancelFlag, CheckpointState, JobControl, NullProgress};
 use slide_transform_core::kfb::MAGIC as KFB_MAGIC;
-use slide_transform_core::plan::{InputIdentity, TransformPlan};
+use slide_transform_core::plan::{InputIdentity, OutputProfile, TransformPlan};
 use slide_transform_core::resume::{parse_resume_json, ResumePoint};
 use slide_transform_core::synth_gen::build_synthetic_kfb;
 use slide_transform_core::validate::validate_output;
@@ -73,6 +73,10 @@ fn truncate_file(p: &std::path::Path, len: u64) {
 /// complete, then resume from the last checkpoint = finalize-phase crash);
 /// the resumed output must equal the uninterrupted bytes.
 fn bf_case(width: u32, height: u32, stop: Option<usize>) {
+    bf_case_profile(width, height, stop, OutputProfile::ClassicJpegBigTiff);
+}
+
+fn bf_case_profile(width: u32, height: u32, stop: Option<usize>, profile: OutputProfile) {
     let dir = tmpdir("bf");
     let src_path = dir.join("in.kfb");
     let mut sink = FileSink::create(&src_path).unwrap();
@@ -85,7 +89,11 @@ fn bf_case(width: u32, height: u32, stop: Option<usize>) {
     sink.flush().unwrap();
     drop(sink);
 
-    let plan = || TransformPlan::brightfield(InputIdentity::default());
+    let plan = || {
+        let mut p = TransformPlan::brightfield(InputIdentity::default());
+        p.profile = profile;
+        p
+    };
 
     // reference run
     let ref_out = dir.join("ref.tif");
@@ -220,6 +228,18 @@ fn bf_resume_finalize_phase_crash() {
     // complete payload phase, "crash" during finalize: resume from the last
     // checkpoint must re-run finish() and stay byte-identical
     bf_case(300, 300, None);
+}
+
+#[test]
+fn bf_ome_resume_matches_uninterrupted() {
+    // RGB OME profile: same crash points; the SubIFD layout is rebuilt at
+    // finish from the committed per-level streams
+    for k in [1usize, 2] {
+        bf_case_profile(300, 300, Some(k), OutputProfile::OmeBigTiffRgbSubifd);
+    }
+    bf_case_profile(300, 300, None, OutputProfile::OmeBigTiffRgbSubifd);
+    bf_case_profile(700, 500, Some(2), OutputProfile::OmeBigTiffRgbSubifd);
+    bf_case_profile(700, 500, Some(3), OutputProfile::OmeBigTiffRgbSubifd);
 }
 
 #[test]

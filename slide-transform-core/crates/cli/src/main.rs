@@ -1,11 +1,15 @@
 //! `slide-transform` — native CLI over the shared transform core.
 //!
 //!   slide-transform probe <input> [--sha256]
-//!   slide-transform convert <input> <output> [--profile auto|bf-classic|fl-ome]
+//!   slide-transform convert <input> <output> [--profile auto|bf-classic|bf-ome|fl-ome]
 //!                           [--policy allow-edge|strict-lossless]
 //!                           [--channel-json PATH] [--timeout SECONDS]
 //!                           [--max-output-bytes N] [--min-free-bytes N]
 //!                           [--overwrite]
+//!
+//! `--profile auto` keeps the historical mapping (KFB → bf-classic, KFBF →
+//! fl-ome) because unattended callers (the Baidu import plugin worker) name
+//! their outputs from it; the browser tool chooses bf-ome explicitly.
 //!
 //! Both commands print a single JSON object to stdout; errors print
 //! {"error":{"code","message"}} and exit 1. The converter writes
@@ -21,7 +25,9 @@ use slide_transform_core::io::{ByteSource, FileScratch, FileSink, FileSource, Ra
 use slide_transform_core::job::{JobControl, NullProgress};
 use slide_transform_core::kfb::MAGIC as KFB_MAGIC;
 use slide_transform_core::kfbf::KFBF_MAGIC;
-use slide_transform_core::plan::{InputIdentity, PixelPolicy, ResourceLimits, TransformPlan};
+use slide_transform_core::plan::{
+    InputIdentity, OutputProfile, PixelPolicy, ResourceLimits, TransformPlan,
+};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -329,6 +335,8 @@ fn cmd_validate(args: &[String]) -> Result<String, CoreError> {
         jstr("sha256", &out.sha256),
         ju("size", out.size),
         ju("ifd_count", out.ifd_count as u64),
+        ju("main_ifds", out.main_ifds as u64),
+        ju("sub_ifds", out.sub_ifds as u64),
         ju("tile_records", out.tile_records),
         jarr(
             "checks",
@@ -435,12 +443,13 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
         }
     }
 
-    let is_fl = match profile.as_str() {
-        "fl-ome" => true,
-        "bf-classic" => false,
-        "auto" => magic == KFBF_MAGIC,
-        _ => return Err(CoreError::validation(format!("未知 profile {profile}"))),
+    let out_profile = match profile.as_str() {
+        "auto" if magic == KFBF_MAGIC => OutputProfile::OmeBigTiffSubifd,
+        "auto" => OutputProfile::ClassicJpegBigTiff,
+        id => OutputProfile::from_id(id)
+            .ok_or_else(|| CoreError::validation(format!("未知 profile {profile}")))?,
     };
+    let is_fl = !out_profile.is_brightfield();
     let pixel_policy = match policy.as_str() {
         "allow-edge" => PixelPolicy::AllowEdgeReencode,
         "strict-lossless" => PixelPolicy::StrictLossless,
@@ -486,9 +495,10 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
             companion.as_ref(),
         )
     } else {
-        let plan = TransformPlan::brightfield(identity)
+        let mut plan = TransformPlan::brightfield(identity)
             .with_policy(pixel_policy)
             .with_limits(limits);
+        plan.profile = out_profile;
         slide_transform_core::convert_bf::convert_kfb_to_bigtiff(
             &src,
             &mut sink,
@@ -619,6 +629,7 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
         jstr("tool", "slide-transform"),
         jstr("core_version", slide_transform_core::CORE_VERSION),
         ju("plan_version", result.plan_version as u64),
+        jstr("output_profile", out_profile.id()),
         jstr("format", result.format),
         jstr("output", &output.display().to_string()),
         ju("output_bytes", result.output_bytes),

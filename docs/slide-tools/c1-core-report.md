@@ -181,6 +181,17 @@ Decision: brightfield stays `ClassicJpegBigTiff`. If a future Bio-Formats
 pipeline needs resolution grouping, a SubIFD profile can be added behind
 `OutputProfile` without touching the classic path (open item, §9).
 
+> **Superseded 2026-10-02** — see `bf-ome-acceptance-report.md`. Point 2
+> turned out to matter to users: QuPath picks Bio-Formats by default and
+> exposes the classic chain as a single resolution. A SubIFD profile
+> `OmeBigTiffRgbSubifd` (`bf-ome`, format
+> `ome-bigtiff-subifd-rgb-jpeg-pyramid`) was added exactly as anticipated
+> above and is now the default for *new* browser brightfield jobs. The
+> classic writer is untouched (classic sha256 unchanged on every fixture);
+> the byte-parity gate for `bf-ome` is browser == native, and its tile
+> payload stream is byte-identical to classic at the same offsets. The CLI
+> `--profile auto` still produces classic for KFB.
+
 ## 6. License review (hard requirement)
 
 **jpeg-encoder 0.6** (the C0 spike's encoder) is licensed

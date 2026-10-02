@@ -1,13 +1,14 @@
 # Brightfield pyramidal OME-BigTIFF (`bf-ome`) — implementation & acceptance report
 
-Date: 2026-10-02 · Branch `bf-ome-tiff` (local commits, not pushed, not deployed)
+Date: 2026-10-02, updated 2026-10-03 · Branch `bf-ome-tiff`, integrated into `release/r1` locally (not pushed, not deployed)
 Host: Linux x86_64 (Ubuntu 26.04.1), 18 GiB RAM.
 
 Privacy: real samples are referred to only by alias and sha256. **KFB-1** = first
 `*.kfb` of the private sample folder (C1/C2 alias); **KFB-Q** = the brightfield
 sample of the 2026-10-02 QuPath investigation; **KFBF-A..D** = fluorescence
 samples (C1 aliases). No sample bytes, names, scanner identifiers or screenshots
-are committed; raw evidence stays under the git-ignored-by-convention `.gate-tmp/`.
+are committed; raw evidence stays in the untracked `.gate-tmp/` working area,
+which is never added to commits.
 
 ## 0. Verdict
 
@@ -15,7 +16,11 @@ are committed; raw evidence stays under the git-ignored-by-convention `.gate-tmp
 |---|---|---|
 | A. QuPath **default** opening, Linux x86_64, 0.6.0-rc5 / 0.6.0 / 0.7.0 | **PASS** | §4.1 — Bio-Formats chosen by default, all resolutions, regions at every level pixel-identical to classic, project save/reopen |
 | A. Bio-Formats grouping checked explicitly | **PASS** | §4.1 — `OMETiffReader`, 1 series, N resolutions, 1 channel × 3 samples |
-| A. QuPath on macOS ARM64 | **EXTERNAL — not run** | §9 |
+| A. QuPath on macOS ARM64 — opens by default with the full pyramid and metadata | **CONFIRMED by user** (screenshot, 2026-10-03) | §4.2 |
+| A. QuPath on macOS ARM64 — full-resolution colour/texture, project save/reopen | **PENDING (user manual check)** | §4.2, §9 |
+| A. QuPath on Windows | **PENDING (external)** | §9 |
+| Real OS save dialog (filter, suggested name) | **PENDING (user manual check)** — tests stub the picker | §9 |
+| Real 4 GB / 8 GB devices | **PENDING (external)** — memory figures are cgroup simulations | §6.1, §9 |
 | B. Payload / pixel / metadata preservation | **PASS** | §5 |
 | B. Browser output byte-equal to native | **PASS** | §6 (synthetic, KFB-1, 4.4 GiB, 9.8 GiB) |
 | C. Browser flows (local convert/export, refresh/resume, cancel, interrupted finalize, one-click convert-and-upload, >4 GiB, low memory, oversize save) | **PASS** (cgroup-simulated memory, see caveats) | §6 |
@@ -185,9 +190,43 @@ OME-XML schema: both OME-XML documents validate against the released OME
 2016-06 `ome.xsd` (JDK validator) and Bio-Formats `XMLTools.validateXML`
 ("No validation errors found").
 
-### 4.2 Not run here
+### 4.2 macOS ARM64 (user's original installation)
 
-macOS ARM64 QuPath (and Windows) — **external check**, see §9.
+Run by the user on the macOS ARM64 installation where the classic output had
+shown a single resolution; nothing could be run from this Linux host.
+
+* **First attempt — failed.** The first copy downloaded to the Mac did not
+  open ("No supported image reader found"; QuPath log: `IOException: Unable to
+  open` from `ImageServers.getAllImageSupports`). Its SHA-256 was
+  `676fb2ef921d4d608c1777e3e32f914f34dd7ee1afd72e9d8c00eeb024a50a2a`, which
+  differs from the verified artifact (165 940 628 B, SHA-256
+  `14b71b615c6ad7fc6553d3e5cc7b3e9e72f9bd79111803527cd1c41550e56021`, first
+  bytes `49 49 2b 00 08 00 00 00` = little-endian BigTIFF). The cause of the
+  byte difference is **unknown**: the failing bytes and their transfer
+  provenance were not available for analysis, so neither transfer damage nor a
+  converter defect is established. No converter change was made on the basis
+  of this observation.
+* **Retransmission — opens.** The verified artifact was copied again for
+  transfer (sender-side rehash `14b71b61…`, 165 940 628 B). The user reports
+  that this copy opens on the same installation, without changing
+  preferences. The user's screenshot of QuPath's Image tab shows:
+
+  | Field | Value | Matches expected |
+  |---|---|---|
+  | Server type | Bio-Formats | yes |
+  | Pixel type | uint8 (rgb) | yes |
+  | Width × height | 34043 × 45101 px | yes |
+  | Dimensions (CZT) | 3 × 1 × 1 (RGB samples) | yes |
+  | Magnification | 20.0 | yes |
+  | Pixel width / height | 0.4841 µm / 0.4841 µm | yes |
+  | Pyramid | 1 2 4 8 16 32 64 128 256 (9 levels) | yes |
+
+  The "Image type: Brightfield (H-DAB)" and stain vectors in the same
+  screenshot are QuPath's own image-type estimate, not file metadata. The Mac
+  QuPath version was not recorded.
+* **Still pending (user):** full-resolution colour/texture inspection on
+  tissue and project save → close → reopen on the Mac. These are not marked
+  passed.
 
 ## 5. B — Preservation (KFB-Q real sample; synthetic 9.8 GiB)
 
@@ -311,22 +350,20 @@ the platform-chain tests above, and the C2 profile scenarios.
 
 ## 9. Remaining external checks (not passes)
 
-1. QuPath on **macOS ARM64** (0.6.0-rc5 and 0.7.0), on the installation where
-   the problem was first seen, with the reviewer's file `user-bfome.ome.tif`
-   (sha256 `14b71b615c6ad7fc6553d3e5cc7b3e9e72f9bd79111803527cd1c41550e56021`).
-   Without changing preferences: drag the file into a new project → Image tab
-   shows server Bio-Formats, 9 pyramid levels (Image › Server / pyramid
-   info), pixel size ≈ 0.4841 µm, magnification 20; zoom from overview to
-   full resolution on tissue, colors normal H&E; save, close and reopen the
-   project and repeat. If QuPath is scriptable there, the same
-   `scripts/qupath-probe/run_probe.sh <QuPath.app/Contents> …` gate can run
-   (launcher path differs on macOS). Not runnable on this Linux host.
+1. QuPath on **macOS ARM64** — remaining parts only (opening, reader,
+   pyramid and calibration are confirmed in §4.2): with the verified file
+   (SHA-256 `14b71b61…`, check the hash on the Mac first), zoom from overview
+   to full resolution on tissue and confirm normal H&E colour and texture;
+   save the project, close QuPath, reopen the project and confirm the same
+   server, 9 levels and calibration. Record the QuPath version. A browser
+   conversion saved through the real macOS save dialog should go through the
+   same steps (release checklist).
 2. QuPath on Windows (same steps).
 3. Real OS save dialog: the tests stub `showSaveFilePicker`; the filter text
    "OME-TIFF (.ome.tif)" and the suggested name must be checked by hand in
    Chrome/Edge on Windows/macOS.
 4. Real 4 GB / 8 GB devices (memory numbers above are cgroup simulations).
-5. Production deployment and production upload/viewing (out of scope here).
+5. Production deployment and production upload/viewing (release checklist; not run here).
 
 ## 10. Commits (branch `bf-ome-tiff`, on top of `c914f23`)
 

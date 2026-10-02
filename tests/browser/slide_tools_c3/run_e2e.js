@@ -545,6 +545,11 @@ async function scenarioL() {
     await waitVisible(page, '#probe-section:not([hidden])');
     await page.click('#convert-btn');
     await waitVisible(page, '#result-section:not([hidden])');
+    // 本场景验证 zh → en → zh：起点须是 zh（--locale 覆盖成英文时先切回 zh）
+    if (await page.evaluate(() => document.documentElement.lang) !== 'zh-CN') {
+      await page.click('.lang-toggle');
+      await page.waitForFunction(() => document.documentElement.lang === 'zh-CN');
+    }
     await page.click('.lang-toggle');
     await page.waitForFunction(() => document.documentElement.lang === 'en');
     await L.shot(page, 'en-locale');

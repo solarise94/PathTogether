@@ -20,7 +20,7 @@
 // gated behind init{testMode:true} and inert in production.
 
 import init, {
-  probe, convert, convertResume, finalizeValidate, sha256Source,
+  probe, convertProfile, convertResumeProfile, finalizeValidate, sha256Source,
   coreVersion, configure, enableCheckpoint,
 } from './slide_transform.js';
 import * as E from './engine.js';
@@ -597,6 +597,7 @@ async function runJob(msg) {
     t: 'gen', gen, identity: opts.identity || null,
     core: opts.coreVersion, plan: 1,
     policy: opts.policy, profile: profile.id,
+    outputProfile: opts.outputProfile,
     cap: opts.outputCapBytes || null,
     resume: resume ? resume.st : null,
   });
@@ -623,14 +624,16 @@ async function runJob(msg) {
 
   const strict = opts.policy === 'strict-lossless';
   const channelJson = opts.channelJson || '';
+  // the core refuses to continue a checkpoint journalled under another profile
+  const outputProfile = opts.outputProfile || '';
   const t0 = Date.now();
   post({ type: 'phase', phase: 'pre-convert', ms: Date.now() - tJobStart });
   post({ type: 'state', state: 'running' });
   let conv;
   try {
     conv = resume
-      ? convertResume(JSON.stringify(resume.st), strict, channelJson)
-      : convert(strict, channelJson);
+      ? convertResumeProfile(JSON.stringify(resume.st), outputProfile, strict, channelJson)
+      : convertProfile(outputProfile, strict, channelJson);
   } catch (e) {
     conv = JSON.stringify(E.stError('io_recoverable', `wasm 异常: ${E.errText(e)}`));
   }
@@ -662,8 +665,8 @@ async function runJob(msg) {
 
   post({ type: 'state', state: 'validating' });
   post({ type: 'phase', phase: 'validate-start', ms: Date.now() - tJobStart });
-  const vJson = JSON.parse(finalizeValidate(
-    opts.modality === 'fluorescence' ? 0 : (convJson.ifd_count | 0)));
+  // ifd_count covers the main chain and every SubIFD for all profiles
+  const vJson = JSON.parse(finalizeValidate(convJson.ifd_count | 0));
   const wasmHeapPeak = Math.max(running.wasmHeapPeak, mem().buffer.byteLength);
 
   closeAllHandles();

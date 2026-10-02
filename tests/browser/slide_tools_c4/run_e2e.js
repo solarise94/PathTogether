@@ -79,7 +79,8 @@ async function main() {
       await waitFor(async () => /已发布|Published/.test(await textOf(page, '#upload-status')), 60000, 'published');
       if (fake.st.creates.length !== 1) throw new Error(`creates=${fake.st.creates.length}`);
       const name = fake.st.creates[0].filename;
-      const wantExt = modality === 'fl' ? '.ome.tif' : '.tif';
+      // both modalities now produce OME (brightfield: RGB OME profile)
+      const wantExt = '.ome.tif';
       if (!name.endsWith(wantExt)) throw new Error(`filename ${name} should end ${wantExt}`);
       const putBytes = fake.st.puts.reduce((s, p) => s + p.bytes, 0);
       if (putBytes !== before.size) throw new Error(`PUT bytes ${putBytes} != ${before.size}`);
@@ -269,6 +270,7 @@ async function main() {
             max_concurrent_parts: 2, sign_batch_max_parts: 4, policy_version: 'v1-manual',
           },
           viewable_formats: ['classic-bigtiff-jpeg-pyramid',
+            'ome-bigtiff-subifd-rgb-jpeg-pyramid',
             'ome-bigtiff-subifd-multichannel-jpeg-passthrough'],
         },
       });

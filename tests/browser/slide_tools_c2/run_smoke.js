@@ -20,7 +20,7 @@ async function main() {
     execFileSync(L.CLI, ['gen-kfb', kfb, '--width', '580', '--height', '300'], { stdio: 'inherit' });
   }
   const nativeOut = path.join(fixtureDir, 'bf-native.tif');
-  execFileSync(L.CLI, ['convert', kfb, nativeOut, '--overwrite']);
+  execFileSync(L.CLI, ['convert', kfb, nativeOut, '--overwrite', '--profile', 'bf-ome']);
   const nativeSha = await L.sha256File(nativeOut);
 
   const server = await L.startServer(PORT);

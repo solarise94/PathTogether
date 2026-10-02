@@ -57,6 +57,9 @@ async function ensureRunner() {
 
 let skipDiskPrecheck = false;
 let preparedJobId = null;
+// output layout for the next start/resume call (undefined = runner default /
+// the job's saved profile); set per __c2 call, never sticky
+let outputProfileOpt;
 
 function opts() {
   // scripting defaults: reads the selects only for manual clicking — the
@@ -67,6 +70,7 @@ function opts() {
   return {
     profileId: profileSel === 'auto' ? undefined : profileSel,
     policy: policySel || 'allow-edge',
+    outputProfile: outputProfileOpt,
     faults: faults || undefined,
     jobId: currentJob || undefined,
     // test runs on a fresh profile hit Chromium's capped quota report;
@@ -125,6 +129,7 @@ window.__c2 = {
     return r;
   },
   async start(o = {}) {
+    outputProfileOpt = o.outputProfile || undefined;
     if (o.profileId) document.getElementById('profile').value = o.profileId;
     if (o.policy) document.getElementById('policy').value = o.policy;
     else document.getElementById('policy').value = 'allow-edge';
@@ -134,6 +139,7 @@ window.__c2 = {
     return start();
   },
   async resume(o = {}) {
+    outputProfileOpt = o.outputProfile || undefined;
     if (o.profileId) document.getElementById('profile').value = o.profileId;
     if (o.policy) document.getElementById('policy').value = o.policy;
     else document.getElementById('policy').value = 'allow-edge';
@@ -144,6 +150,7 @@ window.__c2 = {
   cancel: cancel,
   exportToOpfs: exportToOpfs,
   async tryResume(o = {}) {
+    outputProfileOpt = o.outputProfile || undefined;
     if (o.jobId) currentJob = o.jobId;
     // snapshot BOTH selects so refusal probes leave no UI-state residue
     const profEl = document.getElementById('profile');
@@ -163,6 +170,7 @@ window.__c2 = {
     }
   },
   async tryStart(o = {}) {
+    outputProfileOpt = o.outputProfile || undefined;
     if (o.profileId) document.getElementById('profile').value = o.profileId;
     document.getElementById('policy').value = o.policy || 'allow-edge';
     faults = o.faults || null;
@@ -287,6 +295,36 @@ window.__c2 = {
     const prev = await engine.readSlotRecord(dir, 'job');
     await engine.writeSlotRecord(dir, 'job', { ...prev, ...patch });
     return true;
+  },
+  async legacyizeJob(id = currentJob) {
+    // test hook: make a job look like it was written before output profiles
+    // existed — no outputProfile in the record, no outputProfile/profile in
+    // the journal generations and committed states
+    const root = await navigator.storage.getDirectory();
+    const jobs = await root.getDirectoryHandle('slide-jobs');
+    const dir = await jobs.getDirectoryHandle(id);
+    const engine = await import('/tools/engine.js');
+    const prev = await engine.readSlotRecord(dir, 'job');
+    const rec = { ...prev };
+    delete rec.outputProfile;
+    await engine.writeSlotRecord(dir, 'job', rec);
+    const fh = await dir.getFileHandle('journal.jsonl');
+    const text = new TextDecoder().decode(await (await fh.getFile()).arrayBuffer());
+    const { records } = engine.decodeJournal(text);
+    const strip = (st) => { if (st) delete st.profile; return st; };
+    const out = records.map((r) => {
+      const o = { ...r };
+      delete o.rc;
+      if (o.t === 'gen') { delete o.outputProfile; strip(o.resume); }
+      if (o.t === 'c') strip(o.st);
+      return engine.encodeJournalRecord(o);
+    }).join('');
+    // a terminated worker's sync handle on the journal can linger briefly
+    const w = await engine.withRetry(() => fh.createWritable({ keepExistingData: false }),
+      { attempts: 20, delayMs: 300, name: 'legacyize journal' });
+    await w.write(out);
+    await w.close();
+    return { records: records.length };
   },
   deviceMemory: navigator.deviceMemory,
   hardwareConcurrency: navigator.hardwareConcurrency,

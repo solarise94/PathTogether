@@ -64,6 +64,7 @@ function savePickerStub() {
       value: async (opts) => {
         window.__pickerCalled = (window.__pickerCalled || 0) + 1;
         window.__pickerSuggested = opts && opts.suggestedName || null;
+        window.__pickerTypes = opts && opts.types || null;
         const root = await navigator.storage.getDirectory();
         return root.getFileHandle('__saved-output.bin', { create: true });
       },
@@ -120,8 +121,12 @@ async function sha256File(p) {
   });
 }
 
+/// Native reference for the page's default output: brightfield inputs use
+/// bf-ome (the browser default for new jobs) unless `extra` names a profile.
 function nativeConvert(input, output, extra = []) {
-  execFileSync(CLI, ['convert', input, output, '--overwrite', ...extra]);
+  const profile = extra.includes('--profile') ? []
+    : ['--profile', /\.kfbf$/i.test(input) ? 'fl-ome' : 'bf-ome'];
+  execFileSync(CLI, ['convert', input, output, '--overwrite', ...profile, ...extra]);
   return output;
 }
 

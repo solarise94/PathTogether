@@ -538,6 +538,8 @@ async function driveConversion() {
         outputBytes: result.result.output_bytes,
         sha256: result.validation && result.validation.sha256,
         modality: probeDoc().modality,
+        outputProfile: result.result.output_profile || null,
+        result: { format: result.result.format || null },
         sourceName: page.file.name,
         channels: result.result.channels || [],
       };
@@ -609,8 +611,7 @@ async function onCancel() {
 
 function suggestedOutputName() {
   if (!page.readyInfo) return 'output.tif';
-  const base = (page.readyInfo.sourceName || 'slide').replace(/\.(kfb|kfbf)$/i, '');
-  return page.readyInfo.modality === 'fluorescence' ? `${base}.ome.tif` : `${base}.tif`;
+  return E.outputFileName(page.readyInfo.sourceName, page.readyInfo);
 }
 
 function renderResultPanel() {
@@ -618,6 +619,8 @@ function renderResultPanel() {
   els.resultSection.hidden = false;
   const g = els.resultGrid;
   g.textContent = '';
+  dlRow(g, t('tools.result.format'),
+    t(`tools.result.format.${E.jobOutputProfile(page.readyInfo)}`), 'result-format');
   dlRow(g, t('tools.result.size'), fmtBytes(page.readyInfo.outputBytes), 'result-size');
   dlRow(g, t('tools.result.sha256'), String(page.readyInfo.sha256 || '—'), 'result-sha');
   if (page.readyInfo.modality === 'fluorescence') {
@@ -646,6 +649,8 @@ async function selectResultJob(jobId) {
       outputBytes: job.result.outputBytes,
       sha256: job.result.sha256,
       modality: job.modality,
+      outputProfile: job.outputProfile || null,
+      result: { format: job.result.format || null },
       sourceName: job.source && job.source.name,
       channels: job.result.channels || [],
     };
@@ -684,10 +689,7 @@ async function onSave() {
     // 必须在用户手势内请求 picker（Chromium 手势约束）
     const handle = await window.showSaveFilePicker({
       suggestedName: suggestedOutputName(),
-      types: [{
-        description: 'TIFF',
-        accept: { 'image/tiff': ['.tif', '.tiff'] },
-      }],
+      types: E.saveFileTypes(page.readyInfo),
     });
     const r = await page.runner.exportJob(page.readyInfo.jobId, () => handle.createWritable());
     page.saveMsg = { key: 'tools.result.save.done', vars: { bytes: fmtBytes(r.exportedBytes) } };
@@ -875,10 +877,9 @@ async function onJobAction(action, job) {
     }
     if (action === 'export') {
       if (typeof window.showSaveFilePicker !== 'function') return;
-      const base = (job.source && job.source.name || 'slide').replace(/\.(kfb|kfbf)$/i, '');
       const handle = await window.showSaveFilePicker({
-        suggestedName: job.modality === 'fluorescence' ? `${base}.ome.tif` : `${base}.tif`,
-        types: [{ description: 'TIFF', accept: { 'image/tiff': ['.tif', '.tiff'] } }],
+        suggestedName: E.outputFileName(job.source && job.source.name, job),
+        types: E.saveFileTypes(job),
       });
       const r = await page.runner.exportJob(job.id, () => handle.createWritable());
       page.saveMsg = { key: 'tools.result.save.done', vars: { bytes: fmtBytes(r.exportedBytes) } };
@@ -915,6 +916,8 @@ async function onJobAction(action, job) {
           outputBytes: result.result.output_bytes,
           sha256: result.validation && result.validation.sha256,
           modality: job.modality,
+          outputProfile: result.result.output_profile || job.outputProfile || null,
+          result: { format: result.result.format || null },
           sourceName: job.source && job.source.name,
           channels: result.result.channels || [],
         };

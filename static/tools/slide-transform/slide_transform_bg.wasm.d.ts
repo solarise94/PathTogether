@@ -3,7 +3,9 @@
 export const memory: WebAssembly.Memory;
 export const configure: (a: number) => void;
 export const convert: (a: number, b: number, c: number) => [number, number];
+export const convertProfile: (a: number, b: number, c: number, d: number, e: number) => [number, number];
 export const convertResume: (a: number, b: number, c: number, d: number, e: number) => [number, number];
+export const convertResumeProfile: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number];
 export const coreVersion: () => [number, number];
 export const enableCheckpoint: () => void;
 export const enableSourceHash: () => void;

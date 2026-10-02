@@ -55,10 +55,13 @@ async function prepareFixtures() {
   if (!fs.existsSync(bf)) execFileSync(L.CLI, ['gen-kfb', bf, '--width', '700', '--height', '500']);
   if (!fs.existsSync(bf2)) execFileSync(L.CLI, ['gen-kfb', bf2, '--width', '1600', '--height', '1200']);
   if (!fs.existsSync(fl)) execFileSync(L.CLI, ['gen-kfbf', fl, '--width', '600', '--height', '400']);
+  // brightfield references use the browser's default for new jobs (bf-ome);
+  // `bfClassic` is the classic profile kept for legacy/compatibility jobs
   const native = {};
-  for (const [k, p] of [['bf', bf], ['bf2', bf2], ['fl', fl]]) {
+  for (const [k, p, prof] of [['bf', bf, 'bf-ome'], ['bf2', bf2, 'bf-ome'],
+    ['bfClassic', bf, 'bf-classic'], ['fl', fl, 'fl-ome']]) {
     const out = path.join(dir, `${k}-native.tif`);
-    execFileSync(L.CLI, ['convert', p, out, '--overwrite']);
+    execFileSync(L.CLI, ['convert', p, out, '--overwrite', '--profile', prof]);
     native[k] = await L.sha256File(out);
   }
   return { bf, bf2, fl, native, dir };
@@ -440,6 +443,52 @@ function makeScenarios(F) {
     return { done, sha: await shaOf(page, jobId), expect: F.native.bf2 };
   }]);
 
+  S.push(['classic-profile-resume-matches', async (page) => {
+    const b = await begin(page, F.bf, { profileId: 'saver', outputProfile: 'bf-classic', faults: { crashAtWrite: 5 } }); const jobId = b.jobId; const base = b.base;
+    await waitForFault(page, 'crashAtWrite', base, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    await page.evaluate((id) => window.__c2.resume({ jobId: id }), jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    const rec = await page.evaluate((id) => window.__c2.jobRecord(id), jobId);
+    return { done, outputProfile: rec.outputProfile, format: rec.result && rec.result.format,
+      sha: await shaOf(page, jobId), expect: F.native.bfClassic };
+  }]);
+
+  S.push(['output-profile-change-refused', async (page) => {
+    // default new job = bf-ome; a resume asking for classic must be refused
+    const b = await begin(page, F.bf, { profileId: 'saver', faults: { crashAtWrite: 6 } }); const jobId = b.jobId; const base = b.base;
+    await waitForFault(page, 'crashAtWrite', base, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    const rec0 = await page.evaluate((id) => window.__c2.jobRecord(id), jobId);
+    const change = await page.evaluate((id) => window.__c2.tryResume({ jobId: id, outputProfile: 'bf-classic' }), jobId);
+    // record tampered to claim another profile than the journal → refused
+    await page.evaluate(() => window.__c2.tamperJobRecord({ outputProfile: 'bf-classic' }));
+    const mismatch = await page.evaluate((id) => window.__c2.tryResume({ jobId: id }), jobId);
+    await page.evaluate(() => window.__c2.tamperJobRecord({ outputProfile: 'bf-ome' }));
+    await page.evaluate((id) => window.__c2.resume({ jobId: id }), jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    return { recProfile: rec0.outputProfile, change, mismatch, done,
+      sha: await shaOf(page, jobId), expect: F.native.bf };
+  }]);
+
+  S.push(['legacy-record-resumes-classic', async (page) => {
+    // a job paused by a pre-profile build: record + journal carry no profile;
+    // its partial output is classic and must be finished as classic
+    const b = await begin(page, F.bf, { profileId: 'saver', outputProfile: 'bf-classic', faults: { crashAtWrite: 5 } }); const jobId = b.jobId; const base = b.base;
+    await waitForFault(page, 'crashAtWrite', base, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    const legacy = await page.evaluate((id) => window.__c2.legacyizeJob(id), jobId);
+    const rec0 = await page.evaluate((id) => window.__c2.jobRecord(id), jobId);
+    const listed = await page.evaluate((id) => window.__c2.getJob(id), jobId);
+    const asOme = await page.evaluate((id) => window.__c2.tryResume({ jobId: id, outputProfile: 'bf-ome' }), jobId);
+    await page.evaluate((id) => window.__c2.resume({ jobId: id }), jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    const rec = await page.evaluate((id) => window.__c2.jobRecord(id), jobId);
+    return { legacy, recHadProfile: 'outputProfile' in rec0, listedProfile: listed && listed.outputProfile,
+      asOme, done, format: rec.result && rec.result.format,
+      sha: await shaOf(page, jobId), expect: F.native.bfClassic };
+  }]);
+
   S.push(['fl-resume-matches', async (page) => {
     const b = await begin(page, F.fl, { profileId: 'saver', faults: { crashAtWrite: 6 } }); const jobId = b.jobId; const base = b.base;
     await waitForFault(page, 'crashAtWrite', base, jobId);
@@ -510,6 +559,24 @@ function verdict(name, r) {
       const pc = r.profileChange && r.profileChange.code, lc = r.policyChange && r.policyChange.code;
       return pc === 'resume_refused' && lc === 'resume_refused' && r.done && r.done.ok && r.sha === r.expect
         ? ok() : fail(`profile=${pc} policy=${lc} done=${JSON.stringify(r.done && r.done.ok)} sha=${r.sha && r.sha.slice(0, 8)}`);
+    case 'classic-profile-resume-matches':
+      return r.done && r.done.ok && r.outputProfile === 'bf-classic'
+        && r.format === 'classic-bigtiff-jpeg-pyramid' && r.sha === r.expect
+        ? ok() : fail(safeJson({ done: r.done && r.done.ok, p: r.outputProfile, f: r.format, sha: r.sha }));
+    case 'output-profile-change-refused': {
+      const c = r.change || {}, m = r.mismatch || {};
+      return r.recProfile === 'bf-ome' && c.refused && c.code === 'resume_refused'
+        && m.refused && m.code === 'resume_refused'
+        && r.done && r.done.ok && r.sha === r.expect
+        ? ok() : fail(safeJson({ rec: r.recProfile, change: c, mismatch: m, done: r.done && r.done.ok }));
+    }
+    case 'legacy-record-resumes-classic': {
+      const a = r.asOme || {};
+      return r.recHadProfile === false && r.listedProfile === 'bf-classic'
+        && a.refused && a.code === 'resume_refused'
+        && r.done && r.done.ok && r.format === 'classic-bigtiff-jpeg-pyramid' && r.sha === r.expect
+        ? ok() : fail(safeJson({ had: r.recHadProfile, listed: r.listedProfile, asOme: a, done: r.done && r.done.ok, f: r.format }));
+    }
     case 'core-version-bump-refused':
       const cb = r.coreBump && r.coreBump.code;
       return cb === 'resume_refused' ? ok() : fail(`coreBump=${cb}`);

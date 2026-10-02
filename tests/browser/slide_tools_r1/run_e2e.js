@@ -131,7 +131,8 @@ async function main() {
       await waitFor(async () => /已发布|Published/.test(await textOf(page, '#upload-status')), 120000, 'published');
       if (fake.st.creates.length !== 1) throw new Error(`creates=${fake.st.creates.length}`);
       const name = fake.st.creates[0].filename;
-      if (!name.endsWith('.tif') || name.endsWith('.ome.tif')) throw new Error(`filename ${name}`);
+      // new brightfield jobs write the RGB OME profile → <base>.ome.tif
+      if (!name.endsWith('.ome.tif')) throw new Error(`filename ${name}`);
       const product = await L.opfsJobSha256(page, jobId);
       const uploaded = L.uploadedSha256(fake.st);
       if (uploaded.sha256 !== product.sha256) {
@@ -228,6 +229,7 @@ async function main() {
             max_concurrent_parts: 2, sign_batch_max_parts: 4, policy_version: 'v1-manual',
           },
           viewable_formats: ['classic-bigtiff-jpeg-pyramid',
+            'ome-bigtiff-subifd-rgb-jpeg-pyramid',
             'ome-bigtiff-subifd-multichannel-jpeg-passthrough'],
         },
       });
@@ -720,7 +722,7 @@ async function main() {
           max_size_bytes: 1000, part_bytes: 8, url_ttl_seconds: 600,
           max_concurrent_parts: 2, sign_batch_max_parts: 4, policy_version: 'v1-manual',
         },
-        viewable_formats: ['classic-bigtiff-jpeg-pyramid'],
+        viewable_formats: ['classic-bigtiff-jpeg-pyramid', 'ome-bigtiff-subifd-rgb-jpeg-pyramid'],
       },
     });
     try {

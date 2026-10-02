@@ -31,6 +31,31 @@ export function convert(strict_lossless, channel_json) {
 }
 
 /**
+ * Run a conversion with an explicit output profile id (`bf-classic`,
+ * `bf-ome`, `fl-ome`; empty = the input's pre-profile default).
+ * @param {string} profile
+ * @param {boolean} strict_lossless
+ * @param {string} channel_json
+ * @returns {string}
+ */
+export function convertProfile(profile, strict_lossless, channel_json) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const ptr0 = passStringToWasm0(profile, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(channel_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.convertProfile(ptr0, len0, strict_lossless, ptr1, len1);
+        deferred3_0 = ret[0];
+        deferred3_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+    }
+}
+
+/**
  * Resume a conversion from a checkpoint state (the same JSON
  * `stHostCheckpoint` emits; journal-recorded by the runner).
  * @param {string} resume_json
@@ -52,6 +77,34 @@ export function convertResume(resume_json, strict_lossless, channel_json) {
         return getStringFromWasm0(ret[0], ret[1]);
     } finally {
         wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+    }
+}
+
+/**
+ * Resume under an explicit output profile; refused when the checkpoint
+ * state was committed under a different one.
+ * @param {string} resume_json
+ * @param {string} profile
+ * @param {boolean} strict_lossless
+ * @param {string} channel_json
+ * @returns {string}
+ */
+export function convertResumeProfile(resume_json, profile, strict_lossless, channel_json) {
+    let deferred4_0;
+    let deferred4_1;
+    try {
+        const ptr0 = passStringToWasm0(resume_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(profile, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(channel_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ret = wasm.convertResumeProfile(ptr0, len0, ptr1, len1, strict_lossless, ptr2, len2);
+        deferred4_0 = ret[0];
+        deferred4_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
     }
 }
 
@@ -86,8 +139,8 @@ export function enableSourceHash() {
 /**
  * Re-open + validate the finished output (streamed sha256 + structural
  * IFD walk) through the host read-back callbacks. Only a passing result
- * may be marked `ready`. `expect_ifd` 0 skips the count equality (the FL
- * walker counts the top-level chain; SubIFDs hang off tag 330).
+ * may be marked `ready`. `expect_ifd` is the converter's `ifd_count` (main
+ * chain + SubIFDs, every profile); 0 skips the equality.
  * @param {number} expect_ifd
  * @returns {string}
  */

@@ -118,6 +118,13 @@ async function scenarioA() {
     if (saved.sha256 !== nativeSha) throw new Error(`saved sha ${saved.sha256} != native ${nativeSha}`);
     const resultSha = await shaOfResult(page);
     if (resultSha !== nativeSha) throw new Error(`result sha ${resultSha} != native`);
+    // new brightfield jobs: RGB OME profile → .ome.tif name, OME-TIFF filter,
+    // and the result panel names the format
+    const picker = await page.evaluate(() => ({ name: window.__pickerSuggested, types: window.__pickerTypes }));
+    if (picker.name !== 'bf-580x300.ome.tif') throw new Error(`suggested name ${picker.name}`);
+    if (!picker.types || picker.types[0].description !== 'OME-TIFF') throw new Error(`picker types ${JSON.stringify(picker.types)}`);
+    const fmtRow = (await page.textContent('#result-format')) || '';
+    if (!/OME-TIFF/.test(fmtRow)) throw new Error(`result format row "${fmtRow}"`);
 
     // persist()：手势内请求，如实回报（granted 或 denied 都接受，只要有明确文案）
     await page.click('#persist-btn');
@@ -138,7 +145,7 @@ async function scenarioA() {
     const downloads = await page.evaluate(() => window.__downloads);
     const cspErrors = consoleErrors.filter((e) => /Refused|Content Security Policy|CSP/i.test(e));
 
-    record("a-bf-happy-path", true, { savedSha256: saved.sha256, nativeSha256: nativeSha, savedBytes: saved.size, notSavedWarnShown: /OPFS|还不是|NOT saved/i.test(notSavedWarn), persistMsg: persistMsg.trim() });
+    record("a-bf-happy-path", true, { savedSha256: saved.sha256, nativeSha256: nativeSha, savedBytes: saved.size, suggestedName: picker.name, formatRow: fmtRow.trim(), notSavedWarnShown: /OPFS|还不是|NOT saved/i.test(notSavedWarn), persistMsg: persistMsg.trim() });
     record('j-network-capture', bad.length === 0 && nonGet.length === 0 && apiCalls.length === 0
       && nameLeak.length === 0 && shaLeak.length === 0 && nonStatic.length === 0 && (!downloads || downloads.length === 0),
       { totalRequests: requests.length, nonSameOrigin: bad.length, nonGet: nonGet.map((r) => r.method),

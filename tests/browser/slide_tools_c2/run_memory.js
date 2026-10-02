@@ -215,7 +215,8 @@ async function main() {
     if (SIZE === '1g' && done && done.ok) {
       const nativeOut = input.replace(/\.kfb$/, '-native.tif');
       if (!fs.existsSync(nativeOut)) {
-        execFileSync(L.CLI, ['convert', input, nativeOut, '--overwrite']);
+        execFileSync(L.CLI, ['convert', input, nativeOut, '--overwrite',
+          '--profile', /\.kfbf$/i.test(input) ? 'fl-ome' : 'bf-ome']);
       }
       const nativeSha = await L.sha256File(nativeOut);
       report.nativeSha256 = nativeSha;

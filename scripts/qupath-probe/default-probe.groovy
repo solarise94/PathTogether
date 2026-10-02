@@ -52,10 +52,18 @@ try {
             edge:   [Math.max(0, lw - 80), Math.max(0, lh - 80), Math.min(80, lw), Math.min(80, lh)],
             tissue: [Math.max(0, Math.min(lw - 128, (int)(Double.parseDouble(args[4]) * lw) - 64)), Math.max(0, Math.min(lh - 128, (int)(Double.parseDouble(args[5]) * lh) - 64)), Math.min(128, lw), Math.min(128, lh)],
         ]
+        // Boxes are clamped to the level bounds above (center/corner/edge/tissue
+        // all use Math.max(0, ...)/Math.min(...)); also clamp the full-res
+        // request so rounding at a fractional downsample can never push it
+        // past the image edge (readRegion would otherwise pad).
+        int fw = server.getWidth(), fh = server.getHeight()
         boxes.each { name, b ->
+            int rx = (int)Math.max(0, Math.min(Math.round(b[0] * ds), fw - 1))
+            int ry = (int)Math.max(0, Math.min(Math.round(b[1] * ds), fh - 1))
+            int rw = (int)Math.max(1, Math.min(Math.round(b[2] * ds), fw - rx))
+            int rh = (int)Math.max(1, Math.min(Math.round(b[3] * ds), fh - ry))
             def req = RegionRequest.createInstance(server.getPath(), ds,
-                (int)Math.round(b[0] * ds), (int)Math.round(b[1] * ds),
-                (int)Math.round(b[2] * ds), (int)Math.round(b[3] * ds))
+                rx, ry, rw, rh)
             def img = server.readRegion(req)
             def f = new File(regionDir, "l${i}-${name}.png")
             ImageIO.write(img, 'png', f)

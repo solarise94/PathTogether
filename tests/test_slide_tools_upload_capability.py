@@ -54,8 +54,7 @@ def native_fixtures(tmp_path_factory):
     fl_ome = d / "fl.ome.tif"
     subprocess.run([str(CLI), "gen-kfb", str(bf_kfb),
                     "--width", "580", "--height", "300"], check=True)
-    # 600x400：与 C2/C3 夹具同参（部分小尺寸的合成 KFBF 会触发核心校验
-    # 拒绝 IFD 布局错位——不用那些尺寸做读取证明）
+    # 600x400：与 C2/C3 夹具同参
     subprocess.run([str(CLI), "gen-kfbf", str(fl_kfbf),
                     "--width", "600", "--height", "400"], check=True)
     reports = {}

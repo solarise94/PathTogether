@@ -518,6 +518,35 @@ function makeScenarios(F) {
     return { done, sha: await shaOf(page, jobId), expect: F.native.fl };
   }]);
 
+  S.push(['prepared-output-profile-set-rules', async (page) => {
+    // the page's radio change → setPreparedOutputProfile: writes a prepared
+    // record; refuses once the job left prepared; refuses a profile that does
+    // not fit the modality (fluorescence + a brightfield profile)
+    await L.clearJobs(page);
+    await L.setFile(page, F.bf);
+    const prep = await page.evaluate(() => window.__c2.probe());
+    const rec0 = await page.evaluate((id) => window.__c2.jobRecord(id), prep.jobId);
+    const set = await page.evaluate((id) => window.__runner.setPreparedOutputProfile(id, 'bf-classic')
+      .then(() => ({ ok: true }), (e) => ({ ok: false, code: e && e.error && e.error.code })), prep.jobId);
+    const rec1 = await page.evaluate((id) => window.__c2.jobRecord(id), prep.jobId);
+    // start the prepared job (record profile = classic) to completion…
+    await page.evaluate((id) => window.__runner.startJob(null, { jobId: id, profileId: 'saver' }).then(() => true), prep.jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    // …then the same setter must refuse (job beyond prepared)
+    const started = await page.evaluate((id) => window.__runner.setPreparedOutputProfile(id, 'bf-ome')
+      .then(() => ({ ok: true }), (e) => ({ ok: false, code: e && e.error && e.error.code,
+        kind: e && e.error && e.error.kind })), prep.jobId);
+    // fluorescence prepared job: a brightfield profile is rejected
+    await L.setFile(page, F.fl);
+    const prepFl = await page.evaluate(() => window.__c2.probe());
+    const flSet = await page.evaluate((id) => window.__runner.setPreparedOutputProfile(id, 'bf-ome')
+      .then(() => ({ ok: true }), (e) => ({ ok: false, code: e && e.error && e.error.code,
+        kind: e && e.error && e.error.kind })), prepFl.jobId);
+    return { rec0Profile: rec0.outputProfile, set, rec1Profile: rec1.outputProfile,
+      done, startedRefusal: started, flRefusal: flSet,
+      sha: await shaOf(page, prep.jobId), expect: F.native.bfClassic };
+  }]);
+
   return S;
 }
 
@@ -576,6 +605,15 @@ function verdict(name, r) {
         && a.refused && a.code === 'resume_refused'
         && r.done && r.done.ok && r.format === 'classic-bigtiff-jpeg-pyramid' && r.sha === r.expect
         ? ok() : fail(safeJson({ had: r.recHadProfile, listed: r.listedProfile, asOme: a, done: r.done && r.done.ok, f: r.format }));
+    }
+    case 'prepared-output-profile-set-rules': {
+      const st = r.startedRefusal || {}, fl = r.flRefusal || {};
+      return r.rec0Profile === 'bf-ome' && r.set && r.set.ok === true && r.rec1Profile === 'bf-classic'
+        && st.ok === false && st.code === 'resume_refused' && st.kind === 'output-profile'
+        && fl.ok === false && fl.code === 'unsupported_input' && fl.kind === 'output-profile'
+        && r.done && r.done.ok && r.sha === r.expect
+        ? ok() : fail(safeJson({ rec0: r.rec0Profile, set: r.set, rec1: r.rec1Profile,
+          started: st, fl: fl, done: r.done && r.done.ok }));
     }
     case 'core-version-bump-refused':
       const cb = r.coreBump && r.coreBump.code;

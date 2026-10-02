@@ -698,13 +698,281 @@ async function scenarioN() {
   }
 }
 
+// (o) 明场输出格式选择「经典金字塔 TIFF」→ 转换/命名/过滤器/结果行/锁定。
+async function scenarioO() {
+  const kfb = L.ensureFixture('bf-580x300.kfb', ['gen-kfb', '--width', '580', '--height', '300']);
+  const native = L.nativeConvert(kfb, path.join(L.GATE, 'fixtures', 'bf-580x300-native-classic.tif'),
+    ['--profile', 'bf-classic']);
+  const nativeSha = await L.sha256File(native);
+
+  const { context, page } = await L.launch('o', [L.savePickerStub(), L.downloadGuard(), READ_JOB_RECORDS]);
+  try {
+    await L.openTools(page, PORT);
+    await L.setFile(page, kfb);
+    await waitVisible(page, '#probe-section:not([hidden])');
+    await waitVisible(page, '#format-section:not([hidden])');
+    const def = await page.evaluate(() =>
+      (document.querySelector('input[name="outputFormat"]:checked') || {}).value);
+    if (def !== 'bf-ome') throw new Error(`default selection ${def} (want bf-ome)`);
+    await page.check('#format-classic');
+    await page.click('#convert-btn');
+    await waitVisible(page, '#result-section:not([hidden])');
+    // 开始后不可再改：字段组禁用，改为展示任务实际格式
+    const lockedUi = await page.evaluate(() => ({
+      disabled: document.getElementById('format-fieldset').disabled,
+      noteHidden: document.getElementById('format-locked').hidden,
+      note: document.getElementById('format-locked').textContent,
+    }));
+    if (!lockedUi.disabled || lockedUi.noteHidden || !/经典金字塔 TIFF/.test(lockedUi.note)) {
+      throw new Error(`lock UI ${JSON.stringify(lockedUi)}`);
+    }
+    const fmtRow = (await page.textContent('#result-format')) || '';
+    if (!/经典金字塔 TIFF/.test(fmtRow)) throw new Error(`format row "${fmtRow}"`);
+    await page.click('#save-btn');
+    await waitText(page, '#save-status', /已保存|Saved/);
+    const saved = await L.opfsSha256(page);
+    if (saved.sha256 !== nativeSha) throw new Error(`saved sha ${saved.sha256} != native classic ${nativeSha}`);
+    const picker = await page.evaluate(() => ({ name: window.__pickerSuggested, types: window.__pickerTypes }));
+    if (!picker.name || !picker.name.endsWith('.tif') || picker.name.endsWith('.ome.tif')) {
+      throw new Error(`suggested name ${picker.name}`);
+    }
+    if (!picker.types || picker.types[0].description !== 'TIFF') throw new Error(`picker types ${JSON.stringify(picker.types)}`);
+    const rec = (await page.evaluate(() => window.__readJobRecords()))[0];
+    if (rec.outputProfile !== 'bf-classic') throw new Error(`record outputProfile ${rec.outputProfile}`);
+    const rowMeta = await page.textContent('.job-row');
+    if (!/经典 TIFF/.test(rowMeta)) throw new Error(`job row lacks format marker: ${rowMeta}`);
+    await L.shot(page, 'bf-classic-ready');
+    record('o-bf-classic-choice', true, { savedSha256: saved.sha256, nativeSha256: nativeSha,
+      suggestedName: picker.name, filter: picker.types[0].description, formatRow: fmtRow.trim(),
+      rowFormatShown: /经典 TIFF/.test(rowMeta), lockedNote: lockedUi.note.trim() });
+  } catch (e) {
+    record('o-bf-classic-choice', false, { error: String(e).slice(0, 400) });
+  } finally {
+    await context.close();
+  }
+}
+
+// (p) 选经典 → 转换中刷新 → 任务列表续跑：结果仍是经典且 sha == 原生经典。
+async function scenarioP() {
+  const kfb = L.ensureFixture('bf-2g.kfb', ['gen-kfb', '--width', '36500', '--height', '36500']);
+  const native = L.nativeConvert(kfb, path.join(L.GATE, 'fixtures', 'bf-2g-native-classic.tif'),
+    ['--profile', 'bf-classic']);
+  const nativeSha = await L.sha256File(native);
+
+  const { context, page } = await L.launch('p', [L.savePickerStub(), READ_JOB_RECORDS]);
+  page.on('dialog', (d) => d.accept());
+  try {
+    await L.openTools(page, PORT);
+    await L.setFile(page, kfb);
+    await waitVisible(page, '#probe-section:not([hidden])', 300000);
+    await page.check('#format-classic');
+    await page.click('#convert-btn');
+    await page.waitForFunction(() => {
+      const el = document.getElementById('run-bytes');
+      return el && !el.hidden && /\d/.test(el.textContent);
+    }, null, { timeout: 180000 });
+    await page.waitForTimeout(700);
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
+
+    // 刷新后不提供更改（设置节隐藏）；行内显示任务格式；resume 不带设置
+    const fmtHidden = await page.evaluate(() => document.getElementById('format-section').hidden);
+    if (!fmtHidden) throw new Error('format choice offered after reload of a started job');
+    const rowMeta = await page.textContent('.job-row');
+    if (!/经典 TIFF/.test(rowMeta)) throw new Error(`row lacks classic marker: ${rowMeta}`);
+    const resumeBtn = '.job-row[data-next-action="resume"] button[data-action="resume"]';
+    await waitVisible(page, resumeBtn);
+    await page.click(resumeBtn);
+    await waitVisible(page, '#result-section:not([hidden])', 300000);
+    const fmtRow = (await page.textContent('#result-format')) || '';
+    if (!/经典金字塔 TIFF/.test(fmtRow)) throw new Error(`format row "${fmtRow}"`);
+    await page.click('#save-btn');
+    await waitText(page, '#save-status', /已保存|Saved/, 120000);
+    const saved = await L.opfsSha256(page);
+    if (saved.sha256 !== nativeSha) throw new Error(`resume sha ${saved.sha256} != native classic ${nativeSha}`);
+    const rec = (await page.evaluate(() => window.__readJobRecords()))[0];
+    if (rec.outputProfile !== 'bf-classic') throw new Error(`record outputProfile ${rec.outputProfile}`);
+    record('p-classic-refresh-resume', true, { savedSha256: saved.sha256, nativeSha256: nativeSha,
+      rowFormatShown: /经典 TIFF/.test(rowMeta) });
+  } catch (e) {
+    record('p-classic-refresh-resume', false, { error: String(e).slice(0, 400) });
+  } finally {
+    await context.close();
+  }
+}
+
+// (q) prepared 任务从任务列表「开始」用当前 UI 选择并记录之（同页选择经典）。
+async function scenarioQ() {
+  const kfb = L.ensureFixture('bf-580x300.kfb', ['gen-kfb', '--width', '580', '--height', '300']);
+  const native = L.nativeConvert(kfb, path.join(L.GATE, 'fixtures', 'bf-580x300-native-classic-q.tif'),
+    ['--profile', 'bf-classic']);
+  const classicSha = await L.sha256File(native);
+
+  const { context, page } = await L.launch('q', [L.savePickerStub(), READ_JOB_RECORDS]);
+  page.on('dialog', (d) => d.accept());
+  try {
+    await L.openTools(page, PORT);
+    await L.setFile(page, kfb);
+    // probe 完成后 prepared 行已在列表（不从顶部按钮转换）
+    await waitVisible(page, '.job-row[data-next-action="start"]', 60000);
+    await page.check('#format-classic');
+    await page.click('.job-row[data-next-action="start"] button[data-action="start"]');
+    await waitVisible(page, '#result-section:not([hidden])', 120000);
+    const sha = await shaOfResult(page);
+    if (sha !== classicSha) throw new Error(`list-start sha ${sha} != native classic ${classicSha}`);
+    const rec = (await page.evaluate(() => window.__readJobRecords()))[0];
+    if (rec.outputProfile !== 'bf-classic') throw new Error(`record outputProfile ${rec.outputProfile}`);
+    record('q-list-start-uses-selection', true, { sha, nativeClassicSha: classicSha,
+      recordedProfile: rec.outputProfile });
+  } catch (e) {
+    record('q-list-start-uses-selection', false, { error: String(e).slice(0, 400) });
+  } finally {
+    await context.close();
+  }
+}
+
+// (r) 荧光输入：不提供输出格式选择，输出固定 fl-ome。
+async function scenarioR() {
+  const kfbf = L.ensureFixture('fl-600x400.kfbf', ['gen-kfbf']);
+  const { context, page } = await L.launch('r', [L.savePickerStub(), READ_JOB_RECORDS]);
+  try {
+    await L.openTools(page, PORT);
+    await L.setFile(page, kfbf);
+    await waitVisible(page, '#probe-section:not([hidden])');
+    const fmt = await page.evaluate(() => ({
+      hidden: document.getElementById('format-section').hidden,
+    }));
+    if (!fmt.hidden) throw new Error('output-format choice offered for a fluorescence input');
+    await page.click('#convert-btn');
+    await waitVisible(page, '#result-section:not([hidden])');
+    const fmtRow = (await page.textContent('#result-format')) || '';
+    if (!/多通道 OME-TIFF/.test(fmtRow)) throw new Error(`format row "${fmtRow}"`);
+    await page.click('#save-btn');
+    await waitText(page, '#save-status', /已保存|Saved/);
+    const picker = await page.evaluate(() => ({ name: window.__pickerSuggested }));
+    if (picker.name !== 'fl-600x400.ome.tif') throw new Error(`suggested ${picker.name}`);
+    const rec = (await page.evaluate(() => window.__readJobRecords()))[0];
+    if (rec.outputProfile !== 'fl-ome') throw new Error(`record outputProfile ${rec.outputProfile}`);
+    record('r-fl-no-choice-fl-ome', true, { sectionHidden: fmt.hidden,
+      formatRow: fmtRow.trim(), suggestedName: picker.name, recordedProfile: rec.outputProfile });
+  } catch (e) {
+    record('r-fl-no-choice-fl-ome', false, { error: String(e).slice(0, 400) });
+  } finally {
+    await context.close();
+  }
+}
+
+// (s) prepared 后改选经典并落盘 → 刷新（radio 回默认 bf-ome、节隐藏）→ 从
+// 任务列表「开始」：记录值获胜——结果经典、记录 bf-classic、建议名 .tif。
+async function scenarioS() {
+  const kfb = L.ensureFixture('bf-580x300.kfb', ['gen-kfb', '--width', '580', '--height', '300']);
+  const native = L.nativeConvert(kfb, path.join(L.GATE, 'fixtures', 'bf-580x300-native-classic-s.tif'),
+    ['--profile', 'bf-classic']);
+  const nativeSha = await L.sha256File(native);
+
+  const { context, page } = await L.launch('s', [L.savePickerStub(), READ_JOB_RECORDS]);
+  page.on('dialog', (d) => d.accept());
+  try {
+    await L.openTools(page, PORT);
+    await L.setFile(page, kfb);
+    await waitVisible(page, '#format-section:not([hidden])');
+    await page.check('#format-classic');
+    // 等改选真正写进 prepared 记录再刷新（异步谓词不能交给 waitForFunction）
+    const deadline = Date.now() + 20000;
+    for (;;) {
+      const recs = await page.evaluate(() => window.__readJobRecords());
+      if (recs.length === 1 && recs[0].state === 'prepared'
+        && recs[0].outputProfile === 'bf-classic') break;
+      if (Date.now() > deadline) {
+        throw new Error(`prepared record lacks classic profile: ${
+          JSON.stringify(recs.map((r) => ({ state: r.state, p: r.outputProfile })))}`);
+      }
+      await page.waitForTimeout(200);
+    }
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
+    // 刷新后：radio 回到模板默认 bf-ome、输出格式节隐藏——记录的经典必须获胜
+    const radioAfterReload = await page.evaluate(() =>
+      (document.querySelector('input[name="outputFormat"]:checked') || {}).value);
+    if (radioAfterReload !== 'bf-ome') throw new Error(`radio after reload ${radioAfterReload}`);
+    const startBtn = '.job-row[data-next-action="start"] button[data-action="start"]';
+    await waitVisible(page, startBtn);
+    const rowMeta = await page.textContent('.job-row');
+    if (!/经典 TIFF/.test(rowMeta)) throw new Error(`row lacks classic marker: ${rowMeta}`);
+    await page.click(startBtn);
+    await waitVisible(page, '#result-section:not([hidden])', 120000);
+    const sha = await shaOfResult(page);
+    if (sha !== nativeSha) throw new Error(`start sha ${sha} != native classic ${nativeSha}`);
+    const rec = (await page.evaluate(() => window.__readJobRecords()))[0];
+    if (rec.outputProfile !== 'bf-classic') throw new Error(`record outputProfile ${rec.outputProfile}`);
+    await page.click('#save-btn');
+    await waitText(page, '#save-status', /已保存|Saved/);
+    const picker = await page.evaluate(() => ({ name: window.__pickerSuggested }));
+    if (!picker.name || !picker.name.endsWith('.tif') || picker.name.endsWith('.ome.tif')) {
+      throw new Error(`suggested ${picker.name}`);
+    }
+    record('s-classic-persist-reload-list-start', true, { sha,
+      radioAfterReload, rowFormatShown: /经典 TIFF/.test(rowMeta),
+      recordedProfile: rec.outputProfile, suggestedName: picker.name });
+  } catch (e) {
+    record('s-classic-persist-reload-list-start', false, { error: String(e).slice(0, 400) });
+  } finally {
+    await context.close();
+  }
+}
+
+// (t) prepared 保持默认（bf-ome）→ 刷新 → 从任务列表「开始」：记录值获胜，
+// 其余不变（sha == 原生 bf-ome、建议名 .ome.tif）。
+async function scenarioT() {
+  const kfb = L.ensureFixture('bf-580x300.kfb', ['gen-kfb', '--width', '580', '--height', '300']);
+  const native = L.nativeConvert(kfb, path.join(L.GATE, 'fixtures', 'bf-580x300-native.tif'));
+  const nativeSha = await L.sha256File(native);
+
+  const { context, page } = await L.launch('t', [L.savePickerStub(), READ_JOB_RECORDS]);
+  page.on('dialog', (d) => d.accept());
+  try {
+    await L.openTools(page, PORT);
+    await L.setFile(page, kfb);
+    await waitVisible(page, '#format-section:not([hidden])');
+    // 不触碰 radio：prepared 记录保持默认 bf-ome
+    const recBefore = await page.evaluate(async () => {
+      const recs = await window.__readJobRecords();
+      return recs.length === 1 ? recs[0] : null;
+    });
+    if (!recBefore || recBefore.state !== 'prepared' || recBefore.outputProfile !== 'bf-ome') {
+      throw new Error(`prepared record ${JSON.stringify(recBefore && { s: recBefore.state, p: recBefore.outputProfile })}`);
+    }
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
+    const startBtn = '.job-row[data-next-action="start"] button[data-action="start"]';
+    await waitVisible(page, startBtn);
+    await page.click(startBtn);
+    await waitVisible(page, '#result-section:not([hidden])', 120000);
+    const sha = await shaOfResult(page);
+    if (sha !== nativeSha) throw new Error(`start sha ${sha} != native bf-ome ${nativeSha}`);
+    const rec = (await page.evaluate(() => window.__readJobRecords()))[0];
+    if (rec.outputProfile !== 'bf-ome') throw new Error(`record outputProfile ${rec.outputProfile}`);
+    await page.click('#save-btn');
+    await waitText(page, '#save-status', /已保存|Saved/);
+    const picker = await page.evaluate(() => ({ name: window.__pickerSuggested }));
+    if (picker.name !== 'bf-580x300.ome.tif') throw new Error(`suggested ${picker.name}`);
+    record('t-record-wins-after-reload', true, { sha,
+      recordedProfile: rec.outputProfile, suggestedName: picker.name });
+  } catch (e) {
+    record('t-record-wins-after-reload', false, { error: String(e).slice(0, 400) });
+  } finally {
+    await context.close();
+  }
+}
+
 // ------------------------------------------------------------------ main --
 
 const SCENARIOS = [
   ['a', scenarioA], ['b', scenarioB], ['c', scenarioC], ['d', scenarioD],
   ['e', scenarioE], ['f', scenarioF], ['g', scenarioG], ['h', scenarioH],
   ['i', scenarioI], ['k', scenarioK], ['l', scenarioL], ['m', scenarioM],
-  ['n', scenarioN],
+  ['n', scenarioN], ['o', scenarioO], ['p', scenarioP], ['q', scenarioQ],
+  ['r', scenarioR], ['s', scenarioS], ['t', scenarioT],
 ];
 
 async function main() {

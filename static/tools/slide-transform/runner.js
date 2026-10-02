@@ -12,6 +12,11 @@
 //   // channelJson (≤1 MiB string) is saved on the prepared record so a
 //   // start after a page refresh keeps it; replace it before starting with
 //   await runner.setPreparedChannelJson(prep.jobId, channelJson | null);
+//   // replace the output-format choice saved on a job that has not started
+//   // yet (the page radio); refused (resume_refused/output-profile) once the
+//   // job left `prepared`, and a profile that does not fit the modality is
+//   // rejected (unsupported_input/output-profile)
+//   await runner.setPreparedOutputProfile(prep.jobId, 'bf-classic');
 //   // the FIRST argument is still the File; passing a `prepared` jobId
 //   // reuses its copy (no second copy), otherwise probe() runs first.
 //   // channelJson: undefined = the saved one, null = none, string = this one
@@ -414,6 +419,26 @@ export class SlideToolsRunner {
       }
       await this._writeJobRecordNow(jobId, {
         ...rec, channelJson: cj, channelJsonHash: channelJsonHash(cj), updatedAt: E.nowIso(),
+      });
+    });
+  }
+
+  /// Replace the output profile saved on a job that has not started yet (the
+  /// page's output-format radio). Mirrors setPreparedChannelJson: only a
+  /// `prepared` record accepts the change — anything planned/run/paused has
+  /// its profile fixed for life (resume_refused, kind output-profile) — and
+  /// the value must fit the probed modality (checkedOutputProfile →
+  /// unsupported_input, kind output-profile).
+  async setPreparedOutputProfile(jobId, profile) {
+    await this._serialRecord(async () => {
+      const rec = await this._readJobRecord(jobId);
+      if (!rec || rec.state !== 'prepared') {
+        throw E.stError(E.ERROR_CODES.RESUME_REFUSED, '任务已开始，不能再更改输出格式',
+          { kind: 'output-profile' });
+      }
+      const outputProfile = checkedOutputProfile(profile, rec.modality);
+      await this._writeJobRecordNow(jobId, {
+        ...rec, outputProfile, updatedAt: E.nowIso(),
       });
     });
   }

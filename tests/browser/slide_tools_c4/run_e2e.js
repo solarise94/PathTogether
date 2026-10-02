@@ -639,6 +639,55 @@ async function main() {
     }
   }
 
+  // ---------------------------------------------------------------- (n) --
+  // 明场输出格式选「经典金字塔 TIFF」：上传创建的是 <base>.tif（非 .ome.tif），
+  // PUT 字节 == 产物大小，产物 sha256 == 原生 CLI --profile bf-classic。
+  async function scenarioClassicUpload() {
+    const { context, page } = await L.launch('n-classic', [L.savePickerStub(), L.downloadGuard()]);
+    const fake = await L.fakeUploadRoutes(page, creds.cosOrigin, { partsCount: 4 });
+    try {
+      await L.login(page, PORT, creds, 'user');
+      await L.C3.openTools(page, PORT);
+      await L.setFile(page, bf);
+      await waitFor(async () => (await page.$('#probe-section:not([hidden])')) !== null, 60000, 'probe');
+      await waitFor(async () => (await page.$('#format-section:not([hidden])')) !== null, 30000, 'format choice');
+      await page.check('#format-classic');
+      await page.click('#convert-btn');
+      await waitFor(async () => (await page.$('#result-section:not([hidden])')) !== null, 120000, 'ready');
+      const jobId = await currentJobId(page);
+      const before = await L.opfsJobSha256(page, jobId);
+      const nativeDir = path.join(L.GATE, 'fixtures');
+      fs.mkdirSync(nativeDir, { recursive: true });
+      const native = L.nativeConvert(bf,
+        path.join(nativeDir, 'bf-580x300-native-classic.tif'), ['--profile', 'bf-classic']);
+      const nativeSha = await L.sha256File(native);
+      if (before.sha256 !== nativeSha) {
+        throw new Error(`classic artifact sha ${before.sha256} != native ${nativeSha}`);
+      }
+      const fmtRow = await textOf(page, '#result-format');
+      if (!/经典金字塔 TIFF/.test(fmtRow)) throw new Error(`format row "${fmtRow}"`);
+      await page.click('#upload-btn');
+      await waitFor(async () => /已发布|Published/.test(await textOf(page, '#upload-status')), 60000, 'published');
+      if (fake.st.creates.length !== 1) throw new Error(`creates=${fake.st.creates.length}`);
+      const name = fake.st.creates[0].filename;
+      if (!name.endsWith('.tif') || name.endsWith('.ome.tif')) {
+        throw new Error(`filename ${name} should be <base>.tif (classic)`);
+      }
+      const putBytes = fake.st.puts.reduce((s, p) => s + p.bytes, 0);
+      if (putBytes !== before.size) throw new Error(`PUT bytes ${putBytes} != ${before.size}`);
+      const after = await L.opfsJobSha256(page, jobId);
+      if (after.sha256 !== before.sha256) throw new Error('artifact sha changed');
+      record('n-classic-upload', true, {
+        filename: name, putBytes, sha: before.sha256.slice(0, 12),
+        nativeSha: nativeSha.slice(0, 12), formatRow: fmtRow.trim().slice(0, 30),
+      });
+    } catch (e) {
+      record('n-classic-upload', false, { error: String(e).slice(0, 400) });
+    } finally {
+      await context.close();
+    }
+  }
+
   const all = [
     ['a-bf', () => scenarioHappy('bf', bf)],
     ['a-fl', () => scenarioHappy('fl', fl)],
@@ -655,6 +704,7 @@ async function main() {
     ['l-record-write-failure', scenarioPersistFailure],
     ['m1-cancel-during-poll', () => scenarioCancelDuringWait('waiting')],
     ['m2-cancel-during-backoff', () => scenarioCancelDuringWait('backoff')],
+    ['n-classic-upload', scenarioClassicUpload],
   ];
   for (const [id, fn] of all) {
     if (ONLY && id !== ONLY) continue;

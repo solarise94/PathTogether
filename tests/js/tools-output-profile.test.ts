@@ -71,6 +71,22 @@ describe("output profile helpers (engine.js)", () => {
 			expect(exts.some((x: string) => name.endsWith(x))).toBe(true);
 		}
 	});
+
+	it("magicModality: KFB → brightfield, KFBF → fluorescence, else null", () => {
+		const kfb = [0xf1, 0x01, 0xee, 0xee, 0x4b, 0x46, 0x42, 0x00];
+		const kfbf = [0xf1, 0x01, 0xee, 0xee, 0x4b, 0x46, 0x42, 0x46];
+		expect(E.magicModality(kfb)).toBe("brightfield");
+		expect(E.magicModality(kfbf)).toBe("fluorescence");
+		// short/garbage heads never claim a modality (page then passes no profile)
+		expect(E.magicModality([0xf1, 0x01])).toBeNull();
+		expect(E.magicModality([0, 0, 0, 0, 0, 0, 0, 0])).toBeNull();
+		// the choice the page offers only fits the sniffed brightfield input:
+		// for fluorescence neither option fits, so the page must pass nothing
+		expect(E.profileFitsModality("bf-ome", "brightfield")).toBe(true);
+		expect(E.profileFitsModality("bf-classic", "brightfield")).toBe(true);
+		expect(E.profileFitsModality("bf-ome", "fluorescence")).toBe(false);
+		expect(E.profileFitsModality("bf-classic", "fluorescence")).toBe(false);
+	});
 });
 
 // ---- upload controller harness (same shape as tools-upload-limit.test.ts) --
@@ -225,5 +241,73 @@ describe("upload of bf-ome artifacts", () => {
 		expect(messages).toContain("tools.upload.format.unsupported");
 		expect(doc.getElementById("save-btn").disabled).toBe(false);
 		expect(fetchLog.filter((c) => c.url.indexOf("/api/ingestions") >= 0)).toHaveLength(0);
+	});
+});
+
+// ---- page wiring (source-level; tools-slides.js is a live-DOM module) ----
+
+const pageSrc = readFileSync(resolve(here, "../../static/tools/tools-slides.js"), "utf8");
+const runnerSrc = readFileSync(resolve(here, "../../static/tools/slide-transform/runner.js"), "utf8");
+const shellSrc = readFileSync(resolve(here, "../../templates/tools_slides.html"), "utf8");
+const i18nSrc = readFileSync(resolve(here, "../../static/i18n.js"), "utf8");
+
+describe("tool page output-format choice (wiring)", () => {
+	it("template offers the brightfield choice, bf-ome default-checked", () => {
+		expect(shellSrc).toContain('id="format-section"');
+		expect(shellSrc).toContain('id="format-ome" name="outputFormat" value="bf-ome" checked');
+		expect(shellSrc).toContain('id="format-classic" name="outputFormat" value="bf-classic"');
+		expect(shellSrc).toContain('data-i18n="tools.format.ome"');
+		expect(shellSrc).toContain('data-i18n="tools.format.classic"');
+	});
+
+	it("page passes the selection at prepare and at both start paths", () => {
+		// prepare: only a sniffed brightfield input carries the UI selection
+		// (fluorescence → undefined → runner defaults to fl-ome)
+		expect(pageSrc)
+			.toContain("sniffedModality === 'brightfield' ? selectedOutputProfile() : undefined");
+		// fresh start (「仅转换并保存」and R1「转换并上传」share driveConversion)
+		expect(pageSrc).toMatch(/startJob\(page\.file, \{[\s\S]*?outputProfile,/);
+		// job-list start passes the UI selection only when the visible format
+		// section belongs to THIS job — after a reload (page.prep null, section
+		// hidden) nothing is passed and the runner uses record.outputProfile,
+		// so the template-default radio can never override a saved choice
+		expect(pageSrc).toMatch(/startJob\(null, \{[\s\S]*?outputProfile: startOutputProfile,/);
+		expect(pageSrc).toContain("page.prep && page.prep.jobId === job.id && !els.formatSection.hidden");
+		// resume passes no settings at all → the record's profile is kept
+		expect(pageSrc).toContain("await page.runner.resumeJob(job.id)");
+		expect(pageSrc).not.toMatch(/resumeJob\(job\.id, \{[\s\S]*?outputProfile/);
+	});
+
+	it("a radio change after prepare is persisted into the prepared record", () => {
+		expect(pageSrc).toContain("setPreparedOutputProfile(page.prep.jobId, ev.target.value)");
+		// the handler is armed on the radio group and skips locked/hidden state
+		expect(pageSrc).toMatch(/input\[name="outputFormat"\][\s\S]*?onOutputFormatChange/);
+		expect(pageSrc).toMatch(/onOutputFormatChange\(ev\)[\s\S]*?page\.outputLockedProfile \|\| els\.formatSection\.hidden/);
+		// lock shows the job's actual format: explicit choice, else the record
+		expect(pageSrc).toContain("startOutputProfile || job.outputProfile");
+	});
+
+	it("runner setPreparedOutputProfile: prepared-only and modality-checked", () => {
+		expect(runnerSrc).toContain("async setPreparedOutputProfile(jobId, profile)");
+		// only a prepared record accepts the change (typed refusal otherwise)…
+		expect(runnerSrc).toMatch(/setPreparedOutputProfile\(jobId, profile\)[\s\S]*?rec\.state !== 'prepared'/);
+		// …and the value must fit the probed modality
+		expect(runnerSrc).toMatch(/setPreparedOutputProfile\(jobId, profile\)[\s\S]*?checkedOutputProfile\(profile, rec\.modality\)/);
+	});
+
+	it("a started job locks the choice and shows its actual format", () => {
+		expect(pageSrc)
+			.toContain("lockOutputProfile(outputProfile || E.defaultOutputProfile(probeDoc().modality))");
+		expect(pageSrc).toContain("els.formatFieldset.disabled = !!locked;");
+		expect(pageSrc).toContain("t(`tools.result.format.${locked}`)");
+		// the job list row names the job's output format
+		expect(pageSrc).toContain("t(`tools.jobs.format.${job.outputProfile}`)");
+	});
+
+	it("i18n carries the choice labels in zh and en", () => {
+		expect(i18nSrc).toContain('"tools.format.ome": "OME-TIFF（推荐，QuPath / Bio-Formats）"');
+		expect(i18nSrc).toContain('"tools.format.classic": "经典金字塔 TIFF（OpenSlide 工具）"');
+		expect(i18nSrc).toContain('"tools.format.ome": "OME-TIFF (recommended; QuPath / Bio-Formats)"');
+		expect(i18nSrc).toContain('"tools.format.classic": "Classic pyramid TIFF (OpenSlide tools)"');
 	});
 });

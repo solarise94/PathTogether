@@ -375,6 +375,16 @@ export function magicSupported(head) {
   return SUPPORTED_MAGICS.some((m) => m.every((b, i) => head[i] === b));
 }
 
+/// Container magic → modality ('brightfield' KFB | 'fluorescence' KFBF;
+/// null = not a supported container). The core decides the variant from the
+/// same magic, so the page can offer the brightfield output-format choice
+/// (or withhold it for fluorescence) before the copy+probe round-trip.
+export function magicModality(head) {
+  if (SUPPORTED_MAGICS[1].every((b, i) => head[i] === b)) return 'fluorescence';
+  if (SUPPORTED_MAGICS[0].every((b, i) => head[i] === b)) return 'brightfield';
+  return null;
+}
+
 // ------------------------------------------------------ output profiles --
 
 /// Output layouts the core can write (`--profile` ids; persisted in job

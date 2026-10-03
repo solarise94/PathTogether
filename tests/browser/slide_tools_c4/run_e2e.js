@@ -657,7 +657,8 @@ async function main() {
       await L.login(page, PORT, creds, 'user');
       await L.C3.openTools(page, PORT);
       await L.setFile(page, bf);
-      await waitFor(async () => (await page.$('#probe-section:not([hidden])')) !== null, 60000, 'probe');
+      await waitFor(async () => (await page.$('#summary-section:not([hidden])')) !== null, 60000, 'summary');
+      await L.C3.openMoreOptions(page);
       await waitFor(async () => (await page.$('#format-section:not([hidden])')) !== null, 30000, 'format choice');
       await page.check('#format-classic');
       await page.click('#convert-btn');
@@ -782,11 +783,14 @@ async function main() {
       if (!bytesTexts.some((t) => /已传输|transferred/i.test(t))) {
         throw new Error(`no byte text seen: ${JSON.stringify([...new Set(bytesTexts)].slice(0, 4))}`);
       }
-      // ③ 上传 100% 后、发布前：接收/校验阶段持续显示（不定态活动指示）
-      const sawReceive = stageSeen.some((s) => /等待服务器接收|服务器接收中/.test(s));
-      const sawValidate = stageSeen.some((s) => /正在校验|服务器处理中/.test(s));
-      if (!sawReceive || !sawValidate) {
-        throw new Error(`server stages missing before published: rx=${sawReceive} validate=${sawValidate}`);
+      // ③ 上传 100% 后、发布前：接收/校验阶段持续显示（不定态活动指示）。
+      //    U2：工具页阶段文案与计划对齐（排队 → 上传至腾讯云 → 工作台接收 →
+      //    校验/发布 → 可查看）——按新文案断言。
+      const sawCos = stageSeen.some((s) => /上传至腾讯云|Uploading to Tencent Cloud/.test(s));
+      const sawReceive = stageSeen.some((s) => /工作台接收|Receiving in the workbench/.test(s));
+      const sawValidate = stageSeen.some((s) => /校验\/发布|Validating\/publishing/.test(s));
+      if (!sawCos || !sawReceive || !sawValidate) {
+        throw new Error(`server stages missing before published: cos=${sawCos} rx=${sawReceive} validate=${sawValidate}`);
       }
       if (!indeterminateDuringServer) throw new Error('no indeterminate bar during server stages');
       await waitFor(async () => (await rowUploadState(page)) === 'published', 30000, 'row published');

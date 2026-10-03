@@ -100,6 +100,16 @@ async function openTools(page, port) {
   return page;
 }
 
+/// U2：高级项（输出格式/资源档位/像素策略/技术摘要/空间细项/通道信息）都在
+/// 折叠的「更多选项」里；需要操作其中的控件时先展开（幂等）。
+async function openMoreOptions(page) {
+  return page.evaluate(() => {
+    const d = document.getElementById('more-options');
+    if (d && !d.open) d.open = true;
+    return !!(d && d.open);
+  });
+}
+
 // ---------------------------------------------------------------- files --
 
 function ensureFixture(name, args) {
@@ -272,7 +282,8 @@ async function shot(page, name) {
 }
 
 module.exports = {
-  arg, testLocale, startServer, launch, openTools, savePickerStub, downloadGuard, setFile,
+  arg, testLocale, startServer, launch, openTools, openMoreOptions, savePickerStub,
+  downloadGuard, setFile,
   ensureFixture, sparseLargeKfb, sha256File, nativeConvert, opfsSha256,
   clearJobs, jobDirs, writeJson, shot,
   GATE, REPO, CLI, SCREENS, chromium,

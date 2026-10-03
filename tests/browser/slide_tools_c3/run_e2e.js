@@ -40,12 +40,15 @@ async function i18nLabel(page, key) {
   return s;
 }
 
-/// 主流程：选文件 → probe 摘要 → 转换 → ready。返回 {saved?} 由调用方扩展。
+/// 主流程：选文件 → 准备（复制与识别）→ 配置摘要 → 转换 → ready。返回 {saved?} 由调用方扩展。
 async function runConvertFlow(page, file, { profile = null } = {}) {
   await L.setFile(page, file);
-  await waitVisible(page, '#probe-section:not([hidden])');
+  await waitVisible(page, '#summary-section:not([hidden])');
   await waitText(page, '#estimate-total', /[0-9]/);
-  if (profile) await page.check(`#profile-${profile}`);
+  if (profile) {
+    await L.openMoreOptions(page);
+    await page.check(`#profile-${profile}`);
+  }
   await page.click('#convert-btn');
   await waitVisible(page, '#result-section:not([hidden])');
 }
@@ -196,7 +199,8 @@ async function assertDisplayWindows(page) {
 }
 
 // (b) KFBF 荧光夹具 + 可选 channel.json 伴随输入（≤1 MiB 有界读）。
-// 伴随文件在选源文件之后才选：走「准备后改选 → 写回任务记录」路径。
+// U2：通道信息输入只在荧光文件识别后出现（更多选项内）；伴随文件在识别后
+// 选择：走「准备后改选 → 写回任务记录」路径。
 async function scenarioB() {
   const kfbf = L.ensureFixture('fl-600x400.kfbf', ['gen-kfbf']);
   const cj = channelFixture();
@@ -206,8 +210,18 @@ async function scenarioB() {
   const { context, page } = await L.launch('b', [L.savePickerStub()]);
   try {
     await L.openTools(page, PORT);
+    // 识别前不出现通道信息输入（U2 回归点：旧行为是一直可见）
+    const channelBefore = await page.evaluate(() => {
+      const el = document.getElementById('channel-section');
+      return el ? !el.hidden : null;
+    });
+    if (channelBefore !== false) throw new Error(`channel section visible before identification: ${channelBefore}`);
     await L.setFile(page, kfbf);
+    await waitVisible(page, '#summary-section:not([hidden])');
+    const channelAfter = await page.evaluate(() => !document.getElementById('channel-section').hidden);
+    if (!channelAfter) throw new Error('channel section missing after fluorescence identification');
     await page.setInputFiles('#channel-input', cj);
+    await L.openMoreOptions(page);
     await waitVisible(page, '#probe-section:not([hidden])');
     const channelsText = await page.textContent('#probe-grid');
     if (!/DAPI/.test(channelsText)) throw new Error('probe summary missing channel names');
@@ -219,7 +233,8 @@ async function scenarioB() {
     const saved = await L.opfsSha256(page);
     if (saved.sha256 !== nativeSha) throw new Error(`saved sha ${saved.sha256} != native ${nativeSha}`);
     record('b-kfbf-happy-path', true, { savedSha256: saved.sha256, nativeSha256: nativeSha,
-      savedBytes: saved.size, displayWindows: windows });
+      savedBytes: saved.size, displayWindows: windows,
+      channelShownAfterIdentify: channelAfter });
   } catch (e) {
     record('b-kfbf-happy-path', false, { error: String(e).slice(0, 400) });
   } finally {
@@ -245,7 +260,7 @@ async function scenarioC() {
       return p && Number(p.getAttribute('aria-valuenow') || 0) > 3;
     }, null, { timeout: 120000 });
     await L.shot(page, 'copying');
-    await waitVisible(page, '#probe-section:not([hidden])');
+    await waitVisible(page, '#summary-section:not([hidden])', 300000);
     await page.click('#convert-btn');
     // converting 截图 + 等到有已提交字节后刷新（模拟用户中途关页）
     await page.waitForFunction(() => {
@@ -383,7 +398,7 @@ async function scenarioE() {
   try {
     await L.openTools(page, PORT);
     await L.setFile(page, kfb);
-    await waitVisible(page, '#probe-section:not([hidden])', 300000);
+    await waitVisible(page, '#summary-section:not([hidden])', 300000);
     await page.click('#convert-btn');
     await waitVisible(page, '#cancel-btn:not([hidden])', 300000);
     // 点击 → 同步反馈 + 下一渲染帧均 ≤ 250ms
@@ -421,7 +436,7 @@ async function scenarioF() {
   try {
     await L.openTools(page, PORT);
     await L.setFile(page, kfb);
-    await waitVisible(page, '.job-row[data-next-action="start"]', 60000);
+    await waitVisible(page, '#summary-section:not([hidden])', 60000);
     // 刷新 → prepared 任务在列表 → 开始（无需重选文件）
     await page.reload({ waitUntil: 'load' });
     await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
@@ -449,8 +464,10 @@ async function scenarioG() {
   try {
     await L.openTools(page, PORT);
     await L.setFile(page, kfb);
-    await waitVisible(page, '#probe-section:not([hidden])');
+    await waitVisible(page, '#summary-section:not([hidden])');
     const warnVisible = await page.evaluate(() => !document.getElementById('policy-strict-warn').hidden);
+    await L.openMoreOptions(page);
+    await waitVisible(page, '#policy-section:not([hidden])');
     await page.check('#policy-strict');
     await page.click('#convert-btn');
     await waitText(page, '#page-error', /pixel_policy_violation/, 120000);
@@ -542,7 +559,7 @@ async function scenarioL() {
   try {
     await L.openTools(page, PORT);
     await L.setFile(page, kfb);
-    await waitVisible(page, '#probe-section:not([hidden])');
+    await waitVisible(page, '#summary-section:not([hidden])');
     await page.click('#convert-btn');
     await waitVisible(page, '#result-section:not([hidden])');
     // 本场景验证 zh → en → zh：起点须是 zh（--locale 覆盖成英文时先切回 zh）
@@ -571,7 +588,7 @@ async function scenarioL() {
       save: document.getElementById('save-btn').textContent,
     }));
     record('l-zh-en-toggle', audit.rawKeys.length === 0 && audit.cjkSample === ''
-      && /保存到磁盘/.test(backZh.save) && /本地切片工具/.test(backZh.h1),
+      && /保存到电脑/.test(backZh.save) && /本地切片工具/.test(backZh.h1),
       { ...audit, backZhH1: backZh.h1, backZhSave: backZh.save });
   } catch (e) {
     record('l-zh-en-toggle', false, { error: String(e).slice(0, 400) });
@@ -603,9 +620,57 @@ async function scenarioM() {
       page.keyboard.press('Enter'),
     ]);
     await chooser.setFiles(kfb);
-    await waitVisible(page, '#probe-section:not([hidden])');
+    await waitVisible(page, '#summary-section:not([hidden])');
 
-    // 资源档位 radio：Tab 进入组，方向键可选（值必须真的改变）
+    // 画质 radio（摘要内、折叠外）：Tab 进入组，方向键可选（值必须真的改变）
+    for (let i = 0; i < 30; i++) {
+      const inGroup = await page.evaluate(() => {
+        const a = document.activeElement;
+        return a && a.name === 'encoding';
+      });
+      if (inGroup) break;
+      await page.keyboard.press('Tab');
+    }
+    const qualityBefore = await page.evaluate(() =>
+      (document.querySelector('input[name="encoding"]:checked') || {}).value);
+    await page.keyboard.press('ArrowDown');
+    const qualityChanged = await page.evaluate(() => {
+      const c = document.querySelector('input[name="encoding"]:checked');
+      return c && c.value;
+    });
+    // 画质也写回 prepared 记录（U3 合同的键盘路径）
+    await page.waitForFunction(async () => {
+      const E = await import('/static/tools/slide-transform/engine.js');
+      const root = await navigator.storage.getDirectory();
+      let jobs;
+      try { jobs = await root.getDirectoryHandle('slide-jobs'); } catch { return false; }
+      for await (const [, h] of jobs.entries()) {
+        if (h.kind !== 'directory') continue;
+        const rec = await E.readSlotRecord(h, 'job').catch(() => null);
+        if (rec && rec.state === 'prepared') return rec.encodingProfile === 'compact-jpeg-v1';
+      }
+      return false;
+    }, null, { timeout: 20000 });
+    // 选回保留画质（后续场景沿用默认输出）
+    const backToPreserve = await page.evaluate(() => {
+      const c = document.getElementById('quality-preserve');
+      c.focus();
+      c.checked = true;
+      c.dispatchEvent(new Event('change', { bubbles: true }));
+      return c.checked;
+    });
+
+    // 「更多选项」summary：Tab 至 + Enter 展开（键盘折叠/展开）
+    for (let i = 0; i < 30; i++) {
+      const onSummary = await page.evaluate(() =>
+        document.activeElement === document.querySelector('#more-options > summary'));
+      if (onSummary) break;
+      await page.keyboard.press('Tab');
+    }
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.getElementById('more-options').open, null, { timeout: 10000 });
+
+    // 资源档位 radio（更多选项内）：Tab 进入组，方向键可选（值必须真的改变）
     for (let i = 0; i < 20; i++) {
       const inGroup = await page.evaluate(() => {
         const a = document.activeElement;
@@ -641,8 +706,10 @@ async function scenarioM() {
 
     // 对话框键盘：硬不足的错误不是对话框——用删除确认（native confirm）覆盖；
     // <dialog> 焦点圈已由 d1 的 focusIn/focusRestored 断言覆盖。
-    record('m-keyboard-only', !!profileChanged && profileChanged !== profileBefore && !!saved.sha256,
-      { profileBefore, profileChangedTo: profileChanged, savedSha256: saved.sha256 });
+    record('m-keyboard-only', !!profileChanged && profileChanged !== profileBefore
+        && !!qualityChanged && qualityChanged !== qualityBefore && backToPreserve && !!saved.sha256,
+      { profileBefore, profileChangedTo: profileChanged, qualityBefore,
+        qualityChangedTo: qualityChanged, savedSha256: saved.sha256 });
   } catch (e) {
     record('m-keyboard-only', false, { error: String(e).slice(0, 400) });
   } finally {
@@ -666,8 +733,9 @@ const READ_JOB_RECORDS = `window.__readJobRecords = async () => {
 };`;
 
 // (n) C4-1：选择 → 准备 → 刷新 → 从任务列表开始，channel.json 不丢。
-//   n1：伴随文件先于源文件选择（随 probe 写入准备记录）
-//   n2：源文件准备完成后才选伴随文件（setPreparedChannelJson 写回）
+// U2：通道信息输入只在荧光文件识别后出现（更多选项内），两个变体都在识别
+// 后选择伴随文件；n1 识别后立即选，n2 等准备记录已存在后再选
+// （setPreparedChannelJson 写回已 prepared 的记录）。
 async function scenarioN() {
   const kfbf = L.ensureFixture('fl-600x400.kfbf', ['gen-kfbf']);
   const cj = channelFixture();
@@ -677,10 +745,20 @@ async function scenarioN() {
     page.on('dialog', (d) => d.accept());
     try {
       await L.openTools(page, PORT);
-      if (variant === 'n1') await page.setInputFiles('#channel-input', cj);
       await L.setFile(page, kfbf);
-      await waitVisible(page, '#probe-section:not([hidden])');
-      if (variant === 'n2') await page.setInputFiles('#channel-input', cj);
+      await waitVisible(page, '#summary-section:not([hidden])');
+      if (variant === 'n2') {
+        // n2：等 prepared 记录先落盘，再补选伴随文件（写回路径）
+        const deadline0 = Date.now() + 20000;
+        for (;;) {
+          const recs = await page.evaluate(() => window.__readJobRecords());
+          if (recs.length === 1 && recs[0].state === 'prepared') break;
+          if (Date.now() > deadline0) throw new Error('prepared record not found before channel.json');
+          await page.waitForTimeout(200);
+        }
+      }
+      await L.openMoreOptions(page);
+      await page.setInputFiles('#channel-input', cj);
       // 等准备记录里落下 channel.json 后再刷新（异步谓词不能交给 waitForFunction：
       // 它把返回的 Promise 当作真值立即放行）
       const deadline = Date.now() + 20000;
@@ -725,7 +803,8 @@ async function scenarioO() {
   try {
     await L.openTools(page, PORT);
     await L.setFile(page, kfb);
-    await waitVisible(page, '#probe-section:not([hidden])');
+    await waitVisible(page, '#summary-section:not([hidden])');
+    await L.openMoreOptions(page);
     await waitVisible(page, '#format-section:not([hidden])');
     const def = await page.evaluate(() =>
       (document.querySelector('input[name="outputFormat"]:checked') || {}).value);
@@ -784,7 +863,8 @@ async function scenarioP() {
   try {
     await L.openTools(page, PORT);
     await L.setFile(page, kfb);
-    await waitVisible(page, '#probe-section:not([hidden])', 300000);
+    await waitVisible(page, '#summary-section:not([hidden])', 300000);
+    await L.openMoreOptions(page);
     await page.check('#format-classic');
     await page.click('#convert-btn');
     await page.waitForFunction(() => {
@@ -837,6 +917,8 @@ async function scenarioQ() {
     await L.setFile(page, kfb);
     // probe 完成后 prepared 行已在列表（不从顶部按钮转换）
     await waitVisible(page, '.job-row[data-next-action="start"]', 60000);
+    await L.openMoreOptions(page);
+    await waitVisible(page, '#format-section:not([hidden])');
     await page.check('#format-classic');
     await page.click('.job-row[data-next-action="start"] button[data-action="start"]');
     await waitVisible(page, '#result-section:not([hidden])', 120000);
@@ -860,11 +942,13 @@ async function scenarioR() {
   try {
     await L.openTools(page, PORT);
     await L.setFile(page, kfbf);
-    await waitVisible(page, '#probe-section:not([hidden])');
+    await waitVisible(page, '#summary-section:not([hidden])');
     const fmt = await page.evaluate(() => ({
       hidden: document.getElementById('format-section').hidden,
+      qualityHidden: document.getElementById('quality-fieldset').hidden,
     }));
     if (!fmt.hidden) throw new Error('output-format choice offered for a fluorescence input');
+    if (!fmt.qualityHidden) throw new Error('quality choice offered for a fluorescence input');
     await page.click('#convert-btn');
     await waitVisible(page, '#result-section:not([hidden])');
     const flName = await i18nLabel(page, 'tools.result.format.fl-ome');
@@ -877,6 +961,7 @@ async function scenarioR() {
     const rec = (await page.evaluate(() => window.__readJobRecords()))[0];
     if (rec.outputProfile !== 'fl-ome') throw new Error(`record outputProfile ${rec.outputProfile}`);
     record('r-fl-no-choice-fl-ome', true, { sectionHidden: fmt.hidden,
+      qualityHidden: fmt.qualityHidden,
       formatRow: fmtRow.trim(), suggestedName: picker.name, recordedProfile: rec.outputProfile });
   } catch (e) {
     record('r-fl-no-choice-fl-ome', false, { error: String(e).slice(0, 400) });
@@ -898,6 +983,8 @@ async function scenarioS() {
   try {
     await L.openTools(page, PORT);
     await L.setFile(page, kfb);
+    await waitVisible(page, '#summary-section:not([hidden])');
+    await L.openMoreOptions(page);
     await waitVisible(page, '#format-section:not([hidden])');
     await page.check('#format-classic');
     // 等改选真正写进 prepared 记录再刷新（异步谓词不能交给 waitForFunction）
@@ -957,6 +1044,8 @@ async function scenarioT() {
   try {
     await L.openTools(page, PORT);
     await L.setFile(page, kfb);
+    await waitVisible(page, '#summary-section:not([hidden])');
+    await L.openMoreOptions(page);
     await waitVisible(page, '#format-section:not([hidden])');
     // 不触碰 radio：prepared 记录保持默认 bf-ome
     const recBefore = await page.evaluate(async () => {
@@ -989,6 +1078,352 @@ async function scenarioT() {
   }
 }
 
+
+// (u) U2 入口：drop 与 file input 走同一 prepareSource；多文件/目录/.mrxs/
+// .dat/.svs 给出明确提示且不开始任何处理；伪装后缀按文件头识别（扩展名
+// 只是提示）。多文件/目录项/不支持提示在旧代码上无对应元素 → 回归标记。
+async function scenarioU() {
+  const kfb = L.ensureFixture('bf-580x300.kfb', ['gen-kfb', '--width', '580', '--height', '300']);
+  const kfbBytes = fs.readFileSync(kfb).toString('base64');
+  // 目录项测试桩：名为 MRXS-DIR 的条目按目录处理（真实目录项只能在事件内取）
+  const dirStub = `(() => {
+    const orig = DataTransferItem.prototype.webkitGetAsEntry;
+    DataTransferItem.prototype.webkitGetAsEntry = function () {
+      const f = this.getAsFile && this.getAsFile();
+      if (f && f.name === 'MRXS-DIR') return { isDirectory: true };
+      return orig ? orig.call(this) : null;
+    };
+  })();`;
+  const { context, page } = await L.launch('u', [dirStub]);
+  try {
+    await L.openTools(page, PORT);
+    const dropByName = (name, b64, kind = 'file') => page.evaluate(
+      ([name, b64]) => {
+        const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+        const dt = new DataTransfer();
+        dt.items.add(new File([bytes], name, { type: '' }));
+        const zone = document.getElementById('drop-zone');
+        zone.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
+        return true;
+      }, [name, b64, kind]);
+
+    const msgIs = async (re) => {
+      await page.waitForFunction((r) => {
+        const el = document.getElementById('input-message');
+        return el && !el.hidden && r.test(el.textContent);
+      }, re, { timeout: 10000 });
+      return (await page.textContent('#input-message')).trim();
+    };
+
+    // 多文件：明确提示，无任务目录
+    await page.evaluate(() => {
+      const dt = new DataTransfer();
+      dt.items.add(new File([new Uint8Array(4)], 'a.kfb'));
+      dt.items.add(new File([new Uint8Array(4)], 'b.kfb'));
+      document.getElementById('drop-zone')
+        .dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
+    });
+    const multiMsg = await msgIs(/一次只处理一个|One slide file at a time/);
+    if ((await L.jobDirs(page)).length !== 0) throw new Error('multi-file drop started a job');
+
+    // 目录 / .mrxs：MRXS 需要完整包且当前未支持
+    await dropByName('MRXS-DIR', Buffer.from('x').toString('base64'));
+    const dirMsg = await msgIs(/MRXS|完整包/);
+    await dropByName('slide.mrxs', Buffer.from('x').toString('base64'));
+    const mrxsMsg = await msgIs(/MRXS|完整包/);
+    await dropByName('index.dat', Buffer.from('x').toString('base64'));
+    await msgIs(/MRXS|完整包/);
+
+    // .svs：尚未支持
+    await dropByName('scan.svs', Buffer.from('x').toString('base64'));
+    const svsMsg = await msgIs(/SVS/);
+    if ((await L.jobDirs(page)).length !== 0) throw new Error('hinted drop started a job');
+
+    // 伪装后缀：.kfb 名字 + 无关内容 → 文件头识别拒绝（复制前）
+    await dropByName('fake.kfb', Buffer.from('not a slide at all').toString('base64'));
+    await waitText(page, '#page-error', /unsupported_input|不支持|not a supported/i, 30000);
+    if ((await L.jobDirs(page)).length !== 0) throw new Error('fake .kfb left a job dir');
+
+    // 反向伪装：真实 KFB 字节 + .txt 名字 → 头识别接受（扩展名只是提示）
+    await dropByName('renamed.txt', kfbBytes);
+    await waitVisible(page, '#summary-section:not([hidden])', 60000);
+    const identifiedName = await page.textContent('#summary-name');
+
+    // 真实 KFB drop happy path：换一个干净 profile 再来一次（直接拖入即出摘要）
+    await L.clearJobs(page);
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
+    await dropByName('dropped.kfb', kfbBytes);
+    await waitVisible(page, '#summary-section:not([hidden])', 60000);
+    const rowPrepared = await page.waitForSelector('.job-row[data-next-action="start"]', { timeout: 30000 });
+
+    record('u-drop-entry-and-hints', true, {
+      multiMsg: multiMsg.slice(0, 60), dirMsg: dirMsg.slice(0, 40), mrxsMsg: mrxsMsg.slice(0, 40),
+      svsMsg: svsMsg.slice(0, 40), disguisedRejected: true, disguisedAccepted: identifiedName.trim(),
+      dropHappyPath: !!rowPrepared,
+    });
+  } catch (e) {
+    record('u-drop-entry-and-hints', false, { error: String(e).slice(0, 400) });
+  } finally {
+    await context.close();
+  }
+}
+
+// (v) U2 画质：明场显示画质选择；strict 与 compact 互斥（UI 阻止）；选
+// compact 后磁盘预估切换上界；端到端产物 encoding=compact 且 sha == 原生
+// CLI --encoding compact。
+async function scenarioV() {
+  const kfb = L.ensureFixture('bf-580x300.kfb', ['gen-kfb', '--width', '580', '--height', '300']);
+  const native = L.nativeConvert(kfb, path.join(L.GATE, 'fixtures', 'bf-580x300-native-compact.tif'),
+    ['--encoding', 'compact']);
+  const nativeSha = await L.sha256File(native);
+
+  const { context, page } = await L.launch('v', [L.savePickerStub(), READ_JOB_RECORDS]);
+  try {
+    await L.openTools(page, PORT);
+    await L.setFile(page, kfb);
+    await waitVisible(page, '#summary-section:not([hidden])');
+    const qShown = await page.evaluate(() => !document.getElementById('quality-fieldset').hidden);
+    if (!qShown) throw new Error('quality choice not shown for a brightfield input');
+    const defQ = await page.evaluate(() =>
+      (document.querySelector('input[name="encoding"]:checked') || {}).value);
+    if (defQ !== 'preserve-source-v1') throw new Error(`default quality ${defQ}`);
+    const estimateBefore = await page.textContent('#estimate-output');
+
+    // strict 选中 → compact 被禁用（UI 互斥）
+    await L.openMoreOptions(page);
+    await page.check('#policy-strict');
+    let compactDisabled = await page.evaluate(() => document.getElementById('quality-compact').disabled);
+    if (!compactDisabled) throw new Error('compact not disabled while strict selected');
+    await page.check('#policy-allow-edge');
+
+    // compact 选中 → strict 被禁用；磁盘预估换成 compact 上界；写回 prepared 记录
+    await page.check('#quality-compact');
+    const strictDisabled = await page.evaluate(() => document.getElementById('policy-strict').disabled);
+    if (!strictDisabled) throw new Error('strict not disabled while compact selected');
+    await page.waitForFunction((before) =>
+      document.getElementById('estimate-output').textContent !== before, estimateBefore,
+      { timeout: 10000 });
+    const estimateAfter = (await page.textContent('#estimate-output')).trim();
+    const deadline = Date.now() + 20000;
+    for (;;) {
+      const recs = await page.evaluate(() => window.__readJobRecords());
+      if (recs.length === 1 && recs[0].state === 'prepared'
+        && recs[0].encodingProfile === 'compact-jpeg-v1') break;
+      if (Date.now() > deadline) throw new Error('prepared record lacks compact encodingProfile');
+      await page.waitForTimeout(200);
+    }
+    await page.click('#convert-btn');
+    await waitVisible(page, '#result-section:not([hidden])');
+    const encRow = (await page.textContent('#result-encoding')) || '';
+    const compactLabel = await i18nLabel(page, 'tools.quality.compact');
+    if (!encRow.includes(compactLabel)) throw new Error(`result encoding row "${encRow}"`);
+    await page.click('#save-btn');
+    await waitText(page, '#save-status', /已保存|Saved/);
+    const saved = await L.opfsSha256(page);
+    if (saved.sha256 !== nativeSha) throw new Error(`compact sha ${saved.sha256} != native ${nativeSha}`);
+    // 开始后锁定：radio 禁用 + 文案展示任务画质
+    const lockedUi = await page.evaluate(() => ({
+      disabled: document.getElementById('quality-fieldset').disabled,
+      noteHidden: document.getElementById('quality-locked').hidden,
+      note: document.getElementById('quality-locked').textContent,
+    }));
+    if (!lockedUi.disabled || lockedUi.noteHidden || !lockedUi.note.includes(compactLabel)) {
+      throw new Error(`quality lock UI ${JSON.stringify(lockedUi)}`);
+    }
+    record('v-compact-quality-e2e', true, { savedSha256: saved.sha256, nativeSha256: nativeSha,
+      estimateBefore: estimateBefore.trim(), estimateAfter,
+      resultEncodingRow: encRow.trim(), lockedNote: lockedUi.note.trim() });
+  } catch (e) {
+    record('v-compact-quality-e2e', false, { error: String(e).slice(0, 400) });
+  } finally {
+    await context.close();
+  }
+}
+
+// (w) U2 画质「重开以记录为准」：prepared 选 compact → 刷新（radio 回默认
+// preserve、画质组隐藏）→ 从任务列表「开始」：记录的 compact 获胜，结果
+// encoding=compact 且 sha == 原生 compact。
+async function scenarioW() {
+  const kfb = L.ensureFixture('bf-580x300.kfb', ['gen-kfb', '--width', '580', '--height', '300']);
+  const native = L.nativeConvert(kfb, path.join(L.GATE, 'fixtures', 'bf-580x300-native-compact-w.tif'),
+    ['--encoding', 'compact']);
+  const nativeSha = await L.sha256File(native);
+
+  const { context, page } = await L.launch('w', [L.savePickerStub(), READ_JOB_RECORDS]);
+  try {
+    await L.openTools(page, PORT);
+    await L.setFile(page, kfb);
+    await waitVisible(page, '#summary-section:not([hidden])');
+    await page.check('#quality-compact');
+    const deadline = Date.now() + 20000;
+    for (;;) {
+      const recs = await page.evaluate(() => window.__readJobRecords());
+      if (recs.length === 1 && recs[0].state === 'prepared'
+        && recs[0].encodingProfile === 'compact-jpeg-v1') break;
+      if (Date.now() > deadline) throw new Error('prepared record lacks compact encodingProfile');
+      await page.waitForTimeout(200);
+    }
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
+    const radioAfterReload = await page.evaluate(() =>
+      (document.querySelector('input[name="encoding"]:checked') || {}).value);
+    if (radioAfterReload !== 'preserve-source-v1') {
+      throw new Error(`radio after reload ${radioAfterReload}`);
+    }
+    const rowMeta = await page.textContent('.job-row');
+    if (!rowMeta.includes(await i18nLabel(page, 'tools.jobs.encoding.compact'))) {
+      throw new Error(`job row lacks compact marker: ${rowMeta}`);
+    }
+    const startBtn = '.job-row[data-next-action="start"] button[data-action="start"]';
+    await waitVisible(page, startBtn);
+    await page.click(startBtn);
+    await waitVisible(page, '#result-section:not([hidden])', 120000);
+    const encRow = (await page.textContent('#result-encoding')) || '';
+    if (!encRow.includes(await i18nLabel(page, 'tools.quality.compact'))) {
+      throw new Error(`record did not win: encoding row "${encRow}"`);
+    }
+    await page.click('#save-btn');
+    await waitText(page, '#save-status', /已保存|Saved/);
+    const saved = await L.opfsSha256(page);
+    if (saved.sha256 !== nativeSha) throw new Error(`sha ${saved.sha256} != native compact ${nativeSha}`);
+    record('w-compact-record-wins-after-reload', true, { sha: saved.sha256,
+      radioAfterReload, encodingRow: encRow.trim() });
+  } catch (e) {
+    record('w-compact-record-wins-after-reload', false, { error: String(e).slice(0, 400) });
+  } finally {
+    await context.close();
+  }
+}
+
+// (x) 旧任务记录没有 encodingProfile 字段（U3 之前的记录）→ 续跑必须按
+// preserve 语义（结果与原生 preserve 一致），绝不被当成 compact。
+async function scenarioX() {
+  const kfb = L.ensureFixture('bf-580x300.kfb', ['gen-kfb', '--width', '580', '--height', '300']);
+  const native = L.nativeConvert(kfb, path.join(L.GATE, 'fixtures', 'bf-580x300-native-x.tif'));
+  const nativeSha = await L.sha256File(native);
+
+  const { context, page } = await L.launch('x', [L.savePickerStub(), READ_JOB_RECORDS]);
+  try {
+    await L.openTools(page, PORT);
+    await L.setFile(page, kfb);
+    await waitVisible(page, '#summary-section:not([hidden])');
+    // 把准备记录改写成 U3 之前的形状：删除 encodingProfile 字段
+    await page.evaluate(async () => {
+      const E = await import('/static/tools/slide-transform/engine.js');
+      const root = await navigator.storage.getDirectory();
+      const jobs = await root.getDirectoryHandle('slide-jobs');
+      const names = [];
+      for await (const [n, h] of jobs.entries()) {
+        if (h.kind === 'directory' && !n.startsWith('.')) names.push(n);
+      }
+      for (const n of names) {
+        const dir = await jobs.getDirectoryHandle(n);
+        const rec = await E.readSlotRecord(dir, 'job');
+        delete rec.encodingProfile;
+        await E.writeSlotRecord(dir, 'job', rec);
+      }
+    });
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
+    const startBtn = '.job-row[data-next-action="start"] button[data-action="start"]';
+    await waitVisible(page, startBtn);
+    await page.click(startBtn);
+    await waitVisible(page, '#result-section:not([hidden])', 120000);
+    const encRow = (await page.textContent('#result-encoding')) || '';
+    if (!encRow.includes(await i18nLabel(page, 'tools.quality.preserve'))) {
+      throw new Error(`legacy record not resumed as preserve: "${encRow}"`);
+    }
+    await page.click('#save-btn');
+    await waitText(page, '#save-status', /已保存|Saved/);
+    const saved = await L.opfsSha256(page);
+    if (saved.sha256 !== nativeSha) {
+      throw new Error(`legacy resume sha ${saved.sha256} != native preserve ${nativeSha}`);
+    }
+    record('x-legacy-record-resumes-preserve', true, { sha: saved.sha256,
+      encodingRow: encRow.trim() });
+  } catch (e) {
+    record('x-legacy-record-resumes-preserve', false, { error: String(e).slice(0, 400) });
+  } finally {
+    await context.close();
+  }
+}
+
+// (y) U2 取消准备：复制进行中点击「取消准备」→ 阶段消失、明确反馈、
+// 任务目录删除（无残留）。
+async function scenarioY() {
+  const kfb = L.ensureFixture('bf-2g.kfb', ['gen-kfb', '--width', '36500', '--height', '36500']);
+  const { context, page } = await L.launch('y', []);
+  try {
+    await L.openTools(page, PORT);
+    await L.setFile(page, kfb);
+    await page.waitForFunction(() => {
+      const p = document.getElementById('stage-progress');
+      return p && Number(p.getAttribute('aria-valuenow') || 0) > 0;
+    }, null, { timeout: 120000 });
+    const cancelVisible = await page.evaluate(() => !document.getElementById('prepare-cancel-btn').hidden);
+    if (!cancelVisible) throw new Error('prepare cancel button not visible during preparation');
+    await page.click('#prepare-cancel-btn');
+    await page.waitForFunction(() => document.getElementById('stage-section').hidden, null, { timeout: 30000 });
+    await waitText(page, '#page-status', /已取消准备|cancelled/i, 10000);
+    const deadline = Date.now() + 60000;
+    let dirs = [];
+    while (Date.now() < deadline) {
+      dirs = await L.jobDirs(page);
+      if (dirs.length === 0) break;
+      await page.waitForTimeout(500);
+    }
+    record('y-prepare-cancel', dirs.length === 0, { jobDirsAfter: dirs });
+  } catch (e) {
+    record('y-prepare-cancel', false, { error: String(e).slice(0, 400) });
+  } finally {
+    await context.close();
+  }
+}
+
+// (z) U2 窄屏（≤400px）与折叠项：默认视图折叠（任务记录空、摘要未出现）、
+// 识别后「更多选项」默认折叠、任务记录有任务时展开；400px 视口截图检查。
+async function scenarioZ() {
+  const kfb = L.ensureFixture('bf-580x300.kfb', ['gen-kfb', '--width', '580', '--height', '300']);
+  const { context, page } = await L.launch('z', [L.savePickerStub()]);
+  try {
+    await page.setViewportSize({ width: 400, height: 850 });
+    await L.openTools(page, PORT);
+    const before = await page.evaluate(() => ({
+      summaryHidden: document.getElementById('summary-section').hidden,
+      jobsOpen: document.getElementById('jobs-details').open,
+      moreOptionsOpen: (document.getElementById('more-options') || {}).open,
+    }));
+    if (!before.summaryHidden || before.jobsOpen) {
+      throw new Error(`default view not collapsed: ${JSON.stringify(before)}`);
+    }
+    await L.shot(page, 'narrow-default');
+    await L.setFile(page, kfb);
+    await waitVisible(page, '#summary-section:not([hidden])');
+    const after = await page.evaluate(() => ({
+      moreOptionsOpen: document.getElementById('more-options').open,
+      jobsOpen: document.getElementById('jobs-details').open,
+      qualityHidden: document.getElementById('quality-fieldset').hidden,
+    }));
+    if (after.moreOptionsOpen) throw new Error('more options not collapsed by default after identification');
+    if (!after.jobsOpen) throw new Error('job records not opened once a job exists');
+    if (after.qualityHidden) throw new Error('quality choice hidden for brightfield on narrow viewport');
+    await L.shot(page, 'narrow-identified');
+    // 英文窄屏截图（语言切换动态文案与折叠结构同查）
+    await page.click('.lang-toggle');
+    await page.waitForFunction(() => document.documentElement.lang === 'en');
+    await L.shot(page, 'narrow-identified-en');
+    await page.click('#convert-btn');
+    await waitVisible(page, '#result-section:not([hidden])', 120000);
+    await L.shot(page, 'narrow-ready-en');
+    record('z-narrow-viewport-collapsed', true, { before, after });
+  } catch (e) {
+    record('z-narrow-viewport-collapsed', false, { error: String(e).slice(0, 400) });
+  } finally {
+    await context.close();
+  }
+}
+
 // ------------------------------------------------------------------ main --
 
 const SCENARIOS = [
@@ -996,7 +1431,9 @@ const SCENARIOS = [
   ['e', scenarioE], ['f', scenarioF], ['g', scenarioG], ['h', scenarioH],
   ['i', scenarioI], ['k', scenarioK], ['l', scenarioL], ['m', scenarioM],
   ['n', scenarioN], ['o', scenarioO], ['p', scenarioP], ['q', scenarioQ],
-  ['r', scenarioR], ['s', scenarioS], ['t', scenarioT],
+  ['r', scenarioR], ['s', scenarioS], ['t', scenarioT], ['u', scenarioU],
+  ['v', scenarioV], ['w', scenarioW], ['x', scenarioX], ['y', scenarioY],
+  ['z', scenarioZ],
 ];
 
 async function main() {

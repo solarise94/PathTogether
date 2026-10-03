@@ -301,6 +301,7 @@ module.exports = {
   GATE, REPO,
   startServer, readCreds: C4.readCreds, login,
   arg: C3.arg, launch: C3.launch, openTools: C3.openTools,
+  openMoreOptions: C3.openMoreOptions,
   savePickerStub: C3.savePickerStub, downloadGuard: C3.downloadGuard,
   setFile: C3.setFile, ensureFixture: C3.ensureFixture, sparseLargeKfb: C3.sparseLargeKfb,
   sha256File: C3.sha256File, clearJobs: C3.clearJobs, jobDirs: C3.jobDirs,

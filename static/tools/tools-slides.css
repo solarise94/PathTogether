@@ -85,10 +85,109 @@ main {
 .privacy-list { margin: 0; padding-left: 20px; color: var(--muted); }
 .privacy-list li + li { margin-top: 4px; }
 
+/* U2：一行本地处理说明（details 摘要），完整条目折叠保留 */
+details.privacy {
+  background: var(--card);
+  border: 1px solid var(--card-edge);
+  border-radius: var(--radius);
+  padding: 12px 20px;
+  color: var(--muted);
+  font-size: 14px;
+}
+details.privacy > summary {
+  cursor: pointer;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+details.privacy > summary::marker { color: var(--muted); }
+details.privacy > h2 { margin: 12px 0 8px; font-size: 15px; }
+
 .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
 .field:last-child { margin-bottom: 0; }
 .field label { font-weight: 600; }
 .hint { margin: 0; color: var(--muted); font-size: 13px; }
+
+/* U2：大拖放区为主入口；file input 视觉隐藏但保持键盘可达（clip 方式，
+   不用 display:none，键盘 Tab/Enter 行为不变） */
+.visually-hidden-input {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0; border: 0;
+  clip: rect(0 0 0 0); clip-path: inset(50%);
+  overflow: hidden; white-space: nowrap;
+}
+.drop-zone {
+  border: 2px dashed #3a3a3a;
+  border-radius: var(--radius);
+  background: #1b1b1b;
+  padding: 40px 20px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.drop-zone:hover { border-color: var(--accent); }
+.drop-zone.dragover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.drop-zone:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 3px;
+}
+.drop-zone .drop-title {
+  margin: 0 0 10px;
+  font-size: 18px;
+  font-weight: 600;
+}
+.drop-zone .drop-alt {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+#input-message { margin: 10px 0 0; }
+#input-hint { margin-top: 10px; }
+
+/* U2：准备阶段标题行（标题 + 取消准备按钮同行） */
+.stage-head {
+  display: flex; flex-wrap: wrap; gap: 10px 16px;
+  align-items: center; justify-content: space-between;
+}
+.stage-head h2 { margin: 0; font-size: 17px; }
+
+.output-summary {
+  margin: 12px 0 4px;
+  font-size: 15px;
+}
+.output-summary-label {
+  display: inline-block;
+  color: var(--muted);
+  margin-right: 8px;
+}
+#quality-fieldset { margin: 10px 0 4px; }
+#quality-conflict { margin: 10px 0 0; }
+
+/* U2：「更多选项」折叠容器与内部小节（缩进 + 细边框，不是整卡） */
+.more-options { margin: 14px 0 4px; }
+.more-options > summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--accent);
+  padding: 6px 2px;
+}
+.more-options > summary::marker { color: var(--accent); }
+.more-body {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.more-card {
+  border: 1px solid var(--card-edge);
+  border-radius: 8px;
+  padding: 14px 16px;
+  background: #1a1a1a;
+}
+.more-card > h3 { margin: 0 0 10px; font-size: 15px; }
 
 input[type="file"] {
   color: var(--text);
@@ -205,6 +304,14 @@ input[type="file"]::file-selector-button {
 .warn-panel::before { content: "⚠ "; }
 
 .jobs-list { display: flex; flex-direction: column; gap: 12px; }
+/* U2：任务记录 = 折叠 details 卡片；summary 即标题 */
+details.card > summary {
+  cursor: pointer;
+  font-size: 17px;
+  font-weight: 600;
+}
+details.card > summary::marker { color: var(--muted); }
+details.card > .hint { margin: 10px 0 12px; }
 .job-row {
   border: 1px solid var(--card-edge);
   border-radius: 8px;
@@ -268,6 +375,17 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
 
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; scroll-behavior: auto; }
+}
+
+/* 窄屏（U2 验收 ≤ 400px）：拖放区收紧、动作按钮铺满整行 */
+@media (max-width: 400px) {
+  main { padding: 14px 12px 40px; gap: 14px; }
+  .card { padding: 14px; }
+  .drop-zone { padding: 26px 12px; }
+  .drop-zone .drop-title { font-size: 16px; }
+  .run-actions { flex-direction: column; align-items: stretch; }
+  .run-actions .btn { width: 100%; }
+  .topbar-inner { padding: 16px 12px 14px; }
 }
 
 /* C4 上传接入：结果面板上传块 + 任务行上传状态（文字为主，色调仅辅助） */

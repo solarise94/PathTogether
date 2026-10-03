@@ -1,13 +1,21 @@
-// tools-slides.js — /tools/slides 本地切片工具页（C3）。
+// tools-slides.js — /tools/slides 本地切片工具页（C3；U2 页面简化）。
 // 页面唯一职责：UI、文件授权、设置选择与结果展示；全部转换逻辑经
 // C2 运行器（slide-transform/runner.js，页面唯一 API 面）。零第三方依赖。
 //
 // 隐私（计划 §6）：除本页自托管静态代码外不发任何网络请求；文件字节/
 // 文件名/哈希/缩略图不出浏览器；不创建平台任务。离线可用（引擎加载后）。
 //
+// U2 结构：默认视图 = 标题 + 一行本地处理说明 + 大拖放区/选择文件；识别后
+// 只出现一张配置摘要（文件/类型/输出/画质 + 折叠「更多选项」）与两个动作
+// （转换并上传到工作台 / 仅转换）。file input 与 drop 都进入同一
+// prepareSource 流程；一次只接受一个切片文件；扩展名只是提示，识别靠
+// engine.js 的文件头魔数表（已知不支持文件在完整复制前被拒绝）。
+// 画质（U3 编码档）与输出格式同样遵循「prepared 可改并落盘、开始即锁定、
+// 重开以任务记录为准」的合同。
+//
 // 可访问性：progress 用 role=progressbar + aria-valuenow；状态文本走
 // aria-live；对话框 <dialog showModal> 原生焦点圈 + 打开者焦点还原；
-// 所有状态同时有文字，不只靠颜色。
+// 所有状态同时有文字，不只靠颜色。file input 视觉隐藏但保持键盘可达。
 'use strict';
 
 import { SlideToolsRunner } from './slide-transform/runner.js';
@@ -19,13 +27,26 @@ const CHANNEL_JSON_MAX_BYTES = 1 << 20; // 伴随文件读取上限 1 MiB（有�
 
 const $ = (id) => document.getElementById(id);
 const els = {
+  inputSection: $('input-section'),
+  inputMessage: $('input-message'),
+  dropZone: $('drop-zone'),
+  pickFileBtn: $('pick-file-btn'),
   fileInput: $('file-input'),
+  channelSection: $('channel-section'),
   channelInput: $('channel-input'),
   stageSection: $('stage-section'),
   stageStatus: $('stage-status'),
   stageProgress: $('stage-progress'),
   stageBar: $('stage-bar'),
   stageBytes: $('stage-bytes'),
+  prepareCancelBtn: $('prepare-cancel-btn'),
+  summarySection: $('summary-section'),
+  summaryGrid: $('summary-grid'),
+  outputSummaryText: $('output-summary-text'),
+  qualityConflict: $('quality-conflict'),
+  qualityFieldset: $('quality-fieldset'),
+  qualityLocked: $('quality-locked'),
+  moreOptions: $('more-options'),
   probeSection: $('probe-section'),
   probeGrid: $('probe-grid'),
   estimateSection: $('estimate-section'),
@@ -53,6 +74,7 @@ const els = {
   uploadBtn: $('upload-btn'),
   uploadCancelBtn: $('upload-cancel-btn'),
   uploadStatus: $('upload-status'),
+  jobsDetails: $('jobs-details'),
   jobsList: $('jobs-list'),
   pageError: $('page-error'),
   pageStatus: $('page-status'),
@@ -121,8 +143,11 @@ function dynText(el, store, key, vars) {
 }
 const stageMsg = { key: null, vars: null };
 const statusMsg = { key: null, vars: null };
+const inputMsg = { key: null, vars: null };
 function setStageMsg(key, vars) { dynText(els.stageStatus, stageMsg, key, vars); }
 function setPageMsg(key, vars) { dynText(els.pageStatus, statusMsg, key, vars); }
+function showInputMessage(key, vars) { dynText(els.inputMessage, inputMsg, key, vars); }
+function clearInputMessage() { dynText(els.inputMessage, inputMsg, null); }
 
 function setProgress(progressEl, barEl, bytesEl, frac, bytesText) {
   const pct = Math.max(0, Math.min(100, Math.round((frac || 0) * 100)));
@@ -154,7 +179,8 @@ const page = {
   prep: null,              // { jobId, probe, identity }
   running: false,
   readyInfo: null,        // { jobId, outputBytes, sha256, modality, sourceName }
-  outputLockedProfile: null, // 明场输出格式：任务一旦开始即锁定（见 lockOutputProfile）
+  outputLockedProfile: null,  // 明场输出格式：任务一旦开始即锁定（lockOutputProfile）
+  encodingLockedProfile: null, // 画质：任务一旦开始即锁定（lockEncodingProfile）
   saveSupported: typeof window.showSaveFilePicker === 'function',
   beforeunloadOn: false,
   lastJobs: [],
@@ -168,15 +194,20 @@ function rerenderForLang() {
   document.title = t('tools.doc.title');
   updateProfileSuggestText();
   renderOutputFormatSection();
+  renderQualitySection();
   renderSaveStatus();
   renderResultPanel();
   renderJobs(page.lastJobs || []);
   if (page.uploadCtl) page.uploadCtl.rerenderForLang();
   if (page.convertUploadCtl) page.convertUploadCtl.rerenderForLang();
-  if (page.prep) renderProbeSummary();
+  if (page.prep) {
+    renderSummary();
+    renderProbeSummary();
+  }
   if (page.busyPhaseLabelKey) els.runStatus.textContent = t(page.busyPhaseLabelKey);
   if (stageMsg.key) els.stageStatus.textContent = t(stageMsg.key, stageMsg.vars);
   if (statusMsg.key) els.pageStatus.textContent = t(statusMsg.key, statusMsg.vars);
+  if (inputMsg.key) els.inputMessage.textContent = t(inputMsg.key, inputMsg.vars);
   if (runBytesMsg.key && !els.runBytes.hidden) els.runBytes.textContent = t(runBytesMsg.key, runBytesMsg.vars);
   updateStrictWarning();
 }
@@ -200,7 +231,8 @@ function renderFlowMsg(key, vars) {
 // ------------------------------------------------------------- dialogs --
 
 /// uncertain 磁盘确认：返回 true（确认继续）/ false（取消）。焦点进入对话框，
-/// 关闭后还原到打开者（键盘可达；Esc = 取消）。
+/// 关闭后还原到打开者（键盘可达；Esc = 取消）。U2：该确认是独立模态对话框，
+/// 永不被折叠或隐藏。
 function askDiskConfirm({ title, body, confirmLabel }) {
   return new Promise((resolve) => {
     const opener = document.activeElement;
@@ -235,6 +267,7 @@ async function probeWithDiskFlow(file, opts = {}) {
     return await page.runner.probe(file, {
       confirmUncertainDisk: confirmOverride, channelJson: page.channelJson,
       outputProfile: opts.outputProfile,
+      encodingProfile: opts.encodingProfile,
     });
   } catch (e) {
     if (errCode(e) === 'disk_precheck_failed') {
@@ -251,6 +284,7 @@ async function probeWithDiskFlow(file, opts = {}) {
         return await page.runner.probe(file, {
           confirmUncertainDisk: true, channelJson: page.channelJson,
           outputProfile: opts.outputProfile,
+          encodingProfile: opts.encodingProfile,
         });
       }
     }
@@ -258,15 +292,65 @@ async function probeWithDiskFlow(file, opts = {}) {
   }
 }
 
-// --------------------------------------------------------------- probe --
+// ------------------------------------------------------- prepareSource --
+//
+// file input 与 drop 的唯一汇合点（计划 §3.2.1）。一次只接受一个切片文件：
+// 多文件 → 明确提示、什么都不开始；目录 / .mrxs / .dat → MRXS 需要完整包
+// 且当前未支持；.svs → 尚未支持。扩展名只是提示：真正的识别在运行器的
+// 文件头魔数检查（_prepare 在完整复制之前拒绝已知不支持的文件）。
+
+async function prepareSource(fileList) {
+  const files = Array.from(fileList || []);
+  if (!files.length) return;
+  if (page.running) {
+    // 转换进行中不接受新输入：此时 resetFlowPanels 会撤掉进行中的进度 UI
+    //（file input 已禁用，这里补上 drop 路径的同等防护）
+    showInputMessage('tools.drop.busy');
+    return;
+  }
+  if (files.length > 1) {
+    showInputMessage('tools.drop.multiple', { n: String(files.length) });
+    return;
+  }
+  const file = files[0];
+  const hint = E.inputExtensionHint(file.name);
+  if (hint === 'bundle') {
+    showInputMessage('tools.drop.bundle');
+    return;
+  }
+  if (hint === 'svs') {
+    showInputMessage('tools.drop.svs');
+    return;
+  }
+  await onFilePicked(file);
+}
+
+/// drop 事件取目录项只能在事件处理器内同步做（webkitGetAsEntry 的有效窗口）
+function handleDropData(dt) {
+  if (!dt) return;
+  const items = dt.items ? Array.from(dt.items) : [];
+  for (const it of items) {
+    try {
+      const entry = it.webkitGetAsEntry && it.webkitGetAsEntry();
+      if (entry && entry.isDirectory) {
+        showInputMessage('tools.drop.bundle');
+        return;
+      }
+    } catch { /* 非 filesystem 条目：按普通文件处理 */ }
+  }
+  prepareSource(dt.files ? Array.from(dt.files) : []);
+}
 
 function resetFlowPanels() {
   clearError();
+  clearInputMessage();
   page.prep = null;
   page.readyInfo = null;
   page.outputLockedProfile = null;
+  page.encodingLockedProfile = null;
   for (const el of [els.probeSection, els.estimateSection, els.profileSection,
-    els.policySection, els.formatSection, els.resultSection]) el.hidden = true;
+    els.policySection, els.formatSection, els.resultSection, els.summarySection,
+    els.channelSection]) el.hidden = true;
   els.runSection.hidden = true;
   els.convertBtn.disabled = true;
   if (els.convertUploadBtn) els.convertUploadBtn.disabled = true;
@@ -274,13 +358,28 @@ function resetFlowPanels() {
   els.runProgress.hidden = true;
   els.runBytes.hidden = true;
   els.stageSection.hidden = true;
+  els.prepareCancelBtn.hidden = true;
   els.uploadStatus.textContent = '';
   els.uploadCancelBtn.hidden = true;
+  els.qualityFieldset.hidden = true;
+  els.qualityFieldset.disabled = false;
+  els.qualityLocked.hidden = true;
+  els.qualityConflict.hidden = true;
+  els.moreOptions.open = false;
+  const preserve = document.getElementById('quality-preserve');
+  if (preserve) preserve.checked = true;
 }
 
-async function onFilePicked() {
-  const file = els.fileInput.files && els.fileInput.files[0];
+async function onFilePicked(explicitFile) {
+  const list = els.fileInput.files;
+  const file = explicitFile || (list && list[0]);
   if (!file) return;
+  // 一次一个切片文件（U2 第一版）：多选只提示、不静默丢弃
+  if (!explicitFile && list && list.length > 1) {
+    showInputMessage('tools.drop.multiple', { n: String(list.length) });
+    return;
+  }
+  clearInputMessage();
   // 离开上一个未完成任务：留在任务列表里可续跑/删除
   resetFlowPanels();
   page.file = file;
@@ -336,27 +435,38 @@ async function runProbeFlow() {
   setStageMsg('tools.stage.status');
   setProgress(els.stageProgress, els.stageBar, els.stageBytes, 0, `0 / ${fmtBytes(page.file.size)}`);
   setBeforeunload(true);
+  els.prepareCancelBtn.hidden = false;
+  els.prepareCancelBtn.disabled = false;
   try {
     const cjAtProbe = page.channelJson;
-    // 输出格式选择在准备时就传给运行器（prepared 记录的 outputProfile 反映
-    // 用户选择）。模态在复制+探测后才能确认，这里用文件头嗅探（与核心同源
-    // 的魔数表）预判：只有明场才传，荧光固定 fl-ome（运行器按模态默认）。
+    // 输出格式与画质选择在准备时就传给运行器（prepared 记录反映用户选择）。
+    // 模态在复制+探测后才能确认，这里用文件头嗅探（与核心同源的魔数表）
+    // 预判：只有明场才传（荧光固定 fl-ome / 保留画质，运行器按模态默认）。
     const head = new Uint8Array(await page.file.slice(0, 8).arrayBuffer());
     const sniffedModality = E.magicModality(head);
     const prep = await probeWithDiskFlow(page.file, {
       outputProfile: sniffedModality === 'brightfield' ? selectedOutputProfile() : undefined,
+      encodingProfile: sniffedModality === 'brightfield' ? selectedEncodingProfile() : undefined,
     });
     page.prep = prep;
     // 伴随文件在复制/探测期间改选过：补写进任务记录
     if (page.channelJson !== cjAtProbe) {
       await page.runner.setPreparedChannelJson(prep.jobId, page.channelJson);
     }
-    renderProbeSummary();
   } catch (e) {
+    els.prepareCancelBtn.hidden = true;
     setBeforeunload(false);
     setStageMsg(null);
     const code = errCode(e);
     const info = (e && e.error) || {};
+    if (code === 'cancelled') {
+      // 取消准备（U2）：worker 已终止、任务目录已删除——明确反馈，不算错误
+      els.stageSection.hidden = true;
+      page.file = null;
+      setPageMsg('tools.stage.cancelled');
+      refreshJobs();
+      return;
+    }
     if (code === 'disk_precheck_failed') {
       els.pageError.hidden = false;
       els.pageError.textContent = (info.uncertain
@@ -372,15 +482,22 @@ async function runProbeFlow() {
     refreshJobs();
     return;
   }
+  els.prepareCancelBtn.hidden = true;
   setBeforeunload(false);
   setStageMsg('tools.stage.done');
   setProgress(els.stageProgress, els.stageBar, els.stageBytes, 1,
     `${fmtBytes(page.file.size)} / ${fmtBytes(page.file.size)}`);
+  // 识别完成：一张配置摘要 + 折叠的高级项（荧光只隐藏不适用的选择组）
+  els.summarySection.hidden = false;
   els.probeSection.hidden = false;
   els.estimateSection.hidden = false;
   els.profileSection.hidden = false;
   els.policySection.hidden = false;
   renderOutputFormatSection();
+  renderQualitySection();
+  renderChannelSection();
+  renderSummary();
+  renderProbeSummary();
   els.runSection.hidden = false;
   els.convertBtn.disabled = false;
   if (els.convertUploadBtn) els.convertUploadBtn.disabled = false;
@@ -397,6 +514,35 @@ function probeEstimate() {
   const p = page.prep && page.prep.probe;
   if (!p) return {};
   return p.document && p.document.estimate ? p.document.estimate : (p.estimate || {});
+}
+
+// Summary card shows a reader-friendly family name; the core's format id stays
+// in the technical summary under "更多选项".
+function formatFamilyLabel(id) {
+  const s = String(id || '');
+  if (!s) return '—';
+  if (s.startsWith('kfbf')) return 'KFBF';
+  if (s.startsWith('kfb')) return 'KFB';
+  if (s.startsWith('aperio-svs')) return 'SVS (Aperio)';
+  if (s.startsWith('mirax')) return 'MRXS';
+  return s;
+}
+
+function renderSummary() {
+  if (!page.prep) return;
+  const doc = probeDoc();
+  const identity = page.prep.identity || {};
+  const g = els.summaryGrid;
+  g.textContent = '';
+  dlRow(g, t('tools.summary.name'),
+    String(identity.name || (page.file && page.file.name) || '—'), 'summary-name');
+  dlRow(g, t('tools.summary.size'),
+    fmtBytes(Number.isFinite(identity.size) ? identity.size : (page.file ? page.file.size : NaN)),
+    'summary-size');
+  dlRow(g, t('tools.probe.format'), formatFamilyLabel(doc.format), 'summary-format');
+  dlRow(g, t('tools.probe.modality'), doc.modality === 'fluorescence'
+    ? t('tools.probe.modality.fl') : t('tools.probe.modality.bf'), 'summary-modality');
+  renderOutputSummary();
 }
 
 function renderProbeSummary() {
@@ -440,8 +586,17 @@ function renderProbeSummary() {
   }
   dlRow(grid, t('tools.probe.identity.sha'), String(page.prep.identity.sha256 || '—'));
 
-  // 空间预估：源副本 + 输出（上界）+ 索引/日志（来自 engine.diskNeedBytes）
-  const need = E.diskNeedBytes(est, { sourceBytes: page.prep.identity.size });
+  renderEstimate();
+}
+
+// 空间预估：源副本 + 输出（上界，随所选画质取对应编码的上界）+ 索引/日志
+function renderEstimate() {
+  if (!page.prep) return;
+  const est = probeEstimate();
+  const need = E.diskNeedBytes(est, {
+    sourceBytes: page.prep.identity.size,
+    encoding: selectedEncodingProfile(),
+  });
   const eg = els.estimateGrid;
   eg.textContent = '';
   dlRow(eg, t('tools.estimate.source'), fmtBytes(need.source), 'estimate-source');
@@ -512,6 +667,27 @@ function renderOutputFormatSection() {
       name: t(`tools.result.format.${locked}`),
     });
   }
+  renderOutputSummary();
+}
+
+/// 配置摘要的「输出」行：按目标软件表达，同时保留真实格式名 + 扩展名。
+function renderOutputSummary() {
+  if (!page.prep) return;
+  const modality = probeDoc().modality;
+  const profile = page.outputLockedProfile
+    || (modality === 'brightfield' ? selectedOutputProfile() : E.defaultOutputProfile(modality));
+  const ext = E.isOmeProfile(profile) ? '.ome.tif' : '.tif';
+  els.outputSummaryText.textContent = t('tools.summary.output.line', {
+    name: t(`tools.jobs.format.${profile}`),
+    ext,
+  });
+}
+
+/// 通道信息（可选 channel.json）只在荧光/KFBF 文件识别后出现（U2：识别前
+/// 不问用户要伴随文件；明场输入整节隐藏）。
+function renderChannelSection() {
+  const show = !!page.prep && probeDoc().modality === 'fluorescence';
+  els.channelSection.hidden = !show;
 }
 
 function updateStrictWarning() {
@@ -525,8 +701,88 @@ function updateStrictWarning() {
   }
 }
 
+// ------------------------------------------------------- quality (U3) --
+
+const ENCODING_LABEL_KEY = {
+  [E.ENCODING_PROFILES.PRESERVE]: 'tools.quality.preserve',
+  [E.ENCODING_PROFILES.COMPACT]: 'tools.quality.compact',
+};
+
+function encodingLabel(encoding) {
+  const key = ENCODING_LABEL_KEY[encoding];
+  return key ? t(key) : String(encoding || '—');
+}
+
+/// 当前 UI 的画质选择（模板默认勾选保留画质；无 DOM 时回落 preserve）。
+function selectedEncodingProfile() {
+  const checked = document.querySelector('input[name="encoding"]:checked');
+  return checked ? checked.value : E.defaultEncodingProfile();
+}
+
+/// 传给运行器的 encodingProfile：只有确定是明场才传当前选择；荧光不传
+/// （运行器按记录/默认 preserve——荧光不提供有损模式，与 outputProfile
+/// 同一模式，runner 会以 kind=encoding-profile 拒绝不适用的值）。
+function encodingProfileForModality(modality) {
+  return modality === 'brightfield' ? selectedEncodingProfile() : undefined;
+}
+
+/// 任务一旦开始，画质不可再改：字段组禁用，改以文案展示任务实际画质。
+function lockEncodingProfile(encoding) {
+  page.encodingLockedProfile = encoding || null;
+  renderQualitySection();
+}
+
+function renderQualitySection() {
+  // 荧光不提供画质选择（compact 仅明场；保留画质是唯一语义）→ 整组隐藏。
+  const show = !!page.prep && probeDoc().modality !== 'fluorescence';
+  els.qualityFieldset.hidden = !show;
+  if (!show) return;
+  const locked = page.encodingLockedProfile;
+  els.qualityFieldset.disabled = !!locked;
+  els.qualityLocked.hidden = !locked;
+  if (locked) {
+    els.qualityLocked.textContent = t('tools.quality.locked', {
+      name: encodingLabel(locked),
+    });
+  }
+  updateQualityPolicyGate();
+}
+
+/// 「像素严格无损」与「更小文件（有损）」互斥（U2 要求在 UI 也阻止，核心
+/// 另有类型化拒绝兜底）：选了 compact → 禁用 strict；选了 strict → 禁用
+/// compact。已经勾选的一方在切换时被自动改回（onEncodingChange /
+/// onPolicyChange），并显示一次性说明。
+function updateQualityPolicyGate() {
+  const compactRadio = document.getElementById('quality-compact');
+  const strictRadio = document.getElementById('policy-strict');
+  if (!compactRadio || !strictRadio) return;
+  const compactSel = selectedEncodingProfile() === E.ENCODING_PROFILES.COMPACT;
+  const strictSel = selectedPolicy() === 'strict-lossless';
+  compactRadio.disabled = strictSel || !!page.encodingLockedProfile;
+  strictRadio.disabled = compactSel;
+  const conflicted = compactSel && strictSel;
+  els.qualityConflict.hidden = !conflicted;
+  if (conflicted) els.qualityConflict.textContent = t('tools.quality.strict.conflict');
+}
+
 document.querySelectorAll('input[name="policy"]').forEach((r) => {
-  r.addEventListener('change', updateStrictWarning);
+  r.addEventListener('change', () => {
+    updateStrictWarning();
+    // strict 与 compact 互斥：strict 被选中时把 compact 改回保留画质。
+    // 派发 change 让 onEncodingChange 把改回的选择写回 prepared 记录
+    //（radio 的程序化勾选本身不触发事件）。
+    if (selectedPolicy() === 'strict-lossless'
+        && selectedEncodingProfile() === E.ENCODING_PROFILES.COMPACT) {
+      const preserve = document.getElementById('quality-preserve');
+      if (preserve) {
+        preserve.checked = true;
+        preserve.dispatchEvent(new Event('change', { bubbles: true }));
+        return;
+      }
+    }
+    updateQualityPolicyGate();
+    renderEstimate();
+  });
 });
 
 /// 准备后改选明场输出格式：立即写回 prepared 记录（刷新后从任务列表「开始」
@@ -540,10 +796,36 @@ async function onOutputFormatChange(ev) {
   } catch (e) {
     showError(e);
   }
+  renderOutputSummary();
 }
 
 document.querySelectorAll('input[name="outputFormat"]').forEach((r) => {
   r.addEventListener('change', onOutputFormatChange);
+});
+
+/// 准备后改选画质：立即写回 prepared 记录（与输出格式同一合同）；磁盘预估
+/// 跟随所选编码取对应上界。strict+compact 在此也被阻止（选 compact 时把
+/// strict 改回允许边缘重编码）。
+async function onEncodingChange(ev) {
+  if (!page.prep || page.encodingLockedProfile || els.qualityFieldset.hidden) return;
+  if (ev.target.value === E.ENCODING_PROFILES.COMPACT
+      && selectedPolicy() === 'strict-lossless') {
+    const allow = document.getElementById('policy-allow-edge');
+    if (allow) allow.checked = true;
+  }
+  updateStrictWarning();
+  updateQualityPolicyGate();
+  renderEstimate();
+  try {
+    await page.runner.setPreparedEncodingProfile(page.prep.jobId, ev.target.value);
+    refreshJobs();
+  } catch (e) {
+    showError(e);
+  }
+}
+
+document.querySelectorAll('input[name="encoding"]').forEach((r) => {
+  r.addEventListener('change', onEncodingChange);
 });
 
 // -------------------------------------------------------------- convert --
@@ -569,13 +851,14 @@ function phaseText(state) {
   return key ? t(key) : state;
 }
 
-/// 转换执行驱动（「仅转换并保存」与 R1「转换并上传」共用）：startJob →
-/// 进度/结果 UI。返回 worker 的 result（{ok}|{type:'cancelled'}|失败形态）。
+/// 转换执行驱动（「仅转换」与 R1「转换并上传」共用）：startJob → 进度/结果
+/// UI。返回 worker 的 result（{ok}|{type:'cancelled'}|失败形态）。
 async function driveConversion() {
   if (!page.prep || !page.file) return null;
   clearError();
   els.convertBtn.disabled = true;
   if (els.convertUploadBtn) els.convertUploadBtn.disabled = true;
+  els.prepareCancelBtn.hidden = true;
   els.fileInput.disabled = true;
   els.channelInput.disabled = true;
   els.cancelBtn.hidden = false;
@@ -586,16 +869,20 @@ async function driveConversion() {
   setBeforeunload(true);
   page.running = true;
   try {
-    // 开始即用当前 UI 选择（明场；荧光不传 → fl-ome）；任务从此锁定该格式。
+    // 开始即用当前 UI 选择（明场；荧光不传 → fl-ome / preserve）；
+    // 任务从此锁定该输出格式与画质。
     const outputProfile = outputProfileForModality(probeDoc().modality);
+    const encodingProfile = encodingProfileForModality(probeDoc().modality);
     const { jobId, done } = await page.runner.startJob(page.file, {
       jobId: page.prep.jobId,
       profileId: selectedProfileId(),
       policy: selectedPolicy(),
       channelJson: page.channelJson,
       outputProfile,
+      encodingProfile,
     });
     lockOutputProfile(outputProfile || E.defaultOutputProfile(probeDoc().modality));
+    lockEncodingProfile(encodingProfile || E.defaultEncodingProfile());
     page.prep.jobId = jobId;
     const result = await done;
     page.running = false;
@@ -613,6 +900,7 @@ async function driveConversion() {
         sha256: result.validation && result.validation.sha256,
         modality: probeDoc().modality,
         outputProfile: result.result.output_profile || null,
+        encoding: result.result.encoding || null,
         result: { format: result.result.format || null },
         sourceName: page.file.name,
         channels: result.result.channels || [],
@@ -681,6 +969,18 @@ async function onCancel() {
   refreshJobs();
 }
 
+/// 取消准备（U2）：终止 worker、删除任务目录；runProbeFlow 的 probe promise
+/// 以类型化 `cancelled` 拒绝（runner 小改动）并显示「已取消准备」。
+async function onPrepareCancel() {
+  els.prepareCancelBtn.disabled = true;
+  try {
+    await page.runner.cancelJob();
+  } finally {
+    els.prepareCancelBtn.disabled = false;
+    els.prepareCancelBtn.hidden = true;
+  }
+}
+
 // ---------------------------------------------------------------- ready --
 
 function suggestedOutputName() {
@@ -695,6 +995,8 @@ function renderResultPanel() {
   g.textContent = '';
   dlRow(g, t('tools.result.format'),
     t(`tools.result.format.${E.jobOutputProfile(page.readyInfo)}`), 'result-format');
+  dlRow(g, t('tools.result.encoding'),
+    encodingLabel(page.readyInfo.encoding || E.ENCODING_PROFILES.PRESERVE), 'result-encoding');
   dlRow(g, t('tools.result.size'), fmtBytes(page.readyInfo.outputBytes), 'result-size');
   dlRow(g, t('tools.result.sha256'), String(page.readyInfo.sha256 || '—'), 'result-sha');
   if (page.readyInfo.modality === 'fluorescence') {
@@ -724,6 +1026,7 @@ async function selectResultJob(jobId) {
       sha256: job.result.sha256,
       modality: job.modality,
       outputProfile: job.outputProfile || null,
+      encoding: (job.result && job.result.encoding) || job.encodingProfile || null,
       result: { format: job.result.format || null },
       sourceName: job.source && job.source.name,
       channels: job.result.channels || [],
@@ -830,6 +1133,8 @@ const JOB_ACTION_INTENT_LABEL_KEY = {
 
 function renderJobs(jobs) {
   page.lastJobs = jobs;
+  // 任务记录默认折叠；有任务（可续跑/可保存/上传中）时自动展开一次
+  if (jobs.length && !els.jobsDetails.open) els.jobsDetails.open = true;
   els.jobsList.textContent = '';
   if (!jobs.length) {
     const p = document.createElement('p');
@@ -881,6 +1186,12 @@ function renderJobs(jobs) {
         name: t(`tools.jobs.format.${job.outputProfile}`),
       })}`;
     }
+    // 画质：只在非默认（更小文件/有损）时展示，避免给旧任务刷屏
+    if (job.encodingProfile === E.ENCODING_PROFILES.COMPACT) {
+      meta.textContent += ` · ${t('tools.jobs.encoding', {
+        name: t('tools.jobs.encoding.compact'),
+      })}`;
+    }
     if (job.hasChannelJson) meta.textContent += ` · ${t('tools.jobs.channel')}`;
     row.appendChild(meta);
 
@@ -911,8 +1222,9 @@ function renderJobs(jobs) {
     del.addEventListener('click', () => onJobAction('discard', job));
     actions.appendChild(del);
     row.appendChild(actions);
-    // C4：行内上传状态/继续上传；上传进行中禁用删除（避免丢唯一本地产物）。
-    // 必须在 actions 挂到行之后再渲染（段内 insertBefore 以 actions 为锚点）。
+    // C4：行内上传状态/继续/取消旧上传；上传进行中禁用删除（避免丢唯一
+    // 本地产物）。必须在 actions 挂到行之后再渲染（段内 insertBefore 以
+    // actions 为锚点）。
     if (page.uploadCtl && (job.state === 'ready' || job.state === 'exported')) {
       page.uploadCtl.renderRowSegment(job, actions, del);
     }
@@ -969,20 +1281,23 @@ async function onJobAction(action, job) {
     }
     if (action === 'start' || action === 'resume') {
       // prepared/paused 任务：源副本已在浏览器临时存储，无需重选文件。
-      // resume 不传设置（含输出格式）→ 沿用任务记录；start（prepared）只有当
-      // 可见的输出格式节属于该任务（本会话刚准备、未锁定）时才传当前界面选择，
-      // 否则（刷新后 / 设置节属于别的任务）不传 → 运行器用任务记录里保存的
-      // 格式——记录值优先于隐藏的 radio 默认值。channel.json 一律沿用准备时
-      // 保存在任务记录里的那份。两种动作开始后格式都锁定为任务实际格式。
+      // resume 不传设置（含输出格式/画质）→ 沿用任务记录；start（prepared）
+      // 只有当可见的输出格式/画质组属于该任务（本会话刚准备、未锁定）时才
+      // 传当前界面选择，否则（刷新后 / 设置组属于别的任务）不传 → 运行器用
+      // 任务记录里保存的值——记录值优先于隐藏的 radio 默认值。channel.json
+      // 一律沿用准备时保存在任务记录里的那份。两种动作开始后格式与画质都
+      // 锁定为任务实际值。
       els.runSection.hidden = false;
       els.cancelBtn.hidden = false;
       els.runProgress.hidden = false;
       els.runBytes.hidden = false;
       els.runStatus.textContent = phaseText(action === 'resume' ? 'paused' : 'planned');
       setBeforeunload(true);
-      const startOutputProfile = (action === 'start'
-        && page.prep && page.prep.jobId === job.id && !els.formatSection.hidden)
+      const thisPrep = page.prep && page.prep.jobId === job.id;
+      const startOutputProfile = (action === 'start' && thisPrep && !els.formatSection.hidden)
         ? outputProfileForModality(job.modality) : undefined;
+      const startEncodingProfile = (action === 'start' && thisPrep && !els.qualityFieldset.hidden)
+        ? encodingProfileForModality(job.modality) : undefined;
       const started = action === 'resume'
         ? await page.runner.resumeJob(job.id)
         : await page.runner.startJob(null, {
@@ -990,9 +1305,14 @@ async function onJobAction(action, job) {
           profileId: selectedProfileId(),
           policy: selectedPolicy(),
           outputProfile: startOutputProfile,
+          encodingProfile: startEncodingProfile,
         });
       lockOutputProfile(startOutputProfile || job.outputProfile
         || E.defaultOutputProfile(job.modality));
+      lockEncodingProfile(startEncodingProfile
+        || (job.encodingProfile && E.encodingFitsModality(job.encodingProfile, job.modality)
+          ? job.encodingProfile : null)
+        || E.defaultEncodingProfile());
       const result = await started.done;
       setBeforeunload(false);
       els.cancelBtn.hidden = true;
@@ -1006,6 +1326,7 @@ async function onJobAction(action, job) {
           sha256: result.validation && result.validation.sha256,
           modality: job.modality,
           outputProfile: result.result.output_profile || job.outputProfile || null,
+          encoding: result.result.encoding || job.encodingProfile || null,
           result: { format: result.result.format || null },
           sourceName: job.source && job.source.name,
           channels: result.result.channels || [],
@@ -1091,6 +1412,22 @@ async function init() {
   page.convertUploadCtl.installHandoffReceiver();
   refreshJobs();
 
+  // 拖放：全页阻止默认导航（拖到页面任意位置都不会打开/替换文档），
+  // 拖放区内的 drop 进入与 file input 相同的 prepareSource 流程
+  for (const type of ['dragover', 'drop']) {
+    window.addEventListener(type, (ev) => { ev.preventDefault(); });
+  }
+  els.dropZone.addEventListener('dragover', () => els.dropZone.classList.add('dragover'));
+  els.dropZone.addEventListener('dragleave', () => els.dropZone.classList.remove('dragover'));
+  els.dropZone.addEventListener('drop', (ev) => {
+    els.dropZone.classList.remove('dragover');
+    handleDropData(ev.dataTransfer);
+  });
+  els.dropZone.addEventListener('click', () => { els.fileInput.click(); });
+  els.pickFileBtn.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    els.fileInput.click();
+  });
   els.fileInput.addEventListener('change', () => { onFilePicked(); });
   els.channelInput.addEventListener('change', () => { onChannelPicked(); });
   els.convertBtn.addEventListener('click', () => { onConvert(); });
@@ -1098,6 +1435,7 @@ async function init() {
     els.convertUploadBtn.addEventListener('click', () => { onConvertUpload(); });
   }
   els.cancelBtn.addEventListener('click', () => { onCancel(); });
+  els.prepareCancelBtn.addEventListener('click', () => { onPrepareCancel(); });
   els.saveBtn.addEventListener('click', () => { onSave(); });
   els.persistBtn.addEventListener('click', () => { onPersist(); });
   // C4：上传是唯一主动外连入口（点击后先查能力，再判定登录/限额/格式）

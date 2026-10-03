@@ -196,12 +196,14 @@ export class SlideToolsRunner {
   }
 
   /// A terminated worker never answers: fail every in-flight request now.
-  _rejectPending(reason) {
+  /// `code` lets cancelJob reject pending prepare requests as typed
+  /// `cancelled` (U2 取消准备) instead of a generic worker error.
+  _rejectPending(reason, code = E.ERROR_CODES.IO_RECOVERABLE) {
     if (!this._pending) return;
     for (const [id, p] of this._pending) {
       clearTimeout(p.t);
       p.reject(Object.assign(new Error(reason),
-        E.stError(E.ERROR_CODES.IO_RECOVERABLE, reason)));
+        E.stError(code, reason)));
       this._pending.delete(id);
     }
   }
@@ -955,7 +957,7 @@ export class SlideToolsRunner {
       this.worker = null;
       this.workerReady = null;
       w.terminate();
-      this._rejectPending('cancelled');
+      this._rejectPending('cancelled', E.ERROR_CODES.CANCELLED);
       this._emit('workerExit', { reason: 'cancelled' });
     }
     const jobId = this.jobId;

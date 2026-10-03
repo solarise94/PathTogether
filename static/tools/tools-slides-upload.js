@@ -292,9 +292,23 @@ export function createUploadController({
     };
   }
 
+  /// U2：工具页上传阶段文案与计划对齐（排队 → 上传至腾讯云 → 工作台接收 →
+  /// 校验/发布 → 可查看）。引擎的细阶段映射到这五个用户可见阶段；共享引擎
+  /// 的 upload.cos.stage.* 键仍是工作台措辞，工具页用自己的键（zh/en 均备）。
+  const TOOL_STAGE_KEY = {
+    waiting_space: 'tools.upload.stage.queued',
+    uploading: 'tools.upload.stage.cos',
+    awaiting_server: 'tools.upload.stage.workbench',
+    downloading: 'tools.upload.stage.workbench',
+    validating: 'tools.upload.stage.validate',
+    processing: 'tools.upload.stage.validate',
+    readiness: 'tools.upload.stage.validate',
+    viewable: 'tools.upload.stage.viewable',
+  };
+
   function stageText(body) {
-    if (!body) return '';
-    const key = `upload.cos.stage.${body.stage}`;
+    if (!body || !body.stage) return '';
+    const key = TOOL_STAGE_KEY[body.stage] || `upload.cos.stage.${body.stage}`;
     const s = t(key);
     if (s === key) return String(body.stage || '');
     if (body.stage === 'waiting_space' && typeof body.queue_position === 'number') {
@@ -736,7 +750,7 @@ export function createUploadController({
             // 分块重试：loaded 回退 + 「正在重试」提示（不用历史最大值冒充）
             setProgress(jobId, { active: true, retrying: true, sentAll: false });
           } else if (ev.type === 'created') {
-            setStageTxt(jobId, t('upload.cos.stage.uploading'));
+            setStageTxt(jobId, t('tools.upload.stage.cos'));
             // 记录已排队写入：列表行切到“上传中/继续上传”形态
             queueRefresh();
           }

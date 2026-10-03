@@ -355,11 +355,12 @@ describe("R1 i18n（静态契约）", () => {
 		}
 	});
 
-	it("tools.run.start 已改为「仅转换并保存」语义（与模板内联一致）", () => {
-		expect(i18nSrc).toContain('"tools.run.start": "仅转换并保存"');
-		expect(i18nSrc).toContain('"tools.run.start": "Convert and save locally only"');
+	it("tools.run.start 是本地语义（U2：仅转换；上传按钮另列且命名到工作台）", () => {
+		expect(i18nSrc).toContain('"tools.run.start": "仅转换"');
+		expect(i18nSrc).toContain('"tools.run.start": "Convert only"');
 		const shell = readFileSync(resolve(here, "../../templates/tools_slides.html"), "utf8");
-		expect(shell).toContain('data-i18n="tools.run.start">仅转换并保存');
+		expect(shell).toContain('data-i18n="tools.run.start">仅转换');
 		expect(shell).toContain('data-i18n="tools.run.upload"');
+		expect(shell).toContain('data-i18n="tools.run.upload">转换并上传到工作台');
 	});
 });

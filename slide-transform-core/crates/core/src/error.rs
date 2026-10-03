@@ -25,6 +25,11 @@ pub enum ErrorCode {
     /// adapter failing). The Python oracle raises OSError instead; code kept
     /// separate so callers can distinguish infrastructure from format.
     Io,
+    /// Review §1: the input's metadata/working-set estimate exceeds the
+    /// caller's resource budget (native `--memory-budget`, browser resource
+    /// profile). Stable code is the one the tool page already maps
+    /// (`engine.js ERROR_CODES.RESOURCE_PROFILE_INSUFFICIENT`).
+    ResourceLimitExceeded,
 }
 
 impl ErrorCode {
@@ -42,6 +47,7 @@ impl ErrorCode {
             ErrorCode::ConversionDiskLow => "conversion_disk_low",
             ErrorCode::PixelPolicyViolation => "pixel_policy_violation",
             ErrorCode::Io => "io_error",
+            ErrorCode::ResourceLimitExceeded => "resource_profile_insufficient",
         }
     }
 }
@@ -94,6 +100,9 @@ impl CoreError {
     }
     pub fn io(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Io, message)
+    }
+    pub fn resource_limit(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::ResourceLimitExceeded, message)
     }
 }
 

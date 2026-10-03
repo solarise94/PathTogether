@@ -13,6 +13,7 @@
 //!
 //! Byte-layout parity with the oracle is a hard requirement.
 
+pub mod budget;
 pub mod companion;
 pub mod bundle;
 #[cfg(feature = "codecs")]

@@ -127,6 +127,15 @@ pub struct ResourceLimits {
     /// Free-space floor the host must verify before starting (checked by
     /// the native CLI; the core reports it in the plan echo).
     pub min_free_bytes: u64,
+    /// Review §1: the host's actual memory budget for the conversion
+    /// (native CLI `--memory-budget`, default the browser `saver` profile's
+    /// 192 MiB; the browser worker passes the active profile's
+    /// `budgetBytes`). Adapters whose working-set estimate exceeds it refuse
+    /// with `resource_profile_insufficient` BEFORE the allocation. Only the
+    /// MRXS adapter charges against it today (its metadata working set is
+    /// data-dependent); KFB/KFBF/SVS working sets are already bound by
+    /// fixed per-tile/cell structures.
+    pub memory_budget_bytes: u64,
 }
 
 impl Default for ResourceLimits {
@@ -135,6 +144,7 @@ impl Default for ResourceLimits {
             timeout_seconds: 600.0,
             max_output_bytes: 64 * 1024 * 1024 * 1024,
             min_free_bytes: 256 * 1024 * 1024,
+            memory_budget_bytes: crate::budget::SAVER_BUDGET_BYTES,
         }
     }
 }

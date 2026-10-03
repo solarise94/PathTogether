@@ -381,7 +381,9 @@ per-level bucket index for 368 501 L0 tiles). Placements are per-level, the
 image cache is 32 MiB-bounded, the canvas is one tile, scratch = the
 offset/count streams. Saved-1_16 native convert: 1 s. Browser conversion
 runs inside the existing single-worker profile caps; the member copy uses
-one 4 MiB buffer. No OOM events in any gated run.
+one 4 MiB buffer. No OOM events in any gated run. Since the independent
+review the adapter additionally holds these numbers under the **saver**
+budget itself and refuses over-budget metadata pre-allocation — §8.1.
 
 ## 6. Not verified / open issues
 
@@ -428,3 +430,291 @@ convert_mirax,inflate,mirax_fixture}.rs`, `crates/core/examples/{mrxs_roi,
 mrxs_bench}.rs`, `crates/core/tests/mirax.rs`,
 `tests/js/tools-mrxs-input.test.ts`, `tests/test_slide_mirax_viewer.py`,
 this report.
+
+## 8. Review fixes (§1, §3 — independent review 2026-10-03)
+
+Fixes for `docs/slide-tools/ux-formats-independent-review-20261003.md`
+§1 (P1: probe/convert allocations unbounded by the resource profile) and
+§3 (P2: the GT pixel gate passed with missing/empty ROI material). §2
+(bundle identity on resume) is fixed separately in the `fixbundle-wt`
+worktree.
+
+### 8.1 §1 — memory budget model
+
+The adapter's working set is now bounded by the host's actual resource
+budget, checked BEFORE each large allocation
+(`crates/core/src/budget.rs::MemBudget`):
+
+- **Host budget in**: native CLI `--memory-budget BYTES` on
+  `probe`/`convert` (conservative default = the browser `saver` profile's
+  **192 MiB**); wasm `probeBundle(budgetBytes)` /
+  `convertProfileEncodedBundle(…, budgetBytes)` /
+  `convertResumeProfileEncodedBundle(…, budgetBytes)` — `worker.js` passes
+  the active profile's `budgetBytes`, and the probe-bundle request resolves
+  a profile even at prepare time (`runner.js` sends `profileId`; the worker
+  falls back to saver). A 24 MiB reserve (decoder slack, allocator
+  overhead, process baseline) is subtracted, so the saver cap is
+  176,160,768 B.
+- **Charges** (overflow-checked estimates, refused before allocating):
+  camera positions — raw buffer 9 B/entry + tuple table 16 B/entry
+  (synthesised fallback: 16 B/entry), activity marks 1 B/entry, index
+  page-chain visited set 64 B/page, image records 64 B/record; per convert
+  level — placement sort copies (order element 56 B + stable-sort temporary
+  28 B + output vec 40 B per placement upper bound), CSR `ranges`
+  32 B/placement, `counts/starts/fill` 12 B/tile (+4), `items` 4 B × the
+  tile-span bound, image cache + **decoded-pixel budget** 6 B/px charged
+  before every JPEG decode (trued up to the real size, released on
+  evict/drop — a single oversized member is refused pre-decode), tile
+  canvas/encode 1.5 MB.
+- **Refusal**: new `ErrorCode::ResourceLimitExceeded` with stable code
+  **`resource_profile_insufficient`** — deliberately the code the tool page
+  already maps (`engine.js ERROR_CODES.RESOURCE_PROFILE_INSUFFICIENT`,
+  `tools.err.resource_profile_insufficient`), so browser and CLI surface
+  the same typed error; no new i18n key.
+
+**Reviewer negative, reproduced** (50,883 B bundle, INI
+IMAGENUMBER 5000×5000, `CameraImageDivisionsPerSide = 1`, no position
+buffer → nominal fallback ⇒ 25,000,000 declared positions):
+
+| | old code | new code |
+|---|---|---|
+| `probe`, no cgroup | exit 0, **peak RSS 394,084 KB** | exit 1, typed `resource_profile_insufficient` |
+| `probe`, `MemoryMax=192M` | **exit 137 (SIGKILL/OOM)** | exit 1, typed error (`已计 400000000 B` before any 400 MB allocation) |
+| `convert`, `MemoryMax=192M` | OOM (probe runs first) | exit 1, typed error |
+
+Regressions (committed): Rust
+`large_grid_nominal_fallback_refused_within_budget` builds the reviewer's
+bundle in code (same INI values, tiny members) and asserts the typed error
+under the default saver budget AND a metered pre-allocation peak
+< 64 MiB (per-thread counting allocator — fails on the old code, whose
+probe exited 0 after committing ~400 MB); CLI script
+`scripts/test_mrxs_memory_budget.sh` regenerates the bundle via
+`gen-mrxs` + the INI rewrite and runs probe AND convert under
+`systemd-run --user --scope -q -p MemoryMax=192M -p MemorySwapMax=0`,
+asserting exit 1 + the typed JSON code and no kill signal (exit 137 on the
+old code). `tests/js/tools-mrxs-memory-budget.test.ts` (4) pins the
+worker/runner/`.d.ts` budget wiring.
+
+**Real samples still convert under saver** (native, `MemoryMax=192M`):
+
+| run | peak RSS | wall | output |
+|---|---:|---:|---|
+| CMU-1 probe | 7.0 MB | 0.01 s | — |
+| CMU-1 convert bf-ome | 43.7 MB | 2 m 22 s | **1,075,354,246 B — unchanged** (§4.3) |
+| Mirax2.2-1 probe | 11.2 MB | 0.03 s | — |
+| Mirax2.2-1 convert bf-ome | 52.3 MB | 9 m 26 s | 5,453,168,505 B |
+| CMU-1-Saved-1_16 convert bf-ome / bf-classic | — | 1 s | pins hold `42f3c650…` / `77d3b1b8…` |
+
+No real sample needed a budget raise — the metadata working set of every
+public sample is a few MB (declared camera grids of ~20 K positions, not
+the synthetic 25 M).
+
+### 8.2 §3 — GT gate fails closed
+
+The checker is factored into `compare_gt_rois` (tests/mirax.rs) with
+fail-closed rules; every violation is an error **naming the ROI**:
+reference raw must exist and be exactly `w·h·3` bytes (no more silent
+`continue`, no zip truncation), a mask sidecar must be exactly
+`⌈w·h/8⌉` bytes with **non-trivial valid coverage (≥ 1 %** of the ROI —
+an almost-fully-transparent mask verifies nothing), the ROI must be
+in-bounds and compose, the output must be exactly `w·h·3` bytes, and at
+least one level-0 AND one reduced-level ROI must actually have been
+compared.
+
+Committed negatives (reviewer's `missing-gt/rois.json` semantics: one L0 +
+one L1 16×16 ROI; the source bundle is generated in code):
+
+| negative | old gate | new gate |
+|---|---|---|
+| both raw files missing | **PASS** (`worst L0 mean 0.0000, worst L1+ mean 0.0000`) | `gt_gate_fails_when_reference_raw_files_are_missing` — FAILED naming `roi-l0-missing-l0` |
+| both raw files 0 bytes | **PASS** | `gt_gate_fails_when_reference_raw_files_are_empty` — FAILED: `参考 raw 长度 0 ≠ w*h*3 = 768` |
+
+Strict gate re-run on freshly regenerated real ROI material (same
+`.gate-tmp/f3/{gen_rois,export_gt}.py` scripts, all levels, 256-px ROIs;
+ROIs with 0 % opaque coverage — OpenSlide fully-transparent regions — are
+dropped at generation time and counted, never silently compared):
+
+| sample | ROIs compared (L0 / L1+) | worst L0 mean | worst L1+ mean | gate |
+|---|---|---:|---:|---|
+| CMU-1-Saved-1_16 | 3 / 15 (18 exported) | **0.0000** | 8.9373 | PASS |
+| CMU-1 | 3 / 27 (30 exported) | **0.0000** | 8.1816 | PASS |
+| Mirax2.2-1 | 1 / 18 (19 kept; 11 dropped at 0.0 % opaque) | **0.0000** | 15.5978 | PASS |
+
+The numbers reproduce §4.2 (8.94 / 8.18 / 15.60) under the strict gate.
+
+### 8.3 Files changed for this round
+
+New: `slide-transform-core/crates/core/src/budget.rs` (MemBudget +
+element-size constants), `scripts/test_mrxs_memory_budget.sh` (CLI cgroup
+negative), `tests/js/tools-mrxs-memory-budget.test.ts` (budget wiring).
+Modified: `crates/core/src/{error,lib,plan,mirax,convert_mirax}.rs`
+(resource-limit code, budget account, probe/convert charges),
+`crates/core/tests/mirax.rs` (metered allocator, large-grid negative,
+strict GT checker + 2 negatives), `crates/cli/src/main.rs`
+(`--memory-budget` on probe/convert), `crates/wasm/src/lib.rs` (budget
+params on the three bundle entry points),
+`static/tools/slide-transform/{runner,worker}.js` (budget plumbing only)
++ rebuilt wasm/glue/`.d.ts`/manifest, this report.
+
+Gate re-run after the fixes (serial): Rust workspace
+`--features slide-transform-core/fixtures` **148 passed** (mirax 22 =
+19 + 3 new); vitest `tests/js` **748 passed / 46 files**; C2 smoke
+preserve `6e8744f9…` / compact `7e2f4f82…` (pins), fault matrix **39/39**,
+parity MRXS `42f3c650…`/`77d3b1b8…` + SVS Small-Region
+`fcb6d171…`/`dcefe860…` + KFB-1 `374c70c8…` (pins), native pin re-check
+KFB-1 classic `385a59c6…` / compact `86131cab…`, SVS CMU-1
+`9d1ac1e8…`/`00198666…`, `test_no_whole_file.js` PASS, pytest
+mirax/svs/upload-capability **18 passed**.
+
+## 9. Review fix (§4) — L0-derived pyramid (`l0-box2`, adapter v2)
+
+Fix for `docs/slide-tools/ux-formats-independent-review-20261003.md` §4 (MRXS
+low-zoom geometry). The reviewer's chosen direction was adopted: **build the
+reduced levels so they keep L0 coordinates.**
+
+### 9.1 Method and versioning
+
+- **Every output level k ≥ 1 is the 2×2 area-average (box) downsample chain
+  of output level 0** (`pyramid id l0-box2`): level k's 256×256 tile is the
+  box downsample of the `256·f` square of output level k−1 (`f = 2^exp` is
+  the level's concat factor; tile-aligned ⇒ exactly `f²` previous tiles).
+  Level dimensions stay exactly what they were (`⌊base/concat⌋`): floor
+  dims telescope under floor-halving, and every averaged source column
+  `f·x + d ≤ f·w_k − 1 ≤ w_{k−1} − 1` is provably inside the level, so odd
+  edges need no partial averaging — the dropped right/bottom edge of an odd
+  level is never part of any level-k pixel. Edge tiles clip to the level
+  extent; the out-of-level canvas remainder is the Slidedat fill colour,
+  deterministically on every run. Fill tiles stay deduplicated: a reduced
+  tile all of whose previous tiles are the previous level's shared fill
+  payload references this level's shared fill payload (counted, warned).
+- **The scanner's reduced-level images are no longer used for pixels** —
+  only parsed (dims/MPP contract) and reported. Level 0 still composes the
+  camera images at their true positions (unchanged; pixel-exact vs
+  OpenSlide).
+- **Bounded memory, inside the `budget.rs` account**: each reduced tile
+  reads its `f²` previous tiles back from the OUTPUT SINK (bounded
+  `read_at`, new on the `RandomAccessSink` surface: File/Mem/wasm-OPFS all
+  implement it; the wasm side reads through the same open sync-access
+  handle) via the writer's per-level offcnt scratch records — the only
+  bytes that survive every checkpoint. Working set per reduced tile =
+  `f²` decoded tiles + one `(256·f)²` canvas, charged before the level
+  (CMU-1: ~1.6 MB; f=2). No full-level raster exists anywhere.
+- **Resume byte-identical**: reduced levels resume from the committed
+  previous-level payloads + records (same bytes ⇒ same tiles). Rust cuts
+  inside L0, exactly at the L0/L1 boundary, and inside a reduced level all
+  reproduce an uninterrupted run byte-for-byte
+  (`pyramid_resume_cuts_l0_boundary_and_reduced_are_byte_identical`,
+  `fill_dedupe_resume_is_byte_identical`).
+- **Versioned**: `ADAPTER_VERSION` 1 → **2**, preserve compose fingerprint
+  `…:v1` → **`mirax-preserve-compose:q96:y422:hstd:v2`**, pyramid id
+  **`l0-box2`** recorded in the result `composed` summary, the classic
+  description JSON, OME-XML provenance (`pyramid_method`) and the
+  engine/runner constants. Old v1 checkpoints are refused on resume with
+  the adapter-mismatch contract — `ResumePoint` now carries
+  `adapter_version` (journalled in every wasm checkpoint state and the
+  runner's journal `gen` record); a missing field (every v1 journal) or a
+  mismatched one is a typed refusal before any output byte, in the core
+  (`convert_mirax_to_bigtiff_resume`), in wasm, and runner-side with the
+  `source-adapter` refusal kind. Compact mode uses the same pyramid with
+  the locked U3 params.
+
+### 9.2 Geometry acceptance (the point of this fix)
+
+**Synthetic, committed Rust tests** (`crates/core/tests/mirax.rs`):
+
+- `pyramid_levels_are_box_downsamples_of_the_previous_level` — every output
+  tile of every level equals the box downsample of the level below, decoded
+  from the committed output; within the stated JPEG tolerance (q96 4:2:2
+  generation error compounding with depth: measured worst mean 1.70 / p99 20
+  at L1, 2.84 / 29 at L2; bounds 0.5+1.25·L / 12+12·L).
+- `pyramid_feature_centroids_follow_l0_coordinates` — a features fixture
+  draws 5-px crosses at KNOWN absolute L0 coordinates (ax ≡ 16 mod 32) in a
+  globally coherent pattern, so crosses straddle camera-image seams;
+  intensity-weighted centroids land at L0/2^k within **±0.5 px** on every
+  level (272 cross/level checks).
+- `pyramid_levels_keep_gradient_continuity_across_former_seams` — a smooth
+  diagonal gradient crossing all seams shows no step: worst adjacent-pixel
+  delta 23 (JPEG noise floor; a snapped-seam misregistration measures ≫32).
+- `pyramid_v1_checkpoints_are_refused_on_resume` — v1/field-less
+  checkpoints refused before any output byte.
+
+**Real samples** (bounded ROIs incl. camera seams, every reduced level):
+
+| sample | cross-level: output Lk vs box-chain of L0 (worst mean / p99 / max) | registration vs OpenSlide Lk (masked-SAD sub-pixel shift) | output Lk vs OpenSlide (worst mean / p99 / max) |
+|---|---|---|---|
+| CMU-1-Saved-1_16 | **11.54 → 2.58** (before → after; p99 58 → 14, max 148 → 38) | ≤ 0.5 px → **≤ 0.26 px** | — → **8.42 / 34 / 84** |
+| CMU-1 | **12.47 → 3.89** (p99 65 → 20, max 161 → 43) | ≤ 0.5 → **≤ 0.27 px** | — → **9.08 / 35 / 96** |
+| Mirax2.2-1 | **19.91 → 6.86** (p99 110 → 34, max 210 → 66) | ≤ 0.6 → **≤ 0.24 px** (delivered pixels, textured ROIs; near-flat ROIs' SAD is degenerate — excluded, as in the harness) | — → **14.34 / 54 / 117** |
+
+("before" cross-level = the v1 reduced levels composed from the scanner's
+own reduced images — they did NOT satisfy "Lk = box-chain of L0". "After"
+residual = the compounding JPEG generation error of each level's q96
+re-encode, verified against the exact pre-encode identity below.)
+
+- **Strict GT gate** (`compare_gt_rois`, fail-closed, re-run on all three
+  samples): adds (i) the **exact cross-level identity** — every budgeted
+  reduced ROI's pre-encode compose must EQUAL the box downsample of the
+  level below (arithmetic, no tolerance; super-ROI compose cost bounded at
+  268 Mpx, deeper ROIs counted loudly as `GT SKIP` and covered by the
+  output-based measurements), (ii) **per-ROI p99** (bound 96), (iii) a
+  **registration bound** — masked-SAD ±3 px parabolic sub-pixel shift vs
+  OpenSlide ≤ 1.5 px on textured ROIs. Results: worst L0 mean 0.0000;
+  worst L1+ mean 8.50 / 8.91 / 13.16; p99 35 / 39 / 59; shift ≤ 0.045 px;
+  exactness failures 0 (Saved-1_16 3 checks, CMU-1 15, Mirax2.2-1 8).
+- Pre-encode vs OpenSlide stayed at the v1 level (mean ~8.5–13.2): what
+  changed is that the residual is now a pure CONTENT difference (the
+  scanner's own reduced images vs the box of L0 — different resampling
+  filters), while misregistration is ≤ 0.05 px and the levels are mutually
+  exact by construction.
+
+### 9.3 Size / time / RSS (native, `MemoryMax=192M`)
+
+| run | before (v1) | after (v2, l0-box2) |
+|---|---|---|
+| CMU-1-Saved-1_16 bf-ome | 6,561,133 B · 0.66 s · 38.2 MB | 6,685,120 B · 0.99 s · 38.3 MB |
+| CMU-1 bf-ome | 1,075,354,246 B · 2 m 21 s · 43.7 MB | 1,132,364,509 B (+5.3 %) · 3 m 15 s · 43.7 MB |
+| Mirax2.2-1 bf-ome | 5,453,168,505 B · 9 m 18 s · 51.9 MB | 5,594,621,137 B (+2.6 %) · 12 m 14 s · 52.2 MB |
+
+The pyramid adds one decode+downsample+encode pass over all reduced tiles
+(each previous tile feeds exactly one output tile): wall +30–40 %, size
++3–5 % (smoother levels re-encode slightly larger), RSS unchanged. NOTE:
+Mirax2.2-1 now exceeds the CLI's default 600 s `--timeout` and needs
+`--timeout 1800` (the plan guard, not a memory bound; the browser worker
+runs without that timeout). Tile/fill accounting is unchanged
+(tiles_filled differs by ≤ 3 on Mirax2.2-1 where the pyramid's fill rule
+differs at deep-level edges).
+
+### 9.4 What remains different from OpenSlide, and why
+
+OpenSlide renders each reduced level from the SCANNER's own reduced-level
+images (cairo, sub-pixel positions); the adapter now renders the box
+downsample chain of the exact L0 mosaic. The two agree on registration
+(≤ 0.05 px pre-encode / ≤ 0.27 px delivered, textured ROIs) but differ in
+resampling filter: the scanner's reduced images carry their own sharpening,
+so per-pixel means stay ~8.5–14.3 (p99 ≤ 59) — the same order as v1 — while
+v1's cross-level inconsistency (Lk vs box-chain of L0: mean 11.5–19.9,
+p99 up to 110) is now exact by construction up to the documented q96 JPEG
+generation error (mean ≤ 3.9 on CMU-1, ≤ 6.9 on Mirax2.2-1 over all
+levels). Closing the remaining gap to OpenSlide's pixels would require
+adopting the scanner's unknown resampling filter; not attempted — the
+geometric contract (levels are mutually consistent and anchored to L0) is
+the acceptance criterion of review §4.
+
+### 9.5 Gates re-run after this fix (serial)
+
+Rust workspace `--features …/fixtures` **153 passed / 0 failed** (mirax 27 =
+22 + 5 new); vitest `tests/js` **748 / 748** (46 files); C2 smoke preserve
+`6e8744f9…` / compact `7e2f4f82…` (non-MRXS pins hold); fault matrix
+**39/39** (`mrxs-bundle-converts-and-matches-native` now asserts
+fingerprint v2 + pyramid `l0-box2`); parity MRXS browser==native byte-equal
+**`62da50da…`** ome / **`2b5bcde1…`** classic, SVS Small-Region
+`fcb6d171…`/`dcefe860…`, KFB-1 `374c70c8…`; `test_no_whole_file.js` PASS;
+`scripts/test_mrxs_memory_budget.sh` PASS (typed refusal under 192M);
+pytest mirax/svs viewer + upload capability **18 passed**; native pin
+re-check KFB-1 `374c70c8…`/`385a59c6…`/`86131cab…`, SVS CMU-1
+`9d1ac1e8…`/`00198666…` — all unchanged; OpenSlide opens the classic output
+with all 6 levels and unchanged dims; QuPath **0.6.0-rc5 AND 0.7.0** strict
+gate PASS on the v2 bf-ome (6 resolutions, Bio-Formats, RGB, 24 region
+reads) and `compare_regions` vs the classic output = **12/12 regions
+max_abs_diff 0** per version; C3 `mx` scenario's pinned native hash literal
+updated `42f3c650…` → `62da50da…` (v2 pyramid changes every reduced level).

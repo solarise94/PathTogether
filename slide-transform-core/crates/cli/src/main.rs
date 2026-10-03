@@ -1,12 +1,17 @@
 //! `slide-transform` — native CLI over the shared transform core.
 //!
-//!   slide-transform probe <input> [--sha256]
+//!   slide-transform probe <input> [--sha256] [--memory-budget BYTES]
 //!   slide-transform convert <input> <output> [--profile auto|bf-classic|bf-ome|fl-ome]
 //!                           [--encoding preserve|compact]
 //!                           [--policy allow-edge|strict-lossless]
 //!                           [--channel-json PATH] [--timeout SECONDS]
 //!                           [--max-output-bytes N] [--min-free-bytes N]
-//!                           [--overwrite]
+//!                           [--memory-budget BYTES] [--overwrite]
+//!
+//! `--memory-budget` (review §1) is the host's memory budget for the
+//! conversion (default: the browser saver profile's 192 MiB). The MRXS
+//! adapter estimates its metadata/decode working set against it and refuses
+//! with a typed `resource_profile_insufficient` error BEFORE allocating.
 //!
 //! `--profile auto` keeps the historical mapping (KFB → bf-classic, KFBF →
 //! fl-ome) because unattended callers (the Baidu import plugin worker) name
@@ -321,15 +326,26 @@ fn svs_doc_json(doc: &slide_transform_core::svs::SvsDoc) -> String {
 fn cmd_probe(args: &[String]) -> Result<String, CoreError> {
     let mut path: Option<&String> = None;
     let mut want_hash = false;
-    for a in args {
-        match a.as_str() {
+    let mut memory_budget = slide_transform_core::budget::SAVER_BUDGET_BYTES;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
             "--sha256" => want_hash = true,
-            _ => path = Some(a),
+            "--memory-budget" => {
+                i += 1;
+                memory_budget = args
+                    .get(i)
+                    .ok_or_else(|| CoreError::validation("--memory-budget 缺值"))?
+                    .parse()
+                    .map_err(|_| CoreError::validation("--memory-budget 非数值"))?;
+            }
+            _ => path = Some(&args[i]),
         }
+        i += 1;
     }
     let path = path.ok_or_else(|| CoreError::validation("probe 需要 <input>"))?;
     if is_mrxs_path(Path::new(path)) {
-        return cmd_probe_mrxs(path, want_hash);
+        return cmd_probe_mrxs(path, want_hash, memory_budget);
     }
     let src = FileSource::open(Path::new(path))?;
     let magic = detect(&src)?;
@@ -483,12 +499,14 @@ fn cmd_probe(args: &[String]) -> Result<String, CoreError> {
 // probe (MRXS bundle, F3)
 // --------------------------------------------------------------------------- //
 
-fn cmd_probe_mrxs(path: &str, want_hash: bool) -> Result<String, CoreError> {
+/// `memory_budget`: the host memory budget for the probe (review §1) —
+/// conservative default = the browser saver profile's 192 MiB.
+fn cmd_probe_mrxs(path: &str, want_hash: bool, memory_budget: u64) -> Result<String, CoreError> {
     let p = Path::new(path);
     let dir = p.parent().map(|d| d.to_path_buf()).unwrap_or_else(|| Path::new(".").to_path_buf());
     let stem = mrxs_stem(p);
     let fs = slide_transform_core::bundle::DirBundle::open(&dir, &stem)?;
-    let doc = slide_transform_core::mirax::probe_mirax(&fs, &stem)?;
+    let doc = slide_transform_core::mirax::probe_mirax_with_budget(&fs, &stem, memory_budget)?;
     let doc_json = mrxs_doc_json(&doc);
     let estimate = slide_transform_core::mirax::estimate_mirax(&doc);
     let est_json = obj(&[
@@ -580,10 +598,20 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
     let mut channel_json: Option<PathBuf> = None;
     let mut timeout: Option<f64> = None;
     let mut max_out: Option<u64> = None;
+    let mut memory_budget: Option<u64> = None;
     let mut overwrite = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--memory-budget" => {
+                i += 1;
+                memory_budget = Some(
+                    args.get(i)
+                        .ok_or_else(|| CoreError::validation("--memory-budget 缺值"))?
+                        .parse()
+                        .map_err(|_| CoreError::validation("--memory-budget 非数值"))?,
+                );
+            }
             "--profile" => {
                 i += 1;
                 profile = args
@@ -639,7 +667,16 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
         return Err(CoreError::validation("convert 需要 <input> <output>"));
     }
     if is_mrxs_path(Path::new(positional[0])) {
-        let r = cmd_convert_mrxs(&positional, &profile, &policy, &encoding, timeout, max_out, overwrite);
+        let r = cmd_convert_mrxs(
+            &positional,
+            &profile,
+            &policy,
+            &encoding,
+            timeout,
+            max_out,
+            memory_budget,
+            overwrite,
+        );
         return r;
     }
     let input = Path::new(positional[0]);
@@ -665,6 +702,8 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
         timeout_seconds: timeout.unwrap_or(600.0),
         max_output_bytes: max_out.unwrap_or(64 * 1024 * 1024 * 1024),
         min_free_bytes: 256 * 1024 * 1024,
+        memory_budget_bytes: memory_budget
+            .unwrap_or(slide_transform_core::budget::SAVER_BUDGET_BYTES),
     };
     // 磁盘剩余空间（宿主侧 statvfs；核心 crate 无 stat 依赖）
     {
@@ -1115,6 +1154,7 @@ fn cmd_convert_mrxs(
     encoding: &str,
     timeout: Option<f64>,
     max_out: Option<u64>,
+    memory_budget: Option<u64>,
     overwrite: bool,
 ) -> Result<String, CoreError> {
     let input = Path::new(positional[0]);
@@ -1157,6 +1197,8 @@ fn cmd_convert_mrxs(
         timeout_seconds: timeout.unwrap_or(600.0),
         max_output_bytes: max_out.unwrap_or(64 * 1024 * 1024 * 1024),
         min_free_bytes: 256 * 1024 * 1024,
+        memory_budget_bytes: memory_budget
+            .unwrap_or(slide_transform_core::budget::SAVER_BUDGET_BYTES),
     };
     {
         let dir = scratch_under(output);
@@ -1265,6 +1307,7 @@ fn emit_convert_json(
             ju("tiles_composed", c.tiles_composed),
             ju("tiles_filled", c.tiles_filled),
             ju("tiles_deduped", c.tiles_deduped),
+            jstr("pyramid", &c.pyramid),
         ]),
         None => "null".to_string(),
     };

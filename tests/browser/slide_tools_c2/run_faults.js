@@ -889,7 +889,9 @@ function verdict(name, r) {
       return r.done && r.done.ok && r.sha === r.expect && r.adapter === 'mirax-bundle'
         && m.adapter === 'mirax-bundle' && Number.isInteger(m.memberCount) && m.memberCount >= 5
         && res.source_format === 'mirax-bundle'
-        && res.composed && composed.fingerprint === 'mirax-preserve-compose:q96:y422:hstd:v1'
+        // review §4: adapter v2 = the l0-box2 pyramid; fingerprint bumped v1→v2
+        && res.composed && composed.fingerprint === 'mirax-preserve-compose:q96:y422:hstd:v2'
+        && composed.pyramid === 'l0-box2'
         && composed.tiles_filled >= 0
         ? ok() : fail(safeJson({ ok: r.done && r.done.ok, shaMatch: r.sha === r.expect,
           adapter: r.adapter, manifest: m.memberCount, sf: res.source_format,

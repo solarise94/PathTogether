@@ -87,13 +87,16 @@ export function convertProfileEncoded(profile, encoding, strict_lossless, channe
 
 /**
  * Bundle conversion with explicit output AND encoding profile ids (F3).
+ * `budget_bytes`: the browser resource profile's budget (review §1;
+ * `undefined` = the conservative saver default).
  * @param {string} profile
  * @param {string} encoding
  * @param {boolean} strict_lossless
  * @param {string} channel_json
+ * @param {number | null} [budget_bytes]
  * @returns {string}
  */
-export function convertProfileEncodedBundle(profile, encoding, strict_lossless, channel_json) {
+export function convertProfileEncodedBundle(profile, encoding, strict_lossless, channel_json, budget_bytes) {
     let deferred4_0;
     let deferred4_1;
     try {
@@ -103,7 +106,7 @@ export function convertProfileEncodedBundle(profile, encoding, strict_lossless, 
         const len1 = WASM_VECTOR_LEN;
         const ptr2 = passStringToWasm0(channel_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len2 = WASM_VECTOR_LEN;
-        const ret = wasm.convertProfileEncodedBundle(ptr0, len0, ptr1, len1, strict_lossless, ptr2, len2);
+        const ret = wasm.convertProfileEncodedBundle(ptr0, len0, ptr1, len1, strict_lossless, ptr2, len2, !isLikeNone(budget_bytes), isLikeNone(budget_bytes) ? 0 : budget_bytes);
         deferred4_0 = ret[0];
         deferred4_1 = ret[1];
         return getStringFromWasm0(ret[0], ret[1]);
@@ -205,9 +208,10 @@ export function convertResumeProfileEncoded(resume_json, profile, encoding, stri
  * @param {string} encoding
  * @param {boolean} strict_lossless
  * @param {string} channel_json
+ * @param {number | null} [budget_bytes]
  * @returns {string}
  */
-export function convertResumeProfileEncodedBundle(resume_json, profile, encoding, strict_lossless, channel_json) {
+export function convertResumeProfileEncodedBundle(resume_json, profile, encoding, strict_lossless, channel_json, budget_bytes) {
     let deferred5_0;
     let deferred5_1;
     try {
@@ -219,7 +223,7 @@ export function convertResumeProfileEncodedBundle(resume_json, profile, encoding
         const len2 = WASM_VECTOR_LEN;
         const ptr3 = passStringToWasm0(channel_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len3 = WASM_VECTOR_LEN;
-        const ret = wasm.convertResumeProfileEncodedBundle(ptr0, len0, ptr1, len1, ptr2, len2, strict_lossless, ptr3, len3);
+        const ret = wasm.convertResumeProfileEncodedBundle(ptr0, len0, ptr1, len1, ptr2, len2, strict_lossless, ptr3, len3, !isLikeNone(budget_bytes), isLikeNone(budget_bytes) ? 0 : budget_bytes);
         deferred5_0 = ret[0];
         deferred5_1 = ret[1];
         return getStringFromWasm0(ret[0], ret[1]);
@@ -297,13 +301,18 @@ export function probe() {
 
 /**
  * Probe a bundle input (F3 MRXS) through the bundle host callbacks.
+ * `budget_bytes` is the browser resource profile's budget (review §1): the
+ * probe refuses with `resource_profile_insufficient` when its metadata
+ * working set would exceed it — before any large allocation. `undefined`
+ * keeps the conservative saver default (192 MiB).
+ * @param {number | null} [budget_bytes]
  * @returns {string}
  */
-export function probeBundle() {
+export function probeBundle(budget_bytes) {
     let deferred1_0;
     let deferred1_1;
     try {
-        const ret = wasm.probeBundle();
+        const ret = wasm.probeBundle(!isLikeNone(budget_bytes), isLikeNone(budget_bytes) ? 0 : budget_bytes);
         deferred1_0 = ret[0];
         deferred1_1 = ret[1];
         return getStringFromWasm0(ret[0], ret[1]);

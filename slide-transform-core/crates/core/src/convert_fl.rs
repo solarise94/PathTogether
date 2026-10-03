@@ -434,6 +434,7 @@ fn convert_inner(
         },
         ifd_chain,
         lossy_reencode: None, // fluorescence never runs the compact encoder
+        composed: None,
         associated: doc
             .associated
             .iter()

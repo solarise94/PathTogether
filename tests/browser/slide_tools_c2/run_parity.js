@@ -25,6 +25,10 @@ const L = require('./lib.js');
 const PORT = Number(L.arg('port', '8944'));
 const SAMPLES = L.arg('samples', '');
 const SVS = L.arg('svs', '');
+// F3: `--mrxs <dir>` — the unpacked bundle directory (entry + same-name
+// folder). Converts through the browser bundle path and compares with the
+// native CLI for BOTH brightfield profiles.
+const MRXS = L.arg('mrxs', '');
 const WITH_FL = process.argv.includes('--fl');
 // --fl-all: every KFBF sample (aliases KFBF-A..D, sorted), not just the first
 const FL_ALL = process.argv.includes('--fl-all');
@@ -49,6 +53,97 @@ async function convertInBrowser(page, input, profileId, outputProfile, encoding)
   const hash = await page.evaluate((id) => window.__c2.hashArtifact(id), jobId);
   const rec = await page.evaluate((id) => window.__c2.jobRecord(id), jobId);
   return { jobId, done, hash, rec };
+}
+
+/// F3: one MRXS bundle, browser conversion (both brightfield profiles) vs
+/// the native CLI bytes of the same profile. The members are read in Node
+/// and handed to the page as {name, relPath, bytes} rows (the engine treats
+/// them exactly like picker files with webkitRelativePath).
+async function mainMrsx() {
+  if (!MRXS || !fs.existsSync(MRXS)) throw new Error('--mrxs <bundle-dir> required');
+  const outDir = path.join(L.GATE, 'parity-mrxs');
+  fs.mkdirSync(outDir, { recursive: true });
+  const results = { runs: [], startedAt: new Date().toISOString() };
+
+  // collect members: <dir>/<stem>.mrxs + <dir>/<stem>/*
+  const stems = fs.readdirSync(MRXS).filter((f) => f.toLowerCase().endsWith('.mrxs')).sort();
+  if (stems.length !== 1) throw new Error(`expected exactly one .mrxs entry in ${MRXS}`);
+  const stem = stems[0].replace(/\.mrxs$/i, '');
+  const members = [{ name: stems[0], relPath: `${stem}/${stems[0]}` }];
+  for (const f of fs.readdirSync(path.join(MRXS, stem)).sort()) {
+    members.push({ name: f, relPath: `${stem}/${stem}/${f}` });
+  }
+  const server = await L.startServer(PORT);
+  process.on('exit', () => { try { server.kill('SIGKILL'); } catch { /* */ } });
+  const { context, page } = await L.launch({ label: 'parity-mrxs' });
+  try {
+    await L.open(page, PORT);
+    // hand the members to the page as File rows (base64 transport —
+    // Playwright serializes evaluate args as JSON, so binary buffers must
+    // not cross as typed arrays). Saved-1_16 ≈ 5.5 MB; the page keeps the
+    // rows for both profile runs (clearJobs only wipes OPFS).
+    await page.evaluate((list) => {
+      const rows = [];
+      for (const m of list) {
+        const bin = atob(m.b64);
+        const u8 = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+        rows.push({ name: m.name, relPath: m.relPath,
+          file: new File([u8], m.name, { type: 'application/octet-stream' }) });
+      }
+      window.__bundleRows = rows;
+    }, await Promise.all(members.map(async (m) => {
+      const rel = m.name === stems[0]
+        ? path.join(MRXS, m.name)
+        : path.join(MRXS, stem, m.name);
+      return { name: m.name, relPath: m.relPath,
+        b64: (await fs.promises.readFile(rel)).toString('base64') };
+    })));
+
+    for (const profile of ['bf-ome', 'bf-classic']) {
+      const tag = profile === 'bf-ome' ? 'ome' : 'classic';
+      const nativeOut = path.join(outDir, `mrxs-native-${tag}.tif`);
+      execFileSync(L.CLI, ['convert', path.join(MRXS, stems[0]), nativeOut,
+        '--overwrite', '--profile', profile,
+        ...(COMPACT ? ['--encoding', 'compact'] : [])]);
+      const nativeSha = await L.sha256File(nativeOut);
+      const t0 = Date.now();
+      await L.clearJobs(page);
+      await page.evaluate(() => window.__c2.pickBundle(window.__bundleRows));
+      await page.evaluate(async ({ p, e }) => {
+        const prep = await window.__c2.probeBundle({ encoding: e, outputProfile: p });
+        await window.__c2.start({ outputProfile: p, encoding: e, preparedJobId: prep.jobId });
+      }, { p: profile, e: COMPACT ? 'compact-jpeg-v1' : undefined });
+      const done = await page.evaluate(() => window.__c2.awaitDone(60 * 60 * 1000));
+      if (!done || !done.ok) throw new Error('browser bundle conversion failed: ' + JSON.stringify(done).slice(0, 300));
+      const jobId = await page.evaluate(() => window.__c2.jobId());
+      const hash = await page.evaluate((id) => window.__c2.hashArtifact(id), jobId);
+      const rec = await page.evaluate((id) => window.__c2.jobRecord(id), jobId);
+      const equal = hash.sha256 === nativeSha;
+      results.runs.push({
+        input: stems[0], bundleMembers: members.length,
+        sourceFormat: rec.result && rec.result.source_format,
+        outputProfile: profile,
+        encoding: COMPACT ? 'compact-jpeg-v1' : 'preserve-source-v1',
+        browserSha256: hash.sha256, nativeSha256: nativeSha, equal,
+        outputBytes: done.result && done.result.output_bytes,
+        convertMs: rec.convertMs,
+        composed: rec.result && rec.result.composed,
+        validation: rec.validation ? { ifdCount: rec.validation.ifd_count } : null,
+        wallMs: Date.now() - t0,
+      });
+      console.log(`MRXS ${profile}${COMPACT ? ' compact' : ''}: browser ${hash.sha256.slice(0, 16)}… native ${nativeSha.slice(0, 16)}… equal=${equal} (${rec.convertMs} ms)`);
+      fs.rmSync(nativeOut, { force: true });
+    }
+  } finally {
+    await context.close().catch(() => { /* */ });
+    server.kill('SIGKILL');
+  }
+  results.finishedAt = new Date().toISOString();
+  results.ok = results.runs.every((r) => r.equal);
+  L.writeJson('parity-mrxs/result.json', results);
+  console.log(results.ok ? 'MRXS PARITY PASS' : 'MRXS PARITY FAIL');
+  process.exitCode = results.ok ? 0 : 1;
 }
 
 /// F1: one SVS input, browser conversion (both brightfield profiles) vs the
@@ -100,6 +195,9 @@ async function mainSvs() {
 }
 
 async function main() {
+  if (MRXS) {
+    return mainMrsx();
+  }
   if (SVS) {
     return mainSvs();
   }

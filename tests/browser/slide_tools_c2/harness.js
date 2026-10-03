@@ -25,7 +25,16 @@ let lastCancelRequestTs = 0;
 
 document.getElementById('file').addEventListener('change', (e) => {
   file = e.target.files[0] || null;
+  bundleFiles = null;
   note('file-picked', { size: file ? file.size : 0, has: !!file });
+});
+
+// F3: a folder selection becomes a bundle prepare (webkitRelativePath)
+let bundleFiles = null;
+document.getElementById('dir').addEventListener('change', (e) => {
+  file = null;
+  bundleFiles = [...e.target.files];
+  note('dir-picked', { count: bundleFiles.length, bytes: bundleFiles.reduce((a, f) => a + f.size, 0) });
 });
 
 async function ensureRunner() {
@@ -88,6 +97,11 @@ async function start() {
   const o = opts();
   o.jobId = preparedJobId || undefined;
   preparedJobId = null;
+  if (!o.jobId && bundleFiles && !file) {
+    // bundle job: prepare from the folder selection, then start
+    const prep = await runner.prepareBundle(bundleFiles, o);
+    o.jobId = prep.jobId;
+  }
   const r = await runner.startJob(file, o);
   currentJob = r.jobId;
   note('start-issued', { jobId: currentJob });
@@ -123,6 +137,46 @@ async function exportToOpfs(name = 'export-copy.bin') {
 
 window.__c2 = {
   events,
+  async pickBundle(files) {
+    // programmatic bundle prepare+start (files: [{name, relPath, bytes}])
+    await ensureRunner();
+    bundleFiles = files;
+    file = null;
+    return true;
+  },
+  async probeBundle(o = {}) {
+    await ensureRunner();
+    const r = await runner.prepareBundle(bundleFiles, {
+      confirmUncertainDisk: true,
+      encodingProfile: o.encoding || undefined,
+      outputProfile: o.outputProfile || undefined,
+      faults: o.faults || undefined,
+    });
+    currentJob = r.jobId;
+    note('probe-bundle', { jobId: r.jobId, members: r.manifest.memberCount });
+    return r;
+  },
+  bundleManifest(id = currentJob) {
+    return window.__c2.jobRecord(id).then((rec) => rec && rec.bundleManifest);
+  },
+  async tamperBundleMember(flatPath, mode = 'flip') {
+    const engine = await import('/tools/engine.js');
+    const root = await navigator.storage.getDirectory();
+    const jobs = await root.getDirectoryHandle('slide-jobs');
+    const dir = await jobs.getDirectoryHandle(currentJob);
+    let b = await dir.getDirectoryHandle('bundle');
+    // member paths nest (slide/Data0000.dat → bundle/slide/Data0000.dat)
+    const segs = flatPath.split('/');
+    for (let i = 0; i < segs.length - 1; i++) {
+      b = await b.getDirectoryHandle(segs[i]);
+    }
+    const fh = await b.getFileHandle(segs[segs.length - 1]);
+    const w = await engine.withRetry(() => fh.createWritable({ keepExistingData: true }));
+    if (mode === 'truncate') await w.truncate((await fh.getFile()).size - 16);
+    else await w.write({ type: 'write', position: 64, data: new Uint8Array([0x41, 0x42]) });
+    await w.close();
+    return true;
+  },
   async ready() { await ensureRunner(); return { coreVersion: runner.coreVersion }; },
   async probe(o = {}) {
     await ensureRunner();

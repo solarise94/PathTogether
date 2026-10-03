@@ -43,6 +43,13 @@ pub struct EncoderCfg {
     pub y_q: [u16; 64],
     pub c_q: [u16; 64],
     pub sampling: Sampling,
+    /// Emit a three-component **RGB** stream (Adobe APP14 transform 0,
+    /// component ids 'R','G','B', no colour conversion) instead of the
+    /// default JFIF YCbCr. Used by the MRXS preserve compose: TIFF
+    /// photometric-2 RGB JPEG is the Aperio-style combination every reader
+    /// (Bio-Formats included) decodes, while YCbCr 4:4:4 tiles render as
+    /// garbage in Bio-Formats (F3 interop gate).
+    pub rgb: bool,
 }
 
 impl EncoderCfg {
@@ -51,6 +58,17 @@ impl EncoderCfg {
             y_q: std_luma_quality(quality),
             c_q: std_chroma_quality(quality),
             sampling,
+            rgb: false,
+        }
+    }
+
+    /// RGB stream (forced 4:4:4 — RGB JPEG has no subsampling).
+    pub fn with_rgb_quality(quality: u8) -> Self {
+        EncoderCfg {
+            y_q: std_luma_quality(quality),
+            c_q: std_chroma_quality(quality),
+            sampling: Sampling::S444,
+            rgb: true,
         }
     }
 }
@@ -429,18 +447,33 @@ pub fn encode_rgb(
     let mcus_x = (w + max_h * 8 - 1) / (max_h * 8);
     let mcus_y = (h + max_v * 8 - 1) / (max_v * 8);
 
-    // color convert into full-resolution component planes
-    let t = rgb_ycc_tables();
-    let mut y_full = vec![0u8; w * h];
-    let mut cb_full = vec![0u8; w * h];
-    let mut cr_full = vec![0u8; w * h];
-    for p in 0..w * h {
-        let r = rgb[p * 3] as usize;
-        let g = rgb[p * 3 + 1] as usize;
-        let b = rgb[p * 3 + 2] as usize;
-        y_full[p] = ((t.r_y[r] + t.g_y[g] + t.b_y[b]) >> J_SCALEBITS) as u8;
-        cb_full[p] = ((t.r_cb[r] + t.g_cb[g] + t.b_cb[b]) >> J_SCALEBITS) as u8;
-        cr_full[p] = ((t.r_cr[r] + t.g_cr[g] + t.b_cr[b]) >> J_SCALEBITS) as u8;
+    // color convert into full-resolution component planes (skipped for the
+    // RGB stream mode — the components ARE the channels)
+    let mut y_full;
+    let mut cb_full;
+    let mut cr_full;
+    if cfg.rgb {
+        y_full = vec![0u8; w * h];
+        cb_full = vec![0u8; w * h];
+        cr_full = vec![0u8; w * h];
+        for p in 0..w * h {
+            y_full[p] = rgb[p * 3];
+            cb_full[p] = rgb[p * 3 + 1];
+            cr_full[p] = rgb[p * 3 + 2];
+        }
+    } else {
+        let t = rgb_ycc_tables();
+        y_full = vec![0u8; w * h];
+        cb_full = vec![0u8; w * h];
+        cr_full = vec![0u8; w * h];
+        for p in 0..w * h {
+            let r = rgb[p * 3] as usize;
+            let g = rgb[p * 3 + 1] as usize;
+            let b = rgb[p * 3 + 2] as usize;
+            y_full[p] = ((t.r_y[r] + t.g_y[g] + t.b_y[b]) >> J_SCALEBITS) as u8;
+            cb_full[p] = ((t.r_cb[r] + t.g_cb[g] + t.b_cb[b]) >> J_SCALEBITS) as u8;
+            cr_full[p] = ((t.r_cr[r] + t.g_cr[g] + t.b_cr[b]) >> J_SCALEBITS) as u8;
+        }
     }
 
     // downsample + pad into block-aligned planes
@@ -683,7 +716,15 @@ fn write_dqt(out: &mut Vec<u8>, id: u8, q_nat: &[u16; 64]) {
 
 fn write_header_rgb(out: &mut Vec<u8>, w: u32, h: u32, cfg: &EncoderCfg) {
     out.extend_from_slice(&[0xFF, 0xD8]);
-    write_jfif_app0(out);
+    if cfg.rgb {
+        // Adobe APP14 (transform 0 = RGB), the marker libjpeg/Pillow emit
+        // for RGB saves; component ids 'R','G','B' per jcmaster's JCS_RGB
+        push_marker(out, 0xEE, &[
+            b'A', b'd', b'o', b'b', b'e', 0x00, 100, 0, 0, 0, 0, 0, 0,
+        ]);
+    } else {
+        write_jfif_app0(out);
+    }
     write_dqt(out, 0, &cfg.y_q);
     write_dqt(out, 1, &cfg.c_q);
     let (hmax, vmax) = match cfg.sampling {
@@ -691,14 +732,19 @@ fn write_header_rgb(out: &mut Vec<u8>, w: u32, h: u32, cfg: &EncoderCfg) {
         Sampling::S422 => (2, 1),
         Sampling::S420 => (2, 2),
     };
+    let (id0, id1, id2) = if cfg.rgb {
+        (b'R', b'G', b'B')
+    } else {
+        (1u8, 2u8, 3u8)
+    };
     let sof = vec![
         8,
         (h >> 8) as u8, h as u8,
         (w >> 8) as u8, w as u8,
         3,
-        1, (hmax << 4) | vmax, 0,
-        2, 0x11, 1,
-        3, 0x11, 1,
+        id0, (hmax << 4) | vmax, 0,
+        id1, 0x11, 1,
+        id2, 0x11, 1,
     ];
     push_marker(out, 0xC0, &sof);
     // DHT: per component (DC then AC), duplicates suppressed → DC0 AC0 DC1 AC1
@@ -707,7 +753,7 @@ fn write_header_rgb(out: &mut Vec<u8>, w: u32, h: u32, cfg: &EncoderCfg) {
     write_dht(out, 1, 0, &tabs[0].ac);
     write_dht(out, 0, 1, &tabs[1].dc);
     write_dht(out, 1, 1, &tabs[1].ac);
-    let sos = [3u8, 1, 0x00, 2, 0x11, 3, 0x11, 0, 63, 0];
+    let sos = [3u8, id0, 0x00, id1, 0x11, id2, 0x11, 0, 63, 0];
     push_marker(out, 0xDA, &sos);
 }
 

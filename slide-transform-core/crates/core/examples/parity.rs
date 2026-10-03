@@ -43,7 +43,7 @@ fn main() -> ExitCode {
                     y_q: yq,
                     c_q: cq,
                     sampling: s,
-                };
+                 rgb: false, };
                 let out = slide_transform_core::jpeg::encode_rgb(&raw, w, h, &cfg)
                     .map_err(|e| e.to_string())?;
                 std::fs::write(&args[8], out).map_err(|e| e.to_string())

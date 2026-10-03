@@ -193,14 +193,36 @@ impl<'a> BigTiffPyramidWriter<'a> {
         let offset = self.cursor;
         self.sink.write_at(offset, data)?;
         self.cursor += data.len() as u64;
+        self.record_tile(offset, data.len() as u32)?;
+        Ok((offset, data.len() as u32))
+    }
+
+    /// Append a RAW payload at the cursor WITHOUT recording a tile — the
+    /// caller becomes responsible for referencing it (see
+    /// [`Self::write_tile_ref`]). F3 fill-tile dedupe: an identical payload
+    /// written once and referenced by every tile that contains exactly it.
+    pub fn write_payload(&mut self, data: &[u8]) -> CoreResult<(u64, u32)> {
+        let offset = self.cursor;
+        self.sink.write_at(offset, data)?;
+        self.cursor += data.len() as u64;
+        Ok((offset, data.len() as u32))
+    }
+
+    /// Record a tile whose payload lives at a previously written offset
+    /// (shared payload). Valid TIFF: TileOffsets entries may repeat.
+    pub fn write_tile_ref(&mut self, offset: u64, count: u32) -> CoreResult<()> {
+        self.record_tile(offset, count)
+    }
+
+    fn record_tile(&mut self, offset: u64, count: u32) -> CoreResult<()> {
         let lv = self.ifds.last_mut().expect("begin_level before write_tile");
         let mut rec = [0u8; OFFCNT_REC as usize];
         rec[..8].copy_from_slice(&offset.to_le_bytes());
-        rec[8..].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        rec[8..].copy_from_slice(&count.to_le_bytes());
         lv.offcnt.write_at(lv.offcnt_bytes, &rec)?;
         lv.offcnt_bytes += OFFCNT_REC;
         lv.tile_count += 1;
-        Ok((offset, data.len() as u32))
+        Ok(())
     }
 
     /// Close the current level with its IFD metadata (Python `add_level`).

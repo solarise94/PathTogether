@@ -22,6 +22,7 @@
 import init, {
   probe, convertProfileEncoded, convertResumeProfileEncoded, finalizeValidate, sha256Source,
   coreVersion, configure, enableCheckpoint,
+  probeBundle, convertProfileEncodedBundle, convertResumeProfileEncodedBundle,
 } from './slide_transform.js';
 import * as E from './engine.js';
 
@@ -153,6 +154,148 @@ async function stageSource(jobId, file, faults) {
   const r = JSON.parse(sha256Source());
   if (r.error) throw r;
   return { size: srcSize, sha256: r.sha256 };
+}
+
+// ------------------------------------------------------------ bundle (F3) --
+
+// A staged MRXS bundle lives in the job dir under `bundle/` with the
+// manifest's flat names. Member copies stream through ONE reused buffer
+// with the digest accumulated on the fly; per-member progress is reported
+// to the runner (which persists it — an incomplete copy is never a
+// resumable prepared job).
+let bundleDir = null; // OPFS dir handle of `bundle/`
+let bundleMembers = []; // [{name, handle(sync), size}]
+const BUNDLE_STAGE_CHUNK = 4 * 2 ** 20;
+
+async function opfsBundleDir(jobId, create) {
+  const dir = await opfsJobDir(jobId, create);
+  return dir.getDirectoryHandle('bundle', { create: !!create });
+}
+
+/// A member's flat path ('slide/Data0000.dat') maps to nested OPFS entries
+/// (OPFS names cannot contain '/'). Returns the leaf file handle.
+async function bundleFileHandle(bundleDir, flatPath, create) {
+  const segs = flatPath.split('/');
+  let dir = bundleDir;
+  for (let i = 0; i < segs.length - 1; i++) {
+    dir = await dir.getDirectoryHandle(segs[i], { create: !!create });
+  }
+  return dir.getFileHandle(segs[segs.length - 1], { create: !!create });
+}
+
+/// Copy members one by one (File list from the folder picker) into OPFS
+/// with sha256 per member. Returns the manifest member list.
+async function stageBundle(jobId, members, onProgress, faults) {
+  closeBundle();
+  const dir = await opfsBundleDir(jobId, true);
+  // remove stale members from an interrupted earlier attempt (recursive:
+  // member paths nest one level under the stem directory)
+  for await (const [name, handle] of dir.entries()) {
+    try { await dir.removeEntry(name, { recursive: true }); } catch { /* */ }
+  }
+  const out = [];
+  let doneBytes = 0;
+  const totalBytes = members.reduce((a, m) => a + m.file.size, 0);
+  for (let i = 0; i < members.length; i++) {
+    const { name, file } = members[i];
+    if (testMode && faults && faults.crashInBundleStage !== undefined && i >= faults.crashInBundleStage) {
+      // Simulated interruption mid-member-copy: the partially written
+      // member and the `staging` record must survive as NOT-prepared.
+      // (hangUntilDeath + self.close with an open sync handle crashes this
+      // Chromium renderer — measured — so the interruption is injected as
+      // a hard IO error from the middle of the copy loop instead.)
+      post({ type: 'fault-reached', fault: 'crashInBundleStage', jobId, detail: { member: i } });
+      throw E.stError(E.ERROR_CODES.IO_RECOVERABLE,
+        `成员复制被中断（测试注入，成员 ${i}）`);
+    }
+    const fh = await E.withRetry(() => bundleFileHandle(dir, name, true), { name: 'bundle member create' });
+    const h = await E.withRetry(() => fh.createSyncAccessHandle());
+    try {
+      h.truncate(0);
+      // BYOB reader refilling ONE buffer (the buffer is transferred by each
+      // read and returned as value.buffer — same discipline as stageSource)
+      const reader = file.stream().getReader({ mode: 'byob' });
+      let at = 0;
+      let lastPost = 0;
+      const hasher = new E.Sha256();
+      let buf = new ArrayBuffer(BUNDLE_STAGE_CHUNK);
+      for (;;) {
+        const { value, done } = await reader.read(new Uint8Array(buf));
+        if (done) break;
+        const n = h.write(value, { at });
+        if (n !== value.length) throw new Error(`bundle member short write ${n}/${value.length}`);
+        hasher.update(value);
+        at += n;
+        doneBytes += n;
+        buf = value.buffer;
+        if (doneBytes - lastPost >= 32 * 2 ** 20) {
+          lastPost = doneBytes;
+          onProgress && onProgress(doneBytes, totalBytes, i, members.length);
+        }
+      }
+      if (at !== file.size) throw new Error(`bundle member ${name} copy ${at} ≠ ${file.size}`);
+      h.flush();
+      const sha256 = hasher.digestHex();
+      out.push({ path: name, size: file.size, sha256 });
+    } catch (e) {
+      try { h.close(); } catch { /* */ }
+      const nm = String((e && e.name) || '') + String(e);
+      if (/QuotaExceeded/i.test(nm)) {
+        throw E.stError(E.ERROR_CODES.QUOTA_EXCEEDED, `包成员写入配额不足：${E.errText(e)}`);
+      }
+      throw e;
+    }
+    h.close();
+    onProgress && onProgress(doneBytes, totalBytes, i + 1, members.length);
+  }
+  return out;
+}
+
+function closeBundle() {
+  for (const m of bundleMembers) {
+    try { m.handle.close(); } catch { /* */ }
+  }
+  bundleMembers = [];
+  bundleDir = null;
+}
+
+/// Open all members as sync handles (probe/convert/verify read them).
+async function openBundle(jobId) {
+  if (bundleMembers.length && bundleDir) return bundleMembers;
+  closeBundle();
+  const dir = await opfsBundleDir(jobId, false);
+  const mfh = await dir.getFileHandle('manifest.json');
+  const mfile = await mfh.getFile();
+  const mtext = new TextDecoder().decode(await mfile.slice(0, 1 << 20).arrayBuffer());
+  const manifest = JSON.parse(mtext);
+  const members = [];
+  for (const m of manifest.members) {
+    const fh = await E.withRetry(() => bundleFileHandle(dir, m.path, false), { name: 'bundle member' });
+    const h = await E.withRetry(() => fh.createSyncAccessHandle(), { name: 'bundle member handle' });
+    members.push({ name: m.path, handle: h, size: h.getSize(), wantSize: m.size, wantSha256: m.sha256 });
+  }
+  bundleDir = dir;
+  bundleMembers = members;
+  return members;
+}
+
+function installBundleHosts() {
+  globalThis.stHostBundleCount = () => bundleMembers.length;
+  globalThis.stHostBundleName = (i) => bundleMembers[i].name;
+  globalThis.stHostBundleSize = (i) => bundleMembers[i].size;
+  globalThis.stHostBundleReadInto = (i, offset, len, ptr) => {
+    try {
+      const m = bundleMembers[i];
+      if (!m) return `bundle member ${i} not open`;
+      E.assertSafeOffset(offset, 'bundle read');
+      if (offset + len > m.size) return `bundle read [${offset},+${len}) beyond ${m.size}`;
+      const n = m.handle.read(view(ptr, len), { at: offset });
+      if (n !== len) return `bundle short read ${n}/${len} @${offset}`;
+      return null;
+    } catch (e) {
+      return E.errText(e);
+    }
+  };
 }
 
 // -------------------------------------------------------------- stHost IO --
@@ -495,12 +638,15 @@ function closeScratchSet() {
 }
 
 /// Exact names for a conversion (geometry known from the probe).
-async function prepareScratch(levels, ifdCount, modality) {
+async function prepareScratch(levels, ifdCount, modality, adapter) {
   closeScratchSet();
   const dirHandle = await jobDir.getDirectoryHandle('scratch', { create: true });
   const names = [];
   for (let l = 0; l < levels; l++) {
-    names.push(modality === 'fluorescence' ? `kfbf-cells-l${l}` : `grid-l${l}`);
+    // MRXS composes from in-memory placements: no index spill, offcnt only
+    if (adapter !== E.MRXS_SOURCE_ADAPTER) {
+      names.push(modality === 'fluorescence' ? `kfbf-cells-l${l}` : `grid-l${l}`);
+    }
   }
   for (let i = 0; i < ifdCount; i++) {
     names.push(modality === 'fluorescence' ? `ome-offcnt-${i}` : `offcnt-l${i}`);
@@ -546,6 +692,7 @@ function closeAllHandles() {
   try { if (outHandle) outHandle.close(); } catch { /* */ }
   outHandle = null;
   closeSource();
+  closeBundle();
 }
 
 // ------------------------------------------------------------------ job --
@@ -571,9 +718,15 @@ async function runJob(msg) {
   };
   cancelFlag = false;
   pendingHostError = null;
-  await openSource(jobId);
-  if (opts.identity && srcSize !== opts.identity.size) {
-    throw new Error(`源副本长度 ${srcSize} ≠ 记录 ${opts.identity.size}`);
+  const isBundle = !!opts.bundle;
+  if (isBundle) {
+    await openBundle(jobId);
+    installBundleHosts();
+  } else {
+    await openSource(jobId);
+    if (opts.identity && srcSize !== opts.identity.size) {
+      throw new Error(`源副本长度 ${srcSize} ≠ 记录 ${opts.identity.size}`);
+    }
   }
 
   const jobsRoot = await (await navigator.storage.getDirectory())
@@ -585,7 +738,7 @@ async function runJob(msg) {
   // probe-derived geometry decides which scratch names to pre-open
   const levels = opts.scratchLevels | 0;
   const ifdCount = opts.scratchIfdCount | 0;
-  await prepareScratch(levels, ifdCount, opts.modality);
+  await prepareScratch(levels, ifdCount, opts.modality, opts.sourceAdapter);
 
   const outFh = await E.withRetry(() => dirHandle.getFileHandle(E.OUTPUT_NAME, { create: true }));
   outHandle = await E.withRetry(() => outFh.createSyncAccessHandle());
@@ -635,9 +788,15 @@ async function runJob(msg) {
   post({ type: 'state', state: 'running' });
   let conv;
   try {
-    conv = resume
-      ? convertResumeProfileEncoded(JSON.stringify(resume.st), outputProfile, encoding, strict, channelJson)
-      : convertProfileEncoded(outputProfile, encoding, strict, channelJson);
+    if (isBundle) {
+      conv = resume
+        ? convertResumeProfileEncodedBundle(JSON.stringify(resume.st), outputProfile, encoding, strict, channelJson)
+        : convertProfileEncodedBundle(outputProfile, encoding, strict, channelJson);
+    } else {
+      conv = resume
+        ? convertResumeProfileEncoded(JSON.stringify(resume.st), outputProfile, encoding, strict, channelJson)
+        : convertProfileEncoded(outputProfile, encoding, strict, channelJson);
+    }
   } catch (e) {
     conv = JSON.stringify(E.stError('io_recoverable', `wasm 异常: ${E.errText(e)}`));
   }
@@ -759,6 +918,86 @@ self.onmessage = async (ev) => {
       post({ type: 'done', ok: false, phase: 'setup', error: {
         code: E.ERROR_CODES.IO_RECOVERABLE, message: E.errText(e) } });
       running = null;
+    }
+    return;
+  }
+  if (m.type === 'stage-bundle') {
+    try {
+      const tS = Date.now();
+      const members = await stageBundle(m.jobId, m.members, (done, total, mi, mc) => {
+        post({ type: 'progress', progress: { unit: 'stage-bundle', done, total, member: mi, members: mc } });
+      }, m.faults || null);
+      // manifest: root digest over (path, size, sha256) lines
+      const rootDigest = E.bundleRootDigest(members);
+      const manifest = {
+        v: 1,
+        adapter: E.MRXS_SOURCE_ADAPTER,
+        adapterVersion: E.MRXS_ADAPTER_VERSION,
+        entry: m.entryName,
+        stem: m.stem,
+        members,
+        memberCount: members.length,
+        totalBytes: members.reduce((a, x) => a + x.size, 0),
+        rootDigest,
+        createdAt: E.nowIso(),
+      };
+      const dir = await opfsBundleDir(m.jobId, true);
+      const fh = await E.withRetry(() => dir.getFileHandle('manifest.json', { create: true }));
+      const w = await E.withRetry(() => fh.createWritable());
+      await w.write(new TextEncoder().encode(JSON.stringify(manifest)));
+      await w.close();
+      post({ type: 'phase', phase: 'stage-bundle', ms: Date.now() - tS, bytes: manifest.totalBytes });
+      post({ type: 'reply', id: m.id, ok: true, result: manifest });
+    } catch (e) {
+      closeBundle();
+      post({ type: 'reply', id: m.id, ok: false,
+        result: E.isStError(e) ? e : E.stError(E.ERROR_CODES.IO_RECOVERABLE, E.errText(e)) });
+    }
+    return;
+  }
+  if (m.type === 'probe-bundle') {
+    try {
+      const tP = Date.now();
+      await openBundle(m.jobId);
+      configure(1);
+      await prepareProbeScratch();
+      installBundleHosts();
+      const r = JSON.parse(probeBundle());
+      await releaseProbeScratch();
+      post({ type: 'phase', phase: 'probe-bundle', ms: Date.now() - tP });
+      post({ type: 'reply', id: m.id, ok: !r.error, result: r });
+    } catch (e) {
+      await releaseProbeScratch().catch(() => { /* */ });
+      post({ type: 'reply', id: m.id, ok: false, result: E.stError('io_recoverable', E.errText(e)) });
+    }
+    return;
+  }
+  if (m.type === 'verify-bundle') {
+    // resume identity: re-hash every member from OPFS (no original handle)
+    try {
+      await openBundle(m.jobId);
+      for (const mbr of bundleMembers) {
+        if (mbr.size !== mbr.wantSize) {
+          throw E.stError(E.ERROR_CODES.SOURCE_CHANGED,
+            `成员 ${mbr.name} 大小 ${mbr.size} ≠ 记录 ${mbr.wantSize}`);
+        }
+        const h = new E.Sha256();
+        const CH = 1 << 20;
+        const u8 = new Uint8Array(CH);
+        for (let at = 0; at < mbr.size; at += CH) {
+          const n = mbr.handle.read(u8, { at });
+          h.update(u8.subarray(0, n));
+        }
+        const got = h.digestHex();
+        if (got !== mbr.wantSha256) {
+          throw E.stError(E.ERROR_CODES.SOURCE_CHANGED,
+            `成员 ${mbr.name} 摘要与清单不符（源在复制后被修改）`);
+        }
+      }
+      post({ type: 'reply', id: m.id, ok: true, result: { verified: bundleMembers.length } });
+    } catch (e) {
+      post({ type: 'reply', id: m.id, ok: false,
+        result: E.isStError(e) ? e : E.stError('io_recoverable', E.errText(e)) });
     }
     return;
   }

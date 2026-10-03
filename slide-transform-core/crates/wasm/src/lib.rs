@@ -34,6 +34,7 @@
 //! are caught (`catch`) and mapped to typed `io_error`s — a quota failure
 //! mid-write must be a recoverable error, never a wasm abort.
 
+use slide_transform_core::bundle::BundleFs;
 use slide_transform_core::error::{CoreError, CoreResult};
 use slide_transform_core::io::{ByteSource, RandomAccessSink, ScratchFactory, ScratchSink};
 use slide_transform_core::job::{JobControl, Progress, ProgressCallback};
@@ -101,6 +102,17 @@ extern "C" {
     fn host_cancelled() -> bool;
     #[wasm_bindgen(js_name = "stHostCheckpoint")]
     fn host_checkpoint(json: &str);
+    // F3: multi-member bundle reads (MRXS). The host owns the member list
+    // (OPFS files staged by prepareBundle); the core resolves members by
+    // their flat name and never reads one whole.
+    #[wasm_bindgen(js_name = "stHostBundleCount", catch)]
+    fn host_bundle_count() -> Result<u32, JsValue>;
+    #[wasm_bindgen(js_name = "stHostBundleName", catch)]
+    fn host_bundle_name(i: u32) -> Result<String, JsValue>;
+    #[wasm_bindgen(js_name = "stHostBundleSize", catch)]
+    fn host_bundle_size(i: u32) -> Result<f64, JsValue>;
+    #[wasm_bindgen(js_name = "stHostBundleReadInto", catch)]
+    fn host_bundle_read_into(i: u32, offset: f64, len: u32, ptr: u32) -> Result<JsValue, JsValue>;
 }
 
 /// Host capability flags (call before convert): bit 0 = stHostReadInto.
@@ -179,6 +191,60 @@ impl ByteSource for HostSource {
             if let Some(h) = hash_state().lock().unwrap().as_mut() {
                 h.update(&out);
             }
+        }
+        Ok(out)
+    }
+}
+
+/// Multi-member bundle source over the host callbacks (F3 MRXS).
+struct HostBundle {
+    infos: Vec<slide_transform_core::bundle::MemberInfo>,
+}
+
+impl HostBundle {
+    fn open() -> CoreResult<HostBundle> {
+        let n = host_bundle_count()
+            .map_err(|e| CoreError::io(format!("宿主 bundle count 异常: {e:?}")))?;
+        if n == 0 || n as usize > slide_transform_core::bundle::MAX_MEMBERS {
+            return Err(CoreError::io(format!("宿主 bundle 成员数 {n} 异常")));
+        }
+        let mut infos = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let name = host_bundle_name(i)
+                .map_err(|e| CoreError::io(format!("宿主 bundle name 异常: {e:?}")))?;
+            let size = host_bundle_size(i)
+                .map_err(|e| CoreError::io(format!("宿主 bundle size 异常: {e:?}")))?;
+            if !slide_transform_core::bundle::valid_member_name(&name) {
+                return Err(CoreError::io(format!("宿主 bundle 成员名 {name:?} 非法")));
+            }
+            infos.push(slide_transform_core::bundle::MemberInfo { name, size: size as u64 });
+        }
+        Ok(HostBundle { infos })
+    }
+}
+
+impl slide_transform_core::bundle::BundleFs for HostBundle {
+    fn members(&self) -> &[slide_transform_core::bundle::MemberInfo] {
+        &self.infos
+    }
+    fn read_member_at(&self, member: usize, offset: u64, len: usize) -> CoreResult<Vec<u8>> {
+        let end = offset
+            .checked_add(len as u64)
+            .ok_or_else(|| CoreError::oob("bundle read length overflow"))?;
+        if member >= self.infos.len() || end > self.infos[member].size {
+            return Err(CoreError::oob("bundle 成员读取越界"));
+        }
+        let mut out = vec![0u8; len];
+        let mut done = 0usize;
+        while done < len {
+            let want = MAX_CHUNK.min(len - done) as u32;
+            let ptr = out.as_mut_ptr() as usize + done;
+            let r = host_bundle_read_into(member as u32, (offset + done as u64) as f64, want, ptr as u32)
+                .map_err(|e| CoreError::io(format!("宿主 bundle read 异常: {e:?}")))?;
+            if let Some(err) = js_err(r) {
+                return Err(err);
+            }
+            done += want as usize;
         }
         Ok(out)
     }
@@ -738,7 +804,11 @@ fn run_convert(
     strict_lossless: bool,
     channel_json: &str,
     resume: Option<(ResumePoint, Option<String>, Option<String>, Option<String>)>,
+    bundle: bool,
 ) -> String {
+    if bundle {
+        return run_convert_bundle(profile, encoding, strict_lossless, channel_json, resume);
+    }
     let src = HostSource::open();
     let magic = match detect(&src) {
         Ok(m) => m,
@@ -915,11 +985,276 @@ fn run_convert(
     }
 }
 
+/// Bundle (F3 MRXS) conversion path: the host owns the member files; the
+/// adapter resolves them by flat name. The output/encoding refusals mirror
+/// the single-file path; committed progress belongs to the `mirax-bundle`
+/// adapter and a state journalled under another adapter is refused.
+fn run_convert_bundle(
+    profile: Option<&str>,
+    encoding: Option<&str>,
+    strict_lossless: bool,
+    _channel_json: &str,
+    resume: Option<(ResumePoint, Option<String>, Option<String>, Option<String>)>,
+) -> String {
+    let fs = match HostBundle::open() {
+        Ok(f) => f,
+        Err(e) => return err_json(&e),
+    };
+    // the stem comes from the entry member name (probe_bundle does the same)
+    let stem = fs
+        .members()
+        .iter()
+        .find(|m| m.name.rsplit('/').next().map(|n| n.to_ascii_lowercase().ends_with(".mrxs")).unwrap_or(false))
+        .and_then(|m| {
+            let leaf = m.name.rsplit('/').next().unwrap_or(&m.name);
+            leaf.strip_suffix(".mrxs").or_else(|| {
+                leaf.char_indices().rfind(|(_, c)| *c == '.').map(|(i, _)| &leaf[..i])
+            })
+        })
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "slide".to_string());
+    let adapter = Some(slide_transform_core::mirax::SOURCE_FORMAT);
+    let out_profile = match resolve_profile(false, profile) {
+        Ok(p) => p,
+        Err(e) => return err_json(&e),
+    };
+    let enc_profile = match resolve_encoding(false, encoding) {
+        Ok(p) => p,
+        Err(e) => return err_json(&e),
+    };
+    if enc_profile == EncodingProfileW::CompactJpegV1 && strict_lossless {
+        return err_json(&CoreError::policy(
+            "compact-jpeg-v1 与 strict-lossless 互斥：逐 tile 重编码必然有损",
+        ));
+    }
+    if strict_lossless {
+        // composition + JPEG re-encode is inherently lossy for this format
+        return err_json(&CoreError::policy(
+            "strict-lossless 与 MRXS 组合输出互斥：拼接 tile 必然重编码（有损），无逐字节搬运路径",
+        ));
+    }
+    let resume = match resume {
+        None => None,
+        Some((rp, journalled, journalled_enc, journalled_adapter)) => {
+            let committed_under = match resolve_profile(false, journalled.as_deref()) {
+                Ok(p) => p,
+                Err(e) => return err_json(&e),
+            };
+            if committed_under != out_profile {
+                return err_json(&CoreError::validation(format!(
+                    "resume: 已提交进度属于输出 profile {}，拒绝以 {} 续跑",
+                    committed_under.id(),
+                    out_profile.id()
+                )));
+            }
+            let committed_enc = match resolve_encoding(false, journalled_enc.as_deref()) {
+                Ok(p) => p,
+                Err(e) => return err_json(&e),
+            };
+            if committed_enc != enc_profile {
+                return err_json(&CoreError::validation(format!(
+                    "resume: 已提交进度属于编码 profile {}，拒绝以 {} 续跑（不混合两种画质）",
+                    committed_enc.id(),
+                    enc_profile.id()
+                )));
+            }
+            let state_adapter = journalled_adapter;
+            let same = match (&state_adapter, adapter) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            };
+            if !same {
+                return err_json(&CoreError::validation(format!(
+                    "resume: 已提交进度属于输入适配器 {}，拒绝以 {} 续跑",
+                    state_adapter.as_deref().unwrap_or("kfb"),
+                    adapter.unwrap_or("kfb")
+                )));
+            }
+            Some(rp)
+        }
+    };
+    let identity = InputIdentity {
+        name: "browser-bundle".to_string(),
+        size: fs.members().iter().map(|m| m.size).sum(),
+        sha256: None,
+    };
+    let policy = if strict_lossless {
+        slide_transform_core::plan::PixelPolicy::StrictLossless
+    } else {
+        slide_transform_core::plan::PixelPolicy::AllowEdgeReencode
+    };
+    let mut plan = TransformPlan::brightfield(identity)
+        .with_policy(policy)
+        .with_encoding(enc_profile);
+    plan.profile = out_profile;
+
+    let mut sink = HostSink;
+    let mut scratch = HostScratchFactory;
+    let progress = HostProgress;
+    let checkpoint = HostCheckpoint { profile: out_profile, encoding: enc_profile, adapter };
+    let mut job = JobControl::new(&progress);
+    if CHECKPOINT_ENABLED.load(Ordering::Relaxed) {
+        job = job.with_checkpoint(&checkpoint);
+    }
+    let result = slide_transform_core::convert_mirax::convert_mirax_to_bigtiff(
+        &fs, &stem, &mut sink, &mut scratch, &plan, &job,
+    );
+    // the job borrowed the checkpoint handle; drop it before reusing fields
+    drop(job);
+    match result {
+        Ok(r) => {
+            let warnings: Vec<String> = r.warnings.iter().map(|w| format!("\"{w}\"")).collect();
+            let (lossy_flag, lossy_json) = match &r.lossy_reencode {
+                Some(l) => (
+                    "true",
+                    format!(
+                        "{{\"profile\":\"{}\",\"params_fingerprint\":\"{}\",\"quality\":{},\"sampling\":\"{}\",\"huffman\":\"{}\",\"tiles_reencoded\":{},\"tiles_padded\":{}}}",
+                        l.profile, l.params_fingerprint, l.quality, l.sampling, l.huffman,
+                        l.tiles_reencoded, l.tiles_padded
+                    ),
+                ),
+                None => ("false", "null".to_string()),
+            };
+            let composed_json = match &r.composed {
+                Some(c) => format!(
+                    "{{\"mode\":\"{}\",\"fingerprint\":\"{}\",\"quality\":{},\"sampling\":\"{}\",\"huffman\":\"{}\",\"tiles_composed\":{},\"tiles_filled\":{},\"tiles_deduped\":{}}}",
+                    c.mode, c.fingerprint, c.quality, c.sampling, c.huffman,
+                    c.tiles_composed, c.tiles_filled, c.tiles_deduped
+                ),
+                None => "null".to_string(),
+            };
+            format!(
+                "{{\"format\":\"{}\",\"source_format\":\"{}\",\"adapter_version\":\"{}\",\"output_profile\":\"{}\",\"encoding\":\"{}\",\"lossy_reencode\":{},\"lossy_reencode_params\":{},\"composed\":{},\"output_bytes\":{},\"width\":{},\"height\":{},\"ifd_count\":{},\"tiles_raw_copied\":{},\"tiles_reencoded\":{},\"tiles_filled\":{},\"resumed\":{},\"channels\":[],\"warnings\":[{}]}}",
+                r.format,
+                r.source_format.unwrap_or(""),
+                r.adapter_version.unwrap_or(""),
+                out_profile.id(),
+                enc_profile.id(),
+                lossy_flag,
+                lossy_json,
+                composed_json,
+                r.output_bytes,
+                r.width,
+                r.height,
+                r.validation.ifd_count,
+                r.count_raw_copied(),
+                r.count_reencoded(),
+                r.levels.iter().map(|l| l.tiles_filled).sum::<u64>(),
+                resume.is_some(),
+                warnings.join(",")
+            )
+        }
+        Err(e) => err_json(&e),
+    }
+}
+
+/// Probe a bundle input (F3 MRXS) through the bundle host callbacks.
+#[wasm_bindgen(js_name = "probeBundle")]
+pub fn probe_bundle() -> String {
+    let fs = match HostBundle::open() {
+        Ok(f) => f,
+        Err(e) => return err_json(&e),
+    };
+    // the entry name ends with .mrxs; resolve the stem from the members
+    let entry = fs
+        .members()
+        .iter()
+        .find(|m| m.name.rsplit('/').next().map(|n| n.to_ascii_lowercase().ends_with(".mrxs")).unwrap_or(false));
+    let Some(entry) = entry else {
+        return err_json(&CoreError::validation(
+            "包内没有 .mrxs 主入口（MRXS 需要完整包）",
+        ));
+    };
+    let stem = entry.name.trim_end_matches(".mrxs").to_string();
+    match slide_transform_core::mirax::probe_mirax(&fs, &stem) {
+        Ok(doc) => {
+            let levels: Vec<String> = doc
+                .levels
+                .iter()
+                .enumerate()
+                .map(|(li, lv)| {
+                    format!(
+                        "{{\"level\":{},\"width\":{},\"height\":{},\"images\":{},\"payload_bytes\":{}}}",
+                        li, lv.width, lv.height, lv.images.len(), lv.payload_bytes
+                    )
+                })
+                .collect();
+            let (mx, my) = doc.mpp.unwrap_or((f64::NAN, f64::NAN));
+            let est = slide_transform_core::mirax::estimate_mirax(&doc);
+            let doc_json = format!(
+                "{{\"format\":\"{}\",\"adapter\":\"{}\",\"adapter_version\":\"{}\",\"modality\":\"brightfield\",\"width\":{},\"height\":{},\"mpp_x\":{},\"mpp_y\":{},\"objective\":{},\"position_source\":\"{}\",\"levels\":[{}],\"codec\":\"mosaic-compose-reencode\",\"estimate\":{}}}",
+                slide_transform_core::mirax::SOURCE_FORMAT,
+                slide_transform_core::mirax::SOURCE_FORMAT,
+                slide_transform_core::mirax::ADAPTER_VERSION,
+                doc.levels[0].width,
+                doc.levels[0].height,
+                json_num(mx),
+                json_num(my),
+                doc.objective.map(json_num).unwrap_or_else(|| "null".into()),
+                match doc.position_source {
+                    slide_transform_core::mirax::PositionSource::VimslideBuffer => "VIMSLIDE_POSITION_BUFFER",
+                    slide_transform_core::mirax::PositionSource::StitchingIntensity => "StitchingIntensityLayer(deflate)",
+                    slide_transform_core::mirax::PositionSource::Synthesized => "synthesized-from-overlap",
+                },
+                levels.join(","),
+                estimate_json(&est)
+            );
+            format!(
+                "{{\"core_version\":\"{}\",\"size\":{},\"document\":{}}}",
+                slide_transform_core::CORE_VERSION,
+                fs.members().iter().map(|m| m.size).sum::<u64>(),
+                doc_json
+            )
+        }
+        Err(e) => err_json(&e),
+    }
+}
+
+/// Bundle conversion with explicit output AND encoding profile ids (F3).
+#[wasm_bindgen(js_name = "convertProfileEncodedBundle")]
+pub fn convert_profile_encoded_bundle(
+    profile: &str,
+    encoding: &str,
+    strict_lossless: bool,
+    channel_json: &str,
+) -> String {
+    run_convert(Some(profile), Some(encoding), strict_lossless, channel_json, None, true)
+}
+
+/// Bundle resume under explicit profiles (F3); refused when the checkpoint
+/// state was committed under another profile/encoding/adapter combination.
+#[wasm_bindgen(js_name = "convertResumeProfileEncodedBundle")]
+pub fn convert_resume_profile_encoded_bundle(
+    resume_json: &str,
+    profile: &str,
+    encoding: &str,
+    strict_lossless: bool,
+    channel_json: &str,
+) -> String {
+    match parse_resume_json(resume_json) {
+        Ok(rp) => run_convert(
+            Some(profile),
+            Some(encoding),
+            strict_lossless,
+            channel_json,
+            Some((
+                rp,
+                resume_profile_field(resume_json),
+                resume_encoding_field(resume_json),
+                resume_adapter_field(resume_json),
+            )),
+            true,
+        ),
+        Err(e) => err_json(&e),
+    }
+}
+
 /// Run a conversion writing to the host sink. `strict_lossless` toggles the
 /// pixel policy; `channel_json` may be empty (no companion).
 #[wasm_bindgen(js_name = "convert")]
 pub fn convert(strict_lossless: bool, channel_json: &str) -> String {
-    run_convert(None, None, strict_lossless, channel_json, None)
+    run_convert(None, None, strict_lossless, channel_json, None, false)
 }
 
 /// Run a conversion with an explicit output profile id (`bf-classic`,
@@ -927,7 +1262,7 @@ pub fn convert(strict_lossless: bool, channel_json: &str) -> String {
 /// preserve-source-v1 (pre-U3 behaviour kept bit-for-bit).
 #[wasm_bindgen(js_name = "convertProfile")]
 pub fn convert_profile(profile: &str, strict_lossless: bool, channel_json: &str) -> String {
-    run_convert(Some(profile), None, strict_lossless, channel_json, None)
+    run_convert(Some(profile), None, strict_lossless, channel_json, None, false)
 }
 
 /// Run a conversion with explicit output AND encoding profile ids (U3).
@@ -940,7 +1275,7 @@ pub fn convert_profile_encoded(
     strict_lossless: bool,
     channel_json: &str,
 ) -> String {
-    run_convert(Some(profile), Some(encoding), strict_lossless, channel_json, None)
+    run_convert(Some(profile), Some(encoding), strict_lossless, channel_json, None, false)
 }
 
 /// Resume under an explicit output profile; refused when the checkpoint
@@ -964,6 +1299,7 @@ pub fn convert_resume_profile(
                 resume_encoding_field(resume_json),
                 resume_adapter_field(resume_json),
             )),
+            false,
         ),
         Err(e) => err_json(&e),
     }
@@ -992,6 +1328,7 @@ pub fn convert_resume_profile_encoded(
                 resume_encoding_field(resume_json),
                 resume_adapter_field(resume_json),
             )),
+            false,
         ),
         Err(e) => err_json(&e),
     }
@@ -1013,6 +1350,7 @@ pub fn convert_resume(resume_json: &str, strict_lossless: bool, channel_json: &s
                 resume_encoding_field(resume_json),
                 resume_adapter_field(resume_json),
             )),
+            false,
         ),
         Err(e) => err_json(&e),
     }

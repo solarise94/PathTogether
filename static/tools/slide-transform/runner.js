@@ -428,6 +428,98 @@ export class SlideToolsRunner {
     }
   }
 
+  /// F3: prepare a bundle (folder selection). Mirrors probe(): pre-copy
+  /// sniff (typed missing-members error listing what is needed, BEFORE any
+  /// large copy) → disk gate → member-by-member copy into OPFS with
+  /// digests → manifest persisted → wasm probe on the staged members →
+  /// estimate-based disk gate → `prepared` record. `files` is the picker's
+  /// File[] with webkitRelativePath (or {name, relPath, file} rows).
+  async prepareBundle(files, opts = {}) {
+    if (!(await this._acquireHeavyLock())) {
+      throw E.stError(E.ERROR_CODES.JOB_LOCKED, '另一个标签页正在执行重转换任务（Web Lock）');
+    }
+    let jobId = null;
+    try {
+      this._state = null;
+      this._setState('selected');
+      const plan = await E.planMrxBundle(files);
+      const totalBytes = plan.members.reduce((a, m) => a + m.file.size, 0);
+      if (totalBytes === 0) {
+        throw E.stError(E.ERROR_CODES.UNSUPPORTED_INPUT, '包成员为空', { kind: 'mrxs-bundle' });
+      }
+      this._setState('probing');
+      jobId = opts.jobId || E.newJobId();
+      this.jobId = jobId;
+      this._diskGate(E.checkDiskBudget({ output_upper_bound_bytes: totalBytes },
+        await navigator.storage.estimate(), { sourceBytes: totalBytes }), opts, 'pre-stage');
+      await this._writeJobRecord(jobId, { state: 'staging', createdAt: E.nowIso(), updatedAt: E.nowIso() });
+      let manifest;
+      let probeResult;
+      let preparedEncoding;
+      try {
+        manifest = await this._request('stage-bundle', {
+          jobId,
+          members: plan.members,
+          stem: plan.stem,
+          entryName: plan.entryName,
+          faults: this.testMode ? (opts.faults || null) : null,
+        }, 60 * 60 * 1000);
+        probeResult = await this._request('probe-bundle', { jobId }, 60 * 60 * 1000);
+        if (probeResult.error) throw probeResult;
+        const doc = probeResult.document;
+        const estimate = doc.estimate || probeResult.estimate;
+        let encodingProfile;
+        try {
+          encodingProfile = checkedEncoding(
+            opts.encodingProfile || E.defaultEncodingProfile(), doc.modality);
+        } catch (e) {
+          await this._discardNow(jobId).catch(() => { /* */ });
+          throw e;
+        }
+        this._diskGate(E.checkDiskBudget(estimate,
+          await navigator.storage.estimate(), { encoding: encodingProfile }), opts, 'post-probe');
+        preparedEncoding = encodingProfile;
+        let outputProfile;
+        try {
+          outputProfile = checkedOutputProfile(
+            opts.outputProfile || E.defaultOutputProfile(doc.modality), doc.modality);
+        } catch (e) {
+          await this._discardNow(jobId).catch(() => { /* */ });
+          throw e;
+        }
+        await this._writeJobRecord(jobId, {
+          state: 'prepared',
+          bundle: true,
+          identity: {
+            name: plan.entryName,
+            size: manifest.totalBytes,
+            lastModified: null,
+            sha256: manifest.rootDigest,
+          },
+          bundleManifest: manifest,
+          core: this.coreVersion,
+          estimate,
+          modality: doc.modality,
+          sourceAdapter: doc.adapter || E.MRXS_SOURCE_ADAPTER,
+          adapterVersion: doc.adapter_version || E.MRXS_ADAPTER_VERSION,
+          outputProfile,
+          encodingProfile: preparedEncoding,
+          channelJson: null,
+          channelJsonHash: null,
+          createdAt: E.nowIso(),
+          updatedAt: E.nowIso(),
+        });
+      } catch (e) {
+        await this._discardNow(jobId).catch(() => { /* pending-cleanup recorded */ });
+        throw e;
+      }
+      this._setState('planned', { probe: probeResult });
+      return { jobId, probe: probeResult, manifest };
+    } finally {
+      this._releaseHeavyLock();
+    }
+  }
+
   /// Replace the companion saved on a job that has not started yet.
   async setPreparedChannelJson(jobId, channelJson) {
     const cj = checkedChannelJson(channelJson);
@@ -724,10 +816,16 @@ export class SlideToolsRunner {
       }
     }
     if (!resumeJobId && !reusable) {
-      if (!file) throw E.stError(E.ERROR_CODES.IO_RECOVERABLE, '缺少输入文件');
-      await this._prepare(file, { ...opts, jobId: jobId || undefined });
-      jobId = this.jobId;
-      record = await this._readJobRecord(jobId);
+      if (record && record.bundle) {
+        // F3: a prepared bundle never needs the File again — the staged
+        // members in OPFS are the source of truth
+        reusable = true;
+      } else {
+        if (!file) throw E.stError(E.ERROR_CODES.IO_RECOVERABLE, '缺少输入文件');
+        await this._prepare(file, { ...opts, jobId: jobId || undefined });
+        jobId = this.jobId;
+        record = await this._readJobRecord(jobId);
+      }
     }
     this.jobId = jobId;
     if (!resumeJobId) {
@@ -783,10 +881,16 @@ export class SlideToolsRunner {
       }
       // the staged copy must still be exactly the bytes hashed at staging
       const id = record.identity;
-      const v = await this._request('verify-source', { jobId, size: id.size }, 60 * 60 * 1000);
-      if (v.size !== id.size || v.sha256 !== id.sha256) {
-        throw E.stError(E.ERROR_CODES.SOURCE_CHANGED,
-          `源副本与记录不符（长度 ${v.size}/${id.size}${v.sha256 ? '，哈希不同' : ''}），拒绝续跑`);
+      if (record.bundle) {
+        // F3: re-verify the manifest from OPFS (no original folder handle)
+        const v = await this._request('verify-bundle', { jobId }, 60 * 60 * 1000);
+        if (v.error) throw v;
+      } else {
+        const v = await this._request('verify-source', { jobId, size: id.size }, 60 * 60 * 1000);
+        if (v.size !== id.size || v.sha256 !== id.sha256) {
+          throw E.stError(E.ERROR_CODES.SOURCE_CHANGED,
+            `源副本与记录不符（长度 ${v.size}/${id.size}${v.sha256 ? '，哈希不同' : ''}），拒绝续跑`);
+        }
       }
       // journal state
       const j = await this._readJournal(jobId);
@@ -830,7 +934,8 @@ export class SlideToolsRunner {
     }
 
     // geometry for scratch pre-opening comes from probing the staged copy
-    const probeResult = await this._request('probe', { jobId }, 60 * 60 * 1000);
+    const isBundle = !!(record && record.bundle);
+    const probeResult = await this._request(isBundle ? 'probe-bundle' : 'probe', { jobId }, 60 * 60 * 1000);
     if (probeResult.error) throw probeResult;
     const doc = probeResult.document;
     const modality = doc.modality; // brightfield | fluorescence
@@ -892,6 +997,7 @@ export class SlideToolsRunner {
         encoding: encodingProfile,
         scratchLevels: levels,
         scratchIfdCount: levels * channels,
+        bundle: isBundle,
       },
       faults: this.testMode ? (opts.faults || null) : null,
     };

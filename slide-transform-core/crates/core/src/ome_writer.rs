@@ -339,14 +339,32 @@ impl<'a> OmeBigTiffWriter<'a> {
         let offset = self.cursor;
         self.sink.write_at(offset, data)?;
         self.cursor += data.len() as u64;
+        self.record_tile(offset, data.len() as u32)?;
+        Ok((offset, data.len() as u32))
+    }
+
+    /// Raw payload without a tile record (F3 fill-tile dedupe).
+    pub fn write_payload(&mut self, data: &[u8]) -> CoreResult<(u64, u32)> {
+        let offset = self.cursor;
+        self.sink.write_at(offset, data)?;
+        self.cursor += data.len() as u64;
+        Ok((offset, data.len() as u32))
+    }
+
+    /// Record a tile referencing a shared payload offset.
+    pub fn write_tile_ref(&mut self, offset: u64, count: u32) -> CoreResult<()> {
+        self.record_tile(offset, count)
+    }
+
+    fn record_tile(&mut self, offset: u64, count: u32) -> CoreResult<()> {
         let lv = self.ifds.last_mut().expect("begin_ifd before write_tile");
         let mut rec = [0u8; OFFCNT_REC as usize];
         rec[..8].copy_from_slice(&offset.to_le_bytes());
-        rec[8..].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        rec[8..].copy_from_slice(&count.to_le_bytes());
         lv.offcnt.write_at(lv.offcnt_bytes, &rec)?;
         lv.offcnt_bytes += OFFCNT_REC;
         lv.tile_count += 1;
-        Ok((offset, data.len() as u32))
+        Ok(())
     }
 
     /// Declare the SubIFD children of the IFD begun most recently

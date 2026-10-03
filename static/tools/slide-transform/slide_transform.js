@@ -86,6 +86,33 @@ export function convertProfileEncoded(profile, encoding, strict_lossless, channe
 }
 
 /**
+ * Bundle conversion with explicit output AND encoding profile ids (F3).
+ * @param {string} profile
+ * @param {string} encoding
+ * @param {boolean} strict_lossless
+ * @param {string} channel_json
+ * @returns {string}
+ */
+export function convertProfileEncodedBundle(profile, encoding, strict_lossless, channel_json) {
+    let deferred4_0;
+    let deferred4_1;
+    try {
+        const ptr0 = passStringToWasm0(profile, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(encoding, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(channel_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ret = wasm.convertProfileEncodedBundle(ptr0, len0, ptr1, len1, strict_lossless, ptr2, len2);
+        deferred4_0 = ret[0];
+        deferred4_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
+    }
+}
+
+/**
  * Resume a conversion from a checkpoint state (the same JSON
  * `stHostCheckpoint` emits; journal-recorded by the runner).
  * @param {string} resume_json
@@ -171,6 +198,37 @@ export function convertResumeProfileEncoded(resume_json, profile, encoding, stri
 }
 
 /**
+ * Bundle resume under explicit profiles (F3); refused when the checkpoint
+ * state was committed under another profile/encoding/adapter combination.
+ * @param {string} resume_json
+ * @param {string} profile
+ * @param {string} encoding
+ * @param {boolean} strict_lossless
+ * @param {string} channel_json
+ * @returns {string}
+ */
+export function convertResumeProfileEncodedBundle(resume_json, profile, encoding, strict_lossless, channel_json) {
+    let deferred5_0;
+    let deferred5_1;
+    try {
+        const ptr0 = passStringToWasm0(resume_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(profile, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(encoding, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(channel_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len3 = WASM_VECTOR_LEN;
+        const ret = wasm.convertResumeProfileEncodedBundle(ptr0, len0, ptr1, len1, ptr2, len2, strict_lossless, ptr3, len3);
+        deferred5_0 = ret[0];
+        deferred5_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred5_0, deferred5_1, 1);
+    }
+}
+
+/**
  * @returns {string}
  */
 export function coreVersion() {
@@ -238,6 +296,23 @@ export function probe() {
 }
 
 /**
+ * Probe a bundle input (F3 MRXS) through the bundle host callbacks.
+ * @returns {string}
+ */
+export function probeBundle() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        const ret = wasm.probeBundle();
+        deferred1_0 = ret[0];
+        deferred1_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
  * One dedicated pass: sha256 of the whole source through bounded host
  * reads (resume identity verification; hashing flag stays off).
  * @returns {string}
@@ -296,6 +371,25 @@ function __wbg_get_imports() {
             getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
             getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
         },
+        __wbg_stHostBundleCount_524c6cefb42f96b8: function() { return handleError(function () {
+            const ret = stHostBundleCount();
+            return ret;
+        }, arguments); },
+        __wbg_stHostBundleName_ecf61dd439495581: function() { return handleError(function (arg0, arg1) {
+            const ret = stHostBundleName(arg1 >>> 0);
+            const ptr1 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len1 = WASM_VECTOR_LEN;
+            getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
+            getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
+        }, arguments); },
+        __wbg_stHostBundleReadInto_372254272ec2b6c4: function() { return handleError(function (arg0, arg1, arg2, arg3) {
+            const ret = stHostBundleReadInto(arg0 >>> 0, arg1, arg2 >>> 0, arg3 >>> 0);
+            return ret;
+        }, arguments); },
+        __wbg_stHostBundleSize_f720cc3bee5b40a3: function() { return handleError(function (arg0) {
+            const ret = stHostBundleSize(arg0 >>> 0);
+            return ret;
+        }, arguments); },
         __wbg_stHostCheckpoint_43fe58aa3bff7e3d: function(arg0, arg1) {
             stHostCheckpoint(getStringFromWasm0(arg0, arg1));
         },

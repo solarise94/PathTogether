@@ -27,6 +27,11 @@ export function convertProfile(profile: string, strict_lossless: boolean, channe
 export function convertProfileEncoded(profile: string, encoding: string, strict_lossless: boolean, channel_json: string): string;
 
 /**
+ * Bundle conversion with explicit output AND encoding profile ids (F3).
+ */
+export function convertProfileEncodedBundle(profile: string, encoding: string, strict_lossless: boolean, channel_json: string): string;
+
+/**
  * Resume a conversion from a checkpoint state (the same JSON
  * `stHostCheckpoint` emits; journal-recorded by the runner).
  */
@@ -44,6 +49,12 @@ export function convertResumeProfile(resume_json: string, profile: string, stric
  * a compact request against a legacy (preserve, no field) state.
  */
 export function convertResumeProfileEncoded(resume_json: string, profile: string, encoding: string, strict_lossless: boolean, channel_json: string): string;
+
+/**
+ * Bundle resume under explicit profiles (F3); refused when the checkpoint
+ * state was committed under another profile/encoding/adapter combination.
+ */
+export function convertResumeProfileEncodedBundle(resume_json: string, profile: string, encoding: string, strict_lossless: boolean, channel_json: string): string;
 
 export function coreVersion(): string;
 
@@ -70,6 +81,11 @@ export function finalizeValidate(expect_ifd: number): string;
 export function probe(): string;
 
 /**
+ * Probe a bundle input (F3 MRXS) through the bundle host callbacks.
+ */
+export function probeBundle(): string;
+
+/**
  * One dedicated pass: sha256 of the whole source through bounded host
  * reads (resume identity verification; hashing flag stays off).
  */
@@ -85,14 +101,17 @@ export interface InitOutput {
     readonly convert: (a: number, b: number, c: number) => [number, number];
     readonly convertProfile: (a: number, b: number, c: number, d: number, e: number) => [number, number];
     readonly convertProfileEncoded: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number];
+    readonly convertProfileEncodedBundle: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number];
     readonly convertResume: (a: number, b: number, c: number, d: number, e: number) => [number, number];
     readonly convertResumeProfile: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number];
     readonly convertResumeProfileEncoded: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => [number, number];
+    readonly convertResumeProfileEncodedBundle: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => [number, number];
     readonly coreVersion: () => [number, number];
     readonly enableCheckpoint: () => void;
     readonly enableSourceHash: () => void;
     readonly finalizeValidate: (a: number) => [number, number];
     readonly probe: () => [number, number];
+    readonly probeBundle: () => [number, number];
     readonly sha256Source: () => [number, number];
     readonly sourceSha256: () => [number, number];
     readonly __wbindgen_malloc: (a: number, b: number) => number;

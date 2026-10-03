@@ -834,6 +834,7 @@ fn convert_inner(
             tiles_reencoded: compact_tiles_reencoded,
             tiles_padded: compact_tiles_padded,
         }),
+        composed: None,
         associated: doc
             .associated
             .iter()

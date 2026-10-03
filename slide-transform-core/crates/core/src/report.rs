@@ -23,6 +23,12 @@ pub struct LevelStats {
     pub tiles_reencoded: u64,
     /// Fluorescence only: sparse cells filled with black.
     pub cells_filled_black: u64,
+    /// MRXS only (F3): output tiles with NO source coverage, filled with
+    /// the level's `IMAGE_FILL_COLOR_BGR` (never silently white).
+    pub tiles_filled: u64,
+    /// MRXS only (F3): tiles whose payload is the deduplicated shared fill
+    /// tile (their TileOffsets entry repeats the single fill payload).
+    pub tiles_deduped: u64,
     /// Fluorescence only: channel index the stats belong to (None for BF).
     pub channel: Option<usize>,
 }
@@ -58,6 +64,28 @@ pub struct LossyReencode {
     /// Tiles whose source geometry was smaller than the canvas (white
     /// padding) — the "padded" subset of `tiles_reencoded`.
     pub tiles_padded: u64,
+}
+
+/// Summary of a mosaic-composed conversion (F3): the documented compose
+/// setting every output tile was re-encoded with, plus the sparse-fill
+/// count. Reported independently of `lossy_reencode` (compose is inherent
+/// to the format; `lossy_reencode` describes the extra compact step).
+#[derive(Debug, Clone)]
+pub struct ComposedSummary {
+    /// e.g. "mosaic-compose-reencode"
+    pub mode: String,
+    /// Versioned fingerprint of the compose encode parameters.
+    pub fingerprint: String,
+    pub quality: u8,
+    /// Human-readable subsampling, e.g. "4:4:4".
+    pub sampling: String,
+    pub huffman: String,
+    /// Output tiles composed (== tiles_total of all levels).
+    pub tiles_composed: u64,
+    /// Output tiles with no source coverage (fill colour).
+    pub tiles_filled: u64,
+    /// Tiles whose record references the shared fill payload (F3 dedupe).
+    pub tiles_deduped: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -105,8 +133,13 @@ pub struct TransformResult {
     pub validation: ValidationReport,
     /// Raw IFD→(level, channel) mapping for structure comparison in tests.
     pub ifd_chain: Vec<(u32, Option<usize>)>,
-    /// Compact-encoding summary; `None` = preserve-source semantics.
-    pub lossy_reencode: Option<LossyReencode>,
+/// Compact-encoding summary; `None` = preserve-source semantics.
+pub lossy_reencode: Option<LossyReencode>,
+/// Mosaic-composition summary (F3 MRXS): present whenever the output was
+/// composed from source images and re-encoded — i.e. for every MRXS run,
+/// under both encoding profiles (there is no byte-passthrough for this
+/// format). The UI can show what 「保留画质」 actually means here.
+pub composed: Option<ComposedSummary>,
     /// Associated images (name, payload bytes are NOT kept; offsets/lengths
     /// refer to the source; hosts copy them to sidecars).
     pub associated: Vec<AssociatedSummary>,

@@ -36,6 +36,15 @@ pub struct JpegProbe {
     pub height: u32,
     /// 3-component sampling (h1,v1,h2,v2,h3,v3) or `None` for grayscale.
     pub sampling: Option<(u8, u8, u8, u8, u8, u8)>,
+    /// Component ids of a 3-component frame (libjpeg colorspace heuristics).
+    pub comp_ids: Option<(u8, u8, u8)>,
+    /// A JFIF APP0 marker was seen (3 components + JFIF ⇒ YCbCr).
+    pub jfif: bool,
+    /// Adobe APP14 transform flag (0 = RGB, 1 = YCbCr, 2 = YCCK; 4-comp only
+    /// uses 2 — kept for reporting).
+    pub adobe_transform: Option<u8>,
+    /// Marker type of the first SOF (0xC0 baseline / 0xC1 extended).
+    pub sof_marker: u8,
 }
 
 // --------------------------------------------------------------------------- //
@@ -251,6 +260,18 @@ struct Plane {
 /// Decode a complete baseline JPEG. `max_pixels` bounds the output (tiles in
 /// this codebase are ≤ 256×256; probe payloads before decoding).
 pub fn decode(data: &[u8], max_pixels: u64) -> CoreResult<DecodedImage> {
+    decode_ex(data, max_pixels, false)
+}
+
+/// [`decode`] with a colorspace override: `force_rgb` skips the YCbCr→RGB
+/// conversion for 3-component streams whose true colorspace is RGB. Used by
+/// the Aperio SVS adapter, whose tiles are tagged Photometric RGB in the
+/// TIFF while carrying no JFIF/Adobe marker (libjpeg's default would wrongly
+/// assume YCbCr; tifffile applies the same "photometric wins" rule —
+/// `jpeg_decode_colorspace`: "RGB -> RGB, if not jfif: colorspace = 2,
+/// found in Aperio SVS"). The default path (`force_rgb=false`) is unchanged,
+/// so KFB decode/encode parity is untouched.
+pub fn decode_ex(data: &[u8], max_pixels: u64, force_rgb: bool) -> CoreResult<DecodedImage> {
     if data.len() < 4 || data[0..2] != [0xFF, 0xD8] {
         return Err(CoreError::jpeg("payload 不是 JPEG（缺 SOI）"));
     }
@@ -463,7 +484,7 @@ pub fn decode(data: &[u8], max_pixels: u64) -> CoreResult<DecodedImage> {
         let y = &full[0];
         let cb = &full[1];
         let cr = &full[2];
-        let ycc = adobe_transform.map_or(true, |t| t != 0);
+        let ycc = adobe_transform.map_or(true, |t| t != 0) && !force_rgb;
         let mut out = vec![0u8; (w as usize) * (h as usize) * 3];
         if ycc {
             let (cr_r, cb_b, cb_g, cr_g) = ycc_tables();
@@ -1023,6 +1044,10 @@ pub fn scan_jpeg(data: &[u8]) -> CoreResult<JpegProbe> {
     let mut width = 0u32;
     let mut height = 0u32;
     let mut sampling = None;
+    let mut comp_ids = None;
+    let mut jfif = false;
+    let mut adobe_transform = None;
+    let mut sof_marker = 0u8;
     let mut i = 2usize;
     while i + 4 <= n {
         if data[i] != 0xFF {
@@ -1049,11 +1074,18 @@ pub fn scan_jpeg(data: &[u8]) -> CoreResult<JpegProbe> {
         if seg_len < 2 || i + seg_len > n {
             return Err(CoreError::jpeg("JPEG 段长度非法"));
         }
+        let seg = &data[i + 2..i + seg_len];
+        if marker == 0xE0 && seg.len() >= 5 && &seg[..5] == b"JFIF\0" {
+            jfif = true;
+        }
+        if marker == 0xEE && seg.len() >= 12 && seg[0..5] == *b"Adobe" {
+            adobe_transform = Some(seg[11]);
+        }
         if is_sof(marker) {
-            let seg = &data[i + 2..i + seg_len];
             if seg.len() < 6 {
                 return Err(CoreError::jpeg("SOF 段残缺"));
             }
+            sof_marker = marker;
             height = ((seg[1] as u32) << 8) | seg[2] as u32;
             width = ((seg[3] as u32) << 8) | seg[4] as u32;
             let ncomp = seg[5];
@@ -1064,6 +1096,7 @@ pub fn scan_jpeg(data: &[u8]) -> CoreResult<JpegProbe> {
                 let f = |c: usize| (seg[6 + 3 * c + 1] >> 4, seg[6 + 3 * c + 1] & 0x0F);
                 let (a, b, c) = (f(0), f(1), f(2));
                 sampling = Some((a.0, a.1, b.0, b.1, c.0, c.1));
+                comp_ids = Some((seg[6], seg[9], seg[12]));
             }
             break; // only the first SOF
         }
@@ -1072,7 +1105,7 @@ pub fn scan_jpeg(data: &[u8]) -> CoreResult<JpegProbe> {
     if width == 0 || height == 0 {
         return Err(CoreError::jpeg("JPEG 缺少 SOF"));
     }
-    Ok(JpegProbe { width, height, sampling })
+    Ok(JpegProbe { width, height, sampling, comp_ids, jfif, adobe_transform, sof_marker })
 }
 
 /// Extract all DQT tables in **natural (row-major) order** (table id order) —

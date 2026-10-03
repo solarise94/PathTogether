@@ -7,8 +7,41 @@ pub mod decoder;
 pub mod encoder;
 pub mod tables;
 
-pub use decoder::{decode, scan_jpeg, ColorKind, DecodedImage, JpegProbe};
+pub use decoder::{decode, decode_ex, scan_jpeg, ColorKind, DecodedImage, JpegProbe};
 pub use encoder::{encode_gray, encode_rgb, EncoderCfg, Sampling};
+
+/// True colorspace decision for a 3-component JPEG inside a TIFF, mirroring
+/// tifffile's `jpeg_decode_colorspace` (the rule that decodes Aperio SVS
+/// correctly, verified pixel-exact against OpenSlide):
+///
+/// - JFIF APP0 present ⇒ YCbCr (JFIF 3-component is YCbCr by definition);
+/// - Adobe APP14: transform 0 ⇒ RGB, anything else ⇒ YCbCr;
+/// - neither marker ⇒ the stream alone is ambiguous (libjpeg would default
+///   to YCbCr); the TIFF PhotometricInterpretation decides: 2 (RGB) ⇒ RGB —
+///   the Aperio `JPEG/RGB` convention with component ids 0,1,2 — while 6
+///   (YCbCr) ⇒ YCbCr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TiffJpegColor {
+    Rgb,
+    YCbCr,
+}
+
+pub fn tiff_jpeg_color(
+    probe: &JpegProbe,
+    tiff_photometric: u64,
+) -> TiffJpegColor {
+    if probe.jfif {
+        return TiffJpegColor::YCbCr;
+    }
+    if let Some(t) = probe.adobe_transform {
+        return if t == 0 { TiffJpegColor::Rgb } else { TiffJpegColor::YCbCr };
+    }
+    if tiff_photometric == 2 {
+        TiffJpegColor::Rgb
+    } else {
+        TiffJpegColor::YCbCr
+    }
+}
 
 /// Pillow `im.quantization` equivalent: all DQT tables in table-id order,
 /// zigzag order, validated to 1..=255 (like the oracle's `_extract_qtables`).

@@ -18,6 +18,8 @@ pub mod companion;
 pub mod convert_bf;
 #[cfg(feature = "codecs")]
 pub mod convert_fl;
+#[cfg(feature = "codecs")]
+pub mod convert_svs;
 pub mod error;
 pub mod estimate;
 pub mod io;
@@ -33,12 +35,18 @@ pub mod report;
 pub mod resume;
 pub mod validate;
 pub mod bigtiff;
+pub mod tiff_read;
+#[cfg(feature = "codecs")]
+pub mod svs;
 
 #[cfg(feature = "codecs")]
 pub mod jpeg;
 
 #[cfg(feature = "codecs")]
 pub mod synth_gen;
+
+#[cfg(all(feature = "codecs", feature = "fixtures"))]
+pub mod svs_fixture;
 
 pub use error::{CoreError, CoreResult};
 pub use plan::{OutputProfile, PixelPolicy, TransformPlan};

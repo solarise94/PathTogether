@@ -60,16 +60,41 @@ struct IfdSpec {
     width: u32,
     height: u32,
     reduced: bool,
-    level_mpp: f64,
-    level_mpp_y: f64,
-    /// YCbCrSubSampling (h, v); only emitted for [`SampleLayout::YCbCr`].
+    level_mpp: Option<f64>,
+    level_mpp_y: Option<f64>,
+    /// YCbCrSubSampling (h, v); only emitted for YCbCr payloads.
     ycbcr_sub: (u16, u16),
     description: Option<Vec<u8>>,
     /// SubIFD target IFD indices (into the ifds vector).
     sub_idx: Vec<usize>,
+    /// F1 generalisation (SVS): source tile shape, photometric and the
+    /// JPEGTables/ICC blobs. Defaults keep the historical KFB layout.
+    tile: (u32, u32),
+    photometric: u16,
+    jpeg_tables: Option<Vec<u8>>,
+    icc: Option<Vec<u8>>,
     offcnt: Box<dyn ScratchSink>,
     offcnt_bytes: u64,
     tile_count: u64,
+}
+
+/// Extra per-IFD tags the SVS adapter needs on the RGB profile.
+#[derive(Debug, Clone, Default)]
+pub struct RgbIfdExtras {
+    /// TileWidth/TileLength (322/323); (0,0) = the historical 256×256.
+    pub tile: (u32, u32),
+    /// PhotometricInterpretation (262): 0 = the historical 6 (YCbCr).
+    pub photometric: u16,
+    pub jpeg_tables: Option<Vec<u8>>,
+    pub icc: Option<Vec<u8>>,
+}
+
+impl RgbIfdExtras {
+    fn resolve(&self) -> (u32, u32, u16) {
+        let tile = if self.tile == (0, 0) { (256, 256) } else { self.tile };
+        let photo = if self.photometric == 0 { 6 } else { self.photometric };
+        (tile.0, tile.1, photo)
+    }
 }
 
 /// Streaming OME-BigTIFF (SubIFD) writer.
@@ -144,7 +169,8 @@ impl<'a> OmeBigTiffWriter<'a> {
     }
 
     /// Begin a brightfield RGB IFD (fresh or, with `committed_tiles`,
-    /// adopting a partially committed offcnt stream).
+    /// adopting a partially committed offcnt stream). Historical signature
+    /// (YCbCr 256-tile levels, MPP always known) — kept for the KFB path.
     #[allow(clippy::too_many_arguments)]
     pub fn begin_rgb_ifd(
         &mut self,
@@ -157,8 +183,48 @@ impl<'a> OmeBigTiffWriter<'a> {
         description: Option<Vec<u8>>,
         committed_tiles: Option<u64>,
     ) -> CoreResult<()> {
+        self.begin_rgb_ifd_ex(
+            scratch,
+            width,
+            height,
+            reduced,
+            Some(mpp),
+            ycbcr_sub,
+            description,
+            committed_tiles,
+            &RgbIfdExtras::default(),
+        )
+    }
+
+    /// F1 generalisation of [`Self::begin_rgb_ifd`] for the SVS adapter:
+    /// arbitrary tile shape / photometric, optional calibration (unknown MPP
+    /// omits 282/283/296), optional JPEGTables (347) and ICC (34675).
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_rgb_ifd_ex(
+        &mut self,
+        scratch: &mut dyn ScratchFactory,
+        width: u32,
+        height: u32,
+        reduced: bool,
+        mpp: Option<(f64, f64)>,
+        ycbcr_sub: (u16, u16),
+        description: Option<Vec<u8>>,
+        committed_tiles: Option<u64>,
+        extras: &RgbIfdExtras,
+    ) -> CoreResult<()> {
         if self.layout != SampleLayout::YCbCr {
             return Err(CoreError::validation("begin_rgb_ifd 仅用于 RGB 写出器"));
+        }
+        let (tile_w, tile_h, photometric) = extras.resolve();
+        if tile_w == 0 || tile_h == 0 || tile_w > 65535 || tile_h > 65535 {
+            return Err(CoreError::validation(format!(
+                "tile 尺寸 {tile_w}×{tile_h} 超出 TIFF SHORT 范围"
+            )));
+        }
+        if photometric != 2 && photometric != 6 {
+            return Err(CoreError::validation(format!(
+                "photometric {photometric} 不在支持集（2 RGB / 6 YCbCr）"
+            )));
         }
         let name = format!("{}{}", self.scratch_prefix, self.ifds.len());
         let (sink, bytes, tiles) = match committed_tiles {
@@ -174,11 +240,15 @@ impl<'a> OmeBigTiffWriter<'a> {
             width,
             height,
             reduced,
-            level_mpp: mpp.0,
-            level_mpp_y: mpp.1,
+            level_mpp: mpp.map(|m| m.0),
+            level_mpp_y: mpp.map(|m| m.1),
             ycbcr_sub,
             description,
             sub_idx: Vec::new(),
+            tile: (tile_w, tile_h),
+            photometric,
+            jpeg_tables: extras.jpeg_tables.clone(),
+            icc: extras.icc.clone(),
             offcnt: sink,
             offcnt_bytes: bytes,
             tile_count: tiles,
@@ -207,11 +277,15 @@ impl<'a> OmeBigTiffWriter<'a> {
             width,
             height,
             reduced,
-            level_mpp,
-            level_mpp_y: level_mpp,
+            level_mpp: Some(level_mpp),
+            level_mpp_y: Some(level_mpp),
             ycbcr_sub: (1, 1),
             description,
             sub_idx: Vec::new(),
+            tile: (256, 256),
+            photometric: 1,
+            jpeg_tables: None,
+            icc: None,
             offcnt: sink,
             offcnt_bytes: bytes,
             tile_count: committed_tiles,
@@ -240,11 +314,15 @@ impl<'a> OmeBigTiffWriter<'a> {
             width,
             height,
             reduced,
-            level_mpp,
-            level_mpp_y: level_mpp,
+            level_mpp: Some(level_mpp),
+            level_mpp_y: Some(level_mpp),
             ycbcr_sub: (1, 1),
             description,
             sub_idx: Vec::new(),
+            tile: (256, 256),
+            photometric: 1,
+            jpeg_tables: None,
+            icc: None,
             offcnt: sink,
             offcnt_bytes: 0,
             tile_count: 0,
@@ -383,8 +461,16 @@ impl<'a> OmeBigTiffWriter<'a> {
             }
             emit(&mut head, &mut segs, &mut ext_cursor, 259, TIFF_SHORT, 1,
                 Some(&7u16.to_le_bytes()), None);
-            emit(&mut head, &mut segs, &mut ext_cursor, 262, TIFF_SHORT, 1,
-                Some(&(if rgb { 6u16 } else { 1u16 }).to_le_bytes()), None);
+            if rgb {
+                // YCbCr payloads are tagged 6; SVS RGB JPEG payloads are
+                // tagged 2 (what the bytes really are — never relabelled)
+                let p = if ifd.photometric == 2 { 2u16 } else { 6u16 };
+                emit(&mut head, &mut segs, &mut ext_cursor, 262, TIFF_SHORT, 1,
+                    Some(&p.to_le_bytes()), None);
+            } else {
+                emit(&mut head, &mut segs, &mut ext_cursor, 262, TIFF_SHORT, 1,
+                    Some(&1u16.to_le_bytes()), None);
+            }
             if let Some(d) = ifd.description.as_ref() {
                 if d.len() <= 8 {
                     let mut d8 = d.clone();
@@ -399,27 +485,34 @@ impl<'a> OmeBigTiffWriter<'a> {
             emit(&mut head, &mut segs, &mut ext_cursor, 277, TIFF_SHORT, 1,
                 Some(&(if rgb { 3u16 } else { 1u16 }).to_le_bytes()), None);
             // RGB resolution tags are byte-equal to the classic brightfield
-            // profile's (same rounding), so both outputs carry one calibration.
-            let (res_x, res_y) = if rgb {
-                (
-                    crate::bigtiff::px_per_cm_rational(ifd.level_mpp)?,
-                    crate::bigtiff::px_per_cm_rational(ifd.level_mpp_y)?,
-                )
-            } else {
-                (px_per_cm_rational(ifd.level_mpp)?, px_per_cm_rational(ifd.level_mpp)?)
-            };
-            emit(&mut head, &mut segs, &mut ext_cursor, 282, TIFF_RATIONAL, 1,
-                Some(&res_x), None);
-            emit(&mut head, &mut segs, &mut ext_cursor, 283, TIFF_RATIONAL, 1,
-                Some(&res_y), None);
+            // profile's (same rounding), so both outputs carry one
+            // calibration. A level without a trustworthy MPP omits 282/283/
+            // 296 entirely (F1: unknown stays unknown).
+            if let (Some(mx), Some(my)) = (ifd.level_mpp, ifd.level_mpp_y) {
+                let (res_x, res_y) = if rgb {
+                    (
+                        crate::bigtiff::px_per_cm_rational(mx)?,
+                        crate::bigtiff::px_per_cm_rational(my)?,
+                    )
+                } else {
+                    (px_per_cm_rational(mx)?, px_per_cm_rational(my)?)
+                };
+                emit(&mut head, &mut segs, &mut ext_cursor, 282, TIFF_RATIONAL, 1,
+                    Some(&res_x), None);
+                emit(&mut head, &mut segs, &mut ext_cursor, 283, TIFF_RATIONAL, 1,
+                    Some(&res_y), None);
+            }
             emit(&mut head, &mut segs, &mut ext_cursor, 284, TIFF_SHORT, 1,
                 Some(&1u16.to_le_bytes()), None);
-            emit(&mut head, &mut segs, &mut ext_cursor, 296, TIFF_SHORT, 1,
-                Some(&3u16.to_le_bytes()), None);
+            if ifd.level_mpp.is_some() && ifd.level_mpp_y.is_some() {
+                emit(&mut head, &mut segs, &mut ext_cursor, 296, TIFF_SHORT, 1,
+                    Some(&3u16.to_le_bytes()), None);
+            }
+            let (tw, th) = if ifd.tile == (0, 0) { (256u32, 256u32) } else { ifd.tile };
             emit(&mut head, &mut segs, &mut ext_cursor, 322, TIFF_SHORT, 1,
-                Some(&256u16.to_le_bytes()), None);
+                Some(&(tw as u16).to_le_bytes()), None);
             emit(&mut head, &mut segs, &mut ext_cursor, 323, TIFF_SHORT, 1,
-                Some(&256u16.to_le_bytes()), None);
+                Some(&(th as u16).to_le_bytes()), None);
             if n * 8 <= 8 {
                 let mut inline = read_offcnt(ifd, n as u32, true)?;
                 inline.resize(8, 0);
@@ -450,7 +543,29 @@ impl<'a> OmeBigTiffWriter<'a> {
                         ifd.sub_idx.len() as u64, None, Some(Seg::Bytes(sub)));
                 }
             }
-            if rgb {
+            if let Some(icc) = ifd.icc.as_ref() {
+                if icc.len() <= 8 {
+                    let mut b8 = icc.clone();
+                    b8.resize(8, 0);
+                    emit(&mut head, &mut segs, &mut ext_cursor, 34675, 7,
+                        icc.len() as u64, Some(&b8), None);
+                } else {
+                    emit(&mut head, &mut segs, &mut ext_cursor, 34675, 7,
+                        icc.len() as u64, None, Some(Seg::Bytes(icc.clone())));
+                }
+            }
+            if let Some(t) = ifd.jpeg_tables.as_ref() {
+                if t.len() <= 8 {
+                    let mut t8 = t.clone();
+                    t8.resize(8, 0);
+                    emit(&mut head, &mut segs, &mut ext_cursor, 347, 7,
+                        t.len() as u64, Some(&t8), None);
+                } else {
+                    emit(&mut head, &mut segs, &mut ext_cursor, 347, 7,
+                        t.len() as u64, None, Some(Seg::Bytes(t.clone())));
+                }
+            }
+            if rgb && ifd.photometric != 2 {
                 let (h, v) = ifd.ycbcr_sub;
                 let mut b = [0u8; 4];
                 b[..2].copy_from_slice(&h.to_le_bytes());
@@ -487,9 +602,16 @@ impl<'a> OmeBigTiffWriter<'a> {
 }
 
 fn entry_count(ifd: &IfdSpec, layout: SampleLayout) -> usize {
-    15 + usize::from(ifd.description.is_some())
-        + usize::from(!ifd.sub_idx.is_empty())
-        + usize::from(layout == SampleLayout::YCbCr)
+    let mut n = 15 + usize::from(ifd.description.is_some())
+        + usize::from(!ifd.sub_idx.is_empty());
+    if layout == SampleLayout::YCbCr && ifd.photometric != 2 {
+        n += 1; // 530 YCbCrSubSampling
+    }
+    if ifd.level_mpp.is_none() || ifd.level_mpp_y.is_none() {
+        n -= 3; // unknown MPP: 282/283/296 omitted
+    }
+    n += usize::from(ifd.jpeg_tables.is_some()) + usize::from(ifd.icc.is_some());
+    n
 }
 
 fn ext_bytes(ifd: &IfdSpec) -> u64 {
@@ -510,6 +632,14 @@ fn ext_bytes(ifd: &IfdSpec) -> u64 {
     let l = (ifd.sub_idx.len() * 8) as u64;
     if l > 8 {
         ext += l + l % 2;
+    }
+    for blob in [&ifd.jpeg_tables, &ifd.icc] {
+        if let Some(b) = blob {
+            let l = b.len() as u64;
+            if l > 8 {
+                ext += l + l % 2;
+            }
+        }
     }
     ext
 }

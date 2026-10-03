@@ -340,10 +340,12 @@ impl ProgressCallback for HostProgress {
     }
 }
 
-/// Emits committed states; the output profile travels with every state so
-/// a journal can never be resumed under a different layout.
+/// Emits committed states; the output profile and the input adapter travel
+/// with every state so a journal can never be resumed under a different
+/// layout or a different source adapter.
 struct HostCheckpoint {
     profile: OutputProfile,
+    adapter: Option<&'static str>,
 }
 
 impl slide_transform_core::job::CheckpointCallback for HostCheckpoint {
@@ -352,14 +354,19 @@ impl slide_transform_core::job::CheckpointCallback for HostCheckpoint {
             return;
         }
         let ifds: Vec<String> = c.ifd_tiles.iter().map(|t| t.to_string()).collect();
+        let adapter = match self.adapter {
+            Some(a) => format!(",\"adapter\":\"{a}\""),
+            None => String::new(),
+        };
         let json = format!(
-            "{{\"level\":{},\"channel\":{},\"cell\":{},\"out\":{},\"ifds\":[{}],\"profile\":\"{}\"}}",
+            "{{\"level\":{},\"channel\":{},\"cell\":{},\"out\":{},\"ifds\":[{}],\"profile\":\"{}\"{}}}",
             c.level,
             c.channel.map(|v| v.to_string()).unwrap_or_else(|| "0".into()),
             c.cell_done,
             c.committed_output,
             ifds.join(","),
-            self.profile.id()
+            self.profile.id(),
+            adapter
         );
         host_checkpoint(&json);
     }
@@ -438,6 +445,117 @@ fn detect(src: &dyn ByteSource) -> CoreResult<[u8; 8]> {
     Ok(m)
 }
 
+/// Input kind by container signature: TIFF/BigTIFF headers route to the F1
+/// SVS adapter (the bounded walk inside decides Aperio/JPEG/convertible).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputKind {
+    Kfb,
+    Kfbf,
+    Svs,
+}
+
+fn input_kind(magic: &[u8; 8]) -> InputKind {
+    if *magic == slide_transform_core::kfbf::KFBF_MAGIC {
+        InputKind::Kfbf
+    } else if is_tiff_magic(magic) {
+        InputKind::Svs
+    } else {
+        InputKind::Kfb
+    }
+}
+
+fn is_tiff_magic(m: &[u8; 8]) -> bool {
+    let bo = &m[0..2];
+    if bo != b"II" && bo != b"MM" {
+        return false;
+    }
+    let v = if bo == b"II" {
+        u16::from_le_bytes([m[2], m[3]])
+    } else {
+        u16::from_be_bytes([m[2], m[3]])
+    };
+    v == 42 || v == 43
+}
+
+/// Source adapter id of an input kind (journal/checkpoint identity; `None`
+/// for the KFB/KFBF readers, which predate adapters).
+fn adapter_of(kind: InputKind) -> Option<&'static str> {
+    match kind {
+        InputKind::Svs => Some(slide_transform_core::svs::SOURCE_FORMAT),
+        _ => None,
+    }
+}
+
+/// `"adapter":"…"` of a checkpoint state; absent in states journalled by
+/// pre-adapter cores (KFB/KFBF) — a mismatch with the current input's
+/// adapter is refused, mirroring the output-profile refusal.
+fn resume_adapter_field(resume_json: &str) -> Option<String> {
+    let key = "\"adapter\"";
+    let at = resume_json.find(key)? + key.len();
+    let rest = resume_json[at..].trim_start().strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    Some(rest[..rest.find('"')?].to_string())
+}
+
+/// SVS capability document (probe result), mirroring the CLI's report.
+fn svs_doc_json(doc: &slide_transform_core::svs::SvsDoc) -> String {
+    let levels: Vec<String> = doc
+        .levels
+        .iter()
+        .map(|lv| {
+            format!(
+                "{{\"level\":{},\"width\":{},\"height\":{},\"tile_w\":{},\"tile_h\":{},\"tiles_across\":{},\"tiles_down\":{},\"color\":\"{}\",\"jpeg_tables\":{}}}",
+                lv.ifd_index,
+                lv.width,
+                lv.height,
+                lv.tile_w,
+                lv.tile_h,
+                lv.tiles_across,
+                lv.tiles_down,
+                match lv.color {
+                    slide_transform_core::svs::PayloadColor::Rgb => "rgb",
+                    slide_transform_core::svs::PayloadColor::YCbCr => "ycbcr",
+                },
+                lv.jpeg_tables.is_some()
+            )
+        })
+        .collect();
+    let assoc: Vec<String> = doc
+        .associated
+        .iter()
+        .map(|a| format!("{{\"name\":\"{}\",\"width\":{},\"height\":{}}}", a.name, a.width, a.height))
+        .collect();
+    let mpp = doc
+        .mpp
+        .map(|v| json_num(v))
+        .unwrap_or_else(|| "null".into());
+    let obj = doc
+        .appmag
+        .map(|v| json_num(v))
+        .unwrap_or_else(|| "null".into());
+    format!(
+        "{{\"format\":\"{}\",\"adapter\":\"{}\",\"adapter_version\":\"{}\",\"modality\":\"brightfield\",\"tiff_kind\":\"{}\",\"width\":{},\"height\":{},\"mpp_x\":{},\"mpp_y\":{},\"objective\":{},\"mpp_source\":\"{}\",\"objective_source\":\"{}\",\"levels\":[{}],\"associated\":[{}],\"icc_profile\":{},\"codec\":\"jpeg-baseline-passthrough\",\"estimate\":{}}}",
+        slide_transform_core::svs::SOURCE_FORMAT,
+        slide_transform_core::svs::SOURCE_FORMAT,
+        slide_transform_core::svs::ADAPTER_VERSION,
+        match doc.kind {
+            slide_transform_core::tiff_read::TiffKind::Classic => "classic",
+            slide_transform_core::tiff_read::TiffKind::BigTiff => "bigtiff",
+        },
+        doc.levels[0].width,
+        doc.levels[0].height,
+        mpp,
+        mpp,
+        obj,
+        if doc.mpp.is_some() { "aperio-description" } else { "unknown" },
+        if doc.appmag.is_some() { "aperio-description-AppMag" } else { "unknown" },
+        levels.join(","),
+        assoc.join(","),
+        doc.icc.is_some(),
+        estimate_json(&slide_transform_core::svs::estimate_svs(doc))
+    )
+}
+
 /// Probe the input through host reads; returns a JSON string. Includes the
 /// C2 disk-precheck estimate (`estimate.output_upper_bound_bytes` etc.).
 #[wasm_bindgen(js_name = "probe")]
@@ -448,7 +566,9 @@ pub fn probe() -> String {
         Ok(m) => m,
         Err(e) => return err_json(&e),
     };
-    let res = if magic == slide_transform_core::kfbf::KFBF_MAGIC {
+    let res = if is_tiff_magic(&magic) {
+        slide_transform_core::svs::probe_svs(&src).map(|doc| svs_doc_json(&doc))
+    } else if magic == slide_transform_core::kfbf::KFBF_MAGIC {
         slide_transform_core::kfbf::parse_kfbf(&src, &mut scratch).map(|doc| {
             let est = slide_transform_core::estimate::estimate_fl(&doc, src.size());
             let channels: Vec<String> = doc
@@ -578,23 +698,26 @@ fn run_convert(
     profile: Option<&str>,
     strict_lossless: bool,
     channel_json: &str,
-    resume: Option<(ResumePoint, Option<String>)>,
+    resume: Option<(ResumePoint, Option<String>, Option<String>)>,
 ) -> String {
     let src = HostSource::open();
     let magic = match detect(&src) {
         Ok(m) => m,
         Err(e) => return err_json(&e),
     };
-    let is_fl = magic == slide_transform_core::kfbf::KFBF_MAGIC;
+    let kind = input_kind(&magic);
+    let is_fl = kind == InputKind::Kfbf;
+    let adapter = adapter_of(kind);
     let out_profile = match resolve_profile(is_fl, profile) {
         Ok(p) => p,
         Err(e) => return err_json(&e),
     };
     // a committed state belongs to the layout that wrote it: never continue
     // a partial output under another profile (legacy states = the default)
+    // nor under a different source adapter (KFB state + SVS copy, etc.)
     let resume = match resume {
         None => None,
-        Some((rp, journalled)) => {
+        Some((rp, journalled, journalled_adapter)) => {
             let committed_under = match resolve_profile(is_fl, journalled.as_deref()) {
                 Ok(p) => p,
                 Err(e) => return err_json(&e),
@@ -604,6 +727,19 @@ fn run_convert(
                     "resume: 已提交进度属于输出 profile {}，拒绝以 {} 续跑",
                     committed_under.id(),
                     out_profile.id()
+                )));
+            }
+            let state_adapter = journalled_adapter;
+            let same = match (&state_adapter, adapter) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            };
+            if !same {
+                return err_json(&CoreError::validation(format!(
+                    "resume: 已提交进度属于输入适配器 {}，拒绝以 {} 续跑",
+                    state_adapter.as_deref().unwrap_or("kfb"),
+                    adapter.unwrap_or("kfb")
                 )));
             }
             Some(rp)
@@ -635,7 +771,7 @@ fn run_convert(
     let mut sink = HostSink;
     let mut scratch = HostScratchFactory;
     let progress = HostProgress;
-    let checkpoint = HostCheckpoint { profile: out_profile };
+    let checkpoint = HostCheckpoint { profile: out_profile, adapter };
     let mut job = JobControl::new(&progress);
     if CHECKPOINT_ENABLED.load(Ordering::Relaxed) {
         job = job.with_checkpoint(&checkpoint);
@@ -648,6 +784,17 @@ fn run_convert(
             ),
             None => slide_transform_core::convert_fl::convert_kfbf_to_ome(
                 &src, &mut sink, &mut scratch, &plan, &job, companion.as_ref(),
+            ),
+        }
+    } else if kind == InputKind::Svs {
+        let mut plan = TransformPlan::brightfield(identity).with_policy(policy);
+        plan.profile = out_profile;
+        match resume.as_ref() {
+            Some(rp) => slide_transform_core::convert_svs::convert_svs_to_bigtiff_resume(
+                &src, &mut sink, &mut scratch, &plan, &job, rp,
+            ),
+            None => slide_transform_core::convert_svs::convert_svs_to_bigtiff(
+                &src, &mut sink, &mut scratch, &plan, &job,
             ),
         }
     } else {
@@ -669,9 +816,11 @@ fn run_convert(
             let warnings: Vec<String> =
                 r.warnings.iter().map(|w| format!("\"{w}\"")).collect();
             format!(
-                "{{{}\"format\":\"{}\",\"output_profile\":\"{}\",\"output_bytes\":{},\"width\":{},\"height\":{},\"ifd_count\":{},\"tiles_raw_copied\":{},\"tiles_reencoded\":{},\"resumed\":{},\"channels\":{},\"warnings\":[{}]}}",
+                "{{{}\"format\":\"{}\",\"source_format\":{},\"adapter_version\":{},\"output_profile\":\"{}\",\"output_bytes\":{},\"width\":{},\"height\":{},\"ifd_count\":{},\"tiles_raw_copied\":{},\"tiles_reencoded\":{},\"resumed\":{},\"channels\":{},\"warnings\":[{}]}}",
                 companion_json_warning,
                 r.format,
+                r.source_format.map(|f| format!("\"{f}\"")).unwrap_or_else(|| "null".into()),
+                r.adapter_version.map(|v| format!("\"{v}\"")).unwrap_or_else(|| "null".into()),
                 out_profile.id(),
                 r.output_bytes,
                 r.width,
@@ -716,7 +865,7 @@ pub fn convert_resume_profile(
             Some(profile),
             strict_lossless,
             channel_json,
-            Some((rp, resume_profile_field(resume_json))),
+            Some((rp, resume_profile_field(resume_json), resume_adapter_field(resume_json))),
         ),
         Err(e) => err_json(&e),
     }
@@ -731,7 +880,7 @@ pub fn convert_resume(resume_json: &str, strict_lossless: bool, channel_json: &s
             None,
             strict_lossless,
             channel_json,
-            Some((rp, resume_profile_field(resume_json))),
+            Some((rp, resume_profile_field(resume_json), resume_adapter_field(resume_json))),
         ),
         Err(e) => err_json(&e),
     }
@@ -783,6 +932,29 @@ mod tests {
         // states journalled before output profiles existed carry none
         let legacy = r#"{"level":1,"channel":0,"cell":3,"out":4096,"ifds":[9,3]}"#;
         assert_eq!(resume_profile_field(legacy), None);
+    }
+
+    #[test]
+    fn journalled_adapter_is_read_from_checkpoint_states() {
+        let st = r#"{"level":0,"channel":0,"cell":3,"out":4096,"ifds":[3],"profile":"bf-ome","adapter":"aperio-svs-jpeg"}"#;
+        assert_eq!(resume_adapter_field(st).as_deref(), Some("aperio-svs-jpeg"));
+        // KFB/KFBF states (and pre-adapter cores) carry no adapter field
+        let legacy = r#"{"level":1,"channel":0,"cell":3,"out":4096,"ifds":[9,3],"profile":"bf-ome"}"#;
+        assert_eq!(resume_adapter_field(legacy), None);
+    }
+
+    #[test]
+    fn tiff_magics_route_to_the_svs_adapter() {
+        assert_eq!(input_kind(&[0x49, 0x49, 42, 0, 8, 0, 0, 0]), InputKind::Svs);
+        assert_eq!(input_kind(&[0x4D, 0x4D, 0, 42, 0, 0, 0, 8]), InputKind::Svs);
+        assert_eq!(input_kind(&[0x49, 0x49, 43, 0, 8, 0, 0, 0]), InputKind::Svs);
+        assert_eq!(input_kind(&[0x4D, 0x4D, 0, 43, 0, 0, 0, 16]), InputKind::Svs);
+        assert_eq!(input_kind(&[0xF1, 0x01, 0xEE, 0xEE, 0x4B, 0x46, 0x42, 0x00]), InputKind::Kfb);
+        assert_eq!(input_kind(&[0xF1, 0x01, 0xEE, 0xEE, 0x4B, 0x46, 0x42, 0x46]), InputKind::Kfbf);
+        // II + wrong version is neither
+        assert_eq!(input_kind(&[0x49, 0x49, 45, 0, 8, 0, 0, 0]), InputKind::Kfb);
+        assert_eq!(adapter_of(InputKind::Svs), Some("aperio-svs-jpeg"));
+        assert_eq!(adapter_of(InputKind::Kfb), None);
     }
 
     #[test]

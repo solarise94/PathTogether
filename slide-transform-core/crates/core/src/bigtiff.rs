@@ -23,13 +23,43 @@ struct LevelIfd {
     width: u32,
     height: u32,
     sampling: (u16, u16),
-    mpp_x: f64,
-    mpp_y: f64,
+    mpp_x: Option<f64>,
+    mpp_y: Option<f64>,
     description: Vec<u8>,
     reduced: bool,
+    /// F1 generalisation: the source's own tile shape (KFB: 256×256).
+    tile: (u32, u32),
+    /// PhotometricInterpretation (KFB: 6 YCbCr; Aperio RGB JPEG: 2).
+    photometric: u16,
+    /// Shared JPEG tables (tag 347) written verbatim when the source uses
+    /// abbreviated streams (Aperio). `None` for KFB.
+    jpeg_tables: Option<Vec<u8>>,
+    /// ICC profile (tag 34675); written on the IFDs the caller declares
+    /// (Aperio: main level only). `None` for KFB.
+    icc: Option<Vec<u8>>,
     offcnt: Box<dyn ScratchSink>,
     offcnt_bytes: u64,
     tile_count: u64,
+}
+
+/// Extra level tags the F1 SVS adapter needs (all fields default to the
+/// historical KFB layout, so `end_level` stays byte-identical).
+#[derive(Debug, Clone)]
+pub struct LevelExtras {
+    /// TileWidth/TileLength (322/323).
+    pub tile: (u32, u32),
+    /// PhotometricInterpretation (262); 530 is only written for 6 (YCbCr).
+    pub photometric: u16,
+    /// JPEGTables (347) bytes, written verbatim into the IFD.
+    pub jpeg_tables: Option<Vec<u8>>,
+    /// InterColorProfile (34675) bytes.
+    pub icc: Option<Vec<u8>>,
+}
+
+impl Default for LevelExtras {
+    fn default() -> Self {
+        LevelExtras { tile: (256, 256), photometric: 6, jpeg_tables: None, icc: None }
+    }
 }
 
 enum EntryVal {
@@ -109,10 +139,14 @@ impl<'a> BigTiffPyramidWriter<'a> {
             width: 0,
             height: 0,
             sampling: (1, 1),
-            mpp_x: 0.0,
-            mpp_y: 0.0,
+            mpp_x: None,
+            mpp_y: None,
             description: Vec::new(),
             reduced: false,
+            tile: (256, 256),
+            photometric: 6,
+            jpeg_tables: None,
+            icc: None,
             offcnt: sink,
             offcnt_bytes: bytes,
             tile_count: committed_tiles,
@@ -134,10 +168,14 @@ impl<'a> BigTiffPyramidWriter<'a> {
             width: 0,
             height: 0,
             sampling: (1, 1),
-            mpp_x: 0.0,
-            mpp_y: 0.0,
+            mpp_x: None,
+            mpp_y: None,
             description: Vec::new(),
             reduced: false,
+            tile: (256, 256),
+            photometric: 6,
+            jpeg_tables: None,
+            icc: None,
             offcnt: sink,
             offcnt_bytes: 0,
             tile_count: 0,
@@ -166,6 +204,8 @@ impl<'a> BigTiffPyramidWriter<'a> {
     }
 
     /// Close the current level with its IFD metadata (Python `add_level`).
+    /// Historical signature: YCbCr 256-tile levels with a known MPP — kept
+    /// so the KFB path is untouched.
     #[allow(clippy::too_many_arguments)]
     pub fn end_level(
         &mut self,
@@ -177,14 +217,56 @@ impl<'a> BigTiffPyramidWriter<'a> {
         description: &[u8],
         reduced: bool,
     ) -> CoreResult<()> {
+        self.end_level_ex(
+            width,
+            height,
+            sampling,
+            Some((mpp_x, mpp_y)),
+            description,
+            reduced,
+            &LevelExtras::default(),
+        )
+    }
+
+    /// F1 generalisation of [`Self::end_level`]: arbitrary tile shape,
+    /// photometric (2 RGB / 6 YCbCr), optional JPEGTables/ICC and optional
+    /// calibration (unknown MPP ⇒ tags 282/283/296 are omitted, not faked).
+    #[allow(clippy::too_many_arguments)]
+    pub fn end_level_ex(
+        &mut self,
+        width: u32,
+        height: u32,
+        sampling: (u16, u16),
+        mpp: Option<(f64, f64)>,
+        description: &[u8],
+        reduced: bool,
+        extras: &LevelExtras,
+    ) -> CoreResult<()> {
         let lv = self.ifds.last_mut().expect("begin_level before end_level");
+        if extras.tile.0 == 0 || extras.tile.1 == 0 || extras.tile.0 > 65535 || extras.tile.1 > 65535
+        {
+            return Err(CoreError::validation(format!(
+                "tile 尺寸 {:?} 超出 TIFF SHORT 范围",
+                extras.tile
+            )));
+        }
+        if extras.photometric != 2 && extras.photometric != 6 {
+            return Err(CoreError::validation(format!(
+                "photometric {} 不在支持集（2 RGB / 6 YCbCr）",
+                extras.photometric
+            )));
+        }
         lv.width = width;
         lv.height = height;
         lv.sampling = sampling;
-        lv.mpp_x = mpp_x;
-        lv.mpp_y = mpp_y;
+        lv.mpp_x = mpp.map(|m| m.0);
+        lv.mpp_y = mpp.map(|m| m.1);
         lv.description = description.to_vec();
         lv.reduced = reduced;
+        lv.tile = extras.tile;
+        lv.photometric = extras.photometric;
+        lv.jpeg_tables = extras.jpeg_tables.clone();
+        lv.icc = extras.icc.clone();
         Ok(())
     }
 
@@ -245,7 +327,6 @@ fn finish_with(
         let mut head = Vec::with_capacity(size as usize);
         head.extend_from_slice(&(entries.len() as u64).to_le_bytes());
         let mut ext_cursor = ifd_pos + size;
-        let mut ext_buf: Vec<u8> = Vec::new();
         for e in &entries {
             head.extend_from_slice(&e.tag.to_le_bytes());
             head.extend_from_slice(&e.typ.to_le_bytes());
@@ -259,10 +340,6 @@ fn finish_with(
                 EntryVal::Static(b) => {
                     head.extend_from_slice(&ext_cursor.to_le_bytes());
                     let l = b.len() as u64;
-                    ext_buf.extend_from_slice(b);
-                    if l % 2 == 1 {
-                        ext_buf.push(0);
-                    }
                     ext_cursor += l + l % 2;
                 }
                 EntryVal::Offsets => {
@@ -299,15 +376,32 @@ fn finish_with(
         let next = positions.get(i + 1).map_or(0u64, |p| p.0);
         head.extend_from_slice(&next.to_le_bytes());
         sink.write_at(ifd_pos, &head)?;
-        sink.write_at(ifd_pos + head.len() as u64, &ext_buf)?;
-        *cursor = ifd_pos + head.len() as u64 + ext_buf.len() as u64;
+        *cursor = ifd_pos + head.len() as u64;
 
-        // 依 tag 序（270 < 324 < 325）流式写出两个 LONG8 数组
-        if n > 1 {
-            stream_array(sink, cursor, lv, true)?;
-        }
-        if n > 1 {
-            stream_array(sink, cursor, lv, false)?;
+        // External segments are laid out in ENTRY ORDER — a Static value may
+        // sort after the tile arrays (347 JPEGTables / 34675 ICC), so the
+        // arrays cannot simply be appended after every static value. (The
+        // KFB layout — one static 270 then 324/325 — produces the very same
+        // byte stream as before.)
+        for e in &entries {
+            match &e.val {
+                EntryVal::Static(b) => {
+                    let l = b.len() as u64;
+                    let mut padded = b.clone();
+                    if l % 2 == 1 {
+                        padded.push(0);
+                    }
+                    sink.write_at(*cursor, &padded)?;
+                    *cursor += l + l % 2;
+                }
+                EntryVal::Offsets | EntryVal::Counts => {
+                    let l = n * 8;
+                    if l > 8 {
+                        stream_array(sink, cursor, lv, matches!(e.val, EntryVal::Offsets))?;
+                    }
+                }
+                EntryVal::Inline(_) => {}
+            }
         }
     }
 
@@ -334,24 +428,49 @@ fn entries_for(lv: &LevelIfd) -> CoreResult<Vec<Entry>> {
             val: EntryVal::Inline([8u16, 8, 8].iter().flat_map(|v| v.to_le_bytes()).collect()),
         },
         Entry { tag: 259, typ: TIFF_SHORT, count: 1, val: EntryVal::Inline(7u16.to_le_bytes().to_vec()) },
-        Entry { tag: 262, typ: TIFF_SHORT, count: 1, val: EntryVal::Inline(6u16.to_le_bytes().to_vec()) },
+        Entry { tag: 262, typ: TIFF_SHORT, count: 1, val: EntryVal::Inline(lv.photometric.to_le_bytes().to_vec()) },
         Entry { tag: 270, typ: TIFF_ASCII, count: lv.description.len() as u64, val: EntryVal::Static(lv.description.clone()) },
         Entry { tag: 277, typ: TIFF_SHORT, count: 1, val: EntryVal::Inline(3u16.to_le_bytes().to_vec()) },
-        Entry { tag: 282, typ: TIFF_RATIONAL, count: 1, val: EntryVal::Inline(px_per_cm_rational(lv.mpp_x)?.to_vec()) },
-        Entry { tag: 283, typ: TIFF_RATIONAL, count: 1, val: EntryVal::Inline(px_per_cm_rational(lv.mpp_y)?.to_vec()) },
         Entry { tag: 284, typ: TIFF_SHORT, count: 1, val: EntryVal::Inline(1u16.to_le_bytes().to_vec()) },
-        Entry { tag: 296, typ: TIFF_SHORT, count: 1, val: EntryVal::Inline(3u16.to_le_bytes().to_vec()) },
-        Entry { tag: 322, typ: TIFF_SHORT, count: 1, val: EntryVal::Inline(256u16.to_le_bytes().to_vec()) },
-        Entry { tag: 323, typ: TIFF_SHORT, count: 1, val: EntryVal::Inline(256u16.to_le_bytes().to_vec()) },
+        Entry { tag: 322, typ: TIFF_SHORT, count: 1, val: EntryVal::Inline((lv.tile.0 as u16).to_le_bytes().to_vec()) },
+        Entry { tag: 323, typ: TIFF_SHORT, count: 1, val: EntryVal::Inline((lv.tile.1 as u16).to_le_bytes().to_vec()) },
         Entry { tag: 324, typ: TIFF_LONG8, count: n, val: EntryVal::Offsets },
         Entry { tag: 325, typ: TIFF_LONG8, count: n, val: EntryVal::Counts },
-        Entry {
+    ];
+    // calibration: a level without a trustworthy MPP omits 282/283/296
+    // rather than inventing one (F1 rule). The KFB path always writes them,
+    // in the historical position (between 277 and 284 after sorting).
+    if let (Some(mx), Some(my)) = (lv.mpp_x, lv.mpp_y) {
+        entries.push(Entry { tag: 282, typ: TIFF_RATIONAL, count: 1, val: EntryVal::Inline(px_per_cm_rational(mx)?.to_vec()) });
+        entries.push(Entry { tag: 283, typ: TIFF_RATIONAL, count: 1, val: EntryVal::Inline(px_per_cm_rational(my)?.to_vec()) });
+        entries.push(Entry { tag: 296, typ: TIFF_SHORT, count: 1, val: EntryVal::Inline(3u16.to_le_bytes().to_vec()) });
+    }
+    // YCbCrSubSampling only for YCbCr payloads; the value is the JPEG SOF
+    // truth (never the source tag, which Aperio files mislabel)
+    if lv.photometric == 6 {
+        entries.push(Entry {
             tag: 530,
             typ: TIFF_SHORT,
             count: 2,
             val: EntryVal::Inline([lv.sampling.0, lv.sampling.1].iter().flat_map(|v| v.to_le_bytes()).collect()),
-        },
-    ];
+        });
+    }
+    if let Some(icc) = &lv.icc {
+        entries.push(Entry {
+            tag: 34675,
+            typ: 7, // UNDEFINED
+            count: icc.len() as u64,
+            val: EntryVal::Static(icc.clone()),
+        });
+    }
+    if let Some(t) = &lv.jpeg_tables {
+        entries.push(Entry {
+            tag: 347,
+            typ: 7, // UNDEFINED
+            count: t.len() as u64,
+            val: EntryVal::Static(t.clone()),
+        });
+    }
     entries.sort_by_key(|e| e.tag);
     Ok(entries)
 }

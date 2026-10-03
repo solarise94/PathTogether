@@ -371,18 +371,152 @@ export const SUPPORTED_MAGICS = [
   [0xF1, 0x01, 0xEE, 0xEE, 0x4B, 0x46, 0x42, 0x46], // KFBF
 ];
 
+/// F1: TIFF/BigTIFF container headers (classic II*\0 / MM\0*, BigTIFF
+/// II+\0 / MM\0+). The first-IFD offset differs per file, so these are
+/// 4-byte prefixes, not full 8-byte magics.
+export const TIFF_HEADER_PREFIXES = [
+  [0x49, 0x49, 0x2A, 0x00],
+  [0x4D, 0x4D, 0x00, 0x2A],
+  [0x49, 0x49, 0x2B, 0x00],
+  [0x4D, 0x4D, 0x00, 0x2B],
+];
+
+export function isTiffHeader(head) {
+  if (!head || head.length < 4) return false;
+  return TIFF_HEADER_PREFIXES.some((m) => m.every((b, i) => head[i] === b));
+}
+
 export function magicSupported(head) {
+  if (isTiffHeader(head)) return true; // staged only after sniffTiffSlideCapability
   return SUPPORTED_MAGICS.some((m) => m.every((b, i) => head[i] === b));
 }
 
 /// Container magic → modality ('brightfield' KFB | 'fluorescence' KFBF;
-/// null = not a supported container). The core decides the variant from the
-/// same magic, so the page can offer the brightfield output-format choice
+/// null = not a supported container). TIFF containers convert through the
+/// brightfield SVS adapter (the bounded sniff rejects anything else before
+/// staging), so they map to 'brightfield'. The core decides the variant from
+/// the same magic, so the page can offer the brightfield output-format choice
 /// (or withhold it for fluorescence) before the copy+probe round-trip.
 export function magicModality(head) {
   if (SUPPORTED_MAGICS[1].every((b, i) => head[i] === b)) return 'fluorescence';
   if (SUPPORTED_MAGICS[0].every((b, i) => head[i] === b)) return 'brightfield';
+  if (isTiffHeader(head)) return 'brightfield';
   return null;
+}
+
+// ------------------------------------------------- input capability (F1) --
+
+/// Bounded structural probe of a TIFF container BEFORE staging (input
+/// capability helper — deliberately separate from the conversion engine;
+/// the authoritative capability report still comes from the wasm core's
+/// probe on the staged copy). Reads at most ~78 KiB: header, one IFD entry
+/// table (≤512 entries) and one bounded description value. Mirrors the
+/// core's accept rule for IFD 0: tiled, baseline JPEG (not JPEG 2000),
+/// chunky, 3 samples, Aperio description.
+///
+///   await sniffTiffSlideCapability(file)
+///     → { supported: true, modality: 'brightfield', format: 'aperio-svs-jpeg',
+///         adapter: 'aperio-svs-jpeg' }
+///     | { supported: false, modality: null, reason: '<typed reason>' }
+export const SVS_SOURCE_ADAPTER = 'aperio-svs-jpeg';
+const SNIFF_MAX_ENTRIES = 512;
+const SNIFF_DESC_MAX = 64 * 2 ** 10;
+
+export async function sniffTiffSlideCapability(file) {
+  const bad = (reason) => ({ supported: false, modality: null, reason });
+  const readAt = async (off, len) =>
+    new Uint8Array(await file.slice(off, off + len).arrayBuffer());
+  let head;
+  try {
+    head = await readAt(0, 16);
+  } catch (e) {
+    return bad(`无法读取文件头：${errText(e)}`);
+  }
+  if (head.length < 8) return bad('文件小于 8 字节，不是 TIFF');
+  if (!isTiffHeader(head)) return bad('不是 TIFF/BigTIFF 容器');
+  const little = head[0] === 0x49 && head[1] === 0x49;
+  const u16 = (b, at) => (little ? b[at] | (b[at + 1] << 8) : (b[at] << 8) | b[at + 1]);
+  const u32 = (b, at) => little
+    ? (b[at] | (b[at + 1] << 8) | (b[at + 2] << 16) | (b[at + 3] << 24)) >>> 0
+    : (((b[at] << 24) | (b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3]) >>> 0);
+  const bigtiff = u16(head, 2) === 43;
+  if (bigtiff && (u16(head, 4) !== 8 || u16(head, 6) !== 0)) {
+    return bad('BigTIFF 头部异常（offset size ≠ 8 或保留位非 0）');
+  }
+  if (file.size < (bigtiff ? 16 : 8)) return bad('文件头不完整');
+  let ifdAt = bigtiff
+    ? (little
+      ? u32(head, 8) + u32(head, 12) * 2 ** 32
+      : u32(head, 8) * 2 ** 32 + u32(head, 12))
+    : u32(head, 4);
+  if (!isSafeOffset(ifdAt) || ifdAt === 0) return bad('首个 IFD 偏移非法');
+  const esize = bigtiff ? 20 : 12;
+  try {
+    const cb = await readAt(ifdAt, bigtiff ? 8 : 2);
+    const n = bigtiff
+      ? (little ? u32(cb, 0) + u32(cb, 4) * 2 ** 32 : u32(cb, 0) * 2 ** 32 + u32(cb, 4))
+      : u16(cb, 0);
+    if (n === 0 || n > SNIFF_MAX_ENTRIES) return bad(`IFD 条目数 ${n} 异常`);
+    const tableLen = n * esize + (bigtiff ? 8 : 2) + (bigtiff ? 8 : 4);
+    if (ifdAt + tableLen > file.size) return bad('IFD 条目表越界');
+    const t = await readAt(ifdAt, tableLen);
+    const base = bigtiff ? 8 : 2;
+    const entries = {};
+    for (let i = 0; i < n; i++) {
+      const e = base + i * esize;
+      const tag = u16(t, e);
+      const typ = u16(t, e + 2);
+      const count = bigtiff
+        ? (little ? u32(t, e + 4) + u32(t, e + 8) * 2 ** 32 : u32(t, e + 4) * 2 ** 32 + u32(t, e + 8))
+        : u32(t, e + 4);
+      let val = t.subarray(e + (bigtiff ? 12 : 8), e + esize);
+      entries[tag] = { typ, count, val };
+    }
+    const scalar = (tag) => {
+      const en = entries[tag];
+      if (!en) return undefined;
+      if (en.typ === 3) return u16(en.val, 0);
+      if (en.typ === 4) return u32(en.val, 0);
+      return undefined;
+    };
+    const descBytes = async () => {
+      const en = entries[270];
+      if (!en) return '';
+      const len = Math.min(en.count, SNIFF_DESC_MAX);
+      const inline = bigtiff ? 8 : 4;
+      if (len <= inline) return new TextDecoder().decode(en.val.subarray(0, len));
+      const off = bigtiff
+        ? (little ? u32(en.val, 0) + u32(en.val, 4) * 2 ** 32 : u32(en.val, 0) * 2 ** 32 + u32(en.val, 4))
+        : u32(en.val, 0);
+      return new TextDecoder().decode(await readAt(off, len));
+    };
+    if (!entries[322] || !entries[323]) return bad('主图不是分块（tiled）存储：该 TIFF 变体不在支持集');
+    const comp = scalar(259);
+    if (comp === 33003 || comp === 33005) {
+      return bad('JPEG 2000 压缩不在当前支持集（需要独立解码器）');
+    }
+    if (comp !== 7) return bad(`压缩编码 ${comp} 不是基线 JPEG，无法按原样搬运`);
+    const spp = scalar(277) ?? 1;
+    if (spp !== 3) return bad(`SamplesPerPixel=${spp}（荧光/多通道或灰度页组不在明场支持集）`);
+    const planar = scalar(284) ?? 1;
+    if (planar !== 1) return bad(`PlanarConfiguration=${planar}（平面存储）不在支持集`);
+    const photo = scalar(262);
+    if (photo !== 2 && photo !== 6) return bad(`PhotometricInterpretation=${photo} 不在支持集（RGB=2 / YCbCr=6）`);
+    const desc = await descBytes();
+    if (!desc.includes('Aperio')) {
+      return bad('TIFF 结构合法但未标识 Aperio：未知厂商变体不猜');
+    }
+    return {
+      supported: true,
+      modality: 'brightfield',
+      format: SVS_SOURCE_ADAPTER,
+      adapter: SVS_SOURCE_ADAPTER,
+      bigtiff,
+      littleEndian: little,
+    };
+  } catch (e) {
+    return bad(`结构探测失败：${errText(e)}`);
+  }
 }
 
 // ------------------------------------------------------ output profiles --

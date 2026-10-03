@@ -43,6 +43,8 @@ fn main() -> ExitCode {
         "gen-kfb" => cmd_gen_kfb(&args[1..]),
         #[cfg(feature = "synth-gen")]
         "gen-kfbf" => cmd_gen_kfbf(&args[1..]),
+        #[cfg(feature = "synth-gen")]
+        "gen-svs" => cmd_gen_svs(&args[1..]),
         _ => Err(CoreError::validation(format!("未知子命令 {}", args[0]))),
     };
     match result {
@@ -151,6 +153,93 @@ fn scratch_under(path: &Path) -> PathBuf {
 // probe
 // --------------------------------------------------------------------------- //
 
+/// TIFF/BigTIFF header check (classic 42 / BigTIFF 43, either byte order).
+fn is_tiff_magic(m: &[u8; 8]) -> bool {
+    let bo = &m[0..2];
+    if bo != b"II" && bo != b"MM" {
+        return false;
+    }
+    let v = if bo == b"II" {
+        u16::from_le_bytes([m[2], m[3]])
+    } else {
+        u16::from_be_bytes([m[2], m[3]])
+    };
+    v == 42 || v == 43
+}
+
+/// Capability report for an SVS input (F1): recognised, convertible variant
+/// or typed reason, levels, tile shape, codec, colorspace, MPP source.
+fn svs_doc_json(doc: &slide_transform_core::svs::SvsDoc) -> String {
+    let levels: Vec<String> = doc
+        .levels
+        .iter()
+        .map(|lv| {
+            obj(&[
+                ju("level", lv.ifd_index as u64),
+                ju("width", lv.width as u64),
+                ju("height", lv.height as u64),
+                ju("tile_w", lv.tile_w as u64),
+                ju("tile_h", lv.tile_h as u64),
+                ju("tiles_across", lv.tiles_across as u64),
+                ju("tiles_down", lv.tiles_down as u64),
+                jstr(
+                    "color",
+                    match lv.color {
+                        slide_transform_core::svs::PayloadColor::Rgb => "rgb",
+                        slide_transform_core::svs::PayloadColor::YCbCr => "ycbcr",
+                    },
+                ),
+                jarr(
+                    "sof_sampling",
+                    &[
+                        lv.sampling.0.to_string(),
+                        lv.sampling.1.to_string(),
+                        lv.sampling.2.to_string(),
+                        lv.sampling.3.to_string(),
+                        lv.sampling.4.to_string(),
+                        lv.sampling.5.to_string(),
+                    ],
+                ),
+                jb("jpeg_tables", lv.jpeg_tables.is_some()),
+            ])
+        })
+        .collect();
+    let assoc: Vec<String> = doc
+        .associated
+        .iter()
+        .map(|a| obj(&[jstr("name", &a.name), ju("width", a.width as u64), ju("height", a.height as u64)]))
+        .collect();
+    obj(&[
+        jstr("format", slide_transform_core::svs::SOURCE_FORMAT),
+        jstr("adapter_version", slide_transform_core::svs::ADAPTER_VERSION),
+        jstr("modality", "brightfield"),
+        jstr(
+            "tiff_kind",
+            match doc.kind {
+                slide_transform_core::tiff_read::TiffKind::Classic => "classic",
+                slide_transform_core::tiff_read::TiffKind::BigTiff => "bigtiff",
+            },
+        ),
+        ju("width", doc.levels[0].width as u64),
+        ju("height", doc.levels[0].height as u64),
+        jraw("mpp_x", &doc.mpp.map(|v| v.to_string()).unwrap_or_else(|| "null".into())),
+        jraw("mpp_y", &doc.mpp.map(|v| v.to_string()).unwrap_or_else(|| "null".into())),
+        jraw("objective", &doc.appmag.map(|v| v.to_string()).unwrap_or_else(|| "null".into())),
+        jstr(
+            "mpp_source",
+            if doc.mpp.is_some() { "aperio-description" } else { "unknown" },
+        ),
+        jstr(
+            "objective_source",
+            if doc.appmag.is_some() { "aperio-description-AppMag" } else { "unknown" },
+        ),
+        jarr("levels", &levels),
+        jarr("associated", &assoc),
+        jb("icc_profile", doc.icc.is_some()),
+        jstr("codec", "jpeg-baseline-passthrough"),
+    ])
+}
+
 fn cmd_probe(args: &[String]) -> Result<String, CoreError> {
     let mut path: Option<&String> = None;
     let mut want_hash = false;
@@ -164,7 +253,10 @@ fn cmd_probe(args: &[String]) -> Result<String, CoreError> {
     let src = FileSource::open(Path::new(path))?;
     let magic = detect(&src)?;
     let mut scratch = FileScratch::new(&scratch_under(Path::new(path)));
-    let doc_json = if magic == KFBF_MAGIC {
+    let doc_json = if is_tiff_magic(&magic) {
+        // F1: bounded TIFF walk + Aperio detection (typed rejection inside)
+        svs_doc_json(&slide_transform_core::svs::probe_svs(&src)?)
+    } else if magic == KFBF_MAGIC {
         let doc = slide_transform_core::kfbf::parse_kfbf(&src, &mut scratch)?;
         let channels: Vec<String> = doc
             .channels
@@ -276,7 +368,9 @@ fn cmd_probe(args: &[String]) -> Result<String, CoreError> {
         "null".to_string()
     };
     // disk-precheck estimate (same shape as the wasm probe's)
-    let estimate = if magic == KFBF_MAGIC {
+    let estimate = if is_tiff_magic(&magic) {
+        slide_transform_core::svs::estimate_svs(&slide_transform_core::svs::probe_svs(&src)?)
+    } else if magic == KFBF_MAGIC {
         let doc = slide_transform_core::kfbf::parse_kfbf(&src, &mut scratch)?;
         slide_transform_core::estimate::estimate_fl(&doc, src.size())
     } else {
@@ -444,12 +538,18 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
     }
 
     let out_profile = match profile.as_str() {
+        // auto keeps the pre-profile default per input kind: KFB → classic
+        // (unattended Baidu import consumes classic), SVS → classic as well
         "auto" if magic == KFBF_MAGIC => OutputProfile::OmeBigTiffSubifd,
         "auto" => OutputProfile::ClassicJpegBigTiff,
         id => OutputProfile::from_id(id)
             .ok_or_else(|| CoreError::validation(format!("未知 profile {profile}")))?,
     };
     let is_fl = !out_profile.is_brightfield();
+    let is_svs = is_tiff_magic(&magic);
+    if is_svs && is_fl {
+        return Err(CoreError::variant("荧光 OME profile 不适用于明场 SVS 输入"));
+    }
     let pixel_policy = match policy.as_str() {
         "allow-edge" => PixelPolicy::AllowEdgeReencode,
         "strict-lossless" => PixelPolicy::StrictLossless,
@@ -494,6 +594,14 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
             &job,
             companion.as_ref(),
         )
+    } else if is_svs {
+        let mut plan = TransformPlan::brightfield(identity)
+            .with_policy(pixel_policy)
+            .with_limits(limits);
+        plan.profile = out_profile;
+        slide_transform_core::convert_svs::convert_svs_to_bigtiff(
+            &src, &mut sink, &mut scratch, &plan, &job,
+        )
     } else {
         let mut plan = TransformPlan::brightfield(identity)
             .with_policy(pixel_policy)
@@ -511,16 +619,27 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
     sink.flush()?;
     drop(sink);
 
-    // associated sidecars（<output>.associated/<name>.jpg）
+    // associated sidecars（<output>.associated/<name>.jpg）。KFB readers
+    // record real payload offsets/lengths; the SVS adapter reports detected
+    // label/macro/thumbnail without exporting them (main-image conversion,
+    // not a source archive — payload length 0), so it gets no sidecars.
+    let exportable = result
+        .associated
+        .iter()
+        .filter(|a| a.source_length > 0)
+        .count();
     let assoc_dir = {
         let name = output.file_name().map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         scratch_under(output).join(format!("{name}.associated"))
     };
-    if !result.associated.is_empty() {
+    if exportable > 0 {
         std::fs::create_dir_all(&assoc_dir)
             .map_err(|e| CoreError::io(format!("创建关联图目录失败: {e}")))?;
         for a in &result.associated {
+            if a.source_length == 0 {
+                continue;
+            }
             let bytes = src.read_at(a.source_offset, a.source_length as usize)?;
             let p = assoc_dir.join(format!("{}.jpg", a.name));
             std::fs::write(&p, &bytes)
@@ -629,6 +748,14 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
         jstr("tool", "slide-transform"),
         jstr("core_version", slide_transform_core::CORE_VERSION),
         ju("plan_version", result.plan_version as u64),
+        jraw("source_format", &result
+            .source_format
+            .map(json_str)
+            .unwrap_or_else(|| "null".into())),
+        jraw("adapter_version", &result
+            .adapter_version
+            .map(json_str)
+            .unwrap_or_else(|| "null".into())),
         jstr("output_profile", out_profile.id()),
         jstr("format", result.format),
         jstr("output", &output.display().to_string()),
@@ -780,6 +907,66 @@ fn cmd_gen_kfbf(args: &[String]) -> Result<String, CoreError> {
     };
     let mut sink = FileSink::create(Path::new(path))?;
     let n = slide_transform_core::kfbf::fixture::build_synthetic_kfbf(&mut sink, &p)?;
+    sink.flush()?;
+    Ok(obj(&[jstr("path", path), ju("bytes", n)]))
+}
+
+// --------------------------------------------------------------------------- //
+// synthetic SVS generator（F1 测试数据；无患者数据）
+// --------------------------------------------------------------------------- //
+
+#[cfg(feature = "synth-gen")]
+fn cmd_gen_svs(args: &[String]) -> Result<String, CoreError> {
+    let mut path = None;
+    let mut width = 580u32;
+    let mut height = 300u32;
+    let mut tile = 256u32;
+    let mut bigtiff = false;
+    let mut big_endian = false;
+    let mut downsample = 4u32;
+    let mut associated = false;
+    let mut crop_tail = false;
+    let mut color = "rgb".to_string();
+    let mut mpp: Option<f64> = Some(0.4990);
+    let mut appmag: Option<f64> = Some(20.0);
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--width" => { i += 1; width = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--width"))?; }
+            "--height" => { i += 1; height = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--height"))?; }
+            "--tile" => { i += 1; tile = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--tile"))?; }
+            "--bigtiff" => bigtiff = true,
+            "--big-endian" => big_endian = true,
+            "--downsample" => { i += 1; downsample = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--downsample"))?; }
+            "--associated" => associated = true,
+            "--crop-tail" => crop_tail = true,
+            "--color" => { i += 1; color = args.get(i).cloned().ok_or_else(|| CoreError::validation("--color"))?; }
+            "--no-mpp" => mpp = None,
+            "--no-appmag" => appmag = None,
+            _ => path = Some(&args[i]),
+        }
+        i += 1;
+    }
+    let path = path.ok_or_else(|| CoreError::validation("gen-svs 需要 <out>"))?;
+    let p = slide_transform_core::svs_fixture::SvsGenParams {
+        width,
+        height,
+        tile,
+        bigtiff,
+        big_endian,
+        downsample,
+        include_associated: associated,
+        mpp,
+        appmag,
+        crop_tail_tiles: crop_tail,
+        color: match color.as_str() {
+            "ycbcr" => slide_transform_core::svs_fixture::FixtureColor::YCbCr,
+            _ => slide_transform_core::svs_fixture::FixtureColor::Rgb,
+        },
+        ..Default::default()
+    };
+    let mut sink = FileSink::create(Path::new(path))?;
+    let n = slide_transform_core::svs_fixture::build_synthetic_svs(&mut sink, &p)?;
     sink.flush()?;
     Ok(obj(&[jstr("path", path), ju("bytes", n)]))
 }

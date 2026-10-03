@@ -402,6 +402,8 @@ fn convert_inner(
 
     Ok(TransformResult {
         plan_version: plan.plan_version,
+        source_format: None,
+        adapter_version: None,
         core_version: plan.core_version.clone(),
         format: "ome-bigtiff-subifd-multichannel-jpeg-passthrough",
         output_bytes,

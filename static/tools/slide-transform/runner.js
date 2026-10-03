@@ -532,11 +532,22 @@ export class SlideToolsRunner {
       { need: chk.need, available: chk.available, uncertain: !!chk.uncertain, stage });
   }
 
-  /// sniff → pre-stage disk gate → stage (copy + sha256) → probe the copy →
-  /// estimate-based disk gate → `prepared` record.
-  async _prepare(file, opts) {
+  /// sniff → (TIFF: bounded structural capability probe) → pre-stage disk
+  /// gate → stage (copy + sha256) → probe the copy → estimate-based disk
+  /// gate → `prepared` record. SVS inputs are only staged after the bounded
+  /// TIFF probe says convertible, so unsupported multi-GiB TIFFs never get
+  /// copied into OPFS.
+  async _prepare(file, opts = {}) {
     const head = new Uint8Array(await file.slice(0, 8).arrayBuffer());
-    if (!E.magicSupported(head)) {
+    let sourceAdapter = null;
+    if (E.isTiffHeader(head)) {
+      const cap = await E.sniffTiffSlideCapability(file);
+      if (!cap.supported) {
+        throw E.stError(E.ERROR_CODES.UNSUPPORTED_INPUT,
+          `不支持该 TIFF 文件：${cap.reason}`, { kind: 'tiff-sniff' });
+      }
+      sourceAdapter = cap.adapter;
+    } else if (!E.magicSupported(head)) {
       throw E.stError(E.ERROR_CODES.UNSUPPORTED_INPUT, '不是本工具支持的 KFB/KFBF 文件（文件头不符）');
     }
     this._setState('probing');
@@ -577,6 +588,9 @@ export class SlideToolsRunner {
       core: this.coreVersion,
       estimate: doc.estimate || probeResult.estimate,
       modality: doc.modality,
+      // F1: the input adapter that will convert this copy (aperio-svs-jpeg
+      // for TIFF inputs; null for KFB/KFBF). Resume refuses on mismatch.
+      sourceAdapter: doc.adapter || sourceAdapter || null,
       outputProfile,
       channelJson,
       channelJsonHash: channelJsonHash(channelJson),
@@ -725,6 +739,13 @@ export class SlideToolsRunner {
            st.lastCommit.st.profile !== journalled)) {
         refuse(`进度记录的输出格式（${journalled}）与任务记录不符`, { kind: 'output-profile' });
       }
+      // F1: committed progress belongs to the input adapter that wrote it
+      const journalledAdapter = st.gen.sourceAdapter || null;
+      const recordAdapter = record.sourceAdapter || null;
+      if (journalledAdapter !== recordAdapter) {
+        refuse(`进度记录的输入适配器（${journalledAdapter || 'kfb'}）与任务记录（${recordAdapter || 'kfb'}）不符`,
+          { kind: 'source-adapter' });
+      }
       if (st.lastCommit) {
         resume = { st: st.lastCommit.st };
       }
@@ -747,6 +768,14 @@ export class SlideToolsRunner {
     const channels = modality === 'fluorescence' ? (doc.channels || []).length : 1;
     const estimate = doc.estimate || probeResult.estimate;
     const identity = record.identity;
+    // F1: the staged copy's true adapter (wasm probe); a resume whose record
+    // names another adapter is refused — the committed bytes belong to it
+    const sourceAdapter = doc.adapter || record.sourceAdapter || null;
+    if (resumeJobId && (record.sourceAdapter || null) !== sourceAdapter) {
+      throw E.stError(E.ERROR_CODES.RESUME_REFUSED,
+        `任务记录的输入适配器（${record.sourceAdapter || 'kfb'}）与源副本（${sourceAdapter || 'kfb'}）不符`,
+        { kind: 'source-adapter' });
+    }
     // fresh runs write nothing they reuse, so a prepared/never-journalled
     // record without the field takes today's default; resumes keep theirs
     const outputProfile = checkedOutputProfile(resumeJobId
@@ -767,6 +796,7 @@ export class SlideToolsRunner {
       cap: opts.outputCapBytes || null,
       estimate,
       modality,
+      sourceAdapter,
       outputProfile,
     });
 
@@ -780,6 +810,7 @@ export class SlideToolsRunner {
         resume, nextGen, identity,
         coreVersion: this.coreVersion,
         modality,
+        sourceAdapter,
         outputProfile,
         scratchLevels: levels,
         scratchIfdCount: levels * channels,

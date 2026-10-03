@@ -5,7 +5,11 @@
 // referenced ONLY by alias + sha256 — file names never enter the report or
 // logs (plan §10.1).
 //
+// F1: `--svs <file.svs>` converts an SVS input through the browser tool and
+// compares against BOTH native output profiles (bf-ome and bf-classic).
+//
 //   node run_parity.js --samples <切片文件夹> [--fl] [--port 8944]
+//   node run_parity.js --svs <sample.svs> [--port 8944]
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -14,6 +18,7 @@ const L = require('./lib.js');
 
 const PORT = Number(L.arg('port', '8944'));
 const SAMPLES = L.arg('samples', '');
+const SVS = L.arg('svs', '');
 const WITH_FL = process.argv.includes('--fl');
 // --fl-all: every KFBF sample (aliases KFBF-A..D, sorted), not just the first
 const FL_ALL = process.argv.includes('--fl-all');
@@ -24,10 +29,11 @@ function sortedBy(p, ext) {
     .map((f) => path.join(p, f));
 }
 
-async function convertInBrowser(page, input, profileId) {
+async function convertInBrowser(page, input, profileId, outputProfile) {
   await L.clearJobs(page);
   await L.setFile(page, input);
-  const jobId = await page.evaluate((p) => window.__c2.start({ profileId: p }), profileId);
+  const jobId = await page.evaluate(([p, o]) => window.__c2.start({ profileId: p, outputProfile: o }),
+    [profileId, outputProfile]);
   const done = await page.evaluate(() => window.__c2.awaitDone(60 * 60 * 1000));
   if (!done || !done.ok) throw new Error('browser conversion failed: ' + JSON.stringify(done).slice(0, 300));
   const hash = await page.evaluate((id) => window.__c2.hashArtifact(id), jobId);
@@ -35,7 +41,54 @@ async function convertInBrowser(page, input, profileId) {
   return { jobId, done, hash, rec };
 }
 
+/// F1: one SVS input, browser conversion (both brightfield profiles) vs the
+/// native CLI bytes of the same profile. Public CC0 samples carry their own
+/// names; the file name never enters the report.
+async function mainSvs() {
+  if (!SVS || !fs.existsSync(SVS)) throw new Error('--svs <file> required');
+  const outDir = path.join(L.GATE, 'parity-svs');
+  fs.mkdirSync(outDir, { recursive: true });
+  const results = { runs: [], startedAt: new Date().toISOString() };
+
+  const server = await L.startServer(PORT);
+  process.on('exit', () => { try { server.kill('SIGKILL'); } catch { /* */ } });
+  const { context, page } = await L.launch({ label: LABEL + '-svs' });
+  try {
+    await L.open(page, PORT);
+    for (const profile of ['bf-ome', 'bf-classic']) {
+      const nativeOut = path.join(outDir, `svs-native-${profile === 'bf-ome' ? 'ome' : 'classic'}.tif`);
+      execFileSync(L.CLI, ['convert', SVS, nativeOut, '--overwrite', '--profile', profile]);
+      const nativeSha = await L.sha256File(nativeOut);
+      const t0 = Date.now();
+      const r = await convertInBrowser(page, SVS, 'saver', profile);
+      const equal = r.hash.sha256 === nativeSha;
+      results.runs.push({
+        input: path.basename(SVS), bytes: fs.statSync(SVS).size,
+        sourceFormat: (r.rec && r.rec.result && r.rec.result.source_format) || null,
+        outputProfile: profile,
+        browserSha256: r.hash.sha256, nativeSha256: nativeSha, equal,
+        outputBytes: r.done.outputBytes, convertMs: r.rec.convertMs,
+        validation: { ifdCount: r.rec.validation.ifd_count, checks: r.rec.validation.checks },
+        wallMs: Date.now() - t0,
+      });
+      console.log(`SVS ${profile}: browser ${r.hash.sha256.slice(0, 16)}… native ${nativeSha.slice(0, 16)}… equal=${equal} (${r.rec.convertMs} ms)`);
+      fs.rmSync(nativeOut, { force: true });
+    }
+  } finally {
+    await context.close().catch(() => { /* */ });
+    server.kill('SIGTERM');
+  }
+  results.finishedAt = new Date().toISOString();
+  results.ok = results.runs.every((r) => r.equal);
+  L.writeJson('parity-svs/result.json', results);
+  console.log(results.ok ? 'SVS PARITY PASS' : 'SVS PARITY FAIL');
+  process.exitCode = results.ok ? 0 : 1;
+}
+
 async function main() {
+  if (SVS) {
+    return mainSvs();
+  }
   if (!SAMPLES || !fs.existsSync(SAMPLES)) {
     throw new Error('--samples <dir> required (private sample folder)');
   }

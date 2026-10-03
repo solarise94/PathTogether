@@ -68,6 +68,12 @@ pub struct TransformResult {
     pub plan_version: u32,
     pub core_version: String,
     pub format: &'static str,
+    /// Input adapter id when the conversion ran through a named source
+    /// adapter (F1: `aperio-svs-jpeg`); `None` for the KFB/KFBF readers.
+    pub source_format: Option<&'static str>,
+    /// Version of the input adapter that produced the output (resume refuses
+    /// on mismatch, like the output profile).
+    pub adapter_version: Option<&'static str>,
     pub output_bytes: u64,
     pub output_sha256: Option<String>,
     pub width: u32,

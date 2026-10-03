@@ -598,6 +598,7 @@ async function runJob(msg) {
     core: opts.coreVersion, plan: 1,
     policy: opts.policy, profile: profile.id,
     outputProfile: opts.outputProfile,
+    sourceAdapter: opts.sourceAdapter || null,
     cap: opts.outputCapBytes || null,
     resume: resume ? resume.st : null,
   });

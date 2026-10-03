@@ -602,6 +602,8 @@ fn convert_inner(
 
     let mut result = TransformResult {
         plan_version: plan.plan_version,
+        source_format: None,
+        adapter_version: None,
         core_version: plan.core_version.clone(),
         format,
         output_bytes,

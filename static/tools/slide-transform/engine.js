@@ -813,6 +813,101 @@ export function bundleRootDigest(members) {
   return h.digestHex();
 }
 
+// --------------------------------------------- bundle resume identity (F3) --
+//
+// Review §2 fix: the manifest on disk must never be the EXPECTATION of a
+// resume — it is bundle data that can be replaced together with the members
+// it describes. Resume re-derives the whole identity from the staged OPFS
+// bytes (member digests, canonical member list, count, total length, root
+// digest) and compares it with the identity pinned at prepare time in the
+// job record AND the journal generation. These helpers are pure so the
+// expectation/contract is vitest-covered; the worker does the IO.
+
+/// The pinned bundle identity of a persisted job record. Returns null for
+/// non-bundle records, {error} when a bundle record cannot pin a source at
+/// all, else the expected values. The saved manifest (record.bundleManifest,
+/// written once at prepare) contributes ONLY the canonical member list —
+/// paths and per-member sizes in prepare order — never the digests resume
+/// must accept.
+export function recordBundleIdentity(rec) {
+  if (!rec || !rec.bundle) return null;
+  const id = rec.identity;
+  if (!id || typeof id.sha256 !== 'string' || !isSafeOffset(id.size)) {
+    return { error: '任务记录缺少包源身份（无法固定源），拒绝续跑' };
+  }
+  const bm = rec.bundleManifest || null;
+  const members = bm && Array.isArray(bm.members)
+    ? bm.members.filter((m) => m && typeof m.path === 'string' && isSafeOffset(m.size))
+    : null;
+  return {
+    sha256: id.sha256,
+    size: id.size,
+    memberCount: members ? members.length
+      : (bm && isSafeOffset(bm.memberCount) ? bm.memberCount : null),
+    memberPaths: members ? members.map((m) => m.path) : null,
+    memberSizes: members ? members.map((m) => m.size) : null,
+    memberSha256: members ? members.map((m) =>
+      typeof m.sha256 === 'string' ? m.sha256 : null) : null,
+    manifestShell: bm
+      ? { v: bm.v, adapter: bm.adapter, adapterVersion: bm.adapterVersion,
+        entry: bm.entry, stem: bm.stem, createdAt: bm.createdAt }
+      : null,
+  };
+}
+
+/// Legacy-tolerant merge of the record's pinned identity with the journal
+/// generation's identity (every generation records `identity`; journals
+/// from builds before bundle identity pinning may carry none — then the
+/// record alone decides). A journal that CONTRADICTS the record is itself
+/// a refused mismatch, never silently ignored.
+export function expectedBundleIdentity(rec, journalIdentity) {
+  const fromRecord = recordBundleIdentity(rec);
+  if (!fromRecord || fromRecord.error) return fromRecord;
+  const j = journalIdentity;
+  if (j && typeof j.sha256 === 'string' && isSafeOffset(j.size) &&
+      (j.sha256 !== fromRecord.sha256 || j.size !== fromRecord.size)) {
+    return { error: `进度记录的源身份（${j.sha256.slice(0, 12)}…）` +
+      `与任务记录（${fromRecord.sha256.slice(0, 12)}…）不符，拒绝续跑` };
+  }
+  return { expected: fromRecord };
+}
+
+/// Compare the re-derived identity with the pinned expectation. Returns
+/// null when everything matches, else the first mismatch reason (member
+/// set → per-member size/bytes → count → total length → root digest).
+export function compareBundleIdentity(expected, actual) {
+  const act = actual.members;
+  if (expected.memberPaths) {
+    const want = expected.memberPaths;
+    if (act.length !== want.length) {
+      return `包成员数量 ${act.length} ≠ 任务记录 ${want.length}（源在复制后被修改）`;
+    }
+    for (let i = 0; i < want.length; i++) {
+      if (act[i].path !== want[i]) {
+        return `包成员 ${act[i].path} 不在任务记录的成员表中（期望 ${want[i]}，源在复制后被修改）`;
+      }
+      if (expected.memberSizes && act[i].size !== expected.memberSizes[i]) {
+        return `包成员 ${act[i].path} 大小 ${act[i].size} ≠ 记录 ${expected.memberSizes[i]}`;
+      }
+      if (expected.memberSha256 && expected.memberSha256[i] &&
+          act[i].sha256 !== expected.memberSha256[i]) {
+        return `包成员 ${act[i].path} 摘要与任务记录不符（源在复制后被修改）`;
+      }
+    }
+  }
+  if (expected.memberCount != null && actual.memberCount !== expected.memberCount) {
+    return `包成员数量 ${actual.memberCount} ≠ 任务记录 ${expected.memberCount}`;
+  }
+  if (actual.totalBytes !== expected.size) {
+    return `包总长度 ${actual.totalBytes} ≠ 任务记录 ${expected.size}`;
+  }
+  if (actual.rootDigest !== expected.sha256) {
+    return `包摘要与任务记录不符（${actual.rootDigest.slice(0, 12)}… ≠ ` +
+      `${expected.sha256.slice(0, 12)}…，源在复制后被修改）`;
+  }
+  return null;
+}
+
 // ------------------------------------------------------ output profiles --
 
 /// Output layouts the core can write (`--profile` ids; persisted in job

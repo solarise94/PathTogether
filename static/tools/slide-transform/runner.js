@@ -903,11 +903,28 @@ export class SlideToolsRunner {
         refuse(`画质已改变：任务 ${committedEncoding}，请求 ${opts.encodingProfile}`,
           { kind: 'encoding-profile' });
       }
+      // journal state (read before source verification: its generation
+      // pins the same source identity the record does — both are anchors)
+      const j = await this._readJournal(jobId);
+      const st = j.state;
+      if (!st.gen) {
+        throw E.stError(E.ERROR_CODES.JOB_DIR_MISSING, 'journal 无有效代次记录');
+      }
+      nextGen = st.gen.gen + 1;
       // the staged copy must still be exactly the bytes hashed at staging
       const id = record.identity;
       if (record.bundle) {
-        // F3: re-verify the manifest from OPFS (no original folder handle)
-        const v = await this._request('verify-bundle', { jobId }, 60 * 60 * 1000);
+        // F3 (review §2 fix): recompute the canonical bundle identity from
+        // the staged OPFS members and compare it with the pinned identity
+        // of the record AND the journal generation. The manifest on disk is
+        // verified data, never the expectation — replacing the bundle
+        // together with a self-consistent manifest must not resume.
+        const exp = E.expectedBundleIdentity(record, st.gen.identity || null);
+        if (exp.error) {
+          throw E.stError(E.ERROR_CODES.SOURCE_CHANGED, exp.error);
+        }
+        const v = await this._request('verify-bundle',
+          { jobId, expected: exp.expected }, 60 * 60 * 1000);
         if (v.error) throw v;
       } else {
         const v = await this._request('verify-source', { jobId, size: id.size }, 60 * 60 * 1000);
@@ -916,13 +933,6 @@ export class SlideToolsRunner {
             `源副本与记录不符（长度 ${v.size}/${id.size}${v.sha256 ? '，哈希不同' : ''}），拒绝续跑`);
         }
       }
-      // journal state
-      const j = await this._readJournal(jobId);
-      const st = j.state;
-      if (!st.gen) {
-        throw E.stError(E.ERROR_CODES.JOB_DIR_MISSING, 'journal 无有效代次记录');
-      }
-      nextGen = st.gen.gen + 1;
       const journalled = st.gen.outputProfile || E.recordOutputProfile({ modality: record.modality });
       if (journalled !== E.recordOutputProfile(record) ||
           (st.lastCommit && st.lastCommit.st.profile &&

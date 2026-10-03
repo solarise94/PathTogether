@@ -298,6 +298,65 @@ function installBundleHosts() {
   };
 }
 
+// ---- verify-bundle (F3 resume identity; review §2 fix) ---------------------
+//
+// Resume must re-derive the WHOLE bundle identity from the staged OPFS
+// bytes and compare it with the job's pinned identity (record + journal
+// generation, supplied by the runner). The manifest.json on disk is bundle
+// data like the members: it can be replaced together with them, so its
+// self-reported digests are never the expectation. These helpers keep
+// verify independent of openBundle()'s manifest-based opening.
+
+/// Enumerate the staged bundle's files as flat member paths (recursive;
+/// OPFS names cannot contain '/', so the nesting mirrors the flat path).
+/// `manifest.json` itself is metadata, never a member.
+async function enumerateBundleFiles(dir, prefix = '') {
+  const out = [];
+  for await (const [name, handle] of dir.entries()) {
+    const flat = prefix ? `${prefix}/${name}` : name;
+    if (handle.kind === 'directory') {
+      out.push(...await enumerateBundleFiles(handle, flat));
+    } else if (!prefix && name === 'manifest.json') {
+      continue;
+    } else {
+      out.push(flat);
+    }
+  }
+  return out;
+}
+
+/// Size + sha256 of one member, streamed in bounded chunks through a sync
+/// handle (the handle is opened and closed here — verify never feeds the
+/// wasm hosts, so it shares nothing with probe/convert state).
+async function hashBundleMember(dir, flatPath) {
+  const fh = await E.withRetry(() => bundleFileHandle(dir, flatPath, false), { name: 'bundle member' });
+  const h = await E.withRetry(() => fh.createSyncAccessHandle(), { name: 'bundle member handle' });
+  try {
+    const size = h.getSize();
+    const hasher = new E.Sha256();
+    const CH = 1 << 20;
+    const u8 = new Uint8Array(CH);
+    for (let at = 0; at < size; at += CH) {
+      const n = h.read(u8, { at });
+      if (n <= 0) throw new Error(`bundle member ${flatPath} short read ${n} @${at}`);
+      hasher.update(u8.subarray(0, n));
+    }
+    return { path: flatPath, size, sha256: hasher.digestHex() };
+  } finally {
+    try { h.close(); } catch { /* */ }
+  }
+}
+
+/// Rewrite the checked manifest from the VERIFIED members (plus the shell
+/// from the job record): later opens (probe/convert) go through this file,
+/// so after verification it can only ever describe the pinned bytes.
+async function writeVerifiedBundleManifest(dir, manifest) {
+  const fh = await E.withRetry(() => dir.getFileHandle('manifest.json', { create: true }));
+  const w = await E.withRetry(() => fh.createWritable());
+  await w.write(new TextEncoder().encode(JSON.stringify(manifest)));
+  await w.close();
+}
+
 // -------------------------------------------------------------- stHost IO --
 
 
@@ -984,28 +1043,72 @@ self.onmessage = async (ev) => {
     return;
   }
   if (m.type === 'verify-bundle') {
-    // resume identity: re-hash every member from OPFS (no original handle)
+    // resume identity (F3, review §2 fix): recompute EVERYTHING from the
+    // staged OPFS members — per-member size/sha256, the canonical member
+    // list, member count, total length and the root digest — and compare
+    // with the expected identity the runner pinned from the job record and
+    // journal generation. Never trust the checked manifest's self-reported
+    // digests: a replaced bundle shipped with a self-consistent manifest
+    // must refuse exactly like a bare member change.
     try {
-      await openBundle(m.jobId);
-      for (const mbr of bundleMembers) {
-        if (mbr.size !== mbr.wantSize) {
-          throw E.stError(E.ERROR_CODES.SOURCE_CHANGED,
-            `成员 ${mbr.name} 大小 ${mbr.size} ≠ 记录 ${mbr.wantSize}`);
-        }
-        const h = new E.Sha256();
-        const CH = 1 << 20;
-        const u8 = new Uint8Array(CH);
-        for (let at = 0; at < mbr.size; at += CH) {
-          const n = mbr.handle.read(u8, { at });
-          h.update(u8.subarray(0, n));
-        }
-        const got = h.digestHex();
-        if (got !== mbr.wantSha256) {
-          throw E.stError(E.ERROR_CODES.SOURCE_CHANGED,
-            `成员 ${mbr.name} 摘要与清单不符（源在复制后被修改）`);
+      const expected = m.expected || null;
+      if (!expected || typeof expected.sha256 !== 'string' ||
+          !E.isSafeOffset(expected.size)) {
+        throw E.stError(E.ERROR_CODES.SOURCE_CHANGED,
+          '任务记录缺少包源身份（无法固定源），拒绝续跑');
+      }
+      const dir = await opfsBundleDir(m.jobId, false);
+      // canonical member order: the record's saved list (as at prepare);
+      // a legacy record without it falls back to the manifest's path order
+      // (the root-digest comparison below still pins the content)
+      let wantPaths = Array.isArray(expected.memberPaths)
+        ? expected.memberPaths : null;
+      let shell = expected.manifestShell || null;
+      if (!wantPaths || !shell) {
+        const mfh = await E.withRetry(() => dir.getFileHandle('manifest.json'));
+        const cur = JSON.parse(new TextDecoder().decode(
+          await (await mfh.getFile()).slice(0, 1 << 20).arrayBuffer()));
+        if (!wantPaths) wantPaths = (cur.members || []).map((x) => x && x.path);
+        if (!shell) {
+          shell = { v: cur.v, adapter: cur.adapter,
+            adapterVersion: cur.adapterVersion, entry: cur.entry,
+            stem: cur.stem, createdAt: cur.createdAt };
         }
       }
-      post({ type: 'reply', id: m.id, ok: true, result: { verified: bundleMembers.length } });
+      // member-set equality first: a member added or removed on disk is a
+      // source change even when the remaining bytes still hash as recorded
+      const onDisk = new Set(await enumerateBundleFiles(dir));
+      const missing = wantPaths.filter((p) => !onDisk.has(p));
+      const extra = [...onDisk].filter((p) => !wantPaths.includes(p));
+      if (missing.length || extra.length) {
+        const parts = [];
+        if (missing.length) parts.push(`缺少 ${missing.join('、')}`);
+        if (extra.length) parts.push(`多出 ${extra.join('、')}`);
+        throw E.stError(E.ERROR_CODES.SOURCE_CHANGED,
+          `包成员与任务记录不符（${parts.join('；')}，源在复制后被修改）`);
+      }
+      const members = [];
+      for (const p of wantPaths) members.push(await hashBundleMember(dir, p));
+      const actual = {
+        members,
+        memberCount: members.length,
+        totalBytes: members.reduce((a, x) => a + x.size, 0),
+        rootDigest: E.bundleRootDigest(members),
+      };
+      const reason = E.compareBundleIdentity(expected, actual);
+      if (reason) throw E.stError(E.ERROR_CODES.SOURCE_CHANGED, reason);
+      // verified: normalise the manifest so probe/convert open exactly the
+      // pinned members even if the checked manifest was doctored
+      await writeVerifiedBundleManifest(dir, {
+        ...shell,
+        members: actual.members,
+        memberCount: actual.memberCount,
+        totalBytes: actual.totalBytes,
+        rootDigest: actual.rootDigest,
+      });
+      post({ type: 'reply', id: m.id, ok: true, result: {
+        verified: actual.memberCount, memberCount: actual.memberCount,
+        totalBytes: actual.totalBytes, rootDigest: actual.rootDigest } });
     } catch (e) {
       post({ type: 'reply', id: m.id, ok: false,
         result: E.isStError(e) ? e : E.stError('io_recoverable', E.errText(e)) });

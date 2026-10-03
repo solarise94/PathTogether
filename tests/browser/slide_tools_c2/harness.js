@@ -177,6 +177,88 @@ window.__c2 = {
     await w.close();
     return true;
   },
+  // review §2 negative case: replace the staged bundle AND keep its
+  // manifest self-consistent (member size/sha256 + rootDigest updated)
+  // while the job record and journal stay untouched. kinds:
+  //   'metadata' — Slidedat.ini OBJECTIVE_MAGNIFICATION 20 → 40 (same size)
+  //   'pixel'    — a Data*.dat member replaced with different bytes
+  //   'add'      — a new member file added to the bundle + manifest
+  //   'remove'   — a member file deleted from the bundle + manifest
+  async mutateBundleAndManifest(o = {}) {
+    const E = await import('/tools/engine.js');
+    const root = await navigator.storage.getDirectory();
+    const jobs = await root.getDirectoryHandle('slide-jobs');
+    const dir = await jobs.getDirectoryHandle(o.job || currentJob);
+    const bundle = await dir.getDirectoryHandle('bundle');
+    const mf = await bundle.getFileHandle('manifest.json');
+    const manifest = JSON.parse(await (await mf.getFile()).text());
+    const oldRoot = manifest.rootDigest;
+    const enc = new TextEncoder();
+    const memberHandle = async (flatPath, create = false) => {
+      const segs = flatPath.split('/');
+      let d = bundle;
+      for (let i = 0; i < segs.length - 1; i++) {
+        d = await d.getDirectoryHandle(segs[i], { create });
+      }
+      return d.getFileHandle(segs[segs.length - 1], { create });
+    };
+    const writeMember = async (flatPath, bytes) => {
+      const fh = await memberHandle(flatPath, true);
+      const w = await E.withRetry(() => fh.createWritable());
+      await w.write(bytes);
+      await w.close();
+    };
+    const kind = o.kind || 'metadata';
+    let changed = null;
+    if (kind === 'metadata' || kind === 'pixel') {
+      const member = manifest.members.find((x) => kind === 'metadata'
+        ? x.path.endsWith('/Slidedat.ini') : /Data\d*\.dat$/.test(x.path));
+      if (!member) throw new Error(`no ${kind} member in manifest`);
+      let bytes = new Uint8Array(await (await (await memberHandle(member.path)).getFile()).arrayBuffer());
+      if (kind === 'metadata') {
+        const text = new TextDecoder().decode(bytes);
+        const next = text.replace('OBJECTIVE_MAGNIFICATION = 20', 'OBJECTIVE_MAGNIFICATION = 40');
+        if (next === text) throw new Error('no source mutation');
+        bytes = enc.encode(next);
+      } else {
+        bytes = bytes.slice();
+        bytes[Math.floor(bytes.length / 2)] ^= 0xff;
+      }
+      await writeMember(member.path, bytes);
+      member.size = bytes.length;
+      member.sha256 = E.sha256Hex(bytes);
+      changed = member.path;
+    } else if (kind === 'add') {
+      const path = `${manifest.stem || 'synthetic'}/Extra.dat`;
+      const bytes = enc.encode('extra member bytes (not part of the recorded job)');
+      await writeMember(path, bytes);
+      manifest.members.push({ path, size: bytes.length, sha256: E.sha256Hex(bytes) });
+      changed = path;
+    } else if (kind === 'remove') {
+      const member = manifest.members.find((x) => /Data\d*\.dat$/.test(x.path));
+      if (!member) throw new Error('no data member in manifest');
+      const fh = await memberHandle(member.path);
+      await fh.getFile(); // NotFound bubbles if already gone
+      const segs = member.path.split('/');
+      let d = bundle;
+      for (let i = 0; i < segs.length - 1; i++) d = await d.getDirectoryHandle(segs[i]);
+      // a dying worker's sync handle can linger briefly (C0 ADR §7) — retry
+      await E.withRetry(() => d.removeEntry(segs[segs.length - 1]),
+        { attempts: 12, delayMs: 300, name: 'mutateBundle remove' });
+      manifest.members = manifest.members.filter((x) => x !== member);
+      changed = member.path;
+    } else {
+      throw new Error(`unknown kind ${kind}`);
+    }
+    manifest.rootDigest = E.bundleRootDigest(manifest.members);
+    manifest.memberCount = manifest.members.length;
+    manifest.totalBytes = manifest.members.reduce((a, x) => a + x.size, 0);
+    const w = await E.withRetry(() => mf.createWritable());
+    await w.write(enc.encode(JSON.stringify(manifest)));
+    await w.close();
+    return { kind, changed, oldRoot, newRoot: manifest.rootDigest,
+      rootChanged: oldRoot !== manifest.rootDigest };
+  },
   async ready() { await ensureRunner(); return { coreVersion: runner.coreVersion }; },
   async probe(o = {}) {
     await ensureRunner();

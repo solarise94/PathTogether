@@ -194,6 +194,53 @@ and the next runner sweeps it (C2-proven).
    KFB edge tile; the pinned KFB hashes caught it before anything shipped
    (all four pins restored exactly after the fix).
 
+### 1.6 Review fix (§2): bundle identity on resume (2026-10-03)
+
+The independent review (`ux-formats-independent-review-20261003.md` §2)
+found that `verify-bundle` only checked the current members against the
+*current* manifest's own size/hash fields: replacing the staged bundle
+together with a self-consistent `manifest.json` (member digests + rootDigest
+updated) resumed successfully even though the bytes no longer belonged to
+the original job.
+
+**Identity model.** At prepare the job record pins `identity =
+{name, size, sha256 = rootDigest}` where the root digest is `sha256` over
+`path\0size\0sha256\n` lines in the canonical prepare order (entry,
+Slidedat, Index, `FILE_i`…), and keeps the full manifest as
+`bundleManifest`. Every journal generation records the same `identity`.
+
+**What resume compares now.** The runner derives the expectation from the
+record and the journal generation (`expectedBundleIdentity`,
+legacy-tolerant: journals written before identity pinning carry none and
+then the record alone decides; a journal that contradicts the record is
+refused). `verify-bundle` re-reads every member from OPFS and recomputes
+per-member size/sha256, the canonical member set (a member added or removed
+on disk is refused even when the remaining bytes still hash as recorded),
+member count, total length and the root digest itself
+(`compareBundleIdentity`); any mismatch is the existing
+`source_changed_refuse_resume` contract (the page shows the existing
+source-changed message). The checked manifest's self-reported digests are
+never the expectation; after a successful verification the manifest is
+rewritten from the verified members, so probe/convert can only open the
+pinned bytes. Helpers are pure and vitest-covered
+(`tests/js/tools-bundle-identity.test.ts`, 15 tests). No Rust change.
+
+**Old fails / new passes.** The reviewer's original reproduction (bundle +
+manifest replaced, job record and journal untouched): before the fix
+`resume.refused=false`, the run completed `ready` with NEW output; after the
+fix it is refused `source_changed_refuse_resume` with no new output. As C2
+fault rows (`run_faults.js`, same steps: gen-mrxs bundle → `crashAtWrite:4`
+→ terminate worker → replace bundle + manifest self-consistently → bare
+resume): `mrxs-bundle-and-manifest-replaced-refused` (metadata member,
+OBJECTIVE_MAGNIFICATION 20→40), `mrxs-pixel-member-and-manifest-replaced-refused`
+(Data*.dat replaced), `mrxs-member-added-manifest-updated-refused`,
+`mrxs-member-removed-manifest-updated-refused` — all four FAIL on the old
+code (three do not refuse at all; the remove case only dies later at
+re-probe with the wrong code) and PASS on the new. The honest interrupted
+resume of the unchanged bundle still finishes byte-identical to the native
+reference (full fault matrix 43/43, parity and smoke unchanged; wasm
+byte-identical).
+
 ## 2. Support matrix (probe = authoritative; both outputs share one accept rule)
 
 | Input | Verdict | Reason / detail |

@@ -381,7 +381,9 @@ per-level bucket index for 368 501 L0 tiles). Placements are per-level, the
 image cache is 32 MiB-bounded, the canvas is one tile, scratch = the
 offset/count streams. Saved-1_16 native convert: 1 s. Browser conversion
 runs inside the existing single-worker profile caps; the member copy uses
-one 4 MiB buffer. No OOM events in any gated run.
+one 4 MiB buffer. No OOM events in any gated run. Since the independent
+review the adapter additionally holds these numbers under the **saver**
+budget itself and refuses over-budget metadata pre-allocation — §8.1.
 
 ## 6. Not verified / open issues
 
@@ -428,3 +430,138 @@ convert_mirax,inflate,mirax_fixture}.rs`, `crates/core/examples/{mrxs_roi,
 mrxs_bench}.rs`, `crates/core/tests/mirax.rs`,
 `tests/js/tools-mrxs-input.test.ts`, `tests/test_slide_mirax_viewer.py`,
 this report.
+
+## 8. Review fixes (§1, §3 — independent review 2026-10-03)
+
+Fixes for `docs/slide-tools/ux-formats-independent-review-20261003.md`
+§1 (P1: probe/convert allocations unbounded by the resource profile) and
+§3 (P2: the GT pixel gate passed with missing/empty ROI material). §2
+(bundle identity on resume) is fixed separately in the `fixbundle-wt`
+worktree.
+
+### 8.1 §1 — memory budget model
+
+The adapter's working set is now bounded by the host's actual resource
+budget, checked BEFORE each large allocation
+(`crates/core/src/budget.rs::MemBudget`):
+
+- **Host budget in**: native CLI `--memory-budget BYTES` on
+  `probe`/`convert` (conservative default = the browser `saver` profile's
+  **192 MiB**); wasm `probeBundle(budgetBytes)` /
+  `convertProfileEncodedBundle(…, budgetBytes)` /
+  `convertResumeProfileEncodedBundle(…, budgetBytes)` — `worker.js` passes
+  the active profile's `budgetBytes`, and the probe-bundle request resolves
+  a profile even at prepare time (`runner.js` sends `profileId`; the worker
+  falls back to saver). A 24 MiB reserve (decoder slack, allocator
+  overhead, process baseline) is subtracted, so the saver cap is
+  176,160,768 B.
+- **Charges** (overflow-checked estimates, refused before allocating):
+  camera positions — raw buffer 9 B/entry + tuple table 16 B/entry
+  (synthesised fallback: 16 B/entry), activity marks 1 B/entry, index
+  page-chain visited set 64 B/page, image records 64 B/record; per convert
+  level — placement sort copies (order element 56 B + stable-sort temporary
+  28 B + output vec 40 B per placement upper bound), CSR `ranges`
+  32 B/placement, `counts/starts/fill` 12 B/tile (+4), `items` 4 B × the
+  tile-span bound, image cache + **decoded-pixel budget** 6 B/px charged
+  before every JPEG decode (trued up to the real size, released on
+  evict/drop — a single oversized member is refused pre-decode), tile
+  canvas/encode 1.5 MB.
+- **Refusal**: new `ErrorCode::ResourceLimitExceeded` with stable code
+  **`resource_profile_insufficient`** — deliberately the code the tool page
+  already maps (`engine.js ERROR_CODES.RESOURCE_PROFILE_INSUFFICIENT`,
+  `tools.err.resource_profile_insufficient`), so browser and CLI surface
+  the same typed error; no new i18n key.
+
+**Reviewer negative, reproduced** (50,883 B bundle, INI
+IMAGENUMBER 5000×5000, `CameraImageDivisionsPerSide = 1`, no position
+buffer → nominal fallback ⇒ 25,000,000 declared positions):
+
+| | old code | new code |
+|---|---|---|
+| `probe`, no cgroup | exit 0, **peak RSS 394,084 KB** | exit 1, typed `resource_profile_insufficient` |
+| `probe`, `MemoryMax=192M` | **exit 137 (SIGKILL/OOM)** | exit 1, typed error (`已计 400000000 B` before any 400 MB allocation) |
+| `convert`, `MemoryMax=192M` | OOM (probe runs first) | exit 1, typed error |
+
+Regressions (committed): Rust
+`large_grid_nominal_fallback_refused_within_budget` builds the reviewer's
+bundle in code (same INI values, tiny members) and asserts the typed error
+under the default saver budget AND a metered pre-allocation peak
+< 64 MiB (per-thread counting allocator — fails on the old code, whose
+probe exited 0 after committing ~400 MB); CLI script
+`scripts/test_mrxs_memory_budget.sh` regenerates the bundle via
+`gen-mrxs` + the INI rewrite and runs probe AND convert under
+`systemd-run --user --scope -q -p MemoryMax=192M -p MemorySwapMax=0`,
+asserting exit 1 + the typed JSON code and no kill signal (exit 137 on the
+old code). `tests/js/tools-mrxs-memory-budget.test.ts` (4) pins the
+worker/runner/`.d.ts` budget wiring.
+
+**Real samples still convert under saver** (native, `MemoryMax=192M`):
+
+| run | peak RSS | wall | output |
+|---|---:|---:|---|
+| CMU-1 probe | 7.0 MB | 0.01 s | — |
+| CMU-1 convert bf-ome | 43.7 MB | 2 m 22 s | **1,075,354,246 B — unchanged** (§4.3) |
+| Mirax2.2-1 probe | 11.2 MB | 0.03 s | — |
+| Mirax2.2-1 convert bf-ome | 52.3 MB | 9 m 26 s | 5,453,168,505 B |
+| CMU-1-Saved-1_16 convert bf-ome / bf-classic | — | 1 s | pins hold `42f3c650…` / `77d3b1b8…` |
+
+No real sample needed a budget raise — the metadata working set of every
+public sample is a few MB (declared camera grids of ~20 K positions, not
+the synthetic 25 M).
+
+### 8.2 §3 — GT gate fails closed
+
+The checker is factored into `compare_gt_rois` (tests/mirax.rs) with
+fail-closed rules; every violation is an error **naming the ROI**:
+reference raw must exist and be exactly `w·h·3` bytes (no more silent
+`continue`, no zip truncation), a mask sidecar must be exactly
+`⌈w·h/8⌉` bytes with **non-trivial valid coverage (≥ 1 %** of the ROI —
+an almost-fully-transparent mask verifies nothing), the ROI must be
+in-bounds and compose, the output must be exactly `w·h·3` bytes, and at
+least one level-0 AND one reduced-level ROI must actually have been
+compared.
+
+Committed negatives (reviewer's `missing-gt/rois.json` semantics: one L0 +
+one L1 16×16 ROI; the source bundle is generated in code):
+
+| negative | old gate | new gate |
+|---|---|---|
+| both raw files missing | **PASS** (`worst L0 mean 0.0000, worst L1+ mean 0.0000`) | `gt_gate_fails_when_reference_raw_files_are_missing` — FAILED naming `roi-l0-missing-l0` |
+| both raw files 0 bytes | **PASS** | `gt_gate_fails_when_reference_raw_files_are_empty` — FAILED: `参考 raw 长度 0 ≠ w*h*3 = 768` |
+
+Strict gate re-run on freshly regenerated real ROI material (same
+`.gate-tmp/f3/{gen_rois,export_gt}.py` scripts, all levels, 256-px ROIs;
+ROIs with 0 % opaque coverage — OpenSlide fully-transparent regions — are
+dropped at generation time and counted, never silently compared):
+
+| sample | ROIs compared (L0 / L1+) | worst L0 mean | worst L1+ mean | gate |
+|---|---|---:|---:|---|
+| CMU-1-Saved-1_16 | 3 / 15 (18 exported) | **0.0000** | 8.9373 | PASS |
+| CMU-1 | 3 / 27 (30 exported) | **0.0000** | 8.1816 | PASS |
+| Mirax2.2-1 | 1 / 18 (19 kept; 11 dropped at 0.0 % opaque) | **0.0000** | 15.5978 | PASS |
+
+The numbers reproduce §4.2 (8.94 / 8.18 / 15.60) under the strict gate.
+
+### 8.3 Files changed for this round
+
+New: `slide-transform-core/crates/core/src/budget.rs` (MemBudget +
+element-size constants), `scripts/test_mrxs_memory_budget.sh` (CLI cgroup
+negative), `tests/js/tools-mrxs-memory-budget.test.ts` (budget wiring).
+Modified: `crates/core/src/{error,lib,plan,mirax,convert_mirax}.rs`
+(resource-limit code, budget account, probe/convert charges),
+`crates/core/tests/mirax.rs` (metered allocator, large-grid negative,
+strict GT checker + 2 negatives), `crates/cli/src/main.rs`
+(`--memory-budget` on probe/convert), `crates/wasm/src/lib.rs` (budget
+params on the three bundle entry points),
+`static/tools/slide-transform/{runner,worker}.js` (budget plumbing only)
++ rebuilt wasm/glue/`.d.ts`/manifest, this report.
+
+Gate re-run after the fixes (serial): Rust workspace
+`--features slide-transform-core/fixtures` **148 passed** (mirax 22 =
+19 + 3 new); vitest `tests/js` **748 passed / 46 files**; C2 smoke
+preserve `6e8744f9…` / compact `7e2f4f82…` (pins), fault matrix **39/39**,
+parity MRXS `42f3c650…`/`77d3b1b8…` + SVS Small-Region
+`fcb6d171…`/`dcefe860…` + KFB-1 `374c70c8…` (pins), native pin re-check
+KFB-1 classic `385a59c6…` / compact `86131cab…`, SVS CMU-1
+`9d1ac1e8…`/`00198666…`, `test_no_whole_file.js` PASS, pytest
+mirax/svs/upload-capability **18 passed**.

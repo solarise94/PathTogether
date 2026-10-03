@@ -29,6 +29,7 @@
 //! decoding; output stays byte-identical to an uninterrupted run.
 
 use crate::bigtiff::{BigTiffPyramidWriter, LevelExtras};
+use crate::budget::MemBudget;
 use crate::bundle::BundleFs;
 use crate::convert_bf::{compact_sampling_label, compact_sampling_tiff};
 use crate::error::{CoreError, CoreResult};
@@ -36,7 +37,7 @@ use crate::io::{RandomAccessSink, ScratchFactory};
 use crate::job::{JobControl, NullProgress, Progress, ProgressUnit};
 use crate::jpeg;
 use crate::mirax::{
-    probe_mirax, MiraxDoc, Placement, ADAPTER_VERSION, SOURCE_FORMAT,
+    probe_mirax_with_budget, MiraxDoc, Placement, ADAPTER_VERSION, SOURCE_FORMAT,
 };
 use crate::ome::py_repr_f64;
 use crate::ome_writer::{OmeBigTiffWriter, RgbIfdExtras};
@@ -109,25 +110,45 @@ struct ImageCache<'a> {
     doc: &'a MiraxDoc,
     level: usize,
     entries: std::collections::HashMap<u32, jpeg::DecodedImage>,
+    /// bytes charged against the budget per cached image (true-up'd to the
+    /// real size after decode; released on eviction and on drop)
+    charged: std::collections::HashMap<u32, u64>,
     order: std::collections::VecDeque<u32>,
     bytes: usize,
     expect_w: u32,
     expect_h: u32,
     decodes: u64,
+    budget: &'a mut MemBudget,
+}
+
+impl Drop for ImageCache<'_> {
+    fn drop(&mut self) {
+        // whatever is still cached is freed here
+        self.budget.release(self.bytes as u64);
+        self.bytes = 0;
+        self.charged.clear();
+    }
 }
 
 impl<'a> ImageCache<'a> {
-    fn new(fs: &'a dyn BundleFs, doc: &'a MiraxDoc, level: usize) -> Self {
+    fn new(
+        fs: &'a dyn BundleFs,
+        doc: &'a MiraxDoc,
+        level: usize,
+        budget: &'a mut MemBudget,
+    ) -> Self {
         ImageCache {
             fs,
             doc,
             level,
             entries: Default::default(),
+            charged: Default::default(),
             order: Default::default(),
             bytes: 0,
             expect_w: doc.levels[level].section.image_w as u32,
             expect_h: doc.levels[level].section.image_h as u32,
             decodes: 0,
+            budget,
         }
     }
 
@@ -150,12 +171,28 @@ impl<'a> ImageCache<'a> {
                 )));
             }
             let max_pixels = (self.expect_w as u64) * (self.expect_h as u64);
+            // Review §1: decoded-pixel budget — the charge is refused BEFORE
+            // any decode allocation. Estimate = cached RGB (3 B/px) + decoder
+            // transient (component planes + upsample buffers, ≤ 3 B/px). A
+            // single member whose DIGITIZER-declared pixel area cannot fit
+            // the budget is a typed refusal, never an OOM mid-decode.
+            let est = max_pixels.saturating_mul(6);
+            self.budget.charge(est, "JPEG 解码（缓存图像 + 解码器临时）")?;
+            let charge_raw = raw.len() as u64;
+            self.budget.charge(charge_raw, "JPEG 原始载荷读取")?;
             // true colourspace from the stream's own markers (the MIRAX
             // camera JPEGs are JFIF YCbCr — mostly 4:2:2/4:2:0); only an
             // Adobe-transform-0 stream without JFIF decodes as RGB
             let force_rgb = !probe.jfif && probe.adobe_transform == Some(0);
-            let dec = jpeg::decode_ex(&raw, max_pixels.max(1 << 16), force_rgb)?;
+            let dec = match jpeg::decode_ex(&raw, max_pixels.max(1 << 16), force_rgb) {
+                Ok(d) => d,
+                Err(e) => {
+                    self.budget.release(est + charge_raw);
+                    return Err(e);
+                }
+            };
             if dec.width != self.expect_w || dec.height != self.expect_h {
+                self.budget.release(est + charge_raw);
                 return Err(CoreError::variant(format!(
                     "层 {} 图像 {} 尺寸 {}×{} ≠ DIGITIZER {}×{}",
                     self.level,
@@ -176,7 +213,9 @@ impl<'a> ImageCache<'a> {
                     v
                 }
             };
+            self.budget.release(charge_raw);
             let sz = data.len();
+            self.budget.reconcile(est, sz as u64, "缓存图像数据")?;
             while self.bytes + sz > IMAGE_CACHE_BYTES {
                 let evict = self
                     .order
@@ -184,9 +223,13 @@ impl<'a> ImageCache<'a> {
                     .ok_or_else(|| CoreError::validation("图像缓存不变量破坏"))?;
                 if let Some(e) = self.entries.remove(&evict) {
                     self.bytes -= e.data.len();
+                    if let Some(c) = self.charged.remove(&evict) {
+                        self.budget.release(c);
+                    }
                 }
             }
             self.bytes += sz;
+            self.charged.insert(img, sz as u64);
             self.order.push_back(img);
             self.decodes += 1;
             self.entries
@@ -337,12 +380,18 @@ pub fn compose_region(
         return Err(CoreError::validation("ROI 越界"));
     }
     let fill = lv.section.fill_rgb;
+    let mut budget = doc.budget.clone();
+    budget.charge(
+        (w as u64).saturating_mul(h as u64).saturating_mul(3),
+        "ROI 画布",
+    )?;
     let mut canvas = vec![0u8; w as usize * h as usize * 3];
     for px in canvas.chunks_exact_mut(3) {
         px.copy_from_slice(&fill);
     }
+    charge_level_index(&mut budget, lv)?;
     let placements = doc.placements(level);
-    let mut cache = ImageCache::new(fs, doc, level);
+    let mut cache = ImageCache::new(fs, doc, level, &mut budget);
     for p in &placements {
         let x0 = (p.dst.0).max(x as i64);
         let y0 = (p.dst.1).max(y as i64);
@@ -713,6 +762,36 @@ pub fn convert_mirax_to_bigtiff_resume(
     convert_inner(fs, stem, sink, scratch, plan, job, Some(resume))
 }
 
+/// Review §1: checked byte estimate for one level's placement/bucket
+/// structures, charged BEFORE they are built. The caller releases the amount
+/// when the level's structures are dropped.
+fn charge_level_index(budget: &mut MemBudget, lv: &crate::mirax::MiraxLevel) -> CoreResult<u64> {
+    let tpi2 =
+        lv.params.tiles_per_image.saturating_mul(lv.params.tiles_per_image) as u64;
+    let pl = (lv.images.len() as u64).saturating_mul(tpi2);
+    let across = (lv.width as u64).div_ceil(OUT_TILE as u64);
+    let down = (lv.height as u64).div_ceil(OUT_TILE as u64);
+    let tiles = across.checked_mul(down).ok_or_else(|| {
+        CoreError::resource_limit("输出 tile 网格数溢出")
+    })?;
+    // a placement intersects at most (span/256 + 2) tiles per axis
+    let sw = (lv.params.tile_w.ceil().max(1.0)) as u64;
+    let sh = (lv.params.tile_h.ceil().max(1.0)) as u64;
+    let ix = (sw / OUT_TILE as u64 + 2).min(across).max(1);
+    let iy = (sh / OUT_TILE as u64 + 2).min(down).max(1);
+    // order vec element (16 B key + 40 B placement) + stable-sort temporary
+    // (≤ half) + the collected Vec<Placement> (40 B)
+    let est_placements = pl.saturating_mul(56 + 28 + 40);
+    let est_ranges = pl.saturating_mul(32); // (x0,x1,y0,y1) i64 quad
+    let est_csr = tiles.saturating_mul(12).saturating_add(4); // counts+starts+fill
+    let est_items = pl.saturating_mul(ix).saturating_mul(iy).saturating_mul(4);
+    budget.charge(est_placements, "placement 排序与副本")?;
+    budget.charge(est_ranges, "CSR ranges")?;
+    budget.charge(est_csr, "CSR counts/starts/fill")?;
+    budget.charge(est_items, "CSR items")?;
+    Ok(est_placements + est_ranges + est_csr + est_items)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn convert_inner(
     fs: &dyn BundleFs,
@@ -724,8 +803,19 @@ fn convert_inner(
     resume: Option<&ResumePoint>,
 ) -> CoreResult<TransformResult> {
     let started = crate::job::WallInstant::now();
-    let doc = probe_mirax(fs, stem)?;
+    let doc = probe_mirax_with_budget(fs, stem, plan.limits.memory_budget_bytes)?;
     let levels = &doc.levels;
+    // Review §1: the conversion continues the probe's memory account (the
+    // probe's positions/images stay alive in `doc`) and charges every
+    // per-level structure — placement sort copies, CSR bucket arrays, the
+    // image cache and the decoded-pixel budget — before allocating it.
+    let mut budget = doc.budget.clone();
+    budget.charge(
+        (OUT_TILE as u64)
+            .saturating_mul(OUT_TILE as u64)
+            .saturating_mul(6),
+        "tile 画布与编码缓冲",
+    )?;
     if plan.profile == OutputProfile::OmeBigTiffSubifd {
         return Err(CoreError::variant("荧光 OME profile 不适用于明场 MRXS 输入"));
     }
@@ -846,6 +936,7 @@ fn convert_inner(
             tiles_total,
             ..Default::default()
         };
+        let level_charged = charge_level_index(&mut budget, lv)?;
         let placements = doc.placements(li);
         let buckets = TileBuckets::build(&placements, lv.width, lv.height);
 
@@ -870,6 +961,7 @@ fn convert_inner(
             writer.end(&meta, &[])?;
             ifd_chain.push((li as u32, None));
             level_stats.push(stats);
+            budget.release(level_charged);
             continue;
         }
 
@@ -887,7 +979,7 @@ fn convert_inner(
             writer.begin(scratch, &meta, None)?;
         }
 
-        let mut cache = ImageCache::new(fs, &doc, li);
+        let mut cache = ImageCache::new(fs, &doc, li, &mut budget);
         let fill = lv.section.fill_rgb;
         let shared_fill = fill_ref_of(li);
         let mut canvas = vec![0u8; OUT_TILE as usize * OUT_TILE as usize * 3];
@@ -926,6 +1018,7 @@ fn convert_inner(
             let row_done = cell.div_ceil(stats.tiles_across as u64);
             maybe_progress_and_checkpoint!(writer, job, stats, li, cell, tiles_total, row_done);
         }
+        drop(cache); // releases the cache's charged bytes back to the account
         if writer.cursor() > plan.limits.max_output_bytes {
             return Err(CoreError::too_large(format!(
                 "输出已写 {} > {}",
@@ -948,6 +1041,9 @@ fn convert_inner(
             committed_bytes: writer.cursor(),
         });
         level_stats.push(stats);
+        // the level's placements/CSR buckets are dropped here — give the
+        // account back so later levels are measured against the peak
+        budget.release(level_charged);
     }
     let output_bytes = writer.finish()?;
     if filled_total > 0 && !warnings.iter().any(|w| w == WARN_SPARSE_FILL) {

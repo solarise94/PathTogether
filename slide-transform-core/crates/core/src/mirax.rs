@@ -30,6 +30,7 @@
 //! Brightfield only: `SLIDE_TYPE_BRIGHTFIELD` required; a fluorescence or
 //! multi-channel slide is a typed refusal.
 
+use crate::budget::{elem, MemBudget};
 use crate::bundle::{BundleFs, MAX_MEMBERS};
 use crate::error::{CoreError, CoreResult};
 use crate::inflate;
@@ -206,6 +207,10 @@ pub struct MiraxDoc {
     /// camera positions with a level-0 image (activity set, OpenSlide rule)
     active: Vec<bool>,
     pub associated: Vec<AssociatedSummary>,
+    /// Memory account carried from the probe into the conversion (review §1):
+    /// already holds the probe's persistent allocations; the converter keeps
+    /// charging placements/CSR/cache/decode against the same host budget.
+    pub budget: MemBudget,
 }
 
 impl MiraxDoc {
@@ -293,6 +298,8 @@ impl<'a> IndexReader<'a> {
 }
 
 /// Walk one hier level's data pages, validating and appending image refs.
+/// Every page visited and every image record appended is charged against the
+/// memory budget BEFORE it is materialised (review §1).
 #[allow(clippy::too_many_arguments)]
 fn walk_hier_level(
     r: &mut IndexReader,
@@ -304,6 +311,7 @@ fn walk_hier_level(
     data_members: &[usize],
     images: &mut Vec<ImageRef>,
     payload: &mut u64,
+    budget: &mut MemBudget,
 ) -> CoreResult<()> {
     if r.i32_at(record_ptr)? != 0 {
         return Err(CoreError::index("层级记录首整数非 0"));
@@ -323,6 +331,7 @@ fn walk_hier_level(
                 "数据页链表回环（页 {page} 已访问过）"
             )));
         }
+        budget.charge(elem::PAGE_VISIT, "Index.dat 数据页链表（visited 集）")?;
         pages += 1;
         if pages > MAX_PAGES_PER_RECORD {
             return Err(CoreError::index("数据页数超过上限（链表异常）"));
@@ -373,6 +382,7 @@ fn walk_hier_level(
                     fileno, member_sizes[fileno as usize]
                 )));
             }
+            budget.charge(elem::IMAGE_REF, "图像记录表")?;
             images.push(ImageRef {
                 x,
                 y,
@@ -525,7 +535,25 @@ fn read_position_buffer(
 // probe
 // --------------------------------------------------------------------------- //
 
+/// Probe with the default (saver-profile) memory budget.
 pub fn probe_mirax(fs: &dyn BundleFs, stem: &str) -> CoreResult<MiraxDoc> {
+    probe_mirax_with_budget(fs, stem, crate::budget::SAVER_BUDGET_BYTES)
+}
+
+/// Probe with an explicit host memory budget (review §1): every large
+/// allocation below (position table, image records, page-chain visited set)
+/// is estimated (overflow-checked) and charged BEFORE it is allocated; an
+/// over-budget charge is a typed `resource_profile_insufficient` refusal.
+pub fn probe_mirax_with_budget(
+    fs: &dyn BundleFs,
+    stem: &str,
+    budget_bytes: u64,
+) -> CoreResult<MiraxDoc> {
+    let mut budget = MemBudget::host(budget_bytes);
+    probe_inner(fs, stem, &mut budget)
+}
+
+fn probe_inner(fs: &dyn BundleFs, stem: &str, budget: &mut MemBudget) -> CoreResult<MiraxDoc> {
     // ---- members ------------------------------------------------------- //
     let entry = format!("{stem}.mrxs");
     let Some(entry_idx) = fs.find(&entry) else {
@@ -752,7 +780,12 @@ pub fn probe_mirax(fs: &dyn BundleFs, stem: &str) -> CoreResult<MiraxDoc> {
     }
 
     // ---- camera positions -------------------------------------------------- //
+    // npositions comes from the DECLARED camera grid (IMAGENUMBER ÷ divisions)
+    // and is what every branch below allocates for — the reviewer's negative
+    // (a 51 KB bundle declaring 5000×5000 cameras without a position buffer)
+    // must be refused HERE, before any of it is materialised.
     let npositions = (images_x / divisions) as usize * (images_y / divisions) as usize;
+    let npositions64 = npositions as u64;
     let expected_buf = npositions * 9;
     let vimslide = nonhier_name_offset(&sd, "VIMSLIDE_POSITION_BUFFER")?;
     let stitching = if vimslide.is_none() {
@@ -761,22 +794,48 @@ pub fn probe_mirax(fs: &dyn BundleFs, stem: &str) -> CoreResult<MiraxDoc> {
         None
     };
     let (positions, position_source) = match (vimslide, stitching) {
-        (Some(off), _) => (
-            read_nonhier_record(&mut r, nonhier_root, off, &member_sizes)?
-                .map(|loc| read_position_buffer(fs, &data_members, loc, expected_buf, false, sections[0].concat))
+        (Some(off), _) => {
+            let loc = read_nonhier_record(&mut r, nonhier_root, off, &member_sizes)?;
+            if let Some(loc) = &loc {
+                // raw member slice (loc.2) + tuple table
+                budget.charge(loc.2 as u64, "位置缓冲原始读取")?;
+            }
+            budget.charge_mul(
+                npositions64,
+                elem::POSITION_RAW + elem::POSITION,
+                "VIMSLIDE 位置表（原始缓冲 + 坐标元组）",
+            )?;
+            (
+                loc.map(|loc| {
+                    read_position_buffer(fs, &data_members, loc, expected_buf, false, sections[0].concat)
+                })
                 .transpose()?
                 .unwrap_or_default(),
-            PositionSource::VimslideBuffer,
-        ),
-        (None, Some(off)) => (
-            read_nonhier_record(&mut r, nonhier_root, off, &member_sizes)?
-                .map(|loc| read_position_buffer(fs, &data_members, loc, expected_buf, true, sections[0].concat))
+                PositionSource::VimslideBuffer,
+            )
+        }
+        (None, Some(off)) => {
+            let loc = read_nonhier_record(&mut r, nonhier_root, off, &member_sizes)?;
+            if let Some(loc) = &loc {
+                budget.charge(loc.2 as u64, "位置缓冲原始读取")?;
+            }
+            budget.charge_mul(
+                npositions64,
+                elem::POSITION_RAW + elem::POSITION,
+                "StitchingIntensity 位置表（解码缓冲 + 坐标元组）",
+            )?;
+            (
+                loc.map(|loc| {
+                    read_position_buffer(fs, &data_members, loc, expected_buf, true, sections[0].concat)
+                })
                 .transpose()?
                 .unwrap_or_default(),
-            PositionSource::StitchingIntensity,
-        ),
+                PositionSource::StitchingIntensity,
+            )
+        }
         _ => {
             // synthesise nominal positions (OpenSlide's fallback)
+            budget.charge_mul(npositions64, elem::POSITION, "合成位置表（坐标元组）")?;
             let positions_x = images_x / divisions;
             let mut v = Vec::with_capacity(npositions);
             for i in 0..npositions as u64 {
@@ -835,6 +894,7 @@ pub fn probe_mirax(fs: &dyn BundleFs, stem: &str) -> CoreResult<MiraxDoc> {
     // ---- per-level image walk ----------------------------------------------
     let mut levels: Vec<MiraxLevel> = Vec::with_capacity(zoom_levels);
     let mut total_placements: u64 = 0;
+    budget.charge_mul(npositions64, elem::ACTIVE, "位置活跃标记表")?;
     let mut active: Vec<bool> = vec![false; npositions];
     for li in 0..zoom_levels {
         let record_ptr = r.i32_at(hier_table as u64 + 4 * li as u64)? as i64;
@@ -854,6 +914,7 @@ pub fn probe_mirax(fs: &dyn BundleFs, stem: &str) -> CoreResult<MiraxDoc> {
             &data_members,
             &mut images,
             &mut payload,
+            budget,
         )?;
         total_placements = total_placements.saturating_add(
             (images.len() as u64).saturating_mul(params.tiles_per_image * params.tiles_per_image),
@@ -908,6 +969,7 @@ pub fn probe_mirax(fs: &dyn BundleFs, stem: &str) -> CoreResult<MiraxDoc> {
         positions,
         active,
         associated,
+        budget: budget.clone(),
     })
 }
 

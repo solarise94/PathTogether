@@ -471,7 +471,13 @@ export class SlideToolsRunner {
           entryName: plan.entryName,
           faults: this.testMode ? (opts.faults || null) : null,
         }, 60 * 60 * 1000);
-        probeResult = await this._request('probe-bundle', { jobId }, 60 * 60 * 1000);
+        probeResult = await this._request('probe-bundle', {
+          jobId,
+          // Review §1: probe under the resource profile budget (explicit
+          // choice or the default suggestion — same rule as start/resume)
+          profileId: E.getProfile(opts.profileId ||
+            E.defaultProfileId(navigator.deviceMemory, navigator.hardwareConcurrency)).id,
+        }, 60 * 60 * 1000);
         if (probeResult.error) throw probeResult;
         const doc = probeResult.document;
         const estimate = doc.estimate || probeResult.estimate;
@@ -953,7 +959,11 @@ export class SlideToolsRunner {
 
     // geometry for scratch pre-opening comes from probing the staged copy
     const isBundle = !!(record && record.bundle);
-    const probeResult = await this._request(isBundle ? 'probe-bundle' : 'probe', { jobId }, 60 * 60 * 1000);
+    const probeResult = await this._request(isBundle ? 'probe-bundle' : 'probe', {
+      jobId,
+      // Review §1: probe under this job's resource profile budget
+      profileId: profile.id,
+    }, 60 * 60 * 1000);
     if (probeResult.error) throw probeResult;
     const doc = probeResult.document;
     const modality = doc.modality; // brightfield | fluorescence

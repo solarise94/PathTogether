@@ -9,7 +9,7 @@ use slide_transform_core::convert_mirax::{
 };
 use slide_transform_core::io::{MemScratch, MemSink};
 use slide_transform_core::job::{JobControl, NullProgress};
-use slide_transform_core::mirax::{probe_mirax, PositionSource};
+use slide_transform_core::mirax::{probe_mirax, probe_mirax_with_budget, PositionSource};
 use slide_transform_core::mirax_fixture::{build_synthetic_mrxs, MrxsGenParams};
 use slide_transform_core::plan::{
     EncodingProfile, OutputProfile, PixelPolicy, TransformPlan,
@@ -690,6 +690,133 @@ fn resume_output_is_byte_identical_to_uninterrupted() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ------------------------------------------------- review §1 regression --
+
+/// Opt-in per-thread allocation meter (review §1): measures the peak bytes
+/// allocated on the calling thread while the closure runs, so the large-grid
+/// negative can assert the probe refuses WITHOUT materialising the 25 M
+/// position tuples. Other threads are not metered (depth guard), so the
+/// measurement is stable under the default parallel test runner.
+mod meter {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    pub struct MeteredAlloc;
+
+    thread_local! {
+        static DEPTH: Cell<usize> = const { Cell::new(0) };
+        static CUR: Cell<usize> = const { Cell::new(0) };
+        static PEAK: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn bump(delta: isize) {
+        if DEPTH.with(|d| d.get()) == 0 {
+            return;
+        }
+        CUR.with(|c| {
+            let v = (c.get() as isize + delta).max(0) as usize;
+            c.set(v);
+            let peak = PEAK.with(|p| p.get());
+            if v > peak {
+                PEAK.with(|p| p.set(v));
+            }
+        });
+    }
+
+    unsafe impl GlobalAlloc for MeteredAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let p = System.alloc(layout);
+            if !p.is_null() {
+                bump(layout.size() as isize);
+            }
+            p
+        }
+        unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
+            System.dealloc(p, layout);
+            bump(-(layout.size() as isize));
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let p = System.alloc_zeroed(layout);
+            if !p.is_null() {
+                bump(layout.size() as isize);
+            }
+            p
+        }
+        unsafe fn realloc(&self, p: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let q = System.realloc(p, layout, new_size);
+            if !q.is_null() {
+                bump(new_size as isize - layout.size() as isize);
+            }
+            q
+        }
+    }
+
+    /// Meter the closure's allocation peak on this thread; returns
+    /// `(peak_bytes, result)`.
+    pub fn measure<T>(f: impl FnOnce() -> T) -> (usize, T) {
+        DEPTH.with(|d| d.set(d.get() + 1));
+        CUR.with(|c| c.set(0));
+        PEAK.with(|p| p.set(0));
+        let out = f();
+        let peak = PEAK.with(|p| p.get());
+        DEPTH.with(|d| d.set(d.get() - 1));
+        (peak, out)
+    }
+}
+
+#[global_allocator]
+static METERED: meter::MeteredAlloc = meter::MeteredAlloc;
+
+/// The reviewer's large-grid negative, built in code: the SAME tiny members
+/// as the default fixture, but the INI declares IMAGENUMBER 5000×5000 with
+/// CameraImageDivisionsPerSide = 1 and no position-buffer record (the
+/// supported nominal fallback). Probe must return the typed
+/// `resource_profile_insufficient` refusal BEFORE allocating the 25 M
+/// position tuples (~400 MB) — not get OOM-killed like the old code.
+#[test]
+fn large_grid_nominal_fallback_refused_within_budget() {
+    let fs = build_synthetic_mrxs(&MrxsGenParams::default()).unwrap();
+    let idx = fs.find("synthetic/Slidedat.ini").unwrap();
+    let sd = fs.read_small_member(idx, 1 << 20).unwrap();
+    let text = String::from_utf8_lossy(&sd)
+        .replace("IMAGENUMBER_X = 8", "IMAGENUMBER_X = 5000")
+        .replace("IMAGENUMBER_Y = 6", "IMAGENUMBER_Y = 5000")
+        .replace(
+            "CameraImageDivisionsPerSide = 2",
+            "CameraImageDivisionsPerSide = 1",
+        )
+        .replace(
+            "NONHIER_1_NAME = VIMSLIDE_POSITION_BUFFER",
+            "NONHIER_1_NAME = unused",
+        );
+    let mut fs2 = MemBundle::new();
+    for m in fs.members() {
+        let i = fs.find(&m.name).unwrap();
+        if m.name.ends_with("Slidedat.ini") {
+            fs2.push(&m.name, text.clone().into_bytes());
+        } else {
+            fs2.push(&m.name, fs.read_member_at(i, 0, m.size as usize).unwrap());
+        }
+    }
+
+    // default (saver, 192 MiB) budget: typed refusal, not a kill
+    let e = probe_mirax(&fs2, "synthetic").unwrap_err();
+    assert_eq!(code_of(&e), "resource_profile_insufficient", "{}", e.message);
+    assert!(e.message.contains("位置表"), "{}", e.message);
+    // a tight explicit budget drives the same typed refusal
+    let e = probe_mirax_with_budget(&fs2, "synthetic", 64 * 1024 * 1024).unwrap_err();
+    assert_eq!(code_of(&e), "resource_profile_insufficient", "{}", e.message);
+
+    // the refusal happens BEFORE the allocation: metered peak stays far
+    // below the 400 MB the old code committed before dying under a cgroup
+    let (peak, r) = meter::measure(|| probe_mirax(&fs2, "synthetic"));
+    assert!(r.is_err(), "probe must refuse");
+    assert!(
+        peak < 64 * 1024 * 1024,
+        "probe allocated {peak} B before refusing (must refuse pre-allocation)"
+    );
+}
+
 // ------------------------------------------------- real-sample (env-gated) --
 
 fn env_dir(name: &str) -> Option<std::path::PathBuf> {
@@ -744,9 +871,195 @@ fn real_samples_probe_matches_openslide() {
     }
 }
 
+// ------------------------------------------------------ GT gate (§3) -----
+
+/// Summary of a strict ground-truth ROI comparison.
+#[derive(Default, Debug)]
+struct GtSummary {
+    worst_l0: f64,
+    worst_l1p: f64,
+    compared_l0: usize,
+    compared_l1p: usize,
+}
+
+/// Strict ground-truth comparison of every listed ROI (review §3).
+///
+/// Missing/empty/malformed reference material is a FAILURE naming the ROI —
+/// never a silent skip:
+/// - the reference raw must exist and be EXACTLY `w*h*3` bytes;
+/// - a mask sidecar must be exactly `⌈w*h/8⌉` bytes (exporter's bit-packed
+///   format) with non-trivial valid coverage (≥ 1 % of the ROI);
+/// - the ROI must be inside the level's bounds and compose without error;
+/// - the output must be exactly `w*h*3` bytes (no zip truncation);
+/// - after the loop, at least one level-0 AND one reduced-level ROI must
+///   have actually been compared.
+fn compare_gt_rois(
+    fs: &dyn slide_transform_core::bundle::BundleFs,
+    doc: &slide_transform_core::mirax::MiraxDoc,
+    gt: &std::path::Path,
+    rois: &[serde_json_free::Roi],
+) -> Result<GtSummary, String> {
+    if rois.is_empty() {
+        return Err("rois.json 未列出任何 ROI".to_string());
+    }
+    let mut s = GtSummary::default();
+    for r in rois {
+        let name = format!("roi-l{}-{}", r.level, r.id);
+        let why = |msg: String| -> String {
+            format!(
+                "ROI {name}（level {} {}×{} @ {},{}）: {msg}",
+                r.level, r.w, r.h, r.x, r.y
+            )
+        };
+        if r.level >= doc.levels.len() {
+            return Err(why(format!("level 越界（共 {} 层）", doc.levels.len())));
+        }
+        let lv = &doc.levels[r.level];
+        if r.x as u64 + r.w as u64 > lv.width as u64
+            || r.y as u64 + r.h as u64 > lv.height as u64
+        {
+            return Err(why(format!("区域越界（层尺寸 {}×{}）", lv.width, lv.height)));
+        }
+        let npix = r.w as usize * r.h as usize;
+        let expect3 = npix * 3;
+
+        let raw_path = gt.join(format!("{name}.raw"));
+        let expect = std::fs::read(&raw_path).map_err(|e| {
+            why(format!("参考 raw 缺失/不可读（{}: {e}）", raw_path.display()))
+        })?;
+        if expect.len() != expect3 {
+            return Err(why(format!(
+                "参考 raw 长度 {} ≠ w*h*3 = {expect3}",
+                expect.len()
+            )));
+        }
+        let mine = compose_region(fs, doc, r.level, r.x, r.y, r.w, r.h)
+            .map_err(|e| why(format!("输出合成失败: {}", e.message)))?;
+        if mine.len() != expect3 {
+            return Err(why(format!(
+                "输出长度 {} ≠ w*h*3 = {expect3}",
+                mine.len()
+            )));
+        }
+
+        let mask_path = gt.join(format!("{name}.mask"));
+        let (mean, count) = match std::fs::read(&mask_path) {
+            Ok(mask) => {
+                if mask.len() != npix.div_ceil(8) {
+                    return Err(why(format!(
+                        "mask 长度 {} ≠ ⌈w*h/8⌉ = {}",
+                        mask.len(),
+                        npix.div_ceil(8)
+                    )));
+                }
+                let mut acc = 0u64;
+                let mut n = 0u64;
+                for i in 0..npix {
+                    if mask[i / 8] & (1 << (7 - i % 8)) != 0 {
+                        for c in 0..3 {
+                            acc += (mine[i * 3 + c] as i64 - expect[i * 3 + c] as i64)
+                                .unsigned_abs();
+                        }
+                        n += 3;
+                    }
+                }
+                let valid = n / 3;
+                // non-trivial coverage: an (almost) fully transparent ROI
+                // verifies nothing — fail instead of counting a zero compare
+                if valid * 100 < npix as u64 {
+                    return Err(why(format!(
+                        "mask 有效覆盖 {valid}/{npix} 像素低于 1%（材料无意义）"
+                    )));
+                }
+                ((acc as f64) / (n.max(1) as f64), n)
+            }
+            Err(_) => {
+                // no mask sidecar: exact-length full comparison
+                let acc: u64 = mine
+                    .iter()
+                    .zip(expect.iter())
+                    .map(|(a, b)| (*a as i64 - *b as i64).unsigned_abs())
+                    .sum();
+                ((acc as f64) / (expect3 as f64), expect3 as u64)
+            }
+        };
+        debug_assert!(count > 0);
+        if r.level == 0 {
+            s.worst_l0 = s.worst_l0.max(mean);
+            s.compared_l0 += 1;
+        } else {
+            s.worst_l1p = s.worst_l1p.max(mean);
+            s.compared_l1p += 1;
+        }
+    }
+    if s.compared_l0 == 0 {
+        return Err("没有任何 level-0 ROI 被实际比较".to_string());
+    }
+    if s.compared_l1p == 0 {
+        return Err("没有任何缩减层（L1+）ROI 被实际比较".to_string());
+    }
+    Ok(s)
+}
+
+/// The reviewer's negative GT material, generated in code: a valid synthetic
+/// source bundle plus a `rois.json` listing one L0 and one L1 16×16 ROI
+/// (the reviewer's `missing-gt/rois.json` semantics); `seed` writes the raw
+/// side (nothing = both missing, 0-byte files = both empty).
+fn gt_negative_material(seed: impl FnOnce(&std::path::Path)) -> (MemBundle, slide_transform_core::mirax::MiraxDoc, std::path::PathBuf) {
+    let fs = build_synthetic_mrxs(&MrxsGenParams::default()).unwrap();
+    let doc = probe_mirax(&fs, "synthetic").unwrap();
+    let gt = std::env::temp_dir().join(format!(
+        "mrxs-gt-neg-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    std::fs::create_dir_all(&gt).unwrap();
+    std::fs::write(
+        gt.join("rois.json"),
+        r#"[{"level": 0, "id": "missing-l0", "x": 0, "y": 0, "w": 16, "h": 16}, {"level": 1, "id": "missing-l1", "x": 0, "y": 0, "w": 16, "h": 16}]"#,
+    )
+    .unwrap();
+    seed(&gt);
+    (fs, doc, gt)
+}
+
+/// Review §3 negative 1 (regression): with MRXS_GT semantics in force, both
+/// reference raw files MISSING must FAIL the gate naming the ROI. The old
+/// gate `continue`d and reported `worst 0.0` — a false pass.
+#[test]
+fn gt_gate_fails_when_reference_raw_files_are_missing() {
+    let (fs, doc, gt) = gt_negative_material(|_| {});
+    let rois = serde_json_free::read(&gt.join("rois.json"));
+    assert_eq!(rois.len(), 2);
+    let e = compare_gt_rois(&fs, &doc, &gt, &rois).unwrap_err();
+    assert!(e.contains("roi-l0-missing-l0"), "{e}");
+    let _ = std::fs::remove_dir_all(&gt);
+}
+
+/// Review §3 negative 2 (regression): both reference raws present but
+/// 0 bytes must FAIL the gate (exact w*h*3 length check). The old gate
+/// zip-compared against an empty slice and reported `worst 0.0`.
+#[test]
+fn gt_gate_fails_when_reference_raw_files_are_empty() {
+    let (fs, doc, gt) = gt_negative_material(|gt| {
+        for n in ["roi-l0-missing-l0.raw", "roi-l1-missing-l1.raw"] {
+            std::fs::write(gt.join(n), []).unwrap();
+        }
+    });
+    let rois = serde_json_free::read(&gt.join("rois.json"));
+    let e = compare_gt_rois(&fs, &doc, &gt, &rois).unwrap_err();
+    assert!(e.contains("roi-l0-missing-l0"), "{e}");
+    assert!(e.contains("w*h*3"), "{e}");
+    let _ = std::fs::remove_dir_all(&gt);
+}
+
 /// Composition fidelity vs OpenSlide: the ground-truth raw RGB files are
 /// exported with the python helper (see the F3 report); level 0 must be
-/// EXACT, reduced levels bounded (fractional placement).
+/// EXACT, reduced levels bounded (fractional placement). Every listed ROI
+/// must actually be compared — missing/empty material fails (review §3).
 #[test]
 fn real_sample_composition_vs_openslide_ground_truth() {
     let Some(gt) = env_dir("MRXS_GT") else {
@@ -763,50 +1076,17 @@ fn real_sample_composition_vs_openslide_ground_truth() {
     }
     let fs = slide_transform_core::bundle::DirBundle::open(&dir, &stem).unwrap();
     let doc = probe_mirax(&fs, &stem).unwrap();
-    let stats_path = gt.join("stats.json");
     let list: Vec<serde_json_free::Roi> = serde_json_free::read(&gt.join("rois.json"));
-    let mut worst_l0 = 0f64;
-    let mut worst_l1p = 0f64;
-    for r in &list {
-        let raw_path = gt.join(format!("roi-l{}-{}.raw", r.level, r.id));
-        let Ok(expect) = std::fs::read(&raw_path) else { continue };
-        // the ground truth is OpenSlide's opaque rendering; where OpenSlide
-        // was transparent the adapter's fill differs — compare only pixels
-        // recorded opaque in the exporter's mask sidecar
-        let mask_path = gt.join(format!("roi-l{}-{}.mask", r.level, r.id));
-        let mine = compose_region(&fs, &doc, r.level, r.x, r.y, r.w, r.h).unwrap();
-        let (mean, count) = if let Ok(mask) = std::fs::read(&mask_path) {
-            let mut s = 0u64;
-            let mut n = 0u64;
-            for i in 0..(r.w as usize * r.h as usize) {
-                if mask.get(i / 8).map(|b| b & (1 << (7 - i % 8)) != 0).unwrap_or(false) {
-                    for c in 0..3 {
-                        s += (mine[i * 3 + c] as i64 - expect[i * 3 + c] as i64).unsigned_abs();
-                    }
-                    n += 3;
-                }
-            }
-            ((s as f64) / (n.max(1) as f64), n)
-        } else {
-            let mut s = 0u64;
-            for (a, b) in mine.iter().zip(expect.iter()) {
-                s += (*a as i64 - *b as i64).unsigned_abs();
-            }
-            ((s as f64) / (mine.len().max(1) as f64), mine.len() as u64)
-        };
-        if count == 0 {
-            continue;
-        }
-        if r.level == 0 {
-            worst_l0 = worst_l0.max(mean);
-        } else {
-            worst_l1p = worst_l1p.max(mean);
-        }
-    }
-    let _ = stats_path;
-    eprintln!("GT comparison: worst L0 mean {worst_l0:.4}, worst L1+ mean {worst_l1p:.4}");
-    assert!(worst_l0 <= 0.6, "level 0 must match OpenSlide (got {worst_l0})");
-    assert!(worst_l1p <= 16.0, "reduced levels bounded (got {worst_l1p})");
+    let s = match compare_gt_rois(&fs, &doc, &gt, &list) {
+        Ok(s) => s,
+        Err(e) => panic!("GT 门禁拒绝（材料不完整）: {e}"),
+    };
+    eprintln!(
+        "GT comparison: compared L0 {}, L1+ {}, worst L0 mean {:.4}, worst L1+ mean {:.4}",
+        s.compared_l0, s.compared_l1p, s.worst_l0, s.worst_l1p
+    );
+    assert!(s.worst_l0 <= 0.6, "level 0 must match OpenSlide (got {})", s.worst_l0);
+    assert!(s.worst_l1p <= 16.0, "reduced levels bounded (got {})", s.worst_l1p);
 }
 
 mod serde_json_free {

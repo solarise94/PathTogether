@@ -789,9 +789,11 @@ async function runJob(msg) {
   let conv;
   try {
     if (isBundle) {
+      // Review §1: pass the active resource profile's budget — the MRXS
+      // adapter bounds its probe+convert allocations by it.
       conv = resume
-        ? convertResumeProfileEncodedBundle(JSON.stringify(resume.st), outputProfile, encoding, strict, channelJson)
-        : convertProfileEncodedBundle(outputProfile, encoding, strict, channelJson);
+        ? convertResumeProfileEncodedBundle(JSON.stringify(resume.st), outputProfile, encoding, strict, channelJson, profile.budgetBytes)
+        : convertProfileEncodedBundle(outputProfile, encoding, strict, channelJson, profile.budgetBytes);
     } else {
       conv = resume
         ? convertResumeProfileEncoded(JSON.stringify(resume.st), outputProfile, encoding, strict, channelJson)
@@ -958,11 +960,16 @@ self.onmessage = async (ev) => {
   if (m.type === 'probe-bundle') {
     try {
       const tP = Date.now();
+      // Review §1: the probe runs under the job's resource profile budget —
+      // the wasm adapter refuses over-budget MRXS metadata with a typed
+      // `resource_profile_insufficient` BEFORE allocating (never an OOM).
+      const pf = E.getProfile(m.profileId || 'saver');
+      E.assertProfileFeasible(pf);
       await openBundle(m.jobId);
       configure(1);
       await prepareProbeScratch();
       installBundleHosts();
-      const r = JSON.parse(probeBundle());
+      const r = JSON.parse(probeBundle(pf.budgetBytes));
       await releaseProbeScratch();
       post({ type: 'phase', phase: 'probe-bundle', ms: Date.now() - tP });
       post({ type: 'reply', id: m.id, ok: !r.error, result: r });

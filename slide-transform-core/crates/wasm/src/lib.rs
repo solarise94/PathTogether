@@ -805,9 +805,10 @@ fn run_convert(
     channel_json: &str,
     resume: Option<(ResumePoint, Option<String>, Option<String>, Option<String>)>,
     bundle: bool,
+    budget_bytes: Option<f64>,
 ) -> String {
     if bundle {
-        return run_convert_bundle(profile, encoding, strict_lossless, channel_json, resume);
+        return run_convert_bundle(profile, encoding, strict_lossless, channel_json, resume, budget_bytes);
     }
     let src = HostSource::open();
     let magic = match detect(&src) {
@@ -995,6 +996,7 @@ fn run_convert_bundle(
     strict_lossless: bool,
     _channel_json: &str,
     resume: Option<(ResumePoint, Option<String>, Option<String>, Option<String>)>,
+    budget_bytes: Option<f64>,
 ) -> String {
     let fs = match HostBundle::open() {
         Ok(f) => f,
@@ -1088,6 +1090,13 @@ fn run_convert_bundle(
         .with_policy(policy)
         .with_encoding(enc_profile);
     plan.profile = out_profile;
+    // Review §1: the browser resource profile's budget — the MRXS adapter
+    // charges its metadata/decode working set against it and refuses with a
+    // typed `resource_profile_insufficient` BEFORE allocating.
+    plan.limits.memory_budget_bytes = budget_bytes
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| v as u64)
+        .unwrap_or(slide_transform_core::budget::SAVER_BUDGET_BYTES);
 
     let mut sink = HostSink;
     let mut scratch = HostScratchFactory;
@@ -1150,8 +1159,12 @@ fn run_convert_bundle(
 }
 
 /// Probe a bundle input (F3 MRXS) through the bundle host callbacks.
+/// `budget_bytes` is the browser resource profile's budget (review §1): the
+/// probe refuses with `resource_profile_insufficient` when its metadata
+/// working set would exceed it — before any large allocation. `undefined`
+/// keeps the conservative saver default (192 MiB).
 #[wasm_bindgen(js_name = "probeBundle")]
-pub fn probe_bundle() -> String {
+pub fn probe_bundle(budget_bytes: Option<f64>) -> String {
     let fs = match HostBundle::open() {
         Ok(f) => f,
         Err(e) => return err_json(&e),
@@ -1167,7 +1180,11 @@ pub fn probe_bundle() -> String {
         ));
     };
     let stem = entry.name.trim_end_matches(".mrxs").to_string();
-    match slide_transform_core::mirax::probe_mirax(&fs, &stem) {
+    let budget = budget_bytes
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| v as u64)
+        .unwrap_or(slide_transform_core::budget::SAVER_BUDGET_BYTES);
+    match slide_transform_core::mirax::probe_mirax_with_budget(&fs, &stem, budget) {
         Ok(doc) => {
             let levels: Vec<String> = doc
                 .levels
@@ -1212,14 +1229,17 @@ pub fn probe_bundle() -> String {
 }
 
 /// Bundle conversion with explicit output AND encoding profile ids (F3).
+/// `budget_bytes`: the browser resource profile's budget (review §1;
+/// `undefined` = the conservative saver default).
 #[wasm_bindgen(js_name = "convertProfileEncodedBundle")]
 pub fn convert_profile_encoded_bundle(
     profile: &str,
     encoding: &str,
     strict_lossless: bool,
     channel_json: &str,
+    budget_bytes: Option<f64>,
 ) -> String {
-    run_convert(Some(profile), Some(encoding), strict_lossless, channel_json, None, true)
+    run_convert(Some(profile), Some(encoding), strict_lossless, channel_json, None, true, budget_bytes)
 }
 
 /// Bundle resume under explicit profiles (F3); refused when the checkpoint
@@ -1231,6 +1251,7 @@ pub fn convert_resume_profile_encoded_bundle(
     encoding: &str,
     strict_lossless: bool,
     channel_json: &str,
+    budget_bytes: Option<f64>,
 ) -> String {
     match parse_resume_json(resume_json) {
         Ok(rp) => run_convert(
@@ -1245,6 +1266,7 @@ pub fn convert_resume_profile_encoded_bundle(
                 resume_adapter_field(resume_json),
             )),
             true,
+            budget_bytes,
         ),
         Err(e) => err_json(&e),
     }
@@ -1254,7 +1276,7 @@ pub fn convert_resume_profile_encoded_bundle(
 /// pixel policy; `channel_json` may be empty (no companion).
 #[wasm_bindgen(js_name = "convert")]
 pub fn convert(strict_lossless: bool, channel_json: &str) -> String {
-    run_convert(None, None, strict_lossless, channel_json, None, false)
+    run_convert(None, None, strict_lossless, channel_json, None, false, None)
 }
 
 /// Run a conversion with an explicit output profile id (`bf-classic`,
@@ -1262,7 +1284,7 @@ pub fn convert(strict_lossless: bool, channel_json: &str) -> String {
 /// preserve-source-v1 (pre-U3 behaviour kept bit-for-bit).
 #[wasm_bindgen(js_name = "convertProfile")]
 pub fn convert_profile(profile: &str, strict_lossless: bool, channel_json: &str) -> String {
-    run_convert(Some(profile), None, strict_lossless, channel_json, None, false)
+    run_convert(Some(profile), None, strict_lossless, channel_json, None, false, None)
 }
 
 /// Run a conversion with explicit output AND encoding profile ids (U3).
@@ -1275,7 +1297,7 @@ pub fn convert_profile_encoded(
     strict_lossless: bool,
     channel_json: &str,
 ) -> String {
-    run_convert(Some(profile), Some(encoding), strict_lossless, channel_json, None, false)
+    run_convert(Some(profile), Some(encoding), strict_lossless, channel_json, None, false, None)
 }
 
 /// Resume under an explicit output profile; refused when the checkpoint
@@ -1300,6 +1322,7 @@ pub fn convert_resume_profile(
                 resume_adapter_field(resume_json),
             )),
             false,
+            None,
         ),
         Err(e) => err_json(&e),
     }
@@ -1329,6 +1352,7 @@ pub fn convert_resume_profile_encoded(
                 resume_adapter_field(resume_json),
             )),
             false,
+            None,
         ),
         Err(e) => err_json(&e),
     }
@@ -1351,6 +1375,7 @@ pub fn convert_resume(resume_json: &str, strict_lossless: bool, channel_json: &s
                 resume_adapter_field(resume_json),
             )),
             false,
+            None,
         ),
         Err(e) => err_json(&e),
     }

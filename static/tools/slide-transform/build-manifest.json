@@ -1,5 +1,5 @@
 {
-  "built_at_utc": "2026-10-03T12:55:41Z",
+  "built_at_utc": "2026-10-03T15:58:43Z",
   "toolchain": {
     "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
     "wasm_bindgen_cli": "wasm-bindgen 0.2.129",
@@ -7,12 +7,12 @@
     "pinned_bindgen": "0.2.129"
   },
   "artifacts": {
-    "slide_transform_bg.wasm": "5e048c7459528b78d1b122d4e3d03da396a8629fcb1714c563e0673bdf8ec95c",
-    "slide_transform.js": "6eb7b744f0124fc3825d5bc0ddb04eba7b976106ea4ffbcbd872381822265721",
-    "runner.js": "b11bcaa1ed6231bc4dd7add73f1c51a889ac424239fb33ac9cb388de150de949",
+    "slide_transform_bg.wasm": "91c8f92e62d7c88fa389f11d445afab23af69a4cd7872f28ad76b8c6b1ae6f77",
+    "slide_transform.js": "3797f7a525a6cfec1ade91df14297fcd41e0b8f9efecbc7a82086b70a3afe74f",
+    "runner.js": "29cd87518b4fd6ed5bfec5879e3316fbdb4621941a19874cc2f55a2bb1245b8d",
     "engine.js": "1d20cc51da02b7ac902c649bd5c81eef921930185218959f6f66a87ff7204af5",
-    "worker.js": "02e076ecb69d4524fe1726ceef2e8099276d5f7bcb3100df93ba7def30cb321b",
-    "slide-transform": "9e0d1b40414d758a88a72a1b76ed0ce4c68f71263347e8238477134fa9a06eb0"
+    "worker.js": "454415c653de4c3c5b12cc953236f05371f5586290ad460a2f449130c0c28ced",
+    "slide-transform": "2b2f8ad4bcf0c7a0077d69b09f3384be62b2627ccea5955b75a9e014ba7d4cd8"
   },
   "dependencies": [
     {

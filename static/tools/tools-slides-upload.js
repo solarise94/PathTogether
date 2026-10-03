@@ -74,6 +74,7 @@ export function describeUploadError(err) {
   const code = STABLE_CODE_RE.test(rawCode) ? rawCode : '';
   const status = err && Number.isInteger(err.status) ? err.status : 0;
   if (code === 'cos_waiting_limit') return { key: 'tools.upload.err.waiting_limit' };
+  if (code === 'plan_size_mismatch') return { key: 'tools.upload.err.plan' };
   if (code === 'upload_too_large' || status === 413) {
     const max = data && Number.isFinite(data.max_size_bytes) ? data.max_size_bytes : null;
     return { key: 'tools.upload.too.large', max, disable: true };
@@ -102,6 +103,9 @@ export function createUploadController({
     // 只有结果面板当前指向的任务会画进 #upload-status：别的任务的进度/失败
     // 不会出现在这个面板里，切回该任务时重放。
     msgs: {},
+    // U1：jobId -> 结果面板上传进度条状态（active/frac/determinate/字节/重试）。
+    // 与 msgs 一样按任务隔离：别的任务的事件不画进当前面板，切换任务后重画。
+    progress: {},
     writes: Promise.resolve(),   // record.upload 写入队列（刷新列表前冲刷）
     orphans: {},                 // jobId -> 未确认取消的 ingestion id
   };
@@ -149,6 +153,77 @@ export function createUploadController({
     if (key === null) delete state.msgs[jobId];
     else state.msgs[jobId] = { key, vars: vars || null };
     paint(jobId);
+  }
+
+  /// U1：结果面板的上传进度条 + 字节文本（与 #upload-status 一样按任务隔离）。
+  /// 百分比只表示当前阶段；determinate=false（无 lengthComputable 事件或
+  /// 排队/服务端接收/校验阶段）用不定态活动指示 + 已确认字节后备。
+  /// 字节文本不进 aria-live（#upload-status 才有 aria-live，且引擎已把字节
+  /// 事件节流到 ≥120ms）。
+  function paintProgress(jobId) {
+    if (!jobId || jobId !== page.currentJobId) return;
+    const wrap = document.getElementById('upload-progress');
+    const bar = document.getElementById('upload-bar');
+    const bytesEl = document.getElementById('upload-bytes');
+    if (!wrap || !bar || !bytesEl) return;
+    const p = state.progress[jobId];
+    if (!p || !p.active) {
+      wrap.hidden = true;
+      bytesEl.hidden = true;
+      bytesEl.textContent = '';
+      if (wrap.classList && wrap.classList.remove) wrap.classList.remove('indeterminate');
+      return;
+    }
+    wrap.hidden = false;
+    bytesEl.hidden = false;
+    const pct = (p.determinate && typeof p.frac === 'number')
+      ? Math.max(0, Math.min(100, Math.round(p.frac * 100))) : null;
+    if (pct !== null) {
+      if (wrap.classList && wrap.classList.remove) wrap.classList.remove('indeterminate');
+      if (bar.style) bar.style.width = `${pct}%`;
+      if (wrap.setAttribute) wrap.setAttribute('aria-valuenow', String(pct));
+    } else {
+      if (wrap.classList && wrap.classList.add) wrap.classList.add('indeterminate');
+      // 清内联宽度：否则旧宽度覆盖 CSS 不定态类的 30%（动画条不可见）
+      if (bar.style) bar.style.width = '';
+      if (wrap.removeAttribute) wrap.removeAttribute('aria-valuenow');
+    }
+    let text = '';
+    if (p.sentAll) {
+      text = t('upload.cos.sent_all');
+    } else if (typeof p.loadedBytes === 'number' && typeof p.totalBytes === 'number'
+               && p.totalBytes > 0) {
+      const base = t('upload.cos.bytes', {
+        done: fmtBytes(p.loadedBytes), total: fmtBytes(p.totalBytes),
+      });
+      text = pct !== null ? `${pct}% · ${base}` : base;
+    }
+    if (p.retrying) {
+      text = text ? `${text} · ${t('upload.cos.retrying')}` : t('upload.cos.retrying');
+    }
+    bytesEl.textContent = text;
+  }
+
+  function setProgress(jobId, patch) {
+    if (!jobId) return;
+    const cur = state.progress[jobId] || { active: false };
+    state.progress[jobId] = { ...cur, ...patch };
+    paintProgress(jobId);
+  }
+
+  /// 上传收口（失败/取消/发布/重新开始）后收起进度条。
+  function clearProgress(jobId) {
+    if (!jobId || !state.progress[jobId]) return;
+    state.progress[jobId] = { active: false };
+    paintProgress(jobId);
+  }
+
+  function beginProgress(jobId) {
+    state.progress[jobId] = {
+      active: true, determinate: false, frac: null,
+      loadedBytes: null, totalBytes: null, sentAll: false, retrying: false,
+    };
+    paintProgress(jobId);
   }
 
   /// 登录链接 / 工作台链接是消息的一部分。
@@ -229,6 +304,7 @@ export function createUploadController({
   }
 
   function handleFailure(err, jobId) {
+    clearProgress(jobId);
     if (err && err.persist) {
       if (err.reconciled) {
         setMsg(jobId, 'tools.upload.persist.failed');
@@ -312,6 +388,7 @@ export function createUploadController({
   /// 目标项目关联未完成时附「重试加入项目」（只重试关联）。
   function showPublished(jobId, slideId, intent, { assocRetry = true } = {}) {
     state.msgs[jobId] = { published: { slideId, intent, assocRetry } };
+    clearProgress(jobId);   // 最终成功（可查看）后收起进度条
     const btn = document.getElementById('upload-btn');
     if (btn && page.currentJobId === jobId) btn.hidden = true;
     paint(jobId);
@@ -600,6 +677,9 @@ export function createUploadController({
         }
         setMsg(jobId, 'tools.upload.working');
       }
+      // U1：上传开始（排队/创建期无字节量化）→ 不定态进度条；后续由引擎的
+      // 字节事件/状态事件驱动（百分比只表示当前阶段）
+      beginProgress(jobId);
 
       // ⑤ 产物只经 slice() 分块读取（引擎内绝不整体物化）
       const file = await runner.artifactView(jobId);
@@ -625,8 +705,36 @@ export function createUploadController({
           if (ev.type === 'status') {
             const txt = stageText(ev.body);
             if (txt) setStageTxt(jobId, txt);
-          } else if (ev.type === 'progress' && typeof ev.frac === 'number') {
-            setStageTxt(jobId, `${t('upload.cos.stage.uploading')} ${Math.round(ev.frac * 100)}%`);
+            // 服务端阶段驱动进度条：下载阶段用 downloaded_bytes/declared_size；
+            // 排队/接收/校验/发布无字节量化 → 不定态活动指示
+            const b = ev.body || {};
+            if (b.stage === 'downloading' && typeof b.downloaded_bytes === 'number'
+                && typeof b.declared_size === 'number' && b.declared_size > 0) {
+              setProgress(jobId, {
+                active: true, determinate: true,
+                frac: Math.min(b.downloaded_bytes / b.declared_size, 1),
+                loadedBytes: b.downloaded_bytes, totalBytes: b.declared_size,
+                sentAll: false, retrying: false,
+              });
+            } else if (b.stage && b.stage !== 'uploading' && b.stage !== 'viewable') {
+              setProgress(jobId, { active: true, determinate: false, sentAll: false, retrying: false });
+            }
+          } else if (ev.type === 'progress' && ev.phase === 'uploading'
+                     && typeof ev.frac === 'number') {
+            // 字节级进度（引擎已节流）：百分比/字节进 #upload-bytes，不刷
+            // #upload-status（阶段文本保持稳定，读屏播报不随字节抖动）
+            setProgress(jobId, {
+              active: true,
+              determinate: ev.determinate !== false,
+              frac: ev.frac,
+              loadedBytes: typeof ev.loadedBytes === 'number' ? ev.loadedBytes : null,
+              totalBytes: typeof ev.totalBytes === 'number' ? ev.totalBytes : null,
+              sentAll: !!ev.sentAll,
+              retrying: false,
+            });
+          } else if (ev.type === 'retry') {
+            // 分块重试：loaded 回退 + 「正在重试」提示（不用历史最大值冒充）
+            setProgress(jobId, { active: true, retrying: true, sentAll: false });
           } else if (ev.type === 'created') {
             setStageTxt(jobId, t('upload.cos.stage.uploading'));
             // 记录已排队写入：列表行切到“上传中/继续上传”形态
@@ -638,6 +746,7 @@ export function createUploadController({
       const r = await upload.done;
       state.handle = null;
       if (r && r.cancelled) {
+        clearProgress(jobId);
         setMsg(jobId, 'tools.upload.cancelled');
         return;
       }
@@ -696,6 +805,7 @@ export function createUploadController({
     if (!jobId) return;
     if (state.handle && state.busyJobId === jobId) {
       state.handle.cancel();
+      clearProgress(jobId);
       setMsg(jobId, 'tools.upload.cancelled');
       return;
     }
@@ -860,6 +970,7 @@ export function createUploadController({
 
   function rerenderForLang() {
     paint(page.currentJobId);
+    paintProgress(page.currentJobId);
   }
 
   /// 结果面板切到某任务：已发布的任务不给上传按钮，只显示发布结果。
@@ -871,7 +982,11 @@ export function createUploadController({
       btn.disabled = state.busyJobId !== null || !!state.disabled[jobId];
       if (changed) btn.hidden = false;
     }
-    if (changed) paint(jobId);
+    if (changed) {
+      paint(jobId);
+      // 切换任务后按该任务自己的进度重画（别的任务的事件不串进度）
+      paintProgress(jobId);
+    }
     return runner.getJob(jobId).then((job) => {
       if (page.currentJobId !== jobId || !job) return;
       const up = job.upload;

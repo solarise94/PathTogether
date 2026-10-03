@@ -50,7 +50,9 @@ async function startServer(port) {
 /// 独立 profile（每个场景一个；结束删除）。showSaveFilePicker stub 写 OPFS。
 /// locale 钉 zh-CN（见 testLocale）：否则英文环境下 i18n 检测会让整页变
 /// 英文，按 zh 文案书写的断言随之失败。
-async function launch(label, initScripts = []) {
+/// extraArgs（U1）：附加 Chromium 启动参数（如 --host-resolver-rules 把假
+/// COS 域名映射到本地 HTTPS 服务，配合 CDP 限速测真实字节级上传进度）。
+async function launch(label, initScripts = [], extraArgs = []) {
   const profiles = path.join(GATE, 'profiles');
   fs.mkdirSync(profiles, { recursive: true });
   const userDataDir = path.join(profiles, `profile-${label}`);
@@ -59,7 +61,7 @@ async function launch(label, initScripts = []) {
     headless: true,
     viewport: { width: 1120, height: 900 },
     locale: testLocale(), // 同时决定 navigator.language 与 Accept-Language
-    args: ['--disable-dev-shm-usage'],
+    args: ['--disable-dev-shm-usage', ...extraArgs],
   });
   for (const s of initScripts) await context.addInitScript(s);
   const page = context.pages()[0] || (await context.newPage());

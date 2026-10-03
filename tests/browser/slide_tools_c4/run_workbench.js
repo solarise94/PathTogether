@@ -20,7 +20,9 @@ async function main() {
   if (!process.argv.includes('--reuse-server')) server = await L.startServer(PORT, CREDS);
   const creds = L.readCreds(CREDS);
 
-  const { context, page } = await L.C3.launch('wb');
+  let context = null;
+  let page = null;
+  ({ context, page } = await L.C3.launch('wb'));
   const fake = await L.fakeUploadRoutes(page, creds.cosOrigin, { partBytes: 8 });
   const requests = [];
   context.on('request', (r) => {
@@ -91,8 +93,84 @@ async function main() {
     fs.writeFileSync(OUT, JSON.stringify(result, null, 2));
     console.log(`WORKBENCH SEQ captured: ${requests.length} requests -> ${OUT}`);
     console.log(JSON.stringify(result.fake, null, 2));
-  } finally {
     await context.close();
+
+    // ------------------------------------------------------------------ //
+    // U1：工作台行字节进度。page.route 拦截下请求体不走网络，XHR upload
+    // progress 无从回调——把假 COS 域名映射到本地 HTTPS 假 COS（真实
+    // socket）+ CDP 上行限速：上传行的字节文本/条宽在 PUT 完成前按字节移动。
+    // ------------------------------------------------------------------ //
+    const cosHost = new URL(creds.cosOrigin).host;
+    const cos = await L.startLocalCos(cosHost);
+    const wb = await L.C3.launch('wb-bytes', [], [
+      `--host-resolver-rules=MAP ${cosHost}:443 127.0.0.1:${cos.port}`,
+      '--ignore-certificate-errors',
+    ]);
+    try {
+      const fake2 = await L.fakeUploadRoutes(wb.page, creds.cosOrigin,
+        { partBytes: 65536, skipCosRoute: true });
+      await L.login(wb.page, PORT, creds, 'user', '/app');
+      await wb.page.waitForFunction(() => !!(window.HP_UPLOAD && window.HP_APP_BOOTSTRAP
+        && window.HP_APP_BOOTSTRAP.capabilities
+        && window.HP_APP_BOOTSTRAP.capabilities.cos_upload
+        && window.HP_APP_BOOTSTRAP.capabilities.cos_upload.available === true),
+        null, { timeout: 30000 });
+      const cdp = await wb.context.newCDPSession(wb.page);
+      await cdp.send('Network.enable');
+      await cdp.send('Network.emulateNetworkConditions', {
+        offline: false, latency: 0,
+        downloadThroughput: 1024 * 1024,
+        uploadThroughput: 32 * 1024,   // 32 KB/s：192 KiB 上传 ≈ 6s
+      });
+      await wb.page.evaluate(() => {
+        const bytes = new Uint8Array(192 * 1024);
+        for (let i = 0; i < bytes.length; i++) bytes[i] = i & 0xff;
+        const f = new File([bytes], 'wb-byte-progress.tif', { type: 'image/tiff' });
+        window.HP_UPLOAD.uploadFile(f);
+      });
+      const byteTexts = [];
+      const widths = [];
+      const deadline = Date.now() + 90000;
+      for (;;) {
+        const snap = await wb.page.evaluate(() => {
+          const rows = document.querySelectorAll('.upload-item');
+          const row = rows[rows.length - 1];
+          if (!row) return { done: false };
+          const bytesEl = row.querySelector('.upload-item-bytes');
+          const bar = row.querySelector('.upload-item-bar-fill');
+          const status = row.querySelector('.upload-item-status');
+          const txt = (status && status.textContent) || '';
+          return {
+            done: /入库完成|Done/.test(txt),
+            failed: /上传失败|failed/.test(txt),
+            bytes: (bytesEl && bytesEl.textContent) || '',
+            width: (bar && bar.style && bar.style.width) || '',
+          };
+        });
+        if (snap.bytes) byteTexts.push(snap.bytes);
+        if (snap.width) widths.push(snap.width);
+        if (snap.done || snap.failed || Date.now() > deadline) break;
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      const midBytes = [...new Set(byteTexts)]
+        .filter((t) => /已传输|transferred/i.test(t) && !/192\.0 KB \/ 192\.0 KB/.test(t));
+      const midWidths = [...new Set(widths)].filter((w) => w !== '100%' && w !== '0%');
+      if (midBytes.length < 3) {
+        throw new Error(`workbench row byte movement insufficient: ${JSON.stringify([...new Set(byteTexts)].slice(0, 6))}`);
+      }
+      const putBytes2 = cos.st.puts.reduce((s, p) => s + p.bytes, 0);
+      if (putBytes2 !== 192 * 1024) throw new Error(`local COS PUT bytes ${putBytes2}`);
+      if (fake2.st.creates.length !== 1) throw new Error(`creates=${fake2.st.creates.length}`);
+      console.log('PASS [wb-byte-progress] ' + JSON.stringify({
+        midByteTexts: midBytes.length, midWidths: midWidths.length,
+        puts: cos.st.puts.map((p) => p.bytes),
+      }));
+    } finally {
+      await wb.context.close();
+      cos.server.close();
+    }
+  } finally {
+    if (context) await context.close().catch(() => {});
     if (server) server.kill('SIGTERM');
   }
 }

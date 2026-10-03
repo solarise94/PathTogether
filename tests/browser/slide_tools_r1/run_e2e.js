@@ -1380,12 +1380,26 @@ async function main() {
       await page.click(rowBtn);
       await waitFor(() => release !== null, 60000, 'upload in progress');
       const progress = await visibleText(page, '#upload-status');
-      if (!/上传中|Uploading|%/.test(progress)) throw new Error(`progress not visible: "${progress}"`);
+      // U1：阶段文本保持稳定（“正在上传”），百分比/字节画在 #upload-bytes、
+      // 进度条画在 #upload-progress——三处任一可见即算进度可见
+      const byteLine = await page.evaluate(() => {
+        const bar = document.getElementById('upload-progress');
+        const bytes = document.getElementById('upload-bytes');
+        return {
+          barVisible: !!(bar && !bar.hidden),
+          bytesText: bytes && !bytes.hidden ? (bytes.textContent || '') : '',
+        };
+      });
+      const progressVisible = /上传中|Uploading|%/.test(progress)
+        || byteLine.barVisible || /已传输|transferred/i.test(byteLine.bytesText);
+      if (!progressVisible) {
+        throw new Error(`progress not visible: "${progress}" bar=${byteLine.barVisible} bytes="${byteLine.bytesText}"`);
+      }
       if (!(await page.isVisible('#upload-cancel-btn'))) throw new Error('cancel not visible during upload');
       release();
       await waitFor(async () => /已发布|Published/.test(await visibleText(page, '#upload-status')), 120000, 'visible published');
       if (fake.st.creates.length !== 1) throw new Error(`creates=${fake.st.creates.length}`);
-      record(id, true, { loginLink: href, loginVisible: true, progressVisible: progress.slice(0, 24), creates: 1, publishedVisible: true });
+      record(id, true, { loginLink: href, loginVisible: true, progressVisible: progress.slice(0, 24), barVisible: byteLine.barVisible, creates: 1, publishedVisible: true });
     } catch (e) {
       record(id, false, { error: String(e).slice(0, 400) });
     } finally {

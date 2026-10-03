@@ -825,9 +825,27 @@ button {
   transition: width 0.2s ease;
 }
 .upload-item-bar-fill.upload-item-bar-error { background: var(--danger); }
+/* U1：无量化信息的阶段（排队/服务端接收/校验等）——不定态活动指示 */
+.upload-item-bar-fill.upload-item-bar-indeterminate {
+  width: 30%;
+  animation: upload-item-slide 1.2s ease-in-out infinite;
+}
+@keyframes upload-item-slide {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(340%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .upload-item-bar-fill.upload-item-bar-indeterminate { animation: none; }
+}
 .upload-item-status {
   font-size: 11px;
   color: var(--text);
+}
+.upload-item-bytes {
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--text-2, var(--text));
+  margin-top: 2px;
 }
 .upload-item.upload-item-error .upload-item-status { color: var(--danger); }
 

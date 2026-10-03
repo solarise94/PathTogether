@@ -36,8 +36,22 @@
                                               // 原行为（网络失败交给行级失败）
           useResumeEndpoint: bool,      // 工具页 true：续传时服务端已离开
                                         // uploading 且仍有未确认分块 → POST /resume
-          onEvent: (ev) => void         // {type:'status', body} | {type:'progress', frac}
+          onEvent: (ev) => void         // {type:'status', body} | {type:'progress', ...}
                                        //  | {type:'created', jobId, body}
+                                       //  | {type:'retry', part, attempt}
+                                       // progress（U1 字节级，frac 保持兼容）：
+                                       //  {type:'progress', phase:'uploading', frac,
+                                       //   loadedBytes, confirmedBytes, totalBytes,
+                                       //   determinate, sentAll, force}
+                                       //  - 字节事件节流（≥120ms）发；force=true
+                                       //    为状态推进（分块确认/sentAll 翻转）
+                                       //    需立即更新；
+                                       //  - determinate=false：未收到可计算长度
+                                       //    的事件 → frac/loadedBytes 退化为已
+                                       //    确认字节（活动态 + 已确认字节后备）；
+                                       //  - sentAll：body 已 100% 发出但 HTTP 响应
+                                       //    未确认 → 显示「数据已发送，等待确认」，
+                                       //    绝不显示「完成」。
         }
 
         done：viewable → resolve {ok:true, body}；取消 → 立即 resolve {cancelled:true}
@@ -45,10 +59,12 @@
         {terminal, data} | {part, status, network} |
         {persist:true, ingestionId, reconciled}（记录未落盘；reconciled=服务端已确认取消）。
 
-   请求语义（与抽出前的 app.js 逐条一致）：
+   请求语义（与抽出前的 app.js 逐条一致；U1 仅传输载体 fetch→XHR）：
    - 控制 API（/api/ingestions*）全部经注入的 apiFetch（CSRF/认证由它负责）；
-   - COS 分块 PUT 绝不走 apiFetch——mode:"cors"、credentials:"omit"、不设
-     请求头（Content-Length 与签名绑定值一致，手动设置会被 CORS 拒绝）；
+   - COS 分块 PUT 绝不走 apiFetch——XHR、withCredentials=false、不设任何
+     请求头（Content-Length 与签名绑定值一致，手动设置会被 CORS 拒绝）、
+     绝不输出预签名 URL；upload.onprogress 提供字节级进度，监听先于 send
+     注册，settle/取消后注销；abortController.abort() 停止全部在途 XHR；
    - 分批签名（sign_batch_max_parts，429/503 退避 ≤3 次同批重试）+ 批内并发
      （max_concurrent_parts）；单片同 URL 重试 ≤3 → 重新签名一次 → 再 ≤3；
    - upload-complete 幂等：409 ingestion_state_conflict = 已完成过，转轮询；
@@ -94,21 +110,80 @@
     }
   }
 
-  // ---------- COS PUT 独立传输（Phase 4-2 合同：不经 apiFetch） ----------
-  function putPart(url, blob, abortCtl) {
-    return fetch(url, {
-      method: "PUT",
-      body: blob,
-      mode: "cors",
-      credentials: "omit",
-      signal: abortCtl ? abortCtl.signal : undefined,
-    }).then(function (resp) {
-      var etag = null;
+  // ---------- COS PUT 独立传输（U1：XHR upload.onprogress；不经 apiFetch） ----------
+  // fetch 不给上传字节回调（F2）；XHR.upload.onprogress 有。CORS 合同与 fetch
+  // 版逐条一致：withCredentials=false、不设任何请求头（Content-Length 由浏览
+  // 器按 body 推导，手动设置会被 CORS 拒绝）、绝不输出预签名 URL。所有监听
+  // 在 send 之前注册；settle（成功/失败/取消/超时）后注销，AbortController
+  // 一次 abort 让全部在途 XHR 停止。
+  function putPart(url, blob, abortCtl, onProgress) {
+    return new Promise(function (resolve, reject) {
+      var xhr;
       try {
-        etag = (resp.headers && resp.headers.get) ? resp.headers.get("ETag") : null;
-      } catch (e) { /* ETag 读不到不影响成功判定（仅提示） */ }
-      if (!resp.ok) throw { status: resp.status, etag: etag };
-      return { etag: etag };
+        xhr = new XMLHttpRequest();
+      } catch (e) {
+        reject({ network: true });
+        return;
+      }
+      var settled = false;
+      var onAbortSignal = null;
+      function detach() {
+        try {
+          xhr.upload.onprogress = null;
+          xhr.onload = null;
+          xhr.onerror = null;
+          xhr.onabort = null;
+          xhr.ontimeout = null;
+        } catch (e) { /* 老 UA 属性只读：监听随 XHR 被 GC */ }
+        if (onAbortSignal && abortCtl && abortCtl.signal &&
+            abortCtl.signal.removeEventListener) {
+          try { abortCtl.signal.removeEventListener("abort", onAbortSignal); }
+          catch (e) {}
+        }
+      }
+      function settle(fn, arg) {
+        if (settled) return;
+        settled = true;
+        detach();
+        fn(arg);
+      }
+      try {
+        xhr.open("PUT", url, true);
+        xhr.withCredentials = false;
+        // 监听先于 send（XHR 规范要求 upload 事件在 send 后才派发，先注册
+        // 才不丢早期进度）
+        xhr.upload.onprogress = function (ev) {
+          if (settled || !onProgress) return;
+          var loaded = (ev && typeof ev.loaded === "number") ? ev.loaded : 0;
+          onProgress(loaded, !!(ev && ev.lengthComputable));
+        };
+        xhr.onload = function () {
+          var etag = null;
+          try { etag = xhr.getResponseHeader("ETag"); } catch (e) {}
+          // upload.load/loadend 不是成功凭据：只有 HTTP 2xx 响应算成功。
+          // status 0（CORS 拦截/连接层异常的怪异路径）不是 HTTP 响应——
+          // fetch 时代从不以 status 0 resolve，这里同样映射进 network 合同
+          if (xhr.status >= 200 && xhr.status < 300) {
+            settle(resolve, { etag: etag });
+          } else if (xhr.status === 0) {
+            settle(reject, { network: true });
+          } else {
+            settle(reject, { status: xhr.status, etag: etag });
+          }
+        };
+        xhr.onerror = function () { settle(reject, { network: true }); };
+        xhr.onabort = function () { settle(reject, { name: "AbortError" }); };
+        xhr.ontimeout = function () { settle(reject, { network: true, timeout: true }); };
+        if (abortCtl && abortCtl.signal) {
+          if (abortCtl.signal.aborted) { settle(reject, { name: "AbortError" }); return; }
+          onAbortSignal = function () { try { xhr.abort(); } catch (e) {} };
+          abortCtl.signal.addEventListener("abort", onAbortSignal);
+        }
+        xhr.send(blob);
+      } catch (e) {
+        // 同步抛出（坏 URL / 不支持的方案等）按网络层失败进入重试合同
+        settle(reject, { network: true });
+      }
     });
   }
 
@@ -146,7 +221,16 @@
     var jobId = opts.resumeJobId || null;
     var confirmedMap = {};         // part_number -> ETag|""（ETag 仅提示）
     var plan = null;               // [{part_number, offset, length}]
+    var planByNum = {};            // part_number -> {offset, length}（字节折算）
     var totalConfirmed = 0;
+    var totalBytes = 0;            // 冻结计划长度之和（必须 == source.size）
+    var confirmedBytes = 0;        // 已确认唯一分块长度之和
+    var activeAttempts = {};       // part_number -> {id, loaded, length}
+    var attemptSeq = 0;            // 每次尝试新 ID：旧尝试的迟到回调无效
+    var computableSeen = false;    // 收到过 lengthComputable 进度事件
+    var sentAllSeen = false;       // 「已发送全部字节、等待确认」已提示过
+    var lastProgressAt = 0;        // 字节进度节流（状态类更新不受节流）
+    var PROGRESS_MIN_MS = 120;     // 计划 §2.2：DOM 更新 100–250ms
     var abortCtl = (typeof AbortController === "function") ? new AbortController() : null;
     var stopped = false;           // 用户取消后停一切后续动作
     var waits = new Set();         // 进行中的等待 {h, reject}：取消时立即以 cancelled 结束
@@ -197,15 +281,84 @@
       }, extra || {}));
     }
 
-    function confirmPart(n, etag) {
+    // ---------- 字节级进度聚合（计划 §2.2） ----------
+    // confirmedBytes = 冻结计划中已确认的唯一分块长度之和；
+    // activeBytes = 各分块最新有效尝试的 loaded 之和（逐片夹到实际长度）；
+    // loadedBytes = min(totalBytes, confirmedBytes + activeBytes)。
+    // 片号只记一次；重试分配新的 attempt ID，旧尝试的迟到回调无效，失败尝试
+    // 的 loaded 不带入下一次尝试；PUT 成功后在同一更新里 active→confirmed。
+
+    function activeBytesSum() {
+      var s = 0;
+      for (var k in activeAttempts) {
+        if (activeAttempts.hasOwnProperty(k)) s += activeAttempts[k].loaded;
+      }
+      return s;
+    }
+
+    function dropAttempt(n, attemptId) {
+      var a = activeAttempts[n];
+      if (a && (attemptId === undefined || a.id === attemptId)) {
+        delete activeAttempts[n];
+      }
+    }
+
+    function registerAttempt(n, length) {
+      attemptSeq += 1;
+      activeAttempts[n] = { id: attemptSeq, loaded: 0, length: length };
+      return attemptSeq;
+    }
+
+    function onPartProgress(n, attemptId, loaded, computable) {
+      var a = activeAttempts[n];
+      if (!a || a.id !== attemptId) return;   // 旧尝试的迟到回调无效
+      if (computable) computableSeen = true;
+      var clamped = Math.max(0, Math.min(
+        typeof loaded === "number" ? loaded : 0, a.length));
+      if (clamped <= a.loaded) return;        // 同一尝试内不回退（重投递保护）
+      a.loaded = clamped;
+      emitUploadProgress(false);              // 字节事件走节流
+    }
+
+    function emitUploadProgress(force) {
+      if (stopped || !plan || !totalBytes) return;
+      var now = Date.now();
+      var active = computableSeen ? activeBytesSum() : 0;
+      var loaded = Math.min(totalBytes, confirmedBytes + active);
+      var sentAll = loaded >= totalBytes && confirmedBytes < totalBytes;
+      // sentAll 翻转（body 发满/开始确认）是状态推进：不受节流窗约束，
+      // 否则最后一拍 progress 被合并后 sentAll 可能永远发不出去
+      if (force !== true && sentAll === sentAllSeen &&
+          now - lastProgressAt < PROGRESS_MIN_MS) return;
+      lastProgressAt = now;
+      if (sentAll !== sentAllSeen) { sentAllSeen = sentAll; force = true; }
+      // 扩展事件（frac 保持向后兼容；determinate=false → 调用方显示活动态 +
+      // 已确认字节后备；sentAll →「数据已发送，等待确认」，绝不显示完成）。
+      // determinate：见过可计算长度的进度事件，或已全部确认（最终态是确定的）
+      emit({
+        type: "progress", phase: "uploading", force: force === true,
+        frac: loaded / totalBytes,
+        loadedBytes: loaded,
+        confirmedBytes: Math.min(confirmedBytes, totalBytes),
+        totalBytes: totalBytes,
+        determinate: computableSeen || confirmedBytes >= totalBytes,
+        sentAll: sentAll,
+      });
+    }
+
+    function confirmPart(n, etag, attemptId) {
       // 取消后才落地的 PUT 不得把已移除的续传记录写回来
-      if (stopped || confirmedMap.hasOwnProperty(n)) return;
+      if (stopped || confirmedMap.hasOwnProperty(n)) {
+        dropAttempt(n, attemptId);
+        return;
+      }
       confirmedMap[n] = etag || "";
       totalConfirmed++;
-      // 进度 = 已确认分块/总块数：只代表上传阶段，重试不重复计数
-      if (plan && plan.length) {
-        emit({ type: "progress", frac: totalConfirmed / plan.length });
-      }
+      var len = (planByNum[n] && planByNum[n].length) || 0;
+      confirmedBytes += len;
+      dropAttempt(n, attemptId);   // 同一更新：active 移除、confirmed 入账
+      // 分块确认 = 状态推进：立即更新（不受节流）；百分比按字节而非片数
+      emitUploadProgress(true);
       quiet(saveRecord());
     }
 
@@ -228,6 +381,31 @@
       return api("/api/ingestions/" + encodeURIComponent(jobId)).then(jsonBody);
     }
 
+    // 服务端冻结计划落位：长度索引 + totalBytes 一致性校验 + 续传已确认字节
+    // 折算。mismatch=true 时调用方必须拒绝上传（不签名、不 PUT、不发事件）。
+    function freezePlan(parts) {
+      var built = buildPlan(parts);
+      var byNum = {};
+      var sum = 0;
+      for (var i = 0; i < built.length; i++) {
+        byNum[built[i].part_number] = built[i];
+        sum += built[i].length;
+      }
+      if (!(typeof source.size === "number") ||
+          !isFinite(source.size) || source.size <= 0 || source.size !== sum) {
+        return { mismatch: true, sum: sum, size: source.size };
+      }
+      planByNum = byNum;
+      totalBytes = sum;
+      confirmedBytes = 0;
+      for (var k in confirmedMap) {
+        if (confirmedMap.hasOwnProperty(k) && byNum[k]) {
+          confirmedBytes += byNum[k].length;
+        }
+      }
+      return { mismatch: false, plan: built };
+    }
+
     function drive() {
       // 统一状态机：waiting_space(5s 轮询) → uploading(拿计划传分块) →
       // upload-complete → 服务端阶段(2s 轮询) → viewable/terminal
@@ -244,7 +422,20 @@
         }
         if (st === "uploading") {
           if (b.parts && b.parts.length) {
-            plan = buildPlan(b.parts);
+            // 冻结计划时校验 totalBytes == source.size == 计划长度之和：
+            // 不一致即拒绝（typed error），绝不制造虚假百分比
+            var frozen = freezePlan(b.parts);
+            if (frozen.mismatch) {
+              throw {
+                status: 0, planMismatch: true,
+                data: {
+                  code: "plan_size_mismatch",
+                  error: "upload part plan does not match source size",
+                  plan_bytes: frozen.sum, declared_bytes: frozen.size,
+                },
+              };
+            }
+            plan = frozen.plan;
             return uploadPendingParts();
           }
           // preparing：worker 尚未初始化 multipart（无分块计划）→ 短间隔再查
@@ -298,18 +489,40 @@
 
     function putPartRobust(item, freshUrl) {
       // 单片容错：同 URL 重试 ≤3 → 重新签名一次（短 TTL URL 可能过期/损坏）
-      // → 新 URL 再试 ≤3 → 仍失败抛给行级失败（confirmed 保留，可续传重试）
+      // → 新 URL 再试 ≤3 → 仍失败抛给行级失败（confirmed 保留，可续传重试）。
+      // 每次尝试分配新的 attempt ID：旧尝试的迟到进度回调无效；失败尝试的
+      // loaded 在进入重试/重新签名前丢弃（暂态百分比可回退，显示「正在重试」）。
       var url = freshUrl || item.url;
       var attempt = 0;
       function go() {
         if (stopped) return Promise.reject({ cancelled: true });
         attempt++;
         if (!url) return Promise.reject({ status: 0, data: null });
+        // 重新签名分支递归出的新闭包 attempt 从 1 重新计数，但它是真实的
+        // 重试（新 URL）——同样发 retry 事件，消费者显示「正在重试」
+        if (attempt > 1 || freshUrl) {
+          emit({ type: "retry", part: item.part.part_number, attempt: attempt });
+        }
+        // attempt ID 必须绑定在本次 go() 调用内：闭包若读外层可变量，
+        // 重试后旧 XHR 的迟到回调会拿到新 ID 而绕过失效判定
+        var attemptId = registerAttempt(item.part.part_number, item.part.length);
         return putPart(url, source.slice(item.part.offset,
-                                         item.part.offset + item.part.length), abortCtl)
-          .then(function (r) { confirmPart(item.part.part_number, r.etag); })
+                                         item.part.offset + item.part.length), abortCtl,
+                       function (loaded, computable) {
+                         onPartProgress(item.part.part_number, attemptId,
+                                        loaded, computable);
+                       })
+          .then(function (r) {
+            confirmPart(item.part.part_number, r.etag, attemptId);
+          })
           .catch(function (err) {
-            if (stopped || (err && err.name === "AbortError")) {
+            var retried = stopped || (err && err.name === "AbortError");
+            dropAttempt(item.part.part_number, attemptId);
+            if (!retried) {
+              // 失败尝试的字节立即出账并强制重画：暂态百分比如实回退
+              emitUploadProgress(true);
+            }
+            if (retried) {
               return Promise.reject({ cancelled: true });
             }
             if (attempt < 3) return delay(600).then(go);
@@ -318,8 +531,10 @@
                 return putPartRobust(item, signed[0] && signed[0].url);
               });
             }
+            // XHR onerror/ontimeout → err.network=true（fetch 时代靠
+            // TypeError；XHR 网络错误没有 status，映射进同一 network 合同）
             throw { part: item.part.part_number, status: err && err.status,
-                    network: err instanceof TypeError };
+                    network: !!(err && err.network) };
           });
       }
       return go();
@@ -352,7 +567,8 @@
         });
       }
       if (!pending.length) return requestComplete();
-      emit({ type: "progress", frac: totalConfirmed / plan.length });
+      // 起点（含续传恢复）：按已确认字节重画，不拿历史最大值冒充已确认传输
+      emitUploadProgress(true);
       return nextBatch();
     }
 

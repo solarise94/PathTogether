@@ -149,6 +149,18 @@ input[type="file"]::file-selector-button {
   border-radius: 999px;
   transition: width 180ms ease;
 }
+/* U1：无量化信息的阶段（排队/服务端接收/校验/重试等待）——不定态活动指示 */
+.progress.indeterminate .progress-bar {
+  width: 30%;
+  animation: tools-progress-slide 1.2s ease-in-out infinite;
+}
+@keyframes tools-progress-slide {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(340%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .progress.indeterminate .progress-bar { animation: none; }
+}
 .progress-bytes, .stage-status { color: var(--muted); font-size: 13px; margin: 4px 0 0; }
 .stage-status { font-size: 14px; }
 

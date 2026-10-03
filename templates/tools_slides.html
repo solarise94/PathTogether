@@ -180,6 +180,12 @@
           <button type="button" id="upload-cancel-btn" class="btn btn-danger" data-i18n="tools.upload.cancel" hidden>取消上传</button>
         </div>
         <p id="upload-status" class="status-panel" role="status" aria-live="polite"></p>
+        <!-- U1：字节级上传进度（阶段文本在上面的 status 里；百分比只表示当前阶段） -->
+        <div id="upload-progress" class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100"
+             aria-valuenow="0" data-i18n-aria="tools.upload.progress.aria" aria-label="上传进度" hidden>
+          <div class="progress-bar" id="upload-bar"></div>
+        </div>
+        <p id="upload-bytes" class="progress-bytes" hidden></p>
       </div>
     </section>
 

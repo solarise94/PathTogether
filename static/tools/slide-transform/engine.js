@@ -546,7 +546,7 @@ export async function sniffTiffSlideCapability(file) {
 
 export const MRXS_SOURCE_ADAPTER = 'mirax-bundle';
 /// Must equal the Rust `ADAPTER_VERSION` (resume refuses on mismatch).
-export const MRXS_ADAPTER_VERSION = '1';
+export const MRXS_ADAPTER_VERSION = '2';
 /// Must equal the Rust `MAX_MEMBERS` bound (bundle.rs).
 export const MRXS_MAX_MEMBERS = 8192;
 /// Must equal the Rust `FILE_COUNT` bound (mirax.rs).
@@ -554,7 +554,11 @@ export const MRXS_MAX_DATA_FILES = 4096;
 export const SLIDEDAT_MAX_BYTES = 1 << 20;
 /// What preserve means for MRXS (mirrors the Rust constants reported by the
 /// core in `result.composed` — shown by the UI when a bundle is converted).
-export const MRAX_PRESERVE_COMPOSE_FINGERPRINT = 'mirax-preserve-compose:q96:y422:hstd:v1';
+export const MRAX_PRESERVE_COMPOSE_FINGERPRINT = 'mirax-preserve-compose:q96:y422:hstd:v2';
+/// Review §4: how reduced levels are built — must equal the Rust
+/// `PYRAMID_METHOD` (l0-box2 = every reduced level is the box-downsample
+/// chain of output level 0).
+export const MRXS_PYRAMID_METHOD = 'l0-box2';
 
 /// Incremental SHA-256 (FIPS 180-4), sync — used for member digests while
 /// copying and for the manifest root digest. Verified against known vectors

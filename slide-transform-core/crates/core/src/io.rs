@@ -24,19 +24,30 @@ pub trait ByteSource {
     }
 }
 
-/// Positional-write sink with truncate/flush. A `truncate` may only grow the
-/// logical size in this spike (the writer never shrinks output).
+/// Positional-write sink with truncate/flush/read-back. A `truncate` may only
+/// grow the logical size in this spike (the writer never shrinks output).
+///
+/// `read_at` (review §4): the L0-derived pyramid composes reduced output
+/// levels from the ENCODED tiles of the previous level, which live in this
+/// sink — the only bytes that survive a crash at every checkpoint, so a
+/// resumed reduced level continues from the same pixels without recomposing.
+/// Readers are bounded explicit-length reads of already-written bytes.
 pub trait RandomAccessSink {
     fn write_at(&mut self, offset: u64, data: &[u8]) -> CoreResult<()>;
     fn truncate(&mut self, size: u64) -> CoreResult<()>;
     fn flush(&mut self) -> CoreResult<()>;
+    /// Read back `len` bytes written at `offset` (must be `offset+len ≤` the
+    /// committed cursor the caller tracks; out-of-bounds is an error).
+    fn read_at(&self, offset: u64, len: usize) -> CoreResult<Vec<u8>>;
 }
 
 /// Factory for scratch sinks (paged tile-index spill files). The browser
-/// runner will hand out OPFS scratch files; tests hand out memory.
+/// runner hands out OPFS scratch files; tests hand out memory.
 ///
 /// Scratch sinks must be readable back (the converter streams spilled index
-/// records), so they implement both write and read.
+/// records and — review §4 — the pyramid reads the previous level's tile
+/// records), so they implement read/write on the one `RandomAccessSink`
+/// surface.
 pub trait ScratchFactory {
     /// Create fresh (truncate any prior content).
     fn create(&mut self, name: &str) -> CoreResult<Box<dyn ScratchSink>>;
@@ -47,14 +58,9 @@ pub trait ScratchFactory {
     }
 }
 
-/// A sink that can also be read back at explicit offsets.
-pub trait ScratchSink: RandomAccessSink + ReadBack {}
-impl<T: RandomAccessSink + ReadBack> ScratchSink for T {}
-
-/// Read side for scratch sinks (mirrors `ByteSource::read_at`).
-pub trait ReadBack {
-    fn read_at(&self, offset: u64, len: usize) -> CoreResult<Vec<u8>>;
-}
+/// A scratch sink: a `RandomAccessSink` (which includes bounded read-back).
+pub trait ScratchSink: RandomAccessSink {}
+impl<T: RandomAccessSink + ?Sized> ScratchSink for T {}
 
 // --------------------------------------------------------------------------- //
 // In-memory impls (unit tests, wasm smoke, fuzz-ish malformed inputs)
@@ -128,6 +134,14 @@ impl RandomAccessSink for MemSink {
     fn flush(&mut self) -> CoreResult<()> {
         Ok(())
     }
+    fn read_at(&self, offset: u64, len: usize) -> CoreResult<Vec<u8>> {
+        let off = usize::try_from(offset).map_err(|_| CoreError::io("offset > usize"))?;
+        let end = off.checked_add(len).ok_or_else(|| CoreError::io("len overflow"))?;
+        if end > self.data.len() {
+            return Err(CoreError::io("read beyond scratch"));
+        }
+        Ok(self.data[off..end].to_vec())
+    }
 }
 
 /// Scratch factory over memory sinks (tests only; not for large inputs).
@@ -140,17 +154,6 @@ impl ScratchFactory for MemScratch {
     fn create(&mut self, name: &str) -> CoreResult<Box<dyn ScratchSink>> {
         self.created.push(name.to_string());
         Ok(Box::new(MemSink::new()))
-    }
-}
-
-impl ReadBack for MemSink {
-    fn read_at(&self, offset: u64, len: usize) -> CoreResult<Vec<u8>> {
-        let off = usize::try_from(offset).map_err(|_| CoreError::io("offset > usize"))?;
-        let end = off.checked_add(len).ok_or_else(|| CoreError::io("len overflow"))?;
-        if end > self.data.len() {
-            return Err(CoreError::io("read beyond scratch"));
-        }
-        Ok(self.data[off..end].to_vec())
     }
 }
 
@@ -249,6 +252,14 @@ impl RandomAccessSink for FileSink {
         f.sync_all().map_err(|e| CoreError::io(format!("fsync 失败: {e}")))?;
         Ok(())
     }
+    fn read_at(&self, offset: u64, len: usize) -> CoreResult<Vec<u8>> {
+        let mut f = self.file.lock().expect("FileSink mutex poisoned");
+        f.seek(SeekFrom::Start(offset))
+            .map_err(|e| CoreError::io(format!("seek 失败: {e}")))?;
+        let mut buf = vec![0u8; len];
+        f.read_exact(&mut buf).map_err(|e| CoreError::io(format!("read 失败: {e}")))?;
+        Ok(buf)
+    }
 }
 
 /// Scratch factory writing real files under a scratch directory; files are
@@ -277,17 +288,6 @@ impl ScratchFactory for FileScratch {
         let sink = FileSink::open_preserve(&path)?;
         self.created.push(path);
         Ok(Box::new(sink))
-    }
-}
-
-impl ReadBack for FileSink {
-    fn read_at(&self, offset: u64, len: usize) -> CoreResult<Vec<u8>> {
-        let mut f = self.file.lock().expect("FileSink mutex poisoned");
-        f.seek(SeekFrom::Start(offset))
-            .map_err(|e| CoreError::io(format!("seek 失败: {e}")))?;
-        let mut buf = vec![0u8; len];
-        f.read_exact(&mut buf).map_err(|e| CoreError::io(format!("read 失败: {e}")))?;
-        Ok(buf)
     }
 }
 

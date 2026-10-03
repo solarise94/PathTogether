@@ -936,6 +936,16 @@ export class SlideToolsRunner {
         refuse(`进度记录的输入适配器（${journalledAdapter || 'kfb'}）与任务记录（${recordAdapter || 'kfb'}）不符`,
           { kind: 'source-adapter' });
       }
+      // review §4 versioning: committed MRXS progress belongs to one adapter
+      // GENERATION (the l0-box2 pyramid changed every reduced level's pixels)
+      // — a journal written by v1 is refused here and the core refuses again
+      // on the checkpoint itself
+      if (recordAdapter === E.MRXS_SOURCE_ADAPTER &&
+          (st.gen.adapterVersion || '1') !== E.MRXS_ADAPTER_VERSION) {
+        refuse(`进度记录属于 MRXS 适配器 v${st.gen.adapterVersion || '1'}，当前为 ` +
+          `v${E.MRXS_ADAPTER_VERSION}（金字塔 ${E.MRXS_PYRAMID_METHOD}）：两种几何配方不得混合`,
+          { kind: 'source-adapter' });
+      }
       // same contract for the encoding: the journal generation and every
       // committed state must agree with the record (missing = preserve)
       const journalledEnc = st.gen.encodingProfile || E.ENCODING_PROFILES.PRESERVE;
@@ -1021,6 +1031,9 @@ export class SlideToolsRunner {
         coreVersion: this.coreVersion,
         modality,
         sourceAdapter,
+        // review §4: the probe's adapter version travels with the job so the
+        // journal can pin the generation its committed output belongs to
+        adapterVersion: doc.adapter_version || (isBundle ? E.MRXS_ADAPTER_VERSION : null),
         outputProfile,
         encoding: encodingProfile,
         scratchLevels: levels,

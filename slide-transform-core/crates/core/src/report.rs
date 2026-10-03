@@ -86,6 +86,10 @@ pub struct ComposedSummary {
     pub tiles_filled: u64,
     /// Tiles whose record references the shared fill payload (F3 dedupe).
     pub tiles_deduped: u64,
+    /// Review §4: how reduced levels were built. `l0-box2` = the L0-derived
+    /// box pyramid (every reduced level is the 2×2 area-average chain of
+    /// output level 0); v1 was `scanner-reduced-integer-snap`.
+    pub pyramid: String,
 }
 
 #[derive(Debug, Clone, Default)]

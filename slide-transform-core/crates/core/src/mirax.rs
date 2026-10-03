@@ -39,8 +39,12 @@ use crate::report::AssociatedSummary;
 /// Stable source-format id recorded in plans/reports/provenance/journals.
 pub const SOURCE_FORMAT: &str = "mirax-bundle";
 /// Adapter version (bump on any output-affecting change; resume refuses on
-/// mismatch, mirroring the output-profile refusal).
-pub const ADAPTER_VERSION: &str = "1";
+/// mismatch, mirroring the output-profile refusal). v2 = review §4: reduced
+/// output levels are the L0-derived box pyramid (`l0-box2`) instead of the
+/// scanner reduced-level images composed at integer-snapped positions —
+/// committed pixels change on every reduced level, so v1 checkpoints must
+/// never be mixed into a v2 output.
+pub const ADAPTER_VERSION: &str = "2";
 
 /// OpenSlide's Slidedat size cap.
 const SLIDEDAT_MAX: usize = 1 << 20;

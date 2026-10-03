@@ -1502,7 +1502,8 @@ async function scenarioSV() {
 // (mx) F3 MRXS 页面入口：真实 CC0 完整包（MRXS_SAMPLE_DIR，缺省跳过并记录）
 // 经「选择文件夹（MRXS）」input（page.setInputFiles 目录 → webkitRelativePath）
 // → 摘要 MRXS/明场/画质 + 拼接重编码说明 → 转换（保留画质，bf-ome）→ 保存
-// sha == 原生 CLI（期望 42f3c650…）→ 刷新后任务列表显示文件夹名；compact 一次
+// sha == 原生 CLI（期望 62da50da…：适配器 v2 = review §4 的 l0-box2 金字塔，
+// 缩减层像素全部改变，v1 的 42f3c650… 随之作废）→ 刷新后任务列表显示文件夹名；compact 一次
 // == 原生 --encoding compact；单独 .mrxs 经 file input → 缺失成员信息、无任务目录。
 async function scenarioMX() {
   const dir = process.env.MRXS_SAMPLE_DIR;
@@ -1516,8 +1517,8 @@ async function scenarioMX() {
   const native = L.nativeConvert(entryRel,
     path.join(L.GATE, 'fixtures', 'mrxs-native-bf-ome.ome.tif'), ['--profile', 'bf-ome']);
   const nativeSha = await L.sha256File(native);
-  if (!nativeSha.startsWith('42f3c650')) {
-    throw new Error(`native preserve sha ${nativeSha} != expected 42f3c650…`);
+  if (!nativeSha.startsWith('62da50da')) {
+    throw new Error(`native preserve sha ${nativeSha} != expected 62da50da…`);
   }
   const nativeCompactSha = await L.sha256File(L.nativeConvert(entryRel,
     path.join(L.GATE, 'fixtures', 'mrxs-native-bf-ome-compact.ome.tif'),
@@ -1591,7 +1592,7 @@ async function scenarioMX() {
 
     record('mx-mrxs-folder-e2e', true, {
       folder: 'CMU-1-Saved-1_16', format: pres.fmt, modality: pres.modality,
-      preserveSha: pres.sha, nativeSha, expectedPrefix: '42f3c650',
+      preserveSha: pres.sha, nativeSha, expectedPrefix: '62da50da',
       compactSha: comp.sha, nativeCompactSha,
       composedRow: pres.composed, qualityNote: pres.note.slice(0, 80),
       rowNameAfterReload: rowAfterReload.trim(),

@@ -308,6 +308,12 @@ impl RandomAccessSink for HostSink {
         }
         Ok(())
     }
+    /// Bounded read-back of committed output bytes (review §4: the pyramid
+    /// decodes the previous level's encoded tiles mid-conversion; the host
+    /// reads through the same open sync-access handle it writes through).
+    fn read_at(&self, offset: u64, len: usize) -> CoreResult<Vec<u8>> {
+        OutReader { size: offset + len as u64 }.read_at(offset, len)
+    }
 }
 
 struct HostScratchFactory;
@@ -366,9 +372,6 @@ impl RandomAccessSink for HostScratchSink {
         }
         Ok(())
     }
-}
-
-impl slide_transform_core::io::ReadBack for HostScratchSink {
     fn read_at(&self, offset: u64, len: usize) -> CoreResult<Vec<u8>> {
         let mut out = Vec::with_capacity(len);
         let mut done = 0usize;
@@ -423,7 +426,10 @@ impl slide_transform_core::job::CheckpointCallback for HostCheckpoint {
         }
         let ifds: Vec<String> = c.ifd_tiles.iter().map(|t| t.to_string()).collect();
         let adapter = match self.adapter {
-            Some(a) => format!(",\"adapter\":\"{a}\""),
+            Some(a) => format!(
+                ",\"adapter\":\"{a}\",\"adapter_version\":\"{}\"",
+                slide_transform_core::mirax::ADAPTER_VERSION
+            ),
             None => String::new(),
         };
         let json = format!(
@@ -1127,9 +1133,9 @@ fn run_convert_bundle(
             };
             let composed_json = match &r.composed {
                 Some(c) => format!(
-                    "{{\"mode\":\"{}\",\"fingerprint\":\"{}\",\"quality\":{},\"sampling\":\"{}\",\"huffman\":\"{}\",\"tiles_composed\":{},\"tiles_filled\":{},\"tiles_deduped\":{}}}",
+                    "{{\"mode\":\"{}\",\"fingerprint\":\"{}\",\"quality\":{},\"sampling\":\"{}\",\"huffman\":\"{}\",\"tiles_composed\":{},\"tiles_filled\":{},\"tiles_deduped\":{},\"pyramid\":\"{}\"}}",
                     c.mode, c.fingerprint, c.quality, c.sampling, c.huffman,
-                    c.tiles_composed, c.tiles_filled, c.tiles_deduped
+                    c.tiles_composed, c.tiles_filled, c.tiles_deduped, c.pyramid
                 ),
                 None => "null".to_string(),
             };

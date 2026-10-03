@@ -1307,6 +1307,7 @@ fn emit_convert_json(
             ju("tiles_composed", c.tiles_composed),
             ju("tiles_filled", c.tiles_filled),
             ju("tiles_deduped", c.tiles_deduped),
+            jstr("pyramid", &c.pyramid),
         ]),
         None => "null".to_string(),
     };

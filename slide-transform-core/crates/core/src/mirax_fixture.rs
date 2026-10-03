@@ -28,6 +28,13 @@ pub struct MrxsGenParams {
     /// camera positions (row-major index) with NO images (sparse holes)
     pub skip_positions: Vec<u32>,
     pub quality: u8,
+    /// Review §4 geometry fixture: level-0 images are drawn from the GLOBAL
+    /// level-0 pattern `f(ax, ay)` (smooth diagonal gradient + a 5-px cross
+    /// at every (ax ≡ 16, ay ≡ 16) mod 32) instead of the per-image base
+    /// pattern — content is then coherent ACROSS camera-image seams (a cross
+    /// straddling a boundary is composed consistently from both images), and
+    /// feature L0 coordinates are known exactly by construction.
+    pub features: bool,
     // fault knobs
     pub index_loop: bool,
     pub oob_page_ptr: bool,
@@ -51,6 +58,7 @@ impl Default for MrxsGenParams {
             position_jitter: 0,
             skip_positions: vec![],
             quality: 90,
+            features: false,
             index_loop: false,
             oob_page_ptr: false,
             corrupt_payload: false,
@@ -62,11 +70,44 @@ impl Default for MrxsGenParams {
 }
 
 /// Deterministic per-image pixel content.
-fn image_pixels(level: usize, gx: u64, gy: u64, w: u32, h: u32) -> Vec<u8> {
+fn image_pixels(
+    level: usize,
+    gx: u64,
+    gy: u64,
+    w: u32,
+    h: u32,
+    l0_origin: Option<(i64, i64)>,
+) -> Vec<u8> {
     let mut v = Vec::with_capacity((w * h * 3) as usize);
     let base = ((level as u64 * 37 + gx * 11 + gy * 23) % 200) as u32;
     for y in 0..h {
         for x in 0..w {
+            if level == 0 {
+                if let Some((ox, oy)) = l0_origin {
+                    // review §4 geometry fixture: the GLOBAL level-0 pattern.
+                    // `ax`/`ay` are the pixel's absolute L0 coordinates —
+                    // identical whether the pixel comes from this image or
+                    // the overlapping neighbour, so the composed L0 (and
+                    // therefore the whole L0-derived pyramid) is seamless
+                    // across camera-image boundaries by construction.
+                    let ax = ox + x as i64;
+                    let ay = oy + y as i64;
+                    // smooth diagonal gradient: ≤ 1 level per pixel step, no wrap
+                    let g = 40 + ((ax + ay) / 8).min(120);
+                    // a 5-px plus (dx + dy ≤ 2) centred on every
+                    // (ax ≡ 16 mod 32, ay ≡ 16 mod 32): known absolute L0
+                    // coordinates, straddling seams for some crosses
+                    let dx = (ax.rem_euclid(32) - 16).abs();
+                    let dy = (ay.rem_euclid(32) - 16).abs();
+                    if dx + dy <= 2 {
+                        v.extend_from_slice(&[255, 255, 255]);
+                    } else {
+                        let b = g as u8;
+                        v.extend_from_slice(&[b, b, b]);
+                    }
+                    continue;
+                }
+            }
             let b = (base + x / 8 + y / 8) % 256;
             v.push((b % 251) as u8);
             v.push((b.wrapping_mul(3) % 255) as u8);
@@ -140,8 +181,27 @@ pub fn build_synthetic_mrxs(p: &MrxsGenParams) -> CoreResult<MemBundle> {
                         }
                     }
                 }
-                if has {
-                    let px = image_pixels(li, gx, gy, p.image_w, p.image_h);
+            if has {
+                // level-0 images (concat exponent 0) sit at exactly ONE
+                // camera position whose L0 destination is the position the
+                // fixture wrote into the buffer — that is the image's L0
+                // origin for the global pattern
+                let l0_origin = if p.features && li == 0 && p.levels[0].0 == 0 {
+                    let xp = (gx / p.divisions) as i64;
+                    let yp = (gy / p.divisions) as i64;
+                    let cp = (yp as u64 * npos_x + xp as u64) as usize;
+                    let adv_x = iw0 * div - p.levels[0].1 as i64;
+                    let adv_y = ih0 * div - p.levels[0].2 as i64;
+                    let jit = if cp % 3 == 0 { p.position_jitter } else { 0 };
+                    let (px, py) = positions
+                        .get(cp)
+                        .copied()
+                        .unwrap_or((xp * adv_x, yp * adv_y));
+                    Some((px, py))
+                } else {
+                    None
+                };
+                let px = image_pixels(li, gx, gy, p.image_w, p.image_h, l0_origin);
                     let mut jpg = encode_rgb(&px, p.image_w, p.image_h, &cfg)?;
                     if p.corrupt_payload && li == 0 && image_items[0].is_empty() {
                         jpg = jpg[..jpg.len() / 2].to_vec();

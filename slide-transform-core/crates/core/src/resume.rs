@@ -20,6 +20,9 @@
 //!   scratch file for it).
 //! - `committed_output` is the sink cursor after the committed cells; the
 //!   host must have truncated the output to exactly this length.
+//! - `adapter_version` (review §4) is the adapter version string journalled
+//!   with the state; a converter whose adapter version differs refuses to
+//!   continue (never mix two output recipes in one output).
 
 use crate::error::{CoreError, CoreResult};
 
@@ -30,6 +33,13 @@ pub struct ResumePoint {
     pub cell: u64,
     pub committed_output: u64,
     pub ifd_tiles: Vec<u64>,
+    /// Adapter version the committed state belongs to (review §4
+    /// versioning): journalled with every checkpoint; a converter that has
+    /// moved to another adapter version refuses to continue the state
+    /// rather than mixing two output recipes into one file. `None` (states
+    /// journalled before the field existed) counts as the pre-pyramid
+    /// generation for the MRXS adapter.
+    pub adapter_version: Option<String>,
 }
 
 impl ResumePoint {
@@ -58,6 +68,7 @@ pub fn parse_resume_json(s: &str) -> CoreResult<ResumePoint> {
     let mut channel = 0usize;
     let mut cell = None;
     let mut out = None;
+    let mut adapter_version: Option<String> = None;
     let mut ifds: Vec<u64> = Vec::new();
 
     let mut i = 0usize;
@@ -113,6 +124,21 @@ pub fn parse_resume_json(s: &str) -> CoreResult<ResumePoint> {
             "channel" => channel = read_num(&mut i, b).unwrap_or(0) as usize,
             "cell" => cell = read_num(&mut i, b),
             "out" => out = read_num(&mut i, b),
+            "adapter_version" => {
+                // string value
+                skip_ws(&mut i, b);
+                if i < b.len() && b[i] == b'"' {
+                    i += 1;
+                    let start = i;
+                    while i < b.len() && b[i] != b'"' {
+                        i += 1;
+                    }
+                    adapter_version = Some(String::from_utf8_lossy(&b[start..i]).into_owned());
+                    if i < b.len() {
+                        i += 1;
+                    }
+                }
+            }
             "ifds" => {
                 if i >= b.len() || b[i] != b'[' {
                     return Err(CoreError::validation("resume json: ifds 非数组"));
@@ -161,6 +187,7 @@ pub fn parse_resume_json(s: &str) -> CoreResult<ResumePoint> {
         cell,
         committed_output: out,
         ifd_tiles: ifds,
+        adapter_version,
     };
     rp.validate()?;
     Ok(rp)

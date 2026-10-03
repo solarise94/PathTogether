@@ -174,6 +174,7 @@ fn bf_case_full(width: u32, height: u32, stop: Option<usize>, profile: OutputPro
         cell: st.cell_done,
         committed_output: st.committed_output,
         ifd_tiles: st.ifd_tiles.clone(),
+        adapter_version: None,
     };
 
     // simulate the crash aftermath the host guarantees:
@@ -409,6 +410,7 @@ fn fl_case(stop: Option<usize>) {
         cell: st.cell_done,
         committed_output: st.committed_output,
         ifd_tiles: st.ifd_tiles.clone(),
+        adapter_version: None,
     };
     truncate_file(&part_out, rp.committed_output);
     for (i, &tiles) in rp.ifd_tiles.iter().enumerate() {
@@ -481,6 +483,7 @@ fn resume_wire_json_roundtrip_and_rejects() {
         cell: 3,
         committed_output: 1 << 20,
         ifd_tiles: vec![1, 2, 3], // 3 IFDs for (level 1, cell 3) is wrong
+        adapter_version: None,
     };
     let mut out = FileSink::create(&dir.join("o.tif")).unwrap();
     let mut scratch = FileScratch::new(&dir);

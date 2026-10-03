@@ -752,6 +752,10 @@ async function runJob(msg) {
     policy: opts.policy, profile: profile.id,
     outputProfile: opts.outputProfile,
     sourceAdapter: opts.sourceAdapter || null,
+    // review §4 versioning: the checkpoint states carry the adapter
+    // version; a journal written by an older adapter generation is refused
+    // on resume (never mix two output recipes into one output)
+    adapterVersion: opts.adapterVersion || null,
     encodingProfile: opts.encoding || 'preserve-source-v1',
     cap: opts.outputCapBytes || null,
     resume: resume ? resume.st : null,

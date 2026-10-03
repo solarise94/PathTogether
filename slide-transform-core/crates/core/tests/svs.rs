@@ -691,6 +691,7 @@ fn compact_svs_resume_matches_uninterrupted() {
         cell: st.cell_done,
         committed_output: st.committed_output,
         ifd_tiles: st.ifd_tiles.clone(),
+        adapter_version: None,
     };
     rp.validate().unwrap();
     {
@@ -1115,6 +1116,7 @@ fn resume_mid_level_is_byte_identical() {
         cell: st.cell_done,
         committed_output: st.committed_output,
         ifd_tiles: st.ifd_tiles.clone(),
+        adapter_version: None,
     };
     rp.validate().unwrap();
     assert!(rp.cell > 0 || rp.level > 0, "a genuine mid-run state");

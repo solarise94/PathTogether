@@ -199,7 +199,11 @@ describe('manifest root digest', () => {
 describe('MRXS adapter constants mirror the core', () => {
   it('adapter id/version and the compose fingerprint match the Rust constants', () => {
     expect(E.MRXS_SOURCE_ADAPTER).toBe('mirax-bundle');
-    expect(E.MRXS_ADAPTER_VERSION).toBe('1');
-    expect(E.MRAX_PRESERVE_COMPOSE_FINGERPRINT).toBe('mirax-preserve-compose:q96:y422:hstd:v1');
+    // review §4: v2 = the L0-derived box pyramid (every reduced level is the
+    // box-downsample chain of output L0; v1 composed the scanner's reduced
+    // images at integer-snapped positions — checkpoints never mix)
+    expect(E.MRXS_ADAPTER_VERSION).toBe('2');
+    expect(E.MRAX_PRESERVE_COMPOSE_FINGERPRINT).toBe('mirax-preserve-compose:q96:y422:hstd:v2');
+    expect(E.MRXS_PYRAMID_METHOD).toBe('l0-box2');
   });
 });

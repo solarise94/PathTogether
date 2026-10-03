@@ -188,6 +188,29 @@ impl<'a> BigTiffPyramidWriter<'a> {
         self.cursor
     }
 
+    /// One committed (TileOffsets, TileByteCounts) record of IFD `ifd`
+    /// (review §4 pyramid: the next level reads the previous level's
+    /// payloads back through these records).
+    pub fn tile_record(&self, ifd: usize, index: usize) -> CoreResult<(u64, u32)> {
+        let lv = self
+            .ifds
+            .get(ifd)
+            .ok_or_else(|| CoreError::validation("tile_record: IFD 越界"))?;
+        let b = lv.offcnt.read_at(index as u64 * OFFCNT_REC, OFFCNT_REC as usize)?;
+        let mut off = [0u8; 8];
+        off.copy_from_slice(&b[..8]);
+        Ok((
+            u64::from_le_bytes(off),
+            u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+        ))
+    }
+
+    /// Bounded read-back of already-written output bytes (review §4: the
+    /// pyramid decodes the previous level's encoded tiles from the sink).
+    pub fn read_output_at(&self, offset: u64, len: usize) -> CoreResult<Vec<u8>> {
+        self.sink.read_at(offset, len)
+    }
+
     /// Append a tile payload sequentially; records (offset, byte count).
     pub fn write_tile(&mut self, data: &[u8]) -> CoreResult<(u64, u32)> {
         let offset = self.cursor;

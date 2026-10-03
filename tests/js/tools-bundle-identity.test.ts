@@ -85,7 +85,7 @@ describe('recordBundleIdentity (pinned expectation from the job record)', () => 
     expect(r.memberPaths).toEqual(manifest.members.map((m) => m.path));
     expect(r.memberSizes).toEqual(manifest.members.map((m) => m.size));
     expect(r.manifestShell).toEqual({
-      v: 1, adapter: 'mirax-bundle', adapterVersion: '1',
+      v: 1, adapter: 'mirax-bundle', adapterVersion: E.MRXS_ADAPTER_VERSION,
       entry: 'synthetic.mrxs', stem: 'synthetic', createdAt: manifest.createdAt,
     });
   });

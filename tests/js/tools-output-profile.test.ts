@@ -265,14 +265,16 @@ describe("tool page output-format choice (wiring)", () => {
 		// (fluorescence → undefined → runner defaults to fl-ome)
 		expect(pageSrc)
 			.toContain("sniffedModality === 'brightfield' ? selectedOutputProfile() : undefined");
-		// fresh start (「仅转换并保存」and R1「转换并上传」share driveConversion)
+		// fresh start (「仅转换」and R1「转换并上传到工作台」share driveConversion)
 		expect(pageSrc).toMatch(/startJob\(page\.file, \{[\s\S]*?outputProfile,/);
 		// job-list start passes the UI selection only when the visible format
 		// section belongs to THIS job — after a reload (page.prep null, section
 		// hidden) nothing is passed and the runner uses record.outputProfile,
 		// so the template-default radio can never override a saved choice
+		// (U2: thisPrep is exactly that guard, shared by format and quality)
 		expect(pageSrc).toMatch(/startJob\(null, \{[\s\S]*?outputProfile: startOutputProfile,/);
-		expect(pageSrc).toContain("page.prep && page.prep.jobId === job.id && !els.formatSection.hidden");
+		expect(pageSrc).toContain("const thisPrep = page.prep && page.prep.jobId === job.id;");
+		expect(pageSrc).toContain("(action === 'start' && thisPrep && !els.formatSection.hidden)");
 		// resume passes no settings at all → the record's profile is kept
 		expect(pageSrc).toContain("await page.runner.resumeJob(job.id)");
 		expect(pageSrc).not.toMatch(/resumeJob\(job\.id, \{[\s\S]*?outputProfile/);
@@ -304,10 +306,10 @@ describe("tool page output-format choice (wiring)", () => {
 		expect(pageSrc).toContain("t(`tools.jobs.format.${job.outputProfile}`)");
 	});
 
-	it("i18n carries the choice labels in zh and en", () => {
-		expect(i18nSrc).toContain('"tools.format.ome": "OME-TIFF（推荐，QuPath / Bio-Formats）"');
-		expect(i18nSrc).toContain('"tools.format.classic": "经典金字塔 TIFF（OpenSlide 工具）"');
-		expect(i18nSrc).toContain('"tools.format.ome": "OME-TIFF (recommended; QuPath / Bio-Formats)"');
-		expect(i18nSrc).toContain('"tools.format.classic": "Classic pyramid TIFF (OpenSlide tools)"');
+	it("i18n carries the choice labels in zh and en (output target by software, U2)", () => {
+		expect(i18nSrc).toContain('"tools.format.ome": "适合 QuPath（OME-TIFF，默认）"');
+		expect(i18nSrc).toContain('"tools.format.classic": "兼容 OpenSlide 工具（经典 TIFF）"');
+		expect(i18nSrc).toContain('"tools.format.ome": "For QuPath (OME-TIFF, default)"');
+		expect(i18nSrc).toContain('"tools.format.classic": "OpenSlide-compatible tools (classic TIFF)"');
 	});
 });

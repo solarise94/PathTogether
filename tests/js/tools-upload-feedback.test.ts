@@ -283,3 +283,208 @@ describe("结构化服务端错误 → 可读文案（不出现 [object Object]�
 		expect(describeUploadError({ weird: {} })).toEqual({ key: "tools.upload.err.unknown" });
 	});
 });
+
+// --------------------------------------------------------------------------- //
+// U1：结果面板的字节级上传进度（#upload-progress/#upload-bytes 按任务隔离）
+// --------------------------------------------------------------------------- //
+/** 可控假 XHR（COS PUT 挂起，由测试驱动字节进度/确认）。 */
+class FakeXHR {
+	static instances: FakeXHR[] = [];
+	static onSend: ((xhr: FakeXHR) => void) | null = null;
+	method = "";
+	url = "";
+	body: unknown = null;
+	sent = false;
+	withCredentials: boolean | undefined = undefined;
+	status = 0;
+	upload: Record<string, unknown> = {};
+	setRequestHeader() {}
+	getResponseHeader() { return null; }
+	open(method: string, url: string) { this.method = method; this.url = url; }
+	send(body: unknown) { this.body = body; this.sent = true; if (FakeXHR.onSend) FakeXHR.onSend(this); }
+	abort() { if (this.onabort) this.onabort(); }
+	respond(status: number) {
+		this.status = status;
+		if (this.onload) this.onload();
+	}
+	progress(loaded: number, computable = true) {
+		const fn = this.upload.onprogress as ((ev: unknown) => void) | undefined;
+		if (fn) fn({ loaded, lengthComputable: computable });
+	}
+	onload: (() => void) | null = null;
+	onerror: (() => void) | null = null;
+	onabort: (() => void) | null = null;
+	ontimeout: (() => void) | null = null;
+	constructor() { FakeXHR.instances.push(this); }
+}
+
+/**
+ * 结果面板进度驱动 harness：真实 tools-slides-upload.js + 真实共享引擎；
+ * ingestion 控制台假后端 + COS PUT 挂起（字节事件由测试逐个触发）。
+ * bodyOverride 可改写 GET /api/ingestions/<id> 的响应（如 plan 不一致）。
+ */
+async function progressSetup(opts: { parts?: Array<{ part_number: number; length: number }>; size?: number; statusBody?: () => unknown } = {}) {
+	const parts = opts.parts || [{ part_number: 1, length: 2500 }, { part_number: 2, length: 2500 }];
+	const size = opts.size === undefined ? 5000 : opts.size;
+	const doc = mkDoc();
+	const calls: string[] = [];
+	let completeReqs = 0;
+	const fetchImpl = vi.fn((url: string, o?: RequestInit) => {
+		const method = String((o && o.method) || "GET");
+		calls.push(`${method} ${url}`);
+		if (String(url) === "/api/tools/slides/upload-capability") {
+			return Promise.resolve(resp({
+				cos_upload: CAPS, viewable_formats: VIEWABLE,
+				account: "u1", account_label: "u1@x",
+			}));
+		}
+		if (method === "POST" && String(url) === "/api/ingestions") {
+			return Promise.resolve(resp({ job_id: "inj_1", state: "uploading", stage: "uploading" }, 202));
+		}
+		if (String(url) === "/api/ingestions/inj_1" && method === "GET") {
+			if (opts.statusBody) return Promise.resolve(resp(opts.statusBody()));
+			if (completeReqs > 0) {
+				return Promise.resolve(resp({ stage: "viewable", slide_id: "sld_u1" }));
+			}
+			return Promise.resolve(resp({ stage: "uploading", declared_size: size, parts }));
+		}
+		if (String(url).endsWith("/parts/sign")) {
+			const nums = JSON.parse(String((o as RequestInit).body)).part_numbers as number[];
+			return Promise.resolve(resp({
+				urls: nums.map((n) => ({ url: `https://cos.example/o?partNumber=${n}`, part_number: n })),
+			}));
+		}
+		if (String(url).endsWith("/upload-complete")) {
+			completeReqs++;
+			return Promise.resolve(resp({ stage: "awaiting_server" }, 202));
+		}
+		return Promise.resolve(resp({}));
+	}) as unknown as typeof fetch;
+	const w: Record<string, unknown> = { HP_COS_UPLOAD: null };
+	new Function("window", "document", "fetch", "location", cosEngineSrc)(
+		w, doc, fetchImpl, { href: "http://local/tools/slides", origin: "http://local" });
+	vi.stubGlobal("window", w);
+	vi.stubGlobal("document", doc);
+	vi.stubGlobal("fetch", fetchImpl);
+	vi.stubGlobal("XMLHttpRequest", FakeXHR);
+	vi.stubGlobal("localStorage", {
+		getItem: () => null, setItem() {}, removeItem() {},
+	});
+	vi.stubGlobal("navigator", {
+		locks: { request: (_n: string, _o: unknown, fn: (l: unknown) => Promise<unknown>) =>
+			Promise.resolve(fn({ name: "lock" })) },
+	});
+	const jobs: Record<string, Record<string, unknown>> = {};
+	for (const id of ["job-a", "job-b"]) {
+		jobs[id] = {
+			id, state: "ready", source: { name: `${id}.kfb`, size: 10 }, modality: "brightfield",
+			result: { outputBytes: size, format: VIEWABLE[0], sha256: "x" }, upload: null, intent: null,
+		};
+	}
+	const runner = {
+		async getJob(id: string) { return jobs[id] ? { ...jobs[id] } : null; },
+		async setJobUpload(id: string, patch: Record<string, unknown>) {
+			jobs[id].upload = { ...((jobs[id].upload as object) || {}), ...patch };
+		},
+		async setJobIntent() { return undefined; },
+		async artifactView() { return { size, slice: (s: number, e: number) => ({ s, e }) }; },
+	};
+	let ctl: Ctl2;
+	const t = (k: string, vars?: Record<string, unknown>) => (vars && Object.keys(vars).length
+		? `${k}|${Object.entries(vars).map(([a, b]) => `${a}=${b}`).join(",")}` : k);
+	ctl = createUploadController({
+		runner: runner as never, t, onJobsRefresh: null, onPublished: null,
+		onSelectJob: async (id: string) => { await ctl.setResultJob(id); },
+	}) as unknown as Ctl2;
+	const status = doc.getElementById("upload-status");
+	const bar = doc.getElementById("upload-progress");
+	const bytes = doc.getElementById("upload-bytes");
+	return { ctl, doc, status, bar, bytes, calls, jobs, fetchImpl };
+}
+
+type Ctl2 = {
+	startOrContinue: (id: string) => Promise<unknown>;
+	setResultJob: (id: string) => Promise<unknown>;
+};
+
+describe("U1：结果面板上传进度条（字节事件驱动、按任务隔离）", () => {
+	afterEach(() => {
+		vi.unstubAllGlobals();
+		FakeXHR.instances = [];
+		FakeXHR.onSend = null;
+	});
+
+	it("字节事件画进度条与字节文本；sentAll 显示「数据已发送，等待确认」而非完成", async () => {
+		const { ctl, bar, bytes } = await progressSetup();
+		FakeXHR.onSend = () => { /* PUT 挂起，由测试驱动 */ };
+		const run = ctl.startOrContinue("job-a");
+		await vi.waitFor(() => expect(FakeXHR.instances.length).toBe(2));
+		// 上传开始：进度条可见（初始不定态 + 已确认字节后备 0 B）
+		await vi.waitFor(() => expect(bar.hidden).toBe(false));
+		await vi.waitFor(() => expect(bytes.textContent).toContain("upload.cos.bytes"));
+		expect(bytes.textContent).toContain("done=0 B");
+		// 引擎字节事件节流 120ms：先让节流窗过去再触发
+		await new Promise((r) => setTimeout(r, 150));
+		const x1 = FakeXHR.instances[0];
+		x1.progress(1250);   // 1250/5000 = 25%（字节加权，不是片数 0%）
+		await vi.waitFor(() => expect(bytes.textContent).toContain("done=1.2 KiB"));
+		expect(bytes.textContent).toContain("total=4.9 KiB");
+		// 两片全部字节发出、HTTP 未确认 → 「数据已发送，等待确认」
+		await new Promise((r) => setTimeout(r, 150));
+		FakeXHR.instances[1].progress(2500);   // 1250+2500 = 3750
+		await vi.waitFor(() => expect(bytes.textContent).toContain("done=3.7 KiB"));
+		await new Promise((r) => setTimeout(r, 150));
+		x1.progress(2000);                     // 4500
+		await vi.waitFor(() => expect(bytes.textContent).toContain("done=4.4 KiB"));
+		await new Promise((r) => setTimeout(r, 150));
+		x1.progress(2500);                     // 5000：全部字节已发出、未确认
+		// （本 harness 的 t 是键回显替身；真实文案由 i18n 表提供）
+		await vi.waitFor(() => expect(bytes.textContent).toMatch(/upload\.cos\.sent_all|数据已发送，等待确认/));
+		expect(bytes.textContent).not.toContain("完成");
+		expect(bar.hidden).toBe(false);
+		FakeXHR.instances.forEach((x) => x.respond(200));
+		const r = await run;
+		expect((r as { ok?: boolean }).ok).toBe(true);
+		// 发布（可查看）后进度条收起
+		await vi.waitFor(() => expect(bar.hidden).toBe(true));
+		await vi.waitFor(() => expect(bytes.hidden).toBe(true));
+	});
+
+	it("面板指向别的任务时不画该任务的进度；切回后按其状态重画", async () => {
+		const { ctl, bar, bytes } = await progressSetup();
+		FakeXHR.onSend = () => { /* 挂起 */ };
+		const run = ctl.startOrContinue("job-a");
+		await vi.waitFor(() => expect(FakeXHR.instances.length).toBe(2));
+		await new Promise((r) => setTimeout(r, 150));
+		FakeXHR.instances[0].progress(1250);
+		await vi.waitFor(() => expect(bytes.textContent).toContain("done=1.2 KiB"));
+		// 切到 job-b：job-a 的进度不出现在 B 的面板里
+		await ctl.setResultJob("job-b");
+		expect(bar.hidden).toBe(true);
+		expect(bytes.hidden).toBe(true);
+		expect(bytes.textContent).toBe("");
+		// 切回 job-a：按其保存的进度状态重画
+		await ctl.setResultJob("job-a");
+		expect(bar.hidden).toBe(false);
+		expect(bytes.textContent).toContain("upload.cos.bytes");
+		FakeXHR.instances.forEach((x) => x.respond(200));
+		await run;
+	});
+
+	it("totalBytes 与产物大小不一致 → 稳定码文案（不制造百分比、不签名不传分块）", async () => {
+		const { ctl, status, bytes } = await progressSetup({
+			// 计划合计 5000 ≠ 产物 4999：freezePlan 拒绝
+			size: 4999,
+		});
+		FakeXHR.onSend = () => { throw new Error("must not PUT"); };
+		await ctl.startOrContinue("job-a");
+		await vi.waitFor(() => expect(status.textContent).toContain("tools.upload.err.plan"));
+		expect(bytes.hidden).toBe(true);
+		expect(FakeXHR.instances).toHaveLength(0);
+	});
+
+	it("describeUploadError：plan_size_mismatch → 稳定码文案", () => {
+		expect(describeUploadError({ status: 0, data: { code: "plan_size_mismatch" } }))
+			.toEqual({ key: "tools.upload.err.plan" });
+	});
+});

@@ -78,8 +78,11 @@ async function intentOf(page, jobId) {
 
 async function convertFixture(page, file, { policy = null } = {}) {
   await L.setFile(page, file);
-  await waitFor(async () => (await page.$('#probe-section:not([hidden])')) !== null, 60000, 'probe');
-  if (policy) await page.check('#policy-strict');
+  await waitFor(async () => (await page.$('#summary-section:not([hidden])')) !== null, 60000, 'summary');
+  if (policy) {
+    await L.openMoreOptions(page);
+    await page.check('#policy-strict');
+  }
   return (await currentJobId(page));
 }
 
@@ -1380,12 +1383,26 @@ async function main() {
       await page.click(rowBtn);
       await waitFor(() => release !== null, 60000, 'upload in progress');
       const progress = await visibleText(page, '#upload-status');
-      if (!/上传中|Uploading|%/.test(progress)) throw new Error(`progress not visible: "${progress}"`);
+      // U1：阶段文本保持稳定（“正在上传”），百分比/字节画在 #upload-bytes、
+      // 进度条画在 #upload-progress——三处任一可见即算进度可见
+      const byteLine = await page.evaluate(() => {
+        const bar = document.getElementById('upload-progress');
+        const bytes = document.getElementById('upload-bytes');
+        return {
+          barVisible: !!(bar && !bar.hidden),
+          bytesText: bytes && !bytes.hidden ? (bytes.textContent || '') : '',
+        };
+      });
+      const progressVisible = /上传中|Uploading|%/.test(progress)
+        || byteLine.barVisible || /已传输|transferred/i.test(byteLine.bytesText);
+      if (!progressVisible) {
+        throw new Error(`progress not visible: "${progress}" bar=${byteLine.barVisible} bytes="${byteLine.bytesText}"`);
+      }
       if (!(await page.isVisible('#upload-cancel-btn'))) throw new Error('cancel not visible during upload');
       release();
       await waitFor(async () => /已发布|Published/.test(await visibleText(page, '#upload-status')), 120000, 'visible published');
       if (fake.st.creates.length !== 1) throw new Error(`creates=${fake.st.creates.length}`);
-      record(id, true, { loginLink: href, loginVisible: true, progressVisible: progress.slice(0, 24), creates: 1, publishedVisible: true });
+      record(id, true, { loginLink: href, loginVisible: true, progressVisible: progress.slice(0, 24), barVisible: byteLine.barVisible, creates: 1, publishedVisible: true });
     } catch (e) {
       record(id, false, { error: String(e).slice(0, 400) });
     } finally {
@@ -1493,9 +1510,16 @@ async function main() {
       if (![200, 202].includes(c.status)) throw new Error(`cancel queued ${c.status}`);
       await page.waitForSelector(`${rowBtn}:not([disabled])`, { timeout: 30000 });
       await page.click(rowBtn);
-      await waitFor(async () => /等待暂存空间|Waiting for staging space/.test(await visibleText(page, '#upload-status')), 60000, 'visible waiting_space');
+      // U2：工具页排队阶段文案为「排队」（计划 §2.3 五阶段），不再用共享
+      // 引擎的旧「等待暂存空间」措辞。锚定行首：409 cos_waiting_limit 的
+      // 错误文案里也含「排队」（“已有一个上传在排队等待…”），整跑时前序
+      // 场景的遗留占用会让这次创建直接 409——那不是排队成功，取消按钮
+      // 也不会出现，必须与真正的排队阶段区分开。
+      await waitFor(async () => /^(排队|Queued|等待暂存空间|Waiting for staging space)( · |$)/.test((await visibleText(page, '#upload-status')).trim()), 60000, 'visible waiting_space');
       const waitText = await visibleText(page, '#upload-status');
-      if (!(await page.isVisible('#upload-cancel-btn'))) throw new Error('cancel not visible while queued');
+      // 取消按钮随首个 created/阶段事件重画（busyJobId 在点击时同步置位，
+      // 但可见性要到下一次 paint 才跟上）——轮询等待而非即时断言
+      await waitFor(async () => page.isVisible('#upload-cancel-btn'), 30000, 'cancel visible while queued');
       await page.click('#upload-cancel-btn');
       await waitFor(async () => /已取消上传|Upload cancelled/.test(await visibleText(page, '#upload-status')), 30000, 'cancelled');
       record(id, true, {

@@ -50,7 +50,9 @@ async function startServer(port) {
 /// 独立 profile（每个场景一个；结束删除）。showSaveFilePicker stub 写 OPFS。
 /// locale 钉 zh-CN（见 testLocale）：否则英文环境下 i18n 检测会让整页变
 /// 英文，按 zh 文案书写的断言随之失败。
-async function launch(label, initScripts = []) {
+/// extraArgs（U1）：附加 Chromium 启动参数（如 --host-resolver-rules 把假
+/// COS 域名映射到本地 HTTPS 服务，配合 CDP 限速测真实字节级上传进度）。
+async function launch(label, initScripts = [], extraArgs = []) {
   const profiles = path.join(GATE, 'profiles');
   fs.mkdirSync(profiles, { recursive: true });
   const userDataDir = path.join(profiles, `profile-${label}`);
@@ -59,7 +61,7 @@ async function launch(label, initScripts = []) {
     headless: true,
     viewport: { width: 1120, height: 900 },
     locale: testLocale(), // 同时决定 navigator.language 与 Accept-Language
-    args: ['--disable-dev-shm-usage'],
+    args: ['--disable-dev-shm-usage', ...extraArgs],
   });
   for (const s of initScripts) await context.addInitScript(s);
   const page = context.pages()[0] || (await context.newPage());
@@ -96,6 +98,16 @@ async function openTools(page, port) {
   await page.goto(`http://127.0.0.1:${port}/tools/slides`, { waitUntil: 'load' });
   await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
   return page;
+}
+
+/// U2：高级项（输出格式/资源档位/像素策略/技术摘要/空间细项/通道信息）都在
+/// 折叠的「更多选项」里；需要操作其中的控件时先展开（幂等）。
+async function openMoreOptions(page) {
+  return page.evaluate(() => {
+    const d = document.getElementById('more-options');
+    if (d && !d.open) d.open = true;
+    return !!(d && d.open);
+  });
 }
 
 // ---------------------------------------------------------------- files --
@@ -270,7 +282,8 @@ async function shot(page, name) {
 }
 
 module.exports = {
-  arg, testLocale, startServer, launch, openTools, savePickerStub, downloadGuard, setFile,
+  arg, testLocale, startServer, launch, openTools, openMoreOptions, savePickerStub,
+  downloadGuard, setFile,
   ensureFixture, sparseLargeKfb, sha256File, nativeConvert, opfsSha256,
   clearJobs, jobDirs, writeJson, shot,
   GATE, REPO, CLI, SCREENS, chromium,

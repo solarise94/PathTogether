@@ -53,9 +53,13 @@ async function login(page, port, creds, who = 'user', next = '/tools/slides') {
 /// 安装有状态假后端。返回 { st, behavior, uninstall }：
 ///  - st：可观察状态（创建数/签名批/PUT 字节/complete 次数/任务表）；
 ///  - behavior：可变钩子（测试按场景改写，null = 走默认实现）。
+///  - opts.skipCosRoute（U1）：不拦截 COS origin——分块 PUT 放行到真实网络
+///    （配合 startLocalCos 的本地 HTTPS 假 COS + --host-resolver-rules +
+///    CDP 上行限速，驱动真实 XHR upload.onprogress 字节进度）。
 async function fakeUploadRoutes(page, cosOrigin, opts = {}) {
   const partBytes = opts.partBytes || 0;
   const partsCount = opts.partsCount || 0;   // 按块数等分（优先于 partBytes）
+  const skipCosRoute = !!opts.skipCosRoute;
   const st = {
     creates: [],            // [ {filename, declared_size} ]
     signs: [],              // [ [part numbers] ]
@@ -247,16 +251,82 @@ async function fakeUploadRoutes(page, cosOrigin, opts = {}) {
   }
 
   await page.route('**/api/ingestions**', handleIngestions);
-  await page.route(`${cosOrigin}/**`, handleCos);
+  if (!skipCosRoute) await page.route(`${cosOrigin}/**`, handleCos);
   await page.route('**/api/tools/slides/upload-capability', handleCapability);
   return {
     st, behavior,
     async uninstall() {
       await page.unroute('**/api/ingestions**', handleIngestions);
-      await page.unroute(`${cosOrigin}/**`, handleCos);
+      if (!skipCosRoute) await page.unroute(`${cosOrigin}/**`, handleCos);
       await page.unroute('**/api/tools/slides/upload-capability', handleCapability);
     },
   };
+}
+
+// ------------------------------------------------- 本地 HTTPS 假 COS（U1） --
+
+/// 起一个真实 TLS 的本地假 COS（127.0.0.1 随机端口）。page.route 的响应在
+/// 请求被网络栈接管前就完成，浏览器不会真正发送请求体——XHR upload progress
+/// 事件随之缺失。要测字节级上传进度，PUT 必须走到真实 socket：调用方用
+/// Chromium `--host-resolver-rules=MAP <cosHost> 127.0.0.1` +
+/// `--ignore-certificate-errors`（自签名证书）把假 COS 域名指到本服务，
+/// 再用 CDP `Network.emulateNetworkConditions` 限制上行吞吐，网络层就会按
+/// 字节缓慢发送 body，XHR upload.onprogress 逐次回调。
+/// 证书经 openssl 生成到 .gate-tmp（测试专用，不进仓库）。
+async function startLocalCos(cosHost) {
+  const https = require('https');
+  const { execFileSync } = require('child_process');
+  fs.mkdirSync(GATE, { recursive: true });
+  const keyPath = path.join(GATE, 'local-cos-key.pem');
+  const certPath = path.join(GATE, 'local-cos-cert.pem');
+  if (!fs.existsSync(keyPath) || !fs.existsSync(certPath)) {
+    execFileSync('openssl', [
+      'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '2',
+      '-keyout', keyPath, '-out', certPath,
+      '-subj', `/CN=${cosHost}`,
+      '-addext', `subjectAltName=DNS:${cosHost}`,
+    ], { stdio: 'ignore' });
+  }
+  const st = { puts: [], options: 0, bytes: 0 };
+  const server = https.createServer(
+    { key: fs.readFileSync(keyPath), cert: fs.readFileSync(certPath) },
+    (req, res) => {
+      const u = new URL(req.url, `https://${cosHost}/`);
+      const cors = {
+        'Access-Control-Allow-Origin': req.headers.origin || '*',
+        'Access-Control-Allow-Methods': 'PUT, OPTIONS',
+        'Access-Control-Expose-Headers': 'ETag',
+        Vary: 'Origin',
+      };
+      if (req.method === 'OPTIONS') {
+        st.options++;
+        // 带类型的 Blob（File.slice 继承 MIME）会让 XHR 附带 Content-Type，
+        // 预检即请求放行这些头——原样回显请求的头清单（含 content-type）
+        res.writeHead(204, {
+          ...cors,
+          'Access-Control-Allow-Headers':
+            req.headers['access-control-request-headers'] || '',
+          'Access-Control-Max-Age': '600',
+        });
+        return res.end();
+      }
+      if (req.method === 'PUT') {
+        let n = 0;
+        req.on('data', (c) => { n += c.length; });
+        req.on('end', () => {
+          const partNumber = Number(u.searchParams.get('partNumber'));
+          st.puts.push({ partNumber, bytes: n });
+          st.bytes += n;
+          res.writeHead(200, { ...cors, ETag: `"etag-${st.puts.length}"` });
+          res.end('');
+        });
+        return;
+      }
+      res.writeHead(404, cors);
+      res.end('');
+    });
+  await new Promise((res) => server.listen(0, '127.0.0.1', res));
+  return { server, port: server.address().port, st };
 }
 
 // ------------------------------------------------------------- OPFS 哈希 --
@@ -280,7 +350,7 @@ async function opfsJobSha256(page, jobId) {
 }
 
 module.exports = {
-  startServer, readCreds, login, fakeUploadRoutes, opfsJobSha256,
+  startServer, readCreds, login, fakeUploadRoutes, opfsJobSha256, startLocalCos,
   arg: C3.arg, launch: C3.launch, openTools: C3.openTools,
   savePickerStub: C3.savePickerStub, downloadGuard: C3.downloadGuard,
   setFile: C3.setFile, ensureFixture: C3.ensureFixture, nativeConvert: C3.nativeConvert,

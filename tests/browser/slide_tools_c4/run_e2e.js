@@ -657,7 +657,8 @@ async function main() {
       await L.login(page, PORT, creds, 'user');
       await L.C3.openTools(page, PORT);
       await L.setFile(page, bf);
-      await waitFor(async () => (await page.$('#probe-section:not([hidden])')) !== null, 60000, 'probe');
+      await waitFor(async () => (await page.$('#summary-section:not([hidden])')) !== null, 60000, 'summary');
+      await L.C3.openMoreOptions(page);
       await waitFor(async () => (await page.$('#format-section:not([hidden])')) !== null, 30000, 'format choice');
       await page.check('#format-classic');
       await page.click('#convert-btn');
@@ -699,6 +700,122 @@ async function main() {
     }
   }
 
+  // ---------------------------------------------------------------- (o) --
+  // U1：字节级上传进度。page.route 的 fulfill 在请求体真正走网络前就完成，
+  // 浏览器不会发送 body——XHR upload.onprogress 无从回调。因此本场景把假
+  // COS 域名经 --host-resolver-rules 指到本地 HTTPS 假 COS（真实 socket），
+  // 再用 CDP Network.emulateNetworkConditions 限制上行吞吐：网络层按字节
+  // 缓慢发送 body，#upload-progress（aria-valuenow）在 PUT 完成前出现多次
+  // 递增的中间值；上传 100% 后服务端接收/校验阶段持续显示到发布为止。
+  // 单分片（partsCount=1，产物 ~289 KiB 全在同一个 PUT 里）：字节级更新
+  // 只能来自 upload.onprogress，不能靠「分片完成」事件凑数（§2.4.1）。
+  async function scenarioThrottledBytes() {
+    const cosHost = new URL(creds.cosOrigin).host;
+    const cos = await L.startLocalCos(cosHost);
+    const { context, page } = await L.launch('o-bytes', [], [
+      // 端口映射：URL 无端口（443），本地假 COS 在随机端口
+      `--host-resolver-rules=MAP ${cosHost}:443 127.0.0.1:${cos.port}`,
+      '--ignore-certificate-errors',   // 本地自签名证书（仅测试浏览器）
+    ]);
+    const fake = await L.fakeUploadRoutes(page, creds.cosOrigin,
+      { partsCount: 1, skipCosRoute: true });
+    // 默认假后端每个服务端阶段只展示一拍；钉住「接收 → 校验」各两拍，
+    // 断言上传 100% 后页面持续显示接收/校验（不定态），直到可查看
+    let serverPolls = 0;
+    fake.behavior.onStatus = (job) => {
+      if (fake.st.completeReqs === 0) return job.stage || 'uploading';
+      serverPolls++;
+      if (serverPolls <= 2) return 'downloading';
+      if (serverPolls <= 4) return 'validating';
+      job.stage = 'viewable';
+      return 'viewable';
+    };
+    try {
+      await L.login(page, PORT, creds, 'user');
+      await L.C3.openTools(page, PORT);
+      const { jobId } = await convertFixture(context, page, fake, bf);
+      const before = await L.opfsJobSha256(page, jobId);
+      const cdp = await context.newCDPSession(page);
+      await cdp.send('Network.enable');
+      await cdp.send('Network.emulateNetworkConditions', {
+        offline: false, latency: 0,
+        downloadThroughput: 1024 * 1024,   // 下载不限（状态轮询照常）
+        uploadThroughput: 40 * 1024,       // 40 KB/s 上行 → ~7s 上传窗口
+      });
+      await page.click('#upload-btn');
+      const pcts = [];
+      const bytesTexts = [];
+      const stageSeen = [];
+      let indeterminateDuringServer = false;
+      const deadline = Date.now() + 120000;
+      for (;;) {
+        const snap = await page.evaluate(() => {
+          const bar = document.getElementById('upload-progress');
+          const bytes = document.getElementById('upload-bytes');
+          const status = document.getElementById('upload-status');
+          return {
+            hidden: bar.hidden,
+            pct: bar.getAttribute('aria-valuenow'),
+            indeterminate: bar.classList.contains('indeterminate'),
+            bytes: bytes.hidden ? '' : (bytes.textContent || ''),
+            stage: (status && status.textContent) || '',
+          };
+        });
+        if (!snap.hidden) {
+          if (snap.pct !== null) pcts.push(Number(snap.pct));
+          bytesTexts.push(snap.bytes);
+          if (snap.indeterminate && /接收|校验|处理/.test(snap.stage)) {
+            indeterminateDuringServer = true;
+          }
+        }
+        stageSeen.push(snap.stage);
+        if (/已发布|Published/.test(snap.stage)) break;
+        if (Date.now() > deadline) throw new Error('timeout waiting for published');
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      // ① PUT 完成前 ≥3 个互不相同的中间字节百分比（禁止只断言“有过进度”）
+      const distinct = [...new Set(pcts)];
+      const mid = distinct.filter((v) => v > 0 && v < 100);
+      if (mid.length < 3) {
+        throw new Error(`intermediate byte percentages insufficient: ${JSON.stringify(distinct)}`);
+      }
+      // ② 字节文本按字节加权（已传输 X / 总大小 Y）
+      if (!bytesTexts.some((t) => /已传输|transferred/i.test(t))) {
+        throw new Error(`no byte text seen: ${JSON.stringify([...new Set(bytesTexts)].slice(0, 4))}`);
+      }
+      // ③ 上传 100% 后、发布前：接收/校验阶段持续显示（不定态活动指示）。
+      //    U2：工具页阶段文案与计划对齐（排队 → 上传至腾讯云 → 工作台接收 →
+      //    校验/发布 → 可查看）——按新文案断言。
+      const sawCos = stageSeen.some((s) => /上传至腾讯云|Uploading to Tencent Cloud/.test(s));
+      const sawReceive = stageSeen.some((s) => /工作台接收|Receiving in the workbench/.test(s));
+      const sawValidate = stageSeen.some((s) => /校验\/发布|Validating\/publishing/.test(s));
+      if (!sawCos || !sawReceive || !sawValidate) {
+        throw new Error(`server stages missing before published: cos=${sawCos} rx=${sawReceive} validate=${sawValidate}`);
+      }
+      if (!indeterminateDuringServer) throw new Error('no indeterminate bar during server stages');
+      await waitFor(async () => (await rowUploadState(page)) === 'published', 30000, 'row published');
+      // ④ 真实 socket 收到的 PUT 字节 == 产物大小（进度不改变传输合同）；
+      //    单分片：恰好一个 PUT
+      const putBytes = cos.st.puts.reduce((s, p) => s + p.bytes, 0);
+      if (putBytes !== before.size) throw new Error(`local COS PUT bytes ${putBytes} != ${before.size}`);
+      if (cos.st.puts.length !== 1) throw new Error(`puts=${JSON.stringify(cos.st.puts.map((p) => p.bytes))}`);
+      const after = await L.opfsJobSha256(page, jobId);
+      if (after.sha256 !== before.sha256) throw new Error('artifact sha changed');
+      const sawSentAll = bytesTexts.some((t) => /数据已发送|awaiting confirmation/i.test(t));
+      record('o-throttled-bytes', true, {
+        midPct: mid, distinctPct: distinct.length, putBytes,
+        parts: cos.st.puts.length, preflights: cos.st.options,
+        sawSentAll, indeterminateDuringServer,
+        stages: [...new Set(stageSeen.map((s) => s.slice(0, 10)))],
+      });
+    } catch (e) {
+      record('o-throttled-bytes', false, { error: String(e).slice(0, 400) });
+    } finally {
+      await context.close();
+      cos.server.close();
+    }
+  }
+
   const all = [
     ['a-bf', () => scenarioHappy('bf', bf)],
     ['a-fl', () => scenarioHappy('fl', fl)],
@@ -716,6 +833,7 @@ async function main() {
     ['m1-cancel-during-poll', () => scenarioCancelDuringWait('waiting')],
     ['m2-cancel-during-backoff', () => scenarioCancelDuringWait('backoff')],
     ['n-classic-upload', scenarioClassicUpload],
+    ['o-throttled-bytes', scenarioThrottledBytes],
   ];
   for (const [id, fn] of all) {
     if (ONLY && id !== ONLY) continue;

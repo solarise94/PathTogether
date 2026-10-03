@@ -82,6 +82,11 @@
     "upload.cos.err.state": { zh: "任务状态冲突，请刷新页面后重试", en: "Job state conflict; please refresh and retry" },
     "upload.cos.err.rate": { zh: "签名请求过于频繁，请稍后重试", en: "Signing rate limited; please retry later" },
     "upload.cos.err.reconcile": { zh: "云端容量对账中，暂不可继续，请稍后重试", en: "Cloud capacity reconciliation in progress; retry later" },
+    // U1 字节级上传进度（i18n.js 为主源，此处兜底）
+    "upload.cos.bytes": { zh: "已传输 {done} / {total}", en: "{done} / {total} transferred" },
+    "upload.cos.sent_all": { zh: "数据已发送，等待确认", en: "All data sent, awaiting confirmation" },
+    "upload.cos.retrying": { zh: "正在重试", en: "Retrying" },
+    "upload.cos.err.plan": { zh: "上传计划与文件大小不一致，已停止；请重新上传", en: "Upload plan does not match the file size; stopped — please re-upload" },
     // R1 一键转换并上传（工作台入口；i18n.js 为主源，此处兜底）
     "upload.kfb.hint": { zh: "该格式需在本机转换后上传（平台不再在服务器端转换 KFB/KFBF）", en: "This format must be converted on your machine before uploading (the platform no longer converts KFB/KFBF server-side)" },
     "upload.kfb.btn": { zh: "在本机转换并上传", en: "Convert on this machine and upload" },
@@ -6394,17 +6399,31 @@
     var barWrap = document.createElement("div");
     var bar = document.createElement("div");
     var statusEl = document.createElement("div");
+    var bytesEl = document.createElement("div");
     row.className = "upload-item";
     nameEl.className = "upload-item-name";
     barWrap.className = "upload-item-bar";
     bar.className = "upload-item-bar-fill";
     statusEl.className = "upload-item-status";
+    bytesEl.className = "upload-item-bytes";
+    // 阶段文本走 polite 播报（role=status），但只装阶段名——百分比/字节在
+    // 播报节流意义上属于逐事件抖动，写进独立的非播报元素（U1 §2.3：
+    // aria-live 只在阶段变化时播报，不要每一个网络事件都播报）
+    if (statusEl.setAttribute) statusEl.setAttribute("role", "status");
+    // 进度条本体具备 progressbar 语义（aria-valuenow 由 setStage 维护；
+    // 无 valuenow 即不定态）
+    if (barWrap.setAttribute) {
+      barWrap.setAttribute("role", "progressbar");
+      barWrap.setAttribute("aria-valuemin", "0");
+      barWrap.setAttribute("aria-valuemax", "100");
+    }
     nameEl.textContent = (file && file.name || "?") + " · " +
       humanSize((file && file.size) || 0);
     barWrap.appendChild(bar);
     row.appendChild(nameEl);
     row.appendChild(barWrap);
     row.appendChild(statusEl);
+    row.appendChild(bytesEl);
     var fallback = !host || !host.appendChild;
     if (!fallback) host.appendChild(row);
     var removed = false;
@@ -6418,28 +6437,44 @@
       }, delay);
     }
     return {
-      // 三段状态：正在传输（confirmed_offset 为准）→ 服务端校验 → 入库完成
-      // note（可选，COS 直传引入）：阶段后的补充说明（如排队位置/续传提示），
-      // 既有调用方不传不受影响
-      setStage: function (stageKey, frac, note) {
+      // 三段状态：正在传输（字节事件为准）→ 服务端校验 → 入库完成
+      // note（可选，COS 直传引入）：字节文本（已传输 X / 总大小 Y、
+      // 「数据已发送，等待确认」）——与百分比一起写进独立的非播报元素；
+      // indeterminate（U1）：当前阶段无量化信息 → 不定态活动指示
+      // （移除 aria-valuenow、清内联宽度让 CSS 动画接管），
+      // 百分比只表示当前阶段，绝不合成为全流程百分比
+      setStage: function (stageKey, frac, note, indeterminate) {
         var label = tt(stageKey);
-        if (frac !== undefined && frac !== null && isFinite(frac)) {
-          label += " " + Math.round(frac * 100) + "%";
-        }
-        if (note) { label += " · " + note; }
+        var pct = (!indeterminate && frac !== undefined && frac !== null &&
+                   isFinite(frac))
+          ? Math.max(0, Math.min(100, Math.round(frac * 100))) : null;
         statusEl.textContent = label;
+        bytesEl.textContent = (pct !== null ? pct + "% · " : "") + (note || "");
+        if (bar.classList) {
+          if (indeterminate) bar.classList.add("upload-item-bar-indeterminate");
+          else bar.classList.remove("upload-item-bar-indeterminate");
+        }
+        if (barWrap.setAttribute) {
+          if (pct !== null) barWrap.setAttribute("aria-valuenow", String(pct));
+          else if (barWrap.removeAttribute) barWrap.removeAttribute("aria-valuenow");
+        }
         if (fallback) {
           // 旧模板回退：写入共用进度条（单文件场景行为与旧版一致）
           if (els.progressWrap && els.progressWrap.style) els.progressWrap.style.display = "block";
-          if (els.progressBar && els.progressBar.style) els.progressBar.style.width = Math.round((frac || 0) * 100) + "%";
-          if (els.progressText) els.progressText.textContent = label;
+          if (els.progressBar && els.progressBar.style) els.progressBar.style.width = (pct === null ? 0 : pct) + "%";
+          if (els.progressText) els.progressText.textContent =
+            (pct !== null ? label + " " + pct + "%" : label) + (note ? " · " + note : "");
         } else if (bar.style) {
-          bar.style.width = Math.round((frac || 0) * 100) + "%";
+          // 不定态清内联宽度：否则旧宽度覆盖动画类的 30%（条不动）
+          bar.style.width = pct === null ? "" : pct + "%";
         }
       },
       markError: function () {
         if (row.classList) row.classList.add("upload-item-error");
-        if (bar && bar.classList) bar.classList.add("upload-item-bar-error");
+        if (bar && bar.classList) {
+          bar.classList.add("upload-item-bar-error");
+          bar.classList.remove("upload-item-bar-indeterminate");
+        }
       },
       finish: function (keepMs) {
         if (fallback) {
@@ -6449,6 +6484,9 @@
         }
       },
       _row: row,
+      _bar: bar,
+      _status: statusEl,
+      _bytes: bytesEl,
     };
   }
 
@@ -6902,6 +6940,7 @@
     if (code === "ingestion_state_conflict") return tt("upload.cos.err.state");
     if (code === "cos_sign_rate_limited") return tt("upload.cos.err.rate");
     if (code === "cos_capacity_reconcile_required") return tt("upload.cos.err.reconcile");
+    if (code === "plan_size_mismatch") return tt("upload.cos.err.plan");
     if (code === "name_unavailable") return tt("upload.err.name");
     if (code === "invalid_declared_size") return tt("upload.err.size_mismatch");
     if (code === "cos_unavailable") return tt("upload.cos.err.unavailable");
@@ -6919,13 +6958,19 @@
   }
 
   function cosShowStage(row, b, noteOverride) {
-    // 阶段文案唯一入口：上传阶段百分比由分块确认驱动（调用方另设），
+    // 阶段文案唯一入口：上传阶段百分比由字节事件驱动（uploadFileCos 另设），
     // 下载进度用服务端持久 checkpoint（downloaded_bytes/declared_size）——
-    // 上传 100% ≠ 可查看，绝不合成全流程百分比（§5）
+    // 上传 100% ≠ 可查看，绝不合成全流程百分比（§5）。无量化信息的服务端
+    // 阶段用不定态活动指示（U1 §2.3：所有百分比只表示当前阶段）。
     var frac = null;
+    var indeterminate = false;
     if (b && b.stage === "downloading" && typeof b.downloaded_bytes === "number" &&
         typeof b.declared_size === "number" && b.declared_size > 0) {
       frac = Math.min(b.downloaded_bytes / b.declared_size, 1);
+    } else if (b) {
+      // 上传（恢复行/探测期）与其余服务端阶段：无字节量化 → 不定态活动指示；
+      // 上传中的字节事件由 uploadFileCos 的 progress 分支另行驱动
+      indeterminate = true;
     }
     var note = noteOverride || "";
     if (!note && b && b.stage === "waiting_space" &&
@@ -6945,7 +6990,7 @@
         note = tt("upload.cos.conv_state", { s: b.conversion.state });
       }
     }
-    row.setStage(cosStageKey(b && b.stage), frac, note);
+    row.setStage(cosStageKey(b && b.stage), frac, note, indeterminate);
   }
 
   // COS 行操作按钮（取消/重试/改用平台上传）：现有上传行无按钮先例，
@@ -6985,6 +7030,25 @@
     }
     var jobId = opts.resumeJobId || null;   // created 事件回填（重试按钮用）
     var upload = null;
+    // U1 字节级进度：上传阶段百分比按已发送/已确认字节（不是分片数）；
+    // 重试期间显示「正在重试」，body 全部发出且未确认时显示
+    // 「数据已发送，等待确认」——绝不显示「完成」。
+    var retrying = false;
+    function cosProgressNote(ev) {
+      if (ev && ev.sentAll) {
+        return tt("upload.cos.sent_all") +
+          (retrying ? " · " + tt("upload.cos.retrying") : "");
+      }
+      if (ev && typeof ev.loadedBytes === "number" &&
+          typeof ev.totalBytes === "number" && ev.totalBytes > 0) {
+        var note = tt("upload.cos.bytes", {
+          done: humanSize(ev.loadedBytes), total: humanSize(ev.totalBytes),
+        });
+        if (retrying) note += " · " + tt("upload.cos.retrying");
+        return note;
+      }
+      return retrying ? tt("upload.cos.retrying") : "";
+    }
 
     // —— 取消（§4 cancel 幂等）：停轮询 + abort 在途 PUT + POST cancel ——
     addRowButton(row, tt("upload.cos.cancel"), function () {
@@ -7018,9 +7082,20 @@
       retryCompleteOnNetworkError: false,
       useResumeEndpoint: false,
       onEvent: function (ev) {
-        if (ev.type === "status") cosShowStage(row, ev.body);
-        else if (ev.type === "progress") {
-          row.setStage("upload.cos.stage.uploading", ev.frac);
+        if (ev.type === "status") {
+          cosShowStage(row, ev.body);
+          if (ev.body && ev.body.stage !== "uploading") retrying = false;
+        } else if (ev.type === "progress") {
+          // phase:'uploading' 字节事件（兼容旧 frac 消费；determinate=false →
+          // 不定态 + 已确认字节后备，不虚构按片百分比）
+          retrying = false;
+          row.setStage("upload.cos.stage.uploading",
+                       ev.determinate === false ? null : ev.frac,
+                       cosProgressNote(ev), ev.determinate === false);
+        } else if (ev.type === "retry") {
+          retrying = true;
+          row.setStage("upload.cos.stage.uploading", null,
+                       cosProgressNote(null), true);
         } else if (ev.type === "created") jobId = ev.jobId;
       },
     });

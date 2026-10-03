@@ -103,27 +103,54 @@ function toastContainer() {
 	};
 }
 
+/** U1：COS PUT 走 XHR（upload.onprogress）。可控假 XHR：send 时经 onSend 裁决。 */
 class FakeXHR {
 	static instances: FakeXHR[] = [];
-	open = vi.fn();
-	setRequestHeader = vi.fn();
-	send = vi.fn();
+	static onSend: ((xhr: FakeXHR) => void) | null = null;
+	method = "";
+	url = "";
+	body: unknown = null;
+	sent = false;
+	aborted = false;
+	withCredentials: boolean | undefined = undefined;
 	status = 0;
-	responseText = "";
-	private listeners: Record<string, () => void> = {};
-	upload = { addEventListener() {} };
-
-	constructor() {
-		FakeXHR.instances.push(this);
+	upload: Record<string, unknown> = {};
+	setRequestHeader = vi.fn();
+	getResponseHeader = vi.fn((_h: string) => null);
+	open(method: string, url: string) { this.method = method; this.url = url; }
+	send(body: unknown) {
+		this.body = body;
+		this.sent = true;
+		if (FakeXHR.onSend) FakeXHR.onSend(this);
 	}
-	addEventListener(type: string, cb: () => void) {
-		this.listeners[type] = cb;
-	}
-	simulateLoad(status: number, body: string) {
+	abort() { this.aborted = true; if (this.onabort) this.onabort(); }
+	respond(status: number, etag: string | null = null) {
 		this.status = status;
-		this.responseText = body;
-		this.listeners["load"] && this.listeners["load"]();
+		this.getResponseHeader = vi.fn((h: string) =>
+			h.toLowerCase() === "etag" ? etag : null);
+		if (this.onload) this.onload();
 	}
+	failNetwork() { if (this.onerror) this.onerror(); }
+	progress(loaded: number, computable = true) {
+		const fn = this.upload.onprogress as ((ev: unknown) => void) | undefined;
+		if (fn) fn({ loaded, lengthComputable: computable });
+	}
+	onload: (() => void) | null = null;
+	onerror: (() => void) | null = null;
+	onabort: (() => void) | null = null;
+	ontimeout: (() => void) | null = null;
+	constructor() { FakeXHR.instances.push(this); }
+}
+
+/** 默认 XHR 后端：全部 COS PUT 立即 200 + ETag。 */
+function okXhr() {
+	FakeXHR.onSend = (x) => { x.respond(200, '"etag-x"'); };
+}
+
+/** 行文本部件（stub 元素不级联 className 之外的语义）。 */
+function rowText(row: ReturnType<typeof el>, cls: string) {
+	const c = row.children.find((x) => String((x as ReturnType<typeof el>).className) === cls) as ReturnType<typeof el> | undefined;
+	return c ? String(c.textContent) : "";
 }
 
 function fakeLocalStorage() {
@@ -260,6 +287,7 @@ afterEach(() => {
 	vi.useRealTimers();
 	vi.unstubAllGlobals();
 	FakeXHR.instances = [];
+	FakeXHR.onSend = null;
 });
 
 // --------------------------------------------------------------------------- #
@@ -334,7 +362,7 @@ describe("选路：capability / eligible 判定（统一 COS）", () => {
 // 2 + 3. 独立传输 / 分批签名 + 并发 + 进度 / upload-complete
 // --------------------------------------------------------------------------- #
 describe("COS 上传状态机：独立传输、分批签名、并发、进度、完成", () => {
-	it("COS PUT 无 CSRF 且 credentials:omit；控制 API 带 CSRF；两批签名 + 批内并发 + 100% 后 upload-complete", async () => {
+	it("COS PUT 走 XHR（无 CSRF 头/不带凭据）；控制 API 带 CSRF；两批签名 + 批内并发 + 字节进度 + upload-complete", async () => {
 		vi.useFakeTimers();
 		const parts = [
 			{ part_number: 1, length: 8 }, { part_number: 2, length: 8 },
@@ -344,6 +372,9 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 		let getStatus = 0;
 		// complete 后第一次 GET 挂起：先断言上传阶段 100% 中间态再放行
 		let releaseServerStage: (() => void) | null = null;
+		// 签名（fetch）与分块 PUT（XHR）的跨载体顺序：批 1 的两个 PUT 都在
+		// 批 2 签名之前
+		const seq: string[] = [];
 		const fetchImpl = vi.fn((url: string, opts?: RequestInit) => {
 			const method = String((opts && opts.method) || "GET");
 			if (url === "/api/ingestions" && method === "POST") {
@@ -370,6 +401,7 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 				return Promise.resolve(resp(body));
 			}
 			if (url === "/api/ingestions/inj_9/parts/sign" && method === "POST") {
+				seq.push("sign");
 				const nums = JSON.parse(String(opts!.body)).part_numbers as number[];
 				return Promise.resolve(resp({
 					job_id: "inj_9", upload_id: "up-1", transport: "presign_parts",
@@ -382,52 +414,98 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 			if (url === "/api/ingestions/inj_9/upload-complete" && method === "POST") {
 				return Promise.resolve(resp({ job_id: "inj_9", state: "completing", stage: "awaiting_server" }, 202));
 			}
-			if (url.startsWith("https://")) return Promise.resolve(resp({}));
+			// U1：COS PUT 不再走 fetch——落到这里即判错（防回归到 fetch 载体）
+			if (url.startsWith("https://")) {
+				return Promise.reject(new Error("COS PUT must use XHR (U1)"));
+			}
 			return Promise.resolve(resp({}));
 		}) as unknown as typeof fetch;
 		const h = loadApp(fetchImpl, { mode: "official", capabilities: {
 			slide_id_api: true,
 			cos_upload: cosCaps(),
 		} });
+		// 分块 PUT：挂起收集字节进度，再逐一确认（字节事件 → 行内字节文本）
+		const gated: FakeXHR[] = [];
+		FakeXHR.onSend = (x) => { seq.push("PUT"); gated.push(x); };
 		const file = cosFile(30);
 		h.up.uploadFile(file);
-		await vi.advanceTimersByTimeAsync(0);
+		for (let i = 0; i < 50 && gated.length < 2; i++) await vi.advanceTimersByTimeAsync(0);
+		expect(gated.length, "批 1 两片并发在途").toBe(2);
 
 		const calls = h.fetchCalls;
-		// ① 独立传输：COS URL 的 PUT 不带 CSRF / 不带 Cookie / cors 模式
-		const puts = calls().filter((c) => c.url.startsWith("https://"));
-		expect(puts).toHaveLength(4);
-		puts.forEach((c) => {
-			expect(c.method).toBe("PUT");
-			expect(c.opts.credentials).toBe("omit");
-			expect(c.opts.mode).toBe("cors");
-			expect(!(c.opts.headers && c.opts.headers["X-CSRF-Token"])).toBe(true);
-		});
 		// ② 控制 API（apiFetch 语义）：创建/签名/完成都带双提交头
 		["/api/ingestions", "/api/ingestions/inj_9/parts/sign", "/api/ingestions/inj_9/upload-complete"]
 			.forEach((u) => {
 				const call = calls().find((c) => c.url === u && c.method === "POST");
+				if (u.endsWith("/upload-complete")) return;   // 尚未到达（批 2 未传）
 				expect(call, u).toBeTruthy();
 				expect((call!.opts.headers as Record<string, string>)["X-CSRF-Token"]).toBe("tok");
 			});
+		// ⑤ U1 字节进度：分块内字节事件 → 行文本按字节（不是按片数）
+		const row = h.container.appendChildren[h.container.appendChildren.length - 1];
+		const statusEl = row.children[2];
+		await vi.advanceTimersByTimeAsync(150);
+		gated[0].progress(4);                    // 批 1 第 1 片 4/8 字节
+		await vi.advanceTimersByTimeAsync(0);
+		expect(rowText(row, "upload-item-status")).toContain("正在上传");
+		expect(rowText(row, "upload-item-bytes")).toContain("upload.cos.bytes:4 B,30 B");
+		// 批 1 全部字节发出（16/30，尾批未开始）：字节文本如实显示，不显示完成
+		await vi.advanceTimersByTimeAsync(150);
+		gated[1].progress(8);                   // 12/30（节流发射）
+		await vi.advanceTimersByTimeAsync(0);
+		await vi.advanceTimersByTimeAsync(150);
+		gated[0].progress(8);                   // 16/30：批 1 body 全发出
+		await vi.advanceTimersByTimeAsync(0);
+		expect(rowText(row, "upload-item-bytes")).toContain("upload.cos.bytes:16 B,30 B");
+		gated[0].respond(200, '"etag-x"');
+		gated[1].respond(200, '"etag-x"');
+		for (let i = 0; i < 50 && gated.length < 4; i++) await vi.advanceTimersByTimeAsync(0);
+		expect(gated.length, "批 2 两片并发在途").toBe(4);
+
+		// ① 独立传输：COS PUT 是 XHR——PUT/签名 URL/零自定义头/不带凭据
+		const puts = FakeXHR.instances;
+		expect(puts).toHaveLength(4);
+		puts.forEach((x) => {
+			expect(x.method).toBe("PUT");
+			expect(String(x.url)).toContain("partNumber=");
+			expect(x.withCredentials).toBe(false);
+			expect(x.setRequestHeader).not.toHaveBeenCalled();
+		});
 		// ③ 分批（sign_batch_max_parts=2）+ 批内并发（max_concurrent_parts=2）：
 		//    批 1 的两个 PUT 都发生在批 2 签名之前
 		const signCalls = calls().filter((c) => c.url.endsWith("/parts/sign"));
 		expect(signCalls).toHaveLength(2);
 		expect(JSON.parse(String((signCalls[0].opts as { body: string }).body)).part_numbers).toEqual([1, 2]);
 		expect(JSON.parse(String((signCalls[1].opts as { body: string }).body)).part_numbers).toEqual([3, 4]);
-		const seq = calls().map((c) => (c.url.startsWith("https://") ? "PUT" : c.url));
-		const sign1 = seq.indexOf("/api/ingestions/inj_9/parts/sign");
-		const sign2 = seq.indexOf("/api/ingestions/inj_9/parts/sign", sign1 + 1);
-		const putCountBetween = seq.slice(sign1, sign2).filter((s) => s === "PUT").length;
-		expect(putCountBetween).toBe(2);
-		// ④ upload-complete 已被调（全部 confirmed 之后）
-		expect(calls().some((c) => c.url === "/api/ingestions/inj_9/upload-complete")).toBe(true);
-		// ⑤ 进度：上传阶段百分比（confirmed/total，仅上传阶段）
-		const row = h.container.appendChildren[h.container.appendChildren.length - 1];
-		const statusEl = row.children[2];
+		const sign1 = seq.indexOf("sign");
+		const sign2 = seq.indexOf("sign", sign1 + 1);
+		expect(seq.slice(sign1, sign2).filter((s) => s === "PUT").length).toBe(2);
+		// 短尾片（6B/30B）：字节加权（已确认 16 + 尾片进行中）
+		await vi.advanceTimersByTimeAsync(150);
+		gated[3].progress(3);
+		await vi.advanceTimersByTimeAsync(0);
+		expect(rowText(row, "upload-item-bytes")).toContain("upload.cos.bytes:19 B,30 B");
+		// 全部 body 已发出、HTTP 未确认 → 「数据已发送，等待确认」（不是完成）
+		await vi.advanceTimersByTimeAsync(150);
+		gated[3].progress(6);                   // 16 + 6 = 22（尾片 body 全发出）
+		await vi.advanceTimersByTimeAsync(0);
+		await vi.advanceTimersByTimeAsync(150);
+		gated[2].progress(8);                   // 16 + 6 + 8 = 30：全部字节已发出
+		await vi.advanceTimersByTimeAsync(0);
+		// （无 vars 的键走 app.js _EXTRA_I18N 兜底的真实中文文案）
+		expect(rowText(row, "upload-item-bytes")).toContain("数据已发送，等待确认");
+		gated[2].respond(200, '"etag-x"');
+		gated[3].respond(200, '"etag-x"');
+		await vi.advanceTimersByTimeAsync(0);
+		// ④ upload-complete 已被调（全部 confirmed 之后，控制 API 带双提交头）
+		const completeCall = calls().find((c) => c.url.endsWith("/upload-complete") && c.method === "POST");
+		expect(completeCall).toBeTruthy();
+		expect((completeCall!.opts.headers as Record<string, string>)["X-CSRF-Token"]).toBe("tok");
+		// 上传阶段 100%（按字节：30/30）；阶段行（aria-live）只装阶段名，
+		// 百分比/字节在非播报的字节行——绝不显示「完成」
 		expect(String(statusEl.textContent)).toContain("正在上传");
-		expect(String(statusEl.textContent)).toContain("100%");
+		expect(rowText(row, "upload-item-bytes")).toContain("100%");
+		expect(String(statusEl.textContent)).not.toContain("100%");
 		// 恢复记录：confirmed 全量落 localStorage（非秘密：无签名 URL/凭证）
 		const saved = JSON.parse(h.storage.getItem("pt.cos.jobs") || "[]");
 		expect(saved[0] && saved[0].confirmed).toEqual([1, 2, 3, 4]);
@@ -439,7 +517,9 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 		expect(String(statusEl.textContent)).toContain("等待服务器接收");
 		await vi.advanceTimersByTimeAsync(2000);   // awaiting_server → downloading
 		expect(String(statusEl.textContent)).toContain("服务器接收中");
-		expect(String(statusEl.textContent)).toContain("50%");
+		// 下载阶段百分比同样在字节行（aria-live 只随阶段播报）
+		expect(rowText(row, "upload-item-bytes")).toContain("50%");
+		expect(String(statusEl.textContent)).not.toContain("50%");
 		await vi.advanceTimersByTimeAsync(2000);   // downloading → viewable
 		await vi.advanceTimersByTimeAsync(0);
 		expect(h.toastMessages.some((m) => m.indexOf("upload.done") >= 0)).toBe(true);
@@ -450,7 +530,7 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 		expect(JSON.parse(h.storage.getItem("pt.cos.jobs") || "[]")).toEqual([]);
 	});
 
-	it("单片失败：同 URL 重试后成功（不触发重新签名分支、不影响其余分块）", async () => {
+	it("单片失败：同 URL 重试后成功（不触发重新签名分支、不影响其余分块；重试显示「正在重试」）", async () => {
 		const parts = [
 			{ part_number: 1, length: 8 }, { part_number: 2, length: 8 },
 			{ part_number: 3, length: 8 }, { part_number: 4, length: 6 },
@@ -475,21 +555,20 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 			if (url === "/api/ingestions/inj_f/upload-complete" && method === "POST") {
 				return Promise.resolve(resp({ stage: "awaiting_server" }, 202));
 			}
-			if (url.startsWith("https://")) {
-				const n = Number(new URL(url).searchParams.get("partNumber"));
-				if (n === 2 && part2Fails-- > 0) return Promise.resolve(resp({}, 500));
-				return Promise.resolve(resp({}));
-			}
 			return Promise.resolve(resp({}));
 		}) as unknown as typeof fetch;
 		const h = loadApp(fetchImpl, { mode: "official", capabilities: { cos_upload: cosCaps() } });
+		FakeXHR.onSend = (x) => {
+			const n = Number(new URL(String(x.url)).searchParams.get("partNumber"));
+			if (n === 2 && part2Fails-- > 0) x.respond(500);
+			else x.respond(200, '"etag-x"');
+		};
 		h.up.uploadFile(cosFile(30));
 		await flush(12);
 		// 重试延迟 600ms（真实定时器）后 part 2 成功 → 全部 confirmed → complete → viewable
 		await new Promise((r) => setTimeout(r, 800));
 		await flush(12);
-		const puts = h.fetchCalls().filter((c) => c.url.startsWith("https://"));
-		expect(puts).toHaveLength(5);   // 4 片 + part2 重试一次
+		expect(FakeXHR.instances).toHaveLength(5);   // 4 片 + part2 重试一次
 		expect(h.fetchCalls().some((c) => c.url === "/api/ingestions/inj_f/upload-complete")).toBe(true);
 		expect(h.toastMessages.some((m) => m.indexOf("upload.done") >= 0)).toBe(true);
 		// 失败重试不累计字节：进度按唯一 confirmed 分块计（viewable 后行文案
@@ -562,26 +641,26 @@ describe("waiting_capacity：排队展示与轮询推进", () => {
 			if (url === "/api/ingestions/inj_w/upload-complete" && method === "POST") {
 				return Promise.resolve(resp({ stage: "awaiting_server" }, 202));
 			}
-			if (url.startsWith("https://")) return Promise.resolve(resp({}));
 			return Promise.resolve(resp({}));
 		}) as unknown as typeof fetch;
 		const h = loadApp(fetchImpl, { mode: "official", capabilities: { cos_upload: cosCaps() } });
+		okXhr();
 		h.up.uploadFile(cosFile(16));
 		await vi.advanceTimersByTimeAsync(0);
 		const row = h.container.appendChildren[h.container.appendChildren.length - 1];
 		const statusEl = row.children[2];
-		// 排队位置展示（0 基 → 第 1 位）；无预计时间（不出现 eta 字样）
+		// 排队位置展示（0 基 → 第 1 位，位置在字节行）；无预计时间（不出现 eta 字样）
 		expect(String(statusEl.textContent)).toContain("等待暂存空间");
-		expect(String(statusEl.textContent)).toContain("upload.cos.queue:1");
+		expect(rowText(row, "upload-item-bytes")).toContain("upload.cos.queue:1");
 		expect(String(statusEl.textContent)).not.toContain("eta");
 		// 5s 轮询推进：第一跳后仍在等待（第二次 GET 仍 waiting），继续放行到 uploading
 		await vi.advanceTimersByTimeAsync(5000);
 		await vi.advanceTimersByTimeAsync(5000);
 		expect(h.fetchCalls().filter((c) => c.url === "/api/ingestions/inj_w" && c.method === "GET").length)
 			.toBeGreaterThanOrEqual(3);
-		// 准入后拿到分块计划 → 签名 + PUT → 完成
+		// 准入后拿到分块计划 → 签名 + PUT（XHR）→ 完成
 		expect(h.fetchCalls().some((c) => c.url === "/api/ingestions/inj_w/parts/sign")).toBe(true);
-		expect(h.fetchCalls().filter((c) => c.url.startsWith("https://"))).toHaveLength(2);
+		expect(FakeXHR.instances).toHaveLength(2);
 		await vi.advanceTimersByTimeAsync(0);
 		expect(h.toastMessages.some((m) => m.indexOf("upload.done") >= 0)).toBe(true);
 	});
@@ -617,11 +696,13 @@ describe("刷新恢复：只读进度行与终态清理", () => {
 		const row = h.container.appendChildren[0];
 		expect(String(row.children[0].textContent)).toContain("big.svs");
 		expect(String(row.children[2].textContent)).toContain("服务器接收中");
-		expect(String(row.children[2].textContent)).toContain("33%");
-		// uploading 未完成 → 提示重选同名文件可续传
+		// 下载百分比在字节行（阶段行 aria-live 只装阶段名）
+		expect(rowText(row, "upload-item-bytes")).toContain("33%");
+		expect(String(row.children[2].textContent)).not.toContain("33%");
+		// uploading 未完成 → 提示重选同名文件可续传（位置在字节行）
 		stage = "uploading";
 		await vi.advanceTimersByTimeAsync(3000);
-		expect(String(row.children[2].textContent)).toContain("重新选择同名文件可续传");
+		expect(rowText(row, "upload-item-bytes")).toContain("重新选择同名文件可续传");
 		// 终态 → row 失败 + 本地记录清理
 		stage = "terminal";
 		await vi.advanceTimersByTimeAsync(3000);
@@ -655,10 +736,10 @@ describe("刷新恢复：只读进度行与终态清理", () => {
 			if (url === "/api/ingestions/inj_r/upload-complete" && method === "POST") {
 				return Promise.resolve(resp({ stage: "awaiting_server" }, 202));
 			}
-			if (url.startsWith("https://")) return Promise.resolve(resp({}));
 			return Promise.resolve(resp({}));
 		}) as unknown as typeof fetch;
 		const h = loadApp(fetchImpl, { mode: "official", capabilities: { cos_upload: cosCaps() } });
+		okXhr();   // U1：COS PUT 走 XHR
 		h.storage.setItem("pt.cos.jobs", JSON.stringify([
 			{ job_id: "inj_r", filename: "big.svs", size: 30, confirmed: [1, 2] },
 		]));
@@ -688,6 +769,9 @@ describe("i18n：upload.cos.* 键（zh/en）与 stage 映射", () => {
 		"upload.cos.items", "upload.cos.conv_state",
 		"upload.cos.err.waiting_limit", "upload.cos.err.state", "upload.cos.err.rate",
 		"upload.cos.err.reconcile",
+		// U1 字节级进度
+		"upload.cos.bytes", "upload.cos.sent_all", "upload.cos.retrying",
+		"upload.cos.err.plan",
 	];
 
 	function loadI18n() {

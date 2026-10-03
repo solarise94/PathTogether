@@ -408,6 +408,25 @@ export function magicModality(head) {
   return null;
 }
 
+/// Extension-based HINTS ONLY — never identification (the 8-byte magic check
+/// in `_prepare` decides, so a disguised extension is still probed and a
+/// wrong extension on a real KFB still works). Used by the tool page to
+/// explain likely-unsupported inputs before attempting any read. Adding an
+/// input format (F1 SVS, F3 MRXS) means touching this table together with
+/// SUPPORTED_MAGICS above — one place for input capabilities.
+export const INPUT_EXTENSION_HINTS = [
+  { ext: /\.(mrxs|dat)$/i, kind: 'bundle' }, // MRXS needs the whole bundle
+];
+
+/// 'bundle' | null for a file name (SVS is identified by its TIFF header).
+export function inputExtensionHint(name) {
+  const n = String(name || '');
+  for (const h of INPUT_EXTENSION_HINTS) {
+    if (h.ext.test(n)) return h.kind;
+  }
+  return null;
+}
+
 // ------------------------------------------------- input capability (F1) --
 
 /// Bounded structural probe of a TIFF container BEFORE staging (input

@@ -1,6 +1,8 @@
 # 切片工具体验与格式扩展：发布交接（U1–U3、F1、F3）
 
-日期：2026-10-03。分支 `ux-formats`（基于 `release/r1` 的 `7aa4d88`，即已上线的 rc6）。**未推送、未部署。** 按 [实施计划](tool-ux-and-format-expansion-implementation-plan-20261003.md) 与 [review](tool-ux-and-upload-progress-review-20261003.md) 实施。F2（SVS / JPEG 2000）只完成 [可行性评估](f2-jpeg2000-feasibility.md)，未实现；赛维尔等待样本，未实施；AI 会话 403 是独立问题，本分支未改动。
+日期：2026-10-03。分支 `ux-formats`（基于 `release/r1` 的 `7aa4d88`，即已上线的 rc6）。**未推送、未部署。**
+
+> **状态（2026-10-03 更新）：实现已提交；[独立 review](ux-formats-independent-review-20261003.md) 发现待修项，发布 gate 待验，当前整包不发布。** 待修：MRXS 探测/转换内存不受资源档位约束（P1）；MRXS 续跑未绑定原任务身份（P1）；MRXS 像素 ground-truth 门禁会对缺失/空材料假通过（P2）；MRXS 低倍层整数拼接的几何精度需单独验收（只看平均色差不足以接受）。在这些项关闭且几何限制获得产品接受之前，F3 只是候选能力。下文 §3–§4 的数值是 review 之前的结果。 按 [实施计划](tool-ux-and-format-expansion-implementation-plan-20261003.md) 与 [review](tool-ux-and-upload-progress-review-20261003.md) 实施。F2（SVS / JPEG 2000）只完成 [可行性评估](f2-jpeg2000-feasibility.md)，未实现；赛维尔等待样本，未实施；AI 会话 403 是独立问题，本分支未改动。
 
 ## 1. 交付内容
 

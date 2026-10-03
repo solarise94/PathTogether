@@ -52,19 +52,25 @@ async function prepareFixtures() {
   const bf = path.join(dir, 'bf.kfb');
   const bf2 = path.join(dir, 'bf-big.kfb'); // bigger for export/cancel tests
   const fl = path.join(dir, 'fl.kfbf');
+  const svs = path.join(dir, 'svs.svs'); // F1: adapter-mismatch refusal row
   if (!fs.existsSync(bf)) execFileSync(L.CLI, ['gen-kfb', bf, '--width', '700', '--height', '500']);
   if (!fs.existsSync(bf2)) execFileSync(L.CLI, ['gen-kfb', bf2, '--width', '1600', '--height', '1200']);
   if (!fs.existsSync(fl)) execFileSync(L.CLI, ['gen-kfbf', fl, '--width', '600', '--height', '400']);
-  // brightfield references use the browser's default for new jobs (bf-ome);
-  // `bfClassic` is the classic profile kept for legacy/compatibility jobs
+  if (!fs.existsSync(svs)) execFileSync(L.CLI, ['gen-svs', svs, '--width', '700', '--height', '500']);
+  // native references use the browser's default for new jobs (bf-ome);
+  // `bfClassic` is the classic profile kept for legacy/compatibility jobs;
+  // `bfCompact` is compact-jpeg-v1 at the SAME bf-ome layout (U3)
   const native = {};
-  for (const [k, p, prof] of [['bf', bf, 'bf-ome'], ['bf2', bf2, 'bf-ome'],
-    ['bfClassic', bf, 'bf-classic'], ['fl', fl, 'fl-ome']]) {
+  for (const [k, p, prof, enc] of [['bf', bf, 'bf-ome', null], ['bf2', bf2, 'bf-ome', null],
+    ['bfClassic', bf, 'bf-classic', null], ['fl', fl, 'fl-ome', null],
+    ['bfCompact', bf, 'bf-ome', 'compact'], ['bfPreserve', bf, 'bf-ome', 'preserve'],
+    ['svs', svs, 'bf-ome', null]]) {
     const out = path.join(dir, `${k}-native.tif`);
-    execFileSync(L.CLI, ['convert', p, out, '--overwrite', '--profile', prof]);
+    execFileSync(L.CLI, ['convert', p, out, '--overwrite', '--profile', prof,
+      ...(enc ? ['--encoding', enc] : [])]);
     native[k] = await L.sha256File(out);
   }
-  return { bf, bf2, fl, native, dir };
+  return { bf, bf2, fl, svs, native, dir };
 }
 
 // ---------------------------------------------------------------- scenarios
@@ -489,6 +495,108 @@ function makeScenarios(F) {
       sha: await shaOf(page, jobId), expect: F.native.bfClassic };
   }]);
 
+  S.push(['compact-encoding-resume-matches', async (page) => {
+    // U3: a compact-jpeg-v1 job crashes mid-payload and resumes; the final
+    // artifact must equal the UNINTERRUPTED native COMPACT conversion
+    const b = await begin(page, F.bf, { profileId: 'saver', encoding: 'compact-jpeg-v1', faults: { crashAtWrite: 5 } }); const jobId = b.jobId; const base = b.base;
+    await waitForFault(page, 'crashAtWrite', base, jobId);
+    const rec0 = await page.evaluate((id) => window.__c2.jobRecord(id), jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    await page.evaluate((id) => window.__c2.resume({ jobId: id }), jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    const rec = await page.evaluate((id) => window.__c2.jobRecord(id), jobId);
+    return { done, recEncoding: rec0.encodingProfile,
+      resultEncoding: rec.result && rec.result.encoding,
+      lossy: rec.result && rec.result.lossy_reencode,
+      sha: await shaOf(page, jobId), expect: F.native.bfCompact };
+  }]);
+
+  S.push(['encoding-change-refused', async (page) => {
+    // a compact job's committed bytes are compact: resuming as preserve (or
+    // a preserve job as compact) is refused; a record tampered to disagree
+    // with its journal generation is refused; the honest resume completes
+    const b = await begin(page, F.bf, { profileId: 'saver', encoding: 'compact-jpeg-v1', faults: { crashAtWrite: 6 } }); const jobId = b.jobId; const base = b.base;
+    await waitForFault(page, 'crashAtWrite', base, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    const asPreserve = await page.evaluate((id) => window.__c2.tryResume({ jobId: id, encoding: 'preserve-source-v1' }), jobId);
+    await page.evaluate(() => window.__c2.tamperJobRecord({ encodingProfile: 'preserve-source-v1' }));
+    const mismatch = await page.evaluate((id) => window.__c2.tryResume({ jobId: id }), jobId);
+    await page.evaluate(() => window.__c2.tamperJobRecord({ encodingProfile: 'compact-jpeg-v1' }));
+    // and the reverse direction on a preserve job
+    const b2 = await begin(page, F.bf, { profileId: 'saver', faults: { crashAtWrite: 6 } }); const jobId2 = b2.jobId; const base2 = b2.base;
+    await waitForFault(page, 'crashAtWrite', base2, jobId2);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    const asCompact = await page.evaluate((id) => window.__c2.tryResume({ jobId: id, encoding: 'compact-jpeg-v1' }), jobId2);
+    await page.evaluate((id) => window.__c2.resume({ jobId: id }), jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    return { asPreserve, mismatch, asCompact, done,
+      sha: await shaOf(page, jobId), expect: F.native.bfCompact };
+  }]);
+
+  S.push(['legacy-record-resumes-preserve', async (page) => {
+    // a job paused by a pre-U3 build: record + journal carry neither the
+    // output profile nor the encoding; its partial output is classic
+    // preserve and must be finished exactly that way (classic layout,
+    // preserve bytes — never compact)
+    const b = await begin(page, F.bf, { profileId: 'saver', faults: { crashAtWrite: 5 } }); const jobId = b.jobId; const base = b.base;
+    await waitForFault(page, 'crashAtWrite', base, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    const legacy = await page.evaluate((id) => window.__c2.legacyizeJob(id), jobId);
+    const rec0 = await page.evaluate((id) => window.__c2.jobRecord(id), jobId);
+    const asCompact = await page.evaluate((id) => window.__c2.tryResume({ jobId: id, encoding: 'compact-jpeg-v1' }), jobId);
+    await page.evaluate((id) => window.__c2.resume({ jobId: id }), jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    const rec = await page.evaluate((id) => window.__c2.jobRecord(id), jobId);
+    return { legacy, recHadEncoding: 'encodingProfile' in rec0, asCompact, done,
+      resultEncoding: rec.result && rec.result.encoding,
+      format: rec.result && rec.result.format,
+      sha: await shaOf(page, jobId), expect: F.native.bfClassic };
+  }]);
+
+  S.push(['prepared-encoding-set-rules', async (page) => {
+    // the page's quality radio change → setPreparedEncodingProfile: writes a
+    // prepared record; refuses once the job left prepared; refuses compact
+    // for a fluorescence job
+    await L.clearJobs(page);
+    await L.setFile(page, F.bf);
+    const prep = await page.evaluate(() => window.__c2.probe());
+    const rec0 = await page.evaluate((id) => window.__c2.jobRecord(id), prep.jobId);
+    const set = await page.evaluate((id) => window.__runner.setPreparedEncodingProfile(id, 'compact-jpeg-v1')
+      .then(() => ({ ok: true }), (e) => ({ ok: false, code: e && e.error && e.error.code })), prep.jobId);
+    const rec1 = await page.evaluate((id) => window.__c2.jobRecord(id), prep.jobId);
+    await page.evaluate((id) => window.__runner.startJob(null, { jobId: id, profileId: 'saver' }).then(() => true), prep.jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    const started = await page.evaluate((id) => window.__runner.setPreparedEncodingProfile(id, 'preserve-source-v1')
+      .then(() => ({ ok: true }), (e) => ({ ok: false, code: e && e.error && e.error.code,
+        kind: e && e.error && e.error.kind })), prep.jobId);
+    await L.setFile(page, F.fl);
+    const prepFl = await page.evaluate(() => window.__c2.probe());
+    const flSet = await page.evaluate((id) => window.__runner.setPreparedEncodingProfile(id, 'compact-jpeg-v1')
+      .then(() => ({ ok: true }), (e) => ({ ok: false, code: e && e.error && e.error.code,
+        kind: e && e.error && e.error.kind })), prepFl.jobId);
+    return { rec0Encoding: rec0.encodingProfile, set, rec1Encoding: rec1.encodingProfile,
+      done, startedRefusal: started, flRefusal: flSet,
+      sha: await shaOf(page, prep.jobId), expect: F.native.bfCompact };
+  }]);
+
+  S.push(['svs-adapter-change-refused', async (page) => {
+    // F1 §8 (merged): committed progress belongs to the input adapter that
+    // wrote it. An SVS job whose record is tampered to name another adapter
+    // (a KFB record carries no sourceAdapter) is refused with the typed
+    // source-adapter kind; the honest resume completes at the native bytes.
+    const b = await begin(page, F.svs, { profileId: 'saver', faults: { crashAtWrite: 6 } }); const jobId = b.jobId; const base = b.base;
+    await waitForFault(page, 'crashAtWrite', base, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    const rec0 = await page.evaluate((id) => window.__c2.jobRecord(id), jobId);
+    await page.evaluate(() => window.__c2.tamperJobRecord({ sourceAdapter: null }));
+    const asKfb = await page.evaluate((id) => window.__c2.tryResume({ jobId: id }), jobId);
+    await page.evaluate(() => window.__c2.tamperJobRecord({ sourceAdapter: 'aperio-svs-jpeg' }));
+    await page.evaluate((id) => window.__c2.resume({ jobId: id }), jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    return { recAdapter: rec0.sourceAdapter, asKfb, done,
+      sha: await shaOf(page, jobId), expect: F.native.svs };
+  }]);
+
   S.push(['fl-resume-matches', async (page) => {
     const b = await begin(page, F.fl, { profileId: 'saver', faults: { crashAtWrite: 6 } }); const jobId = b.jobId; const base = b.base;
     await waitForFault(page, 'crashAtWrite', base, jobId);
@@ -618,6 +726,48 @@ function verdict(name, r) {
     case 'core-version-bump-refused':
       const cb = r.coreBump && r.coreBump.code;
       return cb === 'resume_refused' ? ok() : fail(`coreBump=${cb}`);
+    case 'compact-encoding-resume-matches':
+      return r.done && r.done.ok && r.recEncoding === 'compact-jpeg-v1'
+        && r.resultEncoding === 'compact-jpeg-v1' && r.lossy === true
+        && r.sha === r.expect
+        ? ok() : fail(safeJson({ done: r.done && r.done.ok, rec: r.recEncoding,
+          res: r.resultEncoding, lossy: r.lossy, sha: r.sha && r.sha.slice(0, 8) }));
+    case 'encoding-change-refused': {
+      const p = r.asPreserve || {}, m = r.mismatch || {}, c = r.asCompact || {};
+      return p.refused && p.code === 'resume_refused' && p.message.includes('画质')
+        && m.refused && m.code === 'resume_refused'
+        && c.refused && c.code === 'resume_refused'
+        && r.done && r.done.ok && r.sha === r.expect
+        ? ok() : fail(safeJson({ asPreserve: p, mismatch: m, asCompact: c,
+          done: r.done && r.done.ok }));
+    }
+    case 'legacy-record-resumes-preserve': {
+      const a = r.asCompact || {};
+      return r.recHadEncoding === false && a.refused && a.code === 'resume_refused'
+        && r.done && r.done.ok
+        && r.format === 'classic-bigtiff-jpeg-pyramid'
+        && r.resultEncoding === 'preserve-source-v1' && r.sha === r.expect
+        ? ok() : fail(safeJson({ had: r.recHadEncoding, asCompact: a,
+          done: r.done && r.done.ok, f: r.format, enc: r.resultEncoding }));
+    }
+    case 'prepared-encoding-set-rules': {
+      const st = r.startedRefusal || {}, fl = r.flRefusal || {};
+      return r.rec0Encoding === 'preserve-source-v1' && r.set && r.set.ok === true
+        && r.rec1Encoding === 'compact-jpeg-v1'
+        && st.ok === false && st.code === 'resume_refused' && st.kind === 'encoding-profile'
+        && fl.ok === false && fl.code === 'unsupported_input' && fl.kind === 'encoding-profile'
+        && r.done && r.done.ok && r.sha === r.expect
+        ? ok() : fail(safeJson({ rec0: r.rec0Encoding, set: r.set, rec1: r.rec1Encoding,
+          started: st, fl: fl, done: r.done && r.done.ok }));
+    }
+    case 'svs-adapter-change-refused': {
+      const m = r.asKfb || {};
+      return r.recAdapter === 'aperio-svs-jpeg' && m.refused && m.code === 'resume_refused'
+        && m.kind === 'source-adapter' && m.message.includes('适配器')
+        && r.done && r.done.ok && r.sha === r.expect
+        ? ok() : fail(safeJson({ rec: r.recAdapter, asKfb: m, done: r.done && r.done.ok,
+          sha: r.sha && r.sha.slice(0, 8) }));
+    }
     case 'two-tabs-web-lock':
       return r.secondTab && r.secondTab.refused && r.secondTab.code === 'job_locked_other_tab' ? ok() : fail(`secondTab=${JSON.stringify(r.secondTab)}`);
     case 'opfs-jobdir-deleted-rejected':

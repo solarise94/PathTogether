@@ -465,6 +465,15 @@ pub fn estimate_svs(doc: &SvsDoc) -> crate::estimate::OutputEstimate {
         .saturating_add(ifds.saturating_mul(4 * 1024))
         .saturating_add(extras)
         .saturating_add(1024 * 1024);
+    // compact (U3): every tile is re-encoded at the locked compact
+    // parameters — pixel-bound, not byte-bound; same 1.5× slack as the KFB
+    // estimate (the tables/ICC extras vanish, the slack covers them)
+    let compact = payload
+        .saturating_mul(3)
+        .div_ceil(2)
+        .saturating_add(tiles.saturating_mul(16))
+        .saturating_add(ifds.saturating_mul(4 * 1024))
+        .saturating_add(1024 * 1024);
     crate::estimate::OutputEstimate {
         payload_bytes: payload,
         tiles_present: tiles,
@@ -473,5 +482,6 @@ pub fn estimate_svs(doc: &SvsDoc) -> crate::estimate::OutputEstimate {
         edge_tiles: 0, // passthrough: edge tiles are copied, not re-encoded
         ifds,
         output_upper_bound_bytes: out,
+        compact_upper_bound_bytes: compact,
     }
 }

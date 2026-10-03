@@ -10,7 +10,10 @@
 use slide_transform_core::convert_svs;
 use slide_transform_core::error::ErrorCode::*;
 use slide_transform_core::io::{ByteSource, MemScratch, MemSink, MemSource, RandomAccessSink};
-use slide_transform_core::plan::{InputIdentity, OutputProfile, PixelPolicy, TransformPlan};
+use slide_transform_core::plan::{
+    EncodingProfile, InputIdentity, OutputProfile, PixelPolicy, TransformPlan,
+    COMPACT_JPEG_V1_FINGERPRINT,
+};
 use slide_transform_core::report::TransformResult;
 use slide_transform_core::svs;
 use slide_transform_core::svs_fixture::{build_synthetic_svs, FixtureColor, SvsGenParams};
@@ -242,12 +245,49 @@ fn convert_classic_profiles_structure() {
 }
 
 fn conv_bytes(data: &[u8], profile: OutputProfile) -> Vec<u8> {
+    conv_bytes_enc(data, profile, EncodingProfile::PreserveSource)
+}
+
+fn conv_bytes_enc(
+    data: &[u8],
+    profile: OutputProfile,
+    encoding: EncodingProfile,
+) -> Vec<u8> {
     let src = MemSource::new(data.to_vec());
     let mut sink = MemSink::new();
     let mut scratch = MemScratch::default();
-    convert_svs::convert_svs(&src, &mut sink, &mut scratch, &plan_for(profile, PixelPolicy::AllowEdgeReencode))
-        .unwrap();
+    convert_svs::convert_svs(
+        &src,
+        &mut sink,
+        &mut scratch,
+        &plan_for_enc(profile, PixelPolicy::AllowEdgeReencode, encoding),
+    )
+    .unwrap();
     sink.data
+}
+
+fn plan_for_enc(profile: OutputProfile, policy: PixelPolicy, encoding: EncodingProfile) -> TransformPlan {
+    let mut plan = TransformPlan::brightfield(InputIdentity::default())
+        .with_policy(policy)
+        .with_encoding(encoding);
+    plan.profile = profile;
+    plan
+}
+
+fn convert_enc(
+    data: &[u8],
+    profile: OutputProfile,
+    encoding: EncodingProfile,
+) -> Result<TransformResult, slide_transform_core::error::CoreError> {
+    let src = MemSource::new(data.to_vec());
+    let mut sink = MemSink::new();
+    let mut scratch = MemScratch::default();
+    convert_svs::convert_svs(
+        &src,
+        &mut sink,
+        &mut scratch,
+        &plan_for_enc(profile, PixelPolicy::AllowEdgeReencode, encoding),
+    )
 }
 
 #[test]
@@ -343,6 +383,350 @@ fn cropped_tail_tiles_pass_through_and_are_recorded() {
     // byte-identical between policies
     let a = conv_bytes(&data, OutputProfile::ClassicJpegBigTiff);
     assert_eq!(sink.data, a);
+}
+
+// --------------------------------------------------------------------------- //
+// compact-jpeg-v1 × SVS (U3 merged): decode-every-tile re-encode
+// --------------------------------------------------------------------------- //
+
+/// Extract one IFD's tile payloads from an OUTPUT BigTIFF (independent
+/// walker; shared helper of the passthrough and compact checks).
+fn ifd_tiles(out: &outread::Out, at: u64) -> Vec<Vec<u8>> {
+    let ifd = outread::read_ifd(out, at);
+    let (_, typ, cnt, ob) = ifd.entries.iter().find(|(t, ..)| *t == 324).cloned().unwrap();
+    assert_eq!(typ, 16);
+    let offs: Vec<u64> = (0..cnt as usize)
+        .map(|i| u64::from_le_bytes(ob[i * 8..(i + 1) * 8].try_into().unwrap()))
+        .collect();
+    let (_, _, _, cb) = ifd.entries.iter().find(|(t, ..)| *t == 325).cloned().unwrap();
+    let counts: Vec<u64> = (0..cnt as usize)
+        .map(|i| u64::from_le_bytes(cb[i * 8..(i + 1) * 8].try_into().unwrap()))
+        .collect();
+    offs.into_iter()
+        .zip(counts)
+        .map(|(o, c)| out.read_at(o, c as usize).unwrap())
+        .collect()
+}
+
+#[test]
+fn compact_svs_output_contract_both_layouts() {
+    for profile in [OutputProfile::ClassicJpegBigTiff, OutputProfile::OmeBigTiffRgbSubifd] {
+        let p = SvsGenParams {
+            width: 500,
+            height: 260,
+            tile: 240,
+            include_associated: true,
+            icc: true,
+            ..Default::default()
+        };
+        let data = gen(&p);
+        let r = convert_enc(&data, profile, EncodingProfile::CompactJpegV1).unwrap();
+        // every tile of every level was re-encoded, none copied
+        assert_eq!(r.count_raw_copied(), 0);
+        let total: u64 = r.levels.iter().map(|l| l.tiles_total).sum();
+        assert_eq!(r.count_reencoded(), total);
+        // the lossy summary carries the LOCKED parameters (never "lossless")
+        let l = r.lossy_reencode.as_ref().expect("compact must report lossy_reencode");
+        assert_eq!(l.profile, "compact-jpeg-v1");
+        assert_eq!(l.params_fingerprint, COMPACT_JPEG_V1_FINGERPRINT);
+        assert_eq!(l.quality, 80);
+        assert_eq!(l.sampling, "4:2:0");
+        assert_eq!(l.huffman, "standard-annex-k");
+        assert_eq!(l.tiles_reencoded, total);
+        assert_eq!(l.tiles_padded, 0, "Aperio keeps full-size edge tiles");
+        // the passthrough warning is a preserve-only concept
+        assert!(!r.warnings.iter().any(|w| w == "svs_cropped_edge_tile_passthrough"));
+        // adapter provenance survives the encoding change
+        assert_eq!(r.source_format, Some("aperio-svs-jpeg"));
+        assert_eq!(r.adapter_version, Some("1"));
+
+        let out = outread::Out { data: conv_bytes_enc(&data, profile, EncodingProfile::CompactJpegV1) };
+        let v = validate_output(&out, out.size(), Some(r.validation.ifd_count)).unwrap();
+        // classic: one main IFD per level; OME: main IFD + SubIFD pyramid
+        assert_eq!(v.main_ifds, if profile == OutputProfile::ClassicJpegBigTiff { 3 } else { 1 });
+        let ifd0 = outread::read_ifd(&out, outread::first_ifd(&out));
+        // locked compact payload: photometric 6 + the LOCKED subsampling
+        assert_eq!(outread::entry_u64(&ifd0, 262), Some(6));
+        let sub = outread::entry_bytes(&ifd0, 530).expect("YCbCrSubSampling tag");
+        let h = u16::from_le_bytes([sub[0], sub[1]]);
+        let vv = u16::from_le_bytes([sub[2], sub[3]]);
+        assert_eq!((h, vv), (2, 2), "locked 4:2:0, not the source sampling");
+        // source tile size kept; NO shared JPEGTables (self-contained tiles)
+        assert_eq!(outread::entry_u64(&ifd0, 322), Some(240));
+        assert_eq!(outread::entry_u64(&ifd0, 323), Some(240));
+        assert!(outread::entry_bytes(&ifd0, 347).is_none(), "no tag 347 under compact");
+        assert!(outread::entry_bytes(&ifd0, 34675).is_some(), "ICC still carried");
+        // each tile is a self-contained q80 4:2:0 JPEG at the source geometry
+        for t in ifd_tiles(&out, outread::first_ifd(&out)) {
+            let probe = slide_transform_core::jpeg::scan_jpeg(&t).unwrap();
+            assert_eq!(probe.sampling, Some((2, 2, 1, 1, 1, 1)));
+            assert_eq!((probe.width, probe.height), (240u32, 240u32));
+            let q = slide_transform_core::jpeg::qtables_pillow_style(&t).unwrap();
+            assert_eq!(q.len(), 2, "tile carries its own DQT (no tables needed)");
+        }
+        // provenance: the OME-XML records the encoding, the classic
+        // description stays the pre-U3 adapter JSON (KFB convention)
+        let xml = outread::entry_bytes(&ifd0, 270).unwrap();
+        if profile == OutputProfile::OmeBigTiffRgbSubifd {
+            let s = String::from_utf8_lossy(xml);
+            assert!(s.contains("compact-jpeg-v1"));
+            assert!(s.contains(COMPACT_JPEG_V1_FINGERPRINT));
+            assert!(s.contains("lossy"));
+        } else {
+            assert!(xml.starts_with(b"{\"adapter\": \"aperio-svs-jpeg\""));
+            assert!(!String::from_utf8_lossy(xml).contains("encoding"));
+        }
+    }
+}
+
+#[test]
+fn compact_svs_pixels_track_preserve() {
+    // decode the SAME level-0 tiles from a preserve and a compact output and
+    // compare pixels. The fixture is worst-case uniform noise (the real
+    // H&E pixel gate vs OpenSlide lives in the pytest suite), so the bounds
+    // here are correspondingly loose but still reject crop/scale/channel
+    // swaps by orders of magnitude.
+    let p = SvsGenParams { width: 500, height: 260, tile: 240, ..Default::default() };
+    let data = gen(&p);
+    let pres = outread::Out { data: conv_bytes(&data, OutputProfile::ClassicJpegBigTiff) };
+    let comp =
+        outread::Out { data: conv_bytes_enc(&data, OutputProfile::ClassicJpegBigTiff, EncodingProfile::CompactJpegV1) };
+    // preserve tiles are abbreviated streams: merge the IFD's shared tables
+    let ifd0 = outread::read_ifd(&pres, outread::first_ifd(&pres));
+    let tables = outread::entry_bytes(&ifd0, 347).unwrap().to_vec();
+    let mut sum = [0u64; 3];
+    let mut sum_a = [0u64; 3];
+    let mut sum_b = [0u64; 3];
+    let mut luma_sq = 0u64;
+    let mut n = 0u64;
+    for (tp, tc) in ifd_tiles(&pres, outread::first_ifd(&pres))
+        .into_iter()
+        .zip(ifd_tiles(&comp, outread::first_ifd(&comp)))
+    {
+        let merged = slide_transform_core::svs::merge_tables_then_tile(&tables, &tp);
+        // the fixture writes photometric-2 Aperio RGB (no JFIF/Adobe) — the
+        // adapter colourspace rule decodes it with force_rgb
+        let a = slide_transform_core::jpeg::decode_ex(&merged, 240 * 240 * 4, true).unwrap();
+        // the compact re-encode is a self-contained JFIF YCbCr stream
+        let b = slide_transform_core::jpeg::decode(&tc, 240 * 240 * 4).unwrap();
+        assert_eq!((a.width, a.height), (b.width, b.height));
+        assert_eq!(a.kind, slide_transform_core::jpeg::ColorKind::Rgb);
+        assert_eq!(b.kind, slide_transform_core::jpeg::ColorKind::Rgb);
+        for (pa, pb) in a.data.chunks_exact(3).zip(b.data.chunks_exact(3)) {
+            let lum = |p: &[u8]| {
+                (299 * p[0] as u32 + 587 * p[1] as u32 + 114 * p[2] as u32) / 1000
+            };
+            let dl = (lum(pa) as i32 - lum(pb) as i32).unsigned_abs() as u64;
+            luma_sq += dl * dl;
+            for c in 0..3 {
+                sum[c] += (pa[c] as i32 - pb[c] as i32).unsigned_abs() as u64;
+                sum_a[c] += pa[c] as u64;
+                sum_b[c] += pb[c] as u64;
+            }
+            n += 1;
+        }
+    }
+    // worst-case noise bounds: crop/scale/channel swaps would blow these up
+    // by orders of magnitude. Chroma 4:2:0 decimation of pure RGB noise
+    // dominates the per-channel error, so the structural check runs on
+    // luma (untouched by subsampling); the channel MEANS must track exactly
+    // (no channel swap, no crop/scale shift).
+    let luma_mse = luma_sq as f64 / n as f64;
+    let luma_psnr = 10.0 * (255.0 * 255.0 / luma_mse.max(1.0)).log10();
+    assert!(luma_psnr >= 28.0, "noise-fixture luma PSNR {luma_psnr:.2} < 28 dB");
+    for c in 0..3 {
+        let mad = sum[c] as f64 / n as f64;
+        assert!(mad <= 55.0, "channel {c} MAD {mad:.2}");
+        let drift = (sum_a[c] as f64 - sum_b[c] as f64).abs() / n as f64;
+        assert!(drift < 6.0, "channel {c} mean drift {drift:.2} (swap/crop?)");
+    }
+}
+
+#[test]
+fn compact_svs_strict_lossless_refused() {
+    let p = SvsGenParams { width: 500, height: 260, ..Default::default() };
+    let data = gen(&p);
+    let src = MemSource::new(data);
+    let mut sink = MemSink::new();
+    let mut scratch = MemScratch::default();
+    let err = convert_svs::convert_svs(
+        &src,
+        &mut sink,
+        &mut scratch,
+        &plan_for_enc(
+            OutputProfile::ClassicJpegBigTiff,
+            PixelPolicy::StrictLossless,
+            EncodingProfile::CompactJpegV1,
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, PixelPolicyViolation, "{}", err.message);
+    assert!(sink.data.is_empty(), "refusal happens before any output byte");
+}
+
+#[test]
+fn compact_svs_cropped_tiles_padded_and_recorded() {
+    // a genuinely cropped source tile (fixture crops the tail tiles) is
+    // padded onto the white tile canvas under compact — recorded as an edge
+    // region with reused_qtables=false, WITHOUT the passthrough warning
+    let p = SvsGenParams { width: 500, height: 260, crop_tail_tiles: true, ..Default::default() };
+    let data = gen(&p);
+    let r = convert_enc(&data, OutputProfile::ClassicJpegBigTiff, EncodingProfile::CompactJpegV1).unwrap();
+    assert!(!r.edge_regions.is_empty(), "cropped tiles recorded");
+    assert!(r.edge_regions.iter().all(|e| !e.reused_qtables));
+    assert_eq!(r.lossy_reencode.as_ref().unwrap().tiles_padded, r.edge_regions.len() as u64);
+    assert!(!r.warnings.iter().any(|w| w == "svs_cropped_edge_tile_passthrough"));
+    // padded tiles are nominal-size self-contained JPEGs
+    let out = outread::Out { data: conv_bytes_enc(&data, OutputProfile::ClassicJpegBigTiff, EncodingProfile::CompactJpegV1) };
+    let ifd0 = outread::read_ifd(&out, outread::first_ifd(&out));
+    let tw = outread::entry_u64(&ifd0, 322).unwrap();
+    for t in ifd_tiles(&out, outread::first_ifd(&out)) {
+        let probe = slide_transform_core::jpeg::scan_jpeg(&t).unwrap();
+        assert_eq!(probe.width as u64, tw, "padded tile fills the nominal rect");
+    }
+}
+
+#[test]
+fn compact_svs_resume_matches_uninterrupted() {
+    use slide_transform_core::io::{FileScratch, FileSink, FileSource};
+    use slide_transform_core::job::{CancelFlag, CheckpointState, JobControl, NullProgress};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    struct Collector {
+        states: Mutex<Vec<CheckpointState>>,
+        stop_after: Option<usize>,
+        cancel: CancelFlag,
+        count: AtomicUsize,
+    }
+    impl slide_transform_core::job::CheckpointCallback for Collector {
+        fn on_checkpoint(&self, c: &CheckpointState) {
+            let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+            self.states.lock().unwrap().push(c.clone());
+            if let Some(k) = self.stop_after {
+                if n >= k {
+                    self.cancel.cancel();
+                }
+            }
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "stf1-svs-compact-resume-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let in_path = dir.join("in.svs");
+    {
+        let mut sink = FileSink::create(&in_path).unwrap();
+        build_synthetic_svs(
+            &mut sink,
+            &SvsGenParams { width: 1024, height: 520, ..Default::default() },
+        )
+        .unwrap();
+        sink.flush().unwrap();
+    }
+    let plan = || {
+        plan_for_enc(
+            OutputProfile::OmeBigTiffRgbSubifd,
+            PixelPolicy::AllowEdgeReencode,
+            EncodingProfile::CompactJpegV1,
+        )
+    };
+
+    let ref_out = dir.join("ref.ome.tif");
+    {
+        let mut scratch = FileScratch::new(&dir);
+        let mut out = FileSink::create(&ref_out).unwrap();
+        let null = NullProgress;
+        let job = JobControl::new(&null);
+        let r = convert_svs::convert_svs(
+            &FileSource::open(&in_path).unwrap(),
+            &mut out,
+            &mut scratch,
+            &plan(),
+        )
+        .unwrap();
+        out.flush().unwrap();
+        assert_eq!(r.count_raw_copied(), 0);
+        assert!(r.lossy_reencode.is_some());
+    }
+    let full = std::fs::read(&ref_out).unwrap();
+
+    let stop = 3usize;
+    let part_out = dir.join("part.ome.tif");
+    let cancel = CancelFlag::new();
+    let collector = Collector {
+        states: Mutex::new(Vec::new()),
+        stop_after: Some(stop),
+        cancel: cancel.clone(),
+        count: AtomicUsize::new(0),
+    };
+    let crash_dir = dir.join("crash");
+    std::fs::create_dir_all(&crash_dir).unwrap();
+    let mut scratch2 = FileScratch::new(&crash_dir);
+    {
+        let mut out = FileSink::create(&part_out).unwrap();
+        let null = NullProgress;
+        let job = JobControl::new(&null).with_cancel(cancel).with_checkpoint(&collector);
+        let res = convert_svs::convert_svs_to_bigtiff(
+            &FileSource::open(&in_path).unwrap(),
+            &mut out,
+            &mut scratch2,
+            &plan(),
+            &job,
+        );
+        assert!(res.unwrap_err().message.contains("已取消"));
+        out.flush().unwrap();
+    }
+    let states = collector.states.lock().unwrap().clone();
+    let st = &states[stop - 1];
+    let rp = slide_transform_core::resume::ResumePoint {
+        level: st.level as usize,
+        channel: 0,
+        cell: st.cell_done,
+        committed_output: st.committed_output,
+        ifd_tiles: st.ifd_tiles.clone(),
+    };
+    rp.validate().unwrap();
+    {
+        let f = std::fs::OpenOptions::new().write(true).open(&part_out).unwrap();
+        f.set_len(rp.committed_output).unwrap();
+    }
+    for (i, &tiles) in rp.ifd_tiles.iter().enumerate() {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(crash_dir.join(format!(".kfb2tiff-scratch-offcnt-l{i}")))
+            .unwrap();
+        f.set_len(tiles * 12).unwrap();
+    }
+    let r = {
+        let mut out = FileSink::open_preserve(&part_out).unwrap();
+        let null = NullProgress;
+        let job = JobControl::new(&null);
+        let r = convert_svs::convert_svs_to_bigtiff_resume(
+            &FileSource::open(&in_path).unwrap(),
+            &mut out,
+            &mut scratch2,
+            &plan(),
+            &job,
+            &rp,
+        )
+        .unwrap();
+        out.flush().unwrap();
+        r
+    };
+    let got = std::fs::read(&part_out).unwrap();
+    assert_eq!(got, full, "resumed COMPACT output byte-identical to a fresh compact run");
+    assert_eq!(r.output_bytes as usize, full.len());
+    assert_eq!(r.count_raw_copied(), 0);
+    assert!(r.count_reencoded() > 0);
+    assert!(r.lossy_reencode.is_some());
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

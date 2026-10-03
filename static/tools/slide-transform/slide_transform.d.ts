@@ -14,9 +14,17 @@ export function convert(strict_lossless: boolean, channel_json: string): string;
 
 /**
  * Run a conversion with an explicit output profile id (`bf-classic`,
- * `bf-ome`, `fl-ome`; empty = the input's pre-profile default).
+ * `bf-ome`, `fl-ome`; empty = the input's pre-profile default). Encoding is
+ * preserve-source-v1 (pre-U3 behaviour kept bit-for-bit).
  */
 export function convertProfile(profile: string, strict_lossless: boolean, channel_json: string): string;
+
+/**
+ * Run a conversion with explicit output AND encoding profile ids (U3).
+ * `encoding`: `preserve-source-v1` (default) or `compact-jpeg-v1`
+ * (brightfield only).
+ */
+export function convertProfileEncoded(profile: string, encoding: string, strict_lossless: boolean, channel_json: string): string;
 
 /**
  * Resume a conversion from a checkpoint state (the same JSON
@@ -29,6 +37,13 @@ export function convertResume(resume_json: string, strict_lossless: boolean, cha
  * state was committed under a different one.
  */
 export function convertResumeProfile(resume_json: string, profile: string, strict_lossless: boolean, channel_json: string): string;
+
+/**
+ * Resume under explicit output AND encoding profiles (U3); refused when the
+ * checkpoint state was committed under a different combination — including
+ * a compact request against a legacy (preserve, no field) state.
+ */
+export function convertResumeProfileEncoded(resume_json: string, profile: string, encoding: string, strict_lossless: boolean, channel_json: string): string;
 
 export function coreVersion(): string;
 
@@ -69,8 +84,10 @@ export interface InitOutput {
     readonly configure: (a: number) => void;
     readonly convert: (a: number, b: number, c: number) => [number, number];
     readonly convertProfile: (a: number, b: number, c: number, d: number, e: number) => [number, number];
+    readonly convertProfileEncoded: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number];
     readonly convertResume: (a: number, b: number, c: number, d: number, e: number) => [number, number];
     readonly convertResumeProfile: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number];
+    readonly convertResumeProfileEncoded: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => [number, number];
     readonly coreVersion: () => [number, number];
     readonly enableCheckpoint: () => void;
     readonly enableSourceHash: () => void;

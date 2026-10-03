@@ -73,10 +73,25 @@ fn truncate_file(p: &std::path::Path, len: u64) {
 /// complete, then resume from the last checkpoint = finalize-phase crash);
 /// the resumed output must equal the uninterrupted bytes.
 fn bf_case(width: u32, height: u32, stop: Option<usize>) {
-    bf_case_profile(width, height, stop, OutputProfile::ClassicJpegBigTiff);
+    bf_case_full(width, height, stop, OutputProfile::ClassicJpegBigTiff,
+        slide_transform_core::plan::EncodingProfile::PreserveSource);
 }
 
 fn bf_case_profile(width: u32, height: u32, stop: Option<usize>, profile: OutputProfile) {
+    bf_case_full(width, height, stop, profile,
+        slide_transform_core::plan::EncodingProfile::PreserveSource);
+}
+
+/// U3: the same crash/resume equality under the compact encoding — a resumed
+/// compact job must equal an uninterrupted compact run byte-for-byte and
+/// report-identically (never mixing encode generations).
+fn bf_case_encoding(width: u32, height: u32, stop: Option<usize>,
+    encoding: slide_transform_core::plan::EncodingProfile) {
+    bf_case_full(width, height, stop, OutputProfile::OmeBigTiffRgbSubifd, encoding);
+}
+
+fn bf_case_full(width: u32, height: u32, stop: Option<usize>, profile: OutputProfile,
+    encoding: slide_transform_core::plan::EncodingProfile) {
     let dir = tmpdir("bf");
     let src_path = dir.join("in.kfb");
     let mut sink = FileSink::create(&src_path).unwrap();
@@ -90,7 +105,8 @@ fn bf_case_profile(width: u32, height: u32, stop: Option<usize>, profile: Output
     drop(sink);
 
     let plan = || {
-        let mut p = TransformPlan::brightfield(InputIdentity::default());
+        let mut p = TransformPlan::brightfield(InputIdentity::default())
+            .with_encoding(encoding);
         p.profile = profile;
         p
     };
@@ -209,6 +225,15 @@ fn bf_case_profile(width: u32, height: u32, stop: Option<usize>, profile: Output
         assert_eq!(r.warnings.len(), r2.warnings.len());
         assert_eq!(r.ifd_chain, r2.ifd_chain);
         assert_eq!(r.validation.ifd_count, r2.validation.ifd_count);
+        match (&r.lossy_reencode, &r2.lossy_reencode) {
+            (Some(a), Some(b)) => {
+                assert_eq!(a.params_fingerprint, b.params_fingerprint);
+                assert_eq!(a.tiles_reencoded, b.tiles_reencoded);
+                assert_eq!(a.tiles_padded, b.tiles_padded);
+            }
+            (None, None) => {}
+            _ => panic!("lossy_reencode presence differs after resume"),
+        }
     }
     assert_eq!(sha256_file(&part_out), ref_sha, "resumed bytes differ");
 
@@ -240,6 +265,66 @@ fn bf_ome_resume_matches_uninterrupted() {
     bf_case_profile(300, 300, None, OutputProfile::OmeBigTiffRgbSubifd);
     bf_case_profile(700, 500, Some(2), OutputProfile::OmeBigTiffRgbSubifd);
     bf_case_profile(700, 500, Some(3), OutputProfile::OmeBigTiffRgbSubifd);
+}
+
+#[test]
+fn bf_compact_resume_matches_uninterrupted() {
+    // U3: compact-jpeg-v1 crashes mid level-0 / mid level-1 / finalize and
+    // resumes to the byte-identical uninterrupted compact output
+    for k in [1usize, 2] {
+        bf_case_encoding(300, 300, Some(k),
+            slide_transform_core::plan::EncodingProfile::CompactJpegV1);
+    }
+    bf_case_encoding(300, 300, None, slide_transform_core::plan::EncodingProfile::CompactJpegV1);
+    bf_case_encoding(700, 500, Some(2), slide_transform_core::plan::EncodingProfile::CompactJpegV1);
+    bf_case_encoding(700, 500, Some(3), slide_transform_core::plan::EncodingProfile::CompactJpegV1);
+}
+
+#[test]
+fn bf_compact_resume_output_differs_from_preserve() {
+    // guard against a resume that silently re-encodes with preserve
+    // semantics: the compact artifact (fresh OR resumed) must never equal
+    // the preserve artifact of the same input
+    let dir = tmpdir("bf-ne");
+    let src_path = dir.join("in.kfb");
+    let mut sink = FileSink::create(&src_path).unwrap();
+    build_synthetic_kfb(
+        &mut sink,
+        &slide_transform_core::synth_gen::GenParams { width: 300, height: 300, ..Default::default() },
+    )
+    .unwrap();
+    sink.flush().unwrap();
+    let mut pout = FileSink::create(&dir.join("p.tif")).unwrap();
+    let mut scratch = FileScratch::new(&dir);
+    let null = NullProgress;
+    let job = JobControl::new(&null);
+    let mut plan = TransformPlan::brightfield(InputIdentity::default());
+    plan.profile = OutputProfile::OmeBigTiffRgbSubifd;
+    slide_transform_core::convert_bf::convert_kfb_to_bigtiff(
+        &FileSource::open(&src_path).unwrap(), &mut pout, &mut scratch, &plan, &job,
+    )
+    .unwrap();
+    pout.flush().unwrap();
+    drop(pout);
+    let mut cout = FileSink::create(&dir.join("c.tif")).unwrap();
+    let mut scratch2 = FileScratch::new(&dir.join("c"));
+    std::fs::create_dir_all(&dir.join("c")).unwrap();
+    let null = NullProgress;
+    let job = JobControl::new(&null);
+    let plan2 = TransformPlan::brightfield(InputIdentity::default())
+        .with_encoding(slide_transform_core::plan::EncodingProfile::CompactJpegV1);
+    let r = slide_transform_core::convert_bf::convert_kfb_to_bigtiff(
+        &FileSource::open(&src_path).unwrap(), &mut cout, &mut scratch2, &plan2, &job,
+    )
+    .unwrap();
+    cout.flush().unwrap();
+    assert!(r.lossy_reencode.is_some());
+    assert_ne!(
+        sha256_file(&dir.join("p.tif")),
+        sha256_file(&dir.join("c.tif")),
+        "compact must not reproduce the preserve bytes"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

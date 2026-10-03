@@ -326,15 +326,19 @@ export async function removeEntryRecursive(dirHandle, name) {
 
 // ------------------------------------------------------- disk precheck --
 
-/// estimate: {output_upper_bound_bytes, cells_total, tiles_present} from the
-/// core probe; scratch/index ≈ 44 B/cell + 12 B/tile ×2 (index + offcnt) +
-/// journal allowance; sourceBytes = the staged source copy when it is not
-/// yet written; export peak = a second copy of the upper bound when
-/// exporting to another OPFS file (showSaveFilePicker writes to user disk
-/// and does not consume OPFS quota).
-export function diskNeedBytes(estimate, { exporting = false, sourceBytes = 0 } = {}) {
+/// estimate: {output_upper_bound_bytes, compact_upper_bound_bytes,
+/// cells_total, tiles_present} from the core probe; scratch/index ≈ 44
+/// B/cell + 12 B/tile ×2 (index + offcnt) + journal allowance; sourceBytes
+/// = the staged source copy when it is not yet written; export peak = a
+/// second copy of the upper bound when exporting to another OPFS file
+/// (showSaveFilePicker writes to user disk and does not consume OPFS
+/// quota). `encoding` picks the compact bound for compact jobs (U3: the
+/// re-encoded size is pixel-bound, the compact estimate is wider).
+export function diskNeedBytes(estimate, { exporting = false, sourceBytes = 0, encoding } = {}) {
   const e = estimate || {};
-  const ub = Number(e.output_upper_bound_bytes || 0);
+  const ub = encoding === ENCODING_PROFILES.COMPACT
+    ? Number(e.compact_upper_bound_bytes || e.output_upper_bound_bytes || 0)
+    : Number(e.output_upper_bound_bytes || 0);
   const cells = Number(e.cells_total || 0);
   const tiles = Number(e.tiles_present || 0);
   const scratch = cells * 44 + tiles * 12 * 2 + 8 * 2 ** 20;
@@ -535,6 +539,50 @@ export const FORMAT_PROFILES = {
   'ome-bigtiff-subifd-rgb-jpeg-pyramid': OUTPUT_PROFILES.BF_OME,
   'ome-bigtiff-subifd-multichannel-jpeg-passthrough': OUTPUT_PROFILES.FL_OME,
 };
+
+// ------------------------------------------------------ encoding profiles --
+
+/// Tile-payload encoding strategies (U3 「画质」; independent of the output
+/// profile above). Persisted as `encodingProfile` on job records and in
+/// every journal generation / wasm checkpoint state.
+export const ENCODING_PROFILES = {
+  PRESERVE: 'preserve-source-v1', // tiles kept / edge handling (default)
+  COMPACT: 'compact-jpeg-v1',     // whole-slide decode+re-encode, lossy
+};
+
+/// Must equal the Rust `COMPACT_JPEG_V1_FINGERPRINT` (the locked
+/// parameters the core re-encodes with); persisted next to every compact
+/// job so a parameter change can never resume an old half-output.
+export const COMPACT_JPEG_V1_FINGERPRINT = 'cj1:q80:420:hstd:v1';
+
+/// Profile for a NEW job: preserve for every modality (the recommended
+/// 「保留画质」); compact is an explicit brightfield-only choice.
+export function defaultEncodingProfile() {
+  return ENCODING_PROFILES.PRESERVE;
+}
+
+/// Encoding a job record was written with. Records without the field
+/// predate U3: they ran preserve-source semantics — never reinterpret
+/// their (partial) outputs as compact.
+export function recordEncodingProfile(rec) {
+  if (rec && rec.encodingProfile) return rec.encodingProfile;
+  return ENCODING_PROFILES.PRESERVE;
+}
+
+/// Compact is brightfield-only (fluorescence quantification must not gain
+/// a lossy mode).
+export function encodingFitsModality(encoding, modality) {
+  if (encoding === ENCODING_PROFILES.PRESERVE) return true;
+  if (encoding === ENCODING_PROFILES.COMPACT) return modality !== 'fluorescence';
+  return false;
+}
+
+/// Encoding of a finished/summarized job: the core-reported encoding wins;
+/// then the recorded value; legacy records → preserve.
+export function jobEncodingProfile(job) {
+  if (job && job.result && job.result.encoding) return job.result.encoding;
+  return recordEncodingProfile(job);
+}
 
 /// Profile for a NEW job of `modality`.
 export function defaultOutputProfile(modality) {

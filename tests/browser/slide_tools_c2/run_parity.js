@@ -7,9 +7,15 @@
 //
 // F1: `--svs <file.svs>` converts an SVS input through the browser tool and
 // compares against BOTH native output profiles (bf-ome and bf-classic).
+// --compact also applies to the SVS run (merged U3×F1): the SVS input is
+// converted with compact-jpeg-v1 in the browser AND natively — parity is
+// browser-compact == native-compact, never compared with preserve bytes.
 //
-//   node run_parity.js --samples <切片文件夹> [--fl] [--port 8944]
-//   node run_parity.js --svs <sample.svs> [--port 8944]
+//   node run_parity.js --samples <切片文件夹> [--fl] [--fl-all] [--compact] [--port 8944]
+//   node run_parity.js --svs <sample.svs> [--compact] [--port 8944]
+// --compact (U3): the brightfield sample is converted with compact-jpeg-v1
+// in the browser AND natively — parity is browser-compact == native-compact
+// (compact bytes are never compared with preserve bytes).
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -22,18 +28,22 @@ const SVS = L.arg('svs', '');
 const WITH_FL = process.argv.includes('--fl');
 // --fl-all: every KFBF sample (aliases KFBF-A..D, sorted), not just the first
 const FL_ALL = process.argv.includes('--fl-all');
-const LABEL = L.arg('label', 'parity');
+// --compact: brightfield converts at compact-jpeg-v1 (U3)
+const COMPACT = process.argv.includes('--compact');
+const LABEL = L.arg('label', COMPACT ? 'parity-compact' : 'parity');
 
 function sortedBy(p, ext) {
   return fs.readdirSync(p).filter((f) => f.endsWith(ext)).sort()
     .map((f) => path.join(p, f));
 }
 
-async function convertInBrowser(page, input, profileId, outputProfile) {
+async function convertInBrowser(page, input, profileId, outputProfile, encoding) {
   await L.clearJobs(page);
   await L.setFile(page, input);
-  const jobId = await page.evaluate(([p, o]) => window.__c2.start({ profileId: p, outputProfile: o }),
-    [profileId, outputProfile]);
+  const jobId = await page.evaluate(
+    ({ p, o, e }) => window.__c2.start({ profileId: p, outputProfile: o, encoding: e }),
+    { p: profileId, o: outputProfile, e: encoding },
+  );
   const done = await page.evaluate(() => window.__c2.awaitDone(60 * 60 * 1000));
   if (!done || !done.ok) throw new Error('browser conversion failed: ' + JSON.stringify(done).slice(0, 300));
   const hash = await page.evaluate((id) => window.__c2.hashArtifact(id), jobId);
@@ -56,23 +66,27 @@ async function mainSvs() {
   try {
     await L.open(page, PORT);
     for (const profile of ['bf-ome', 'bf-classic']) {
-      const nativeOut = path.join(outDir, `svs-native-${profile === 'bf-ome' ? 'ome' : 'classic'}.tif`);
-      execFileSync(L.CLI, ['convert', SVS, nativeOut, '--overwrite', '--profile', profile]);
-      const nativeSha = await L.sha256File(nativeOut);
-      const t0 = Date.now();
-      const r = await convertInBrowser(page, SVS, 'saver', profile);
-      const equal = r.hash.sha256 === nativeSha;
-      results.runs.push({
-        input: path.basename(SVS), bytes: fs.statSync(SVS).size,
-        sourceFormat: (r.rec && r.rec.result && r.rec.result.source_format) || null,
-        outputProfile: profile,
-        browserSha256: r.hash.sha256, nativeSha256: nativeSha, equal,
-        outputBytes: r.done.outputBytes, convertMs: r.rec.convertMs,
-        validation: { ifdCount: r.rec.validation.ifd_count, checks: r.rec.validation.checks },
-        wallMs: Date.now() - t0,
-      });
-      console.log(`SVS ${profile}: browser ${r.hash.sha256.slice(0, 16)}… native ${nativeSha.slice(0, 16)}… equal=${equal} (${r.rec.convertMs} ms)`);
-      fs.rmSync(nativeOut, { force: true });
+    const tag = `${profile === 'bf-ome' ? 'ome' : 'classic'}${COMPACT ? '-compact' : ''}`;
+    const nativeOut = path.join(outDir, `svs-native-${tag}.tif`);
+    execFileSync(L.CLI, ['convert', SVS, nativeOut, '--overwrite', '--profile', profile,
+      ...(COMPACT ? ['--encoding', 'compact'] : [])]);
+    const nativeSha = await L.sha256File(nativeOut);
+    const t0 = Date.now();
+    const r = await convertInBrowser(page, SVS, 'saver', profile,
+      COMPACT ? 'compact-jpeg-v1' : undefined);
+    const equal = r.hash.sha256 === nativeSha;
+    results.runs.push({
+      input: path.basename(SVS), bytes: fs.statSync(SVS).size,
+      sourceFormat: (r.rec && r.rec.result && r.rec.result.source_format) || null,
+      outputProfile: profile,
+      encoding: COMPACT ? 'compact-jpeg-v1' : 'preserve-source-v1',
+      browserSha256: r.hash.sha256, nativeSha256: nativeSha, equal,
+      outputBytes: r.done.outputBytes, convertMs: r.rec.convertMs,
+      validation: { ifdCount: r.rec.validation.ifd_count, checks: r.rec.validation.checks },
+      wallMs: Date.now() - t0,
+    });
+    console.log(`SVS ${profile}${COMPACT ? ' compact' : ''}: browser ${r.hash.sha256.slice(0, 16)}… native ${nativeSha.slice(0, 16)}… equal=${equal} (${r.rec.convertMs} ms)`);
+    fs.rmSync(nativeOut, { force: true });
     }
   } finally {
     await context.close().catch(() => { /* */ });
@@ -104,8 +118,9 @@ async function main() {
 
   // native references (cli), aliased
   {
-    const n1 = path.join(outDir, 'kfb1-native.tif');
-    execFileSync(L.CLI, ['convert', kfb, n1, '--overwrite', '--profile', 'bf-ome']);
+    const n1 = path.join(outDir, COMPACT ? 'kfb1-native-compact.tif' : 'kfb1-native.tif');
+    execFileSync(L.CLI, ['convert', kfb, n1, '--overwrite', '--profile', 'bf-ome',
+      ...(COMPACT ? ['--encoding', 'compact'] : [])]);
     nativeOf['KFB-1'] = await L.sha256File(n1);
     results.alias['KFB-1'] = { bytes: fs.statSync(kfb).size, sha256: await L.sha256File(kfb) };
     for (const [i, f] of (WITH_FL || FL_ALL ? kfbfs : []).entries()) {
@@ -127,9 +142,10 @@ async function main() {
     // ---- KFB-1 brightfield ----
     {
       const t0 = Date.now();
-      const r = await convertInBrowser(page, kfb, 'saver');
+      const r = await convertInBrowser(page, kfb, 'saver', undefined,
+        COMPACT ? 'compact-jpeg-v1' : undefined);
       results.runs.push({
-        alias: 'KFB-1', modality: 'brightfield',
+        alias: 'KFB-1', modality: 'brightfield', encoding: COMPACT ? 'compact-jpeg-v1' : 'preserve-source-v1',
         browserSha256: r.hash.sha256, nativeSha256: nativeOf['KFB-1'],
         equal: r.hash.sha256 === nativeOf['KFB-1'],
         outputBytes: r.done.outputBytes, convertMs: r.rec.convertMs,

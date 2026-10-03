@@ -18,21 +18,33 @@ pub struct OutputEstimate {
     pub cells_missing: u64,
     pub edge_tiles: u64,
     pub ifds: u64,
-    /// Upper bound of the final output file size.
+    /// Upper bound of the final output file size (preserve encoding).
     pub output_upper_bound_bytes: u64,
+    /// Upper bound under the `compact-jpeg-v1` encoding (U3): every tile is
+    /// re-encoded, so the source payload length is only a PROXY for the
+    /// re-encoded size. Scanner JPEG (q≈90) re-encoded at the locked compact
+    /// parameters measured ≤ ~1.1× per tile (u3 report); the 1.5× slack
+    /// covers the observed worst ratio. A pathological low-quality source
+    /// can still exceed it — the runtime output cap and the recoverable
+    /// quota error remain the hard guards.
+    pub compact_upper_bound_bytes: u64,
 }
 
 fn bound(e: &mut OutputEstimate) {
     let tiles = e.cells_total.max(e.tiles_present);
-    e.output_upper_bound_bytes = e
-        .payload_bytes
-        .saturating_mul(5)
-        .div_ceil(4) // 1.25× slack on payload copies
-        .saturating_add(e.cells_missing.saturating_mul(8 * 1024)) // black fills
-        .saturating_add(e.edge_tiles.saturating_mul(200 * 1024)) // re-encode bound
-        .saturating_add(tiles.saturating_mul(16)) // offset+count arrays
-        .saturating_add(e.ifds.saturating_mul(4 * 1024)) // IFD bodies
-        .saturating_add(1024 * 1024);
+    let payload = e.payload_bytes;
+    let overhead = |payload: u64| {
+        payload
+            .saturating_add(e.cells_missing.saturating_mul(8 * 1024)) // black fills
+            .saturating_add(e.edge_tiles.saturating_mul(200 * 1024)) // re-encode bound
+            .saturating_add(tiles.saturating_mul(16)) // offset+count arrays
+            .saturating_add(e.ifds.saturating_mul(4 * 1024)) // IFD bodies
+            .saturating_add(1024 * 1024)
+    };
+    // preserve: 1.25× slack on payload copies
+    e.output_upper_bound_bytes = overhead(payload.saturating_mul(5).div_ceil(4));
+    // compact: 1.5× slack (re-encoded tiles are pixel-bound, not byte-bound)
+    e.compact_upper_bound_bytes = overhead(payload.saturating_mul(3).div_ceil(2));
 }
 
 pub fn estimate_bf(doc: &KfbDocument, size: u64) -> CoreResult<OutputEstimate> {
@@ -44,6 +56,7 @@ pub fn estimate_bf(doc: &KfbDocument, size: u64) -> CoreResult<OutputEstimate> {
         edge_tiles: 0,
         ifds: 0,
         output_upper_bound_bytes: 0,
+        compact_upper_bound_bytes: 0,
     };
     for lv in &doc.levels {
         let present = doc.grids.present_count(lv.level);
@@ -85,6 +98,7 @@ pub fn estimate_fl(doc: &KfbfDocument, size: u64) -> OutputEstimate {
         edge_tiles: 0,
         ifds: 0,
         output_upper_bound_bytes: 0,
+        compact_upper_bound_bytes: 0,
     };
     let nch = doc.header.channel_count as u64;
     for lv in &doc.levels {

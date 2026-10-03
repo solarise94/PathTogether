@@ -27,9 +27,12 @@ use crate::io::{ByteSource, RandomAccessSink, ScratchFactory};
 use crate::job::{JobControl, NullProgress, Progress, ProgressUnit};
 use crate::kfb::{KfbDocument, KfbLevel, parse_kfb};
 use crate::ome::py_repr_f64;
-use crate::plan::{OutputProfile, PixelPolicy, TransformPlan};
+use crate::plan::{
+    COMPACT_JPEG_V1_FINGERPRINT, COMPACT_JPEG_V1_HUFFMAN, COMPACT_JPEG_V1_QUALITY,
+    COMPACT_JPEG_V1_SAMPLING, EncodingProfile, OutputProfile, PixelPolicy, TransformPlan,
+};
 use crate::report::{
-    EdgeRegion, LevelStats, TransformResult, WARN_EDGE_REENCODE_FALLBACK_Q95,
+    EdgeRegion, LevelStats, LossyReencode, TransformResult, WARN_EDGE_REENCODE_FALLBACK_Q95,
     level_stats_from_kfb,
 };
 use crate::resume::ResumePoint;
@@ -130,6 +133,24 @@ fn supported_sampling(
         (2, 1, 1, 1, 1, 1) => Some((crate::jpeg::Sampling::S422, (2, 1))),
         (2, 2, 1, 1, 1, 1) => Some((crate::jpeg::Sampling::S420, (2, 2))),
         _ => None,
+    }
+}
+
+/// Human-readable subsampling label of the compact profile.
+pub(crate) fn compact_sampling_label() -> &'static str {
+    match COMPACT_JPEG_V1_SAMPLING {
+        crate::jpeg::Sampling::S444 => "4:4:4",
+        crate::jpeg::Sampling::S422 => "4:2:2",
+        crate::jpeg::Sampling::S420 => "4:2:0",
+    }
+}
+
+/// TIFF (h, v) subsampling tag of the compact profile.
+pub(crate) fn compact_sampling_tiff() -> (u16, u16) {
+    match COMPACT_JPEG_V1_SAMPLING {
+        crate::jpeg::Sampling::S444 => (1, 1),
+        crate::jpeg::Sampling::S422 => (2, 1),
+        crate::jpeg::Sampling::S420 => (2, 2),
     }
 }
 
@@ -297,6 +318,8 @@ fn level_sampling(
 /// edge regions, warnings) from the index — payload is read only for edge
 /// tiles (to recover the quantization-table reuse flag exactly like the
 /// write path). `up_to` bounds the cells; `u64::MAX` = whole level.
+/// `compact` reproduces the compact-mode side effects (no payload read:
+/// nothing depends on the source bytes).
 fn reconstruct_cells_bf(
     src: &dyn ByteSource,
     doc: &KfbDocument,
@@ -305,6 +328,7 @@ fn reconstruct_cells_bf(
     stats: &mut LevelStats,
     edge_regions: &mut Vec<EdgeRegion>,
     warnings: &mut Vec<String>,
+    compact: bool,
 ) -> CoreResult<()> {
     doc.grids.for_each_cell(lv.level, |cell, rec| {
         if cell as u64 >= up_to {
@@ -328,6 +352,23 @@ fn reconstruct_cells_bf(
                 "层 {} tile({row},{col}) 尺寸 {}×{} 超出网格 {want_w}×{want_h}",
                 lv.level, rec.jpeg_w, rec.jpeg_h
             )));
+        }
+        if compact {
+            stats.tiles_reencoded += 1;
+            if rec.jpeg_w as u32 != TILE || rec.jpeg_h as u32 != TILE {
+                edge_regions.push(EdgeRegion {
+                    level: lv.level,
+                    channel: None,
+                    x: rec.x,
+                    y: rec.y,
+                    source_w: rec.jpeg_w as u32,
+                    source_h: rec.jpeg_h as u32,
+                    canvas_w: TILE,
+                    canvas_h: TILE,
+                    reused_qtables: false, // compact never reuses source tables
+                });
+            }
+            return Ok(());
         }
         if rec.is_full_tile() {
             stats.tiles_raw_copied += 1;
@@ -418,9 +459,23 @@ fn convert_inner(
             )));
         }
     }
+    if plan.pixel_policy == PixelPolicy::StrictLossless && plan.encoding == EncodingProfile::CompactJpegV1
+    {
+        // compact re-encodes every tile by construction — a strict-lossless
+        // request contradicts it. Typed refusal BEFORE any output byte.
+        return Err(CoreError::policy(
+            "compact-jpeg-v1 与 strict-lossless 互斥：逐 tile 重编码必然有损",
+        ));
+    }
     if plan.pixel_policy == PixelPolicy::StrictLossless {
         strict_lossless_precheck(src, &doc, &levels)?;
     }
+    let compact = plan.encoding == EncodingProfile::CompactJpegV1;
+    let compact_cfg = if compact {
+        Some(crate::plan::compact_jpeg_v1_encoder_cfg())
+    } else {
+        None
+    };
     let source_format = if doc.header.version != 1 { "kfb_kfbio_jpeg" } else { "kfb_bf_v1" };
     let mpp = (doc.header.mpp_x, doc.header.mpp_y);
     let mut writer = match plan.profile {
@@ -457,14 +512,21 @@ fn convert_inner(
         let resume_done = resume.is_some_and(|r| li < r.level);
         let resume_current = resume.is_some_and(|r| li == r.level);
 
-        // ---- level sampling (full consistency unless resuming past this level)
-        let sampling = level_sampling(src, &doc, lv, !resume_done)?;
-        let (enc_sampling, tiff_sub) = supported_sampling(sampling).ok_or_else(|| {
-            CoreError::validation(format!(
-                "层 {} JPEG 采样 {sampling:?} 不在支持集（4:4:4/4:2:2/4:2:0）",
-                lv.level
-            ))
-        })?;
+        // ---- level sampling (full consistency unless resuming past this level).
+        // Compact mode does not depend on the source sampling at all: every
+        // tile is decoded generically and re-encoded at the LOCKED compact
+        // sampling, which is also what the TIFF tags advertise.
+        let (enc_sampling, tiff_sub) = if compact {
+            (COMPACT_JPEG_V1_SAMPLING, compact_sampling_tiff())
+        } else {
+            let sampling = level_sampling(src, &doc, lv, !resume_done)?;
+            supported_sampling(sampling).ok_or_else(|| {
+                CoreError::validation(format!(
+                    "层 {} JPEG 采样 {sampling:?} 不在支持集（4:4:4/4:2:2/4:2:0）",
+                    lv.level
+                ))
+            })?
+        };
 
         let meta = LevelMeta {
             width: lv.width,
@@ -487,7 +549,7 @@ fn convert_inner(
             }
             writer.begin(scratch, &meta, Some(committed))?;
             reconstruct_cells_bf(src, &doc, lv, u64::MAX, &mut stats, &mut edge_regions,
-                &mut warnings)?;
+                &mut warnings, compact)?;
             writer.end(&meta)?;
             ifd_chain.push((lv.level, None));
             level_stats.push(stats);
@@ -499,7 +561,7 @@ fn convert_inner(
             let committed = resume.unwrap().ifd_tiles[li];
             writer.begin(scratch, &meta, Some(committed))?;
             reconstruct_cells_bf(src, &doc, lv, skip_until, &mut stats, &mut edge_regions,
-                &mut warnings)?;
+                &mut warnings, compact)?;
         } else {
             writer.begin(scratch, &meta, None)?;
         }
@@ -530,7 +592,28 @@ fn convert_inner(
             }
             let payload = src.read_at(rec.payload_offset, rec.payload_length as usize)?;
             let data: Vec<u8>;
-            if rec.is_full_tile() {
+            if let Some(cfg) = &compact_cfg {
+                // compact-jpeg-v1: EVERY tile decoded → white canvas →
+                // re-encoded with the locked parameters. Full source
+                // resolution and coordinates are preserved (no crop/scale);
+                // geometry-padded tiles are counted and listed.
+                let encoded = reencode_tile_on_canvas(payload, rec.jpeg_w, rec.jpeg_h, cfg)?;
+                if rec.jpeg_w as u32 != TILE || rec.jpeg_h as u32 != TILE {
+                    edge_regions.push(EdgeRegion {
+                        level: lv.level,
+                        channel: None,
+                        x: rec.x,
+                        y: rec.y,
+                        source_w: rec.jpeg_w as u32,
+                        source_h: rec.jpeg_h as u32,
+                        canvas_w: TILE,
+                        canvas_h: TILE,
+                        reused_qtables: false, // compact never reuses source tables
+                    });
+                }
+                data = encoded;
+                stats.tiles_reencoded += 1;
+            } else if rec.is_full_tile() {
                 data = payload;
                 stats.tiles_raw_copied += 1;
             } else {
@@ -599,6 +682,11 @@ fn convert_inner(
         level_stats.push(stats);
     }
     let output_bytes = writer.finish()?;
+    let compact_tiles_reencoded: u64 =
+        level_stats.iter().map(|l| l.tiles_reencoded).sum();
+    // every compact EdgeRegion is exactly one padded tile (written or
+    // reconstructed-after-resume), so the list length IS the count
+    let compact_tiles_padded: u64 = edge_regions.len() as u64;
 
     let mut result = TransformResult {
         plan_version: plan.plan_version,
@@ -625,6 +713,15 @@ fn convert_inner(
             },
         },
         ifd_chain,
+        lossy_reencode: compact.then(|| LossyReencode {
+            profile: EncodingProfile::CompactJpegV1.id(),
+            params_fingerprint: COMPACT_JPEG_V1_FINGERPRINT.to_string(),
+            quality: COMPACT_JPEG_V1_QUALITY,
+            sampling: compact_sampling_label(),
+            huffman: COMPACT_JPEG_V1_HUFFMAN,
+            tiles_reencoded: compact_tiles_reencoded,
+            tiles_padded: compact_tiles_padded,
+        }),
         associated: doc
             .associated
             .iter()
@@ -658,15 +755,35 @@ fn ome_rgb_description(
         ("output_profile", OutputProfile::OmeBigTiffRgbSubifd.id().to_string()),
         ("source_format", source_format.to_string()),
     ];
+    // Encoding keys appear ONLY for compact runs: preserve outputs keep their
+    // exact pre-U3 OME-XML (byte-parity gate on pinned sha256 values); a
+    // missing key means preserve-source-v1, exactly like every pre-U3 file.
+    if plan.encoding == EncodingProfile::CompactJpegV1 {
+        provenance.push(("encoding_profile", plan.encoding.id().to_string()));
+        provenance.push(("encoding_params_fingerprint", COMPACT_JPEG_V1_FINGERPRINT.to_string()));
+    }
     if !doc.header.scanner_id.is_empty() {
         provenance.push(("scanner_id", doc.header.scanner_id.clone()));
     }
     provenance.push(("pyramid_levels", levels.len().to_string()));
     provenance.push((
         "tile_payloads",
-        "source JPEG tiles copied byte-for-byte; edge tiles decoded, placed on a white \
-         256x256 canvas and re-encoded with the source quantization tables"
-            .to_string(),
+        match plan.encoding {
+            // never claim losslessness: the source was already JPEG-compressed
+            // and compact adds another encode generation
+            EncodingProfile::CompactJpegV1 => format!(
+                "every tile decoded and re-encoded at the locked compact parameters \
+                 (quality {}, subsampling {}, standard Annex-K Huffman, fingerprint {}); \
+                 full source resolution and coordinates kept; lossy",
+                COMPACT_JPEG_V1_QUALITY,
+                compact_sampling_label(),
+                COMPACT_JPEG_V1_FINGERPRINT
+            ),
+            EncodingProfile::PreserveSource =>
+                "source JPEG tiles copied byte-for-byte; edge tiles decoded, placed on a \
+                 white 256x256 canvas and re-encoded with the source quantization tables"
+                    .to_string(),
+        },
     ));
     provenance.push((
         "pixel_policy",
@@ -691,13 +808,10 @@ struct ReencodeOutcome {
     reused_qtables: bool,
 }
 
-/// Decode → white 256×256 canvas → re-encode (converter.py::_reencode_edge_tile).
-fn reencode_edge_tile(
-    payload: &[u8],
-    jpeg_w: u16,
-    jpeg_h: u16,
-    sampling: crate::jpeg::Sampling,
-) -> CoreResult<(Vec<u8>, ReencodeOutcome)> {
+/// Decode a tile payload and paste it at (0,0) of a white 256×256 RGB
+/// canvas (row-strided paste). Shared by the preserve edge path and the
+/// compact whole-slide path.
+fn decode_tile_on_canvas(payload: &[u8], jpeg_w: u16, jpeg_h: u16) -> CoreResult<Vec<u8>> {
     let img = crate::jpeg::decode(payload, (TILE as u64) * (TILE as u64) * 4)?;
     if img.width != jpeg_w as u32 || img.height != jpeg_h as u32 {
         return Err(CoreError::jpeg(format!(
@@ -725,6 +839,29 @@ fn reencode_edge_tile(
             canvas[dst..dst + src.len()].copy_from_slice(src);
         }
     }
+    Ok(canvas)
+}
+
+/// Decode → white 256×256 canvas → re-encode with the given configuration
+/// (compact-jpeg-v1: locked parameters).
+fn reencode_tile_on_canvas(
+    payload: Vec<u8>,
+    jpeg_w: u16,
+    jpeg_h: u16,
+    cfg: &crate::jpeg::EncoderCfg,
+) -> CoreResult<Vec<u8>> {
+    let canvas = decode_tile_on_canvas(&payload, jpeg_w, jpeg_h)?;
+    crate::jpeg::encode_rgb(&canvas, TILE, TILE, cfg)
+}
+
+/// Decode → white 256×256 canvas → re-encode (converter.py::_reencode_edge_tile).
+fn reencode_edge_tile(
+    payload: &[u8],
+    jpeg_w: u16,
+    jpeg_h: u16,
+    sampling: crate::jpeg::Sampling,
+) -> CoreResult<(Vec<u8>, ReencodeOutcome)> {
+    let canvas = decode_tile_on_canvas(payload, jpeg_w, jpeg_h)?;
     // Pillow im.quantization: dict of tables in id order; reuse needs ≥2
     let qtables = crate::jpeg::qtables_pillow_style(payload).unwrap_or_default();
     let (cfg, reused) = if qtables.len() >= 2 {

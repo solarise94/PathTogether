@@ -565,3 +565,194 @@ def test_over_4gib_both_writers(workdir):
         assert max(offs) > (1 << 32) - 1
     with open(workdir / "big-stats.json", "w") as f:
         json.dump({"bf": [rss_bf, dt_bf], "fl": [rss_fl, dt_fl]}, f, indent=1)
+
+
+# --------------------------------------------------------------------------- #
+# U3 compact-jpeg-v1 (更小文件·有损): report contract + platform reader
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.skipif(CLI is None, reason="slide-transform CLI 未构建")
+def test_compact_report_contract_and_reader(workdir):
+    """compact-jpeg-v1 的报告合同 + 平台 reader（slide_io.open_slide）。
+
+    - CLI --encoding compact：lossy_reencode=true + 锁定参数指纹，
+      tiles_raw_copied=0（全部重编码）；
+    - 结构校验通过（validate）；
+    - slide_io.open_slide 将 compact bf-ome 作为原生 RGB 打开，颜色与
+      preserve 输出一致（整幅 tile 级比较，仅允许有损重编码差异），
+      MPP/尺寸与 preserve 相同；
+    - compact 输出小于 preserve 输出（合成 q90 4:2:2 输入）。
+    """
+    import slide_io
+
+    src = workdir / "bf-compact.kfb"
+    build_synthetic_kfb(src, width=1024, height=777)
+    preserve = workdir / "bf-preserve.ome.tif"
+    compact = workdir / "bf-compact.ome.tif"
+    rj = json.loads(_cli("convert", src, preserve, "--overwrite",
+                         "--profile", "bf-ome").stdout)
+    cj = json.loads(_cli("convert", src, compact, "--overwrite",
+                         "--profile", "bf-ome", "--encoding", "compact").stdout)
+    # report contract
+    assert cj["encoding"] == "compact-jpeg-v1"
+    assert cj["lossy_reencode"] is True
+    p = cj["lossy_reencode_params"]
+    assert p["profile"] == "compact-jpeg-v1"
+    assert p["sampling"] == "4:2:0"
+    assert p["huffman"] == "standard-annex-k"
+    assert p["quality"] >= 75 and p["quality"] <= 90
+    assert cj["tiles_raw_copied"] == 0
+    assert cj["tiles_reencoded"] == sum(l["tiles_total"] for l in cj["levels"])
+    assert cj["output_bytes"] < rj["output_bytes"]
+    # structural self-check
+    vj = json.loads(_cli("validate", compact, "--expect-ifd",
+                         str(cj["validation"]["ifd_count"])).stdout)
+    assert vj["ok"] is True
+    # platform reader: native RGB, correct colours, same geometry/calibration
+    sp = slide_io.open_slide(str(preserve))
+    sc = slide_io.open_slide(str(compact))
+    assert sp.dimensions == sc.dimensions == (1024, 777)
+    assert getattr(sc, "is_native_rgb", False) is True
+    assert sc.properties["openslide.mpp-x"] == sp.properties["openslide.mpp-x"]
+    assert sc.properties["openslide.mpp-y"] == sp.properties["openslide.mpp-y"]
+    from PIL import Image
+
+    for level in (0, min(1, sc.level_count - 1)):
+        box = (256, 200, 768, 456)
+        a = sp.read_region((box[0] * 2 ** level, box[1] * 2 ** level), level,
+                           (box[2] - box[0], box[3] - box[1])).convert("RGB")
+        b = sc.read_region((box[0] * 2 ** level, box[1] * 2 ** level), level,
+                           (box[2] - box[0], box[3] - box[1])).convert("RGB")
+        aa = np.asarray(a, dtype=np.int16)
+        bb = np.asarray(b, dtype=np.int16)
+        d = np.abs(aa - bb)
+        # 有损重编码差异：远小于裁剪/错位/通道交换会造成的变化
+        assert d.mean() < 6.0, f"level {level} mean diff {d.mean()}"
+        assert d.max() <= 255
+        # 通道不交换：逐通道均值接近
+        for c in range(3):
+            assert abs(aa[..., c].mean() - bb[..., c].mean()) < 4.0
+
+
+# --------------------------------------------------------------------------- #
+# U3 × F1 merged: compact-jpeg-v1 on Aperio SVS input (decode-every-tile
+# re-encode; merged branch `fmt-integ`). Sample-gated like the SVS viewer.
+# --------------------------------------------------------------------------- #
+
+SVS_SAMPLE = Path(
+    os.environ.get(
+        "SVS_SAMPLE",
+        str(REPO.parent / ".testdata" / "openslide" / "CMU-1-Small-Region.svs"),
+    )
+)
+
+
+@pytest.mark.skipif(CLI is None, reason="slide-transform CLI 未构建")
+def test_compact_svs_report_contract_and_pixels(workdir):
+    """`--encoding compact` on an SVS input (merged U3×F1 behaviour).
+
+    Synthetic SVS (CLI gen-svs) part:
+    - report contract: encoding=compact-jpeg-v1, lossy_reencode=true with the
+      locked parameters, tiles_raw_copied=0, adapter provenance kept;
+    - structure: photometric 6 + YCbCrSubSampling (2,2) (the LOCKED
+      subsampling, not the source's), tile size kept (240), NO tag 347
+      (self-contained tiles);
+    - slide_io opens the compact output and its pixels track the preserve
+      output's within the compact tolerance (bounded ROI).
+    """
+    import tifffile
+
+    import slide_io
+
+    src = workdir / "svs-compact.svs"
+    _cli("gen-svs", src, "--width", "500", "--height", "260", "--tile", "240")
+    preserve = workdir / "svs-preserve.ome.tif"
+    compact = workdir / "svs-compact.ome.tif"
+    rj = json.loads(_cli("convert", src, preserve, "--overwrite",
+                         "--profile", "bf-ome").stdout)
+    cj = json.loads(_cli("convert", src, compact, "--overwrite",
+                         "--profile", "bf-ome", "--encoding", "compact").stdout)
+    # report contract
+    assert cj["source_format"] == "aperio-svs-jpeg"
+    assert cj["encoding"] == "compact-jpeg-v1"
+    assert cj["lossy_reencode"] is True
+    p = cj["lossy_reencode_params"]
+    assert p["profile"] == "compact-jpeg-v1"
+    assert p["params_fingerprint"] == "cj1:q80:420:hstd:v1"
+    assert p["quality"] == 80
+    assert p["sampling"] == "4:2:0"
+    assert p["huffman"] == "standard-annex-k"
+    assert cj["tiles_raw_copied"] == 0
+    assert cj["tiles_reencoded"] == sum(l["tiles_total"] for l in cj["levels"])
+    # structure: locked YCbCr payload, no shared JPEGTables, tile size kept
+    with tifffile.TiffFile(compact) as tf:
+        page = tf.pages[0]
+        assert page.photometric == 6  # YCbCr (locked compact payload)
+        assert tuple(page.tags["YCbCrSubSampling"].value) == (2, 2)
+        assert page.tags["TileWidth"].value == 240  # source tile size kept
+        assert "JPEGTables" not in page.tags
+    vj = json.loads(_cli("validate", compact, "--expect-ifd",
+                         str(cj["validation"]["ifd_count"])).stdout)
+    assert vj["ok"] is True
+    # strict-lossless refuses the lossy mode (typed policy error)
+    refuse = _cli("convert", src, workdir / "nope.tif", "--overwrite",
+                  "--profile", "bf-ome", "--encoding", "compact",
+                  "--policy", "strict-lossless", check=False)
+    assert refuse.returncode == 1
+    assert json.loads(refuse.stdout)["error"]["code"] == "pixel_policy_violation"
+    # platform reader: the compact output opens with the same geometry
+    sp = slide_io.open_slide(str(preserve))
+    sc = slide_io.open_slide(str(compact))
+    assert sp.dimensions == sc.dimensions == (500, 260)
+    # (the synthetic fixture tiles are worst-case uniform noise, so NO pixel
+    # tolerance is asserted here — the pixel gates below run on the real
+    # H&E sample, exactly like the F1 viewer suite)
+
+    # real-sample part: CMU-1-Small-Region — the compact output's pixels
+    # must stay within the KFB compact tolerance class against BOTH
+    # OpenSlide's reading of the ORIGINAL SVS and the preserve output
+    # (bounded ROI only)
+    if not SVS_SAMPLE.exists():
+        pytest.skip("SVS_SAMPLE 不存在（真实样本像素门跳过）")
+    real_preserve = workdir / "real-preserve.ome.tif"
+    real_compact = workdir / "real-compact.ome.tif"
+    _cli("convert", SVS_SAMPLE, real_preserve, "--overwrite", "--profile", "bf-ome")
+    rcj = json.loads(_cli("convert", SVS_SAMPLE, real_compact, "--overwrite",
+                          "--profile", "bf-ome", "--encoding", "compact").stdout)
+    assert rcj["encoding"] == "compact-jpeg-v1"
+    assert rcj["lossy_reencode"] is True
+    assert rcj["tiles_raw_copied"] == 0
+    assert rcj["tiles_reencoded"] == sum(l["tiles_total"] for l in rcj["levels"])
+    import openslide
+
+    src_slide = openslide.OpenSlide(str(SVS_SAMPLE))
+    out_slide = slide_io.open_slide(str(real_compact))
+    assert src_slide.dimensions == out_slide.dimensions
+    box = (200, 150, 712, 662)  # 512×512 bounded ROI at level 0
+    a = src_slide.read_region((box[0], box[1]), 0,
+                              (box[2] - box[0], box[3] - box[1])).convert("RGB")
+    b = out_slide.read_region((box[0], box[1]), 0,
+                              (box[2] - box[0], box[3] - box[1])).convert("RGB")
+    aa = np.asarray(a, dtype=np.int16)
+    bb = np.asarray(b, dtype=np.int16)
+    d = np.abs(aa - bb)
+    # KFB compact tolerance class (test_compact_report_contract_and_reader)
+    assert d.mean() < 6.0, f"real-sample mean diff {d.mean()}"
+    assert d.max() <= 255
+    for c in range(3):
+        assert abs(aa[..., c].mean() - bb[..., c].mean()) < 4.0
+    # …and against the preserve output (which is pixel-identical to the
+    # source per the F1 adapter proof) at a reduced level too
+    pres_slide = slide_io.open_slide(str(real_preserve))
+    for level in (0, min(1, out_slide.level_count - 1)):
+        a = pres_slide.read_region((box[0] * 2 ** level, box[1] * 2 ** level), level,
+                                   (box[2] - box[0], box[3] - box[1])).convert("RGB")
+        b = out_slide.read_region((box[0] * 2 ** level, box[1] * 2 ** level), level,
+                                  (box[2] - box[0], box[3] - box[1])).convert("RGB")
+        aa = np.asarray(a, dtype=np.int16)
+        bb = np.asarray(b, dtype=np.int16)
+        d = np.abs(aa - bb)
+        assert d.mean() < 6.0, f"real level {level} mean diff {d.mean()}"
+        for c in range(3):
+            assert abs(aa[..., c].mean() - bb[..., c].mean()) < 4.0

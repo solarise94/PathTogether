@@ -79,6 +79,12 @@ are not exported** — this is a main-image conversion, not a source archive
   The output photometric is the payload truth (2 for these files); nothing is relabelled.
   For YCbCr-payload levels the output carries photometric 6 with the SOF subsampling
   (fixture-tested; no real YCbCr SVS sample was available — §8).
+- **Merged U3 (`compact-jpeg-v1`) behaviour**: the default remains pure
+  passthrough with byte-identical pins; with the encoding explicitly set to
+  compact, every tile is decoded (tables merged, `decode_ex(force_rgb)` per the
+  rule above) and re-encoded at the source tile geometry — photometric 6 +
+  locked (2,2) subsampling, no tag 347, `lossy_reencode` reported (see the
+  merge addendum §10 in `u3-compact-encoding-report.md`).
 
 ### 1.3 Writer generalisation and tile size
 
@@ -259,9 +265,10 @@ they are detected, not exported).
   177 at isolated pixels; exactness rests on byte identity, which is the strongest
   property a passthrough can offer, but a pixel-diff gate at tolerance 0 through two
   different decoders is not achievable.
-- **SVS resume refusal is not a C2 fault scenario**: the adapter-mismatch refusal is
-  covered by wasm unit tests and runner logic; a browser fault row (journal adapter
-  vs staged copy) would strengthen the matrix.
+- ~~**SVS resume refusal is not a C2 fault scenario**~~ — resolved in the
+  `fmt-integ` merge: `run_faults.js` gained the `svs-adapter-change-refused` row
+  (record tampered to a KFB record → `resume_refused` / kind `source-adapter`,
+  honest resume completes at the native bytes; 35/35 matrix pass).
 - **SNAP/`gen-svs` big-endian + BigTIFF fixtures** are exercised in-process (Rust), not
   through the browser; the browser path was verified with the real classic little-endian
   sample and synthetic files natively.

@@ -1,22 +1,36 @@
 //! SVS → brightfield conversion (F1): Aperio JPEG tiles → classic multi-IFD
 //! JPEG BigTIFF pyramid or RGB OME-BigTIFF (SubIFD pyramid).
 //!
-//! Payload policy is **pure passthrough**: every source tile byte is copied
-//! verbatim, in tile order, level by level. The shared `JPEGTables` of each
-//! level are written verbatim into the output IFD (tag 347), so abbreviated
-//! source streams stay abbreviated in the output — no splicing into tiles,
-//! no re-encode, nothing relabelled. The output photometric is the JPEG
-//! payloads' true colorspace (2 = RGB for Aperio `JPEG/RGB` streams, 6 =
-//! YCbCr with the SOF subsampling), and the tile tags (322/323) carry the
-//! source's own tile shape (e.g. 240).
+//! Default payload policy is **pure passthrough**: every source tile byte is
+//! copied verbatim, in tile order, level by level. The shared `JPEGTables` of
+//! each level are written verbatim into the output IFD (tag 347), so
+//! abbreviated source streams stay abbreviated in the output — no splicing
+//! into tiles, no re-encode, nothing relabelled. The output photometric is
+//! the JPEG payloads' true colorspace (2 = RGB for Aperio `JPEG/RGB`
+//! streams, 6 = YCbCr with the SOF subsampling), and the tile tags (322/323)
+//! carry the source's own tile shape (e.g. 240).
 //!
-//! Edge policy: Aperio keeps full-size tiles past the image boundary; such
-//! tiles are copied as-is (standard TIFF edge-tile semantics — content past
-//! the image edge is unspecified and invisible). A genuinely cropped tile
-//! (JPEG smaller than the nominal tile rect) is also copied verbatim and
-//! recorded in `edge_regions`; because no pixel is ever re-encoded,
-//! `StrictLossless` accepts everything the default policy accepts (there is
-//! no lossy step in this adapter to forbid).
+//! `compact-jpeg-v1` (U3, merged): every source tile of every level is
+//! decoded with the adapter's colourspace rule (shared `JPEGTables` merged
+//! in, [`crate::jpeg::decode_ex`] `force_rgb` for photometric-RGB payloads)
+//! and re-encoded with the LOCKED [`crate::plan::compact_jpeg_v1_encoder_cfg`]
+//! parameters at the source tile geometry (cropped tiles pasted onto a white
+//! tile-sized canvas, like the KFB compact path). The output advertises
+//! photometric 6 + the locked YCbCrSubsampling, writes NO tag 347 (each tile
+//! is self-contained) and keeps the source tile size; the provenance and the
+//! report carry the `lossy_reencode` summary exactly like the KFB path.
+//! Full source resolution and coordinates are kept; the output is lossy by
+//! construction and is never claimed lossless.
+//!
+//! Edge policy (preserve): Aperio keeps full-size tiles past the image
+//! boundary; such tiles are copied as-is (standard TIFF edge-tile semantics —
+//! content past the image edge is unspecified and invisible). A genuinely
+//! cropped tile (JPEG smaller than the nominal tile rect) is also copied
+//! verbatim and recorded in `edge_regions`; because no pixel is ever
+//! re-encoded, `StrictLossless` accepts everything the default policy
+//! accepts (there is no lossy step in this adapter to forbid). Under
+//! `compact` every tile is re-encoded anyway, so the two policies are
+//! mutually exclusive and the combination is a typed refusal.
 //!
 //! Label/macro/thumbnail are NOT exported — this is a main-image
 //! conversion, not an archive of the source file (`aperio_associated_not_
@@ -28,13 +42,17 @@
 //! re-decoded) and the fresh path stays byte-identical.
 
 use crate::bigtiff::{BigTiffPyramidWriter, LevelExtras};
+use crate::convert_bf::{compact_sampling_label, compact_sampling_tiff};
 use crate::error::{CoreError, CoreResult};
 use crate::io::{ByteSource, RandomAccessSink, ScratchFactory};
 use crate::job::{JobControl, NullProgress, Progress, ProgressUnit};
 use crate::ome::{py_g17, py_repr_f64};
 use crate::ome_writer::{OmeBigTiffWriter, RgbIfdExtras};
-use crate::plan::{OutputProfile, PixelPolicy, TransformPlan};
-use crate::report::{AssociatedSummary, EdgeRegion, LevelStats, TransformResult};
+use crate::plan::{
+    EncodingProfile, OutputProfile, PixelPolicy, TransformPlan, COMPACT_JPEG_V1_FINGERPRINT,
+    COMPACT_JPEG_V1_HUFFMAN, COMPACT_JPEG_V1_QUALITY,
+};
+use crate::report::{AssociatedSummary, EdgeRegion, LevelStats, LossyReencode, TransformResult};
 use crate::resume::ResumePoint;
 use crate::svs::{self, PayloadColor, SvsDoc, SvsLevel, ADAPTER_VERSION, SOURCE_FORMAT};
 use crate::tiff_read::{self, TiffHeader};
@@ -213,11 +231,30 @@ fn svs_ome_xml(doc: &SvsDoc, plan: &TransformPlan) -> Vec<u8> {
             .to_string(),
     ));
     provenance.push(("pyramid_levels", doc.levels.len().to_string()));
+    // Encoding keys appear ONLY for compact runs: preserve outputs keep their
+    // exact pre-U3 OME-XML (byte-parity gate on pinned sha256 values); a
+    // missing key means preserve-source-v1, exactly like every pre-U3 file.
+    if plan.encoding == EncodingProfile::CompactJpegV1 {
+        provenance.push(("encoding_profile", plan.encoding.id().to_string()));
+        provenance.push(("encoding_params_fingerprint", COMPACT_JPEG_V1_FINGERPRINT.to_string()));
+    }
     provenance.push((
         "tile_payloads",
-        "Aperio JPEG tiles copied byte-for-byte; shared JPEGTables written verbatim \
-         into each level IFD (tag 347); no tile is re-encoded or relabelled"
-            .to_string(),
+        if plan.encoding == EncodingProfile::CompactJpegV1 {
+            format!(
+                "every tile decoded (shared JPEGTables merged, adapter colourspace rule) and \
+                 re-encoded at the locked compact parameters (quality {}, subsampling {}, \
+                 standard Annex-K Huffman, fingerprint {}); source tile size and coordinates \
+                 kept; no shared JPEGTables written; lossy",
+                COMPACT_JPEG_V1_QUALITY,
+                compact_sampling_label(),
+                COMPACT_JPEG_V1_FINGERPRINT
+            )
+        } else {
+            "Aperio JPEG tiles copied byte-for-byte; shared JPEGTables written verbatim \
+             into each level IFD (tag 347); no tile is re-encoded or relabelled"
+                .to_string()
+        },
     ));
     provenance.push((
         "pixel_policy",
@@ -286,8 +323,11 @@ SizeX=\"{}\" SizeY=\"{}\" SizeC=\"3\" SizeZ=\"1\" SizeT=\"1\"{phys}>\
 }
 
 /// Per-level output metadata (tile shape, photometric, calibration,
-/// JPEGTables; ICC on the main level only).
-fn level_meta(doc: &SvsDoc, li: usize) -> LevelMeta {
+/// JPEGTables; ICC on the main level only). Under `compact` the output
+/// payload is always the locked YCbCr re-encode: photometric 6, the locked
+/// subsampling, NO shared JPEGTables (each tile is self-contained); the
+/// source tile geometry is kept.
+fn level_meta(doc: &SvsDoc, li: usize, compact: bool) -> LevelMeta {
     let lv = &doc.levels[li];
     let main = &doc.levels[0];
     // per-level calibration from the real dimension ratio (the source
@@ -297,9 +337,17 @@ fn level_meta(doc: &SvsDoc, li: usize) -> LevelMeta {
         let ry = main.height as f64 / lv.height as f64;
         (m * rx, m * ry)
     });
-    let (photometric, tiff_sub) = match lv.color {
-        PayloadColor::Rgb => (2u16, (1u16, 1u16)),
-        PayloadColor::YCbCr => (6u16, (lv.sampling.0 as u16, lv.sampling.1 as u16)),
+    let (photometric, tiff_sub, jpeg_tables) = if compact {
+        (6u16, compact_sampling_tiff(), None)
+    } else {
+        match lv.color {
+            PayloadColor::Rgb => (2u16, (1u16, 1u16), lv.jpeg_tables.clone()),
+            PayloadColor::YCbCr => (
+                6u16,
+                (lv.sampling.0 as u16, lv.sampling.1 as u16),
+                lv.jpeg_tables.clone(),
+            ),
+        }
     };
     LevelMeta {
         width: lv.width,
@@ -309,7 +357,7 @@ fn level_meta(doc: &SvsDoc, li: usize) -> LevelMeta {
         tiff_sub,
         reduced: li > 0,
         mpp,
-        jpeg_tables: lv.jpeg_tables.clone(),
+        jpeg_tables,
         icc: if li == 0 { doc.icc.clone() } else { None },
     }
 }
@@ -348,9 +396,63 @@ fn li_of(lv: &SvsLevel) -> u32 {
     lv.ifd_index
 }
 
+/// Compact-jpeg-v1 re-encode of one SVS source tile (U3 merged path).
+///
+/// The abbreviated tile stream (shared `JPEGTables`) is merged into a
+/// self-contained JPEG, decoded with the adapter's colourspace rule —
+/// `force_rgb` exactly when the level's true payload colorspace is RGB (the
+/// Aperio photometric-2 convention, see [`crate::jpeg::tiff_jpeg_color`]) —
+/// and re-encoded with the LOCKED compact configuration at the SOURCE tile
+/// geometry. A cropped tile is pasted onto a white tile-sized canvas
+/// (`compact` padding semantics of the KFB path); the boolean reports the
+/// padding so the caller can record the edge region.
+fn compact_reencode_tile(
+    payload: &[u8],
+    lv: &SvsLevel,
+    probe: &crate::jpeg::JpegProbe,
+    cfg: &crate::jpeg::EncoderCfg,
+) -> CoreResult<(Vec<u8>, bool)> {
+    let merged;
+    let stream: &[u8] = match &lv.jpeg_tables {
+        Some(t) => {
+            merged = svs::merge_tables_then_tile(t, payload);
+            &merged
+        }
+        None => payload,
+    };
+    // the level contract (check_tile) guarantees the sampling matches the
+    // probe, so the per-level colorspace decision applies to every tile
+    let force_rgb = lv.color == PayloadColor::Rgb;
+    let max_pixels = (lv.tile_w as u64) * (lv.tile_h as u64);
+    let img = crate::jpeg::decode_ex(stream, max_pixels, force_rgb)?;
+    if img.width != probe.width || img.height != probe.height {
+        return Err(CoreError::jpeg(format!(
+            "tile 解码尺寸 {}×{} 与探测 {}×{} 不符",
+            img.width, img.height, probe.width, probe.height
+        )));
+    }
+    let padded = img.width != lv.tile_w || img.height != lv.tile_h;
+    if !padded {
+        let jpg = crate::jpeg::encode_rgb(&img.data, img.width, img.height, cfg)?;
+        return Ok((jpg, false));
+    }
+    // cropped source tile → white tile_w×tile_h canvas, row-strided paste
+    let mut canvas = vec![255u8; (lv.tile_w as usize) * (lv.tile_h as usize) * 3];
+    for y in 0..img.height as usize {
+        let s = y * img.width as usize * 3;
+        let d = y * lv.tile_w as usize * 3;
+        canvas[d..d + img.width as usize * 3].copy_from_slice(&img.data[s..s + img.width as usize * 3]);
+    }
+    let jpg = crate::jpeg::encode_rgb(&canvas, lv.tile_w, lv.tile_h, cfg)?;
+    Ok((jpg, true))
+}
+
 /// Re-scan the boundary cells of a level for resume bookkeeping (edge
 /// regions / stats). Interior cells are nominal by the accept rules (the
-/// fresh path rejects anything else before writing).
+/// fresh path rejects anything else before writing). Under `compact` every
+/// scanned cell counts as re-encoded and cropped boundary tiles are the
+/// padded edge regions (same reconstruction as the fresh compact path).
+#[allow(clippy::too_many_arguments)]
 fn reconstruct_cells_svs(
     src: &dyn ByteSource,
     hdr: &TiffHeader,
@@ -358,6 +460,7 @@ fn reconstruct_cells_svs(
     lv: &SvsLevel,
     head: &crate::jpeg::JpegProbe,
     up_to: u64,
+    compact: bool,
     stats: &mut LevelStats,
     edge_regions: &mut Vec<EdgeRegion>,
     warnings: &mut Vec<String>,
@@ -373,10 +476,16 @@ fn reconstruct_cells_svs(
             let payload = src.read_at(off, len as usize)?;
             let probe = crate::jpeg::scan_jpeg(&payload)?;
             if probe.width as u32 != lv.tile_w || probe.height as u32 != lv.tile_h {
-                record_edge(lv, row, col, probe.width, probe.height, edge_regions, warnings);
+                record_edge(
+                    lv, row, col, probe.width, probe.height, compact, edge_regions, warnings,
+                );
             }
         }
-        stats.tiles_raw_copied += 1;
+        if compact {
+            stats.tiles_reencoded += 1;
+        } else {
+            stats.tiles_raw_copied += 1;
+        }
         cell += 1;
         let _ = head;
     }
@@ -389,9 +498,26 @@ fn record_edge(
     col: u64,
     w: u32,
     h: u32,
+    compact: bool,
     edge_regions: &mut Vec<EdgeRegion>,
     warnings: &mut Vec<String>,
 ) {
+    if compact {
+        // compact pads the cropped tile onto the white tile-sized canvas —
+        // not a passthrough, so the passthrough warning must NOT appear
+        edge_regions.push(EdgeRegion {
+            level: lv.ifd_index,
+            channel: None,
+            x: (col * lv.tile_w as u64) as u32,
+            y: (row * lv.tile_h as u64) as u32,
+            source_w: w,
+            source_h: h,
+            canvas_w: lv.tile_w,
+            canvas_h: lv.tile_h,
+            reused_qtables: false, // compact never reuses source tables
+        });
+        return;
+    }
     if !warnings.iter().any(|w| w == WARN_SVS_EDGE_PASSTHROUGH) {
         warnings.push(WARN_SVS_EDGE_PASSTHROUGH.to_string());
     }
@@ -463,8 +589,22 @@ fn convert_inner(
     if plan.profile == OutputProfile::OmeBigTiffSubifd {
         return Err(CoreError::variant("荧光 OME profile 不适用于明场 SVS"));
     }
-    // PixelPolicy: this adapter never re-encodes, so StrictLossless has
-    // nothing to reject (documented in the report).
+    if plan.pixel_policy == PixelPolicy::StrictLossless
+        && plan.encoding == EncodingProfile::CompactJpegV1
+    {
+        // compact re-encodes every tile by construction — a strict-lossless
+        // request contradicts it. Typed refusal BEFORE any output byte
+        // (same rule and message as the KFB path).
+        return Err(CoreError::policy(
+            "compact-jpeg-v1 与 strict-lossless 互斥：逐 tile 重编码必然有损",
+        ));
+    }
+    let compact = plan.encoding == EncodingProfile::CompactJpegV1;
+    let compact_cfg = if compact {
+        Some(crate::plan::compact_jpeg_v1_encoder_cfg())
+    } else {
+        None
+    };
 
     let mut warnings: Vec<String> = Vec::new();
     if !doc.associated.is_empty() {
@@ -501,7 +641,7 @@ fn convert_inner(
     for (li, lv) in levels.iter().enumerate() {
         job.check()?;
         let ifd = &chain[lv.ifd_index as usize];
-        let meta = level_meta(&doc, li);
+        let meta = level_meta(&doc, li, compact);
         let mut stats = LevelStats {
             level: li as u32,
             width: lv.width,
@@ -538,7 +678,7 @@ fn convert_inner(
             }
             writer.begin(scratch, &meta, Some(committed))?;
             reconstruct_cells_svs(
-                src, &hdr, ifd, lv, &head, u64::MAX, &mut stats, &mut edge_regions,
+                src, &hdr, ifd, lv, &head, u64::MAX, compact, &mut stats, &mut edge_regions,
                 &mut warnings,
             )?;
             writer.end(&meta, &[])?;
@@ -552,7 +692,7 @@ fn convert_inner(
             let committed = resume.unwrap().ifd_tiles[li];
             writer.begin(scratch, &meta, Some(committed))?;
             reconstruct_cells_svs(
-                src, &hdr, ifd, lv, &head, skip_until, &mut stats, &mut edge_regions,
+                src, &hdr, ifd, lv, &head, skip_until, compact, &mut stats, &mut edge_regions,
                 &mut warnings,
             )?;
         } else {
@@ -583,10 +723,26 @@ fn convert_inner(
                 )));
             }
             if probe.width != lv.tile_w || probe.height != lv.tile_h {
-                record_edge(lv, row, col, probe.width, probe.height, &mut edge_regions, &mut warnings);
+                record_edge(
+                    lv, row, col, probe.width, probe.height, compact, &mut edge_regions,
+                    &mut warnings,
+                );
             }
-            writer.write_tile(&payload)?;
-            stats.tiles_raw_copied += 1;
+            let data: Vec<u8>;
+            if let Some(cfg) = &compact_cfg {
+                // compact-jpeg-v1: EVERY tile decoded (shared JPEGTables
+                // merged, adapter colourspace rule) → re-encoded at the
+                // LOCKED compact parameters, source tile geometry kept;
+                // cropped tiles padded onto the white tile canvas (already
+                // recorded as the edge region above).
+                let (encoded, _) = compact_reencode_tile(&payload, lv, &probe, cfg)?;
+                data = encoded;
+                stats.tiles_reencoded += 1;
+            } else {
+                data = payload;
+                stats.tiles_raw_copied += 1;
+            }
+            writer.write_tile(&data)?;
             cell += 1;
             if row + 1 > row_done {
                 row_done = row + 1;
@@ -639,6 +795,10 @@ fn convert_inner(
         level_stats.push(stats);
     }
     let output_bytes = writer.finish()?;
+    let compact_tiles_reencoded: u64 = level_stats.iter().map(|l| l.tiles_reencoded).sum();
+    // under compact every padded (cropped) tile is exactly one EdgeRegion,
+    // so the list length IS the padded count (same rule as the KFB path)
+    let compact_tiles_padded: u64 = if compact { edge_regions.len() as u64 } else { 0 };
 
     let mut result = TransformResult {
         plan_version: plan.plan_version,
@@ -665,6 +825,15 @@ fn convert_inner(
             },
         },
         ifd_chain,
+        lossy_reencode: compact.then(|| LossyReencode {
+            profile: EncodingProfile::CompactJpegV1.id(),
+            params_fingerprint: COMPACT_JPEG_V1_FINGERPRINT.to_string(),
+            quality: COMPACT_JPEG_V1_QUALITY,
+            sampling: compact_sampling_label(),
+            huffman: COMPACT_JPEG_V1_HUFFMAN,
+            tiles_reencoded: compact_tiles_reencoded,
+            tiles_padded: compact_tiles_padded,
+        }),
         associated: doc
             .associated
             .iter()

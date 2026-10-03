@@ -40,6 +40,26 @@ pub struct EdgeRegion {
     pub reused_qtables: bool,
 }
 
+/// Summary of a `compact-jpeg-v1` run (U3): the locked parameters actually
+/// used and the per-run counts. Present ONLY for compact conversions — a
+/// `None` means preserve semantics (no whole-slide lossy re-encode was
+/// requested). Never interpret a compact output as lossless.
+#[derive(Debug, Clone)]
+pub struct LossyReencode {
+    pub profile: &'static str,
+    /// Versioned parameter fingerprint (quality + sampling + huffman).
+    pub params_fingerprint: String,
+    pub quality: u8,
+    /// Human-readable subsampling, e.g. "4:2:0".
+    pub sampling: &'static str,
+    pub huffman: &'static str,
+    /// Every tile of every level was re-encoded (== tiles_total).
+    pub tiles_reencoded: u64,
+    /// Tiles whose source geometry was smaller than the canvas (white
+    /// padding) — the "padded" subset of `tiles_reencoded`.
+    pub tiles_padded: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ValidationReport {
     /// Structural self-checks the converter performed on the produced bytes
@@ -85,6 +105,8 @@ pub struct TransformResult {
     pub validation: ValidationReport,
     /// Raw IFD→(level, channel) mapping for structure comparison in tests.
     pub ifd_chain: Vec<(u32, Option<usize>)>,
+    /// Compact-encoding summary; `None` = preserve-source semantics.
+    pub lossy_reencode: Option<LossyReencode>,
     /// Associated images (name, payload bytes are NOT kept; offsets/lengths
     /// refer to the source; hosts copy them to sidecars).
     pub associated: Vec<AssociatedSummary>,

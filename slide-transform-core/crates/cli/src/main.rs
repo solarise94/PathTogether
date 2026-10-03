@@ -2,6 +2,7 @@
 //!
 //!   slide-transform probe <input> [--sha256]
 //!   slide-transform convert <input> <output> [--profile auto|bf-classic|bf-ome|fl-ome]
+//!                           [--encoding preserve|compact]
 //!                           [--policy allow-edge|strict-lossless]
 //!                           [--channel-json PATH] [--timeout SECONDS]
 //!                           [--max-output-bytes N] [--min-free-bytes N]
@@ -10,6 +11,10 @@
 //! `--profile auto` keeps the historical mapping (KFB → bf-classic, KFBF →
 //! fl-ome) because unattended callers (the Baidu import plugin worker) name
 //! their outputs from it; the browser tool chooses bf-ome explicitly.
+//! `--encoding` (U3) selects the tile-payload strategy independently of the
+//! container: `preserve` (default, pre-U3 behaviour) or `compact`
+//! (brightfield-only whole-slide re-encode at the locked compact-jpeg-v1
+//! parameters; refused for fluorescence and with --policy strict-lossless).
 //!
 //! Both commands print a single JSON object to stdout; errors print
 //! {"error":{"code","message"}} and exit 1. The converter writes
@@ -291,6 +296,7 @@ fn cmd_probe(args: &[String]) -> Result<String, CoreError> {
         ju("edge_tiles", estimate.edge_tiles),
         ju("ifds", estimate.ifds),
         ju("output_upper_bound_bytes", estimate.output_upper_bound_bytes),
+        ju("compact_upper_bound_bytes", estimate.compact_upper_bound_bytes),
     ]);
     Ok(obj(&[
         jstr("tool", "slide-transform"),
@@ -353,6 +359,7 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
     let mut positional: Vec<&String> = Vec::new();
     let mut profile = "auto".to_string();
     let mut policy = "allow-edge".to_string();
+    let mut encoding = "preserve".to_string();
     let mut channel_json: Option<PathBuf> = None;
     let mut timeout: Option<f64> = None;
     let mut max_out: Option<u64> = None;
@@ -365,6 +372,13 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
                 profile = args
                     .get(i)
                     .ok_or_else(|| CoreError::validation("--profile 缺值"))?
+                    .clone();
+            }
+            "--encoding" => {
+                i += 1;
+                encoding = args
+                    .get(i)
+                    .ok_or_else(|| CoreError::validation("--encoding 缺值"))?
                     .clone();
             }
             "--policy" => {
@@ -450,11 +464,32 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
             .ok_or_else(|| CoreError::validation(format!("未知 profile {profile}")))?,
     };
     let is_fl = !out_profile.is_brightfield();
+    let enc_profile = match encoding.as_str() {
+        "preserve" => slide_transform_core::plan::EncodingProfile::PreserveSource,
+        "compact" => slide_transform_core::plan::EncodingProfile::CompactJpegV1,
+        _ => {
+            return Err(CoreError::validation(format!(
+                "未知 encoding {encoding}（preserve|compact）"
+            )))
+        }
+    };
+    if enc_profile == slide_transform_core::plan::EncodingProfile::CompactJpegV1 && is_fl {
+        return Err(CoreError::variant(
+            "compact-jpeg-v1 编码仅适用于明场；荧光不支持有损重编码",
+        ));
+    }
     let pixel_policy = match policy.as_str() {
         "allow-edge" => PixelPolicy::AllowEdgeReencode,
         "strict-lossless" => PixelPolicy::StrictLossless,
         _ => return Err(CoreError::validation(format!("未知 policy {policy}"))),
     };
+    if pixel_policy == PixelPolicy::StrictLossless
+        && enc_profile == slide_transform_core::plan::EncodingProfile::CompactJpegV1
+    {
+        return Err(CoreError::policy(
+            "compact-jpeg-v1 与 strict-lossless 互斥：逐 tile 重编码必然有损",
+        ));
+    }
 
     // companion channel.json（可选；失败仅告警）
     let companion = match &channel_json {
@@ -497,7 +532,8 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
     } else {
         let mut plan = TransformPlan::brightfield(identity)
             .with_policy(pixel_policy)
-            .with_limits(limits);
+            .with_limits(limits)
+            .with_encoding(enc_profile);
         plan.profile = out_profile;
         slide_transform_core::convert_bf::convert_kfb_to_bigtiff(
             &src,
@@ -624,12 +660,32 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
             )
         })
         .collect();
+    // U3 encoding summary: preserve reports the id and no lossy flag; compact
+    // reports the locked parameters (and never claims losslessness).
+    let (lossy_flag, lossy_obj) = match &result.lossy_reencode {
+        Some(l) => (
+            true,
+            obj(&[
+                jstr("profile", l.profile),
+                jstr("params_fingerprint", &l.params_fingerprint),
+                ju("quality", l.quality as u64),
+                jstr("sampling", l.sampling),
+                jstr("huffman", l.huffman),
+                ju("tiles_reencoded", l.tiles_reencoded),
+                ju("tiles_padded", l.tiles_padded),
+            ]),
+        ),
+        None => (false, "null".to_string()),
+    };
 
     Ok(obj(&[
         jstr("tool", "slide-transform"),
         jstr("core_version", slide_transform_core::CORE_VERSION),
         ju("plan_version", result.plan_version as u64),
         jstr("output_profile", out_profile.id()),
+        jstr("encoding", enc_profile.id()),
+        jb("lossy_reencode", lossy_flag),
+        jraw("lossy_reencode_params", &lossy_obj),
         jstr("format", result.format),
         jstr("output", &output.display().to_string()),
         ju("output_bytes", result.output_bytes),

@@ -123,6 +123,14 @@ fn convert_inner(
 ) -> CoreResult<TransformResult> {
     let started = crate::job::WallInstant::now();
     let doc = parse_kfbf(src, scratch)?;
+    // U3: compact (lossy whole-slide re-encode) is a brightfield-only
+    // strategy — fluorescence quantification must not gain a lossy mode.
+    // Refused BEFORE any output byte is written.
+    if plan.encoding == crate::plan::EncodingProfile::CompactJpegV1 {
+        return Err(CoreError::variant(
+            "compact-jpeg-v1 编码仅适用于明场；荧光通道数据不支持有损重编码",
+        ));
+    }
     if !doc.header.mpp.is_finite() || doc.header.mpp <= 0.0 {
         return Err(CoreError::metadata("MPP 缺失/非法"));
     }
@@ -423,6 +431,7 @@ fn convert_inner(
             ],
         },
         ifd_chain,
+        lossy_reencode: None, // fluorescence never runs the compact encoder
         associated: doc
             .associated
             .iter()

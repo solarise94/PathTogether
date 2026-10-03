@@ -17,17 +17,26 @@
 //   // job left `prepared`, and a profile that does not fit the modality is
 //   // rejected (unsupported_input/output-profile)
 //   await runner.setPreparedOutputProfile(prep.jobId, 'bf-classic');
+//   // replace the quality (encoding) choice saved on a job that has not
+//   // started yet (the page's 画质 radio, U3): same prepared-only rules,
+//   // compact-jpeg-v1 only fits brightfield
+//   await runner.setPreparedEncodingProfile(prep.jobId, 'compact-jpeg-v1');
 //   // the FIRST argument is still the File; passing a `prepared` jobId
 //   // reuses its copy (no second copy), otherwise probe() runs first.
 //   // channelJson: undefined = the saved one, null = none, string = this one
 //   const { jobId, done } = await runner.startJob(file, {
 //     jobId: prep.jobId, profileId, policy, outputCapBytes, channelJson,
-//     outputProfile, confirmUncertainDisk });
+//     outputProfile, encodingProfile, confirmUncertainDisk });
 //   // outputProfile (E.OUTPUT_PROFILES): omitted = the record's, else the
 //   // default for the modality (brightfield → 'bf-ome', fluorescence →
 //   // 'fl-ome'); 'bf-classic' stays available for compatibility checks.
 //   // A started job keeps its profile for life: resume under another one is
 //   // refused, and records from before profiles existed resume as classic.
+//   // encodingProfile (E.ENCODING_PROFILES, U3 画质): omitted = the record's,
+//   // else preserve. 'compact-jpeg-v1' is brightfield-only and fixed for
+//   // life once started; resume under another encoding is refused
+//   // (resume_refused, kind 'encoding-profile') and legacy records without
+//   // the field resume as preserve.
 //   // resume never needs the File; omitted settings default to the saved
 //   // ones, explicitly different ones are refused (`resume_refused`)
 //   const { done } = await runner.resumeJob(jobId);
@@ -74,6 +83,7 @@ function savedSettings(rec) {
     outputCapBytes: rec.cap || undefined,
     channelJson: rec.channelJson || undefined,
     outputProfile: E.recordOutputProfile(rec),
+    encodingProfile: E.recordEncodingProfile(rec),
   };
 }
 
@@ -84,6 +94,16 @@ function checkedOutputProfile(profile, modality) {
       { kind: 'output-profile' });
   }
   return profile;
+}
+
+/// Encoding must fit the modality: compact-jpeg-v1 is brightfield-only.
+function checkedEncoding(encoding, modality) {
+  if (!E.encodingFitsModality(encoding, modality)) {
+    throw E.stError(E.ERROR_CODES.UNSUPPORTED_INPUT,
+      `画质 ${encoding} 不适用于${modality === 'fluorescence' ? '荧光' : '明场'}切片（更小文件为明场专用的有损模式）`,
+      { kind: 'encoding-profile' });
+  }
+  return encoding;
 }
 const EXPORT_CHUNK = 4 * 2 ** 20;
 const CHANNEL_JSON_MAX = 2 ** 20;
@@ -443,6 +463,25 @@ export class SlideToolsRunner {
     });
   }
 
+  /// Replace the encoding profile (画质: preserve / compact) saved on a job
+  /// that has not started yet — the page's quality radio (U3). Same rules as
+  /// setPreparedOutputProfile: prepared-only (resume_refused,
+  /// kind encoding-profile afterwards) and modality-checked (compact is
+  /// brightfield-only → unsupported_input, kind encoding-profile).
+  async setPreparedEncodingProfile(jobId, encoding) {
+    await this._serialRecord(async () => {
+      const rec = await this._readJobRecord(jobId);
+      if (!rec || rec.state !== 'prepared') {
+        throw E.stError(E.ERROR_CODES.RESUME_REFUSED, '任务已开始，不能再更改画质',
+          { kind: 'encoding-profile' });
+      }
+      const encodingProfile = checkedEncoding(encoding, rec.modality);
+      await this._writeJobRecordNow(jobId, {
+        ...rec, encodingProfile, updatedAt: E.nowIso(),
+      });
+    });
+  }
+
   /// C4 upload record: merge `patch` into record.upload (read-merge-write on
   /// the serialized record chain — the page must not write the slot itself).
   /// Only ready/exported jobs accept an upload record: the artifact this
@@ -549,13 +588,27 @@ export class SlideToolsRunner {
     await this._writeJobRecord(jobId, { state: 'staging', createdAt: E.nowIso(), updatedAt: E.nowIso() });
     let staged;
     let probeResult;
+    let preparedEncoding;
     try {
       staged = await this._request('stage-source',
         { jobId, file, faults: this.testMode ? (opts.faults || null) : null }, 60 * 60 * 1000);
       probeResult = await this._request('probe', { jobId }, 60 * 60 * 1000);
       if (probeResult.error) throw probeResult;
       const estimate = probeResult.document.estimate || probeResult.estimate;
-      this._diskGate(E.checkDiskBudget(estimate, await navigator.storage.estimate()), opts, 'post-probe');
+      const doc0 = probeResult.document;
+      // the encoding choice (page quality radio) decides which upper bound
+      // the disk gate uses; it must fit the probed modality
+      let encodingProfile;
+      try {
+        encodingProfile = checkedEncoding(
+          opts.encodingProfile || E.defaultEncodingProfile(), doc0.modality);
+      } catch (e) {
+        await this._discardNow(jobId).catch(() => { /* pending-cleanup recorded */ });
+        throw e;
+      }
+      this._diskGate(E.checkDiskBudget(estimate,
+        await navigator.storage.estimate(), { encoding: encodingProfile }), opts, 'post-probe');
+      preparedEncoding = encodingProfile;
     } catch (e) {
       await this._discardNow(jobId).catch(() => { /* pending-cleanup recorded */ });
       throw e;
@@ -578,6 +631,7 @@ export class SlideToolsRunner {
       estimate: doc.estimate || probeResult.estimate,
       modality: doc.modality,
       outputProfile,
+      encodingProfile: preparedEncoding,
       channelJson,
       channelJsonHash: channelJsonHash(channelJson),
       createdAt: E.nowIso(),
@@ -705,6 +759,14 @@ export class SlideToolsRunner {
         refuse(`输出格式已改变：任务 ${committedProfile}，请求 ${opts.outputProfile}`,
           { kind: 'output-profile' });
       }
+      // …and to the encoding (quality) that wrote them — a half-written
+      // compact output is never continued as preserve (or vice versa);
+      // legacy records without the field mean preserve
+      const committedEncoding = E.recordEncodingProfile(record);
+      if (opts.encodingProfile && opts.encodingProfile !== committedEncoding) {
+        refuse(`画质已改变：任务 ${committedEncoding}，请求 ${opts.encodingProfile}`,
+          { kind: 'encoding-profile' });
+      }
       // the staged copy must still be exactly the bytes hashed at staging
       const id = record.identity;
       const v = await this._request('verify-source', { jobId, size: id.size }, 60 * 60 * 1000);
@@ -724,6 +786,14 @@ export class SlideToolsRunner {
           (st.lastCommit && st.lastCommit.st.profile &&
            st.lastCommit.st.profile !== journalled)) {
         refuse(`进度记录的输出格式（${journalled}）与任务记录不符`, { kind: 'output-profile' });
+      }
+      // same contract for the encoding: the journal generation and every
+      // committed state must agree with the record (missing = preserve)
+      const journalledEnc = st.gen.encodingProfile || E.ENCODING_PROFILES.PRESERVE;
+      if (journalledEnc !== E.recordEncodingProfile(record) ||
+          (st.lastCommit && st.lastCommit.st.encoding &&
+           st.lastCommit.st.encoding !== journalledEnc)) {
+        refuse(`进度记录的画质（${journalledEnc}）与任务记录不符`, { kind: 'encoding-profile' });
       }
       if (st.lastCommit) {
         resume = { st: st.lastCommit.st };
@@ -753,6 +823,12 @@ export class SlideToolsRunner {
       ? E.recordOutputProfile(record)
       : (opts.outputProfile || record.outputProfile || E.defaultOutputProfile(modality)),
     modality);
+    // same ladder for the encoding (U3 画质): resumes keep the recorded one,
+    // fresh runs take the explicit choice or the prepared record's
+    const encodingProfile = checkedEncoding(resumeJobId
+      ? E.recordEncodingProfile(record)
+      : (opts.encodingProfile || record.encodingProfile || E.defaultEncodingProfile()),
+    modality);
 
     await this._updateJobRecord(jobId, {
       state: resume ? 'paused' : 'planned',
@@ -768,6 +844,7 @@ export class SlideToolsRunner {
       estimate,
       modality,
       outputProfile,
+      encodingProfile,
     });
 
     this._setState('planned');
@@ -781,6 +858,7 @@ export class SlideToolsRunner {
         coreVersion: this.coreVersion,
         modality,
         outputProfile,
+        encoding: encodingProfile,
         scratchLevels: levels,
         scratchIfdCount: levels * channels,
       },
@@ -1008,6 +1086,8 @@ export class SlideToolsRunner {
       modality: rec ? rec.modality || null : null,
       outputProfile: rec && !['staging', 'prepared'].includes(state)
         ? E.recordOutputProfile(rec) : (rec && rec.outputProfile) || null,
+      encodingProfile: rec && !['staging', 'prepared'].includes(state)
+        ? E.recordEncodingProfile(rec) : (rec && rec.encodingProfile) || null,
       estimate: rec ? rec.estimate || null : null,
       settings: rec && rec.profile ? savedSettings(rec) : null,
       hasChannelJson: !!(rec && rec.channelJson),

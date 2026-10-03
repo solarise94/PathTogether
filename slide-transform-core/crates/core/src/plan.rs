@@ -45,6 +45,68 @@ impl OutputProfile {
     }
 }
 
+/// Tile-payload encoding strategy — INDEPENDENT of the output profile
+/// (quality choice vs container layout; U3). `preserve-source-v1` is the
+/// pre-U3 behaviour and the default for every modality; records, journals
+/// and checkpoints written before this field existed mean preserve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodingProfile {
+    /// Compatible full tiles are copied byte-for-byte; edge tiles are
+    /// decoded, placed on the canvas and re-encoded with the source
+    /// quantization tables (oracle-identical).
+    PreserveSource,
+    /// Every tile of every level is decoded and re-encoded with the LOCKED
+    /// [`COMPACT_JPEG_V1_*`] parameters. Full source resolution and
+    /// coordinates are kept; the output is lossy by construction and is
+    /// never claimed lossless. Brightfield only (fluorescence refuses).
+    CompactJpegV1,
+}
+
+impl EncodingProfile {
+    /// Stable wire id (CLI `--encoding`, browser job records, journals,
+    /// wasm checkpoint states).
+    pub fn id(self) -> &'static str {
+        match self {
+            EncodingProfile::PreserveSource => "preserve-source-v1",
+            EncodingProfile::CompactJpegV1 => "compact-jpeg-v1",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "preserve-source-v1" => Some(EncodingProfile::PreserveSource),
+            "compact-jpeg-v1" => Some(EncodingProfile::CompactJpegV1),
+            _ => None,
+        }
+    }
+}
+
+// --------------------------------------------------------------- //
+// Locked parameters of `compact-jpeg-v1` (U3 step 2 comparison — see
+// docs/slide-tools/u3-compact-encoding-report.md). Changing any of these
+// changes the fingerprint and must bump its version suffix: resumed
+// checkpoints of the old fingerprint are refused, never mixed.
+// --------------------------------------------------------------- //
+
+/// JPEG quality (libjpeg table scaling of the standard IJG tables).
+pub const COMPACT_JPEG_V1_QUALITY: u8 = 80;
+/// Chroma subsampling of the re-encoded tiles.
+pub const COMPACT_JPEG_V1_SAMPLING: crate::jpeg::Sampling =
+    crate::jpeg::Sampling::S420;
+/// Huffman coding: standard Annex-K tables only (no optimized tables — the
+/// codec emits exactly what libjpeg/Pillow emit with std tables).
+pub const COMPACT_JPEG_V1_HUFFMAN: &str = "standard-annex-k";
+/// Parameter fingerprint persisted with every job/journal/checkpoint.
+pub const COMPACT_JPEG_V1_FINGERPRINT: &str = "cj1:q80:420:hstd:v1";
+
+/// The locked encoder configuration of `compact-jpeg-v1`.
+pub fn compact_jpeg_v1_encoder_cfg() -> crate::jpeg::EncoderCfg {
+    crate::jpeg::EncoderCfg::with_quality(
+        COMPACT_JPEG_V1_QUALITY,
+        COMPACT_JPEG_V1_SAMPLING,
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelPolicy {
     /// Allow decode→re-encode of edge/cropped tiles exactly like the oracle
@@ -92,6 +154,9 @@ pub struct TransformPlan {
     pub core_version: String,
     pub input: InputIdentity,
     pub profile: OutputProfile,
+    /// Tile-payload encoding strategy (U3); defaults to (and means, for all
+    /// pre-U3 callers) [`EncodingProfile::PreserveSource`].
+    pub encoding: EncodingProfile,
     pub pixel_policy: PixelPolicy,
     pub limits: ResourceLimits,
 }
@@ -104,6 +169,7 @@ impl TransformPlan {
             core_version: CORE_VERSION.to_string(),
             input,
             profile: OutputProfile::ClassicJpegBigTiff,
+            encoding: EncodingProfile::PreserveSource,
             pixel_policy: PixelPolicy::AllowEdgeReencode,
             limits: ResourceLimits::default(),
         }
@@ -121,6 +187,7 @@ impl TransformPlan {
             core_version: CORE_VERSION.to_string(),
             input,
             profile: OutputProfile::OmeBigTiffSubifd,
+            encoding: EncodingProfile::PreserveSource,
             pixel_policy: PixelPolicy::AllowEdgeReencode,
             limits: ResourceLimits::default(),
         }
@@ -128,6 +195,12 @@ impl TransformPlan {
 
     pub fn with_policy(mut self, policy: PixelPolicy) -> Self {
         self.pixel_policy = policy;
+        self
+    }
+
+    /// Set the encoding profile (brightfield compact mode, U3).
+    pub fn with_encoding(mut self, encoding: EncodingProfile) -> Self {
+        self.encoding = encoding;
         self
     }
 

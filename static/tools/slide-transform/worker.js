@@ -20,7 +20,7 @@
 // gated behind init{testMode:true} and inert in production.
 
 import init, {
-  probe, convertProfile, convertResumeProfile, finalizeValidate, sha256Source,
+  probe, convertProfileEncoded, convertResumeProfileEncoded, finalizeValidate, sha256Source,
   coreVersion, configure, enableCheckpoint,
 } from './slide_transform.js';
 import * as E from './engine.js';
@@ -598,6 +598,7 @@ async function runJob(msg) {
     core: opts.coreVersion, plan: 1,
     policy: opts.policy, profile: profile.id,
     outputProfile: opts.outputProfile,
+    encodingProfile: opts.encoding || 'preserve-source-v1',
     cap: opts.outputCapBytes || null,
     resume: resume ? resume.st : null,
   });
@@ -624,16 +625,18 @@ async function runJob(msg) {
 
   const strict = opts.policy === 'strict-lossless';
   const channelJson = opts.channelJson || '';
-  // the core refuses to continue a checkpoint journalled under another profile
+  // the core refuses to continue a checkpoint journalled under another
+  // profile or encoding (U3: never mix two quality modes in one output)
   const outputProfile = opts.outputProfile || '';
+  const encoding = opts.encoding || '';
   const t0 = Date.now();
   post({ type: 'phase', phase: 'pre-convert', ms: Date.now() - tJobStart });
   post({ type: 'state', state: 'running' });
   let conv;
   try {
     conv = resume
-      ? convertResumeProfile(JSON.stringify(resume.st), outputProfile, strict, channelJson)
-      : convertProfile(outputProfile, strict, channelJson);
+      ? convertResumeProfileEncoded(JSON.stringify(resume.st), outputProfile, encoding, strict, channelJson)
+      : convertProfileEncoded(outputProfile, encoding, strict, channelJson);
   } catch (e) {
     conv = JSON.stringify(E.stError('io_recoverable', `wasm 异常: ${E.errText(e)}`));
   }

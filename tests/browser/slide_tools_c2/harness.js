@@ -60,6 +60,9 @@ let preparedJobId = null;
 // output layout for the next start/resume call (undefined = runner default /
 // the job's saved profile); set per __c2 call, never sticky
 let outputProfileOpt;
+// encoding (画质) for the next start/resume call (undefined = the job's
+// saved encoding; 'compact-jpeg-v1' for the U3 compact mode)
+let encodingOpt;
 
 function opts() {
   // scripting defaults: reads the selects only for manual clicking — the
@@ -71,6 +74,7 @@ function opts() {
     profileId: profileSel === 'auto' ? undefined : profileSel,
     policy: policySel || 'allow-edge',
     outputProfile: outputProfileOpt,
+    encodingProfile: encodingOpt,
     faults: faults || undefined,
     jobId: currentJob || undefined,
     // test runs on a fresh profile hit Chromium's capped quota report;
@@ -120,9 +124,14 @@ async function exportToOpfs(name = 'export-copy.bin') {
 window.__c2 = {
   events,
   async ready() { await ensureRunner(); return { coreVersion: runner.coreVersion }; },
-  async probe() {
+  async probe(o = {}) {
     await ensureRunner();
-    const r = await runner.probe(file, { confirmUncertainDisk: true });
+    encodingOpt = o.encoding || undefined;
+    const r = await runner.probe(file, {
+      confirmUncertainDisk: true,
+      encodingProfile: encodingOpt || undefined,
+    });
+    encodingOpt = undefined;
     currentJob = r.jobId;
     const d = r.probe.document || {};
     note('probe', { jobId: r.jobId, modality: d.modality, estimate: d.estimate });
@@ -130,6 +139,7 @@ window.__c2 = {
   },
   async start(o = {}) {
     outputProfileOpt = o.outputProfile || undefined;
+    encodingOpt = o.encoding || undefined;
     if (o.profileId) document.getElementById('profile').value = o.profileId;
     if (o.policy) document.getElementById('policy').value = o.policy;
     else document.getElementById('policy').value = 'allow-edge';
@@ -140,6 +150,7 @@ window.__c2 = {
   },
   async resume(o = {}) {
     outputProfileOpt = o.outputProfile || undefined;
+    encodingOpt = o.encoding || undefined;
     if (o.profileId) document.getElementById('profile').value = o.profileId;
     if (o.policy) document.getElementById('policy').value = o.policy;
     else document.getElementById('policy').value = 'allow-edge';
@@ -151,6 +162,7 @@ window.__c2 = {
   exportToOpfs: exportToOpfs,
   async tryResume(o = {}) {
     outputProfileOpt = o.outputProfile || undefined;
+    encodingOpt = o.encoding || undefined;
     if (o.jobId) currentJob = o.jobId;
     // snapshot BOTH selects so refusal probes leave no UI-state residue
     const profEl = document.getElementById('profile');
@@ -171,6 +183,7 @@ window.__c2 = {
   },
   async tryStart(o = {}) {
     outputProfileOpt = o.outputProfile || undefined;
+    encodingOpt = o.encoding || undefined;
     if (o.profileId) document.getElementById('profile').value = o.profileId;
     document.getElementById('policy').value = o.policy || 'allow-edge';
     faults = o.faults || null;
@@ -307,15 +320,19 @@ window.__c2 = {
     const prev = await engine.readSlotRecord(dir, 'job');
     const rec = { ...prev };
     delete rec.outputProfile;
+    delete rec.encodingProfile;
     await engine.writeSlotRecord(dir, 'job', rec);
     const fh = await dir.getFileHandle('journal.jsonl');
     const text = new TextDecoder().decode(await (await fh.getFile()).arrayBuffer());
     const { records } = engine.decodeJournal(text);
-    const strip = (st) => { if (st) delete st.profile; return st; };
+    const strip = (st) => {
+      if (st) { delete st.profile; delete st.encoding; }
+      return st;
+    };
     const out = records.map((r) => {
       const o = { ...r };
       delete o.rc;
-      if (o.t === 'gen') { delete o.outputProfile; strip(o.resume); }
+      if (o.t === 'gen') { delete o.outputProfile; delete o.encodingProfile; strip(o.resume); }
       if (o.t === 'c') strip(o.st);
       return engine.encodeJournalRecord(o);
     }).join('');

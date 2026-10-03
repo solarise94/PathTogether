@@ -340,10 +340,12 @@ impl ProgressCallback for HostProgress {
     }
 }
 
-/// Emits committed states; the output profile travels with every state so
-/// a journal can never be resumed under a different layout.
+/// Emits committed states; the output profile and the encoding profile
+/// travel with every state so a journal can never be resumed under a
+/// different layout or a different quality mode.
 struct HostCheckpoint {
     profile: OutputProfile,
+    encoding: slide_transform_core::plan::EncodingProfile,
 }
 
 impl slide_transform_core::job::CheckpointCallback for HostCheckpoint {
@@ -353,13 +355,14 @@ impl slide_transform_core::job::CheckpointCallback for HostCheckpoint {
         }
         let ifds: Vec<String> = c.ifd_tiles.iter().map(|t| t.to_string()).collect();
         let json = format!(
-            "{{\"level\":{},\"channel\":{},\"cell\":{},\"out\":{},\"ifds\":[{}],\"profile\":\"{}\"}}",
+            "{{\"level\":{},\"channel\":{},\"cell\":{},\"out\":{},\"ifds\":[{}],\"profile\":\"{}\",\"encoding\":\"{}\"}}",
             c.level,
             c.channel.map(|v| v.to_string()).unwrap_or_else(|| "0".into()),
             c.cell_done,
             c.committed_output,
             ifds.join(","),
-            self.profile.id()
+            self.profile.id(),
+            self.encoding.id()
         );
         host_checkpoint(&json);
     }
@@ -529,26 +532,38 @@ const DEFAULT_EST: slide_transform_core::estimate::OutputEstimate =
         edge_tiles: 0,
         ifds: 0,
         output_upper_bound_bytes: 0,
+        compact_upper_bound_bytes: 0,
     };
 
 fn estimate_json(e: &slide_transform_core::estimate::OutputEstimate) -> String {
     format!(
-        "{{\"payload_bytes\":{},\"tiles_present\":{},\"cells_total\":{},\"cells_missing\":{},\"edge_tiles\":{},\"ifds\":{},\"output_upper_bound_bytes\":{}}}",
+        "{{\"payload_bytes\":{},\"tiles_present\":{},\"cells_total\":{},\"cells_missing\":{},\"edge_tiles\":{},\"ifds\":{},\"output_upper_bound_bytes\":{},\"compact_upper_bound_bytes\":{}}}",
         e.payload_bytes,
         e.tiles_present,
         e.cells_total,
         e.cells_missing,
         e.edge_tiles,
         e.ifds,
-        e.output_upper_bound_bytes
+        e.output_upper_bound_bytes,
+        e.compact_upper_bound_bytes
     )
 }
 
 /// `"profile":"…"` of a checkpoint state; absent in states journalled
 /// before output profiles existed.
 fn resume_profile_field(resume_json: &str) -> Option<String> {
-    let key = "\"profile\"";
-    let at = resume_json.find(key)? + key.len();
+    resume_string_field(resume_json, "profile")
+}
+
+/// `"encoding":"…"` of a checkpoint state; absent in states journalled
+/// before encoding profiles existed (U3) — those mean preserve.
+fn resume_encoding_field(resume_json: &str) -> Option<String> {
+    resume_string_field(resume_json, "encoding")
+}
+
+fn resume_string_field(resume_json: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let at = resume_json.find(&needle)? + needle.len();
     let rest = resume_json[at..].trim_start().strip_prefix(':')?.trim_start();
     let rest = rest.strip_prefix('"')?;
     Some(rest[..rest.find('"')?].to_string())
@@ -574,11 +589,35 @@ fn resolve_profile(is_fl: bool, requested: Option<&str>) -> CoreResult<OutputPro
     Ok(p)
 }
 
+/// Resolve the requested encoding profile. `None`/empty and every legacy
+/// state without the field mean preserve-source-v1 (pre-U3 semantics).
+/// Compact is brightfield-only.
+fn resolve_encoding(is_fl: bool, requested: Option<&str>) -> CoreResult<EncodingProfileW> {
+    let e = match requested {
+        None | Some("") | Some("preserve-source-v1") => EncodingProfileW::PreserveSource,
+        Some("compact-jpeg-v1") => EncodingProfileW::CompactJpegV1,
+        Some(id) => {
+            return Err(CoreError::validation(format!(
+                "未知编码 profile {id}（preserve-source-v1|compact-jpeg-v1）"
+            )))
+        }
+    };
+    if e == EncodingProfileW::CompactJpegV1 && is_fl {
+        return Err(CoreError::variant(
+            "compact-jpeg-v1 编码仅适用于明场；荧光不支持有损重编码",
+        ));
+    }
+    Ok(e)
+}
+
+use slide_transform_core::plan::EncodingProfile as EncodingProfileW;
+
 fn run_convert(
     profile: Option<&str>,
+    encoding: Option<&str>,
     strict_lossless: bool,
     channel_json: &str,
-    resume: Option<(ResumePoint, Option<String>)>,
+    resume: Option<(ResumePoint, Option<String>, Option<String>)>,
 ) -> String {
     let src = HostSource::open();
     let magic = match detect(&src) {
@@ -590,11 +629,21 @@ fn run_convert(
         Ok(p) => p,
         Err(e) => return err_json(&e),
     };
-    // a committed state belongs to the layout that wrote it: never continue
-    // a partial output under another profile (legacy states = the default)
+    let enc_profile = match resolve_encoding(is_fl, encoding) {
+        Ok(p) => p,
+        Err(e) => return err_json(&e),
+    };
+    if enc_profile == EncodingProfileW::CompactJpegV1 && strict_lossless {
+        return err_json(&CoreError::policy(
+            "compact-jpeg-v1 与 strict-lossless 互斥：逐 tile 重编码必然有损",
+        ));
+    }
+    // a committed state belongs to the layout AND the encoding that wrote
+    // it: never continue a partial output under another profile or quality
+    // mode (legacy states = the pre-profile/pre-encoding defaults)
     let resume = match resume {
         None => None,
-        Some((rp, journalled)) => {
+        Some((rp, journalled, journalled_enc)) => {
             let committed_under = match resolve_profile(is_fl, journalled.as_deref()) {
                 Ok(p) => p,
                 Err(e) => return err_json(&e),
@@ -604,6 +653,17 @@ fn run_convert(
                     "resume: 已提交进度属于输出 profile {}，拒绝以 {} 续跑",
                     committed_under.id(),
                     out_profile.id()
+                )));
+            }
+            let committed_enc = match resolve_encoding(is_fl, journalled_enc.as_deref()) {
+                Ok(p) => p,
+                Err(e) => return err_json(&e),
+            };
+            if committed_enc != enc_profile {
+                return err_json(&CoreError::validation(format!(
+                    "resume: 已提交进度属于编码 profile {}，拒绝以 {} 续跑（不混合两种画质）",
+                    committed_enc.id(),
+                    enc_profile.id()
                 )));
             }
             Some(rp)
@@ -635,7 +695,7 @@ fn run_convert(
     let mut sink = HostSink;
     let mut scratch = HostScratchFactory;
     let progress = HostProgress;
-    let checkpoint = HostCheckpoint { profile: out_profile };
+    let checkpoint = HostCheckpoint { profile: out_profile, encoding: enc_profile };
     let mut job = JobControl::new(&progress);
     if CHECKPOINT_ENABLED.load(Ordering::Relaxed) {
         job = job.with_checkpoint(&checkpoint);
@@ -651,7 +711,9 @@ fn run_convert(
             ),
         }
     } else {
-        let mut plan = TransformPlan::brightfield(identity).with_policy(policy);
+        let mut plan = TransformPlan::brightfield(identity)
+            .with_policy(policy)
+            .with_encoding(enc_profile);
         plan.profile = out_profile;
         match resume.as_ref() {
             Some(rp) => slide_transform_core::convert_bf::convert_kfb_to_bigtiff_resume(
@@ -668,11 +730,25 @@ fn run_convert(
         Ok(r) => {
             let warnings: Vec<String> =
                 r.warnings.iter().map(|w| format!("\"{w}\"")).collect();
+            let (lossy_flag, lossy_json) = match &r.lossy_reencode {
+                Some(l) => (
+                    "true",
+                    format!(
+                        "{{\"profile\":\"{}\",\"params_fingerprint\":\"{}\",\"quality\":{},\"sampling\":\"{}\",\"huffman\":\"{}\",\"tiles_reencoded\":{},\"tiles_padded\":{}}}",
+                        l.profile, l.params_fingerprint, l.quality, l.sampling, l.huffman,
+                        l.tiles_reencoded, l.tiles_padded
+                    ),
+                ),
+                None => ("false", "null".to_string()),
+            };
             format!(
-                "{{{}\"format\":\"{}\",\"output_profile\":\"{}\",\"output_bytes\":{},\"width\":{},\"height\":{},\"ifd_count\":{},\"tiles_raw_copied\":{},\"tiles_reencoded\":{},\"resumed\":{},\"channels\":{},\"warnings\":[{}]}}",
+                "{{{}\"format\":\"{}\",\"output_profile\":\"{}\",\"encoding\":\"{}\",\"lossy_reencode\":{},\"lossy_reencode_params\":{},\"output_bytes\":{},\"width\":{},\"height\":{},\"ifd_count\":{},\"tiles_raw_copied\":{},\"tiles_reencoded\":{},\"resumed\":{},\"channels\":{},\"warnings\":[{}]}}",
                 companion_json_warning,
                 r.format,
                 out_profile.id(),
+                enc_profile.id(),
+                lossy_flag,
+                lossy_json,
                 r.output_bytes,
                 r.width,
                 r.height,
@@ -692,14 +768,28 @@ fn run_convert(
 /// pixel policy; `channel_json` may be empty (no companion).
 #[wasm_bindgen(js_name = "convert")]
 pub fn convert(strict_lossless: bool, channel_json: &str) -> String {
-    run_convert(None, strict_lossless, channel_json, None)
+    run_convert(None, None, strict_lossless, channel_json, None)
 }
 
 /// Run a conversion with an explicit output profile id (`bf-classic`,
-/// `bf-ome`, `fl-ome`; empty = the input's pre-profile default).
+/// `bf-ome`, `fl-ome`; empty = the input's pre-profile default). Encoding is
+/// preserve-source-v1 (pre-U3 behaviour kept bit-for-bit).
 #[wasm_bindgen(js_name = "convertProfile")]
 pub fn convert_profile(profile: &str, strict_lossless: bool, channel_json: &str) -> String {
-    run_convert(Some(profile), strict_lossless, channel_json, None)
+    run_convert(Some(profile), None, strict_lossless, channel_json, None)
+}
+
+/// Run a conversion with explicit output AND encoding profile ids (U3).
+/// `encoding`: `preserve-source-v1` (default) or `compact-jpeg-v1`
+/// (brightfield only).
+#[wasm_bindgen(js_name = "convertProfileEncoded")]
+pub fn convert_profile_encoded(
+    profile: &str,
+    encoding: &str,
+    strict_lossless: bool,
+    channel_json: &str,
+) -> String {
+    run_convert(Some(profile), Some(encoding), strict_lossless, channel_json, None)
 }
 
 /// Resume under an explicit output profile; refused when the checkpoint
@@ -714,9 +804,37 @@ pub fn convert_resume_profile(
     match parse_resume_json(resume_json) {
         Ok(rp) => run_convert(
             Some(profile),
+            None,
             strict_lossless,
             channel_json,
-            Some((rp, resume_profile_field(resume_json))),
+            Some((rp, resume_profile_field(resume_json), None)),
+        ),
+        Err(e) => err_json(&e),
+    }
+}
+
+/// Resume under explicit output AND encoding profiles (U3); refused when the
+/// checkpoint state was committed under a different combination — including
+/// a compact request against a legacy (preserve, no field) state.
+#[wasm_bindgen(js_name = "convertResumeProfileEncoded")]
+pub fn convert_resume_profile_encoded(
+    resume_json: &str,
+    profile: &str,
+    encoding: &str,
+    strict_lossless: bool,
+    channel_json: &str,
+) -> String {
+    match parse_resume_json(resume_json) {
+        Ok(rp) => run_convert(
+            Some(profile),
+            Some(encoding),
+            strict_lossless,
+            channel_json,
+            Some((
+                rp,
+                resume_profile_field(resume_json),
+                resume_encoding_field(resume_json),
+            )),
         ),
         Err(e) => err_json(&e),
     }
@@ -729,9 +847,10 @@ pub fn convert_resume(resume_json: &str, strict_lossless: bool, channel_json: &s
     match parse_resume_json(resume_json) {
         Ok(rp) => run_convert(
             None,
+            None,
             strict_lossless,
             channel_json,
-            Some((rp, resume_profile_field(resume_json))),
+            Some((rp, resume_profile_field(resume_json), None)),
         ),
         Err(e) => err_json(&e),
     }
@@ -786,6 +905,18 @@ mod tests {
     }
 
     #[test]
+    fn journalled_encoding_is_read_from_checkpoint_states() {
+        let st = r#"{"level":1,"channel":0,"cell":3,"out":4096,"ifds":[9,3],"profile":"bf-ome","encoding":"compact-jpeg-v1"}"#;
+        assert_eq!(resume_profile_field(st).as_deref(), Some("bf-ome"));
+        assert_eq!(resume_encoding_field(st).as_deref(), Some("compact-jpeg-v1"));
+        // states journalled before U3 carry no encoding → preserve
+        let legacy = r#"{"level":1,"channel":0,"cell":3,"out":4096,"ifds":[9,3],"profile":"bf-ome"}"#;
+        assert_eq!(resume_encoding_field(legacy), None);
+        // unknown ids must be rejected, never silently coerced
+        assert_eq!(resume_encoding_field(r#"{"encoding":"compact"}"#).as_deref(), Some("compact"));
+    }
+
+    #[test]
     fn legacy_states_resolve_to_the_pre_profile_layouts() {
         assert_eq!(resolve_profile(false, None).unwrap(), OutputProfile::ClassicJpegBigTiff);
         assert_eq!(resolve_profile(true, None).unwrap(), OutputProfile::OmeBigTiffSubifd);
@@ -793,5 +924,24 @@ mod tests {
         assert!(resolve_profile(false, Some("fl-ome")).is_err());
         assert!(resolve_profile(true, Some("bf-ome")).is_err());
         assert!(resolve_profile(false, Some("ome")).is_err());
+    }
+
+    #[test]
+    fn encoding_resolution_rules() {
+        // legacy / empty / explicit preserve all mean preserve
+        assert_eq!(resolve_encoding(false, None).unwrap(), EncodingProfileW::PreserveSource);
+        assert_eq!(resolve_encoding(false, Some("")).unwrap(), EncodingProfileW::PreserveSource);
+        assert_eq!(
+            resolve_encoding(false, Some("preserve-source-v1")).unwrap(),
+            EncodingProfileW::PreserveSource
+        );
+        assert_eq!(
+            resolve_encoding(false, Some("compact-jpeg-v1")).unwrap(),
+            EncodingProfileW::CompactJpegV1
+        );
+        // fluorescence refuses the lossy mode; unknown ids refuse
+        assert!(resolve_encoding(true, Some("compact-jpeg-v1")).is_err());
+        assert!(resolve_encoding(false, Some("compact")).is_err());
+        assert!(resolve_encoding(true, None).is_ok()); // preserve is fine for FL
     }
 }

@@ -722,6 +722,7 @@ fn convert_inner(
             tiles_reencoded: compact_tiles_reencoded,
             tiles_padded: compact_tiles_padded,
         }),
+        composed: None,
         associated: doc
             .associated
             .iter()
@@ -870,6 +871,7 @@ fn reencode_edge_tile(
                 y_q: qtables[0],
                 c_q: qtables[1],
                 sampling,
+                rgb: false,
             },
             true,
         )

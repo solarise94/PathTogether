@@ -14,18 +14,23 @@
 //! Byte-layout parity with the oracle is a hard requirement.
 
 pub mod companion;
+pub mod bundle;
 #[cfg(feature = "codecs")]
 pub mod convert_bf;
 #[cfg(feature = "codecs")]
 pub mod convert_fl;
 #[cfg(feature = "codecs")]
+pub mod convert_mirax;
+#[cfg(feature = "codecs")]
 pub mod convert_svs;
 pub mod error;
 pub mod estimate;
+pub mod inflate;
 pub mod io;
 pub mod job;
 pub mod kfb;
 pub mod kfbf;
+pub mod mirax;
 pub mod ome;
 pub mod ome_writer;
 pub mod paged_index;
@@ -47,6 +52,9 @@ pub mod synth_gen;
 
 #[cfg(all(feature = "codecs", feature = "fixtures"))]
 pub mod svs_fixture;
+
+#[cfg(all(feature = "codecs", feature = "fixtures"))]
+pub mod mirax_fixture;
 
 pub use error::{CoreError, CoreResult};
 pub use plan::{

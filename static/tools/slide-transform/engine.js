@@ -542,6 +542,273 @@ export async function sniffTiffSlideCapability(file) {
   }
 }
 
+// ------------------------------------------------- MRXS bundle input (F3) --
+
+export const MRXS_SOURCE_ADAPTER = 'mirax-bundle';
+/// Must equal the Rust `ADAPTER_VERSION` (resume refuses on mismatch).
+export const MRXS_ADAPTER_VERSION = '1';
+/// Must equal the Rust `MAX_MEMBERS` bound (bundle.rs).
+export const MRXS_MAX_MEMBERS = 8192;
+/// Must equal the Rust `FILE_COUNT` bound (mirax.rs).
+export const MRXS_MAX_DATA_FILES = 4096;
+export const SLIDEDAT_MAX_BYTES = 1 << 20;
+/// What preserve means for MRXS (mirrors the Rust constants reported by the
+/// core in `result.composed` — shown by the UI when a bundle is converted).
+export const MRAX_PRESERVE_COMPOSE_FINGERPRINT = 'mirax-preserve-compose:q96:y422:hstd:v1';
+
+/// Incremental SHA-256 (FIPS 180-4), sync — used for member digests while
+/// copying and for the manifest root digest. Verified against known vectors
+/// in tests/js/tools-mrxs-input.test.ts.
+export class Sha256 {
+  constructor() {
+    this.h = new Int32Array([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+      0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
+    this.len = 0;
+    this.buf = new Uint8Array(64);
+    this.bufLen = 0;
+    this.k = null;
+  }
+  update(u8) {
+    this.len += u8.length;
+    let i = 0;
+    if (this.bufLen) {
+      const take = Math.min(64 - this.bufLen, u8.length);
+      this.buf.set(u8.subarray(0, take), this.bufLen);
+      this.bufLen += take;
+      i = take;
+      if (this.bufLen === 64) { this._block(this.buf); this.bufLen = 0; }
+    }
+    for (; i + 64 <= u8.length; i += 64) this._block(u8.subarray(i, i + 64));
+    if (i < u8.length) {
+      this.buf.set(u8.subarray(i), 0);
+      this.bufLen = u8.length - i;
+    }
+    return this;
+  }
+  _block(b) {
+    if (!this.k) this.k = K256;
+    const w = new Int32Array(64);
+    for (let i = 0; i < 16; i++) w[i] = (b[i * 4] << 24) | (b[i * 4 + 1] << 16) | (b[i * 4 + 2] << 8) | b[i * 4 + 3];
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
+    }
+    let [a, bb, c, d, e, f, g, h] = this.h;
+    for (let i = 0; i < 64; i++) {
+      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (h + S1 + ch + this.k[i] + w[i]) | 0;
+      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      const maj = (a & bb) ^ (a & c) ^ (bb & c);
+      const t2 = (S0 + maj) | 0;
+      h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = bb; bb = a; a = (t1 + t2) | 0;
+    }
+    this.h[0] = (this.h[0] + a) | 0; this.h[1] = (this.h[1] + bb) | 0;
+    this.h[2] = (this.h[2] + c) | 0; this.h[3] = (this.h[3] + d) | 0;
+    this.h[4] = (this.h[4] + e) | 0; this.h[5] = (this.h[5] + f) | 0;
+    this.h[6] = (this.h[6] + g) | 0; this.h[7] = (this.h[7] + h) | 0;
+  }
+  digestHex() {
+    const bits = this.len * 8;
+    const padLen = this.bufLen < 56 ? 56 - this.bufLen : 120 - this.bufLen;
+    const pad = new Uint8Array(padLen + 8);
+    pad[0] = 0x80;
+    // 64-bit big-endian bit length (members are < 2^48 bytes)
+    const hi = Math.floor(bits / 2 ** 32);
+    pad[padLen] = (hi >>> 24) & 0xff;
+    pad[padLen + 1] = (hi >>> 16) & 0xff;
+    pad[padLen + 2] = (hi >>> 8) & 0xff;
+    pad[padLen + 3] = hi & 0xff;
+    pad[padLen + 4] = (bits >>> 24) & 0xff;
+    pad[padLen + 5] = (bits >>> 16) & 0xff;
+    pad[padLen + 6] = (bits >>> 8) & 0xff;
+    pad[padLen + 7] = bits & 0xff;
+    this.update(pad);
+    return [...this.h].map((v) => (v >>> 0).toString(16).padStart(8, '0')).join('');
+  }
+}
+const K256 = new Int32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]);
+function rotr(x, n) { return (x >>> n) | (x << (32 - n)); }
+
+export function sha256Hex(u8) {
+  return new Sha256().update(u8).digestHex();
+}
+
+/// Normalise a webkitRelativePath to a flat member name relative to the
+/// slide folder: the .mrxs entry's parent directory is the bundle root.
+/// Returns null for paths that cannot be member names.
+export function normaliseBundlePath(relPath) {
+  if (typeof relPath !== 'string' || !relPath) return null;
+  if (relPath.includes('\\') || relPath.includes(':')) return null;
+  const segs = relPath.split('/');
+  if (segs.some((s) => s.length === 0)) return null; // 'a//b' is not a member path
+  if (!segs.length) return null;
+  for (const s of segs) {
+    if (s === '.' || s === '..' || s.length > 255) return null;
+  }
+  return segs.join('/');
+}
+
+/// Bounded Slidedat.ini parse: only the members the core needs (DATAFILE
+/// list + INDEXFILE). `slidedatBytes` must be ≤ SLIDEDAT_MAX_BYTES.
+export function parseSlidedatMembers(slidedatBytes) {
+  const text = new TextDecoder('utf-8', { fatal: false }).decode(slidedatBytes).replace(/^\uFEFF/, '');
+  const kv = {};
+  let group = null;
+  for (const raw of text.split(/[\r\n]/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith(';') || line.startsWith('#')) continue;
+    if (line.startsWith('[') && line.endsWith(']')) { group = line.slice(1, -1); continue; }
+    if (group === 'HIERARCHICAL' || group === 'DATAFILE') {
+      const at = line.indexOf('=');
+      if (at > 0) kv[`${group}.${line.slice(0, at).trim()}`] = line.slice(at + 1).trim();
+    }
+  }
+  const count = Number(kv['DATAFILE.FILE_COUNT']);
+  if (!Number.isInteger(count) || count < 1 || count > MRXS_MAX_DATA_FILES) {
+    throw stError(ERROR_CODES.UNSUPPORTED_INPUT, `Slidedat.ini FILE_COUNT 异常（${kv['DATAFILE.FILE_COUNT']}）`);
+  }
+  const files = [];
+  for (let i = 0; i < count; i++) {
+    const name = kv[`DATAFILE.FILE_${i}`];
+    if (!name) throw stError(ERROR_CODES.UNSUPPORTED_INPUT, `Slidedat.ini 缺少 FILE_${i}`);
+    files.push(name);
+  }
+  const indexfile = kv['HIERARCHICAL.INDEXFILE'] || 'Index.dat';
+  return { fileCount: count, files, indexfile };
+}
+
+/// Pre-copy capability sniff of a folder selection (F3). Everything the
+/// bundle needs is decided BEFORE any large copy: entry presence, name
+/// normalisation, duplicates/case conflicts, traversal, Slidedat parse and
+/// the complete required-member list. Files arrive as {name, relPath, file}
+/// (relPath from webkitRelativePath or name).
+///
+///   sniffMrxBundle(files)
+///     → { supported: true, entry, stem, members: [names], required: [...],
+///         fileByName: Map }
+///     | { supported: false, reason, missing?: [...] }
+export function sniffMrxBundle(files) {
+  const bad = (reason, extra = {}) => ({ supported: false, reason, ...extra });
+  if (!Array.isArray(files) || !files.length) return bad('没有选择任何文件');
+  if (files.length > MRXS_MAX_MEMBERS) {
+    return bad(`文件数 ${files.length} 超过包成员上限 ${MRXS_MAX_MEMBERS}`);
+  }
+  const entries = [];
+  for (const f of files) {
+    const rel = normaliseBundlePath(f.webkitRelativePath || f.relPath || f.name);
+    if (!rel) return bad(`成员路径非法：${f.webkitRelativePath || f.name}`);
+    entries.push({ rel, file: f.file || f });
+  }
+  // the bundle root: the directory containing the .mrxs entry
+  const mrxsEntries = entries.filter((e) => /\.mrxs$/i.test(e.rel.split('/').pop()));
+  if (mrxsEntries.length === 0) {
+    return bad('缺少 .mrxs 主入口（MRXS 需要完整包：.mrxs 文件 + 同名目录）', { missing: ['<slide>.mrxs'] });
+  }
+  if (mrxsEntries.length > 1) return bad('选择了多个 .mrxs 主入口（一次只转换一张切片）');
+  const entry = mrxsEntries[0];
+  const segs = entry.rel.split('/');
+  const stem = segs[segs.length - 1].replace(/\.mrxs$/i, '');
+  const rootLen = segs.length - 1;
+  if (!stem || stem === '.' || stem === '..') return bad('主入口文件名非法');
+  // normalise every member relative to the bundle root
+  const seen = new Map(); // name (case-sensitive) -> entry
+  const seenLower = new Map(); // lower-case -> name (conflict detection)
+  for (const e of entries) {
+    const esegs = e.rel.split('/');
+    if (esegs.length <= rootLen) continue;
+    const name = esegs.slice(rootLen).join('/');
+    if (!name) continue;
+    if (seen.has(name)) {
+      return bad(`成员重复：${name}`);
+    }
+    const lower = name.toLowerCase();
+    if (seenLower.has(lower) && seenLower.get(lower) !== name) {
+      return bad(`成员名大小写冲突：${name} 与 ${seenLower.get(lower)}`);
+    }
+    seen.set(name, e);
+    seenLower.set(lower, name);
+  }
+  const member = (n) => n; // names are already root-relative
+  const need = (n) => {
+    if (!seen.has(n)) return n;
+    return null;
+  };
+  const slidedatName = `${stem}/Slidedat.ini`;
+  if (!seen.has(slidedatName)) {
+    return bad(
+      `缺少成员 ${slidedatName}（MRXS 需要完整包：${stem}.mrxs + 同名目录 ${stem}/）`,
+      { missing: [slidedatName] },
+    );
+  }
+  return { supported: true, stem, entryName: segs[segs.length - 1], files: seen, _need: need,
+    slidedatName, rootLen };
+}
+
+/// Full pre-copy plan: sniff + bounded Slidedat parse + the required-member
+/// set ({stem}.mrxs, {stem}/Slidedat.ini, {stem}/<INDEXFILE>, every
+/// FILE_i). Returns the copy plan or a typed unsupported_input error with
+/// the missing member list — before any byte is copied.
+export async function planMrxBundle(files, readSlidedat) {
+  const sniff = sniffMrxBundle(files);
+  if (!sniff.supported) {
+    throw stError(ERROR_CODES.UNSUPPORTED_INPUT, sniff.reason,
+      { kind: 'mrxs-bundle', missing: sniff.missing || undefined });
+  }
+  const { stem, slidedatName } = sniff;
+  const sdEntry = sniff.files.get(slidedatName);
+  const sdFile = sdEntry.file;
+  if (sdFile.size > SLIDEDAT_MAX_BYTES) {
+    throw stError(ERROR_CODES.UNSUPPORTED_INPUT,
+      `Slidedat.ini 大小 ${sdFile.size} 超过上限（文件异常）`, { kind: 'mrxs-bundle' });
+  }
+  const sdBytes = await (sdFile.slice(0, SLIDEDAT_MAX_BYTES).arrayBuffer());
+  let sd;
+  try {
+    sd = parseSlidedatMembers(new Uint8Array(sdBytes));
+  } catch (e) {
+    throw stError(ERROR_CODES.UNSUPPORTED_INPUT, errText(e), { kind: 'mrxs-bundle' });
+  }
+  const safe = (name) => !name.includes('/') && !name.includes('..') && !/[\\:]/.test(name) && name.length > 0;
+  const required = [sniff.entryName, slidedatName, `${stem}/${sd.indexfile}`];
+  for (const f of sd.files) {
+    if (!safe(f)) {
+      throw stError(ERROR_CODES.UNSUPPORTED_INPUT,
+        `数据文件名 ${f} 非法（路径穿越被拒绝）`, { kind: 'mrxs-bundle' });
+    }
+    required.push(`${stem}/${f}`);
+  }
+  const missing = required.filter((n) => !sniff.files.has(n));
+  if (missing.length) {
+    throw stError(ERROR_CODES.UNSUPPORTED_INPUT,
+      `包不完整，缺少成员：${missing.join('、')}（MRXS 需要完整包：${stem}.mrxs + 同名目录）`,
+      { kind: 'mrxs-bundle', missing });
+  }
+  return { stem, entryName: sniff.entryName, required,
+    members: required.map((n) => ({ name: n, file: sniff.files.get(n).file })) };
+}
+
+/// Manifest root digest: sha256 over `name\0size\0sha256\n` lines in
+/// member order — any member change (path, size, bytes) changes it.
+export function bundleRootDigest(members) {
+  const h = new Sha256();
+  const enc = new TextEncoder();
+  for (const m of members) {
+    h.update(enc.encode(`${m.path}\0${m.size}\0${m.sha256}\n`));
+  }
+  return h.digestHex();
+}
+
 // ------------------------------------------------------ output profiles --
 
 /// Output layouts the core can write (`--profile` ids; persisted in job

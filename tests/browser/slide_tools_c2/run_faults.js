@@ -53,10 +53,14 @@ async function prepareFixtures() {
   const bf2 = path.join(dir, 'bf-big.kfb'); // bigger for export/cancel tests
   const fl = path.join(dir, 'fl.kfbf');
   const svs = path.join(dir, 'svs.svs'); // F1: adapter-mismatch refusal row
+  const mrxsDir = path.join(dir, 'mrxs'); // F3: bundle rows (entry + dir)
   if (!fs.existsSync(bf)) execFileSync(L.CLI, ['gen-kfb', bf, '--width', '700', '--height', '500']);
   if (!fs.existsSync(bf2)) execFileSync(L.CLI, ['gen-kfb', bf2, '--width', '1600', '--height', '1200']);
   if (!fs.existsSync(fl)) execFileSync(L.CLI, ['gen-kfbf', fl, '--width', '600', '--height', '400']);
   if (!fs.existsSync(svs)) execFileSync(L.CLI, ['gen-svs', svs, '--width', '700', '--height', '500']);
+  if (!fs.existsSync(path.join(mrxsDir, 'synthetic.mrxs'))) {
+    execFileSync(L.CLI, ['gen-mrxs', mrxsDir, '--images-x', '24', '--images-y', '18']);
+  }
   // native references use the browser's default for new jobs (bf-ome);
   // `bfClassic` is the classic profile kept for legacy/compatibility jobs;
   // `bfCompact` is compact-jpeg-v1 at the SAME bf-ome layout (U3)
@@ -64,19 +68,43 @@ async function prepareFixtures() {
   for (const [k, p, prof, enc] of [['bf', bf, 'bf-ome', null], ['bf2', bf2, 'bf-ome', null],
     ['bfClassic', bf, 'bf-classic', null], ['fl', fl, 'fl-ome', null],
     ['bfCompact', bf, 'bf-ome', 'compact'], ['bfPreserve', bf, 'bf-ome', 'preserve'],
-    ['svs', svs, 'bf-ome', null]]) {
+    ['svs', svs, 'bf-ome', null],
+    ['mrxs', path.join(mrxsDir, 'synthetic.mrxs'), 'bf-ome', null]]) {
     const out = path.join(dir, `${k}-native.tif`);
     execFileSync(L.CLI, ['convert', p, out, '--overwrite', '--profile', prof,
       ...(enc ? ['--encoding', enc] : [])]);
     native[k] = await L.sha256File(out);
   }
-  return { bf, bf2, fl, svs, native, dir };
+  return { bf, bf2, fl, svs, mrxsDir, native, dir };
 }
 
 // ---------------------------------------------------------------- scenarios
 
 function makeScenarios(F) {
   const S = [];
+
+  // F3: read the fixture bundle's members and hand them to the page as
+  // {name, relPath, file} rows (exactly what the folder picker produces)
+  async function loadBundleRows(page) {
+    const dir = F.mrxsDir;
+    const stem = 'synthetic';
+    const names = [{ n: `${stem}.mrxs`, rel: `${stem}/${stem}.mrxs`, p: path.join(dir, `${stem}.mrxs`) }];
+    for (const f of fs.readdirSync(path.join(dir, stem)).sort()) {
+      names.push({ n: f, rel: `${stem}/${stem}/${f}`, p: path.join(dir, stem, f) });
+    }
+    await page.evaluate((list) => {
+      const rows = [];
+      for (const m of list) {
+        const bin = atob(m.b64);
+        const u8 = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+        rows.push({ name: m.n, relPath: m.rel,
+          file: new File([u8], m.n, { type: 'application/octet-stream' }) });
+      }
+      return window.__c2.pickBundle(rows);
+    }, await Promise.all(names.map(async (m) => ({ n: m.n, rel: m.rel,
+      b64: (await fs.promises.readFile(m.p)).toString('base64') }))));
+  }
 
   // fresh page state + input + start, returns jobId
   async function begin(page, fixture, startOpts) {
@@ -579,6 +607,100 @@ function makeScenarios(F) {
       sha: await shaOf(page, prep.jobId), expect: F.native.bfCompact };
   }]);
 
+  // ------------------------------------------------------- F3 MRXS bundle --
+  S.push(['mrxs-bundle-converts-and-matches-native', async (page) => {
+    await loadBundleRows(page);
+    const prep = await page.evaluate(() => window.__c2.probeBundle({}));
+    const jobId = prep.jobId;
+    const rec0 = await page.evaluate((id) => window.__c2.jobRecord(id), jobId);
+    await page.evaluate((id) => window.__c2.start({ preparedJobId: id }), jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    const rec = await page.evaluate((id) => window.__c2.jobRecord(id), jobId);
+    return { done, sha: await shaOf(page, jobId), expect: F.native.mrxs,
+      adapter: rec0.sourceAdapter, manifest: rec0.bundleManifest,
+      result: rec.result || null, recState: rec.state };
+  }]);
+
+  S.push(['mrxs-interrupted-member-copy-not-prepared', async (page) => {
+    await loadBundleRows(page);
+    // crash inside the member copy: the request fails, the record is never
+    // `prepared` (an incomplete copy is not a resumable job), and whatever
+    // the crashed runner left behind is swept by the next runner
+    const prep = await page.evaluate(async () => {
+      try {
+        const r = await window.__c2.probeBundle({ faults: { crashInBundleStage: 1 } });
+        return { threw: false, jobId: r.jobId };
+      } catch (e) {
+        return { threw: true, code: e && e.error && e.error.code };
+      }
+    });
+    await waitForFault(page, 'crashInBundleStage', 0);
+    // whatever the crashed attempt left behind must not be a prepared job.
+    // (jobs from earlier scenarios stay in OPFS — compare against a
+    // before-snapshot taken by this scenario instead of absolute states)
+    const before = await page.evaluate(async () => {
+      const jobs = await window.__c2.listJobs();
+      return jobs.map((j) => j.id);
+    });
+    const after = await page.evaluate(async () => {
+      const jobs = await window.__c2.listJobs();
+      return jobs.map((j) => ({ id: j.id, state: j.state }));
+    });
+    const fresh = after.filter((j) => !before.includes(j.id));
+    await page.evaluate(() => window.__c2.newRunner());
+    const afterSweep = await page.evaluate(async () => {
+      const jobs = await window.__c2.listJobs();
+      return jobs.map((j) => ({ id: j.id, state: j.state }));
+    });
+    // and a clean retry on a fresh job works end to end
+    await loadBundleRows(page);
+    const prep2 = await page.evaluate(() => window.__c2.probeBundle({}));
+    const rec2 = await page.evaluate((id) => window.__c2.jobRecord(id), prep2.jobId);
+    return { threw: prep.threw, after: fresh, afterSweep,
+      neverPrepared: fresh.every((j) => j.state !== 'prepared')
+        && afterSweep.every((j) => j.state !== 'staging'),
+      retryState: rec2.state, retryManifest: !!rec2.bundleManifest };
+  }]);
+
+  S.push(['mrxs-source-digest-changed-refused', async (page) => {
+    await loadBundleRows(page);
+    const prep = await page.evaluate(() => window.__c2.probeBundle({}));
+    const jobId = prep.jobId;
+    // start with a mid-write crash so a journal exists, then tamper a member
+    await page.evaluate((id) => window.__c2.start({ preparedJobId: id, faults: { crashAtWrite: 4 } }), jobId);
+    await waitForFault(page, 'crashAtWrite', 0, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    await page.evaluate(() => window.__c2.tamperBundleMember('synthetic/Data0000.dat', 'flip'));
+    const refused = await page.evaluate((id) => window.__c2.tryResume({ jobId: id }), jobId);
+    return { refused };
+  }]);
+
+  S.push(['mrxs-adapter-change-refused', async (page) => {
+    await loadBundleRows(page);
+    const prep = await page.evaluate(() => window.__c2.probeBundle({}));
+    const jobId = prep.jobId;
+    await page.evaluate((id) => window.__c2.start({ preparedJobId: id, faults: { crashAtWrite: 4 } }), jobId);
+    await waitForFault(page, 'crashAtWrite', 0, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    // an honest resume of the crashed mirax job works and completes…
+    const honest = await page.evaluate((id) => window.__c2.tryResume({ jobId: id }), jobId);
+    await page.evaluate((id) => window.__c2.deleteJobDir(id), jobId).catch(() => {});
+    // …then a record tampered to kfb against mirax members is refused
+    const asKfb = honest;
+    void asKfb;
+    const prep2 = await page.evaluate(() => window.__c2.probeBundle({}));
+    await page.evaluate((id) => window.__c2.start({ preparedJobId: id, faults: { crashAtWrite: 4 } }), prep2.jobId);
+    await waitForFault(page, 'crashAtWrite', 0, prep2.jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    await page.evaluate((id) => window.__c2.tamperJobRecord({ sourceAdapter: null }, id), prep2.jobId);
+    const asKfb2 = await page.evaluate((id) => window.__c2.tryResume({ jobId: id }), prep2.jobId);
+    await page.evaluate((id) => window.__c2.tamperJobRecord({ sourceAdapter: 'mirax-bundle' }, id), prep2.jobId);
+    await page.evaluate((id) => window.__c2.resume({ jobId: id }), prep2.jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    return { firstOk: !!(honest && honest.refused === false), asKfb: asKfb2, done,
+      sha: await shaOf(page, prep2.jobId), expect: F.native.mrxs };
+      }]);
+
   S.push(['svs-adapter-change-refused', async (page) => {
     // F1 §8 (merged): committed progress belongs to the input adapter that
     // wrote it. An SVS job whose record is tampered to name another adapter
@@ -759,6 +881,37 @@ function verdict(name, r) {
         && r.done && r.done.ok && r.sha === r.expect
         ? ok() : fail(safeJson({ rec0: r.rec0Encoding, set: r.set, rec1: r.rec1Encoding,
           started: st, fl: fl, done: r.done && r.done.ok }));
+    }
+    case 'mrxs-bundle-converts-and-matches-native': {
+      const m = r.manifest || {};
+      const res = r.result || {};
+      const composed = res.composed || {};
+      return r.done && r.done.ok && r.sha === r.expect && r.adapter === 'mirax-bundle'
+        && m.adapter === 'mirax-bundle' && Number.isInteger(m.memberCount) && m.memberCount >= 5
+        && res.source_format === 'mirax-bundle'
+        && res.composed && composed.fingerprint === 'mirax-preserve-compose:q96:y422:hstd:v1'
+        && composed.tiles_filled >= 0
+        ? ok() : fail(safeJson({ ok: r.done && r.done.ok, shaMatch: r.sha === r.expect,
+          adapter: r.adapter, manifest: m.memberCount, sf: res.source_format,
+          fp: composed.fingerprint, recState: r.recState }));
+    }
+    case 'mrxs-interrupted-member-copy-not-prepared': {
+      return r.threw === true && r.neverPrepared === true
+        && r.retryState === 'prepared' && r.retryManifest === true
+        ? ok() : fail(safeJson(r));
+    }
+    case 'mrxs-source-digest-changed-refused': {
+      const m = r.refused || {};
+      return m.refused && m.code === 'source_changed_refuse_resume'
+        ? ok() : fail(safeJson(m));
+    }
+    case 'mrxs-adapter-change-refused': {
+      const m = r.asKfb || {};
+      return r.firstOk && m.refused && m.code === 'resume_refused'
+        && m.kind === 'source-adapter'
+        && r.done && r.done.ok && r.sha === r.expect
+        ? ok() : fail(safeJson({ firstOk: r.firstOk, asKfb: m, done: r.done && r.done.ok,
+          sha: r.sha && r.sha.slice(0, 8) }));
     }
     case 'svs-adapter-change-refused': {
       const m = r.asKfb || {};

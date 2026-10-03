@@ -20,6 +20,8 @@ const PORT = Number(L.arg('port', '8943'));
 const LABEL = L.arg('label', 'mem');
 const SIZE = L.arg('size', '1g'); // 1g | 4g | 10g
 const PROFILE = L.arg('profile', 'saver');
+// U3: compact-jpeg-v1 memory measurement (default preserve)
+const ENCODING = L.arg('encoding', 'preserve');
 const BROWSER = L.arg('browser', 'chromium');
 const BASELINE_S = Number(L.arg('baseline-seconds', '6'));
 
@@ -97,7 +99,7 @@ async function main() {
   if (!pid) throw new Error('browser pid not found');
 
   const report = {
-    label: LABEL, size: SIZE, profile: PROFILE, browser: BROWSER,
+    label: LABEL, size: SIZE, profile: PROFILE, encoding: ENCODING, browser: BROWSER,
     cgroup: process.env.CGROUP_DESC || null,
     inputBytes: inBytes,
     startedAt: new Date().toISOString(),
@@ -124,8 +126,10 @@ async function main() {
     let jobId = null;
     let precheckRefusal = null;
     let activePage = page;
+    const encArg = ENCODING === 'compact' ? 'compact-jpeg-v1' : undefined;
     try {
-      jobId = await activePage.evaluate((p) => window.__c2.start({ profileId: p }), PROFILE);
+      jobId = await activePage.evaluate(({ p, e }) => window.__c2.start({ profileId: p, encoding: e }),
+        { p: PROFILE, e: encArg });
     } catch (e) {
       precheckRefusal = (e && e.error) ? e.error : String(e);
       console.log('first start refused/failed:', JSON.stringify(precheckRefusal).slice(0, 220));
@@ -145,7 +149,8 @@ async function main() {
       // retry with the test-only precheck bypass (the refusal itself is the
       // precheck working: fresh quota 10 GiB < 12.5 GiB estimate; Chromium
       // raises quota as usage grows — C0 §8)
-      jobId = await activePage.evaluate((p) => window.__c2.start({ profileId: p, skipDiskPrecheck: true }), PROFILE);
+      jobId = await activePage.evaluate(({ p, e }) => window.__c2.start({ profileId: p, skipDiskPrecheck: true, encoding: e }),
+        { p: PROFILE, e: encArg });
     }
     report.precheckRefusal = precheckRefusal;
     const page2 = activePage;
@@ -216,7 +221,8 @@ async function main() {
       const nativeOut = input.replace(/\.kfb$/, '-native.tif');
       if (!fs.existsSync(nativeOut)) {
         execFileSync(L.CLI, ['convert', input, nativeOut, '--overwrite',
-          '--profile', /\.kfbf$/i.test(input) ? 'fl-ome' : 'bf-ome']);
+          '--profile', /\.kfbf$/i.test(input) ? 'fl-ome' : 'bf-ome',
+          ...(ENCODING === 'compact' ? ['--encoding', 'compact'] : [])]);
       }
       const nativeSha = await L.sha256File(nativeOut);
       report.nativeSha256 = nativeSha;

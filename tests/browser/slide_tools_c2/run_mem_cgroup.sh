@@ -3,17 +3,19 @@
 # wraps run_memory.js in a user-scope memory-limited cgroup and samples
 # memory.events (oom counters) + memory.current live.
 #
-#   bash run_mem_cgroup.sh <label> <MemoryMax> <size> <profile>
+#   bash run_mem_cgroup.sh <label> <MemoryMax> <size> <profile> [preserve|compact]
 #   e.g. bash run_mem_cgroup.sh cg4g-1g 4G 1g saver
+#   e.g. bash run_mem_cgroup.sh cg4g-1g-u3compact 4G 1g saver compact   # U3
 set -euo pipefail
 LABEL="$1"; MAX="$2"; SIZE="$3"; PROFILE="$4"
+ENCODING="${5:-preserve}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 GATE="$HERE/../../../.gate-tmp/slide-tools-c2/browser"
 UNIT="c2mem-$(echo "$LABEL" | tr -c 'a-zA-Z0-9-' -)"
 
 systemd-run --user --scope --unit "$UNIT" -p MemoryMax="$MAX" -p MemorySwapMax=0 \
   env CGROUP_DESC="cgroup 模拟 MemoryMax=$MAX SwapMax=0" \
-  node "$HERE/run_memory.js" --label "$LABEL" --size "$SIZE" --profile "$PROFILE" &
+  node "$HERE/run_memory.js" --label "$LABEL" --size "$SIZE" --profile "$PROFILE" --encoding "$ENCODING" &
 RUN_PID=$!
 
 # locate the scope cgroup and sample it until the run exits

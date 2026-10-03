@@ -565,3 +565,71 @@ def test_over_4gib_both_writers(workdir):
         assert max(offs) > (1 << 32) - 1
     with open(workdir / "big-stats.json", "w") as f:
         json.dump({"bf": [rss_bf, dt_bf], "fl": [rss_fl, dt_fl]}, f, indent=1)
+
+
+# --------------------------------------------------------------------------- #
+# U3 compact-jpeg-v1 (更小文件·有损): report contract + platform reader
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.skipif(CLI is None, reason="slide-transform CLI 未构建")
+def test_compact_report_contract_and_reader(workdir):
+    """compact-jpeg-v1 的报告合同 + 平台 reader（slide_io.open_slide）。
+
+    - CLI --encoding compact：lossy_reencode=true + 锁定参数指纹，
+      tiles_raw_copied=0（全部重编码）；
+    - 结构校验通过（validate）；
+    - slide_io.open_slide 将 compact bf-ome 作为原生 RGB 打开，颜色与
+      preserve 输出一致（整幅 tile 级比较，仅允许有损重编码差异），
+      MPP/尺寸与 preserve 相同；
+    - compact 输出小于 preserve 输出（合成 q90 4:2:2 输入）。
+    """
+    import slide_io
+
+    src = workdir / "bf-compact.kfb"
+    build_synthetic_kfb(src, width=1024, height=777)
+    preserve = workdir / "bf-preserve.ome.tif"
+    compact = workdir / "bf-compact.ome.tif"
+    rj = json.loads(_cli("convert", src, preserve, "--overwrite",
+                         "--profile", "bf-ome").stdout)
+    cj = json.loads(_cli("convert", src, compact, "--overwrite",
+                         "--profile", "bf-ome", "--encoding", "compact").stdout)
+    # report contract
+    assert cj["encoding"] == "compact-jpeg-v1"
+    assert cj["lossy_reencode"] is True
+    p = cj["lossy_reencode_params"]
+    assert p["profile"] == "compact-jpeg-v1"
+    assert p["sampling"] == "4:2:0"
+    assert p["huffman"] == "standard-annex-k"
+    assert p["quality"] >= 75 and p["quality"] <= 90
+    assert cj["tiles_raw_copied"] == 0
+    assert cj["tiles_reencoded"] == sum(l["tiles_total"] for l in cj["levels"])
+    assert cj["output_bytes"] < rj["output_bytes"]
+    # structural self-check
+    vj = json.loads(_cli("validate", compact, "--expect-ifd",
+                         str(cj["validation"]["ifd_count"])).stdout)
+    assert vj["ok"] is True
+    # platform reader: native RGB, correct colours, same geometry/calibration
+    sp = slide_io.open_slide(str(preserve))
+    sc = slide_io.open_slide(str(compact))
+    assert sp.dimensions == sc.dimensions == (1024, 777)
+    assert getattr(sc, "is_native_rgb", False) is True
+    assert sc.properties["openslide.mpp-x"] == sp.properties["openslide.mpp-x"]
+    assert sc.properties["openslide.mpp-y"] == sp.properties["openslide.mpp-y"]
+    from PIL import Image
+
+    for level in (0, min(1, sc.level_count - 1)):
+        box = (256, 200, 768, 456)
+        a = sp.read_region((box[0] * 2 ** level, box[1] * 2 ** level), level,
+                           (box[2] - box[0], box[3] - box[1])).convert("RGB")
+        b = sc.read_region((box[0] * 2 ** level, box[1] * 2 ** level), level,
+                           (box[2] - box[0], box[3] - box[1])).convert("RGB")
+        aa = np.asarray(a, dtype=np.int16)
+        bb = np.asarray(b, dtype=np.int16)
+        d = np.abs(aa - bb)
+        # 有损重编码差异：远小于裁剪/错位/通道交换会造成的变化
+        assert d.mean() < 6.0, f"level {level} mean diff {d.mean()}"
+        assert d.max() <= 255
+        # 通道不交换：逐通道均值接近
+        for c in range(3):
+            assert abs(aa[..., c].mean() - bb[..., c].mean()) < 4.0

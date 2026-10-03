@@ -5,7 +5,10 @@
 // referenced ONLY by alias + sha256 — file names never enter the report or
 // logs (plan §10.1).
 //
-//   node run_parity.js --samples <切片文件夹> [--fl] [--port 8944]
+//   node run_parity.js --samples <切片文件夹> [--fl] [--fl-all] [--compact] [--port 8944]
+// --compact (U3): the brightfield sample is converted with compact-jpeg-v1
+// in the browser AND natively — parity is browser-compact == native-compact
+// (compact bytes are never compared with preserve bytes).
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -17,17 +20,20 @@ const SAMPLES = L.arg('samples', '');
 const WITH_FL = process.argv.includes('--fl');
 // --fl-all: every KFBF sample (aliases KFBF-A..D, sorted), not just the first
 const FL_ALL = process.argv.includes('--fl-all');
-const LABEL = L.arg('label', 'parity');
+// --compact: brightfield converts at compact-jpeg-v1 (U3)
+const COMPACT = process.argv.includes('--compact');
+const LABEL = L.arg('label', COMPACT ? 'parity-compact' : 'parity');
 
 function sortedBy(p, ext) {
   return fs.readdirSync(p).filter((f) => f.endsWith(ext)).sort()
     .map((f) => path.join(p, f));
 }
 
-async function convertInBrowser(page, input, profileId) {
+async function convertInBrowser(page, input, profileId, encoding) {
   await L.clearJobs(page);
   await L.setFile(page, input);
-  const jobId = await page.evaluate((p) => window.__c2.start({ profileId: p }), profileId);
+  const jobId = await page.evaluate(({ p, e }) => window.__c2.start({ profileId: p, encoding: e }),
+    { p: profileId, e: encoding });
   const done = await page.evaluate(() => window.__c2.awaitDone(60 * 60 * 1000));
   if (!done || !done.ok) throw new Error('browser conversion failed: ' + JSON.stringify(done).slice(0, 300));
   const hash = await page.evaluate((id) => window.__c2.hashArtifact(id), jobId);
@@ -51,8 +57,9 @@ async function main() {
 
   // native references (cli), aliased
   {
-    const n1 = path.join(outDir, 'kfb1-native.tif');
-    execFileSync(L.CLI, ['convert', kfb, n1, '--overwrite', '--profile', 'bf-ome']);
+    const n1 = path.join(outDir, COMPACT ? 'kfb1-native-compact.tif' : 'kfb1-native.tif');
+    execFileSync(L.CLI, ['convert', kfb, n1, '--overwrite', '--profile', 'bf-ome',
+      ...(COMPACT ? ['--encoding', 'compact'] : [])]);
     nativeOf['KFB-1'] = await L.sha256File(n1);
     results.alias['KFB-1'] = { bytes: fs.statSync(kfb).size, sha256: await L.sha256File(kfb) };
     for (const [i, f] of (WITH_FL || FL_ALL ? kfbfs : []).entries()) {
@@ -74,9 +81,9 @@ async function main() {
     // ---- KFB-1 brightfield ----
     {
       const t0 = Date.now();
-      const r = await convertInBrowser(page, kfb, 'saver');
+      const r = await convertInBrowser(page, kfb, 'saver', COMPACT ? 'compact-jpeg-v1' : undefined);
       results.runs.push({
-        alias: 'KFB-1', modality: 'brightfield',
+        alias: 'KFB-1', modality: 'brightfield', encoding: COMPACT ? 'compact-jpeg-v1' : 'preserve-source-v1',
         browserSha256: r.hash.sha256, nativeSha256: nativeOf['KFB-1'],
         equal: r.hash.sha256 === nativeOf['KFB-1'],
         outputBytes: r.done.outputBytes, convertMs: r.rec.convertMs,

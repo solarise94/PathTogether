@@ -41,7 +41,9 @@ pub mod jpeg;
 pub mod synth_gen;
 
 pub use error::{CoreError, CoreResult};
-pub use plan::{OutputProfile, PixelPolicy, TransformPlan};
+pub use plan::{
+    EncodingProfile, OutputProfile, PixelPolicy, TransformPlan, COMPACT_JPEG_V1_FINGERPRINT,
+};
 
 
 /// Core crate version (embedded in TransformPlan and reports).

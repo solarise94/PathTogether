@@ -32,7 +32,8 @@ export function convert(strict_lossless, channel_json) {
 
 /**
  * Run a conversion with an explicit output profile id (`bf-classic`,
- * `bf-ome`, `fl-ome`; empty = the input's pre-profile default).
+ * `bf-ome`, `fl-ome`; empty = the input's pre-profile default). Encoding is
+ * preserve-source-v1 (pre-U3 behaviour kept bit-for-bit).
  * @param {string} profile
  * @param {boolean} strict_lossless
  * @param {string} channel_json
@@ -52,6 +53,35 @@ export function convertProfile(profile, strict_lossless, channel_json) {
         return getStringFromWasm0(ret[0], ret[1]);
     } finally {
         wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+    }
+}
+
+/**
+ * Run a conversion with explicit output AND encoding profile ids (U3).
+ * `encoding`: `preserve-source-v1` (default) or `compact-jpeg-v1`
+ * (brightfield only).
+ * @param {string} profile
+ * @param {string} encoding
+ * @param {boolean} strict_lossless
+ * @param {string} channel_json
+ * @returns {string}
+ */
+export function convertProfileEncoded(profile, encoding, strict_lossless, channel_json) {
+    let deferred4_0;
+    let deferred4_1;
+    try {
+        const ptr0 = passStringToWasm0(profile, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(encoding, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(channel_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ret = wasm.convertProfileEncoded(ptr0, len0, ptr1, len1, strict_lossless, ptr2, len2);
+        deferred4_0 = ret[0];
+        deferred4_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
     }
 }
 
@@ -105,6 +135,38 @@ export function convertResumeProfile(resume_json, profile, strict_lossless, chan
         return getStringFromWasm0(ret[0], ret[1]);
     } finally {
         wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
+    }
+}
+
+/**
+ * Resume under explicit output AND encoding profiles (U3); refused when the
+ * checkpoint state was committed under a different combination — including
+ * a compact request against a legacy (preserve, no field) state.
+ * @param {string} resume_json
+ * @param {string} profile
+ * @param {string} encoding
+ * @param {boolean} strict_lossless
+ * @param {string} channel_json
+ * @returns {string}
+ */
+export function convertResumeProfileEncoded(resume_json, profile, encoding, strict_lossless, channel_json) {
+    let deferred5_0;
+    let deferred5_1;
+    try {
+        const ptr0 = passStringToWasm0(resume_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(profile, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(encoding, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(channel_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len3 = WASM_VECTOR_LEN;
+        const ret = wasm.convertResumeProfileEncoded(ptr0, len0, ptr1, len1, ptr2, len2, strict_lossless, ptr3, len3);
+        deferred5_0 = ret[0];
+        deferred5_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred5_0, deferred5_1, 1);
     }
 }
 

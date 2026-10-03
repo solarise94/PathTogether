@@ -2,11 +2,14 @@
  * U2 页面简化（/tools/slides）的纯 helper 与源码级 wiring 约定：
  *
  *  - 入口统一：file input 与 drop 都进入同一 prepareSource 流程；一次只接受
- *    一个切片文件；目录/.mrxs/.dat → MRXS 完整包提示；.svs → 尚未支持；
+ *    一个切片文件（多个普通文件 → 明确提示）；.mrxs/.dat（单个/散装）与
+ *    文件夹/目录 drop 进入同一 prepareBundleSource → runner.prepareBundle
+ *    （缺成员 → 类型化信息，任何复制之前拒绝，绝不静默丢弃）；
  *  - 扩展名只是提示（engine.INPUT_EXTENSION_HINTS），识别靠文件头魔数表
  *    （engine.SUPPORTED_MAGICS / magicSupported）——两者同在一处维护；
  *  - 画质（U3 编码档）与输出格式同一合同：prepared 可改并落盘、开始即锁定、
- *    重开以任务记录为准、荧光不提供有损模式；
+ *    重开以任务记录为准、荧光不提供有损模式；MRXS 的画质说明（拼接后重编码）
+ *    只在 MRXS 识别后出现；
  *  - strict 无损与 compact 互斥必须在 UI 阻止（核心另有类型化拒绝兜底）；
  *  - 磁盘预估跟随所选编码取上界；
  *  - 上传阶段文案与计划对齐（排队 → 上传至腾讯云 → 工作台接收 → 校验/发布
@@ -18,6 +21,11 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 // eslint-disable-next-line
 import * as E from "../../static/tools/slide-transform/engine.js";
+// eslint-disable-next-line
+import {
+	bundleRoute, bundleRows, collectEntryFiles, folderNameFromRelPath,
+	looksLikeBundleMember,
+} from "../../static/tools/tools-slides-bundle.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const read = (rel: string) => readFileSync(resolve(here, "../..", rel), "utf8");
@@ -66,6 +74,29 @@ describe("U2 default view (template structure)", () => {
 		expect(cssSrc).toContain(".visually-hidden-input");
 		expect(cssSrc).not.toMatch(/#file-input\s*\{[^}]*display:\s*none/);
 		expect(cssSrc).toContain(".drop-zone.dragover");
+	});
+
+	it("F3: secondary folder action + hidden-but-focusable webkitdirectory input", () => {
+		expect(shellSrc).toContain('id="pick-folder-btn"');
+		expect(shellSrc).toContain('data-i18n="tools.drop.pick.folder"');
+		expect(shellSrc).toMatch(/<input id="folder-input" name="folder" type="file" webkitdirectory multiple class="visually-hidden-input"/);
+		// keyboard/touch reachable: same visually-hidden pattern (not display:none)
+		expect(cssSrc).not.toMatch(/#folder-input\s*\{[^}]*display:\s*none/);
+		// both pick buttons stopPropagation so the drop-zone click keeps the
+		// single-file default; the folder route goes through its own input
+		expect(pageSrc).toMatch(/pickFolderBtn\.addEventListener\('click', \(ev\) => \{[\s\S]*?ev\.stopPropagation\(\);[\s\S]*?folderInput\.click\(\)/);
+		expect(pageSrc).toContain("els.folderInput.addEventListener('change', () => { onFolderPicked(); })");
+	});
+
+	it("F3: one-line MRXS quality note under the radios, MRXS-only", () => {
+		const fieldsetEnd = shellSrc.indexOf("</fieldset>", shellSrc.indexOf('id="quality-fieldset"'));
+		const noteAt = shellSrc.indexOf('id="quality-mrxs-note"');
+		expect(noteAt).toBeGreaterThan(fieldsetEnd);
+		expect(shellSrc).toContain('data-i18n="tools.quality.mrxs.note"');
+		expect(pageSrc).toMatch(/String\(probeDoc\(\)\.format \|\| ''\)\.startsWith\('mirax'\)/);
+		expect(pageSrc).toContain("els.qualityMrsxNote.hidden = !show");
+		// reset hides it again (a later single-file pick must not keep the note)
+		expect(pageSrc).toMatch(/resetFlowPanels\(\)[\s\S]*?els\.qualityMrsxNote\.hidden = true/);
 	});
 
 	it("one-line local explanation with the full privacy items folded", () => {
@@ -121,7 +152,7 @@ describe("U2 entry flow (page source wiring)", () => {
 		expect(pageSrc).toContain("async function prepareSource(fileList)");
 		expect(pageSrc).toContain("els.fileInput.addEventListener('change', () => { onFilePicked(); })");
 		// onFilePicked is the shared next step of the manual and dropped path
-		expect(pageSrc).toMatch(/async function prepareSource\(fileList\)[\s\S]*?await onFilePicked\(file\)/);
+		expect(pageSrc).toMatch(/async function prepareSource\(fileList\)[\s\S]*?await onFilePicked\(route\.file\)/);
 		expect(pageSrc).toMatch(/async function onFilePicked\(explicitFile\)[\s\S]*?await runProbeFlow\(\)/);
 		// handoff uses the same flow too
 		expect(pageSrc).toMatch(/async function takeHandoffFile\(file\)[\s\S]*?await runProbeFlow\(\)/);
@@ -133,7 +164,7 @@ describe("U2 entry flow (page source wiring)", () => {
 	});
 
 	it("multiple files: visible message, nothing silently dropped or started", () => {
-		expect(pageSrc).toMatch(/prepareSource\(fileList\)[\s\S]*?files\.length > 1[\s\S]*?tools\.drop\.multiple/);
+		expect(pageSrc).toMatch(/route\.route === 'multiple'[\s\S]*?tools\.drop\.multiple/);
 		expect(pageSrc).toMatch(/onFilePicked\(explicitFile\)[\s\S]*?list\.length > 1[\s\S]*?tools\.drop\.multiple/);
 	});
 
@@ -145,9 +176,26 @@ describe("U2 entry flow (page source wiring)", () => {
 		expect(i18nSrc).toContain('"tools.drop.busy": "A conversion is running');
 	});
 
-	it("directory/.mrxs/.dat drops explain before any copy", () => {
-		expect(pageSrc).toMatch(/entry\.isDirectory[\s\S]*?tools\.drop\.bundle/);
-		expect(pageSrc).toMatch(/hint === 'bundle'[\s\S]*?tools\.drop\.bundle/);
+	it(".mrxs/.dat inputs (single or loose) go through the planner — typed missing-members, never silent", () => {
+		// drop route: bundleRoute sends any .mrxs/.dat member to prepareBundleSource
+		expect(pageSrc).toMatch(/route\.route === 'bundle'[\s\S]*?await prepareBundleSource\(route\.files\)/);
+		// file-input route (a .mrxs picked manually) has the same planner delegation
+		expect(pageSrc).toMatch(/inputExtensionHint\(file\.name\) === 'bundle'[\s\S]*?await prepareBundleSource\(\[file\]\)/);
+		// the planner (engine.planMrxBundle via runner.prepareBundle) refuses
+		// incomplete bundles BEFORE any copy; the page shows its typed message
+		expect(runnerSrc).toMatch(/const plan = await E\.planMrxBundle\(files\)/);
+		expect(i18nSrc).toMatch(/"tools\.drop\.bundle": "[^"]*完整包[^"]*"/);
+	});
+
+	it("directory drops are traversed in the handler and fed to the same bundle flow", () => {
+		expect(pageSrc).toMatch(/entry\.isDirectory[\s\S]*?dirEntries\.push\(entry\)/);
+		expect(pageSrc).toMatch(/onDirectoryDropped\(dirEntries\)/);
+		expect(pageSrc).toMatch(/collectEntryFiles\(entry, \{ maxMembers: E\.MRXS_MAX_MEMBERS \}\)/);
+		// untraversable directory → message pointing at the folder button
+		expect(pageSrc).toMatch(/catch \(e\) \{[\s\S]*?tools\.drop\.dir\.unreadable/);
+		expect(i18nSrc).toContain('"tools.drop.dir.unreadable"');
+		expect(i18nSrc).toMatch(/"tools\.drop\.dir\.unreadable": "[^"]*选择文件夹（MRXS）[^"]*"/);
+		expect(i18nSrc).toMatch(/"tools\.drop\.dir\.unreadable": "[^"]*Choose folder \(MRXS\)[^"]*"/);
 	});
 
 	it("cancelled preparation is a typed state, not an error panel", () => {
@@ -242,11 +290,227 @@ describe("U2 i18n (zh/en pairs for the new concepts)", () => {
 		expect(uploadSrc).toContain("setStageTxt(jobId, t('tools.upload.stage.cos'))");
 	});
 
-	it("drop hints explain MRXS bundles and SVS in both languages", () => {
+	it("drop hints explain MRXS bundles (complete package + folder button) in both languages", () => {
 		expect(i18nSrc).toContain('"tools.drop.multiple"');
 		expect(i18nSrc).toContain('"tools.drop.bundle"');
-		expect(i18nSrc).toContain('"tools.drop.svs"');
-		expect(i18nSrc).toMatch(/"tools\.drop\.bundle": "[^"]*完整包[^"]*"/);
-		expect(i18nSrc).toMatch(/"tools\.drop\.bundle": "[^"]*bundle[^"]*"/);
+		// the old “MRXS not supported yet” wording is gone
+		expect(i18nSrc).not.toMatch(/当前版本尚未支持，未复制任何文件/);
+		expect(i18nSrc).not.toMatch(/this version does not support yet — nothing was copied/);
+		expect(i18nSrc).toMatch(/"tools\.drop\.bundle": "[^"]*完整包[^"]*Slidedat\.ini[^"]*"/);
+		expect(i18nSrc).toMatch(/"tools\.drop\.bundle": "[^"]*complete bundle[^"]*Slidedat\.ini[^"]*"/);
+		expect(i18nSrc).toContain('"tools.drop.bundle.multiple"');
+		// subtitle / hint / unsupported-input message now include MRXS
+		expect(i18nSrc).toMatch(/"tools\.subtitle": "[^"]*MRXS 完整包[^"]*"/);
+		expect(i18nSrc).toMatch(/"tools\.subtitle": "[^"]*complete MRXS bundles[^"]*"/);
+		expect(i18nSrc).toMatch(/"tools\.input\.file\.hint": "[^"]*MRXS 完整包[^"]*"/);
+		expect(i18nSrc).toMatch(/"tools\.input\.folder\.label"[\s\S]*"tools\.input\.folder\.label"/);
+		expect(i18nSrc).toMatch(/"tools\.err\.unsupported_input": "[^"]*MRXS 完整包[^"]*"/);
+		expect(i18nSrc).toMatch(/"tools\.err\.unsupported_input": "[^"]*complete MRXS bundles[^"]*"/);
+		// template defaults mirror the zh table (renderer works before i18n.js)
+		const zhHint = i18nSrc.match(/"tools\.input\.file\.hint": "([^"]*)"/);
+		expect(zhHint && shellSrc.includes(zhHint[1])).toBe(true);
+		const zhNote = i18nSrc.match(/"tools\.quality\.mrxs\.note": "([^"]*)"/);
+		expect(zhNote && shellSrc.includes(zhNote[1])).toBe(true);
+	});
+});
+
+/// 假的 FileSystemDirectoryEntry/FileSystemFileEntry（readEntries 批量 ≤100、
+/// 必须循环到空批；file() 回调风格）——驱动真实遍历逻辑。
+function fakeFileEntry(name: string, bytes = 3) {
+	return {
+		isFile: true, isDirectory: false, name,
+		file: (cb: (f: { name: string; size: number }) => void) => cb({ name, size: bytes }),
+	};
+}
+function fakeDirEntry(name: string, children: any[], batchSize = 100) {
+	return {
+		isFile: false, isDirectory: true, name,
+		createReader() {
+			let i = 0;
+			return {
+				readEntries: (ok: (b: any[]) => void, err?: (e: unknown) => void) => {
+					try { ok(children.slice(i, i + batchSize)); i += batchSize; }
+					catch (e) { if (err) err(e); }
+				},
+			};
+		},
+	};
+}
+
+describe("bundle input routing (tools-slides-bundle.js, pure)", () => {
+	it("any .mrxs/.dat member routes to the planner (bundle), never silently dropped", () => {
+		expect(bundleRoute([]).route).toBe("empty");
+		expect(bundleRoute([{ name: "a.kfb" }]).route).toBe("single");
+		expect(bundleRoute([{ name: "a.kfb" }, { name: "b.kfb" }]).route).toBe("multiple");
+		expect(bundleRoute([{ name: "CMU.mrxs" }]).route).toBe("bundle");
+		expect(bundleRoute([{ name: "a.kfb" }, { name: "Index.dat" }]).route).toBe("bundle");
+		expect(looksLikeBundleMember("SLIDE.MRXS")).toBe(true);
+		expect(looksLikeBundleMember("Data0000.dat")).toBe(true);
+		expect(looksLikeBundleMember("a.kfb")).toBe(false);
+	});
+	it("rows normalise File objects (webkitRelativePath) and {name, relPath, file} alike", () => {
+		const picked = { name: "x.mrxs", webkitRelativePath: "top/x.mrxs", size: 1 };
+		expect(bundleRows([picked])[0].relPath).toBe("top/x.mrxs");
+		const traversed = { name: "x.mrxs", relPath: "top/x.mrxs", file: { size: 1 } };
+		expect(bundleRows([traversed])[0].relPath).toBe("top/x.mrxs");
+		expect(bundleRows([null, undefined])).toEqual([]);
+	});
+	it("folderNameFromRelPath: first segment only when there is a folder layer", () => {
+		expect(folderNameFromRelPath("CMU-1/CMU-1.mrxs")).toBe("CMU-1");
+		expect(folderNameFromRelPath("CMU-1/CMU-1/Slidedat.ini")).toBe("CMU-1");
+		expect(folderNameFromRelPath("CMU.mrxs")).toBeNull();
+		expect(folderNameFromRelPath("")).toBeNull();
+	});
+});
+
+describe("directory drop traversal (tools-slides-bundle.js)", () => {
+	it("walks nested folders and prefixes relative paths with the folder chain", async () => {
+		const dropped = fakeDirEntry("CMU-1", [
+			fakeFileEntry("CMU-1.mrxs"),
+			fakeDirEntry("CMU-1", [
+				fakeFileEntry("Slidedat.ini"),
+				fakeFileEntry("Index.dat"),
+				fakeDirEntry("empty", []),
+			]),
+		]);
+		const rows = await collectEntryFiles(dropped);
+		expect(rows.map((r: any) => r.relPath)).toEqual([
+			"CMU-1/CMU-1.mrxs",
+			"CMU-1/CMU-1/Slidedat.ini",
+			"CMU-1/CMU-1/Index.dat",
+		]);
+		expect(rows[0].file).toEqual({ name: "CMU-1.mrxs", size: 3 });
+	});
+	it("loops readEntries until an empty batch (batches smaller than 100)", async () => {
+		const files = Array.from({ length: 7 }, (_, i) => fakeFileEntry(`Data000${i}.dat`));
+		const rows = await collectEntryFiles(fakeDirEntry("d", files, 2));
+		expect(rows).toHaveLength(7);
+	});
+	it("bounds the member count (mirrors the engine cap)", async () => {
+		const files = Array.from({ length: 6 }, (_, i) => fakeFileEntry(`f${i}.dat`));
+		await expect(collectEntryFiles(fakeDirEntry("d", files), { maxMembers: 3 }))
+			.rejects.toMatchObject({ code: "too_many_members" });
+	});
+	it("untraversable entries reject (the page then points at the folder button)", async () => {
+		await expect(collectEntryFiles({ isDirectory: true, name: "d" } as any)).rejects.toBeInstanceOf(TypeError);
+		await expect(collectEntryFiles({ isFile: true, name: "f" } as any)).rejects.toBeInstanceOf(TypeError);
+	});
+	it("a traversed drop forms a plan the engine accepts (root = dropped folder)", async () => {
+		const SLIDEDAT = [
+			"[GENERAL]", "SLIDE_ID = 0123456789ABCDEF0123456789ABCDEF",
+			"SLIDE_TYPE = SLIDE_TYPE_BRIGHTFIELD",
+			"[HIERARCHICAL]", "INDEXFILE = Index.dat", "HIER_COUNT = 1",
+			"NONHIER_COUNT = 1", "HIER_0_NAME = Slide zoom level", "HIER_0_COUNT = 1",
+			"NONHIER_0_NAME = Scan data layer", "NONHIER_0_COUNT = 1",
+			"[DATAFILE]", "FILE_COUNT = 1", "FILE_0 = Data0000.dat",
+		].join("\n");
+		// 真实目录布局：根文件夹 CMU/ 内含 CMU.mrxs + 同名目录 CMU/
+		// （file 需要最小 Blob 形状：planMrxBundle 直接 slice 读 Slidedat）
+		const mk = (n: string, b: any = "x") => {
+			const data = typeof b === "string" ? new TextEncoder().encode(b) : b;
+			const rel = n === "CMU.mrxs" ? "CMU/CMU.mrxs" : `CMU/CMU/${n}`;
+			return {
+				name: n, relPath: rel,
+				file: {
+					name: n, size: data.length,
+					slice: (a: number, e: number) => ({
+						arrayBuffer: async () => data.slice(a, e).buffer,
+					}),
+				},
+			};
+		};
+		const rows = [
+			mk("CMU.mrxs", "entry"),
+			mk("Slidedat.ini", SLIDEDAT),
+			mk("Index.dat", "index"),
+			mk("Data0000.dat", "aaaa"),
+		];
+		const plan = await E.planMrxBundle(rows as any, async (f: any) => f.file.bytes);
+		expect(plan.stem).toBe("CMU");
+		expect(plan.required).toEqual(["CMU.mrxs", "CMU/Slidedat.ini", "CMU/Index.dat", "CMU/Data0000.dat"]);
+	});
+});
+
+describe("missing-member messaging (planner, before any copy)", () => {
+	it("a lone .mrxs names the same-name folder members it still needs", async () => {
+		const row = (n: string) => ({ name: n, relPath: `CMU/${n}`, file: { name: n, size: 1 } });
+		await expect(E.planMrxBundle([row("CMU.mrxs")] as any))
+			.rejects.toMatchObject({ error: { code: "unsupported_input", kind: "mrxs-bundle" } });
+		let caught: any = null;
+		try { await E.planMrxBundle([row("CMU.mrxs")] as any); } catch (e) { caught = e; }
+		expect(caught.error.message).toContain("Slidedat.ini");
+		expect(caught.error.message).toContain("完整包");
+	});
+	it("a lone .dat says the .mrxs entry is missing (no copy started)", async () => {
+		const row = (n: string) => ({ name: n, relPath: `CMU/${n}`, file: { name: n, size: 1 } });
+		let caught: any = null;
+		try { await E.planMrxBundle([row("Data0000.dat")] as any); } catch (e) { caught = e; }
+		expect(caught.error.code).toBe("unsupported_input");
+		expect(caught.error.missing).toEqual(["<slide>.mrxs"]);
+		expect(caught.error.message).toContain(".mrxs");
+	});
+	it("loose files without the folder layer cannot form a bundle (typed refusal, not silence)", async () => {
+		// dropped loose files carry no folder prefix → member names don't match
+		const SLIDEDAT = ["[HIERARCHICAL]", "INDEXFILE = Index.dat",
+			"[DATAFILE]", "FILE_COUNT = 1", "FILE_0 = Data0000.dat"].join("\n");
+		const files: any[] = [
+			{ name: "CMU.mrxs", file: { name: "CMU.mrxs", size: 1 } },
+			{ name: "Slidedat.ini", file: { name: "Slidedat.ini", size: SLIDEDAT.length } },
+		];
+		await expect(E.planMrxBundle(files)).rejects.toMatchObject({ error: { code: "unsupported_input" } });
+	});
+});
+
+describe("bundle job list + result wiring (page source)", () => {
+	it("job rows show the picked folder name for bundle jobs", () => {
+		expect(pageSrc).toMatch(/job\.source && \(job\.source\.folderName \|\| job\.source\.name\)/);
+		expect(runnerSrc).toMatch(/folderName: id0\.folderName \|\| null/);
+		expect(runnerSrc).toMatch(/folderName: typeof opts\.folderName === 'string'/);
+	});
+	it("an interrupted copy (staging) never offers 开始", () => {
+		// _summary: nextAction for 'staging' stays 'discard'; the sweep removes
+		// the dir on next start (C2-proven), so the list cannot offer start
+		expect(runnerSrc).toMatch(/else if \(state === 'prepared'\) nextAction = 'start';/);
+		expect(runnerSrc).not.toMatch(/staging'\) nextAction = 'start'/);
+		expect(runnerSrc).toContain("if (rec && rec.upload) continue;");
+		expect(runnerSrc).toMatch(/if \(!rec \|\| rec\.state === 'staging'\) victims\.push\(name\)/);
+	});
+	it("the result panel shows the core's composed summary when present", () => {
+		expect(shellSrc).toContain('id="result-grid"');
+		expect(pageSrc).toMatch(/tools\.result\.composed[\s\S]*?result-composed/);
+		expect(pageSrc).toMatch(/composed: result\.result\.composed \|\| null/);
+		expect(pageSrc).toMatch(/composed: \(job\.result && job\.result\.composed\) \|\| null/);
+		expect(runnerSrc).toMatch(/composed: rec\.result\.composed \|\| null/);
+		expect(i18nSrc).toContain('"tools.result.composed"');
+		expect(i18nSrc).toContain('"tools.result.composed.note"');
+	});
+	it("member-copy progress drives the same stage bar, by bytes", () => {
+		expect(pageSrc).toMatch(/p\.unit === 'stage-bundle'[\s\S]*?tools\.stage\.bundle\.bytes/);
+		expect(i18nSrc).toContain('"tools.stage.bundle.bytes"');
+		expect(i18nSrc).toMatch(/"tools\.stage\.bundle\.bytes": "[^"]*\{done\}[^"]*\{member\}/);
+	});
+	it("bundle prepare shares the single-file stage/cancel/disk-confirm UI", () => {
+		expect(pageSrc).toContain("async function prepareBundleSource(files, opts = {})");
+		expect(pageSrc).toContain("await runBundleProbeFlow();");
+		expect(pageSrc).toMatch(/runPrepareFlow\(async \(\) => prepareBundleWithDiskFlow\(rows/);
+		expect(pageSrc).toMatch(/async function runPrepareFlow\(doPrepare, totalBytes\)/);
+		// same disk-confirmation contract as single files (uncertain → dialog → retry)
+		expect(pageSrc).toMatch(/prepareBundleWithDiskFlow[\s\S]*?askDiskConfirm/);
+	});
+	it("bundle conversion starts without a File (OPFS members are the source)", () => {
+		expect(pageSrc).toMatch(/if \(!page\.prep \|\| \(!page\.file && !page\.bundleFiles\)\) return null;/);
+		expect(runnerSrc).toMatch(/F3: a prepared bundle never needs the File again/);
+	});
+	it("MRXS output names drop the .mrxs suffix (entry stem)", () => {
+		expect(E.outputFileName("CMU-1.mrxs", { result: { format: "ome-bigtiff-subifd-rgb-jpeg-pyramid" } }))
+			.toBe("CMU-1.ome.tif");
+		expect(E.outputFileName("bf.kfb", { result: { format: "ome-bigtiff-subifd-rgb-jpeg-pyramid" } }))
+			.toBe("bf.ome.tif");
+	});
+	it("SVS output names drop the .svs suffix", () => {
+		expect(E.outputFileName("CMU-1.svs", { result: { format: "ome-bigtiff-subifd-rgb-jpeg-pyramid" } }))
+			.toBe("CMU-1.ome.tif");
+		expect(E.outputFileName("CMU-1.SVS", { result: { format: "classic-bigtiff-jpeg-pyramid" } }))
+			.toBe("CMU-1.tif");
 	});
 });

@@ -904,9 +904,11 @@ export function isOmeProfile(profile) {
 
 /// Local/uploaded file name for a job's artifact: `.ome.tif` for both OME
 /// profiles (Bio-Formats and the platform registry key OME on it), `.tif`
-/// for the classic pyramid.
+/// for the classic pyramid. The source extension is dropped (CMU-1.svs →
+/// CMU-1.ome.tif); MRXS bundle jobs are named after the entry stem.
 export function outputFileName(sourceName, job) {
-  const base = String(sourceName || 'slide').replace(/\.(kfb|kfbf)$/i, '') || 'slide';
+  const base = String(sourceName || 'slide')
+    .replace(/\.(kfb|kfbf|svs|mrxs)$/i, '') || 'slide';
   return isOmeProfile(jobOutputProfile(job)) ? `${base}.ome.tif` : `${base}.tif`;
 }
 

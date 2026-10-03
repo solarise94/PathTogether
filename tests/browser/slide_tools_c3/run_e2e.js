@@ -1079,13 +1079,16 @@ async function scenarioT() {
 }
 
 
-// (u) U2 入口：drop 与 file input 走同一 prepareSource；多文件/目录/.mrxs/
-// .dat 给出明确提示且不开始任何处理；伪 .svs 按文件头拒绝；伪装后缀按文件头识别（扩展名
-// 只是提示）。多文件/目录项/不支持提示在旧代码上无对应元素 → 回归标记。
+// (u) U2/F3 入口：drop 与 file input 走同一 prepareSource；多文件给明确提示
+// 且不开始任何处理；目录 drop 不可遍历时指向「选择文件夹（MRXS）」按钮；单独
+// .mrxs / .dat 进入 planner → 类型化缺失成员信息（列出 Slidedat.ini 等）且零
+// 复制、无任务目录；伪 .svs 按文件头拒绝；伪装后缀按文件头识别（扩展名
+// 只是提示）。
 async function scenarioU() {
   const kfb = L.ensureFixture('bf-580x300.kfb', ['gen-kfb', '--width', '580', '--height', '300']);
   const kfbBytes = fs.readFileSync(kfb).toString('base64');
-  // 目录项测试桩：名为 MRXS-DIR 的条目按目录处理（真实目录项只能在事件内取）
+  // 目录项测试桩：名为 MRXS-DIR 的条目按目录处理（真实目录项只能在事件内取）。
+  // 桩没有 createReader → 页面无法遍历 → 提示改用「选择文件夹（MRXS）」
   const dirStub = `(() => {
     const orig = DataTransferItem.prototype.webkitGetAsEntry;
     DataTransferItem.prototype.webkitGetAsEntry = function () {
@@ -1097,7 +1100,7 @@ async function scenarioU() {
   const { context, page } = await L.launch('u', [dirStub]);
   try {
     await L.openTools(page, PORT);
-    const dropByName = (name, b64, kind = 'file') => page.evaluate(
+    const dropByName = (name, b64) => page.evaluate(
       ([name, b64]) => {
         const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
         const dt = new DataTransfer();
@@ -1105,7 +1108,7 @@ async function scenarioU() {
         const zone = document.getElementById('drop-zone');
         zone.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
         return true;
-      }, [name, b64, kind]);
+      }, [name, b64]);
 
     const msgIs = async (re) => {
       await page.waitForFunction((r) => {
@@ -1113,6 +1116,13 @@ async function scenarioU() {
         return el && !el.hidden && r.test(el.textContent);
       }, re, { timeout: 10000 });
       return (await page.textContent('#input-message')).trim();
+    };
+    const errIs = async (re) => {
+      await page.waitForFunction((r) => {
+        const el = document.getElementById('page-error');
+        return el && !el.hidden && r.test(el.textContent);
+      }, re, { timeout: 10000 });
+      return (await page.textContent('#page-error')).trim();
     };
 
     // 多文件：明确提示，无任务目录
@@ -1126,15 +1136,19 @@ async function scenarioU() {
     const multiMsg = await msgIs(/一次只处理一个|One slide file at a time/);
     if ((await L.jobDirs(page)).length !== 0) throw new Error('multi-file drop started a job');
 
-    // 目录 / .mrxs：MRXS 需要完整包且当前未支持
+    // 目录 drop 无法遍历 → 指向「选择文件夹（MRXS）」按钮（不再说“尚未支持”）
     await dropByName('MRXS-DIR', Buffer.from('x').toString('base64'));
-    const dirMsg = await msgIs(/MRXS|完整包/);
-    await dropByName('slide.mrxs', Buffer.from('x').toString('base64'));
-    const mrxsMsg = await msgIs(/MRXS|完整包/);
-    await dropByName('index.dat', Buffer.from('x').toString('base64'));
-    await msgIs(/MRXS|完整包/);
+    const dirMsg = await msgIs(/选择文件夹（MRXS）|Choose folder \(MRXS\)/);
 
-    if ((await L.jobDirs(page)).length !== 0) throw new Error('hinted drop started a job');
+    // 单独 .mrxs：planner 的类型化缺失成员信息（列出同名目录成员），零复制
+    await dropByName('slide.mrxs', Buffer.from('x').toString('base64'));
+    const mrxsMsg = await errIs(/Slidedat\.ini|complete bundle/);
+    if ((await L.jobDirs(page)).length !== 0) throw new Error('.mrxs-only drop left a job dir');
+
+    // 单独 .dat：planner 指出缺 .mrxs 主入口
+    await dropByName('index.dat', Buffer.from('x').toString('base64'));
+    const datMsg = await errIs(/\.mrxs|complete bundle/);
+    if ((await L.jobDirs(page)).length !== 0) throw new Error('.dat-only drop left a job dir');
 
     // .svs 名字但内容不是 TIFF：SVS 已按文件头识别，扩展名不放行（复制前拒绝）
     await dropByName('scan.svs', Buffer.from('x').toString('base64'));
@@ -1161,7 +1175,8 @@ async function scenarioU() {
     const rowPrepared = await page.waitForSelector('.job-row[data-next-action="start"]', { timeout: 30000 });
 
     record('u-drop-entry-and-hints', true, {
-      multiMsg: multiMsg.slice(0, 60), dirMsg: dirMsg.slice(0, 40), mrxsMsg: mrxsMsg.slice(0, 40),
+      multiMsg: multiMsg.slice(0, 60), dirMsg: dirMsg.slice(0, 60),
+      mrxsMsg: mrxsMsg.slice(0, 80), datMsg: datMsg.slice(0, 80),
       svsMsg: svsMsg.slice(0, 40), disguisedRejected: true, disguisedAccepted: identifiedName.trim(),
       dropHappyPath: !!rowPrepared,
     });
@@ -1484,6 +1499,110 @@ async function scenarioSV() {
   }
 }
 
+// (mx) F3 MRXS 页面入口：真实 CC0 完整包（MRXS_SAMPLE_DIR，缺省跳过并记录）
+// 经「选择文件夹（MRXS）」input（page.setInputFiles 目录 → webkitRelativePath）
+// → 摘要 MRXS/明场/画质 + 拼接重编码说明 → 转换（保留画质，bf-ome）→ 保存
+// sha == 原生 CLI（期望 42f3c650…）→ 刷新后任务列表显示文件夹名；compact 一次
+// == 原生 --encoding compact；单独 .mrxs 经 file input → 缺失成员信息、无任务目录。
+async function scenarioMX() {
+  const dir = process.env.MRXS_SAMPLE_DIR;
+  if (!dir || !fs.existsSync(dir)) {
+    record('mx-mrxs-folder-e2e', true, { skipped: 'MRXS_SAMPLE_DIR not set or missing' });
+    return;
+  }
+  const stems = fs.readdirSync(dir).filter((f) => /\.mrxs$/i.test(f)).sort();
+  if (stems.length !== 1) throw new Error(`expected exactly one .mrxs entry in ${dir}`);
+  const entryRel = path.join(dir, stems[0]);
+  const native = L.nativeConvert(entryRel,
+    path.join(L.GATE, 'fixtures', 'mrxs-native-bf-ome.ome.tif'), ['--profile', 'bf-ome']);
+  const nativeSha = await L.sha256File(native);
+  if (!nativeSha.startsWith('42f3c650')) {
+    throw new Error(`native preserve sha ${nativeSha} != expected 42f3c650…`);
+  }
+  const nativeCompactSha = await L.sha256File(L.nativeConvert(entryRel,
+    path.join(L.GATE, 'fixtures', 'mrxs-native-bf-ome-compact.ome.tif'),
+    ['--profile', 'bf-ome', '--encoding', 'compact']));
+
+  const { context, page } = await L.launch('mx', [L.savePickerStub(), READ_JOB_RECORDS]);
+  try {
+    await L.openTools(page, PORT);
+    const runOnce = async (compact) => {
+      await L.clearJobs(page);
+      await page.reload({ waitUntil: 'load' });
+      await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
+      // webkitdirectory input：Playwright 以目录路径设置，File 带 webkitRelativePath
+      await page.setInputFiles('#folder-input', dir);
+      await waitVisible(page, '#summary-section:not([hidden])', 300000);
+      const fmt = (await page.textContent('#summary-format')).trim();
+      if (fmt !== 'MRXS') throw new Error(`summary format "${fmt}"`);
+      const modality = (await page.textContent('#summary-modality')).trim();
+      const qShown = await page.evaluate(() => ({
+        quality: !document.getElementById('quality-fieldset').hidden,
+        note: !document.getElementById('quality-mrxs-note').hidden,
+      }));
+      if (!qShown.quality) throw new Error('quality choice hidden for MRXS');
+      if (!qShown.note) throw new Error('MRXS quality note hidden');
+      const noteText = (await page.textContent('#quality-mrxs-note')).trim();
+      if (!/重编码|re-encode/.test(noteText)) throw new Error(`mrxs note "${noteText}"`);
+      if (!compact) {
+        // 窄屏（400px）MRXS 摘要截图（报告用；恢复默认视口再继续）
+        await page.setViewportSize({ width: 400, height: 900 });
+        await L.shot(page, 'mrxs-summary-narrow');
+        await page.setViewportSize({ width: 1120, height: 900 });
+      }
+      if (compact) await page.check('#quality-compact');
+      await page.click('#convert-btn');
+      await waitVisible(page, '#result-section:not([hidden])', 600000);
+      const composed = (await page.textContent('#result-composed')) || '';
+      if (!composed.trim()) throw new Error('composed summary row missing');
+      await page.click('#save-btn');
+      await waitText(page, '#save-status', /已保存|Saved/, 120000);
+      const saved = await L.opfsSha256(page);
+      return { fmt, modality, note: noteText, composed: composed.trim(), sha: saved.sha256 };
+    };
+    const pres = await runOnce(false);
+    if (pres.sha !== nativeSha) throw new Error(`mrxs preserve sha ${pres.sha} != native ${nativeSha}`);
+    const jobName = await page.textContent('.job-row .job-name');
+    if (!jobName || jobName.trim() !== 'CMU-1-Saved-1_16') {
+      throw new Error(`bundle job row name "${jobName}" (want the picked folder name)`);
+    }
+
+    // 刷新后：任务从 OPFS 恢复（无需重选文件夹）——行仍在、显示文件夹名，
+    // 产物可再次保存（nextAction=export）
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
+    const exportBtn = '.job-row[data-next-action="export"] button[data-action="export"]';
+    await waitVisible(page, exportBtn, 30000);
+    const rowAfterReload = await page.textContent('.job-row .job-name');
+    if (!rowAfterReload || rowAfterReload.trim() !== 'CMU-1-Saved-1_16') {
+      throw new Error(`row name after reload "${rowAfterReload}"`);
+    }
+
+    const comp = await runOnce(true);
+    if (comp.sha !== nativeCompactSha) throw new Error(`mrxs compact sha ${comp.sha} != native ${nativeCompactSha}`);
+
+    // 单独 .mrxs（file input 手动选到）：planner 缺失成员信息，无任务目录
+    await L.clearJobs(page);
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
+    await L.setFile(page, entryRel);
+    await waitText(page, '#page-error', /Slidedat\.ini|complete bundle/, 60000);
+    if ((await L.jobDirs(page)).length !== 0) throw new Error('.mrxs-only pick left a job dir');
+
+    record('mx-mrxs-folder-e2e', true, {
+      folder: 'CMU-1-Saved-1_16', format: pres.fmt, modality: pres.modality,
+      preserveSha: pres.sha, nativeSha, expectedPrefix: '42f3c650',
+      compactSha: comp.sha, nativeCompactSha,
+      composedRow: pres.composed, qualityNote: pres.note.slice(0, 80),
+      rowNameAfterReload: rowAfterReload.trim(),
+    });
+  } catch (e) {
+    record('mx-mrxs-folder-e2e', false, { error: String(e).slice(0, 400) });
+  } finally {
+    await context.close();
+  }
+}
+
 // ------------------------------------------------------------------ main --
 
 const SCENARIOS = [
@@ -1493,7 +1612,7 @@ const SCENARIOS = [
   ['n', scenarioN], ['o', scenarioO], ['p', scenarioP], ['q', scenarioQ],
   ['r', scenarioR], ['s', scenarioS], ['t', scenarioT], ['u', scenarioU],
   ['v', scenarioV], ['w', scenarioW], ['x', scenarioX], ['y', scenarioY],
-  ['z', scenarioZ], ['sv', scenarioSV],
+  ['z', scenarioZ], ['sv', scenarioSV], ['mx', scenarioMX],
 ];
 
 async function main() {

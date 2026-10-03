@@ -144,6 +144,13 @@ details.privacy > h2 { margin: 12px 0 8px; font-size: 15px; }
   color: var(--muted);
   font-size: 13px;
 }
+/* F3：主按钮（选择文件）+ 次按钮（选择文件夹（MRXS））同一行；窄屏换行 */
+.drop-zone .drop-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  flex-wrap: wrap;
+}
 #input-message { margin: 10px 0 0; }
 #input-hint { margin-top: 10px; }
 

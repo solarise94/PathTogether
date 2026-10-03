@@ -8,8 +8,11 @@
 // U2 结构：默认视图 = 标题 + 一行本地处理说明 + 大拖放区/选择文件；识别后
 // 只出现一张配置摘要（文件/类型/输出/画质 + 折叠「更多选项」）与两个动作
 // （转换并上传到工作台 / 仅转换）。file input 与 drop 都进入同一
-// prepareSource 流程；一次只接受一个切片文件；扩展名只是提示，识别靠
-// engine.js 的文件头魔数表（已知不支持文件在完整复制前被拒绝）。
+// prepareSource 流程；一次只接受一个切片文件（多文件给明确提示）；
+// F3：MRXS 完整包经「选择文件夹（MRXS）」（webkitdirectory）或目录 drop
+// （事件内遍历构造相对路径成员行）进入同一 prepareBundleSource →
+// runner.prepareBundle（缺成员在复制前被类型化拒绝）。扩展名只是提示，
+// 识别靠 engine.js 的文件头魔数表（已知不支持文件在完整复制前被拒绝）。
 // 画质（U3 编码档）与输出格式同样遵循「prepared 可改并落盘、开始即锁定、
 // 重开以任务记录为准」的合同。
 //
@@ -20,6 +23,8 @@
 
 import { SlideToolsRunner } from './slide-transform/runner.js';
 import * as E from './slide-transform/engine.js';
+import { bundleRoute, bundleRows, collectEntryFiles, folderNameFromRelPath }
+  from './tools-slides-bundle.js';
 import { createUploadController } from './tools-slides-upload.js';
 import { createConvertUploadController } from './tools-slides-convert-upload.js';
 
@@ -32,6 +37,8 @@ const els = {
   dropZone: $('drop-zone'),
   pickFileBtn: $('pick-file-btn'),
   fileInput: $('file-input'),
+  pickFolderBtn: $('pick-folder-btn'),
+  folderInput: $('folder-input'),
   channelSection: $('channel-section'),
   channelInput: $('channel-input'),
   stageSection: $('stage-section'),
@@ -45,6 +52,7 @@ const els = {
   outputSummaryText: $('output-summary-text'),
   qualityConflict: $('quality-conflict'),
   qualityFieldset: $('quality-fieldset'),
+  qualityMrsxNote: $('quality-mrxs-note'),
   qualityLocked: $('quality-locked'),
   moreOptions: $('more-options'),
   probeSection: $('probe-section'),
@@ -174,6 +182,8 @@ const page = {
   uploadCtl: null,         // C4 上传控制器（tools-slides-upload.js）
   convertUploadCtl: null,  // R1 一键转换并上传控制器（tools-slides-convert-upload.js）
   file: null,
+  bundleFiles: null,       // F3：MRXS 完整包成员行 [{name, relPath, file}] | null
+  bundleFolderName: null,  // F3：选择的文件夹名（任务列表显示用）
   channelJson: null,       // string | null（≤1 MiB 读取结果）
   channelJsonName: null,
   prep: null,              // { jobId, probe, identity }
@@ -295,46 +305,144 @@ async function probeWithDiskFlow(file, opts = {}) {
 // ------------------------------------------------------- prepareSource --
 //
 // file input 与 drop 的唯一汇合点（计划 §3.2.1）。一次只接受一个切片文件：
-// 多文件 → 明确提示、什么都不开始；目录 / .mrxs / .dat → MRXS 需要完整包
-// 且当前未支持。扩展名只是提示：真正的识别在运行器的
+// 多文件 → 明确提示、什么都不开始；含 .mrxs/.dat 的输入（单独主文件、散装
+// 成员或恰好完整的包）一律交给 MRXS planner（engine.planMrxBundle 经
+// runner.prepareBundle）：缺成员 → 类型化信息列出还差什么，任何复制之前
+// 拒绝——绝不静默丢弃。扩展名只是提示：真正的识别在运行器的
 // 文件头魔数检查（_prepare 在完整复制之前拒绝已知不支持的文件）。
 
 async function prepareSource(fileList) {
-  const files = Array.from(fileList || []);
-  if (!files.length) return;
+  const route = bundleRoute(fileList);
+  if (route.route === 'empty') return;
   if (page.running) {
     // 转换进行中不接受新输入：此时 resetFlowPanels 会撤掉进行中的进度 UI
     //（file input 已禁用，这里补上 drop 路径的同等防护）
     showInputMessage('tools.drop.busy');
     return;
   }
-  if (files.length > 1) {
-    showInputMessage('tools.drop.multiple', { n: String(files.length) });
+  if (route.route === 'bundle') {
+    // .mrxs / .dat（单个或散装多个）→ 同一 planner；文件夹/目录 drop 见
+    // handleDropData（带相对路径的完整包在这里被接受）
+    await prepareBundleSource(route.files);
     return;
   }
-  const file = files[0];
-  const hint = E.inputExtensionHint(file.name);
-  if (hint === 'bundle') {
-    showInputMessage('tools.drop.bundle');
+  if (route.route === 'multiple') {
+    showInputMessage('tools.drop.multiple', { n: String(route.files.length) });
     return;
   }
-  await onFilePicked(file);
+  await onFilePicked(route.file);
 }
 
-/// drop 事件取目录项只能在事件处理器内同步做（webkitGetAsEntry 的有效窗口）
+/// drop 事件取目录项只能在事件处理器内同步做（webkitGetAsEntry 的有效
+/// 窗口）。目录 drop：递归遍历（readEntries 每批 ≤100，循环到空批）构造
+/// 带相对路径的成员行，进入与「选择文件夹（MRXS）」相同的
+/// prepareBundleSource 流程；浏览器无法遍历时提示改用该按钮。
 function handleDropData(dt) {
   if (!dt) return;
   const items = dt.items ? Array.from(dt.items) : [];
+  const dirEntries = [];
   for (const it of items) {
     try {
       const entry = it.webkitGetAsEntry && it.webkitGetAsEntry();
-      if (entry && entry.isDirectory) {
-        showInputMessage('tools.drop.bundle');
-        return;
-      }
+      if (entry && entry.isDirectory) dirEntries.push(entry);
     } catch { /* 非 filesystem 条目：按普通文件处理 */ }
   }
+  if (dirEntries.length) {
+    void onDirectoryDropped(dirEntries);
+    return;
+  }
   prepareSource(dt.files ? Array.from(dt.files) : []);
+}
+
+/// 目录 drop 的遍历与接管（webkitGetAsEntry 只能在事件内同步取，取到的
+/// entry 对象此后仍可异步读取）。
+async function onDirectoryDropped(dirEntries) {
+  if (page.running) {
+    showInputMessage('tools.drop.busy');
+    return;
+  }
+  if (dirEntries.length > 1) {
+    showInputMessage('tools.drop.bundle.multiple', { n: String(dirEntries.length) });
+    return;
+  }
+  const entry = dirEntries[0];
+  try {
+    const rows = await collectEntryFiles(entry, { maxMembers: E.MRXS_MAX_MEMBERS });
+    await prepareBundleSource(rows, { folderName: entry.name });
+  } catch (e) {
+    // 无法遍历（旧浏览器 API 缺失/读取失败/成员数超上限）：指向文件夹按钮
+    console.warn('drop traversal failed', e);
+    showInputMessage('tools.drop.dir.unreadable');
+  }
+}
+
+// -------------------------------------------------- bundle source (F3) --
+//
+// MRXS 完整包输入的唯一汇合点：webkitdirectory 文件夹选择、目录 drop 遍历、
+// 以及 .mrxs/.dat 散文件都进这里，委托 runner.prepareBundle（复制前 planner
+// 决定接受/缺成员拒绝；成员逐个复制到 OPFS 并全程按字节显示进度；清单
+// 落盘后续跑不再需要原文件夹）。阶段 UI/磁盘确认/取消准备与单文件相同。
+
+async function prepareBundleSource(files, opts = {}) {
+  if (page.running) {
+    showInputMessage('tools.drop.busy');
+    return;
+  }
+  const rows = bundleRows(files);
+  clearInputMessage();
+  // 离开上一个未完成任务：留在任务列表里可续跑/删除
+  resetFlowPanels();
+  // 清空文件夹选择器，保证再次选择同一目录仍触发 change；file input 不动
+  //（其 files 在处理期间保持可读，清空会破坏进行中的读取约定）
+  els.folderInput.value = '';
+  page.file = null;
+  page.channelJson = null;
+  page.channelJsonName = null;
+  page.bundleFiles = rows;
+  page.bundleFolderName = opts.folderName
+    || folderNameFromRelPath(rows.length ? rows[0].relPath : '');
+  await runBundleProbeFlow();
+}
+
+/// runner.prepareBundle + uncertain 磁盘确认（与 probeWithDiskFlow 同一合同：
+/// 报告封顶无法证明空间时问用户，确认后带 confirmUncertainDisk 重试）。
+async function prepareBundleWithDiskFlow(rows, opts = {}) {
+  const call = (confirmUncertainDisk) => page.runner.prepareBundle(rows, {
+    confirmUncertainDisk,
+    outputProfile: opts.outputProfile,
+    encodingProfile: opts.encodingProfile,
+    folderName: opts.folderName,
+  });
+  try {
+    return await call(opts.confirmUncertainDisk || false);
+  } catch (e) {
+    if (errCode(e) === 'disk_precheck_failed') {
+      const info = (e && e.error) || {};
+      if (info.uncertain) {
+        const ok = await askDiskConfirm({
+          title: t('tools.disk.title'),
+          body: t('tools.disk.body', {
+            need: fmtBytes(info.need && info.need.total),
+            available: fmtBytes(info.available),
+          }),
+        });
+        if (!ok) throw e;
+        return await call(true);
+      }
+    }
+    throw e;
+  }
+}
+
+/// 完整包准备流程：MRXS 恒为明场（荧光包由核心在探测时类型化拒绝），
+/// 直接带上当前输出/画质选择；无伴随文件概念。
+async function runBundleProbeFlow() {
+  const rows = page.bundleFiles || [];
+  await runPrepareFlow(async () => prepareBundleWithDiskFlow(rows, {
+    outputProfile: selectedOutputProfile(),
+    encodingProfile: selectedEncodingProfile(),
+    folderName: page.bundleFolderName,
+  }), rows.reduce((a, r) => a + (r.file.size || 0), 0));
 }
 
 function resetFlowPanels() {
@@ -342,6 +450,8 @@ function resetFlowPanels() {
   clearInputMessage();
   page.prep = null;
   page.readyInfo = null;
+  page.bundleFiles = null;
+  page.bundleFolderName = null;
   page.outputLockedProfile = null;
   page.encodingLockedProfile = null;
   for (const el of [els.probeSection, els.estimateSection, els.profileSection,
@@ -359,6 +469,7 @@ function resetFlowPanels() {
   els.uploadCancelBtn.hidden = true;
   els.qualityFieldset.hidden = true;
   els.qualityFieldset.disabled = false;
+  els.qualityMrsxNote.hidden = true;
   els.qualityLocked.hidden = true;
   els.qualityConflict.hidden = true;
   els.moreOptions.open = false;
@@ -375,12 +486,28 @@ async function onFilePicked(explicitFile) {
     showInputMessage('tools.drop.multiple', { n: String(list.length) });
     return;
   }
+  // 单独的 .mrxs / .dat（file input 手动选到）也交给 planner：缺成员的
+  // 类型化信息在任何复制之前出现
+  if (E.inputExtensionHint(file.name) === 'bundle') {
+    await prepareBundleSource([file]);
+    return;
+  }
   clearInputMessage();
   // 离开上一个未完成任务：留在任务列表里可续跑/删除
   resetFlowPanels();
   page.file = file;
   await readChannelJsonInput();
   await runProbeFlow();
+}
+
+/// 「选择文件夹（MRXS）」：webkitdirectory input 的 change —— File 的
+/// webkitRelativePath 已带文件夹前缀（engine 据此定位包根），交给
+/// prepareBundleSource（与目录 drop 完全相同的流程）。
+async function onFolderPicked() {
+  const list = els.folderInput.files;
+  const files = list ? Array.from(list) : [];
+  if (!files.length) return;
+  await prepareBundleSource(files);
 }
 
 /// R1 工作台交接：postMessage 收到的 File 走与手动选择完全相同的流程
@@ -390,6 +517,7 @@ async function takeHandoffFile(file) {
   if (!file) return;
   resetFlowPanels();
   els.fileInput.value = '';
+  els.folderInput.value = '';
   page.file = file;
   page.channelJson = null;
   page.channelJsonName = null;
@@ -426,14 +554,7 @@ async function onChannelPicked() {
 }
 
 async function runProbeFlow() {
-  clearError();
-  els.stageSection.hidden = false;
-  setStageMsg('tools.stage.status');
-  setProgress(els.stageProgress, els.stageBar, els.stageBytes, 0, `0 / ${fmtBytes(page.file.size)}`);
-  setBeforeunload(true);
-  els.prepareCancelBtn.hidden = false;
-  els.prepareCancelBtn.disabled = false;
-  try {
+  await runPrepareFlow(async () => {
     const cjAtProbe = page.channelJson;
     // 输出格式与画质选择在准备时就传给运行器（prepared 记录反映用户选择）。
     // 模态在复制+探测后才能确认，这里用文件头嗅探（与核心同源的魔数表）
@@ -444,11 +565,29 @@ async function runProbeFlow() {
       outputProfile: sniffedModality === 'brightfield' ? selectedOutputProfile() : undefined,
       encodingProfile: sniffedModality === 'brightfield' ? selectedEncodingProfile() : undefined,
     });
-    page.prep = prep;
     // 伴随文件在复制/探测期间改选过：补写进任务记录
     if (page.channelJson !== cjAtProbe) {
       await page.runner.setPreparedChannelJson(prep.jobId, page.channelJson);
     }
+    return prep;
+  }, page.file.size);
+}
+
+/// 准备（复制与识别）的共用驱动：单文件 runProbeFlow 与完整包
+/// runBundleProbeFlow 共享同一阶段 UI/取消/磁盘确认/错误与摘要收尾。
+/// `doPrepare` 返回 prep（{jobId, probe, identity?}），totalBytes 用于进度。
+async function runPrepareFlow(doPrepare, totalBytes) {
+  clearError();
+  els.stageSection.hidden = false;
+  setStageMsg('tools.stage.status');
+  setProgress(els.stageProgress, els.stageBar, els.stageBytes, 0, `0 / ${fmtBytes(totalBytes)}`);
+  setBeforeunload(true);
+  els.prepareCancelBtn.hidden = false;
+  els.prepareCancelBtn.disabled = false;
+  let prep;
+  try {
+    prep = await doPrepare();
+    page.prep = prep;
   } catch (e) {
     els.prepareCancelBtn.hidden = true;
     setBeforeunload(false);
@@ -459,6 +598,8 @@ async function runProbeFlow() {
       // 取消准备（U2）：worker 已终止、任务目录已删除——明确反馈，不算错误
       els.stageSection.hidden = true;
       page.file = null;
+      page.bundleFiles = null;
+      page.bundleFolderName = null;
       setPageMsg('tools.stage.cancelled');
       refreshJobs();
       return;
@@ -481,8 +622,10 @@ async function runProbeFlow() {
   els.prepareCancelBtn.hidden = true;
   setBeforeunload(false);
   setStageMsg('tools.stage.done');
+  const copiedBytes = Number.isFinite(prep.identity && prep.identity.size)
+    ? prep.identity.size : totalBytes;
   setProgress(els.stageProgress, els.stageBar, els.stageBytes, 1,
-    `${fmtBytes(page.file.size)} / ${fmtBytes(page.file.size)}`);
+    `${fmtBytes(copiedBytes)} / ${fmtBytes(totalBytes)}`);
   // 识别完成：一张配置摘要 + 折叠的高级项（荧光只隐藏不适用的选择组）
   els.summarySection.hidden = false;
   els.probeSection.hidden = false;
@@ -732,6 +875,7 @@ function renderQualitySection() {
   // 荧光不提供画质选择（compact 仅明场；保留画质是唯一语义）→ 整组隐藏。
   const show = !!page.prep && probeDoc().modality !== 'fluorescence';
   els.qualityFieldset.hidden = !show;
+  updateMrsxQualityNote();
   if (!show) return;
   const locked = page.encodingLockedProfile;
   els.qualityFieldset.disabled = !!locked;
@@ -742,6 +886,15 @@ function renderQualitySection() {
     });
   }
   updateQualityPolicyGate();
+}
+
+/// F3（MRXS）画质说明：MRXS 瓦片总是拼接后重编码——「保留画质」是高质量
+/// 重编码而非字节复制，输出可能大于源包。仅 MRXS（mirax*）识别后显示。
+function updateMrsxQualityNote() {
+  const show = !!page.prep
+    && String(probeDoc().format || '').startsWith('mirax')
+    && probeDoc().modality !== 'fluorescence';
+  els.qualityMrsxNote.hidden = !show;
 }
 
 /// 「像素严格无损」与「更小文件（有损）」互斥（U2 要求在 UI 也阻止，核心
@@ -849,13 +1002,16 @@ function phaseText(state) {
 
 /// 转换执行驱动（「仅转换」与 R1「转换并上传」共用）：startJob → 进度/结果
 /// UI。返回 worker 的 result（{ok}|{type:'cancelled'}|失败形态）。
+/// F3：完整包任务 page.file 为 null——源已整包复制进 OPFS（bundle 记录），
+/// startJob(null, {jobId}) 直接用暂存成员，无需（也无法）再提供 File。
 async function driveConversion() {
-  if (!page.prep || !page.file) return null;
+  if (!page.prep || (!page.file && !page.bundleFiles)) return null;
   clearError();
   els.convertBtn.disabled = true;
   if (els.convertUploadBtn) els.convertUploadBtn.disabled = true;
   els.prepareCancelBtn.hidden = true;
   els.fileInput.disabled = true;
+  els.folderInput.disabled = true;
   els.channelInput.disabled = true;
   els.cancelBtn.hidden = false;
   els.runProgress.hidden = false;
@@ -865,7 +1021,8 @@ async function driveConversion() {
   setBeforeunload(true);
   page.running = true;
   try {
-    // 开始即用当前 UI 选择（明场；荧光不传 → fl-ome / preserve）；
+    // 开始即用当前 UI 选择（明场；荧光不传 → fl-ome / preserve；完整包
+    // 恒为明场——荧光 MRXS 在准备时已被核心拒绝）；
     // 任务从此锁定该输出格式与画质。
     const outputProfile = outputProfileForModality(probeDoc().modality);
     const encodingProfile = encodingProfileForModality(probeDoc().modality);
@@ -885,6 +1042,7 @@ async function driveConversion() {
     setBeforeunload(false);
     els.cancelBtn.hidden = true;
     els.fileInput.disabled = false;
+    els.folderInput.disabled = false;
     els.channelInput.disabled = false;
     if (result && result.ok) {
       els.runStatus.textContent = phaseText('ready');
@@ -898,8 +1056,10 @@ async function driveConversion() {
         outputProfile: result.result.output_profile || null,
         encoding: result.result.encoding || null,
         result: { format: result.result.format || null },
-        sourceName: page.file.name,
+        sourceName: (page.prep.identity && page.prep.identity.name)
+          || (page.file && page.file.name),
         channels: result.result.channels || [],
+        composed: result.result.composed || null,
       };
       renderResultPanel();
       renderSaveStatus();
@@ -922,6 +1082,7 @@ async function driveConversion() {
     setBeforeunload(false);
     els.cancelBtn.hidden = true;
     els.fileInput.disabled = false;
+    els.folderInput.disabled = false;
     els.channelInput.disabled = false;
     els.runStatus.textContent = phaseText('failed');
     showError(e);
@@ -995,6 +1156,16 @@ function renderResultPanel() {
     encodingLabel(page.readyInfo.encoding || E.ENCODING_PROFILES.PRESERVE), 'result-encoding');
   dlRow(g, t('tools.result.size'), fmtBytes(page.readyInfo.outputBytes), 'result-size');
   dlRow(g, t('tools.result.sha256'), String(page.readyInfo.sha256 || '—'), 'result-sha');
+  // F3（MRXS）：核心的拼接重编码摘要（合成/填充/去重 tile 计数）
+  if (page.readyInfo.composed) {
+    const c = page.readyInfo.composed;
+    dlRow(g, t('tools.result.composed'),
+      t('tools.result.composed.note', {
+        composed: Number(c.tiles_composed || 0),
+        filled: Number(c.tiles_filled || 0),
+        deduped: Number(c.tiles_deduped || 0),
+      }), 'result-composed');
+  }
   if (page.readyInfo.modality === 'fluorescence') {
     (page.readyInfo.channels || []).forEach((c, i) => {
       const dw = Array.isArray(c.display_window) ? c.display_window : null;
@@ -1026,6 +1197,7 @@ async function selectResultJob(jobId) {
       result: { format: job.result.format || null },
       sourceName: job.source && job.source.name,
       channels: job.result.channels || [],
+      composed: (job.result && job.result.composed) || null,
     };
     page.saveMsg = null;
   }
@@ -1149,7 +1321,9 @@ function renderJobs(jobs) {
     head.className = 'job-row-head';
     const name = document.createElement('p');
     name.className = 'job-name';
-    name.textContent = (job.source && job.source.name) || job.id;
+    // F3：完整包任务显示所选文件夹名（记录里保存了 folderName；散文件/
+    // 旧记录回退到入口文件名）
+    name.textContent = (job.source && (job.source.folderName || job.source.name)) || job.id;
     const st = document.createElement('span');
     st.className = 'job-state';
     // the record says planned/paused while this tab's worker is converting
@@ -1326,6 +1500,7 @@ async function onJobAction(action, job) {
           result: { format: result.result.format || null },
           sourceName: job.source && job.source.name,
           channels: result.result.channels || [],
+          composed: result.result.composed || null,
         };
         page.saveMsg = null;
         renderResultPanel();
@@ -1425,6 +1600,13 @@ async function init() {
     els.fileInput.click();
   });
   els.fileInput.addEventListener('change', () => { onFilePicked(); });
+  // F3：MRXS 完整包——webkitdirectory 文件夹选择（键盘/触屏可达，input
+  // 视觉隐藏与 file input 同款）；change 后交给 prepareBundleSource
+  els.pickFolderBtn.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    els.folderInput.click();
+  });
+  els.folderInput.addEventListener('change', () => { onFolderPicked(); });
   els.channelInput.addEventListener('change', () => { onChannelPicked(); });
   els.convertBtn.addEventListener('click', () => { onConvert(); });
   if (els.convertUploadBtn) {
@@ -1456,6 +1638,17 @@ function onProgress(p) {
     els.stageSection.hidden = false;
     setProgress(els.stageProgress, els.stageBar, els.stageBytes, frac,
       `${fmtBytes(p.done)} / ${fmtBytes(p.total)}`);
+    return;
+  }
+  if (p.unit === 'stage-bundle') {
+    // F3：成员逐个复制（单个复用缓冲），进度按字节聚合；顺带显示第几个成员
+    const frac = p.total ? p.done / p.total : 0;
+    els.stageSection.hidden = false;
+    setProgress(els.stageProgress, els.stageBar, els.stageBytes, frac,
+      t('tools.stage.bundle.bytes', {
+        done: fmtBytes(p.done), total: fmtBytes(p.total),
+        member: p.member, members: p.members,
+      }));
     return;
   }
   if (p.unit === 'level') {

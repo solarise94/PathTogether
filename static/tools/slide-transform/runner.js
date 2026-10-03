@@ -436,6 +436,11 @@ export class SlideToolsRunner {
   /// digests → manifest persisted → wasm probe on the staged members →
   /// estimate-based disk gate → `prepared` record. `files` is the picker's
   /// File[] with webkitRelativePath (or {name, relPath, file} rows).
+  /// opts.folderName (page-supplied picked-folder name) is only a display
+  /// label on the record (job list shows it); it never takes part in any
+  /// digest. Returns { jobId, probe, manifest, identity } — identity mirrors
+  /// probe()'s {name, size, sha256} (the entry name, bundle bytes and the
+  /// manifest root digest) so the page's summary uses one shape.
   async prepareBundle(files, opts = {}) {
     if (!(await this._acquireHeavyLock())) {
       throw E.stError(E.ERROR_CODES.JOB_LOCKED, '另一个标签页正在执行重转换任务（Web Lock）');
@@ -494,6 +499,8 @@ export class SlideToolsRunner {
           bundle: true,
           identity: {
             name: plan.entryName,
+            folderName: typeof opts.folderName === 'string' && opts.folderName
+              ? opts.folderName : null,
             size: manifest.totalBytes,
             lastModified: null,
             sha256: manifest.rootDigest,
@@ -516,7 +523,16 @@ export class SlideToolsRunner {
         throw e;
       }
       this._setState('planned', { probe: probeResult });
-      return { jobId, probe: probeResult, manifest };
+      return {
+        jobId,
+        probe: probeResult,
+        manifest,
+        identity: {
+          name: plan.entryName,
+          size: manifest.totalBytes,
+          sha256: manifest.rootDigest,
+        },
+      };
     } finally {
       this._releaseHeavyLock();
     }
@@ -1221,7 +1237,13 @@ export class SlideToolsRunner {
       id, state, nextAction, active,
       createdAt: rec ? rec.createdAt : null,
       updatedAt: rec ? rec.updatedAt : null,
-      source: id0 ? { name: id0.name, size: id0.size, sha256: id0.sha256 } : null,
+      source: id0 ? {
+        name: id0.name,
+        // F3: the picked folder's display name for bundle jobs (else null)
+        folderName: id0.folderName || null,
+        size: id0.size,
+        sha256: id0.sha256,
+      } : null,
       modality: rec ? rec.modality || null : null,
       outputProfile: rec && !['staging', 'prepared'].includes(state)
         ? E.recordOutputProfile(rec) : (rec && rec.outputProfile) || null,
@@ -1237,6 +1259,8 @@ export class SlideToolsRunner {
           sha256: rec.validation && rec.validation.sha256,
           format: rec.result.format || null,
           channels: rec.result.channels || [],
+          // F3: the MRXS composed summary (tiles composed/filled/deduped)
+          composed: rec.result.composed || null,
         }
         : null,
       upload: rec && rec.upload ? { ...rec.upload } : null,

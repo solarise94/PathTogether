@@ -20,7 +20,7 @@
       <div class="brand-block">
         <p class="brand-tag" data-i18n="tools.brand">HistoPilot · 本地工具</p>
         <h1 data-i18n="tools.title">本地切片工具</h1>
-        <p class="subtitle" data-i18n="tools.subtitle">在本机浏览器内完成 KFB / KFBF / SVS 切片的识别、转换与保存（BigTIFF / OME-TIFF）</p>
+        <p class="subtitle" data-i18n="tools.subtitle">在本机浏览器内完成 KFB / KFBF / SVS 单文件与 MRXS 完整包的识别、转换与保存（BigTIFF / OME-TIFF）</p>
       </div>
       <div class="topbar-actions">
         <a class="btn btn-secondary" href="/" data-i18n="tools.back.home">返回主页</a>
@@ -46,17 +46,22 @@
     <p id="page-status" class="status-panel" role="status" aria-live="polite"></p>
 
     <!-- 1 · 选择文件：大拖放区为主入口；file input 视觉隐藏但保留键盘可达，
-         与 drop 走同一 prepareSource 流程（U2 §3.2） -->
+         与 drop 走同一 prepareSource 流程（U2 §3.2）。F3：MRXS 完整包经
+         webkitdirectory 文件夹选择或拖入整个文件夹（同一 prepareBundleSource） -->
     <section class="card" id="input-section" aria-labelledby="input-title">
       <h2 id="input-title" data-i18n="tools.input.title">选择切片文件</h2>
       <div class="drop-zone" id="drop-zone" aria-describedby="input-hint">
         <p class="drop-title" data-i18n="tools.drop.title">将切片文件拖到这里</p>
         <p class="drop-alt" data-i18n="tools.drop.or">或</p>
-        <button type="button" id="pick-file-btn" class="btn btn-primary" data-i18n="tools.drop.pick">选择文件</button>
+        <div class="drop-actions">
+          <button type="button" id="pick-file-btn" class="btn btn-primary" data-i18n="tools.drop.pick">选择文件</button>
+          <button type="button" id="pick-folder-btn" class="btn btn-secondary" data-i18n="tools.drop.pick.folder">选择文件夹（MRXS）</button>
+        </div>
       </div>
       <input id="file-input" name="file" type="file" accept=".kfb,.kfbf,.svs" class="visually-hidden-input" data-i18n-aria="tools.input.file.label" aria-label="切片文件（KFB / KFBF / SVS）" />
+      <input id="folder-input" name="folder" type="file" webkitdirectory multiple class="visually-hidden-input" data-i18n-aria="tools.input.folder.label" aria-label="MRXS 切片文件夹（完整包）" />
       <p id="input-message" class="status-panel" role="status"></p>
-      <p id="input-hint" class="hint" data-i18n="tools.input.file.hint">目前支持已验证的 KFB（明场）、KFBF（荧光）与 Aperio SVS（明场，JPEG 编码）单文件；JPEG 2000 编码的 SVS 暂不支持。扩展名只是提示——页面按文件头识别，不支持的其他格式会在复制前被拒绝。</p>
+      <p id="input-hint" class="hint" data-i18n="tools.input.file.hint">支持已验证的 KFB（明场）、KFBF（荧光）与 Aperio SVS（明场，JPEG 编码）单文件，以及标准 MRXS 完整包（.mrxs 主文件 + 同名数据目录，含 Slidedat.ini、Index.dat、Data*.dat——用「选择文件夹（MRXS）」或拖入整个文件夹）；JPEG 2000 编码的 SVS 暂不支持。扩展名只是提示——页面按文件头识别，不支持的其他格式会在复制前被拒绝。</p>
     </section>
 
     <!-- 2 · 准备（复制与识别）：与转换阶段分开显示；可取消准备（U2） -->
@@ -96,6 +101,8 @@
             <span class="opt-desc" data-i18n="tools.quality.compact.desc">每个 tile 解码后按固定参数重新编码（仅明场）：文件通常变小，但节省幅度可能有限；不适合颜色定量用途。</span></label>
         </div>
       </fieldset>
+      <!-- F3（MRXS）：画质正下方一行格式特定说明——瓦片总是拼接后重编码 -->
+      <p id="quality-mrxs-note" class="hint" role="note" data-i18n="tools.quality.mrxs.note" hidden>MRXS 的瓦片总是先按真实位置拼接、再重编码：「保留画质」指高质量重编码（不是字节复制），输出文件可能大于源包。</p>
       <p id="quality-locked" class="hint" role="note" hidden></p>
 
       <!-- 更多选项（默认折叠）：输出目标软件 / 内存档位 / 像素策略 / 通道信息

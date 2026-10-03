@@ -675,6 +675,50 @@ function makeScenarios(F) {
     return { refused };
   }]);
 
+  // Review §2 regression (independent review 2026-10-03): the bundle AND
+  // its manifest are replaced TOGETHER — the manifest stays self-consistent
+  // (member size/sha256 + rootDigest recomputed) while the job record and
+  // journal are untouched. The reviewer's original case is the metadata
+  // member; further variants replace a pixel member, add and remove a
+  // member. Resume must refuse with the source-changed code and produce no
+  // new output. Shared steps (as the reviewer's check-bundle-identity.cjs):
+  // synthetic gen-mrxs bundle → prepare → crashAtWrite:4 → terminate worker
+  // → mutate bundle+manifest in OPFS → bare resume.
+  async function bundleReplacedCase(page, kind) {
+    await loadBundleRows(page);
+    const prep = await page.evaluate(() => window.__c2.probeBundle({}));
+    const jobId = prep.jobId;
+    await page.evaluate((id) => window.__c2.start({ preparedJobId: id, faults: { crashAtWrite: 4 } }), jobId);
+    await waitForFault(page, 'crashAtWrite', 0, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    const mutation = await page.evaluate((o) => window.__c2.mutateBundleAndManifest(o),
+      { job: jobId, kind });
+    const outBefore = await page.evaluate((id) => window.__c2.outputInfo(id), jobId);
+    const recBefore = await page.evaluate((id) => window.__c2.jobRecord(id), jobId);
+    const refused = await page.evaluate((id) => window.__c2.tryResume({ jobId: id }), jobId);
+    const outAfter = await page.evaluate((id) => window.__c2.outputInfo(id), jobId);
+    const recAfter = await page.evaluate((id) => window.__c2.jobRecord(id), jobId);
+    return { kind, mutation, refused,
+      outBefore: outBefore.size, outAfter: outAfter.size,
+      stateBefore: recBefore.state, stateAfter: recAfter.state };
+  }
+
+  S.push(['mrxs-bundle-and-manifest-replaced-refused', async (page) => {
+    return bundleReplacedCase(page, 'metadata');
+  }]);
+
+  S.push(['mrxs-pixel-member-and-manifest-replaced-refused', async (page) => {
+    return bundleReplacedCase(page, 'pixel');
+  }]);
+
+  S.push(['mrxs-member-added-manifest-updated-refused', async (page) => {
+    return bundleReplacedCase(page, 'add');
+  }]);
+
+  S.push(['mrxs-member-removed-manifest-updated-refused', async (page) => {
+    return bundleReplacedCase(page, 'remove');
+  }]);
+
   S.push(['mrxs-adapter-change-refused', async (page) => {
     await loadBundleRows(page);
     const prep = await page.evaluate(() => window.__c2.probeBundle({}));
@@ -904,6 +948,19 @@ function verdict(name, r) {
       const m = r.refused || {};
       return m.refused && m.code === 'source_changed_refuse_resume'
         ? ok() : fail(safeJson(m));
+    }
+    case 'mrxs-bundle-and-manifest-replaced-refused':
+    case 'mrxs-pixel-member-and-manifest-replaced-refused':
+    case 'mrxs-member-added-manifest-updated-refused':
+    case 'mrxs-member-removed-manifest-updated-refused': {
+      const m = r.refused || {};
+      return m.refused && m.code === 'source_changed_refuse_resume'
+        && r.mutation && r.mutation.rootChanged === true
+        && r.outAfter === r.outBefore
+        && r.stateAfter === r.stateBefore
+        ? ok({ code: m.code }) : fail(safeJson({ refused: m,
+          mutation: r.mutation, out: [r.outBefore, r.outAfter],
+          state: [r.stateBefore, r.stateAfter] }));
     }
     case 'mrxs-adapter-change-refused': {
       const m = r.asKfb || {};

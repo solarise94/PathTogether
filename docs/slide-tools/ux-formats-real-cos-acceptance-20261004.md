@@ -1,0 +1,54 @@
+# ux-formats 真实 COS 验收
+
+日期：2026-10-04（Asia/Shanghai）。候选提交：`d861dd19c41c1f3899263bd1ebf4bd583d2c65be`。
+
+**结论：本轮真实 COS/XHR 小文件验收通过。没有发现新的应用缺陷；不等于整包已发布或画质已获用户接受。**
+
+## 环境及边界
+
+- homePC 现有 rc6 runtime image 加只读候选 source mount，Gunicorn 仅监听 `127.0.0.1:18094`。没有运行 entrypoint，没有执行迁移，没有启动第二套后台 worker。
+- 候选 `app.py`、摄取/签名/COS/reader 代码、requirements 和 migrations 与 rc6 对应基线一致。请求使用真实平台数据库和专用普通测试账号；上传后的处理由现有生产摄取 worker 执行。
+- Chromium 保留 `https://pt.solarise94.fun` origin；页面及平台请求经验收代理转到私有端口。COS 请求由浏览器直接发往真实腾讯桶，不被 mock 或代理，适用实际 CSP/CORS。
+- 这验证了候选代码与真实上传链路，**不是新构建 candidate image 的打包验收**。后续仍应构建并检查实际发布镜像。
+- 仅使用合成 KFB/OME-TIFF。公网容器未停止、替换或切流；测试确实创建并删除了测试账号的上传和切片，不能描述为生产完全零写入。
+
+## 已执行
+
+| 检查 | 结果 |
+| --- | --- |
+| 普通测试账号及上限 | 真实登录；能力端点返回 9,500,000,000 B |
+| 转换并上传 | 默认 OME、保留画质；9,537,416 B 产物真实 COS PUT 200；浏览器校验摘要与原生基线相同，服务端下载摘要也相同 |
+| 字节进度 | 每次完整工具页上传观测到 190 个 XHR upload progress 事件；页面有 0–100 之间的中间百分比，非仅起点/终点 |
+| 完成语义 | 观测到“上传至腾讯云”“数据已发送，等待确认”“工作台接收”和最终发布。小任务未逐一捕捉所有短暂服务端阶段，不宣称每个阶段均可见 |
+| 可读性 | 工具页两次成功上传均可读取明场 info；低倍及全分辨率瓦片均 HTTP 200、非空；刷新后保留已发布状态 |
+| 上传中刷新 | 首个分块未完成时刷新，点击继续，仍使用原 ingestion ID；未把未确认分块当作已完成。这不是多分块已确认部分跳过的真实云测试 |
+| 上传中取消 | 在真实 PUT 进行中取消；服务端任务最终 cancelled，OPFS job 仍 ready、校验摘要保留 |
+| 取消后重试 | 用户动作重新发起上传，创建新 ingestion，完整 PUT 200 并成功发布；产物与原生基线相同 |
+| 工作台直接上传 | 551,016 B 合成荧光 OME-TIFF 真实 COS PUT 200；记录 27 个 UI 状态样本，存在中间进度；发布后 reader 返回 multichannel |
+
+上传用浏览器网络限速延长观察窗口（工具页 500,000 B/s，工作台 100,000 B/s）；不是性能基准。三个成功产物合计 19,625,848 B；另有被刷新/取消的部分传输。没有以腾讯控制台延迟统计推断即时上传行为或费用。
+
+## 清理与账本
+
+- 本轮共四个 ingestion：三个 completed、一个 cancelled。
+- 对每个实际 object key 独立调用 COS 版本和 multipart 列举：对象版本、删除标记、未完成上传全部为 0，分页未截断。
+- 四个任务的 `cleanup_status=cleaned`、`pool_reserved_bytes=0`。
+- 三个测试切片经普通账号删除 API 删除成功（HTTP 200）；切片列表恢复测试前基线，没有删除其他资产。
+- 测试账号 `used_bytes` 从 6,359,395 增至 25,985,243，删除产物后恢复 6,359,395；最终 `reserved_bytes=0`，与基线完全一致。
+- 私有候选容器已停止并删除；临时环境文件已删除；SSH 验收隧道已关闭。生产仍运行 `localhost/pathtogether-demo:suite-20261003`。
+
+## 验收脚本修正
+
+沿用旧验收 harness 时，两个 UI 定位不再适用：技术 probe 面板已折叠，应等待摘要卡；带自动上传意图的任务使用“继续上传”按钮，应按稳定任务上传属性定位。初次等待超时没有证明应用失败。
+
+另外，点击取消会先更新 UI，再异步写入本地记录/通知服务端。首次即时读取断言过早，导致 harness 提前关闭；后续复核确认本地 cancelled/ready 状态、真实服务端 cancelled、远端清理完成，再从该结果重试成功。本报告记录最终持久状态的验收，不把这次过早断言计为产品缺陷，也不抹去私有原始日志。
+
+本轮没有改应用代码。验收脚本是按阶段操作的私有 harness，不应不加检查地当作通用一键发布脚本。
+
+## 证据与待办
+
+私有证据：本 worktree 的 `.gate-tmp/acceptance-20261004/`，包括 `result.json`、`first-upload-evidence.json`、`remote-before-slide-cleanup.json`、`remote-status.json`、`quota-before.json` 和截图。原始文件可能含内部身份、任务标识及浏览器状态，不提交。
+
+仍待用户完成 compact 盲评与 MRXS v2 低倍效果接受；Windows、真实低内存设备、真实 OS 保存对话框保持原待验状态。本轮没有重跑大样本或全量回归，也没有发布候选代码。
+
+下一步可交给 agent 的执行说明：[release closeout prompt](../agent-prompts/ux-formats-release-closeout-20261004.md)。

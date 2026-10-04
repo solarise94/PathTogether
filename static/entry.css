@@ -1120,3 +1120,10 @@ body.login-dialog-open { overflow: hidden; }
   .login-dialog-card { padding: 28px 20px 22px; }
   .login-dialog-links { flex-direction: column; gap: 10px; }
 }
+
+/* Prominent local converter entry, available with or without an account. */
+.converter-entry { display: grid; gap: 8px; margin-top: 24px; padding: 18px 20px; border: 1px solid #73c8c0; border-radius: 12px; background: rgba(75, 180, 165, .12); color: inherit; text-decoration: none; }
+.converter-entry strong { color: #a1e8dc; font-size: 19px; }
+.converter-entry span { font-size: 14px; line-height: 1.65; }
+.converter-entry:hover { background: rgba(75, 180, 165, .22); }
+.converter-entry:focus-visible { outline: 3px solid #a1e8dc; outline-offset: 4px; }

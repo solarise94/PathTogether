@@ -51,4 +51,4 @@
 
 仍待用户完成 compact 盲评与 MRXS v2 低倍效果接受；Windows、真实低内存设备、真实 OS 保存对话框保持原待验状态。本轮没有重跑大样本或全量回归，也没有发布候选代码。
 
-下一步可交给 agent 的执行说明：[release closeout prompt](../agent-prompts/ux-formats-release-closeout-20261004.md)。
+后续执行范围与发布门禁见[发布与回滚计划](ux-formats-release-plan-20261004.md)。

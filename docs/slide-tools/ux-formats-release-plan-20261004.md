@@ -1,8 +1,8 @@
-# ux-formats 发布与回滚计划（待批准）
+# ux-formats 发布与回滚计划（已执行，最终版本见发布记录）
 
 日期：2026-10-04。候选为分支 `ux-formats` 的 `d861dd1`。
 
-> **未部署、未切流、未推送。整包在 compact 盲评与 MRXS v2 低倍层两项视觉验收完成前不发布。本文是待批准计划，不是发布记录。**
+> **2026-10-05 用户批准发布及官网入口调整。已以最终提交 `3fcd388` / 镜像 `suite-20261005` 发布，详见[发布记录](ux-formats-production-20261005.md)。以下 rc1 镜像信息保留为原计划历史；未推送 Git。**
 
 关联：[发布交接](tool-ux-formats-release-handoff-20261003.md)、[独立复核](ux-formats-independent-recheck-20261004.md)、[真实 COS 验收](ux-formats-real-cos-acceptance-20261004.md)、[rc6 发布记录](../review-evidence/slide-tools/R1/rc6-production-20261003.md)。
 
@@ -80,7 +80,11 @@ python3 deploy.py post-check        # pt.solarise94.fun 与 histopilot.cn 公网
 
 ## 7. 回滚
 
-首选 `python3 deploy.py rollback`：先确认运行中的 PT 是候选镜像，否则拒绝；停止它并改名 `pathtogether-demo-failed-suite-20261004`；把 `pathtogether-demo-pre-suite-20261004` 改回 `pathtogether-demo` 并启动；健康检查（含 sidecar）；最后断言运行的是 rc6 镜像。手工等价的 podman 命令为 stop、rename、rename、start，再 curl `/healthz`。
+首选 `python3 deploy.py rollback`。2026-10-04 独立复核发现并修复了部分改名状态无法恢复的问题，homePC helper 已同步更新，原文件保留为 `deploy.py.pre-rollback-review`。任何步骤在停止旧容器后失败，应执行该恢复命令，不继续切换。
+
+恢复前核对当前/旧/失败容器的镜像身份及冲突。正常候选运行状态下，停止候选并改名 `pathtogether-demo-failed-suite-20261004`，将旧容器改回标准名后启动。也支持旧容器刚停止尚未改名、切换只完成第一次改名、候选尚未启动、回滚只完成第一次改名、旧容器已改回但尚未启动及已回滚状态。未知镜像、缺少旧目标、失败名冲突或 staged 容器仍运行均在修改前拒绝。最后做健康检查（含 sidecar）并核对 rc6 镜像。
+
+验证为本地模拟容器状态：7 个恢复状态和 5 个拒绝条件通过，未在生产执行切换/回滚演练。[复核证据与补丁](ux-formats-release-recheck-20261004.md)。
 
 无数据库回滚需求（无迁移）；备份仅用于灾难场景。回滚限制（如实记录，未测试）：
 
@@ -91,10 +95,10 @@ python3 deploy.py post-check        # pt.solarise94.fun 与 histopilot.cn 公网
 
 ## 8. 发布前未决事项（阻断项，由用户决定）
 
-- compact 画质盲评：待 owner。
-- MRXS v2 低倍层接受：待 owner。
-- Windows、真实低内存设备、真实系统保存对话框仍未验证；是否阻断由 owner 决定。
-- 升级续跑未测：rc6 页面创建、在切流时尚未完成的浏览器任务，由新页面续跑的行为本轮没有实测（rc6 发布时做过 rc5 → rc6 的同类检查）。建议在批准发布前补一次：同源先用 rc6 中断一个 KFB 任务，再换候选镜像续跑，并与 native 对比字节。
+- compact 画质盲评：2026-10-05 owner 已接受当前有损版本，反馈“A/B 有一点区别但是不明显”。六组记录见[有损模式视觉验收](ux-formats-compact-visual-acceptance-20261005.md)。保留画质仍为默认。
+- MRXS v2 低倍层接受：2026-10-05 owner 已接受，反馈十字对齐、无明显跳变、清晰度差异不明显。性能说明中的增加指转换耗时及输出体积，不是页面加载计时；见[MRXS 视觉验收](ux-formats-mrxs-visual-acceptance-20261005.md)。
+- 2026-10-05 用户明确：没有 Windows 设备，本轮不测试 Windows，不作为本轮阻断项。低内存验证接受本机 Docker/Linux 限制内存的方法；执行结果见 [Docker 低内存核验](ux-formats-linux-memory-20261005.md)。这不扩展为真实 Windows 或真实低配硬件验收。真实系统保存对话框仍未验证。
+- rc6 → 候选升级续跑已补测：用 rc6 实际 runner/worker/WASM 写入非零 checkpoint 并中断，同源候选工具页点击任务列表续跑；明场 OME、经典 TIFF、荧光 OME 三份产物均与原生基线逐字节一致。测试使用旧版 harness 注入中断、新版真实页面恢复；不是 OS 杀进程、Mac/Windows 或新→旧→新回滚往返测试。详见[独立复核](ux-formats-release-recheck-20261004.md)。
 - AI 会话列表 403 是独立的既有问题，不属于本次发布。
 
 部分发布仅在用户日后选择时才考虑：需要覆盖所有入口（工具页文件选择、文件夹选择、拖放、工作台交接、续跑）的真实能力开关；既有本地结果必须保持可读、可导出；不得删除任务。现在不做决定，当前没有任何功能被移除或禁用。

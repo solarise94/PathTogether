@@ -1,0 +1,48 @@
+--- a/deploy.py
++++ b/deploy.py
+@@ -277,14 +277,37 @@
+ 
+ 
+ def rollback():
+-    if not exists(PT_PRE):
+-        raise SystemExit(PT_PRE + ' missing; nothing to roll back to')
+-    if inspect(PT)['Image'] != NEW_IMAGE_ID:
+-        raise SystemExit('running PT is not the candidate image; refusing')
+-    run('podman', 'stop', '-t', '30', PT)
+-    run('podman', 'rename', PT, PT_FAILED)
+-    run('podman', 'rename', PT_PRE, PT)
+-    run('podman', 'start', PT)
++    # Recover partial cutover/rollback as well as a fully running candidate.
++    # Validate identities before stopping or renaming anything.
++    cur = inspect(PT) if exists(PT) else None
++    prev = inspect(PT_PRE) if exists(PT_PRE) else None
++    failed = inspect(PT_FAILED) if exists(PT_FAILED) else None
++    if prev and prev['Image'] != OLD_IMAGE_ID:
++        raise SystemExit('rollback target is not the verified rc6 image; refusing')
++    if failed and (failed['Image'] != NEW_IMAGE_ID or failed['State']['Running']):
++        raise SystemExit('failed-container slot is unexpected or running; refusing')
++    if exists(PT_STAGED) and inspect(PT_STAGED)['State']['Running']:
++        raise SystemExit('staged container is running; refusing competing writers')
++    if cur and cur['Image'] not in (OLD_IMAGE_ID, NEW_IMAGE_ID):
++        raise SystemExit('current PT has an unexpected image; refusing')
++    if cur and cur['Image'] == OLD_IMAGE_ID:
++        if prev:
++            raise SystemExit('two rc6 rollback candidates exist; refusing ambiguous state')
++        # Old container stopped before cutover, or rollback already renamed it.
++    else:
++        if not prev:
++            raise SystemExit(PT_PRE + ' missing; no verified rollback target')
++        if cur:
++            if failed:
++                raise SystemExit('failed-container slot already occupied; refusing overwrite')
++            if cur['State']['Running']:
++                run('podman', 'stop', '-t', '30', PT)
++            run('podman', 'rename', PT, PT_FAILED)
++        # PT can be absent after either the first cutover rename or the first
++        # rollback rename. In both cases the verified old container is PT_PRE.
++        run('podman', 'rename', PT_PRE, PT)
++    if not inspect(PT)['State']['Running']:
++        run('podman', 'start', PT)
+     print('ROLLBACK_HEALTH', health(18080, need_sidecar=True), flush=True)
+     assert inspect(PT)['Image'] == OLD_IMAGE_ID
+     (ROOT / 'rollback-ok.txt').write_text(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))

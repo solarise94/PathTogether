@@ -673,6 +673,10 @@ export class SlideToolsRunner {
 
   async _discardNow(jobId) {
     await this._request('release-source', {});
+    // bundle jobs: close the staged members' sync handles too — OPFS refuses
+    // to remove entries whose access handles are still open (probe-bundle
+    // leaves them open), and a refused probe must not leave a locked dir
+    await this._request('release-bundle', {}).catch(() => { /* pre-bundle worker */ });
     const jobs = await this._jobsDir();
     try {
       await E.withRetry(() => E.removeEntryRecursive(jobs, jobId), { attempts: 12, delayMs: 500 });

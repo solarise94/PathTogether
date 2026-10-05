@@ -1827,9 +1827,27 @@ async function scenarioVM() {
     path.join(L.GATE, 'fixtures', 'vms-native-bf-ome-compact.ome.tif'),
     ['--profile', 'bf-ome', '--encoding', 'compact', '--timeout', '7200']));
 
+  // 变体拒绝先行（廉价）：无 restart marker 的 VMS tile 在核心探测被拒——
+  // 复制后、任何输出前；任务目录必须被同步丢弃（release-bundle → OPFS
+  // 可删除），无遗留
+  const fixtureDir = path.join(L.GATE, 'fixtures');
+  fs.mkdirSync(fixtureDir, { recursive: true });
+  const noRestartDir = path.join(fixtureDir, 'vms-no-restart');
+  if (!fs.existsSync(path.join(noRestartDir, 'synthetic.vms'))) {
+    const { execFileSync } = require('child_process');
+    execFileSync(L.CLI, ['gen-vms', noRestartDir, '--no-restart']);
+  }
+
   const { context, page } = await L.launch('vm', [L.savePickerStub()]);
   try {
     await L.openTools(page, PORT);
+    await L.clearJobs(page);
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
+    await page.setInputFiles('#folder-input', noRestartDir);
+    await waitText(page, '#page-error', /restart marker/, 60000);
+    if ((await L.jobDirs(page)).length !== 0) throw new Error('no-restart VMS left a job dir');
+
     const runOnce = async (compact) => {
       await L.clearJobs(page);
       await page.reload({ waitUntil: 'load' });
@@ -1859,20 +1877,6 @@ async function scenarioVM() {
     const comp = await runOnce(true);
     if (comp.sha !== nativeCompactSha) throw new Error(`vms compact sha ${comp.sha} != native ${nativeCompactSha}`);
 
-    // 变体拒绝：无 restart marker 的 VMS tile 在复制前被拒（无任务目录）
-    const fixtureDir = path.join(L.GATE, 'fixtures');
-    fs.mkdirSync(fixtureDir, { recursive: true });
-    const noRestartDir = path.join(fixtureDir, 'vms-no-restart');
-    if (!fs.existsSync(path.join(noRestartDir, 'synthetic.vms'))) {
-      const { execFileSync } = require('child_process');
-      execFileSync(L.CLI, ['gen-vms', noRestartDir, '--no-restart']);
-    }
-    await L.clearJobs(page);
-    await page.reload({ waitUntil: 'load' });
-    await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
-    await page.setInputFiles('#folder-input', noRestartDir);
-    await waitText(page, '#page-error', /restart marker/, 60000);
-    if ((await L.jobDirs(page)).length !== 0) throw new Error('no-restart VMS left a job dir');
     record('vm-vms-folder-e2e', true, { format: pres.fmt, preserveSha: pres.sha,
       compactSha: comp.sha, variant: 'no-restart rejected before copy' });
   } catch (e) {

@@ -1188,4 +1188,11 @@ self.onmessage = async (ev) => {
     post({ type: 'reply', id: m.id, ok: true, result: {} });
     return;
   }
+  if (m.type === 'release-bundle') {
+    // discard path: close the staged members' sync handles so the job dir
+    // (locked while probe/convert hold them open) can be removed
+    closeBundle();
+    post({ type: 'reply', id: m.id, ok: true, result: {} });
+    return;
+  }
 };

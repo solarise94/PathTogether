@@ -59,6 +59,8 @@ fn main() -> ExitCode {
         #[cfg(feature = "synth-gen")]
         "gen-scn" => cmd_gen_scn(&args[1..]),
         #[cfg(feature = "synth-gen")]
+        "gen-gtiff" => cmd_gen_gtiff(&args[1..]),
+        #[cfg(feature = "synth-gen")]
         "gen-mrxs" => cmd_gen_mrxs(&args[1..]),
         _ => Err(CoreError::validation(format!("未知子命令 {}", args[0]))),
     };
@@ -334,10 +336,70 @@ fn vendor_rejection(v: slide_transform_core::scn::TiffVendor) -> CoreError {
         slide_transform_core::scn::TiffVendor::ConverterBigTiff => CoreError::variant(
             "本工具导出的 BigTIFF 不是转换输入：请直接上传该产物（或选择原始切片）",
         ),
+        // 未知厂商按 F5 路由进通用 TIFF 适配器（由适配器自身给出结构/
+        // 变体的类型化拒绝），这个兜底只应在无描述的非 TIFF 输入上出现
         _ => CoreError::variant(
-            "TIFF 结构合法但描述未标识 Aperio / Leica SCN：未知厂商变体不猜",
+            "TIFF 结构合法但描述未标识已知厂商：通用 TIFF 适配器未接受该文件",
         ),
     }
+}
+
+/// Capability report for a generic tiled JPEG TIFF input (F5).
+fn gtiff_doc_json(doc: &slide_transform_core::gtiff::GtiffDoc) -> String {
+    let levels: Vec<String> = doc
+        .levels
+        .iter()
+        .map(|lv| {
+            obj(&[
+                ju("ifd", lv.ifd_index as u64),
+                ju("width", lv.width as u64),
+                ju("height", lv.height as u64),
+                ju("tile_w", lv.tile_w as u64),
+                ju("tile_h", lv.tile_h as u64),
+                ju("tiles_across", lv.tiles_across as u64),
+                ju("tiles_down", lv.tiles_down as u64),
+                jstr(
+                    "color",
+                    match lv.color {
+                        slide_transform_core::gtiff::PayloadColor::Rgb => "rgb",
+                        slide_transform_core::gtiff::PayloadColor::YCbCr => "ycbcr",
+                    },
+                ),
+                jb("jpeg_tables", lv.jpeg_tables.is_some()),
+            ])
+        })
+        .collect();
+    let generated: Vec<String> = doc
+        .generated
+        .iter()
+        .map(|(w, h)| obj(&[ju("width", *w as u64), ju("height", *h as u64)]))
+        .collect();
+    obj(&[
+        jstr("format", slide_transform_core::gtiff::SOURCE_FORMAT),
+        jstr("adapter", slide_transform_core::gtiff::SOURCE_FORMAT),
+        jstr("adapter_version", slide_transform_core::gtiff::ADAPTER_VERSION),
+        jstr("modality", "brightfield"),
+        jstr(
+            "tiff_kind",
+            match doc.kind {
+                slide_transform_core::tiff_read::TiffKind::Classic => "classic",
+                slide_transform_core::tiff_read::TiffKind::BigTiff => "bigtiff",
+            },
+        ),
+        ju("width", doc.levels[0].width as u64),
+        ju("height", doc.levels[0].height as u64),
+        jraw("mpp_x", &doc.mpp.map(|v| v.to_string()).unwrap_or_else(|| "null".into())),
+        jraw("mpp_y", &doc.mpp.map(|v| v.to_string()).unwrap_or_else(|| "null".into())),
+        jstr(
+            "mpp_source",
+            if doc.mpp.is_some() { "tiff-resolution-tags" } else { "unknown" },
+        ),
+        jstr("pyramid_method", slide_transform_core::gtiff::PYRAMID_METHOD),
+        jarr("levels", &levels),
+        jarr("generated_levels", &generated),
+        jb("icc_profile", doc.icc.is_some()),
+        jstr("codec", "jpeg-baseline-passthrough"),
+    ])
 }
 
 /// Capability report for a Leica SCN input (F4).
@@ -434,8 +496,9 @@ fn cmd_probe(args: &[String]) -> Result<String, CoreError> {
     let magic = detect(&src)?;
     let mut scratch = FileScratch::new(&scratch_under(Path::new(path)));
     let doc_json = if is_tiff_magic(&magic) {
-        // F1/F4: bounded TIFF walk + vendor dispatch (typed rejections
-        // inside the adapters; OME-TIFF / converter BigTIFF are not inputs)
+        // F1/F4/F5: bounded TIFF walk + vendor dispatch (typed rejections
+        // inside the adapters; OME-TIFF / converter BigTIFF are not inputs;
+        // unknown vendors route to the generic tiled-JPEG adapter)
         match slide_transform_core::scn::sniff_tiff_vendor(&src)? {
             slide_transform_core::scn::TiffVendor::LeicaScn => {
                 scn_doc_json(&slide_transform_core::scn::probe_scn_with_budget(
@@ -446,6 +509,12 @@ fn cmd_probe(args: &[String]) -> Result<String, CoreError> {
             slide_transform_core::scn::TiffVendor::AperioSvs => svs_doc_json(
                 &slide_transform_core::svs::probe_svs(&src)?,
             ),
+            slide_transform_core::scn::TiffVendor::Unknown => {
+                gtiff_doc_json(&slide_transform_core::gtiff::probe_gtiff_with_budget(
+                    &src,
+                    memory_budget,
+                )?)
+            }
             v => return Err(vendor_rejection(v)),
         }
     } else if magic == KFBF_MAGIC {
@@ -565,6 +634,11 @@ fn cmd_probe(args: &[String]) -> Result<String, CoreError> {
             slide_transform_core::scn::TiffVendor::LeicaScn => {
                 slide_transform_core::scn::estimate_scn(
                     &slide_transform_core::scn::probe_scn_with_budget(&src, memory_budget)?,
+                )
+            }
+            slide_transform_core::scn::TiffVendor::Unknown => {
+                slide_transform_core::gtiff::estimate_gtiff(
+                    &slide_transform_core::gtiff::probe_gtiff_with_budget(&src, memory_budget)?,
                 )
             }
             _ => slide_transform_core::svs::estimate_svs(
@@ -837,16 +911,16 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
     };
     let is_scn = is_tiff_magic(&magic)
         && vendor == slide_transform_core::scn::TiffVendor::LeicaScn;
-    // 未知厂商留在 SVS 路由（由 SVS 适配器给出原「未标识 Aperio」文案）；
-    // OME-TIFF / 转换器 BigTIFF 在下面显式拒绝
+    // F5: 未知厂商（无已知厂商描述的 TIFF/BigTIFF）路由进通用瓦片 JPEG
+    // 适配器——由适配器自身按结构给类型化拒绝（条带/LZW/deflate/非 8 位/
+    // 多通道等「暂时直传」变体在复制前拒绝）
+    let is_gtiff = is_tiff_magic(&magic)
+        && vendor == slide_transform_core::scn::TiffVendor::Unknown;
     let is_svs = is_tiff_magic(&magic)
         && !is_scn
-        && matches!(
-            vendor,
-            slide_transform_core::scn::TiffVendor::AperioSvs
-                | slide_transform_core::scn::TiffVendor::Unknown
-        );
-    if is_tiff_magic(&magic) && !is_svs && !is_scn {
+        && !is_gtiff
+        && vendor == slide_transform_core::scn::TiffVendor::AperioSvs;
+    if is_tiff_magic(&magic) && !is_svs && !is_scn && !is_gtiff {
         return Err(vendor_rejection(vendor));
     }
     let enc_profile = match encoding.as_str() {
@@ -863,9 +937,9 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
             "compact-jpeg-v1 编码仅适用于明场；荧光不支持有损重编码",
         ));
     }
-    if (is_svs || is_scn) && is_fl {
+    if (is_svs || is_scn || is_gtiff) && is_fl {
         return Err(CoreError::variant(
-            "荧光 OME profile 不适用于明场 SVS/SCN 输入",
+            "荧光 OME profile 不适用于明场 SVS/SCN/通用 TIFF 输入",
         ));
     }
     let pixel_policy = match policy.as_str() {
@@ -926,6 +1000,15 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
             .with_encoding(enc_profile);
         plan.profile = out_profile;
         slide_transform_core::convert_scn::convert_scn_to_bigtiff(
+            &src, &mut sink, &mut scratch, &plan, &job,
+        )
+    } else if is_gtiff {
+        let mut plan = TransformPlan::brightfield(identity)
+            .with_policy(pixel_policy)
+            .with_limits(limits)
+            .with_encoding(enc_profile);
+        plan.profile = out_profile;
+        slide_transform_core::convert_gtiff::convert_gtiff_to_bigtiff(
             &src, &mut sink, &mut scratch, &plan, &job,
         )
     } else if is_svs {
@@ -1615,9 +1698,96 @@ fn cmd_gen_svs(args: &[String]) -> Result<String, CoreError> {
 }
 
 // --------------------------------------------------------------------------- //
-// synthetic Leica SCN generator（F4 测试数据；无患者数据）
+// synthetic generic-TIFF generator（F5 测试数据；无患者数据）
 // --------------------------------------------------------------------------- //
 
+#[cfg(feature = "synth-gen")]
+fn cmd_gen_gtiff(args: &[String]) -> Result<String, CoreError> {
+    let mut path = None;
+    let mut width = 520u32;
+    let mut height = 300u32;
+    let mut tile = 128u32;
+    let mut levels = 3u32;
+    let mut bigtiff = false;
+    let mut big_endian = false;
+    let mut color = "ycbcr".to_string();
+    let mut desc = "none".to_string();
+    let mut stripped = false;
+    let mut deflate = false;
+    let mut lzw = false;
+    let mut gray = false;
+    let mut bits16 = false;
+    let mut planar2 = false;
+    let mut tile_mismatch = false;
+    let mut shared_tables = false;
+    let mut no_xres = false;
+    let mut icc = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--width" => { i += 1; width = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--width"))?; }
+            "--height" => { i += 1; height = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--height"))?; }
+            "--tile" => { i += 1; tile = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--tile"))?; }
+            "--levels" => { i += 1; levels = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--levels"))?; }
+            "--bigtiff" => bigtiff = true,
+            "--big-endian" => big_endian = true,
+            "--color" => { i += 1; color = args.get(i).cloned().ok_or_else(|| CoreError::validation("--color"))?; }
+            "--desc" => { i += 1; desc = args.get(i).cloned().ok_or_else(|| CoreError::validation("--desc"))?; }
+            "--stripped" => stripped = true,
+            "--deflate" => deflate = true,
+            "--lzw" => lzw = true,
+            "--gray" => gray = true,
+            "--bits16" => bits16 = true,
+            "--planar2" => planar2 = true,
+            "--tile-mismatch" => tile_mismatch = true,
+            "--shared-tables" => shared_tables = true,
+            "--no-xres" => no_xres = true,
+            "--icc" => icc = true,
+            _ => path = Some(&args[i]),
+        }
+        i += 1;
+    }
+    let path = path.ok_or_else(|| CoreError::validation("gen-gtiff 需要 <out>"))?;
+    let p = slide_transform_core::gtiff_fixture::GtiffGenParams {
+        width,
+        height,
+        tile,
+        levels,
+        bigtiff,
+        big_endian,
+        color: match color.as_str() {
+            "rgb" => slide_transform_core::gtiff_fixture::FixtureColor::Rgb,
+            _ => slide_transform_core::gtiff_fixture::FixtureColor::YCbCr,
+        },
+        desc_mode: match desc.as_str() {
+            "ome" => slide_transform_core::gtiff_fixture::DescMode::Ome,
+            "converter" => slide_transform_core::gtiff_fixture::DescMode::Converter,
+            "aperio" => slide_transform_core::gtiff_fixture::DescMode::Aperio,
+            "scn" => slide_transform_core::gtiff_fixture::DescMode::ScnXml,
+            "foreign" => slide_transform_core::gtiff_fixture::DescMode::Foreign,
+            _ => slide_transform_core::gtiff_fixture::DescMode::None,
+        },
+        stripped,
+        deflate,
+        lzw,
+        gray,
+        bits16,
+        planar2,
+        tile_mismatch,
+        shared_tables,
+        xres: if no_xres { None } else { Some(10.0) },
+        icc,
+        ..Default::default()
+    };
+    let mut sink = FileSink::create(Path::new(path))?;
+    let n = slide_transform_core::gtiff_fixture::build_synthetic_gtiff(&mut sink, &p)?;
+    sink.flush()?;
+    Ok(obj(&[jstr("path", path), ju("bytes", n)]))
+}
+
+// --------------------------------------------------------------------------- //
+// synthetic Leica SCN generator（F4 测试数据；无患者数据）
+// --------------------------------------------------------------------------- //
 #[cfg(feature = "synth-gen")]
 fn cmd_gen_scn(args: &[String]) -> Result<String, CoreError> {
     let mut path = None;

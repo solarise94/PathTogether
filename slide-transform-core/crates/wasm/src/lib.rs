@@ -524,8 +524,9 @@ fn detect(src: &dyn ByteSource) -> CoreResult<[u8; 8]> {
     Ok(m)
 }
 
-/// Input kind by container signature: TIFF/BigTIFF headers route to the F1
-/// SVS adapter (the bounded walk inside decides Aperio/JPEG/convertible).
+/// Input kind by container signature: TIFF/BigTIFF headers start on the SVS
+/// route and are refined by the bounded vendor sniff into SCN (F4) / the
+/// generic tiled-JPEG adapter (F5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputKind {
     Kfb,
@@ -534,6 +535,9 @@ enum InputKind {
     /// Leica SCN (F4): a TIFF container whose IFD 0 description is the SCN
     /// XML — decided by the bounded vendor sniff, never by extension.
     Scn,
+    /// Generic tiled JPEG TIFF/BigTIFF (F5): a TIFF container whose IFD 0
+    /// description names NO known vendor — decided by the same sniff.
+    Gtiff,
 }
 
 fn input_kind(magic: &[u8; 8]) -> InputKind {
@@ -565,6 +569,7 @@ fn adapter_of(kind: InputKind) -> Option<&'static str> {
     match kind {
         InputKind::Svs => Some(slide_transform_core::svs::SOURCE_FORMAT),
         InputKind::Scn => Some(slide_transform_core::scn::SOURCE_FORMAT),
+        InputKind::Gtiff => Some(slide_transform_core::gtiff::SOURCE_FORMAT),
         _ => None,
     }
 }
@@ -575,18 +580,21 @@ fn adapter_version_of(kind: InputKind) -> Option<&'static str> {
     match kind {
         InputKind::Svs => Some(slide_transform_core::svs::ADAPTER_VERSION),
         InputKind::Scn => Some(slide_transform_core::scn::ADAPTER_VERSION),
+        InputKind::Gtiff => Some(slide_transform_core::gtiff::ADAPTER_VERSION),
         _ => None,
     }
 }
 
 /// Vendor-aware classification of a TIFF-magic source. OME-TIFF and this
 /// converter's own BigTIFF are NOT conversion inputs — typed rejection
-/// before anything is staged or written. An unknown vendor stays on the SVS
-/// route so the SVS adapter's own "未标识 Aperio" contract is unchanged.
+/// before anything is staged or written. An unknown vendor (no known
+/// vendor description) routes to the F5 generic tiled-JPEG adapter, whose
+/// own structural walk types the「暂时直传」variants.
 fn tiff_route(src: &dyn ByteSource) -> CoreResult<InputKind> {
     use slide_transform_core::scn::TiffVendor;
     match slide_transform_core::scn::sniff_tiff_vendor(src)? {
         TiffVendor::LeicaScn => Ok(InputKind::Scn),
+        TiffVendor::Unknown => Ok(InputKind::Gtiff),
         TiffVendor::OmeTiff => Err(CoreError::variant(
             "OME-TIFF 不是转换输入：平台可直接读取 OME-TIFF，请直接上传该文件",
         )),
@@ -730,14 +738,73 @@ fn scn_doc_json(doc: &slide_transform_core::scn::ScnDoc) -> String {
     )
 }
 
+/// Generic tiled JPEG TIFF capability document (probe result), mirroring
+/// the CLI's report.
+fn gtiff_doc_json(doc: &slide_transform_core::gtiff::GtiffDoc) -> String {
+    let levels: Vec<String> = doc
+        .levels
+        .iter()
+        .map(|lv| {
+            format!(
+                "{{\"ifd\":{},\"width\":{},\"height\":{},\"tile_w\":{},\"tile_h\":{},\"tiles_across\":{},\"tiles_down\":{},\"color\":\"{}\",\"jpeg_tables\":{}}}",
+                lv.ifd_index,
+                lv.width,
+                lv.height,
+                lv.tile_w,
+                lv.tile_h,
+                lv.tiles_across,
+                lv.tiles_down,
+                match lv.color {
+                    slide_transform_core::gtiff::PayloadColor::Rgb => "rgb",
+                    slide_transform_core::gtiff::PayloadColor::YCbCr => "ycbcr",
+                },
+                lv.jpeg_tables.is_some()
+            )
+        })
+        .collect();
+    let generated: Vec<String> = doc
+        .generated
+        .iter()
+        .map(|(w, h)| format!("{{\"width\":{w},\"height\":{h}}}"))
+        .collect();
+    let mpp = doc
+        .mpp
+        .map(|v| json_num(v))
+        .unwrap_or_else(|| "null".into());
+    format!(
+        "{{\"format\":\"{}\",\"adapter\":\"{}\",\"adapter_version\":\"{}\",\"modality\":\"brightfield\",\"tiff_kind\":\"{}\",\"width\":{},\"height\":{},\"mpp_x\":{},\"mpp_y\":{},\"mpp_source\":\"{}\",\"pyramid_method\":\"{}\",\"levels\":[{}],\"generated_levels\":[{}],\"icc_profile\":{},\"codec\":\"jpeg-baseline-passthrough\",\"estimate\":{}}}",
+        slide_transform_core::gtiff::SOURCE_FORMAT,
+        slide_transform_core::gtiff::SOURCE_FORMAT,
+        slide_transform_core::gtiff::ADAPTER_VERSION,
+        match doc.kind {
+            slide_transform_core::tiff_read::TiffKind::Classic => "classic",
+            slide_transform_core::tiff_read::TiffKind::BigTiff => "bigtiff",
+        },
+        doc.levels[0].width,
+        doc.levels[0].height,
+        mpp,
+        mpp,
+        if doc.mpp.is_some() { "tiff-resolution-tags" } else { "unknown" },
+        slide_transform_core::gtiff::PYRAMID_METHOD,
+        levels.join(","),
+        generated.join(","),
+        doc.icc.is_some(),
+        estimate_json(&slide_transform_core::gtiff::estimate_gtiff(doc))
+    )
+}
+
 /// TIFF-container probe dispatch (host-free so it is unit-testable):
-/// SCN vendor → the SCN adapter, every other vendor → the SVS adapter, and
-/// a routing Err (OME-TIFF / converter BigTIFF / structural failure) is
-/// returned VERBATIM — never masked by the SVS adapter's "未标识 Aperio".
+/// SCN vendor → the SCN adapter, unknown vendors → the generic tiled-JPEG
+/// adapter, Aperio → the SVS adapter, and a routing Err (OME-TIFF /
+/// converter BigTIFF / structural failure) is returned VERBATIM — never
+/// masked by another adapter's message.
 fn probe_tiff_doc(src: &dyn ByteSource) -> CoreResult<String> {
     match tiff_route(src)? {
         InputKind::Scn => {
             slide_transform_core::scn::probe_scn(src).map(|doc| scn_doc_json(&doc))
+        }
+        InputKind::Gtiff => {
+            slide_transform_core::gtiff::probe_gtiff(src).map(|doc| gtiff_doc_json(&doc))
         }
         _ => slide_transform_core::svs::probe_svs(src).map(|doc| svs_doc_json(&doc)),
     }
@@ -1061,6 +1128,26 @@ fn run_convert(
                 &src, &mut sink, &mut scratch, &plan, &job, rp,
             ),
             None => slide_transform_core::convert_scn::convert_scn_to_bigtiff(
+                &src, &mut sink, &mut scratch, &plan, &job,
+            ),
+        }
+    } else if kind == InputKind::Gtiff {
+        // Review §1 parity: the adapter bounds its probe/composition
+        // working set by the host's memory budget (the single-file path
+        // keeps the conservative saver default, like SCN).
+        let mut plan = TransformPlan::brightfield(identity)
+            .with_policy(policy)
+            .with_encoding(enc_profile);
+        plan.profile = out_profile;
+        plan.limits.memory_budget_bytes = budget_bytes
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|v| v as u64)
+            .unwrap_or(slide_transform_core::budget::SAVER_BUDGET_BYTES);
+        match resume.as_ref() {
+            Some(rp) => slide_transform_core::convert_gtiff::convert_gtiff_to_bigtiff_resume(
+                &src, &mut sink, &mut scratch, &plan, &job, rp,
+            ),
+            None => slide_transform_core::convert_gtiff::convert_gtiff_to_bigtiff(
                 &src, &mut sink, &mut scratch, &plan, &job,
             ),
         }
@@ -1728,6 +1815,30 @@ mod tests {
         assert_eq!(adapter_version_of(InputKind::Scn), Some("1"));
         assert_eq!(adapter_version_of(InputKind::Svs), Some("1"));
         assert_eq!(adapter_version_of(InputKind::Kfb), None);
+    }
+
+    #[test]
+    fn unknown_vendor_tiff_routes_to_the_generic_adapter() {
+        use slide_transform_core::io::MemSource;
+        // no description at all → vendor Unknown → the F5 generic adapter
+        let doc = probe_tiff_doc(&MemSource::new(one_ifd_bigtiff(
+            "", true, 7, 6, 16, 16,
+        )))
+        .unwrap();
+        assert!(
+            doc.contains("\"format\":\"generic-tiled-jpeg-tiff\""),
+            "{doc}"
+        );
+        assert!(doc.contains("\"adapter_version\":\"1\""), "{doc}");
+        assert_eq!(adapter_of(InputKind::Gtiff), Some("generic-tiled-jpeg-tiff"));
+        assert_eq!(adapter_version_of(InputKind::Gtiff), Some("1"));
+        // OME / converter BigTIFF still refuse with their typed reasons,
+        // never the generic adapter's structural messages
+        let e = probe_tiff_doc(&MemSource::new(one_ifd_bigtiff(
+            OME_XML_DESC, false, 7, 2, 520, 300,
+        )))
+        .unwrap_err();
+        assert!(e.message.contains("OME-TIFF 不是转换输入"), "{}", e.message);
     }
 
     #[test]

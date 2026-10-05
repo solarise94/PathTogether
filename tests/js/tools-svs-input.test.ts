@@ -146,10 +146,15 @@ describe("sniffTiffSlideCapability (bounded pre-stage probe)", () => {
 		expect(fl.reason).toContain("SamplesPerPixel");
 	});
 
-	it("rejects non-Aperio TIFFs without guessing", async () => {
+	it("non-Aperio TIFFs route to the generic tiled-JPEG adapter (F5)", async () => {
+		// F4 时无厂商描述一律拒绝；F5 把结构合法的无厂商 TIFF 交给
+		// generic-tiled-jpeg-tiff 适配器（变体由结构门槛与核心拒绝）
 		const cap = await E.sniffTiffSlideCapability(asFile(buildTiff({ aperio: false })));
-		expect(cap.supported).toBe(false);
-		expect(cap.reason).toContain("Aperio");
+		expect(cap).toMatchObject({
+			supported: true,
+			modality: "brightfield",
+			adapter: "generic-tiled-jpeg-tiff",
+		});
 	});
 
 	it("rejects non-TIFF files before any structure read", async () => {

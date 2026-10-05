@@ -346,7 +346,9 @@ fn vendor_rejection(v: slide_transform_core::scn::TiffVendor) -> CoreError {
 
 /// Capability report for a generic tiled JPEG TIFF input (F5).
 fn gtiff_doc_json(doc: &slide_transform_core::gtiff::GtiffDoc) -> String {
-    let levels: Vec<String> = doc
+    // `levels` is the OUTPUT pyramid (source + generated l0-box2 tail marked
+    // `"generated":true`) — same contract as the wasm probe document
+    let mut levels: Vec<String> = doc
         .levels
         .iter()
         .map(|lv| {
@@ -366,9 +368,25 @@ fn gtiff_doc_json(doc: &slide_transform_core::gtiff::GtiffDoc) -> String {
                     },
                 ),
                 jb("jpeg_tables", lv.jpeg_tables.is_some()),
+                jb("generated", false),
             ])
         })
         .collect();
+    for (i, (w, h)) in doc.generated.iter().enumerate() {
+        let tile = (doc.levels[0].tile_w, doc.levels[0].tile_h);
+        levels.push(obj(&[
+            ju("ifd", (doc.levels.len() + i) as u64),
+            ju("width", *w as u64),
+            ju("height", *h as u64),
+            ju("tile_w", tile.0 as u64),
+            ju("tile_h", tile.1 as u64),
+            ju("tiles_across", w.div_ceil(tile.0) as u64),
+            ju("tiles_down", h.div_ceil(tile.1) as u64),
+            jstr("color", "ycbcr"),
+            jb("jpeg_tables", false),
+            jb("generated", true),
+        ]));
+    }
     let generated: Vec<String> = doc
         .generated
         .iter()

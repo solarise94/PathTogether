@@ -1571,6 +1571,68 @@ async function scenarioSC() {
   }
 }
 
+// (gt) F5 通用 TIFF 页面入口：真实 CC0 样本（GTIFF_SAMPLE，缺省跳过）经页面
+// 识别为 Generic TIFF 明场 → 默认 bf-ome/保留画质转换 → 保存 sha == 原生；
+// compact 一次 == 原生 compact。变体拒绝（本地 gen-gtiff 条带夹具）在页面
+// 上复制前被拒且无任务目录（暂时直传变体）。
+async function scenarioGT() {
+  const gtiff = process.env.GTIFF_SAMPLE;
+  if (!gtiff || !fs.existsSync(gtiff)) {
+    record('gt-gtiff-page-e2e', true, { skipped: 'GTIFF_SAMPLE not set or missing' });
+    return;
+  }
+  const nativeSha = await L.sha256File(L.nativeConvert(gtiff,
+    path.join(L.GATE, 'fixtures', 'gtiff-native-bf-ome.ome.tif'), ['--profile', 'bf-ome']));
+  const nativeCompactSha = await L.sha256File(L.nativeConvert(gtiff,
+    path.join(L.GATE, 'fixtures', 'gtiff-native-bf-ome-compact.ome.tif'),
+    ['--profile', 'bf-ome', '--encoding', 'compact']));
+  const { context, page } = await L.launch('gt', [L.savePickerStub()]);
+  try {
+    await L.openTools(page, PORT);
+    const runOnce = async (compact) => {
+      await L.clearJobs(page);
+      await page.reload({ waitUntil: 'load' });
+      await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
+      await L.setFile(page, gtiff);
+      await waitVisible(page, '#summary-section:not([hidden])', 120000);
+      const fmt = (await page.textContent('#summary-format')).trim();
+      if (fmt !== 'Generic TIFF') throw new Error(`summary format "${fmt}"`);
+      const qShown = await page.evaluate(() => !document.getElementById('quality-fieldset').hidden);
+      if (!qShown) throw new Error('quality choice hidden for generic TIFF');
+      if (compact) await page.check('#quality-compact');
+      await page.click('#convert-btn');
+      await waitVisible(page, '#result-section:not([hidden])', 600000);
+      await page.click('#save-btn');
+      await waitText(page, '#save-status', /已保存|Saved/);
+      return { fmt, sha: (await L.opfsSha256(page)).sha256 };
+    };
+    const pres = await runOnce(false);
+    if (pres.sha !== nativeSha) throw new Error(`gtiff preserve sha ${pres.sha} != native ${nativeSha}`);
+    const comp = await runOnce(true);
+    if (comp.sha !== nativeCompactSha) throw new Error(`gtiff compact sha ${comp.sha} != native ${nativeCompactSha}`);
+    // 变体拒绝：条带通用 TIFF 夹具在复制前被拒（无任务目录）
+    const fixtureDir = path.join(L.GATE, 'fixtures');
+    fs.mkdirSync(fixtureDir, { recursive: true });
+    const stripped = path.join(fixtureDir, 'gtiff-stripped.tiff');
+    if (!fs.existsSync(stripped)) {
+      const { execFileSync } = require('child_process');
+      execFileSync(L.CLI, ['gen-gtiff', stripped, '--stripped']);
+    }
+    await L.clearJobs(page);
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
+    await L.setFile(page, stripped);
+    await waitText(page, '#page-error', /tiled|分块/, 60000);
+    if ((await L.jobDirs(page)).length !== 0) throw new Error('stripped generic TIFF left a job dir');
+    record('gt-gtiff-page-e2e', true, { format: pres.fmt, preserveSha: pres.sha, compactSha: comp.sha,
+      variant: 'stripped rejected before copy' });
+  } catch (e) {
+    record('gt-gtiff-page-e2e', false, { error: String(e).slice(0, 400) });
+  } finally {
+    await context.close();
+  }
+}
+
 // (mx) F3 MRXS 页面入口：真实 CC0 完整包（MRXS_SAMPLE_DIR，缺省跳过并记录）
 // 经「选择文件夹（MRXS）」input（page.setInputFiles 目录 → webkitRelativePath）
 // → 摘要 MRXS/明场/画质 + 拼接重编码说明 → 转换（保留画质，bf-ome）→ 保存
@@ -1686,6 +1748,7 @@ const SCENARIOS = [
   ['r', scenarioR], ['s', scenarioS], ['t', scenarioT], ['u', scenarioU],
   ['v', scenarioV], ['w', scenarioW], ['x', scenarioX], ['y', scenarioY],
   ['z', scenarioZ], ['sv', scenarioSV], ['mx', scenarioMX], ['sc', scenarioSC],
+  ['gt', scenarioGT],
 ];
 
 async function main() {

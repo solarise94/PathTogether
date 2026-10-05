@@ -741,12 +741,15 @@ fn scn_doc_json(doc: &slide_transform_core::scn::ScnDoc) -> String {
 /// Generic tiled JPEG TIFF capability document (probe result), mirroring
 /// the CLI's report.
 fn gtiff_doc_json(doc: &slide_transform_core::gtiff::GtiffDoc) -> String {
-    let levels: Vec<String> = doc
+    // `levels` is the OUTPUT pyramid (source levels + the generated l0-box2
+    // tail, marked `"generated":true`) — hosts size their per-IFD scratch
+    // set from this count, exactly like the MRXS probe document.
+    let mut levels: Vec<String> = doc
         .levels
         .iter()
         .map(|lv| {
             format!(
-                "{{\"ifd\":{},\"width\":{},\"height\":{},\"tile_w\":{},\"tile_h\":{},\"tiles_across\":{},\"tiles_down\":{},\"color\":\"{}\",\"jpeg_tables\":{}}}",
+                "{{\"ifd\":{},\"width\":{},\"height\":{},\"tile_w\":{},\"tile_h\":{},\"tiles_across\":{},\"tiles_down\":{},\"color\":\"{}\",\"jpeg_tables\":{},\"generated\":false}}",
                 lv.ifd_index,
                 lv.width,
                 lv.height,
@@ -762,6 +765,17 @@ fn gtiff_doc_json(doc: &slide_transform_core::gtiff::GtiffDoc) -> String {
             )
         })
         .collect();
+    for (i, (w, h)) in doc.generated.iter().enumerate() {
+        let tile = (doc.levels[0].tile_w, doc.levels[0].tile_h);
+        levels.push(format!(
+            "{{\"ifd\":{},\"width\":{w},\"height\":{h},\"tile_w\":{},\"tile_h\":{},\"tiles_across\":{},\"tiles_down\":{},\"color\":\"ycbcr\",\"jpeg_tables\":false,\"generated\":true}}",
+            doc.levels.len() + i,
+            tile.0,
+            tile.1,
+            w.div_ceil(tile.0),
+            h.div_ceil(tile.1),
+        ));
+    }
     let generated: Vec<String> = doc
         .generated
         .iter()

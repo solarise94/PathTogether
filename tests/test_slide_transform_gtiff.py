@@ -146,7 +146,11 @@ def test_missing_levels_generated_with_l0_box2(workdir):
          "--levels", "1", "--no-xres", "--gradient")
     pj = json.loads(_cli("probe", src).stdout)
     doc = pj["document"]
-    assert len(doc["levels"]) == 1
+    # probe 的 levels = 输出金字塔（源层 + 生成尾，生成层带 generated=true）
+    assert len(doc["levels"]) == 3
+    assert [l["generated"] for l in doc["levels"]] == [False, True, True]
+    assert [(l["width"], l["height"]) for l in doc["levels"]] == \
+        [(520, 300), (260, 150), (130, 75)]
     assert [(g["width"], g["height"]) for g in doc["generated_levels"]] == \
         [(260, 150), (130, 75)]
     assert doc["mpp_x"] is None, "分辨率标签缺失时不发明 mpp"

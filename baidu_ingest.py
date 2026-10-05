@@ -15,10 +15,10 @@ P4-c（合同 docs/slide-id-refactor-p4-contract-20260925.md §4）：
   **绝不写 UPLOAD_DIR 根、不查同名占用**——同名导入是独立资产（新
   slide_id）；预分配资产由调用方（baidu_import_store 条目编排）同事务绑定
   ``baidu_import_items.slide_id``，无 item 上下文的独立调用在此分配。
-- **convert（KFB/KFBF）**：仍经 conversion 现有接口（源副本按 source_name
-  落 UPLOAD_DIR 根、canonical 名语义保留）——转换链本体在 P4-a 切 ID；
-  本侧在 job 收口时优先回填 ``conversion_jobs.slide_id``（P4-a 落地前该列
-  为 NULL，保持现状名快照）。
+- **convert（KFB/KFBF）**：先转换后上传阶段 1 起不再触发服务端转换——
+  条目直接失败 ``convert_in_browser_first``（与筛选层一致）；筛选层只放行
+  TIFF 类扩展，下载后经 upload_direct_class 复查字节（OME-TIFF/转换器
+  BigTIFF/普通 TIFF 放行）。
 - **ingest_token 形态**：native = ``item:<item_id>``（条目持久身份，不再
   承诺 "slide:<name>" 的按名身份）；convert = ``cvj:<job_id>`` 不变。
 - **项目关联**按 slide_id（share_store.add_slides_to_project(slide_ids=)）；
@@ -38,6 +38,7 @@ import conversion_worker
 import share_store
 import slide_format_registry
 import slide_io
+import upload_direct_class
 
 
 class IngestError(Exception):
@@ -248,6 +249,11 @@ def _finish_ready_job(job, owner_user_id, target_project_id):
 def _ingest_convert(*, owner_user_id, name, staging, digest, dest_dir,
                     source_dest, target_project_id):
     """convert-required 收口：create_job（owner+sha 幂等）后按 job state 分派。
+
+    **先转换后上传阶段 1 起本函数不可达**：ingest_staging 对
+    convert-required 一律先拒绝（convert_in_browser_first，与筛选层同一
+    原因码），不再触发服务端转换。函数体保留只为历史提交可读与直接调用
+    的兼容（任何新调用点都必须先过 ingest_staging 的拒绝闸）。
 
     - ``ready``：产物已在（同内容换名也复用原任务），**不 claim/process**；
       按原 canonical 收口并删除本次复制的源文件副本（别名登记已由
@@ -520,8 +526,11 @@ def ingest_staging(*, owner_user_id, original_name, staging_path,
     """把已下载的暂存文件收口进工作区。返回 dict。
 
     调用方负责：暂存文件已按 source_size 校验；本函数再核 SHA、格式，
-    然后 native 走统一发布（受管理暂存 → 验证 → objects/<slide_id>/）或
-    convert-required 走转换 worker（P4-a 前保持 canonical 名语义）。
+    然后 native 走统一发布（受管理暂存 → 验证 → objects/<slide_id>/）。
+    先转换后上传阶段 1：convert-required（KFB/KFBF）不再触发服务端转换——
+    拒绝并给出与筛选层一致的原因码 ``convert_in_browser_first``；
+    native TIFF 候选下载后经 upload_direct_class 复查（OME-TIFF/转换器
+    BigTIFF/普通 TIFF「暂时直传」放行，非 TIFF 字节拒绝同一原因码）。
     ``item_id``/``slide_id`` 是批次条目上下文（预分配绑定；见
     :func:`_ingest_native`）。
     """
@@ -544,12 +553,19 @@ def ingest_staging(*, owner_user_id, original_name, staging_path,
         raise IngestError("baidu_bundle_unsupported")
 
     if cap == slide_format_registry.CAP_CONVERT_REQUIRED:
-        dest_dir = _upload_dir()
-        return _ingest_convert(
-            owner_user_id=owner_user_id, name=name, staging=staging,
-            digest=digest, dest_dir=dest_dir,
-            source_dest=dest_dir / name,
-            target_project_id=target_project_id)
+        # 先转换后上传阶段 1：KFB/KFBF 维持不转换——_ingest_convert 从此
+        # 不可达（保留函数体仅作历史兼容），拒绝给筛选层同一原因码。
+        raise IngestError(
+            "convert_in_browser_first", "请先在本机转换为 OME-TIFF 后再上传")
+
+    # native：下载后复查（upload_direct_class 单一实现，只读文件头/IFD）。
+    # OME-TIFF（ome-tiff）/转换器 BigTIFF（converter-bigtiff）放行；
+    # 普通 TIFF（tiff-other）按「暂时直传」规则放行；非 TIFF 字节
+    # （伪装扩展名/损坏文件）拒绝——先在本机转换为 OME-TIFF。
+    actual = upload_direct_class.sniff_tiff_class(str(staging))
+    if actual == upload_direct_class.ACTUAL_NON_TIFF:
+        raise IngestError(
+            "convert_in_browser_first", "请先在本机转换为 OME-TIFF 后再上传")
 
     # native 单文件：统一发布（P4-c）——同名不再冲突，独立新资产
     _upload_dir()  # 确保根目录存在

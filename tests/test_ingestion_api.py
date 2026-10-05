@@ -68,14 +68,16 @@ def owner_client():
     return client
 
 
-def _create(client, filename="cosapi-a.svs", size=500_000, **extra):
+def _create(client, filename="cosapi-a.tif", size=500_000, **extra):
+    # 先转换后上传阶段 1：默认名用 .tif（直传开放）；.svs 已关闭直传，
+    # 须显式 direct_class="unconverted-variant:svs-jp2k"。
     return client.post("/api/ingestions", json=dict(
         filename=filename, declared_size=size, **extra))
 
 
 def _mk_uploading(client, size=500_000):
     """创建并推进到 uploading（直改 store，绕过 worker）。"""
-    r = _create(client, filename="cosapi-%s.svs" % size, size=size)
+    r = _create(client, filename="cosapi-%s.tif" % size, size=size)
     assert r.status_code == 202, r.get_json()
     job_id = r.get_json()["job_id"]
     if ist.get_job(job_id)["state"] != ist.PREPARING:
@@ -161,7 +163,7 @@ def test_release_config_boundary_9p5e9(owner_client, monkeypatch):
     monkeypatch.setattr(cos_config, "COS_POOL_SAFETY_BYTES", 500_000_000)
     cos_pool_store.ensure_pool_state()
     monkeypatch.setattr(app_mod, "UPLOAD_PRODUCT_MAX_BYTES", 9_500_000_000)
-    r = _create(owner_client, filename="rel-a.svs", size=9_500_000_000,
+    r = _create(owner_client, filename="rel-a.tif", size=9_500_000_000,
                 idempotency_key="REL9")
     assert r.status_code == 202
     body = r.get_json()
@@ -169,7 +171,7 @@ def test_release_config_boundary_9p5e9(owner_client, monkeypatch):
     assert "code" not in body or body["code"] != "cos_pool_below_product_limit"
     assert cos_pool_store.get_pool_state()["reserved_bytes"] == 9_500_000_000
     # 多 1 字节即超产品上限：413，不建行、不占预约（无任何新副作用）
-    r2 = _create(owner_client, filename="rel-b.svs", size=9_500_000_001,
+    r2 = _create(owner_client, filename="rel-b.tif", size=9_500_000_001,
                  idempotency_key="REL10")
     assert r2.status_code == 413
     assert r2.get_json()["code"] == "upload_too_large"
@@ -180,20 +182,24 @@ def test_release_config_boundary_9p5e9(owner_client, monkeypatch):
 
 def test_format_acceptance_derived_from_registry(owner_client):
     # U2（§3.2）：受理词表从注册表派生——原生单文件（含此前被 COS 白名单
-    # 排除的 bmp/jpg）、zip（包）、kfb（conversion）均建任务；裸 bundle
-    # （.mrxs）与未登记格式 422 说明原因（无 fallback 指引）。
+    # 排除的 bmp/jpg）、zip（包）均建任务；裸 bundle（.mrxs）与未登记格式
+    # 422 说明原因（无 fallback 指引）。
     for name in ("cosapi-a.mrxs", "cosapinoext", "cosapi-a.exe"):
         r = _create(owner_client, filename=name)
         assert r.status_code == 422, name
         assert r.get_json()["code"] == "cos_format_unsupported"
-    # R1：convert-required（kfb）不再建后端转换任务，引导本机「转换并上传」
-    # （闸的完整断言见 tests/test_r1_conversion_gate.py）
+    # R1：convert-required（kfb）不再建后端转换任务，引导本机「转换并上传」；
+    # 阶段 1 起统一错误码 convert_in_browser（旧码 conversion_moved_to_browser
+    # 保留在 conversion retry 410 路径；闸的完整断言见
+    # tests/test_r1_conversion_gate.py）
     r = _create(owner_client, filename="cosapi-a.kfb", size=100_000)
     assert r.status_code == 422
-    assert r.get_json()["code"] == "conversion_moved_to_browser"
+    body = r.get_json()
+    assert body["code"] == "convert_in_browser"
+    assert body["tools_url"] == "/tools/slides"
     accepted = {"cosapi-a.zip": "zip",
-                "cosapi-b.svs": "native", "cosapi-a.bmp": "native",
-                "cosapi-c.tif": "native"}
+                "cosapi-a.bmp": "native", "cosapi-c.tif": "native",
+                "cosapi-d.ndpi": "native", "cosapi-e.ome.tif": "native"}
     for name, kind in accepted.items():
         r = _create(owner_client, filename=name, size=100_000)
         assert r.status_code == 202, name
@@ -201,6 +207,58 @@ def test_format_acceptance_derived_from_registry(owner_client):
         assert body["kind"] == kind, name
         # 每身份 1 active + 1 waiting：逐个取消腾位再验下一格式
         owner_client.post("/api/ingestions/%s/cancel" % body["job_id"])
+
+
+def test_direct_class_svs_closed_unless_declared(owner_client):
+    """阶段 1：.svs 直传关闭——无声明 422 convert_in_browser（不建行）；
+    合法 unconverted-variant:svs-jp2k 声明放行且随任务落库。"""
+    r = _create(owner_client, filename="dc-a.svs", size=100_000)
+    assert r.status_code == 422
+    body = r.get_json()
+    assert body["code"] == "convert_in_browser"
+    assert body["tools_url"] == "/tools/slides"
+    assert ist.waiting_and_holding_counts()["waiting"] == 0
+    r = _create(owner_client, filename="dc-b.svs", size=100_000,
+                direct_class="unconverted-variant:svs-jp2k")
+    assert r.status_code == 202, r.get_json()
+    job = ist.get_job(r.get_json()["job_id"])
+    assert job["kind"] == "native"
+    assert job["direct_class"] == "unconverted-variant:svs-jp2k"
+    owner_client.post("/api/ingestions/%s/cancel" % job["job_id"])
+
+
+def test_direct_class_vocab_and_extension_matching(owner_client):
+    """direct_class 词表校验 + 声明↔扩展名匹配（错配 422 invalid_direct_class）。"""
+    for bad in ("ome-tiff-but-wrong", "UNCONVERTED-VARIANT:SVS-JP2K-ish", ""):
+        r = _create(owner_client, filename="dcv-a.tif", size=100_000,
+                    direct_class=bad)
+        assert r.status_code in (400, 422), bad
+    # ome-tiff/converter-bigtiff 只对 .tif/.tiff
+    for dc in ("ome-tiff", "converter-bigtiff"):
+        r = _create(owner_client, filename="dcv-b.ndpi", size=100_000,
+                    direct_class=dc)
+        assert r.status_code == 422
+        assert r.get_json()["code"] == "invalid_direct_class"
+        r = _create(owner_client, filename="dcv-c.tif", size=100_000,
+                    direct_class=dc)
+        assert r.status_code == 202, dc
+        owner_client.post("/api/ingestions/%s/cancel" % r.get_json()["job_id"])
+    # svs-jp2k 变体只对 .svs
+    r = _create(owner_client, filename="dcv-d.tif", size=100_000,
+                direct_class="unconverted-variant:svs-jp2k")
+    assert r.status_code == 422
+    assert r.get_json()["code"] == "invalid_direct_class"
+    # legacy-direct 只对直传开放格式
+    r = _create(owner_client, filename="dcv-e.ndpi", size=100_000,
+                direct_class="legacy-direct")
+    assert r.status_code == 202
+    job = ist.get_job(r.get_json()["job_id"])
+    assert job["direct_class"] == "legacy-direct"
+    owner_client.post("/api/ingestions/%s/cancel" % job["job_id"])
+    r = _create(owner_client, filename="dcv-f.svs", size=100_000,
+                direct_class="legacy-direct")
+    assert r.status_code == 422
+    assert r.get_json()["code"] == "convert_in_browser"
 
 
 def test_sha256_expected_validation(owner_client):
@@ -228,9 +286,9 @@ def test_create_admits_and_responds_state(owner_client):
 
 
 def test_pool_exhausted_waits_with_position(owner_client):
-    a = _create(owner_client, filename="cosapi-e.svs", idempotency_key="A")
+    a = _create(owner_client, filename="cosapi-e.tif", idempotency_key="A")
     assert a.get_json()["state"] == ist.PREPARING
-    b = _create(owner_client, filename="cosapi-f.svs", idempotency_key="B")
+    b = _create(owner_client, filename="cosapi-f.tif", idempotency_key="B")
     assert b.status_code == 202
     body = b.get_json()
     assert body["state"] == ist.WAITING
@@ -244,12 +302,12 @@ def test_pool_exhausted_waits_with_position(owner_client):
 
 
 def test_second_waiting_rejected(owner_client):
-    a = _create(owner_client, filename="cosapi-e.svs", idempotency_key="A")
+    a = _create(owner_client, filename="cosapi-e.tif", idempotency_key="A")
     assert a.get_json()["state"] == ist.PREPARING
-    b = _create(owner_client, filename="cosapi-f.svs", idempotency_key="B")
+    b = _create(owner_client, filename="cosapi-f.tif", idempotency_key="B")
     assert b.get_json()["state"] == ist.WAITING
     # 同一身份（owner-1）已有一条 waiting → 409
-    c = _create(owner_client, filename="cosapi-g.svs", idempotency_key="C")
+    c = _create(owner_client, filename="cosapi-g.tif", idempotency_key="C")
     assert c.status_code == 409
     assert c.get_json()["code"] == "cos_waiting_limit"
 

@@ -51,12 +51,12 @@ _FORMATS = {
     ".vms": {
         "capability": CAP_NATIVE_SINGLE_FILE,
         "canonical_ext": None,
-        "notes": "Sakura VMS",
+        "notes": "Hamamatsu VMS（虚拟切片文本 + 同名数据目录）",
     },
     ".vmu": {
         "capability": CAP_NATIVE_SINGLE_FILE,
         "canonical_ext": None,
-        "notes": "Sakura VMU",
+        "notes": "Hamamatsu VMU",
     },
     ".scn": {
         "capability": CAP_NATIVE_SINGLE_FILE,
@@ -71,7 +71,7 @@ _FORMATS = {
     ".svslide": {
         "capability": CAP_NATIVE_SINGLE_FILE,
         "canonical_ext": None,
-        "notes": "GE/Synthesys SVSlide",
+        "notes": "Sakura SVSlide（NeoVue 格式）",
     },
     # --- 普通图片族（BMP/JPEG；raster_slide.RasterSlide 直接读） -----------
     ".bmp": {
@@ -180,6 +180,19 @@ def capability_exts(capability):
 
 #: 产品目录展示表（id 唯一；extensions 不重叠）。capability 在 public_catalog
 #: 里按首个扩展名回查 _FORMATS 防漂移（.ome.* 不在 _FORMATS，取声明值）。
+#
+# 先转换后上传阶段 1（docs/slide-tools/upload-convert-first-phase1.md）新增
+# 两个行级字段，import_mode 由它们派生：
+#   browser_convert: 'available'   有本机浏览器转换器（工作台交接 /tools/slides）
+#                    'unavailable' 暂无浏览器转换器
+#   direct_import:   'open'       平台当前受理直传（目录行级别）
+#                    'closed'     本阶段关闭直传（须先转换或凭声明例外）
+#   import_mode:     'direct-upload'     OME-TIFF/转换器 BigTIFF：嗅探确认后直接上传
+#                    'direct-temporary'  暂时直传（尚无浏览器转换器的格式/变体）
+#                    'convert'           本机转换后上传
+# 目录行级别无法区分编码变体（如 JPEG 编码与 JPEG2000 编码的 SVS）：.svs 行
+# 关闭直传；JPEG2000 变体经 /api/ingestions 的 direct_class 声明例外放行，
+# 服务端在 open_slide 前按文件头核验（upload_direct_class）。
 _CATALOG_DISPLAY = (
     {
         "id": "svs",
@@ -188,8 +201,11 @@ _CATALOG_DISPLAY = (
         "capability": CAP_NATIVE_SINGLE_FILE,
         "canonical_format": None,
         "bundle_required": False,
-        "import_mode": "direct",
-        "limits": [],
+        "browser_convert": "available",
+        "direct_import": "closed",
+        "import_mode": "convert",
+        "limits": ["本阶段需在本机转换为 OME-TIFF 后上传（转换工具识别 "
+                   "JPEG 编码 SVS）；JPEG2000 编码的 SVS 暂可直接导入"],
         "selectable_for_upload": True,
     },
     {
@@ -199,8 +215,11 @@ _CATALOG_DISPLAY = (
         "capability": CAP_NATIVE_SINGLE_FILE,
         "canonical_format": None,
         "bundle_required": False,
-        "import_mode": "direct",
-        "limits": [],
+        "browser_convert": "unavailable",
+        "direct_import": "open",
+        "import_mode": "direct-temporary",
+        "limits": ["暂时直接导入；本机转换工具导出的 BigTIFF 会被识别并"
+                   "按「直接上传」处理"],
         "selectable_for_upload": True,
     },
     {
@@ -210,7 +229,9 @@ _CATALOG_DISPLAY = (
         "capability": CAP_NATIVE_SINGLE_FILE,
         "canonical_format": None,
         "bundle_required": False,
-        "import_mode": "direct",
+        "browser_convert": "unavailable",
+        "direct_import": "open",
+        "import_mode": "direct-upload",
         "limits": ["请使用完整的 .ome.tif / .ome.tiff 后缀命名，"
                    "多通道荧光元数据可被直接识别"],
         "selectable_for_upload": True,
@@ -222,8 +243,10 @@ _CATALOG_DISPLAY = (
         "capability": CAP_NATIVE_SINGLE_FILE,
         "canonical_format": None,
         "bundle_required": False,
-        "import_mode": "direct",
-        "limits": [],
+        "browser_convert": "unavailable",
+        "direct_import": "open",
+        "import_mode": "direct-temporary",
+        "limits": ["暂时直接导入（本阶段尚无本机转换器）"],
         "selectable_for_upload": True,
     },
     {
@@ -233,30 +256,37 @@ _CATALOG_DISPLAY = (
         "capability": CAP_NATIVE_BUNDLE,
         "canonical_format": None,
         "bundle_required": True,
-        "import_mode": "bundle",
-        "limits": ["需要完整包（主文件 + 同名伴随目录），请打包 zip 上传"],
+        "browser_convert": "available",
+        "direct_import": "closed",
+        "import_mode": "convert",
+        "limits": ["需要完整包（主文件 + 同名伴随目录）；在工作台选择"
+                   "整个文件夹，在本机浏览器转换后上传"],
         "selectable_for_upload": True,
     },
     {
         "id": "vms",
-        "display_name": "Sakura VMS",
+        "display_name": "Hamamatsu VMS",
         "extensions": [".vms"],
         "capability": CAP_NATIVE_SINGLE_FILE,
         "canonical_format": None,
         "bundle_required": False,
-        "import_mode": "direct",
-        "limits": [],
+        "browser_convert": "unavailable",
+        "direct_import": "open",
+        "import_mode": "direct-temporary",
+        "limits": ["暂时直接导入（本阶段尚无本机转换器）"],
         "selectable_for_upload": True,
     },
     {
         "id": "vmu",
-        "display_name": "Sakura VMU",
+        "display_name": "Hamamatsu VMU",
         "extensions": [".vmu"],
         "capability": CAP_NATIVE_SINGLE_FILE,
         "canonical_format": None,
         "bundle_required": False,
-        "import_mode": "direct",
-        "limits": [],
+        "browser_convert": "unavailable",
+        "direct_import": "open",
+        "import_mode": "direct-temporary",
+        "limits": ["暂时直接导入（本阶段尚无本机转换器）"],
         "selectable_for_upload": True,
     },
     {
@@ -266,8 +296,10 @@ _CATALOG_DISPLAY = (
         "capability": CAP_NATIVE_SINGLE_FILE,
         "canonical_format": None,
         "bundle_required": False,
-        "import_mode": "direct",
-        "limits": [],
+        "browser_convert": "unavailable",
+        "direct_import": "open",
+        "import_mode": "direct-temporary",
+        "limits": ["暂时直接导入（本阶段尚无本机转换器）"],
         "selectable_for_upload": True,
     },
     {
@@ -277,19 +309,23 @@ _CATALOG_DISPLAY = (
         "capability": CAP_NATIVE_SINGLE_FILE,
         "canonical_format": None,
         "bundle_required": False,
-        "import_mode": "direct",
-        "limits": [],
+        "browser_convert": "unavailable",
+        "direct_import": "open",
+        "import_mode": "direct-temporary",
+        "limits": ["暂时直接导入（本阶段尚无本机转换器）"],
         "selectable_for_upload": True,
     },
     {
         "id": "svslide",
-        "display_name": "GE / Synthesys SVSlide",
+        "display_name": "Sakura SVSlide",
         "extensions": [".svslide"],
         "capability": CAP_NATIVE_SINGLE_FILE,
         "canonical_format": None,
         "bundle_required": False,
-        "import_mode": "direct",
-        "limits": [],
+        "browser_convert": "unavailable",
+        "direct_import": "open",
+        "import_mode": "direct-temporary",
+        "limits": ["暂时直接导入（本阶段尚无本机转换器）"],
         "selectable_for_upload": True,
     },
     {
@@ -299,8 +335,10 @@ _CATALOG_DISPLAY = (
         "capability": CAP_NATIVE_SINGLE_FILE,
         "canonical_format": None,
         "bundle_required": False,
-        "import_mode": "direct",
-        "limits": ["普通图片、支持像素坐标、无物理标尺"],
+        "browser_convert": "unavailable",
+        "direct_import": "open",
+        "import_mode": "direct-temporary",
+        "limits": ["普通图片、支持像素坐标、无物理标尺；暂时直接导入"],
         "selectable_for_upload": True,
     },
     {
@@ -310,6 +348,8 @@ _CATALOG_DISPLAY = (
         "capability": CAP_CONVERT_REQUIRED,
         "canonical_format": "bigtiff",
         "bundle_required": False,
+        "browser_convert": "available",
+        "direct_import": "closed",
         "import_mode": "convert",
         "limits": ["在本机浏览器中转换为 BigTIFF（明场）后上传"],
         "selectable_for_upload": True,
@@ -321,6 +361,8 @@ _CATALOG_DISPLAY = (
         "capability": CAP_CONVERT_REQUIRED,
         "canonical_format": "ome-tiff",
         "bundle_required": False,
+        "browser_convert": "available",
+        "direct_import": "closed",
         "import_mode": "convert",
         "limits": ["在本机浏览器中转换为多通道 OME-TIFF（荧光）后上传"],
         "selectable_for_upload": True,
@@ -333,9 +375,11 @@ def public_catalog():
 
     每项字段：``id / display_name / extensions / capability /
     canonical_format(None|'bigtiff'|'ome-tiff') / bundle_required /
-    import_mode('direct'|'convert'|'bundle') / limits(用户向短句) /
-    selectable_for_upload``。capability 按首个扩展名回查 ``_FORMATS``
-    （防两表漂移；.ome.* 复合后缀不在 _FORMATS，取声明值）。
+    browser_convert('available'|'unavailable') /
+    direct_import('open'|'closed') /
+    import_mode('direct-upload'|'convert'|'direct-temporary') /
+    limits(用户向短句) / selectable_for_upload``。capability 按首个扩展名
+    回查 ``_FORMATS``（防两表漂移；.ome.* 复合后缀不在 _FORMATS，取声明值）。
     文案不复用 _FORMATS.notes（那是引擎判定备注，含已过时的接入状态）。
     """
     items = []
@@ -347,6 +391,8 @@ def public_catalog():
             "capability": row["capability"],
             "canonical_format": row["canonical_format"],
             "bundle_required": row["bundle_required"],
+            "browser_convert": row["browser_convert"],
+            "direct_import": row["direct_import"],
             "import_mode": row["import_mode"],
             "limits": list(row["limits"]),
             "selectable_for_upload": row["selectable_for_upload"],
@@ -356,3 +402,18 @@ def public_catalog():
             item["capability"] = info["capability"]
         items.append(item)
     return items
+
+
+def catalog_rows_by_flag(flag, value):
+    """目录行级旗标筛选 → 该批行的扩展名集合（不带点、小写）。
+
+    先转换后上传阶段 1 的两个派生词表共用：
+      ``catalog_rows_by_flag("direct_import", "closed")``  → 直传关闭集
+      ``catalog_rows_by_flag("browser_convert", "available")`` → 浏览器转换集
+    （mrxs 的裸扩展名不在 COS 直传受理集，经 zip 的 MRXS 在 worker 拒绝。）
+    """
+    exts = set()
+    for row in _CATALOG_DISPLAY:
+        if row.get(flag) == value:
+            exts.update(e.lstrip(".").lower() for e in row["extensions"])
+    return frozenset(exts)

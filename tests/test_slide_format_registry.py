@@ -143,7 +143,7 @@ def test_raster_image_whitelist_synced():
 
 
 def test_public_catalog_raster_image_row():
-    """目录单列一条 raster-image：direct 单文件、可选上传、用户向短句。"""
+    """目录单列一条 raster-image：暂时直传、可选上传、用户向短句。"""
     rows = {item["id"]: item for item in reg.public_catalog()}
     item = rows["raster-image"]
     assert item["display_name"] == "普通图片（BMP / JPEG）"
@@ -151,9 +151,9 @@ def test_public_catalog_raster_image_row():
     assert item["capability"] == reg.CAP_NATIVE_SINGLE_FILE
     assert item["canonical_format"] is None
     assert item["bundle_required"] is False
-    assert item["import_mode"] == "direct"
+    assert item["import_mode"] == "direct-temporary"
     assert item["selectable_for_upload"] is True
-    assert item["limits"] == ["普通图片、支持像素坐标、无物理标尺"]
+    assert item["limits"] == ["普通图片、支持像素坐标、无物理标尺；暂时直接导入"]
 
 
 def test_public_catalog_user_wording_no_internal_terms():
@@ -176,3 +176,47 @@ def test_public_catalog_ids_unique_and_exts_disjoint():
         for ext in item["extensions"]:
             assert ext not in seen, ext
             seen.append(ext)
+
+
+# --------------------------------------------------------------------------- #
+# 4. 先转换后上传阶段 1：目录行级 browser_convert / direct_import / import_mode
+# --------------------------------------------------------------------------- #
+def test_public_catalog_direct_class_flags():
+    """每行带 browser_convert/direct_import，import_mode 三值由旗标派生。"""
+    rows = {item["id"]: item for item in reg.public_catalog()}
+    for item in rows.values():
+        assert item["browser_convert"] in ("available", "unavailable")
+        assert item["direct_import"] in ("open", "closed")
+        assert item["import_mode"] in ("direct-upload", "convert",
+                                       "direct-temporary")
+    # 直接上传：仅 OME-TIFF（转换器 BigTIFF 与普通 TIFF 共用 .tif 行，
+    # 行级按「暂时直传」展示；识别靠文件头嗅探）
+    assert rows["ome-tiff"]["import_mode"] == "direct-upload"
+    assert rows["ome-tiff"]["direct_import"] == "open"
+    # 本机转换后上传：svs（JPEG 编码）/ mrxs / kfb / kfbf
+    for rid in ("svs", "mrxs", "kfb", "kfbf"):
+        assert rows[rid]["import_mode"] == "convert", rid
+        assert rows[rid]["browser_convert"] == "available", rid
+        assert rows[rid]["direct_import"] == "closed", rid
+    # 暂时直接导入：尚无浏览器转换器的格式
+    for rid in ("tif", "ndpi", "vms", "vmu", "scn", "bif", "svslide",
+                "raster-image"):
+        assert rows[rid]["import_mode"] == "direct-temporary", rid
+        assert rows[rid]["direct_import"] == "open", rid
+        assert rows[rid]["browser_convert"] == "unavailable", rid
+
+
+def test_catalog_flag_derived_vocabularies():
+    """catalog_rows_by_flag 派生两张词表（app 能力下发/关闭闸共用）。"""
+    closed = reg.catalog_rows_by_flag("direct_import", "closed")
+    assert closed == {"svs", "mrxs", "kfb", "kfbf"}
+    bc = reg.catalog_rows_by_flag("browser_convert", "available")
+    assert bc == {"svs", "mrxs", "kfb", "kfbf"}
+
+
+def test_vendor_names_corrected():
+    """名称修正：VMS/VMU 属 Hamamatsu，SVSlide 属 Sakura（目录行展示名）。"""
+    rows = {item["id"]: item for item in reg.public_catalog()}
+    assert rows["vms"]["display_name"].startswith("Hamamatsu")
+    assert rows["vmu"]["display_name"].startswith("Hamamatsu")
+    assert rows["svslide"]["display_name"].startswith("Sakura")

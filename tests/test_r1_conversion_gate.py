@@ -46,7 +46,10 @@ def test_convert_required_upload_refused_without_side_effects(owner_client,
     r = _create(owner_client, filename=name, size=100_000)
     assert r.status_code == 422
     body = r.get_json()
-    assert body["code"] == "conversion_moved_to_browser"
+    # 阶段 1：创建闸统一错误码 convert_in_browser（与旧码
+    # conversion_moved_to_browser 同形：error + code + tools_url；
+    # 旧码保留在下方 retry 410 路径）
+    assert body["code"] == "convert_in_browser"
     assert body["tools_url"] == "/tools/slides"
     after = (_count("SELECT count(*) FROM ingestion_jobs"),
              _count("SELECT count(*) FROM upload_reservations"),
@@ -77,8 +80,14 @@ def test_capability_routes_convert_required_to_browser(monkeypatch):
     with app_mod.app.test_request_context("/"):
         p = app_mod._cos_upload_capability_payload(demo=False)
     assert "kfb" not in p["formats"] and "kfbf" not in p["formats"]
-    assert {"kfb", "kfbf"} <= set(p["browser_convert"]["formats"])
+    # 阶段 1：browser_convert 词表扩展到目录行级（kfb/kfbf + svs + mrxs）
+    assert {"kfb", "kfbf", "svs", "mrxs"} == \
+        set(p["browser_convert"]["formats"])
     assert p["browser_convert"]["url"] == "/tools/slides"
+    # direct_upload 清单：直传开放格式（不含 svs/kfb/kfbf/mrxs/zip）
+    du = set(p["direct_upload"]["formats"])
+    assert {"tif", "tiff", "ome.tif", "ome.tiff", "ndpi", "vms", "vmu",
+            "scn", "bif", "svslide", "bmp", "jpg", "jpeg"} == du
 
 
 def test_image_does_not_start_legacy_executors_by_default():

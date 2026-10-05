@@ -222,8 +222,8 @@ def test_homepage_links_to_tools():
     html = (REPO_ROOT / "templates" / "entry.html").read_text(encoding="utf-8")
     assert 'href="/tools/slides"' in html
     assert 'data-i18n="entry.nav.slides"' in html
-    # 本地切片工具链接文本存在（zh 默认）
-    assert "本地切片工具" in html
+    # 本地切片工具链接文本存在（zh 默认；2026-10 起导航文案为「切片格式转换工具」）
+    assert "切片格式转换工具" in html
 
 
 def test_homepage_entry_renders_link(_iso):

@@ -253,7 +253,7 @@ def test_slide_formats_endpoint_raster_image_row():
     assert it["capability"] == "native-single-file"
     assert it["canonical_format"] is None
     assert it["bundle_required"] is False
-    assert it["import_mode"] == "direct"
+    assert it["import_mode"] == "direct-temporary"
     assert it["selectable_for_upload"] is True
     assert any("无物理标尺" in lim for lim in it["limits"])  # 用户向短句
 

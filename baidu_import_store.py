@@ -508,8 +508,21 @@ def _format_suffix(name):
     return ""
 
 
+#: 百度导入放行的扩展名（先转换后上传阶段 1）：只放行 TIFF 类——其余扩展
+#: （KFB/KFBF、SVS、MRXS 等）标为不可选，原因码 convert_in_browser_first
+#: （「请先在本机转换为 OME-TIFF 后再上传」）。下载后的字节级复查在
+#: baidu_ingest（upload_direct_class 单一实现）。
+BAIDU_SELECTABLE_SUFFIXES = frozenset(
+    {".tif", ".tiff", ".ome.tif", ".ome.tiff"})
+
+
 def _classify_files(files, dirs):
-    """按注册表 + W5 规则分类文件条目 → candidate 行字段列表。"""
+    """按注册表 + W5 规则分类文件条目 → candidate 行字段列表。
+
+    先转换后上传阶段 1：筛选层只放行 TIFF 类扩展；其他已登记扩展
+    （KFB/KFBF/SVS/MRXS 等）不可选，原因码 ``convert_in_browser_first``；
+    未登记扩展维持 ``unsupported_format``。
+    """
     out = []
     for f in files:
         rel = f["relative_path"]
@@ -520,21 +533,13 @@ def _classify_files(files, dirs):
             continue
         info = slide_format_registry.lookup(name)
         cap = info["capability"]
-        if cap == slide_format_registry.CAP_NATIVE_BUNDLE:
-            # MRXS：本地完整包入口保留；百度侧无法保证整目录包时明确
-            # “当前不支持从百度导入该 bundle”，不假装支持
-            parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
-            stem = name[:-len(suffix)] if suffix else name
-            sibling = (parent + "/" + stem) if parent else stem
-            reason = ("baidu_bundle_unsupported" if sibling in dirs
-                      else "bundle_incomplete")
-            out.append((f, suffix, cap, False, reason))
-        elif cap in (slide_format_registry.CAP_NATIVE_SINGLE_FILE,
-                     slide_format_registry.CAP_CONVERT_REQUIRED):
-            # native 单文件 + 已实现转换（KFB/KFBF）可选
+        if suffix in BAIDU_SELECTABLE_SUFFIXES:
             out.append((f, suffix, cap, True, None))
-        else:
+        elif cap == slide_format_registry.CAP_UNSUPPORTED:
             out.append((f, suffix, cap, False, "unsupported_format"))
+        else:
+            # 已登记但本阶段不走百度直传：先在本机转换为 OME-TIFF
+            out.append((f, suffix, cap, False, "convert_in_browser_first"))
     return out
 
 

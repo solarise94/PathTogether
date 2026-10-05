@@ -314,7 +314,8 @@ def _abandon_staging_asset(cur, job):
 def create_waiting_job(owner_user_id, owner_role, filename, safe_name,
                        format_ext, declared_size, *, idempotency_key=None,
                        policy_version=None, route_reason=None,
-                       kind=KIND_NATIVE, sha256_expected=None):
+                       kind=KIND_NATIVE, sha256_expected=None,
+                       direct_class=None):
     """创建 waiting_capacity 任务（尚不预约任何容量/凭证，§4/§6.1）。
 
     P4-b（合同 §5.2）：native 形态**创建即预分配 slide_id**——同一事务内
@@ -328,6 +329,12 @@ def create_waiting_job(owner_user_id, owner_role, filename, safe_name,
     create_job 预分配（job 经 conversion_job_id 关联）。两类任务的
     ``slide_id`` 恒 NULL（``_abandon_staging_asset`` 等 null 安全）。
     ``sha256_expected``（可选，64 hex）为整对象声明，下载校验后比对。
+
+    0078（先转换后上传阶段 1）：``direct_class``（可选）是浏览器端嗅探
+    文件头后的直传类别声明（ome-tiff|converter-bigtiff|legacy-direct|
+    unconverted-variant:svs-jp2k）；词表校验在 app 层，这里原样落库。
+    worker 在 open_slide 之前按 upload_direct_class 核验（NULL=未声明，
+    不做头级核验）。
 
     幂等：同 (owner, idempotency_key) 存活/已完成任务唯一（0066 部分唯一
     索引兜底）——冲突时返回 (既有行, False)，**复用既有行的 slide_id**
@@ -368,13 +375,13 @@ def create_waiting_job(owner_user_id, owner_role, filename, safe_name,
                             "owner_role, idempotency_key, filename, safe_name, "
                             "format_ext, declared_size, state, transport, "
                             "policy_version, route_reason, slide_id, kind, "
-                            "sha256_expected, waiting_expires_at) "
+                            "sha256_expected, direct_class, waiting_expires_at) "
                             "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'presign_parts',"
-                            "%s,%s,%s,%s,%s, now() + make_interval(secs => %s))",
+                            "%s,%s,%s,%s,%s,%s, now() + make_interval(secs => %s))",
                             (job_id, owner_user_id, owner_role, idempotency_key,
                              filename, safe_name, format_ext, declared_size,
                              WAITING, policy_version, route_reason,
-                             slide_id, kind, sha256_expected,
+                             slide_id, kind, sha256_expected, direct_class,
                              cos_config.COS_WAITING_MAX_AGE_SECONDS))
                 except psycopg.errors.UniqueViolation as exc:
                     constraint = getattr(exc.diag, "constraint_name", "") or ""
@@ -409,7 +416,8 @@ def create_waiting_job(owner_user_id, owner_role, filename, safe_name,
                 _append_event(cur, job_id, "created", {
                     "declared_size": declared_size, "format_ext": format_ext,
                     "policy_version": policy_version,
-                    "route_reason": route_reason})
+                    "route_reason": route_reason,
+                    "direct_class": direct_class})
                 cur.execute("SELECT * FROM ingestion_jobs WHERE job_id=%s",
                             (job_id,))
                 return _norm_row(cur.fetchone()), True

@@ -77,6 +77,7 @@ import slide_publish  # noqa: E402
 import slide_storage  # noqa: E402
 import slide_store  # noqa: E402
 import task_storage_lock  # noqa: E402
+import upload_direct_class  # noqa: E402  # direct_class 声明头级核验（阶段 1）
 import upload_guard  # noqa: E402
 
 _log = logging.getLogger("svs.cos_ingest")
@@ -911,6 +912,20 @@ def _validating_critical_section(job, state, cleanup_due):
             if os.path.getsize(staged) != declared:
                 _fail("local_size_mismatch")
                 return None
+            # 先转换后上传阶段 1（0078）：open_slide 试开**之前**核验创建时
+            # 声明的直传类别（只读文件头/IFD，upload_direct_class 单一实现）。
+            # 不符 → 确定性失败，错误码 convert_in_browser（引导本机转换）；
+            # NULL/legacy-direct 不做头级核验，字节合法性仍由 open_slide 终审。
+            declared_direct = (job.get("direct_class") or "").strip().lower()
+            if declared_direct and not upload_direct_class.declaration_matches(
+                    staged, declared_direct,
+                    filename=(job.get("filename")
+                              or job.get("safe_name") or entry)):
+                _fail("convert_in_browser")
+                _log.warning(
+                    "direct_class 声明与文件头不符（job=%s declared=%s）",
+                    job_id, declared_direct)
+                return None
             try:
                 # open_slide 试开+关（app.py:_validate_slide_file 同口径；
                 # format_hint 用客户端文件名——暂存件扩展名不参与逻辑格式判定）。
@@ -1092,6 +1107,14 @@ def _zip_critical_section(job, state, cleanup_due):
                 return None
             if os.path.getsize(staged) != declared:
                 _fail("local_size_mismatch")
+                return None
+            # 先转换后上传阶段 1：关闭「zip 中含 MRXS 包」的上传——解包前扫
+            # 中央目录（不触碰成员字节）；命中即确定性失败 convert_in_browser
+            # （MRXS 改走工作台文件夹交接 → 本机浏览器转换）。
+            if upload_direct_class.zip_contains_bundle_entry(staged):
+                _fail("convert_in_browser")
+                _log.warning(
+                    "zip 内含 MRXS 包，直传已关闭（job=%s）", job_id)
                 return None
             sha = (job.get("download_checkpoint_json") or {}).get("sha256") or ""
             if not sha:

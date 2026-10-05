@@ -70,6 +70,9 @@ import slide_publish
 import slide_store
 import slide_storage
 import task_storage_lock
+# 先转换后上传阶段 1：direct_class 声明词表与头级核验（worker/百度共用
+# 实现；本文件只在创建时做词表/扩展名匹配，不做文件头读取）。
+import upload_direct_class
 # 多通道伪彩渲染（规格 §7.1 共享模块）：manifest / canonical context /
 # HMAC render_token / 请求级解析 / RenderedSlideView 由 app.py 与
 # share_server.py 共用，禁止在本文件复制颜色/签名算法。
@@ -2813,9 +2816,36 @@ def _server_conversion_closed(message):
                    tools_url=BROWSER_CONVERT_URL)
 
 
+def _convert_in_browser_closed(message):
+    """先转换后上传阶段 1 的统一拒绝形态（与 conversion_moved_to_browser
+    同形：error + code + tools_url；旧码保留在 conversion retry 410 路径，
+    见 test_r1_conversion_gate.py）。"""
+    return jsonify(error=message, code="convert_in_browser",
+                   tools_url=BROWSER_CONVERT_URL)
+
+
 def _browser_convert_formats():
-    return set(slide_format_registry.capability_exts(
-        slide_format_registry.CAP_CONVERT_REQUIRED))
+    """浏览器转换器覆盖的扩展名（目录行级 browser_convert=available）。"""
+    return set(slide_format_registry.catalog_rows_by_flag(
+        "browser_convert", "available"))
+
+
+def _direct_import_closed_formats():
+    """目录行级直传关闭集（direct_import=closed）。.svs 本阶段关闭——
+    JPEG2000 变体凭 direct_class 声明例外放行（api_ingestions_create）。"""
+    return set(slide_format_registry.catalog_rows_by_flag(
+        "direct_import", "closed"))
+
+
+def _direct_upload_formats():
+    """capability 下发的 direct_upload 清单：当前受理直传的扩展名
+    （native − 直传关闭集 + OME 复合后缀；zip 是运输容器，不在此列）。"""
+    exts = set(slide_format_registry.capability_exts(
+        slide_format_registry.CAP_NATIVE_SINGLE_FILE))
+    exts -= _direct_import_closed_formats()
+    exts.discard("mrxs")
+    exts |= {e.lstrip(".") for e in slide_format_registry.ome_extensions()}
+    return exts
 
 
 def _cos_accepted_formats():
@@ -2854,6 +2884,65 @@ def _cos_ingestion_kind_for(safe):
                           code="cos_format_unsupported"), 422)
 
 
+def _validate_direct_class(safe, kind, value):
+    """创建时的 direct_class 校验 + 直传关闭闸（阶段 1）。
+
+    返回 (规范化声明|None, None) 或 (None, 422 响应)。规则：
+
+    - 词表：ome-tiff / converter-bigtiff / legacy-direct /
+      ``unconverted-variant:<variant>``（白名单变体）；非法 → 422
+      invalid_direct_class；
+    - 声明须与扩展名匹配（ome-tiff/converter-bigtiff 只对 .tif/.tiff、
+      svs-jp2k 只对 .svs、legacy-direct 只对直传开放格式），否则 422
+      invalid_direct_class；
+    - 直传关闭格式（.svs）：没有合法 unconverted-variant:svs-jp2k 声明 →
+      422 convert_in_browser + tools_url（与 conversion_moved_to_browser
+      同形；zip 中的 MRXS 由 worker 在解包前拒绝同一错误码）；
+    - conversion 形态（kfb/kfbf）维持关闭 → convert_in_browser。
+    """
+    ext = safe.rsplit(".", 1)[-1].lower() if "." in safe else ""
+    declared = None
+    if value is not None:
+        if not isinstance(value, str) or not value.strip():
+            return None, (jsonify(error="direct_class 需为非空字符串"),
+                          400)
+        declared = value.strip().lower()
+        if not upload_direct_class.is_direct_class(declared):
+            return None, (jsonify(error="未知的 direct_class 声明",
+                                  code="invalid_direct_class"), 422)
+    # 词表 ↔ 扩展名匹配
+    if declared == "ome-tiff" and ext not in ("tif", "tiff"):
+        return None, (jsonify(
+            error="ome-tiff 声明只适用于 .tif/.tiff 文件",
+            code="invalid_direct_class"), 422)
+    if declared == "converter-bigtiff" and ext not in ("tif", "tiff"):
+        return None, (jsonify(
+            error="converter-bigtiff 声明只适用于 .tif/.tiff 文件",
+            code="invalid_direct_class"), 422)
+    variant = upload_direct_class.variant_of(declared) if declared else None
+    if variant is not None and variant != "svs-jp2k":
+        return None, (jsonify(error="未知的 unconverted-variant 变体",
+                              code="invalid_direct_class"), 422)
+    if variant is not None and ext != "svs":
+        return None, (jsonify(
+            error="unconverted-variant:svs-jp2k 声明只适用于 .svs 文件",
+            code="invalid_direct_class"), 422)
+    # 直传关闭闸（阶段 1：.svs；kfb/kfbf 走 conversion 分支）——先于
+    # legacy-direct 的扩展名匹配裁定（关闭格式上的 legacy-direct 声明给
+    # 可行动的 convert_in_browser，不是词表错误）
+    if kind == "native" and ext in _direct_import_closed_formats() \
+            and variant != "svs-jp2k":
+        return None, (_convert_in_browser_closed(
+            "该格式已关闭直传：请在本机转换为 OME-TIFF 后上传"
+            "（切片转换工具 /tools/slides）"), 422)
+    if declared == "legacy-direct" and \
+            ext not in _direct_upload_formats():
+        return None, (jsonify(
+            error="legacy-direct 声明不适用于该扩展名",
+            code="invalid_direct_class"), 422)
+    return declared, None
+
+
 def _cos_upload_capability_payload(demo):
     """COS 直传 capability 下发（off 时零 DB 查询，静态不可用）。
 
@@ -2867,6 +2956,9 @@ def _cos_upload_capability_payload(demo):
         payload["browser_convert"] = {
             "formats": sorted(_browser_convert_formats()),
             "url": BROWSER_CONVERT_URL}
+    # 先转换后上传阶段 1：direct_upload 与 browser_convert 两张清单一起
+    # 下发（静态派生，无 DB 查询；available=false 时也随形下发供前端展示）。
+    payload["direct_upload"] = {"formats": sorted(_direct_upload_formats())}
     if demo or cos_config.COS_UPLOAD_CAPABILITY not in ("off", "internal", "on"):
         return payload
     _sid, _skey, ok = cos_config.cos_credentials()
@@ -11664,6 +11756,14 @@ def api_ingestions_create():
     convert-required conversion；裸 bundle（.mrxs）与未登记格式 422 说明
     原因（无 fallback 指引）。可选 sha256_expected（64 hex）为整对象声明，
     下载校验后比对（不符=确定性失败 hash_mismatch）。
+
+    先转换后上传阶段 1：可选 direct_class（浏览器嗅探文件头后的直传类别
+    声明，词表见 upload_direct_class）。直传关闭格式（.svs）无合法
+    unconverted-variant:svs-jp2k 声明 → 422 convert_in_browser +
+    tools_url（conversion_moved_to_browser 同形，旧码保留在 conversion
+    retry 410 路径）；kfb/kfbf（conversion）维持关闭。大小合同先行裁定，
+    直传关闭闸其后（均不建行/不占预约/不发凭证）。声明随任务落库
+    （0078），worker 在 open_slide 之前按 upload_direct_class 核验。
     """
     if not can_upload():
         return jsonify(error="无上传权限"), 403
@@ -11683,8 +11783,10 @@ def api_ingestions_create():
         return ferr
     if kind == "conversion" and not SERVER_CONVERSION_CREATION:
         # 不建行、不占预约、不发凭证：引导到本机「转换并上传」
-        return _server_conversion_closed(
-            "该格式需在本机转换后上传，请使用切片转换工具的「转换并上传」"), 422
+        #（阶段 1：统一错误码 convert_in_browser；旧码保留在 conversion
+        # retry 410 路径，前端两个码都映射同一文案）
+        return _convert_in_browser_closed(
+            "该格式需在本机转换后上传，请使用切片转换工具（/tools/slides）"), 422
 
     try:
         declared_size = int(body.get("declared_size"))
@@ -11710,6 +11812,13 @@ def api_ingestions_create():
                   "上限，待运维调整）",
             code="cos_pool_below_product_limit",
             max_size_bytes=product_max), 503
+
+    # 先转换后上传阶段 1：直传类别声明校验 + 直传关闭闸（大小合同**之后**
+    # 裁定——非法大小/超限先给各自的稳定码；本闸不建行/不占预约/不发凭证）
+    direct_class, dc_err = _validate_direct_class(
+        safe, kind, body.get("direct_class"))
+    if dc_err is not None:
+        return dc_err
 
     sha_expected = body.get("sha256_expected")
     if sha_expected is not None and (
@@ -11738,7 +11847,8 @@ def api_ingestions_create():
             policy_version="v1-manual",
             route_reason=body.get("route_reason") or "manual_cos",
             kind=kind,
-            sha256_expected=(sha_expected.lower() if sha_expected else None))
+            sha256_expected=(sha_expected.lower() if sha_expected else None),
+            direct_class=direct_class)
     except ingestion_store.IngestionStateError as e:
         # 空 owner（本地态未配置 owner，不允许自动认领）是服务端配置故障 →
         # 500；仅容量等待上限（cos_waiting_limit）落 409（P4-app C2 收口：

@@ -346,9 +346,10 @@ def test_public_catalog_rows_and_product_copy():
     by_ext = {}
     ids = set()
     for item in catalog:
-        # 契约字段齐全
+        # 契约字段齐全（阶段 1 新增 browser_convert / direct_import 两列）
         assert set(item) == {"id", "display_name", "extensions", "capability",
                              "canonical_format", "bundle_required",
+                             "browser_convert", "direct_import",
                              "import_mode", "limits",
                              "selectable_for_upload"}
         assert item["id"] not in ids
@@ -356,7 +357,10 @@ def test_public_catalog_rows_and_product_copy():
         assert item["capability"] in (reg.CAP_NATIVE_SINGLE_FILE,
                                       reg.CAP_NATIVE_BUNDLE,
                                       reg.CAP_CONVERT_REQUIRED)
-        assert item["import_mode"] in ("direct", "convert", "bundle")
+        assert item["browser_convert"] in ("available", "unavailable")
+        assert item["direct_import"] in ("open", "closed")
+        assert item["import_mode"] in ("direct-upload", "convert",
+                                       "direct-temporary")
         assert isinstance(item["limits"], list)
         for ext in item["extensions"]:
             assert ext not in by_ext      # 扩展名跨行不重叠
@@ -370,16 +374,23 @@ def test_public_catalog_rows_and_product_copy():
     assert by_ext[".kfbf"]["import_mode"] == "convert"
     assert by_ext[".kfbf"]["canonical_format"] == "ome-tiff"
     assert by_ext[".mrxs"]["capability"] == reg.CAP_NATIVE_BUNDLE
-    assert by_ext[".mrxs"]["import_mode"] == "bundle"
+    # 阶段 1：MRXS 走本机转换（zip 直传关闭），不再是 bundle 直传模式
+    assert by_ext[".mrxs"]["import_mode"] == "convert"
+    assert by_ext[".mrxs"]["browser_convert"] == "available"
+    assert by_ext[".mrxs"]["direct_import"] == "closed"
     assert by_ext[".mrxs"]["bundle_required"] is True
 
-    # OME-TIFF 复合后缀单列一行，明确可见
+    # OME-TIFF 复合后缀单列一行，明确可见：direct-upload（直接上传）
     assert ".ome.tif" in by_ext and ".ome.tiff" in by_ext
     assert by_ext[".ome.tif"] is by_ext[".ome.tiff"]
     assert by_ext[".ome.tif"]["id"] == "ome-tiff"
     assert by_ext[".ome.tif"]["capability"] == reg.CAP_NATIVE_SINGLE_FILE
-    assert by_ext[".ome.tif"]["import_mode"] == "direct"
+    assert by_ext[".ome.tif"]["import_mode"] == "direct-upload"
     assert set(reg.ome_extensions()) == {".ome.tif", ".ome.tiff"}
+
+    # 阶段 1 关闭的直传：JPEG 编码 .svs（目录行级关闭；JP2K 变体凭声明例外）
+    assert by_ext[".svs"]["direct_import"] == "closed"
+    assert by_ext[".svs"]["import_mode"] == "convert"
 
     # 目录覆盖 _FORMATS 全部扩展名（防两表漂移）
     assert set(reg._FORMATS) <= set(by_ext)  # noqa: SLF001
@@ -391,7 +402,7 @@ def test_public_catalog_rows_and_product_copy():
     assert by_ext[".kfbf"]["selectable_for_upload"] is True
     assert any("BigTIFF" in s for s in by_ext[".kfb"]["limits"])
     assert any("OME-TIFF" in s for s in by_ext[".kfbf"]["limits"])
-    assert any("zip" in s for s in by_ext[".mrxs"]["limits"])
+    assert any("文件夹" in s for s in by_ext[".mrxs"]["limits"])
 
     # 返回的是新副本：调用方改写不污染模块状态
     catalog[0]["extensions"].append(".mutated")

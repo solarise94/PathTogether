@@ -183,30 +183,36 @@ def test_b03_over_max_entries_incomplete_import_rejected(monkeypatch):
 
 def test_b04_mixed_format_selectability(monkeypatch):
     _, enum_id, by_path = _make_ready(monkeypatch)
-    # KFBF：当前产品已支持 → convert-required 可选
+    # 先转换后上传阶段 1：筛选层只放行 TIFF 类；KFBF/SVS/KFB 标不可选，
+    # 原因码 convert_in_browser_first（请先在本机转换为 OME-TIFF 后再上传）
     kfbf = by_path["A1/panel.kfbf"]
-    assert kfbf["selectable"] is True
+    assert kfbf["selectable"] is False
     assert kfbf["capability"] == "convert-required"
     assert kfbf["format"] == ".kfbf"
-    # KFB 同为 convert-required 可选；native 单文件可选
-    assert by_path["B1/big.kfb"]["selectable"] is True
-    assert by_path["A1/sample.svs"]["capability"] == "native-single-file"
-    # OME 最长后缀匹配
+    assert kfbf["reason_code"] == "convert_in_browser_first"
+    assert by_path["B1/big.kfb"]["selectable"] is False
+    assert by_path["B1/big.kfb"]["reason_code"] == "convert_in_browser_first"
+    svs = by_path["A1/sample.svs"]
+    assert svs["capability"] == "native-single-file"
+    assert svs["selectable"] is False
+    assert svs["reason_code"] == "convert_in_browser_first"
+    # TIFF 类（含 OME 复合后缀，最长后缀匹配）可选
+    assert by_path["A1/scan.ome.tif"]["selectable"] is True
     assert by_path["A1/scan.ome.tif"]["format"] == ".ome.tif"
     assert by_path["A1/scan2.ome.tiff"]["format"] == ".ome.tiff"
+    assert by_path["A1/scan2.ome.tiff"]["selectable"] is True
     # channel.json / 未知格式不可选
     cj = by_path["A1/panel_kfbf/channel.json"]
     assert cj["selectable"] is False and cj["reason_code"] == "not_a_slide"
     assert by_path["B1/notes.txt"]["reason_code"] == "unsupported_format"
-    # MRXS：无伴随目录 → bundle_incomplete；有伴随目录但百度侧无法保证
-    # 完整目录包 → baidu_bundle_unsupported（均不可选）
-    assert by_path["A1/scan.mrxs"]["reason_code"] == "bundle_incomplete"
+    # MRXS（含无伴随目录的散文件）同样 convert_in_browser_first（均不可选）
+    assert by_path["A1/scan.mrxs"]["reason_code"] == "convert_in_browser_first"
     deep = by_path["B1/deep.mrxs"]
-    assert deep["reason_code"] == "baidu_bundle_unsupported"
+    assert deep["reason_code"] == "convert_in_browser_first"
     assert deep["selectable"] is False
     # size_bytes 十进制字符串
-    assert by_path["A1/sample.svs"]["size_bytes"] == "1000"
-    assert isinstance(by_path["A1/sample.svs"]["size_bytes"], str)
+    assert svs["size_bytes"] == "1000"
+    assert isinstance(svs["size_bytes"], str)
 
 
 def test_b04_empty_selection_400(monkeypatch):
@@ -226,11 +232,11 @@ def test_b04_expired_enumeration_409(monkeypatch):
     view = store.get_enumeration(enum_id, OWNER)
     assert view["state"] == "expired"
     with pytest.raises(store.ConflictError) as ei:
-        store.create_import(OWNER, enum_id, [by_path["A1/sample.svs"]["id"]])
+        store.create_import(OWNER, enum_id, [by_path["A1/scan.ome.tif"]["id"]])
     assert ei.value.code == "enumeration_expired"
     body, status = http.create_import(
         IDENT, {"enumeration_id": enum_id,
-                "candidate_ids": [by_path["A1/sample.svs"]["id"]]})
+                "candidate_ids": [by_path["A1/scan.ome.tif"]["id"]]})
     assert status == 409 and body["code"] == "enumeration_expired"
 
 
@@ -273,7 +279,7 @@ def test_b04_extraction_code_roundtrip(monkeypatch):
 
 def test_b05_same_key_same_digest_same_batch(monkeypatch):
     _, enum_id, by_path = _make_ready(monkeypatch)
-    ids = [by_path["A1/sample.svs"]["id"], by_path["A1/panel.kfbf"]["id"]]
+    ids = [by_path["A1/scan.ome.tif"]["id"], by_path["A1/scan2.ome.tiff"]["id"]]
     b1 = store.create_import(OWNER, enum_id, ids, idempotency_key="idem-1")
     b2 = store.create_import(OWNER, enum_id, list(reversed(ids)),
                              idempotency_key="idem-1")  # 顺序无关同 digest
@@ -299,8 +305,8 @@ def test_b05_same_key_same_digest_same_batch(monkeypatch):
 
 def test_b05_same_key_different_selection_409(monkeypatch):
     _, enum_id, by_path = _make_ready(monkeypatch)
-    a = by_path["A1/sample.svs"]["id"]
-    b = by_path["A1/panel.kfbf"]["id"]
+    a = by_path["A1/scan.ome.tif"]["id"]
+    b = by_path["A1/scan2.ome.tiff"]["id"]
     store.create_import(OWNER, enum_id, [a], idempotency_key="idem-2")
     with pytest.raises(store.ConflictError) as ei:
         store.create_import(OWNER, enum_id, [a, b], idempotency_key="idem-2")
@@ -309,7 +315,7 @@ def test_b05_same_key_different_selection_409(monkeypatch):
 
 def test_b05_concurrent_same_key_single_batch(monkeypatch):
     _, enum_id, by_path = _make_ready(monkeypatch)
-    ids = [by_path["A1/sample.svs"]["id"], by_path["B1/big.kfb"]["id"]]
+    ids = [by_path["A1/scan.ome.tif"]["id"], by_path["A1/scan2.ome.tiff"]["id"]]
     barrier = threading.Barrier(2, timeout=10)
     results, errors = [], []
 
@@ -351,7 +357,7 @@ def test_b05_concurrent_same_key_single_batch(monkeypatch):
 
 def test_b05_quota_insufficient_zero_side_effects(monkeypatch):
     fake, enum_id, by_path = _make_ready(monkeypatch)
-    ids = [by_path["A1/sample.svs"]["id"]]  # 1000 bytes
+    ids = [by_path["A1/scan.ome.tif"]["id"]]  # 2000 bytes
     calls = []
 
     def hook(user_id, nbytes):
@@ -361,7 +367,7 @@ def test_b05_quota_insufficient_zero_side_effects(monkeypatch):
     with pytest.raises(store.QuotaError):
         store.create_import(OWNER, enum_id, ids, idempotency_key="q1",
                             quota_hook=hook)
-    assert calls == [(OWNER, 1000)]
+    assert calls == [(OWNER, 2000)]
     # 零外部副作用：无批次行、fake 无转存/下载/删除
     import psycopg
     import os
@@ -387,7 +393,7 @@ def test_b05_quota_insufficient_http_429(monkeypatch):
         u["user_id"], "https://pan.baidu.com/s/1TestShareId99")
     store.run_enumeration(out["id"], fake)
     cands = store.list_candidates(out["id"], u["user_id"], limit=100)
-    svs = [c for c in cands["items"] if c["name"] == "sample.svs"][0]
+    svs = [c for c in cands["items"] if c["name"] == "scan.ome.tif"][0]
     monkeypatch.setattr(upload_guard, "UPLOAD_USER_QUOTA_BYTES", 100)
     body, status = http.create_import(
         quota_ident, {"enumeration_id": out["id"], "candidate_ids": [svs["id"]]},
@@ -412,8 +418,8 @@ def test_b05_quota_reservation_recorded(monkeypatch):
         return rid_holder["rid"]
 
     batch = store.create_import(
-        u["user_id"], enum_id, [by_path["A1/sample.svs"]["id"],
-                                by_path["B1/big.kfb"]["id"]],
+        u["user_id"], enum_id, [by_path["A1/scan.ome.tif"]["id"],
+                                by_path["A1/scan2.ome.tiff"]["id"]],
         idempotency_key="q3", quota_hook=hook)
     import psycopg
     import os
@@ -427,8 +433,8 @@ def test_b05_quota_reservation_recorded(monkeypatch):
     finally:
         conn.close()
     assert rid == rid_holder["rid"]
-    assert int(total) == 1700
-    assert batch["total_bytes"] == "1700"
+    assert int(total) == 2000 + 3000
+    assert batch["total_bytes"] == "5000"
 
 
 # --------------------------------------------------------------------------- #
@@ -438,7 +444,7 @@ def test_b05_quota_reservation_recorded(monkeypatch):
 def test_b11_no_secrets_in_public_views(monkeypatch, tmp_path):
     fake, enum_id, by_path = _make_ready(
         monkeypatch, extraction_code="ab12")
-    ids = [by_path["A1/sample.svs"]["id"], by_path["A1/panel.kfbf"]["id"]]
+    ids = [by_path["A1/scan.ome.tif"]["id"], by_path["A1/scan2.ome.tiff"]["id"]]
     batch = store.create_import(OWNER, enum_id, ids, idempotency_key="s1")
     # 推进到终态（含 staging 路径/staging 文件生成）
     view = store.run_batch(batch["id"], fake, staging_root=tmp_path)
@@ -469,7 +475,7 @@ def test_b11_no_secrets_in_public_views(monkeypatch, tmp_path):
 def test_b11_owner_isolation_lists(monkeypatch):
     fake, enum_id, by_path = _make_ready(monkeypatch)
     store.create_import(OWNER, enum_id,
-                        [by_path["A1/sample.svs"]["id"]],
+                        [by_path["A1/scan.ome.tif"]["id"]],
                         idempotency_key="o1")
     mine = store.list_imports(OWNER)
     theirs = store.list_imports(OTHER)

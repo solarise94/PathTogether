@@ -300,7 +300,7 @@ export function probe() {
 }
 
 /**
- * Probe a bundle input (F3 MRXS) through the bundle host callbacks.
+ * Probe a bundle input (F3 MRXS / VMS) through the bundle host callbacks.
  * `budget_bytes` is the browser resource profile's budget (review §1): the
  * probe refuses with `resource_profile_insufficient` when its metadata
  * working set would exceed it — before any large allocation. `undefined`

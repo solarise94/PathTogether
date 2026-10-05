@@ -162,6 +162,12 @@ function kfbFile(size = 1024, name = "spec.kfb") {
 	return { name, size, lastModified: 1, slice: () => null, type: "" };
 }
 
+/// 阶段 1：uploadFile 先嗅探（微任务）再分流——断言前先排空微任务。
+const tick = () => new Promise((r) => setTimeout(r, 0));
+async function flush(n = 10) {
+	for (let i = 0; i < n; i++) await tick();
+}
+
 /// 行部件（stub 的 textContent 不级联，按 className 定位）。
 function rowPart(row: ReturnType<typeof el>, cls: string) {
 	const found = row.children.find((c) => (c as ReturnType<typeof el>).className === cls);
@@ -175,10 +181,11 @@ function rowButtons(row: ReturnType<typeof el>) {
 }
 
 describe("R1 工作台入口（真实 app.js）", () => {
-	it("KFB（browser_convert 词表内）→ 不判失败、零 /api/ 请求、行内给「在本机转换并上传」", () => {
+	it("KFB（browser_convert 词表内）→ 不判失败、零 /api/ 请求、行内给「在本机转换并上传」", async () => {
 		const h = loadApp({ mode: "official", capabilities: { cos_upload: cosCaps() } });
 		expect(h.up.isBrowserConvertFile(kfbFile())).toBe(true);
 		h.up.uploadFile(kfbFile());
+		await flush(8);
 		// 上传行不报错、不触发任何控制 API
 		const calls = h.fetchMock.mock.calls as unknown as [string, Record<string, unknown>?][];
 		expect(calls.filter(([u]) => String(u).includes("/api/ingestions"))).toHaveLength(0);
@@ -198,12 +205,13 @@ describe("R1 工作台入口（真实 app.js）", () => {
 		return spy.mock.calls.map((c) => Number(c[1])).filter((d) => d === 0 || d >= 6000);
 	}
 
-	it("待操作入口不定时移除：未点击时不安排任何移除计时", () => {
+	it("待操作入口不定时移除：未点击时不安排任何移除计时", async () => {
 		const spy = vi.spyOn(globalThis, "setTimeout");
 		try {
 			const h = loadApp({ mode: "official", capabilities: { cos_upload: cosCaps() } });
-			spy.mockClear();
 			h.up.uploadFile(kfbFile());
+			await flush(8);
+			spy.mockClear();
 			expect(removalDelays(spy)).toEqual([]);
 			const row = h.container.children[0] as ReturnType<typeof el>;
 			expect(rowButtons(row).length).toBe(2);
@@ -212,11 +220,12 @@ describe("R1 工作台入口（真实 app.js）", () => {
 		}
 	});
 
-	it("忽略 → 立即安排移除该行（不打开 popup）", () => {
+	it("忽略 → 立即安排移除该行（不打开 popup）", async () => {
 		const spy = vi.spyOn(globalThis, "setTimeout");
 		try {
 			const h = loadApp({ mode: "official", capabilities: { cos_upload: cosCaps() } });
 			h.up.uploadFile(kfbFile());
+			await flush(8);
 			const row = h.container.children[0] as ReturnType<typeof el>;
 			spy.mockClear();
 			fire(rowButtons(row)[1], "click");
@@ -227,11 +236,12 @@ describe("R1 工作台入口（真实 app.js）", () => {
 		}
 	});
 
-	it("弹窗被拦截 → 行保留可重试（不安排移除），重按仍尝试打开", () => {
+	it("弹窗被拦截 → 行保留可重试（不安排移除），重按仍尝试打开", async () => {
 		const spy = vi.spyOn(globalThis, "setTimeout");
 		try {
 			const h = loadApp({ mode: "official", capabilities: { cos_upload: cosCaps() } }, null);
 			h.up.uploadFile(kfbFile());
+			await flush(8);
 			const row = h.container.children[0] as ReturnType<typeof el>;
 			spy.mockClear();
 			fire(rowButtons(row)[0], "click");
@@ -268,9 +278,10 @@ describe("R1 工作台入口（真实 app.js）", () => {
 		expect(h.up.isBrowserConvertFile(null)).toBe(false);
 	});
 
-	it("弹窗被拦截 → 明示原因 + 工具页链接（选择不静默丢失）", () => {
+	it("弹窗被拦截 → 明示原因 + 工具页链接（选择不静默丢失）", async () => {
 		const h = loadApp({ mode: "official", capabilities: { cos_upload: cosCaps() } }, null);
 		h.up.uploadFile(kfbFile());
+		await flush(8);
 		const row = h.container.children[0] as ReturnType<typeof el>;
 		const btn = rowButtons(row)[0];
 		expect(btn).toBeTruthy();
@@ -297,6 +308,7 @@ describe("R1 工作台入口（真实 app.js）", () => {
 		const h = loadApp({ mode: "official", capabilities: { cos_upload: cosCaps() } },
 			() => popupStub);
 		h.up.uploadFile(kfbFile());
+		await flush(8);   // 阶段 1：先嗅探（微任务）再给「本机转换」入口
 		const row = h.container.children[0] as ReturnType<typeof el>;
 		fire(rowButtons(row)[0], "click");
 		const status = rowPart(row, "upload-item-status");

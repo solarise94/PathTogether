@@ -53,10 +53,12 @@ function targetLabel(t, target) {
 
 export function createConvertUploadController({
   runner, uploadCtl, t, onJobsRefresh, onFlowMessage, takeFile,
+  takeDirectFile, takeBundle,
 }) {
   const state = {
     running: false,        // 一键链进行中（转换或上传任一阶段）
-    handoff: null,         // {file, target, source, port} —— 工作台交接的文件与目标
+    // 工作台交接：{file, bundle, folderName, target, source, port}
+    handoff: null,
   };
 
   /// 流程状态文案（页级 #page-status，经页面注入的 onFlowMessage 渲染——
@@ -218,29 +220,74 @@ export function createConvertUploadController({
 
   // ------------------------------------------------------ 工作台交接接收 --
 
-  /// 接收工作台 postMessage 交接的 File（structured clone，零额外复制——
-  /// 唯一副本是运行器 staging 的 OPFS source.bin）。同源校验 + 去重（重复
-  /// 投递只 ack）。takeFile 由页面注入：走与手动选择完全相同的探测/磁盘
-  /// 确认流程。
+  /// 接收工作台 postMessage 交接（structured clone，零额外复制——唯一副本
+  /// 是运行器 staging 的 OPFS source.bin）。同源校验 + 去重（重复投递只
+  /// ack）。三种形态按序消费：
+  ///   - bundle（阶段 1）：MRXS 文件夹成员行 [{file, relPath}] + folderName
+  ///     → takeBundle（与「选择文件夹（MRXS）」同一 prepareBundleSource）；
+  ///   - 直传类别单文件（阶段 1）：OME-TIFF/转换器 BigTIFF → takeDirectFile
+  ///     （不进转换，直接上传并关联目标项目）；
+  ///   - 其余单文件 → takeFile（探测/磁盘确认的既有转换流程）。
   function acceptHandoff(data, source) {
+    const bundle = data && Array.isArray(data.bundle) ? data.bundle : null;
     const file = data && data.file;
-    if (!file || typeof file.slice !== 'function') return;
+    if (!file && !(bundle && bundle.length)) return;
+    const displayName = file ? file.name
+      : (data.folderName || (bundle[0] && bundle[0].relPath || '').split('/')[0] || 'MRXS');
     const ack = () => {
       try {
         source.postMessage({
-          type: HANDOFF_ACK, name: file.name, size: file.size,
+          type: HANDOFF_ACK, name: displayName,
+          size: file ? file.size : null,
         }, window.location.origin);
       } catch { /* 打开者已关闭：文件照常保留在本页使用 */ }
     };
     if (state.handoff) { ack(); return; }   // 已接收过：幂等 ack
     state.handoff = {
-      file, target: data.target || null, source: 'workbench', port: source,
+      file: file || null,
+      bundle,
+      folderName: (data && data.folderName) || null,
+      target: (data && data.target) || null,
+      source: 'workbench', port: source,
     };
     ack();
-    setFlow('tools.handoff.received', {
-      name: file.name, target: targetLabel(t, state.handoff.target),
+    if (bundle) {
+      setFlow('tools.handoff.bundle.received', {
+        name: displayName,
+        n: String(bundle.length),
+        target: targetLabel(t, state.handoff.target),
+      });
+      if (takeBundle) {
+        takeBundle(bundle.map((m) => ({
+          name: m.file && m.file.name, relPath: m.relPath || (m.file && m.file.name),
+          file: m.file,
+        })), { folderName: state.handoff.folderName || displayName });
+      }
+      return;
+    }
+    // 单文件：先嗅探直传类别（头级 ≤128KB；嗅探失败走既有转换流程）
+    const sniff = (window.HP_SLIDE_SNIFF &&
+                   typeof window.HP_SLIDE_SNIFF.classifyFile === 'function')
+      ? window.HP_SLIDE_SNIFF.classifyFile(file)
+      : Promise.resolve(null);
+    sniff.then((cls) => {
+      if (cls && (cls.cls === 'ome-tiff' || cls.cls === 'converter-bigtiff')) {
+        setFlow('tools.direct.ready.title');
+        if (takeDirectFile) {
+          takeDirectFile(file, cls, state.handoff.target);
+          return;
+        }
+      }
+      setFlow('tools.handoff.received', {
+        name: file.name, target: targetLabel(t, state.handoff.target),
+      });
+      if (takeFile) takeFile(file);   // 与手动选择完全相同的探测/磁盘确认流程
+    }, () => {
+      setFlow('tools.handoff.received', {
+        name: file.name, target: targetLabel(t, state.handoff.target),
+      });
+      if (takeFile) takeFile(file);
     });
-    if (takeFile) takeFile(file);   // 走与手动选择完全相同的探测/磁盘确认流程
   }
 
   function installHandoffReceiver() {

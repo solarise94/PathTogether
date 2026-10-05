@@ -185,8 +185,8 @@ describe("Wave 3：文件选择器 accept 派生与静态 fallback", () => {
 		const raster = fallbackCatalog.find((f) => f.id === "raster-image");
 		expect(raster).toBeTruthy();
 		expect(raster!.extensions).toEqual([".bmp", ".jpg", ".jpeg"]);
-		expect(raster!.import_mode).toBe("direct");
-		expect(raster!.limits).toContain("普通图片、支持像素坐标、无物理标尺");
+		expect(raster!.import_mode).toBe("direct-temporary");   // 阶段 1：暂时直接导入
+		expect(raster!.limits).toContain("普通图片、支持像素坐标、无物理标尺；暂时直接导入");
 		// 静态 accept = 派生函数作用于 fallback 目录（契约：两者不漂移）
 		expect(h.hooks.formats.acceptFromCatalog(fallbackCatalog)).toBe(acceptFallback);
 		// 且包含 bmp/jpg/jpeg 与 .zip
@@ -250,7 +250,7 @@ describe("Wave 3：文件选择器 accept 派生与静态 fallback", () => {
 		expect(rasterRow).toBeTruthy();
 		expect(rasterRow![1]).toBe("True");
 		expect(rasterRow![0]).toMatch(/"\.bmp",\s*"\.jpg",\s*"\.jpeg"/);
-		expect(rasterRow![0]).toMatch(/"import_mode":\s*"direct"/);
+		expect(rasterRow![0]).toMatch(/"import_mode":\s*"direct-temporary"/);   // 阶段 1
 		expect(rasterRow![0]).toContain("普通图片、支持像素坐标、无物理标尺");
 	});
 });

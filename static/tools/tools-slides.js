@@ -27,6 +27,7 @@ import { bundleRoute, bundleRows, collectEntryFiles, folderNameFromRelPath }
   from './tools-slides-bundle.js';
 import { createUploadController } from './tools-slides-upload.js';
 import { createConvertUploadController } from './tools-slides-convert-upload.js';
+import { createDirectUploadController } from './tools-slides-direct-upload.js';
 
 const CHANNEL_JSON_MAX_BYTES = 1 << 20; // 伴随文件读取上限 1 MiB（有界）
 
@@ -82,6 +83,9 @@ const els = {
   uploadBtn: $('upload-btn'),
   uploadCancelBtn: $('upload-cancel-btn'),
   uploadStatus: $('upload-status'),
+  directSection: $('direct-section'),
+  directUploadBtn: $('direct-upload-btn'),
+  directStatus: $('direct-status'),
   jobsDetails: $('jobs-details'),
   jobsList: $('jobs-list'),
   pageError: $('page-error'),
@@ -181,7 +185,9 @@ const page = {
   runner: null,
   uploadCtl: null,         // C4 上传控制器（tools-slides-upload.js）
   convertUploadCtl: null,  // R1 一键转换并上传控制器（tools-slides-convert-upload.js）
+  directCtl: null,         // 阶段 1 直传类别上传控制器（tools-slides-direct-upload.js）
   file: null,
+  directCls: null,         // 阶段 1：当前直传类别文件的嗅探结果（classifyFile）
   bundleFiles: null,       // F3：MRXS 完整包成员行 [{name, relPath, file}] | null
   bundleFolderName: null,  // F3：选择的文件夹名（任务列表显示用）
   channelJson: null,       // string | null（≤1 MiB 读取结果）
@@ -210,6 +216,7 @@ function rerenderForLang() {
   renderJobs(page.lastJobs || []);
   if (page.uploadCtl) page.uploadCtl.rerenderForLang();
   if (page.convertUploadCtl) page.convertUploadCtl.rerenderForLang();
+  if (directMsg.key) els.directStatus.textContent = t(directMsg.key, directMsg.vars);
   if (page.prep) {
     renderSummary();
     renderProbeSummary();
@@ -330,7 +337,61 @@ async function prepareSource(fileList) {
     showInputMessage('tools.drop.multiple', { n: String(route.files.length) });
     return;
   }
+  // 阶段 1（先转换后上传）：OME-TIFF/转换器 BigTIFF 不进转换——「已是可
+  // 上传格式」面板 +「上传到工作台」（嗅探只读 ≤128KB 头；分类表见
+  // slide-sniff.js）
+  const file = route.file;
+  const cls = await sniffOrNull(file);
+  if (cls && (cls.cls === 'ome-tiff' || cls.cls === 'converter-bigtiff')) {
+    showDirectReady(file, cls);
+    return;
+  }
   await onFilePicked(route.file);
+}
+
+/// classifyFile 的容错包装（嗅探失败按 null 处理——走既有转换流程）。
+async function sniffOrNull(file) {
+  try {
+    if (window.HP_SLIDE_SNIFF &&
+        typeof window.HP_SLIDE_SNIFF.classifyFile === 'function') {
+      return await window.HP_SLIDE_SNIFF.classifyFile(file);
+    }
+  } catch { /* 嗅探失败不阻塞既有流程 */ }
+  return null;
+}
+
+/// 「已是可上传格式」面板：直传类别文件不复制、不探测，等用户点击上传。
+/// 点击之前零 /api 请求（C3 合同不变）。
+function showDirectReady(file, cls) {
+  resetFlowPanels();
+  els.fileInput.value = '';
+  els.folderInput.value = '';
+  page.file = file;
+  page.directCls = cls || null;
+  els.directSection.hidden = false;
+  setDirectStatus(null);
+}
+
+const directMsg = { key: null, vars: null };
+function setDirectStatus(key, vars) {
+  directMsg.key = key;
+  directMsg.vars = vars || null;
+  els.directStatus.textContent = key ? t(key, directMsg.vars) : '';
+}
+
+/// 「上传到工作台」点击：直传控制器完成能力判定/登录检查/上限/格式受理，
+/// 数据源就是用户的 File（无 OPFS 中转）。目标沿用工作台交接（如有）。
+async function onDirectUpload() {
+  if (!page.file || !page.directCtl) return;
+  els.directUploadBtn.disabled = true;
+  try {
+    await page.directCtl.uploadFile(page.file, {
+      cls: page.directCls,
+      target: page.convertUploadCtl ? page.convertUploadCtl.handoffTarget() : null,
+    });
+  } finally {
+    els.directUploadBtn.disabled = false;
+  }
 }
 
 /// drop 事件取目录项只能在事件处理器内同步做（webkitGetAsEntry 的有效
@@ -454,6 +515,10 @@ function resetFlowPanels() {
   page.bundleFolderName = null;
   page.outputLockedProfile = null;
   page.encodingLockedProfile = null;
+  // 阶段 1：直传面板一并复位（换新文件时离开上一个未完成任务）
+  els.directSection.hidden = true;
+  setDirectStatus(null);
+  page.directCls = null;
   for (const el of [els.probeSection, els.estimateSection, els.profileSection,
     els.policySection, els.formatSection, els.resultSection, els.summarySection,
     els.channelSection]) el.hidden = true;
@@ -522,6 +587,22 @@ async function takeHandoffFile(file) {
   page.channelJson = null;
   page.channelJsonName = null;
   await runProbeFlow();
+}
+
+/// 阶段 1 交接（直传类别）：OME-TIFF/转换器 BigTIFF 不进转换——直接上传
+/// 并关联工作台带来的目标项目（用户已在工作台完成选择动作）。
+async function takeDirectHandoffFile(file, cls, target) {
+  if (!file || !page.directCtl) return;
+  showDirectReady(file, cls);
+  await page.directCtl.uploadFile(file, { cls, target });
+}
+
+/// 阶段 1 交接（MRXS 文件夹）：成员行（[{file, relPath}]）走与「选择文件夹
+/// （MRXS）」完全相同的 prepareBundleSource 流程（转换意图由用户在结果面板
+/// 点击「转换并上传到工作台」时经 convertUploadCtl 的交接目标收口）。
+async function takeHandoffBundle(rows, opts = {}) {
+  if (!rows || !rows.length) return;
+  await prepareBundleSource(rows, opts);
 }
 
 async function readChannelJsonInput() {
@@ -1579,8 +1660,16 @@ async function init() {
     onJobsRefresh: refreshJobs,
     onFlowMessage: renderFlowMsg,
     takeFile: takeHandoffFile,
+    // 阶段 1：直传类别文件 / MRXS 文件夹的交接接收（见 acceptHandoff）
+    takeDirectFile: takeDirectHandoffFile,
+    takeBundle: takeHandoffBundle,
   });
   page.convertUploadCtl.installHandoffReceiver();
+  page.directCtl = createDirectUploadController({
+    t,
+    onStatus: (text) => { els.directStatus.textContent = text; },
+    onPublished: () => { refreshJobs(); },
+  });
   refreshJobs();
 
   // 拖放：全页阻止默认导航（拖到页面任意位置都不会打开/替换文档），
@@ -1620,6 +1709,10 @@ async function init() {
   els.uploadBtn.addEventListener('click', () => {
     if (page.readyInfo) page.uploadCtl.startOrContinue(page.readyInfo.jobId);
   });
+  // 阶段 1：直传类别文件的「上传到工作台」（点击后才查能力）
+  if (els.directUploadBtn) {
+    els.directUploadBtn.addEventListener('click', () => { onDirectUpload(); });
+  }
   els.uploadCancelBtn.addEventListener('click', () => { page.uploadCtl.cancel(); });
   // 测试/诊断可观测钩子（不承载任何逻辑）
   window.__stToolsReady = true;

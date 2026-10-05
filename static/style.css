@@ -4045,6 +4045,46 @@ button {
 }
 .imp-format-badge.mode-convert { background: var(--accent-fill); }
 .imp-format-badge.mode-bundle { background: var(--seg-bg); color: var(--text-2); }
+/* 阶段 1（先转换后上传）三种徽标：直接上传 / 本机转换后上传 / 暂时直接导入 */
+.imp-format-badge.mode-direct-upload { background: var(--accent-fill); }
+.imp-format-badge.mode-direct-temporary { background: var(--seg-bg); color: var(--text-2); }
+
+/* 导入抽屉本地页：大拖放区 + 选择文件 / 选择文件夹（MRXS）；
+   完整格式目录收进折叠 details（imp-formats-details） */
+.imp-drop-zone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-height: 120px;
+  padding: 16px;
+  border: 1.5px dashed var(--separator);
+  border-radius: var(--r-panel);
+  background: rgba(255, 255, 255, 0.45);
+  cursor: pointer;
+  text-align: center;
+}
+.imp-drop-zone:hover,
+.imp-drop-zone:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+}
+.imp-drop-zone-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+.imp-formats-details summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-1);
+  padding: 2px 0;
+}
+.imp-formats-details[open] summary {
+  margin-bottom: 8px;
+}
 .imp-format-limit {
   font-size: 11px;
   color: var(--text-2);

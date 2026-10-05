@@ -895,6 +895,9 @@
     importPanelLocal: $("import-panel-local"),
     importPanelBaidu: $("import-panel-baidu"),
     importPickFiles: $("import-pick-files"),
+    importPickFolder: $("import-pick-folder"),
+    importFolderInput: $("import-folder-input"),
+    importDropZone: $("import-drop-zone"),
     importTargetSelect: $("import-target-select"),
     importTargetNewName: $("import-target-new-name"),
     importFormatCatalog: $("import-format-catalog"),
@@ -6603,20 +6606,50 @@
   function uploadFile(file, opts) {
     if (!file) return;
     opts = opts || {};
+    // 先转换后上传阶段 1（docs/slide-tools/upload-convert-first-phase1.md）：
+    // 先按文件头嗅探直传类别（slide-sniff.js 共享模块，只读 ≤128KB 头），
+    // 按类别分流——直传类（OME-TIFF/转换器 BigTIFF）与暂时直传类立即上传
+    // （创建 ingestion 携带 direct_class 声明）；需要本机转换的（KFB/KFBF/
+    // JPEG 编码 SVS/MRXS）走弹窗交接；未登记扩展名明确报错。嗅探失败按
+    // 既有词表路径降级（服务端创建闸与 worker 核验兜底）。
+    var row = makeUploadRow(file);
+    var sniff = (window.HP_SLIDE_SNIFF &&
+                 typeof window.HP_SLIDE_SNIFF.classifyFile === "function")
+      ? window.HP_SLIDE_SNIFF.classifyFile(file)
+      : Promise.resolve(null);
+    sniff.then(function (cls) {
+      uploadFileClassified(file, row, opts, cls);
+    }, function () {
+      uploadFileClassified(file, row, opts, null);
+    });
+  }
+
+  function uploadFileClassified(file, row, opts, cls) {
     // U3（统一 COS，docs/cos-only-upload-agent-plan-20260928.md §4）：新任务
     // 只建 ingestion。能力不可用（capability off / 容量配置门禁未过）→ 禁用
     // 创建并提示，**不回退 V1/V2**；词表与上限以服务端 capability 为唯一
     // 权威（cosUploadEligible 判定），不合格即说明原因。
-    var row = makeUploadRow(file);
     if (!COS_UPLOAD_CONFIG) {
       row.markError();
       row.setStage("upload.cos.unavailable");
       row.finish(10000);
       return;
     }
+    // 嗅探判定需要本机转换（KFB/KFBF/JPEG SVS/MRXS 成员）→ 本机转换入口
+    if (cls && cls.cls === "convert") {
+      offerBrowserConvert(file, row);
+      return;
+    }
+    if (cls && cls.cls === "unsupported") {
+      row.markError();
+      row.setStage("upload.stage.failed");
+      row.finish(10000);
+      toast(t("upload.fail", { e: tt("upload.err.unsupported") }), "error");
+      return;
+    }
     if (!cosUploadEligible(file)) {
-      // R1：KFB/KFBF 在服务端受理词表外但属 browser_convert 词表 → 本机
-      // 转换并上传入口（不判失败、不回退其它后端）
+      // R1：服务端受理词表外但属 browser_convert 词表 → 本机转换并上传
+      //（嗅探不可用时的旧路径兜底）
       if (isBrowserConvertFile(file)) {
         offerBrowserConvert(file, row);
         return;
@@ -6627,8 +6660,14 @@
       toast(t("upload.fail", { e: cosIneligibleReason(file) }), "error");
       return;
     }
-    uploadFileCos(file, row,
-      opts.cosRetry ? { resumeJobId: opts.cosRetry, skipConfirm: true } : null);
+    uploadFileCos(file, row, {
+      resumeJobId: opts.cosRetry || null,
+      skipConfirm: !!opts.cosRetry,
+      // 直传类携带 direct_class 声明（ome-tiff/converter-bigtiff/
+      // legacy-direct/unconverted-variant:svs-jp2k；服务端词表校验 + worker
+      // 头级核验）
+      directClass: cls ? (cls.directClass || null) : null,
+    });
   }
 
   // =========================================================================
@@ -6702,7 +6741,9 @@
 
   /// 「在本机转换并上传」点击：popup 交接。弹窗被拦截 → 明示 + 工具页链接
   ///（选择不静默丢失：允许弹窗后重按同一按钮即可重试）。
-  function openConvertHandoff(file, row) {
+  /// 阶段 1 扩展：MRXS 文件夹交接——bundle = [{file, relPath}] 数组 +
+  /// folderName；单文件仍走 file 字段（两者互斥，工具页按序消费）。
+  function openConvertHandoff(file, row, bundle) {
     ensureConvertHandoffListener();
     var target = convertHandoffTarget();
     var popup = null;
@@ -6730,8 +6771,8 @@
     convertHandoff.popup = popup;
     convertHandoff.acked = false;
     row.setStage("upload.kfb.handoff.sent");
-    // popup 加载完成前 postMessage 可能丢失：重投至 ack（File 句柄克隆，
-    // 零字节复制；工具页幂等去重）
+    // popup 加载完成前 postMessage 可能丢失：重投至 ack（File/数组结构化
+    // clone，零字节复制；工具页幂等去重）
     var attempts = 0;
     var timer = setInterval(function () {
       attempts++;
@@ -6747,7 +6788,9 @@
       try {
         popup.postMessage({
           type: HANDOFF_MSG,
-          file: file,
+          file: bundle ? null : file,
+          bundle: bundle || null,          // [{file, relPath}]（MRXS 文件夹）
+          folderName: bundle ? (convertHandoff._folderName || null) : null,
           target: target,
         }, window.location.origin);
       } catch (e) { /* retry next tick */ }
@@ -6775,10 +6818,14 @@
     return host;
   }
 
-  /// KFB/KFBF 行：不判失败——给出「在本机转换并上传」入口（能力词表内）。
-  /// 待操作入口不是完成通知：保留到用户点击或忽略，不定时移除。
-  function offerBrowserConvert(file, row) {
+  /// KFB/KFBF/MRXS 文件夹行：不判失败——给出「在本机转换并上传」入口
+  ///（能力词表内）。bundle 形态（MRXS 文件夹）：file 为 null，bundle 是
+  /// [{file, relPath}]；展示名用文件夹名。待操作入口不是完成通知：保留到
+  /// 用户点击或忽略，不定时移除。
+  function offerBrowserConvert(file, row, bundle) {
     row.setStage("upload.kfb.hint");
+    var displayName = (file && file.name) ||
+      (bundle && bundle.folderName) || "";
     var drawerItem = null;
     var drawerHost = null;
     var buttons = [];
@@ -6792,7 +6839,8 @@
       }
     }
     function start() {
-      if (openConvertHandoff(file, row)) {
+      convertHandoff._folderName = bundle ? bundle.folderName : null;
+      if (openConvertHandoff(file, row, bundle ? bundle.rows : null)) {
         removeDrawerItem();
         buttons.forEach(function (b) { if (b && b.parentNode) b.parentNode.removeChild(b); });
       }
@@ -6810,7 +6858,7 @@
         drawerItem.className = "import-convert-offer";
         var label = document.createElement("div");
         label.className = "import-convert-offer-name";
-        label.textContent = (file && file.name) || "";
+        label.textContent = displayName;
         drawerItem.appendChild(label);
         var go = document.createElement("button");
         go.type = "button";
@@ -6936,6 +6984,11 @@
     if (code === "upload_too_large") return tt("upload.cos.err.too_large");
     if (code === "cos_pool_below_product_limit") return tt("upload.cos.err.pool_config");
     if (code === "cos_format_unsupported") return tt("upload.cos.err.format_unsupported");
+    // 阶段 1：直传关闭格式（旧码 conversion_moved_to_browser 同文案兼容）
+    if (code === "convert_in_browser" ||
+        code === "conversion_moved_to_browser") {
+      return tt("upload.cos.err.convert_in_browser");
+    }
     if (code === "cos_waiting_limit") return tt("upload.cos.err.waiting_limit");
     if (code === "ingestion_state_conflict") return tt("upload.cos.err.state");
     if (code === "cos_sign_rate_limited") return tt("upload.cos.err.rate");
@@ -7062,6 +7115,9 @@
       source: file,
       apiFetch: apiFetch,
       config: COS_UPLOAD_CONFIG,
+      // 阶段 1：创建 ingestion 时携带嗅探出的直传类别声明（服务端词表校验，
+      // worker 在 open_slide 前头级核验；无声明则不带字段——存量语义不变）
+      createBody: opts.directClass ? { direct_class: opts.directClass } : null,
       storage: {
         save: cosJobSave,
         complete: cosJobRemove,   // viewable/终态：本地恢复记录清理（§5）
@@ -7233,6 +7289,11 @@
     isBrowserConvertFile: isBrowserConvertFile,
     convertHandoffTarget: convertHandoffTarget,
     openConvertHandoff: openConvertHandoff,
+    // 阶段 1（先转换后上传）：分类分流与交接扩展（测试驱动面）
+    uploadFileClassified: uploadFileClassified,
+    offerBrowserConvert: offerBrowserConvert,
+    handoffBundleFolder: handoffBundleFolder,
+    importDroppedDirectory: importDroppedDirectory,
   };
   // 供测试（升级 A）：侧栏开合控制器与偏好存取的真实逻辑入口
   window.HP_SIDEBAR = {
@@ -7244,18 +7305,142 @@
     syncViewerLayoutNow: syncViewerLayoutNow,
   };
 
-  // ---------- 拖拽上传 ----------
+  // ---------- 拖拽上传（阶段 1：整页拖放 + 文件夹拖入） ----------
+  // document 级 dragenter/over/leave/drop（复用 #drop-overlay 与计数逻辑）：
+  // 拖到页面任意位置都不打开文档；文件夹拖入经 webkitGetAsEntry 在事件内
+  // 同步取 entry（有效窗口限制），再异步遍历——含 .mrxs/.dat 成员的文件夹
+  // 按 MRXS 完整包走本机转换交接，普通文件夹按成员逐个 uploadFile。
   function setupDragDrop() {
-    var wrap = els.viewerWrap;
     var counter = 0;
-    wrap.addEventListener("dragenter", function (e) { e.preventDefault(); counter++; els.dropOverlay.classList.add("active"); });
-    wrap.addEventListener("dragover", function (e) { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; });
-    wrap.addEventListener("dragleave", function (e) { e.preventDefault(); counter--; if (counter <= 0) { counter = 0; els.dropOverlay.classList.remove("active"); } });
-    wrap.addEventListener("drop", function (e) {
-      e.preventDefault(); counter = 0; els.dropOverlay.classList.remove("active");
-      var files = e.dataTransfer.files;
-      if (files && files.length > 0) { for (var i = 0; i < files.length; i++) uploadFile(files[i]); }
+    function overlayOn() { els.dropOverlay.classList.add("active"); }
+    function overlayOff() { counter = 0; els.dropOverlay.classList.remove("active"); }
+    document.addEventListener("dragenter", function (e) {
+      e.preventDefault(); counter++; overlayOn();
     });
+    document.addEventListener("dragover", function (e) {
+      e.preventDefault(); e.dataTransfer.dropEffect = "copy";
+    });
+    document.addEventListener("dragleave", function (e) {
+      e.preventDefault(); counter--; if (counter <= 0) overlayOff();
+    });
+    document.addEventListener("drop", function (e) {
+      e.preventDefault(); overlayOff();
+      handleWorkbenchDrop(e.dataTransfer);
+    });
+  }
+
+  /// drop 事件数据分流：目录项（webkitGetAsEntry 只能在事件处理器内同步取）
+  /// 优先——目录走遍历；散文件逐个 uploadFile（内部再按嗅探类别分流）。
+  function handleWorkbenchDrop(dt) {
+    if (!dt) return;
+    var items = dt.items ? Array.from(dt.items) : [];
+    var dirEntries = [];
+    for (var i = 0; i < items.length; i++) {
+      try {
+        var entry = items[i].webkitGetAsEntry && items[i].webkitGetAsEntry();
+        if (entry && entry.isDirectory) dirEntries.push(entry);
+      } catch (e) { /* 非 filesystem 条目：按普通文件处理 */ }
+    }
+    if (dirEntries.length) {
+      for (var d = 0; d < dirEntries.length; d++) {
+        importDroppedDirectory(dirEntries[d]);
+      }
+      return;
+    }
+    var files = dt.files;
+    if (files && files.length > 0) {
+      for (var f = 0; f < files.length; f++) uploadFile(files[f]);
+    }
+  }
+
+  /// 拖入目录的遍历（readEntries 每批 ≤100，循环到空批；成员数封顶）。
+  /// MRXS 完整包（含 .mrxs/.dat 成员）→ 弹窗交接（转换工具按文件夹接收）；
+  /// 普通目录 → 成员文件逐个 uploadFile。无法遍历给明确提示。
+  function importDroppedDirectory(dirEntry) {
+    var MAX_MEMBERS = 8192;
+    function collect(entry, prefix, rows) {
+      return new Promise(function (resolve, reject) {
+        if (!entry) return resolve();
+        if (entry.isFile) {
+          return entry.file(function (file) {
+            rows.push({
+              name: entry.name,
+              relPath: prefix ? prefix + "/" + entry.name : entry.name,
+              file: file,
+            });
+            if (rows.length > MAX_MEMBERS) {
+              reject(new Error("too_many_members"));
+              return;
+            }
+            resolve();
+          }, reject);
+        }
+        if (!entry.isDirectory) return resolve();
+        if (typeof entry.createReader !== "function") {
+          return reject(new Error("unreadable"));
+        }
+        var reader = entry.createReader();
+        var readBatch = function () {
+          reader.readEntries(function (batch) {
+            if (!batch || !batch.length) return resolve();
+            var chain = Promise.resolve();
+            batch.forEach(function (child) {
+              chain = chain.then(function () {
+                var dirPath = prefix
+                  ? prefix + "/" + entry.name : entry.name;
+                return collect(child, dirPath, rows);
+              });
+            });
+            chain.then(readBatch, reject);
+          }, reject);
+        };
+        readBatch();
+      });
+    }
+    var rows = [];
+    collect(dirEntry, "", rows).then(function () {
+      var members = rows.filter(function (r) {
+        return /\.(mrxs|dat)$/i.test(r.name);
+      });
+      if (members.length) {
+        handoffBundleFolder(rows, dirEntry.name);
+        return;
+      }
+      rows.forEach(function (r) { uploadFile(r.file); });
+    }).catch(function () {
+      toast(tt("imp.drop.dir.unreadable"), "error");
+    });
+  }
+
+  /// MRXS 完整包 → 本机转换交接（弹窗 + 抽屉待操作入口，可重试）。
+  function handoffBundleFolder(rows, folderName) {
+    var total = rows.reduce(function (a, r) {
+      return a + ((r.file && r.file.size) || 0);
+    }, 0);
+    var row = makeUploadRow({ name: folderName, size: total });
+    offerBrowserConvert(null, row, {
+      rows: rows.map(function (r) {
+        return { file: r.file, relPath: r.relPath };
+      }),
+      folderName: folderName,
+    });
+  }
+
+  /// 「选择文件夹（MRXS）」（webkitdirectory input）→ 与拖入目录同一交接。
+  function importPickFolder() {
+    var list = els.importFolderInput && els.importFolderInput.files;
+    var files = list ? Array.from(list) : [];
+    if (!files.length) return;
+    var rows = files.map(function (f) {
+      return {
+        name: f.name,
+        relPath: f.webkitRelativePath || f.name,
+        file: f,
+      };
+    });
+    var first = rows[0].relPath.split("/")[0] || rows[0].name;
+    els.importFolderInput.value = "";   // 允许再次选择同一目录触发 change
+    handoffBundleFolder(rows, first);
   }
 
   // =========================================================================
@@ -7387,18 +7572,20 @@
   // Wave 3（普通图片兼容）：目录是格式词表的唯一权威（§3），raster-image 行
   // 与后端 slide_format_registry._CATALOG_DISPLAY 同文；一致性由
   // tests/js/raster-image-compat.test.ts 对后端源码做契约校验，防漂移。
+  // 阶段 1（先转换后上传）：import_mode 三值 direct-upload/convert/
+  // direct-temporary 与后端目录行同文。
   var FORMAT_CATALOG_FALLBACK = [
     { display_name: "SVS / TIFF / BigTIFF / OME-TIFF / NDPI / VMS / VMU / SCN / BIF / SVSlide",
       extensions: [".svs", ".tif", ".tiff", ".ome.tif", ".ome.tiff", ".ndpi", ".vms", ".vmu", ".scn", ".bif", ".svslide"],
-      import_mode: "direct", limits: [] },
+      import_mode: "direct-temporary", limits: [] },
     { id: "raster-image", display_name: "普通图片（BMP / JPEG）",
-      extensions: [".bmp", ".jpg", ".jpeg"], import_mode: "direct",
-      limits: ["普通图片、支持像素坐标、无物理标尺"] },
+      extensions: [".bmp", ".jpg", ".jpeg"], import_mode: "direct-temporary",
+      limits: ["普通图片、支持像素坐标、无物理标尺；暂时直接导入"] },
     { id: "kfb-kfbf", display_name: "KFB / KFBF", extensions: [".kfb", ".kfbf"],
       import_mode: "convert",
       limits: ["在本机浏览器中转换后上传：KFB 转为 BigTIFF（明场），KFBF 转为多通道 OME-TIFF（荧光）"] },
-    { id: "mrxs", display_name: "MRXS", extensions: [".mrxs"], import_mode: "bundle",
-      limits: ["需要完整包（主文件 + 同名伴随目录），请打包 zip 上传"] },
+    { id: "mrxs", display_name: "MRXS", extensions: [".mrxs"], import_mode: "convert",
+      limits: ["需要完整包（主文件 + 同名伴随目录）；在工作台选择整个文件夹，在本机浏览器转换后上传"] },
   ];
 
   // 文件选择器 accept 的静态 fallback：= acceptFromCatalog(FORMAT_CATALOG_FALLBACK)
@@ -7443,9 +7630,11 @@
   }
 
   function formatModeLabel(mode) {
+    // 阶段 1 三种徽标：直接上传 / 本机转换后上传 / 暂时直接导入
+    if (mode === "direct-upload") return t("imp.formats.mode.direct-upload");
     if (mode === "convert") return t("imp.formats.mode.convert");
-    if (mode === "bundle") return t("imp.formats.mode.bundle");
-    return t("imp.formats.mode.direct");
+    if (mode === "direct-temporary") return t("imp.formats.mode.direct-temporary");
+    return t("imp.formats.mode.direct-temporary");
   }
 
   function renderFormatCatalog(items) {
@@ -7966,6 +8155,10 @@
     if (code === "directory") return t("bd.cand.reason.directory");
     if (code === "bundle_incomplete") return t("bd.cand.reason.bundle_incomplete");
     if (code === "unsupported") return t("bd.cand.reason.unsupported");
+    // 阶段 1：非 TIFF 类候选（请先在本机转换为 OME-TIFF 后再上传）
+    if (code === "convert_in_browser_first") {
+      return t("bd.cand.reason.convert_in_browser_first");
+    }
     return code;
   }
 
@@ -8836,6 +9029,22 @@
     }
     if (els.importPickFiles) {
       els.importPickFiles.addEventListener("click", function () {
+        if (els.fileInput) els.fileInput.click();
+      });
+    }
+    // 阶段 1：「选择文件夹（MRXS）」（webkitdirectory）→ MRXS 完整包走
+    // 本机转换交接（与拖入目录同一 handoffBundleFolder）
+    if (els.importPickFolder) {
+      els.importPickFolder.addEventListener("click", function () {
+        if (els.importFolderInput) els.importFolderInput.click();
+      });
+    }
+    if (els.importFolderInput) {
+      els.importFolderInput.addEventListener("change", importPickFolder);
+    }
+    if (els.importDropZone) {
+      // 抽屉内大拖放区点击 = 打开文件选择（拖放本身由 document 级处理）
+      els.importDropZone.addEventListener("click", function () {
         if (els.fileInput) els.fileInput.click();
       });
     }

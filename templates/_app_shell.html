@@ -731,10 +731,19 @@
     <div class="drawer-body">
       <section id="import-panel-local" class="drawer-panel" role="tabpanel" aria-labelledby="import-tab-local">
         <div class="imp-block">
-          <div class="imp-block-title" data-i18n="imp.local.pick.title">选择文件</div>
-          <button id="import-pick-files" type="button" class="btn primary block"
-                  data-i18n="imp.local.pick">选择本地文件</button>
-          <p class="imp-hint" data-i18n="imp.local.drop.hint">也可以直接把文件拖到查看器窗口</p>
+          <div id="import-drop-zone" class="imp-drop-zone" tabindex="0" role="button"
+               aria-label="把切片文件拖到这里，或点击选择文件" data-i18n-aria="imp.local.drop.aria">
+            <span class="imp-drop-zone-title" data-i18n="imp.local.drop.title">把切片文件拖到这里</span>
+            <span class="imp-hint" data-i18n="imp.local.drop.hint">整页任意位置都可拖入；点击可选择文件</span>
+          </div>
+          <input id="import-folder-input" type="file" webkitdirectory multiple hidden
+                 data-i18n-aria="imp.local.folder.aria" aria-label="选择文件夹（MRXS 完整包）" />
+          <div class="np-actions">
+            <button id="import-pick-files" type="button" class="btn primary"
+                    data-i18n="imp.local.pick">选择文件</button>
+            <button id="import-pick-folder" type="button" class="btn secondary"
+                    data-i18n="imp.local.pick.folder">选择文件夹（MRXS）</button>
+          </div>
         </div>
         <div class="imp-block">
           <label class="imp-field" for="import-target-select">
@@ -746,9 +755,11 @@
           <p class="imp-hint" data-i18n="imp.target.hint">上传成功后自动把切片加入所选位置</p>
         </div>
         <div class="imp-block">
-          <div class="imp-block-title" data-i18n="imp.formats.title">支持的格式</div>
-          <div id="import-format-catalog" class="imp-format-catalog"
-               data-i18n="imp.formats.loading">格式目录加载中…</div>
+          <details id="import-formats-details" class="imp-formats-details">
+            <summary data-i18n="imp.formats.title">支持的格式</summary>
+            <div id="import-format-catalog" class="imp-format-catalog"
+                 data-i18n="imp.formats.loading">格式目录加载中…</div>
+          </details>
         </div>
         <div class="imp-block">
           <button id="format-req-btn" type="button" class="btn secondary block"

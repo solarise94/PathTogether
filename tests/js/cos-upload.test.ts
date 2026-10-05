@@ -32,6 +32,9 @@ const appSrc = readFileSync(resolve(here, "../../static/app.js"), "utf8");
 // 先于 app.js 加载）。harness 同序执行两个源码——只改加载方式，不改断言。
 const cosEngineSrc = readFileSync(
 	resolve(here, "../../static/upload/cos-uploader.js"), "utf8");
+// 阶段 1：直传类别嗅探共享模块（index.html 与 cos-uploader 同段加载）
+const slideSniffSrc = readFileSync(
+	resolve(here, "../../static/upload/slide-sniff.js"), "utf8");
 const i18nSrc = readFileSync(resolve(here, "../../static/i18n.js"), "utf8");
 
 const THRESHOLD = 16 * 1024 * 1024;
@@ -228,6 +231,7 @@ function loadApp(fetchImpl?: typeof fetch, bootstrap?: unknown) {
 	vi.stubGlobal("XMLHttpRequest", FakeXHR);
 	vi.stubGlobal("localStorage", storage);
 	new Function("window", "document", "fetch", "location", cosEngineSrc)(w, doc, theFetch, loc);
+	new Function("window", slideSniffSrc)(w);
 	new Function("window", "document", "fetch", "location", appSrc)(w, doc, theFetch, loc);
 	const up = w.HP_UPLOAD as Record<string, unknown>;
 	return {
@@ -294,12 +298,13 @@ afterEach(() => {
 // 1. 选路（U3 统一 COS：无开关、无大小分流；capability off 禁用创建）
 // --------------------------------------------------------------------------- #
 describe("选路：capability / eligible 判定（统一 COS）", () => {
-	it("cos_upload 未下发（off）→ 禁用创建：零网络请求 + 「上传暂不可用」提示（不回退 V1/V2）", () => {
+	it("cos_upload 未下发（off）→ 禁用创建：零网络请求 + 「上传暂不可用」提示（不回退 V1/V2）", async () => {
 		const h = loadApp(undefined, { mode: "official", capabilities: { upload_v2_threshold_bytes: THRESHOLD } });
 		expect(h.up.resolveCosConfig()).toBeNull();
 		h.up.initCosUploadUi();
 		expect(h.toggleParent._inserts.length).toBe(0);   // 无任何开关渲染
 		h.up.uploadFile({ name: "a.svs", size: 3 });
+		await flush(8);   // 阶段 1：uploadFile 先嗅探（微任务）再分流
 		expect(FakeXHR.instances).toHaveLength(0);        // 不发 V1 XHR
 		expect(h.fetchCalls().length).toBe(0);            // 不建 V2/COS 任务
 		const row = h.container.appendChildren[h.container.appendChildren.length - 1];
@@ -336,7 +341,7 @@ describe("选路：capability / eligible 判定（统一 COS）", () => {
 		expect(FakeXHR.instances).toHaveLength(0);
 	});
 
-	it("eligible 词表以服务端 capability 为准：zip/kfb 受理（词表内）、裸 mrxs/超大/零字节拒绝并说明原因", () => {
+	it("eligible 词表以服务端 capability 为准：zip/kfb 受理（词表内）、裸 mrxs/超大/零字节拒绝并说明原因", async () => {
 		const h = loadApp(undefined, { mode: "official", capabilities: {
 			cos_upload: cosCaps({ formats: ["bif", "ndpi", "svs", "tif", "zip", "kfb"] }),
 		} });
@@ -348,13 +353,21 @@ describe("选路：capability / eligible 判定（统一 COS）", () => {
 		expect(h.up.cosUploadEligible({ name: "a.svs", size: 1001 })).toBe(false);     // 超产品上限
 		expect(String(h.up.cosIneligibleReason({ name: "a.mrxs", size: 30 }))).toContain("不支持该文件格式");
 		expect(String(h.up.cosIneligibleReason({ name: "a.svs", size: 5000 }))).toContain("超过平台上限");
-		// 不合格 → 零请求 + 可读说明（不提供另一后端）
+		// 不合格 → 零请求 + 可读说明（不提供另一后端）。阶段 1：mrxs 按嗅探
+		// 类别走「本机转换并上传」入口（行提示，不判失败）；超大 .svs 走
+		// 「超过平台上限」toast（嗅探读失败按暂时直传降级 → 词表路径）
 		h.up.uploadFile({ name: "a.mrxs", size: 30 });
 		h.up.uploadFile({ name: "huge.svs", size: 5000 });
+		await flush(8);
 		expect(FakeXHR.instances).toHaveLength(0);
 		expect(h.fetchCalls().length).toBe(0);
-		expect(h.toastMessages.some((m) => m.indexOf("不支持该文件格式") >= 0)).toBe(true);
-		expect(h.toastMessages.some((m) => m.indexOf("超过平台上限") >= 0)).toBe(true);
+		const rows = h.container.appendChildren;
+		// mrxs 行是「待本机转换」提示（upload.kfb.hint），不判失败；huge 行
+		// 是「超过平台上限」toast（upload.cos.err.too_large）
+		const mrxsRow = String(rows[rows.length - 2].children[2].textContent);
+		expect(mrxsRow).toContain("本机转换");
+		expect(h.toastMessages.some((m) => m.indexOf("超过平台上限") >= 0))
+			.toBe(true);
 	});
 });
 

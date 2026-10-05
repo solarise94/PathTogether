@@ -30,6 +30,9 @@
           resumeJobId: string | null,   // 显式续传：跳过创建与询问
           skipConfirm: bool,            // 续传不询问（重试按钮语义）
           confirmResume: () => bool,    // 发现可续传任务时询问（默认 true）
+          createBody: object | null,    // 阶段 1：POST /api/ingestions 附加
+                                        // 字段（direct_class 声明；仅新任务
+                                        // 创建时合并，续传不带）
           retryCompleteOnNetworkError: bool,  // 工具页 true：完成响应丢失→重发
                                               // complete（409 ingestion_state_conflict
                                               // 视为已完成过）；工作台 false 保持
@@ -683,12 +686,16 @@
       });
     }).then(function () {
       if (jobId) return null;
+      // 创建体：基础字段 + 调用方附加（direct_class 声明等；仅新任务——
+      // 续传/重试走既有 job id，不重发声明）
+      var createBody = Object.assign({
+        filename: source.name, declared_size: source.size,
+      }, (opts.createBody && typeof opts.createBody === "object")
+        ? opts.createBody : {});
       return api("/api/ingestions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          filename: source.name, declared_size: source.size,
-        }),
+        body: JSON.stringify(createBody),
       }).then(jsonBody).then(function (res) {
         if (res.ok && res.body && res.body.job_id) {
           jobId = res.body.job_id;

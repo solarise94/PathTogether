@@ -13,6 +13,8 @@
 //
 //   node run_parity.js --samples <切片文件夹> [--fl] [--fl-all] [--compact] [--port 8944]
 //   node run_parity.js --svs <sample.svs> [--compact] [--port 8944]
+//   node run_parity.js --input <file.scn|file.svs|...> [--compact] [--port 8944]
+//   node run_parity.js --bundle <bundle-dir> [--compact] [--port 8944]  (= --mrxs)
 // --compact (U3): the brightfield sample is converted with compact-jpeg-v1
 // in the browser AND natively — parity is browser-compact == native-compact
 // (compact bytes are never compared with preserve bytes).
@@ -25,10 +27,14 @@ const L = require('./lib.js');
 const PORT = Number(L.arg('port', '8944'));
 const SAMPLES = L.arg('samples', '');
 const SVS = L.arg('svs', '');
-// F3: `--mrxs <dir>` — the unpacked bundle directory (entry + same-name
-// folder). Converts through the browser bundle path and compares with the
-// native CLI for BOTH brightfield profiles.
-const MRXS = L.arg('mrxs', '');
+// F3: `--mrxs <dir>` / `--bundle <dir>` (alias) — the unpacked bundle
+// directory (entry + same-name folder). Converts through the browser bundle
+// path and compares with the native CLI for BOTH brightfield profiles.
+const MRXS = L.arg('mrxs', '') || L.arg('bundle', '');
+// F4: `--input <file>` — ANY single-file converter input (SVS / SCN / KFB);
+// the browser artifact must be byte-identical with the native CLI for both
+// brightfield profiles (preserve + compact once each via --compact).
+const INPUT = L.arg('input', '');
 const WITH_FL = process.argv.includes('--fl');
 // --fl-all: every KFBF sample (aliases KFBF-A..D, sorted), not just the first
 const FL_ALL = process.argv.includes('--fl-all');
@@ -146,12 +152,14 @@ async function mainMrsx() {
   process.exitCode = results.ok ? 0 : 1;
 }
 
-/// F1: one SVS input, browser conversion (both brightfield profiles) vs the
-/// native CLI bytes of the same profile. Public CC0 samples carry their own
-/// names; the file name never enters the report.
-async function mainSvs() {
-  if (!SVS || !fs.existsSync(SVS)) throw new Error('--svs <file> required');
-  const outDir = path.join(L.GATE, 'parity-svs');
+/// F1/F4: one single-file input (SVS/SCN/KFB), browser conversion (both
+/// brightfield profiles) vs the native CLI bytes of the same profile. Public
+/// CC0 samples carry their own names; the file name never enters the report.
+async function mainInput() {
+  const input = INPUT || SVS;
+  if (!input || !fs.existsSync(input)) throw new Error('--input <file> (or --svs) required');
+  const ext = (path.extname(input) || '.bin').toLowerCase().slice(1);
+  const outDir = path.join(L.GATE, `parity-${ext}`);
   fs.mkdirSync(outDir, { recursive: true });
   const results = { runs: [], startedAt: new Date().toISOString() };
 
@@ -162,16 +170,16 @@ async function mainSvs() {
     await L.open(page, PORT);
     for (const profile of ['bf-ome', 'bf-classic']) {
     const tag = `${profile === 'bf-ome' ? 'ome' : 'classic'}${COMPACT ? '-compact' : ''}`;
-    const nativeOut = path.join(outDir, `svs-native-${tag}.tif`);
-    execFileSync(L.CLI, ['convert', SVS, nativeOut, '--overwrite', '--profile', profile,
+    const nativeOut = path.join(outDir, `${ext}-native-${tag}.tif`);
+    execFileSync(L.CLI, ['convert', input, nativeOut, '--overwrite', '--profile', profile,
       ...(COMPACT ? ['--encoding', 'compact'] : [])]);
     const nativeSha = await L.sha256File(nativeOut);
     const t0 = Date.now();
-    const r = await convertInBrowser(page, SVS, 'saver', profile,
+    const r = await convertInBrowser(page, input, 'saver', profile,
       COMPACT ? 'compact-jpeg-v1' : undefined);
     const equal = r.hash.sha256 === nativeSha;
     results.runs.push({
-      input: path.basename(SVS), bytes: fs.statSync(SVS).size,
+      input: path.basename(input), bytes: fs.statSync(input).size,
       sourceFormat: (r.rec && r.rec.result && r.rec.result.source_format) || null,
       outputProfile: profile,
       encoding: COMPACT ? 'compact-jpeg-v1' : 'preserve-source-v1',
@@ -180,7 +188,7 @@ async function mainSvs() {
       validation: { ifdCount: r.rec.validation.ifd_count, checks: r.rec.validation.checks },
       wallMs: Date.now() - t0,
     });
-    console.log(`SVS ${profile}${COMPACT ? ' compact' : ''}: browser ${r.hash.sha256.slice(0, 16)}… native ${nativeSha.slice(0, 16)}… equal=${equal} (${r.rec.convertMs} ms)`);
+    console.log(`${ext.toUpperCase()} ${profile}${COMPACT ? ' compact' : ''}: browser ${r.hash.sha256.slice(0, 16)}… native ${nativeSha.slice(0, 16)}… equal=${equal} (${r.rec.convertMs} ms)`);
     fs.rmSync(nativeOut, { force: true });
     }
   } finally {
@@ -189,8 +197,8 @@ async function mainSvs() {
   }
   results.finishedAt = new Date().toISOString();
   results.ok = results.runs.every((r) => r.equal);
-  L.writeJson('parity-svs/result.json', results);
-  console.log(results.ok ? 'SVS PARITY PASS' : 'SVS PARITY FAIL');
+  L.writeJson(`parity-${ext}/result.json`, results);
+  console.log(results.ok ? `${ext.toUpperCase()} PARITY PASS` : `${ext.toUpperCase()} PARITY FAIL`);
   process.exitCode = results.ok ? 0 : 1;
 }
 
@@ -198,8 +206,8 @@ async function main() {
   if (MRXS) {
     return mainMrsx();
   }
-  if (SVS) {
-    return mainSvs();
+  if (INPUT || SVS) {
+    return mainInput();
   }
   if (!SAMPLES || !fs.existsSync(SAMPLES)) {
     throw new Error('--samples <dir> required (private sample folder)');

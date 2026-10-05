@@ -63,6 +63,8 @@ pub struct GtiffGenParams {
     pub height: u32,
     /// Nominal tile size (the sample family: 256).
     pub tile: u32,
+    /// Tile height override (non-square 128×256 geometry; None = square).
+    pub tile_h: Option<u32>,
     /// Source pyramid level count (each step ÷2, ≥ 8 px).
     pub levels: u32,
     pub bigtiff: bool,
@@ -102,6 +104,7 @@ impl Default for GtiffGenParams {
             width: 520,
             height: 300,
             tile: 128,
+            tile_h: None,
             levels: 3,
             bigtiff: false,
             big_endian: false,
@@ -390,16 +393,25 @@ pub fn build_synthetic_gtiff(out: &mut dyn RandomAccessSink, p: &GtiffGenParams)
     // ---- encode every level's tiles ------------------------------------- //
     let mut tables_of: Vec<Vec<u8>> = Vec::new();
     let mut tiles_of: Vec<Vec<Vec<u8>>> = Vec::new();
+    let tile_dims = |li: usize| -> (u32, u32) {
+        let tw = if p.tile_mismatch && li > 0 { (p.tile / 2).max(16) } else { p.tile };
+        let th = if p.tile_mismatch && li > 0 {
+            (p.tile_h.unwrap_or(p.tile) / 2).max(16)
+        } else {
+            p.tile_h.unwrap_or(p.tile)
+        };
+        (tw, th)
+    };
     for (li, &(lw, lh)) in levels.iter().enumerate() {
-        let tile = if p.tile_mismatch && li > 0 { (p.tile / 2).max(16) } else { p.tile };
+        let (tile, tile_h) = tile_dims(li);
         let across = (lw + tile - 1) / tile;
-        let down = (lh + tile - 1) / tile;
+        let down = (lh + tile_h - 1) / tile_h;
         let mut lvl_tables: Option<Vec<u8>> = None;
         let mut lvl_tiles = Vec::new();
         for row in 0..down {
             for col in 0..across {
                 let tw = tile.min(lw - col * tile);
-                let th = tile.min(lh - row * tile);
+                let th = tile_h.min(lh - row * tile_h);
                 let seed = p
                     .seed
                     ^ (li as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -500,9 +512,9 @@ pub fn build_synthetic_gtiff(out: &mut dyn RandomAccessSink, p: &GtiffGenParams)
             b.add(273, if p.bigtiff { 16 } else { 4 }, 1, off);
             b.add(279, if p.bigtiff { 16 } else { 4 }, 1, cnt);
         } else {
-            let tile = if p.tile_mismatch && li > 0 { (p.tile / 2).max(16) } else { p.tile };
+            let (tile, tile_h) = tile_dims(li);
             b.add_short(322, tile as u16);
-            b.add_short(323, tile as u16);
+            b.add_short(323, tile_h as u16);
             let offs = &lvl_offsets[li];
             let cnts = &lvl_counts[li];
             let (typ, ob, cb): (u16, Vec<u8>, Vec<u8>) = if p.bigtiff {

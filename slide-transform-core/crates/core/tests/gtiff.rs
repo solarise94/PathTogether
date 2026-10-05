@@ -811,3 +811,180 @@ fn hand_built_lzw_gray_and_planar_refuse() {
         assert!(e.message.contains(frag), "{}: {}", frag, e.message);
     }
 }
+
+// --------------------------------------------------------------------------- //
+// 审查回归：非方形 tile（tile_h > tile_w）
+// --------------------------------------------------------------------------- //
+
+#[test]
+fn non_square_tiles_probe_and_convert_without_panic() {
+    // 复现（审查 #1）：probe 接受 tile 128×256 的合法 TIFF，转换在 l0-box2
+    // 合成时 canvas 越界 panic（`range end index … out of range`）——probe
+    // 判定与转换崩溃自相矛盾。合成画布按 (2·tile_w)×(2·tile_h) 计。
+    let p = GtiffGenParams {
+        tile: 128,
+        tile_h: Some(256),
+        levels: 1,
+        xres: None,
+        ..default_params()
+    };
+    let data = gen(&p);
+    let src = MemSource::new(data.clone());
+    let doc = probe_gtiff(&src).unwrap();
+    assert_eq!(doc.levels[0].tile_w, 128);
+    assert_eq!(doc.levels[0].tile_h, 256);
+    assert_eq!(doc.levels[0].tiles_total, 5 * 2, "520/128=5 × ceil(300/256)=2");
+    assert_eq!(doc.generated, vec![(260, 150), (130, 75)]);
+
+    let (out, out_bytes) = convert(&data, OutputProfile::ClassicJpegBigTiff).unwrap();
+    assert_eq!(out.width, p.width);
+    // L0 tile 仍原样搬运
+    let isrc = MemSource::new(data);
+    let ihdr = tiff_read::read_header(&isrc).unwrap();
+    let ichain = tiff_read::ifd_chain(&isrc, &ihdr).unwrap();
+    let osrc = MemSource::new(out_bytes);
+    let ohdr = tiff_read::read_header(&osrc).unwrap();
+    let ochain = tiff_read::ifd_chain(&osrc, &ohdr).unwrap();
+    let mut s = tiff_read::TileCursor::new(&isrc, &ihdr, &ichain[0]).unwrap();
+    let mut o = tiff_read::TileCursor::new(&osrc, &ohdr, &ochain[0]).unwrap();
+    let mut cell = 0u64;
+    while let (Some((so, sl)), Some((oo, ol))) = (s.next_pair().unwrap(), o.next_pair().unwrap()) {
+        assert_eq!(
+            isrc.read_at(so, sl as usize).unwrap(),
+            osrc.read_at(oo, ol as usize).unwrap(),
+            "level 0 cell {cell} must be verbatim"
+        );
+        cell += 1;
+    }
+    // 生成层几何：tile 128×256 → L1 (260×150) = 3×1、L2 (130×75) = 2×1
+    assert_eq!(out.levels[1].tiles_across, 3);
+    assert_eq!(out.levels[1].tiles_down, 1);
+    assert_eq!(out.levels[1].tiles_total, 3);
+    assert_eq!(out.levels[2].tiles_total, 2);
+}
+
+#[test]
+fn non_square_generated_tiles_match_the_box2_average() {
+    // 非方形 tile 下生成层的像素内容也要对：256×512 画布、行距 2·tile_w
+    let p = GtiffGenParams {
+        tile: 128,
+        tile_h: Some(256),
+        levels: 1,
+        xres: None,
+        pattern: FixturePattern::Gradient,
+        ..default_params()
+    };
+    let data = gen(&p);
+    let (out, out_bytes) = convert(&data, OutputProfile::ClassicJpegBigTiff).unwrap();
+    let osrc = MemSource::new(out_bytes);
+    let ohdr = tiff_read::read_header(&osrc).unwrap();
+    let ochain = tiff_read::ifd_chain(&osrc, &ohdr).unwrap();
+    let decode_tile = |ifd_idx: usize, cell: usize| -> CoreResult<slide_transform_core::jpeg::DecodedImage> {
+        let mut cur = tiff_read::TileCursor::new(&osrc, &ohdr, &ochain[ifd_idx]).unwrap();
+        let mut i = 0usize;
+        while let Some((off, len)) = cur.next_pair()? {
+            if i == cell {
+                return slide_transform_core::jpeg::decode_ex(
+                    &osrc.read_at(off, len as usize).unwrap(),
+                    u64::MAX,
+                    false,
+                );
+            }
+            i += 1;
+        }
+        Err(CoreError::validation("tile?"))
+    };
+    let lv0 = &out.levels[0];
+    let (tw, th) = (128usize, 256usize);
+    let gen1 = &out.levels[1];
+    for cell in 0..gen1.tiles_total as usize {
+        let tx = cell % gen1.tiles_across as usize;
+        let ty = cell / gen1.tiles_across as usize;
+        let mut canvas = vec![255u8; tw * 2 * th * 2 * 3];
+        for pty in (ty * 2)..(ty * 2 + 2) {
+            for ptx in (tx * 2)..(tx * 2 + 2) {
+                if ptx >= lv0.tiles_across as usize || pty >= lv0.tiles_down as usize {
+                    continue;
+                }
+                let img = decode_tile(0, pty * lv0.tiles_across as usize + ptx).unwrap();
+                let bx = (ptx - tx * 2) * tw;
+                let by = (pty - ty * 2) * th;
+                for row in 0..img.height as usize {
+                    for col in 0..img.width as usize {
+                        let s = (row * img.width as usize + col) * 3;
+                        let d = ((by + row) * tw * 2 + bx + col) * 3;
+                        canvas[d..d + 3].copy_from_slice(&img.data[s..s + 3]);
+                    }
+                }
+            }
+        }
+        let valid_w = tw.min(260 - tx * tw);
+        let valid_h = th.min(150 - ty * th);
+        let gen_img = decode_tile(1, cell).unwrap();
+        let mut total_abs = 0u64;
+        let mut max_abs = 0u64;
+        for oy in 0..valid_h {
+            for ox in 0..valid_w {
+                for c in 0..3 {
+                    let mut acc = 0u32;
+                    for dy in 0..2 {
+                        for dx in 0..2 {
+                            acc += canvas[((oy * 2 + dy) * tw * 2 + ox * 2 + dx) * 3 + c] as u32;
+                        }
+                    }
+                    let d = ((acc >> 2) as i32 - gen_img.data[(oy * tw + ox) * 3 + c] as i32)
+                        .unsigned_abs() as u64;
+                    total_abs += d;
+                    max_abs = max_abs.max(d);
+                }
+            }
+        }
+        let n = (valid_w * valid_h * 3) as u64;
+        assert!(
+            total_abs * 100 / n < 100 && max_abs <= 12,
+            "generated tile {cell}: mean {:.2} max {max_abs}",
+            total_abs as f64 / n as f64
+        );
+    }
+}
+
+// --------------------------------------------------------------------------- //
+// 审查回归：ICC 带入输出且 WARN_NO_ICC 条件化
+// --------------------------------------------------------------------------- //
+
+#[test]
+fn icc_profile_is_carried_and_the_warning_is_conditional() {
+    // 复现（审查 #2/#3）：源带 ICC（tag 34675）时警告仍无条件推
+    // color_management_not_applied，与「ICC 已带入输出」矛盾；
+    // 且该行为此前零测试。
+    let with_icc = GtiffGenParams { icc: true, ..single_level_params() };
+    let data = gen(&with_icc);
+    let src = MemSource::new(data.clone());
+    let doc = probe_gtiff(&src).unwrap();
+    assert!(doc.icc.is_some(), "fixture wrote tag 34675 on IFD 0");
+    let (out, out_bytes) = convert(&data, OutputProfile::ClassicJpegBigTiff).unwrap();
+    assert!(
+        !out.warnings.iter().any(|w| w == "color_management_not_applied"),
+        "带 ICC 的源不得再报 color_management_not_applied: {:?}",
+        out.warnings
+    );
+    // ICC 确实带到输出 level 0
+    let osrc = MemSource::new(out_bytes);
+    let ohdr = tiff_read::read_header(&osrc).unwrap();
+    let ochain = tiff_read::ifd_chain(&osrc, &ohdr).unwrap();
+    let icc_entry = ochain[0].find(34675);
+    assert!(icc_entry.is_some(), "output IFD 0 must carry tag 34675");
+    assert_eq!(
+        tiff_read::entry_value(&osrc, &ohdr, icc_entry.unwrap()).unwrap(),
+        doc.icc.unwrap(),
+        "output ICC bytes must be the source's, verbatim"
+    );
+    // OME profile 同样携带
+    let (ome_out, _) = convert(&gen(&with_icc), OutputProfile::OmeBigTiffRgbSubifd).unwrap();
+    assert!(!ome_out.warnings.iter().any(|w| w == "color_management_not_applied"));
+
+    // 无 ICC 的源维持原警告
+    let without = GtiffGenParams { icc: false, ..single_level_params() };
+    let (out2, _) = convert(&gen(&without), OutputProfile::ClassicJpegBigTiff).unwrap();
+    assert!(out2.warnings.iter().any(|w| w == "color_management_not_applied"));
+}

@@ -1725,6 +1725,7 @@ fn cmd_gen_gtiff(args: &[String]) -> Result<String, CoreError> {
     let mut width = 520u32;
     let mut height = 300u32;
     let mut tile = 128u32;
+    let mut tile_h: Option<u32> = None;
     let mut levels = 3u32;
     let mut bigtiff = false;
     let mut big_endian = false;
@@ -1747,6 +1748,7 @@ fn cmd_gen_gtiff(args: &[String]) -> Result<String, CoreError> {
             "--width" => { i += 1; width = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--width"))?; }
             "--height" => { i += 1; height = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--height"))?; }
             "--tile" => { i += 1; tile = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--tile"))?; }
+            "--tile-h" => { i += 1; tile_h = Some(args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--tile-h"))?); }
             "--levels" => { i += 1; levels = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--levels"))?; }
             "--bigtiff" => bigtiff = true,
             "--big-endian" => big_endian = true,
@@ -1763,7 +1765,17 @@ fn cmd_gen_gtiff(args: &[String]) -> Result<String, CoreError> {
             "--no-xres" => no_xres = true,
             "--icc" => icc = true,
             "--gradient" => gradient = true,
-            _ => path = Some(&args[i]),
+            // 硬化：未知旗标不落进输出路径（此前 `_ =>` 会把 `--flag` 当
+            // 位置参数写到 CWD——遗留文件 --gradient / 256 的事故类）
+            _ => {
+                if args[i].starts_with('-') && args[i] != "-" {
+                    return Err(CoreError::validation(format!(
+                        "gen-gtiff 未知旗标 {}",
+                        args[i]
+                    )));
+                }
+                path = Some(&args[i]);
+            }
         }
         i += 1;
     }
@@ -1772,6 +1784,7 @@ fn cmd_gen_gtiff(args: &[String]) -> Result<String, CoreError> {
         width,
         height,
         tile,
+        tile_h,
         levels,
         bigtiff,
         big_endian,

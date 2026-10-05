@@ -522,8 +522,11 @@ fn generated_tile_from_prev(
     prev_tables: Option<&[u8]>,
 ) -> CoreResult<()> {
     const F: usize = 2;
-    let side = (tile_w as usize) * F;
-    let canvas = &mut canvas[..side * side * 3];
+    // non-square tiles: the canvas pitch is 2·tile_w COLUMNS but 2·tile_h
+    // ROWS (the review #1 out-of-bounds was a square-canvas assumption)
+    let pitch = (tile_w as usize) * F;
+    let canvas_rows = (tile_h as usize) * F;
+    let canvas = &mut canvas[..pitch * canvas_rows * 3];
     let out = &mut out[..(tile_w as usize) * (tile_h as usize) * 3];
     // the level's extent clips the last tile row/column: out-of-level canvas
     // stays white (brightfield padding), never stale bytes from a previous
@@ -570,7 +573,7 @@ fn generated_tile_from_prev(
             let by = (pty - ty * F) * tile_h as usize;
             for row in 0..img.height as usize {
                 let s = row * img.width as usize * 3;
-                let d = (by + row) * side + bx;
+                let d = (by + row) * pitch + bx;
                 match img.kind {
                     crate::jpeg::ColorKind::Rgb => {
                         canvas[d * 3..(d + img.width as usize) * 3]
@@ -595,7 +598,7 @@ fn generated_tile_from_prev(
             for c in 0..3 {
                 let mut acc = 0u32;
                 for dy in 0..F {
-                    let row = (oy * F + dy) * side + ox * F;
+                    let row = (oy * F + dy) * pitch + ox * F;
                     for dx in 0..F {
                         acc += canvas[(row + dx) * 3 + c] as u32;
                     }
@@ -706,14 +709,20 @@ fn convert_inner(
     if !doc.generated.is_empty() {
         warnings.push(format!("{WARN_GTIFF_LEVELS_GENERATED}:{}", doc.generated.len()));
     }
-    warnings.push(WARN_NO_ICC.to_string());
+    // SVS 同款条件式：ICC 实际带入输出 level 0 时不报（SCN/MRXS 无条件是
+    // 因为它们没有 ICC 概念——本适配器有）
+    if doc.icc.is_none() {
+        warnings.push(WARN_NO_ICC.to_string());
+    }
 
-    // composition working set: the padded canvas (side²) + the out tile +
-    // one decoded previous tile — charged ONCE before the first composition
+    // composition working set: the padded canvas ((2·tw)×(2·th) — tiles may
+    // be non-square) + the out tile + one decoded previous tile — charged
+    // ONCE before the first composition
     let tile = (levels[0].tile_w, levels[0].tile_h);
-    let side = (tile.0 as u64) * 2;
-    let compose_bytes = side
-        .saturating_mul(side)
+    let side_x = (tile.0 as u64) * 2;
+    let side_y = (tile.1 as u64) * 2;
+    let compose_bytes = side_x
+        .saturating_mul(side_y)
         .saturating_mul(3)
         .saturating_add((tile.0 as u64) * (tile.1 as u64) * 3 * 2);
     if !doc.generated.is_empty() {

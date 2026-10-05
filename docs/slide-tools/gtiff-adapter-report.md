@@ -30,9 +30,14 @@ q80/4:2:0/标准 Huffman，全量重编码，报告 lossy）。
 
 元数据：MPP 取自 XResolution/YResolution + ResolutionUnit（inch/cm），双方
 同时在场、有限、为正且相差 ≤1% 才写入；其余一律 unknown（不发明）。
-IFD 0 的 ICC（34675）带入输出 level 0。JPEG tile 真彩色空间按流内标记判定
+IFD 0 的 ICC（34675）带入输出 level 0，且此时**不再**报
+`color_management_not_applied`（无 ICC 时才报，SVS 同款条件式——独立审查
+2026-10-05 修复，带 Rust/pytest 回归）。JPEG tile 真彩色空间按流内标记判定
 （与 SVS/SCN 同规则：TIFF photometric 只在歧义时参与）；共享 `JPEGTables`
-（347）顺位搬运。
+（347）顺位搬运。tile 允许非方形（tile_w ≠ tile_h）：l0-box2 合成画布按
+(2·tile_w)×(2·tile_h) 计（独立审查 2026-10-05 修复——此前合成按正方形
+假设，tile_h > tile_w 时越界 panic，probe 判定与转换崩溃自相矛盾；现
+probe/convert 一致，Rust/pytest 双回归）。
 
 ## 2. 关键行为
 
@@ -119,12 +124,13 @@ adapter_version 一律拒绝。Rust 项 `resume_from_a_crash_inside_a_generated_
 
 ## 5. 测试矩阵
 
-- Rust `crates/core/tests/gtiff.rs`：23 项（探测/生成尾几何、逐字节搬运、
-  box2 逐 tile 像素、OME profile 校验、变体/路由拒绝、零值 tile、预算、
-  估算、续跑一致、大端/BigTIFF、厂商分类词表）。
-- pytest `tests/test_slide_transform_gtiff.py`：16 项（夹具双 profile、
-  生成层像素门、变体拒绝、厂商路由分派、预算、env 未设置 skip 回归；
-  真实样本门 + 320M scope + L0 硬门）。
+- Rust `crates/core/tests/gtiff.rs`：26 项（探测/生成尾几何、逐字节搬运、
+  box2 逐 tile 像素（含非方形 tile 回归）、OME profile 校验、变体/路由
+  拒绝、零值 tile、预算、估算、续跑一致、大端/BigTIFF、厂商分类词表、
+  ICC 携带与条件警告回归）。
+- pytest `tests/test_slide_transform_gtiff.py`：18 项（夹具双 profile、
+  生成层像素门、变体拒绝、厂商路由分派、预算、env 未设置 skip 回归、
+  ICC/--tile-h 审查回归；真实样本门 + 320M scope + L0 硬门）。
 - vitest `tests/js/tools-gtiff-input.test.ts`（13 项）+ `slide-sniff.test.ts`
   /`tools-scn-input.test.ts` 跟进。
 - 浏览器 C2：`run_faults.js` 新增 `gtiff-adapter-change-refused` /
@@ -150,3 +156,6 @@ adapter_version 一律拒绝。Rust 项 `resume_from_a_crash_inside_a_generated_
    仅影响空间预检的保守性，不影响产物。
 7. **大端 classic TIFF 的真实样本未测**（公开目录无此类 generic-tiff），
    仅合成夹具覆盖。
+8. **JS 侧无 ICC/tile 形状行为**：engine.js 嗅探只做厂商分派 + IFD 0 结构
+   快判，不读 ICC 也不检查 tile 比例——两项审查修复的行为都在 wasm 核心
+   （probe/convert），JS 无对应断言面（故 vitest 未加用例，非遗漏）。

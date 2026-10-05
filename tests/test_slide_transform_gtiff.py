@@ -234,6 +234,67 @@ def test_vendor_descriptions_route_to_their_adapters(workdir, knobs, fmt):
 
 
 @pytest.mark.skipif(CLI is None, reason="slide-transform CLI 未构建")
+def test_icc_carried_to_output_and_warning_conditional(workdir):
+    """审查回归 #2/#3：源 ICC 带入输出 level 0，且不再报
+    color_management_not_applied（无 ICC 时维持该警告）。此前该行为零覆盖。
+    """
+    import tifffile
+
+    src = workdir / "icc.tiff"
+    _cli("gen-gtiff", src, "--levels", "1", "--icc")
+    pj = json.loads(_cli("probe", src).stdout)
+    assert pj["document"]["icc_profile"] is True
+
+    out = workdir / "icc.tif"
+    rj = json.loads(_cli("convert", src, out, "--overwrite").stdout)
+    assert "color_management_not_applied" not in rj["warnings"]
+    vj = json.loads(
+        _cli("validate", out, "--expect-ifd", str(rj["validation"]["ifd_count"])).stdout
+    )
+    assert vj["ok"] is True
+    with tifffile.TiffFile(out) as tf:
+        icc = tf.pages[0].tags.get(34675)
+        assert icc is not None, "输出 level 0 必须携带 tag 34675"
+        assert bytes(icc.value).startswith(b"PTGFIXICC")
+
+    # 无 ICC 的源维持原警告（对照）
+    src2 = workdir / "noicc.tiff"
+    _cli("gen-gtiff", src2, "--levels", "1", "--no-xres")
+    rj2 = json.loads(_cli("convert", src2, workdir / "noicc.tif", "--overwrite").stdout)
+    assert "color_management_not_applied" in rj2["warnings"]
+
+
+@pytest.mark.skipif(CLI is None, reason="slide-transform CLI 未构建")
+def test_non_square_tiles_convert_without_panic(workdir):
+    """审查回归 #1：tile 128×256 的合法 TIFF——probe 判定与转换一致，
+    不再在 l0-box2 合成时 canvas 越界 panic（此前 rc=101 无输出文件）。
+    """
+    import slide_io
+
+    src = workdir / "nonsquare.tiff"
+    _cli("gen-gtiff", src, "--width", "520", "--height", "300", "--tile", "128",
+         "--tile-h", "256", "--levels", "1", "--no-xres")
+    pj = json.loads(_cli("probe", src).stdout)
+    doc = pj["document"]
+    assert doc["levels"][0]["tile_w"] == 128
+    assert doc["levels"][0]["tile_h"] == 256
+
+    out = workdir / "nonsquare.ome.tif"
+    rj = json.loads(
+        _cli("convert", src, out, "--overwrite", "--profile", "bf-ome").stdout
+    )
+    assert [l["width"] for l in rj["levels"]] == [520, 260, 130]
+    assert rj["levels"][0]["tiles_raw_copied"] == rj["levels"][0]["tiles_total"]
+    vj = json.loads(
+        _cli("validate", out, "--expect-ifd", str(rj["validation"]["ifd_count"])).stdout
+    )
+    assert vj["ok"] is True
+    sp = slide_io.open_slide(str(out))
+    assert sp.dimensions == (520, 300)
+    assert getattr(sp, "is_native_rgb", True)
+
+
+@pytest.mark.skipif(CLI is None, reason="slide-transform CLI 未构建")
 def test_memory_budget_refusal_before_allocation(workdir):
     """预算 < 结构预留 → 分配前 resource_profile_insufficient。"""
     src = workdir / "b.tiff"

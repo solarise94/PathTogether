@@ -1805,6 +1805,83 @@ async function scenarioMX() {
   }
 }
 
+// (vm) F7 VMS 页面入口：真实 CC0 Hamamatsu 样本（VMS_SAMPLE_DIR，缺省跳过）
+// 经「选择文件夹」input（page.setInputFiles 目录 → webkitRelativePath；平铺
+// 布局：.vms 入口 + 同目录 tile JPEG）→ 摘要 VMS (Hamamatsu)/明场/画质 +
+// 拼接重编码说明 → 转换（保留画质，bf-ome）→ 保存 sha == 原生；compact 一次
+// == 原生 compact。变体拒绝（本地 gen-vms 无 restart marker 夹具）在页面上
+// 复制前被拒且无任务目录。
+async function scenarioVM() {
+  const dir = process.env.VMS_SAMPLE_DIR;
+  if (!dir || !fs.existsSync(dir)) {
+    record('vm-vms-folder-e2e', true, { skipped: 'VMS_SAMPLE_DIR not set or missing' });
+    return;
+  }
+  const stems = fs.readdirSync(dir).filter((f) => /\.vms$/i.test(f)).sort();
+  if (stems.length !== 1) throw new Error(`expected exactly one .vms entry in ${dir}`);
+  const entryRel = path.join(dir, stems[0]);
+  const nativeSha = await L.sha256File(L.nativeConvert(entryRel,
+    path.join(L.GATE, 'fixtures', 'vms-native-bf-ome.ome.tif'),
+    ['--profile', 'bf-ome', '--timeout', '7200']));
+  const nativeCompactSha = await L.sha256File(L.nativeConvert(entryRel,
+    path.join(L.GATE, 'fixtures', 'vms-native-bf-ome-compact.ome.tif'),
+    ['--profile', 'bf-ome', '--encoding', 'compact', '--timeout', '7200']));
+
+  const { context, page } = await L.launch('vm', [L.savePickerStub()]);
+  try {
+    await L.openTools(page, PORT);
+    const runOnce = async (compact) => {
+      await L.clearJobs(page);
+      await page.reload({ waitUntil: 'load' });
+      await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
+      await page.setInputFiles('#folder-input', dir);
+      await waitVisible(page, '#summary-section:not([hidden])', 600000);
+      const fmt = (await page.textContent('#summary-format')).trim();
+      if (fmt !== 'VMS (Hamamatsu)') throw new Error(`summary format "${fmt}"`);
+      const qShown = await page.evaluate(() => ({
+        quality: !document.getElementById('quality-fieldset').hidden,
+        note: !document.getElementById('quality-vms-note').hidden,
+      }));
+      if (!qShown.quality) throw new Error('quality choice hidden for VMS');
+      if (!qShown.note) throw new Error('VMS quality note hidden');
+      if (compact) await page.check('#quality-compact');
+      await page.click('#convert-btn');
+      await waitVisible(page, '#result-section:not([hidden])', 7200000);
+      const composed = (await page.textContent('#result-composed')) || '';
+      if (!composed.trim()) throw new Error('composed summary row missing');
+      await page.click('#save-btn');
+      await waitText(page, '#save-status', /已保存|Saved/, 120000);
+      const saved = await L.opfsSha256(page);
+      return { fmt, sha: saved.sha256 };
+    };
+    const pres = await runOnce(false);
+    if (pres.sha !== nativeSha) throw new Error(`vms preserve sha ${pres.sha} != native ${nativeSha}`);
+    const comp = await runOnce(true);
+    if (comp.sha !== nativeCompactSha) throw new Error(`vms compact sha ${comp.sha} != native ${nativeCompactSha}`);
+
+    // 变体拒绝：无 restart marker 的 VMS tile 在复制前被拒（无任务目录）
+    const fixtureDir = path.join(L.GATE, 'fixtures');
+    fs.mkdirSync(fixtureDir, { recursive: true });
+    const noRestartDir = path.join(fixtureDir, 'vms-no-restart');
+    if (!fs.existsSync(path.join(noRestartDir, 'synthetic.vms'))) {
+      const { execFileSync } = require('child_process');
+      execFileSync(L.CLI, ['gen-vms', noRestartDir, '--no-restart']);
+    }
+    await L.clearJobs(page);
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
+    await page.setInputFiles('#folder-input', noRestartDir);
+    await waitText(page, '#page-error', /restart marker/, 60000);
+    if ((await L.jobDirs(page)).length !== 0) throw new Error('no-restart VMS left a job dir');
+    record('vm-vms-folder-e2e', true, { format: pres.fmt, preserveSha: pres.sha,
+      compactSha: comp.sha, variant: 'no-restart rejected before copy' });
+  } catch (e) {
+    record('vm-vms-folder-e2e', false, { error: String(e).slice(0, 400) });
+  } finally {
+    await context.close();
+  }
+}
+
 // ------------------------------------------------------------------ main --
 
 const SCENARIOS = [
@@ -1815,7 +1892,7 @@ const SCENARIOS = [
   ['r', scenarioR], ['s', scenarioS], ['t', scenarioT], ['u', scenarioU],
   ['v', scenarioV], ['w', scenarioW], ['x', scenarioX], ['y', scenarioY],
   ['z', scenarioZ], ['sv', scenarioSV], ['mx', scenarioMX], ['sc', scenarioSC],
-  ['gt', scenarioGT], ['nd', scenarioND],
+  ['gt', scenarioGT], ['nd', scenarioND], ['vm', scenarioVM],
 ];
 
 async function main() {

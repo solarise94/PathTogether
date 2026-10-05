@@ -159,7 +159,10 @@ fn split_stream(full: &[u8]) -> CoreResult<(Vec<u8>, Vec<u8>)> {
 
 /// Encode one tile JPEG with row-aligned restart markers (S422: MCU 16×8;
 /// the encoder's MCU layout matches the ndpi fixture's strip assembly).
-fn build_tile(w: u32, h: u32, p: &VmsGenParams, col: u32, row: u32) -> CoreResult<Vec<u8>> {
+/// Returns the stream plus the entropy-start byte offset of every MCU row
+/// (the `.opt` records — the offset AFTER each row's RST marker, row 0's
+/// being the header end, exactly what OpenSlide validates against).
+fn build_tile(w: u32, h: u32, p: &VmsGenParams, col: u32, row: u32) -> CoreResult<(Vec<u8>, Vec<u64>)> {
     const MCU_W: u32 = 16;
     const MCU_H: u32 = 8;
     if w % MCU_W != 0 || h % MCU_H != 0 {
@@ -170,7 +173,7 @@ fn build_tile(w: u32, h: u32, p: &VmsGenParams, col: u32, row: u32) -> CoreResul
     let px = tile_pixels(p, col, row, w, h);
     if p.no_restart && col == 0 && row == 0 {
         let cfg = EncoderCfg::with_quality(p.quality, Sampling::S422);
-        return encode_rgb(&px, w, h, &cfg);
+        return Ok((encode_rgb(&px, w, h, &cfg)?, Vec::new()));
     }
     let mcus_x = w / MCU_W;
     let mcus_y = h / MCU_H;
@@ -179,6 +182,7 @@ fn build_tile(w: u32, h: u32, p: &VmsGenParams, col: u32, row: u32) -> CoreResul
     let seg_px_rows = seg_rows_mcu * MCU_H;
     let cfg = EncoderCfg::with_quality(p.quality, Sampling::S422);
     let mut out: Vec<u8> = Vec::new();
+    let mut row_offsets: Vec<u64> = Vec::new();
     let mut header_done = false;
     let mut rst = 0u8;
     let mut sy = 0u32;
@@ -220,18 +224,19 @@ fn build_tile(w: u32, h: u32, p: &VmsGenParams, col: u32, row: u32) -> CoreResul
             out.extend_from_slice(&[0xFF, 0xD0 + (rst & 7)]);
             rst += 1;
         }
+        row_offsets.push(out.len() as u64);
         out.extend_from_slice(&entropy);
         sy += rows / MCU_H;
     }
     out.extend_from_slice(&[0xFF, 0xD9]);
     if p.progressive && col == 0 && row == 0 {
         // bare progressive header (typed SOF2 rejection path)
-        return Ok(vec![
+        return Ok((vec![
             0xFF, 0xD8, 0xFF, 0xC2, 0x00, 0x11, 0x08, 0x00, 0x08, 0x01, 0x00, 0x03, 0x01,
             0x11, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01, 0xFF, 0xD9,
-        ]);
+        ], Vec::new()));
     }
-    Ok(out)
+    Ok((out, row_offsets))
 }
 
 /// Assemble the bundle (members: `<stem>.vms`, `<stem>-<c>-<r>.jpg` per
@@ -286,6 +291,7 @@ pub fn build_synthetic_vms(p: &VmsGenParams) -> CoreResult<MemBundle> {
 
     let mut out = MemBundle::new();
     out.push(&format!("{}.vms", p.stem), ini.into_bytes());
+    let mut opt_records: Vec<u64> = Vec::new();
     for r in 0..p.rows {
         for c in 0..p.cols {
             let name = p.tile_name(c, r);
@@ -295,45 +301,39 @@ pub fn build_synthetic_vms(p: &VmsGenParams) -> CoreResult<MemBundle> {
             if p.missing_member && c == p.cols - 1 && r == p.rows - 1 {
                 continue; // drop the LAST tile (a non-(0,0) member)
             }
-            out.push(&name, build_tile(p.width_of(c), p.height_of(r), p, c, r)?);
+            let (jpg, row_offsets) = build_tile(p.width_of(c), p.height_of(r), p, c, r)?;
+            opt_records.extend_from_slice(&row_offsets);
+            out.push(&name, jpg);
         }
     }
     if p.macro_image {
-        // small deterministic macro (dims not MCU-bound: associated images
-        // are only header-probed, never decoded)
-        let (w, h) = (64u32, 48u32);
-        let mut px = Vec::with_capacity((w * h * 3) as usize);
-        for y in 0..h {
-            for x in 0..w {
-                let v = ((x + y) % 251) as u8;
-                px.extend_from_slice(&[v, v.saturating_add(11), v.saturating_add(23)]);
-            }
-        }
-        let cfg = EncoderCfg::with_quality(85, Sampling::S444);
-        out.push(&macro_name, encode_rgb(&px, w, h, &cfg)?);
+        // small deterministic macro (64×48 = MCU-aligned; OpenSlide's VMS
+        // driver validates the macro JPEG as well, so it carries restart
+        // markers like every other image in the bundle)
+        let mp = VmsGenParams { quality: 85, ..p.clone() };
+        let (jpg, _) = build_tile(64, 48, &mp, 0, 0)?;
+        out.push(&macro_name, jpg);
     }
     if p.map_file {
-        let (w, h) = (128u32, 64u32);
-        let mut px = Vec::with_capacity((w * h * 3) as usize);
-        for y in 0..h {
-            for x in 0..w {
-                let v = ((x * 3 + y) % 249) as u8;
-                px.extend_from_slice(&[v, v, v]);
-            }
-        }
-        let cfg = EncoderCfg::with_quality(85, Sampling::S444);
-        out.push(&map_name, encode_rgb(&px, w, h, &cfg)?);
+        // the scanner's own map/reduced image (OpenSlide validates it too;
+        // the converter never decodes it — reduced output levels are l0-box2)
+        let mp = VmsGenParams { quality: 85, ..p.clone() };
+        let (jpg, _) = build_tile(128, 64, &mp, 0, 1)?;
+        out.push(&map_name, jpg);
     }
-    if p.opt_file {
-        // a plausible .opt: 40-byte records, one int64-LE offset each (the
-        // adapter reports its presence only — OpenSlide itself treats the
-        // file as an untrusted hint, the converter decodes every byte)
-        let mut opt: Vec<u8> = Vec::new();
-        let mut off: u64 = 640;
-        for _ in 0..16 {
+    if p.opt_file && opt_records.len() >= 2 {
+        // a FAITHFUL .opt: 40-byte records (int64-LE entropy-start offset of
+        // each MCU row, tiles ordered left-to-right top-to-bottom) with the
+        // documented quirk that the LAST row of the entire file is missing
+        // (the real sample's 762840 B = 19071 records = Σmcus_y − 1).
+        // OpenSlide validates these against the streams; the adapter itself
+        // reports presence only and decodes every byte.
+        let n = opt_records.len();
+        opt_records.truncate(n - 1);
+        let mut opt: Vec<u8> = Vec::with_capacity((n - 1) * 40);
+        for off in &opt_records {
             opt.extend_from_slice(&off.to_le_bytes());
             opt.extend_from_slice(&[0u8; 32]);
-            off += 4096;
         }
         out.push(&opt_name, opt);
     }

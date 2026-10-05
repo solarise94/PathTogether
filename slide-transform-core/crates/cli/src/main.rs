@@ -2031,10 +2031,13 @@ fn cmd_gen_vms(args: &[String]) -> Result<String, CoreError> {
     let mut out_dir = None;
     let mut cols = 2u32;
     let mut rows = 2u32;
-    let mut width0 = 96u32;
-    let mut width1 = 64u32;
-    let mut height0 = 80u32;
-    let mut height1 = 48u32;
+    // MCU 网格对齐（S422：16×8）；等宽列（OpenSlide 要求各 tile JPEG 的
+    // restart 内部 tile 尺寸一致——DRI=每行 MCU 数时即等宽）；拼接后
+    // 512×400 → L0 2×2 输出 tile + 一级 l0-box2 生成尾
+    let mut width0 = 256u32;
+    let mut width1 = 256u32;
+    let mut height0 = 256u32;
+    let mut height1 = 144u32;
     let mut macro_image = true;
     let mut map_file = true;
     let mut opt_file = true;

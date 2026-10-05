@@ -57,6 +57,7 @@ async function prepareFixtures() {
   const gtiff = path.join(dir, 'syn.tiff'); // F5: generic tiled-JPEG adapter rows
   const ndpi = path.join(dir, 'syn.ndpi'); // F6: NDPI adapter rows
   const mrxsDir = path.join(dir, 'mrxs'); // F3: bundle rows (entry + dir)
+  const vmsDir = path.join(dir, 'vms'); // F7: VMS flat-bundle rows
   if (!fs.existsSync(bf)) execFileSync(L.CLI, ['gen-kfb', bf, '--width', '700', '--height', '500']);
   if (!fs.existsSync(bf2)) execFileSync(L.CLI, ['gen-kfb', bf2, '--width', '1600', '--height', '1200']);
   if (!fs.existsSync(fl)) execFileSync(L.CLI, ['gen-kfbf', fl, '--width', '600', '--height', '400']);
@@ -66,6 +67,9 @@ async function prepareFixtures() {
   if (!fs.existsSync(ndpi)) execFileSync(L.CLI, ['gen-ndpi', ndpi, '--width', '512', '--height', '320', '--levels', '2']);
   if (!fs.existsSync(path.join(mrxsDir, 'synthetic.mrxs'))) {
     execFileSync(L.CLI, ['gen-mrxs', mrxsDir, '--images-x', '24', '--images-y', '18']);
+  }
+  if (!fs.existsSync(path.join(vmsDir, 'synthetic.vms'))) {
+    execFileSync(L.CLI, ['gen-vms', vmsDir]);
   }
   // native references use the browser's default for new jobs (bf-ome);
   // `bfClassic` is the classic profile kept for legacy/compatibility jobs;
@@ -78,13 +82,14 @@ async function prepareFixtures() {
     ['scn', scn, 'bf-ome', null],
     ['gtiff', gtiff, 'bf-ome', null],
     ['ndpi', ndpi, 'bf-ome', null],
-    ['mrxs', path.join(mrxsDir, 'synthetic.mrxs'), 'bf-ome', null]]) {
+    ['mrxs', path.join(mrxsDir, 'synthetic.mrxs'), 'bf-ome', null],
+    ['vms', path.join(vmsDir, 'synthetic.vms'), 'bf-ome', null]]) {
     const out = path.join(dir, `${k}-native.tif`);
     execFileSync(L.CLI, ['convert', p, out, '--overwrite', '--profile', prof,
       ...(enc ? ['--encoding', enc] : [])]);
     native[k] = await L.sha256File(out);
   }
-  return { bf, bf2, fl, svs, scn, gtiff, ndpi, mrxsDir, native, dir };
+  return { bf, bf2, fl, svs, scn, gtiff, ndpi, mrxsDir, vmsDir, native, dir };
 }
 
 // ---------------------------------------------------------------- scenarios
@@ -113,6 +118,26 @@ function makeScenarios(F) {
       return window.__c2.pickBundle(rows);
     }, await Promise.all(names.map(async (m) => ({ n: m.n, rel: m.rel,
       b64: (await fs.promises.readFile(m.p)).toString('base64') }))));
+  }
+
+  // F7: read the fixture VMS bundle's members (flat layout — the entry and
+  // its sibling tile JPEGs share one directory) and hand them to the page as
+  // {name, relPath, file} rows, exactly what the folder picker produces
+  async function loadVmsBundleRows(page) {
+    const dir = F.vmsDir;
+    const names = fs.readdirSync(dir).filter((f) => !f.startsWith('.')).sort();
+    await page.evaluate((list) => {
+      const rows = [];
+      for (const m of list) {
+        const bin = atob(m.b64);
+        const u8 = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+        rows.push({ name: m.n, relPath: m.n,
+          file: new File([u8], m.n, { type: 'application/octet-stream' }) });
+      }
+      return window.__c2.pickBundle(rows);
+    }, await Promise.all(names.map(async (n) => ({ n,
+      b64: (await fs.promises.readFile(path.join(dir, n))).toString('base64') }))));
   }
 
   // fresh page state + input + start, returns jobId
@@ -839,6 +864,59 @@ function makeScenarios(F) {
       outBefore: outBefore && outBefore.size, outAfter: outAfter && outAfter.size };
   }]);
 
+  S.push(['vms-bundle-converts-and-matches-native', async (page) => {
+    // F7 baseline: the flat VMS bundle converts through the browser bundle
+    // path and completes at the native bytes (segment-compose + l0-box2)
+    await loadVmsBundleRows(page);
+    const prep = await page.evaluate(() => window.__c2.probeBundle({}));
+    const jobId = prep.jobId;
+    const rec0 = await page.evaluate((id) => window.__c2.jobRecord(id), jobId);
+    await page.evaluate((id) => window.__c2.start({ preparedJobId: id }), jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    return { done, sha: await shaOf(page, jobId), expect: F.native.vms,
+      adapter: rec0.sourceAdapter };
+  }]);
+
+  S.push(['vms-adapter-change-refused', async (page) => {
+    // F7 换转换器拒绝续跑：committed progress belongs to the input adapter
+    // that wrote it (hamamatsu-vms-bundle); a record tampered to another
+    // adapter kind is refused, the honest resume completes at the native
+    // bytes (mosaic-compose + l0-box2 tail).
+    await loadVmsBundleRows(page);
+    const prep = await page.evaluate(() => window.__c2.probeBundle({}));
+    const jobId = prep.jobId;
+    await page.evaluate((id) => window.__c2.start({ preparedJobId: id, faults: { crashAtWrite: 4 } }), jobId);
+    await waitForFault(page, 'crashAtWrite', 0, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    const rec0 = await page.evaluate((id) => window.__c2.jobRecord(id), jobId);
+    await page.evaluate((id) => window.__c2.tamperJobRecord({ sourceAdapter: null }, id), jobId);
+    const asKfb = await page.evaluate((id) => window.__c2.tryResume({ jobId: id }), jobId);
+    await page.evaluate((id) => window.__c2.tamperJobRecord({ sourceAdapter: 'hamamatsu-vms-bundle' }, id), jobId);
+    await page.evaluate((id) => window.__c2.resume({ jobId: id }), jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    return { recAdapter: rec0.sourceAdapter, asKfb, done,
+      sha: await shaOf(page, jobId), expect: F.native.vms };
+  }]);
+
+  S.push(['vms-source-changed-refused', async (page) => {
+    // F7 源文件被改拒绝续跑：flip a byte inside one staged OPFS member after
+    // a mid-write crash → the bundle identity re-derivation refuses with the
+    // source-changed code and writes nothing.
+    await loadVmsBundleRows(page);
+    const prep = await page.evaluate(() => window.__c2.probeBundle({}));
+    const jobId = prep.jobId;
+    await page.evaluate((id) => window.__c2.start({ preparedJobId: id, faults: { crashAtWrite: 4 } }), jobId);
+    await waitForFault(page, 'crashAtWrite', 0, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    const outBefore = await page.evaluate((id) => window.__c2.outputInfo(id), jobId);
+    await page.evaluate((o) => window.__c2.tamperBundleMember(o.path, 'flip'),
+      { path: 'synthetic-0-0.jpg' });
+    const refused = await page.evaluate((id) => window.__c2.tryResume({ jobId: id }), jobId);
+    const outAfter = await page.evaluate((id) => window.__c2.outputInfo(id), jobId);
+    return { refused,
+      outBefore: outBefore && outBefore.size, outAfter: outAfter && outAfter.size };
+  }]);
+
   S.push(['gtiff-source-changed-refused', async (page) => {
     // F5: the staged copy must still be exactly the bytes hashed at staging.
     const b = await begin(page, F.gtiff, { profileId: 'saver', faults: { crashAtWrite: 6 } }); const jobId = b.jobId; const base = b.base;
@@ -1109,6 +1187,25 @@ function verdict(name, r) {
           sha: r.sha && r.sha.slice(0, 8) }));
     }
     case 'ndpi-source-changed-refused': {
+      const m = r.refused || {};
+      return m.refused && m.code === 'source_changed_refuse_resume'
+        && r.outAfter === r.outBefore
+        ? ok({ code: m.code }) : fail(safeJson({ refused: m, out: [r.outBefore, r.outAfter] }));
+    }
+    case 'vms-bundle-converts-and-matches-native': {
+      return r.done && r.done.ok && r.sha === r.expect && r.adapter === 'hamamatsu-vms-bundle'
+        ? ok() : fail(safeJson({ done: r.done && r.done.ok, sha: r.sha && r.sha.slice(0, 8),
+          expect: r.expect && r.expect.slice(0, 8), adapter: r.adapter }));
+    }
+    case 'vms-adapter-change-refused': {
+      const m = r.asKfb || {};
+      return r.recAdapter === 'hamamatsu-vms-bundle' && m.refused && m.code === 'resume_refused'
+        && m.kind === 'source-adapter' && m.message.includes('适配器')
+        && r.done && r.done.ok && r.sha === r.expect
+        ? ok() : fail(safeJson({ rec: r.recAdapter, asKfb: m, done: r.done && r.done.ok,
+          sha: r.sha && r.sha.slice(0, 8) }));
+    }
+    case 'vms-source-changed-refused': {
       const m = r.refused || {};
       return m.refused && m.code === 'source_changed_refuse_resume'
         && r.outAfter === r.outBefore

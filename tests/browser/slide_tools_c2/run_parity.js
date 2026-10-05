@@ -61,23 +61,41 @@ async function convertInBrowser(page, input, profileId, outputProfile, encoding)
   return { jobId, done, hash, rec };
 }
 
-/// F3: one MRXS bundle, browser conversion (both brightfield profiles) vs
-/// the native CLI bytes of the same profile. The members are read in Node
-/// and handed to the page as {name, relPath, bytes} rows (the engine treats
-/// them exactly like picker files with webkitRelativePath).
+/// F3/F7: one bundle (MRXS same-name dir, or a FLAT VMS folder: the .vms
+/// entry plus its sibling tile JPEGs), browser conversion (both brightfield
+/// profiles) vs the native CLI bytes of the same profile. The members are
+/// read in Node and handed to the page as {name, relPath, bytes} rows (the
+/// engine treats them exactly like picker files with webkitRelativePath).
 async function mainMrsx() {
   if (!MRXS || !fs.existsSync(MRXS)) throw new Error('--mrxs <bundle-dir> required');
   const outDir = path.join(L.GATE, 'parity-mrxs');
   fs.mkdirSync(outDir, { recursive: true });
   const results = { runs: [], startedAt: new Date().toISOString() };
 
-  // collect members: <dir>/<stem>.mrxs + <dir>/<stem>/*
-  const stems = fs.readdirSync(MRXS).filter((f) => f.toLowerCase().endsWith('.mrxs')).sort();
-  if (stems.length !== 1) throw new Error(`expected exactly one .mrxs entry in ${MRXS}`);
-  const stem = stems[0].replace(/\.mrxs$/i, '');
-  const members = [{ name: stems[0], relPath: `${stem}/${stems[0]}` }];
-  for (const f of fs.readdirSync(path.join(MRXS, stem)).sort()) {
-    members.push({ name: f, relPath: `${stem}/${stem}/${f}` });
+  // collect members by entry kind: MRXS = <dir>/<stem>.mrxs + <dir>/<stem>/*
+  // (relPath <stem>/<stem>.mrxs …); VMS = <dir>/<stem>.vms + flat siblings
+  // (relPath = the bare file name — members are named relative to the
+  // entry's directory)
+  const mrxsStems = fs.readdirSync(MRXS).filter((f) => f.toLowerCase().endsWith('.mrxs')).sort();
+  const vmsStems = fs.readdirSync(MRXS).filter((f) => f.toLowerCase().endsWith('.vms')).sort();
+  let members;
+  let entryFile;
+  let kind;
+  if (vmsStems.length === 1 && mrxsStems.length === 0) {
+    kind = 'vms';
+    entryFile = vmsStems[0];
+    members = fs.readdirSync(MRXS).filter((f) => !f.startsWith('.')).sort()
+      .map((f) => ({ name: f, relPath: f, p: path.join(MRXS, f) }));
+  } else if (mrxsStems.length === 1 && vmsStems.length === 0) {
+    kind = 'mrxs';
+    entryFile = mrxsStems[0];
+    const stem = mrxsStems[0].replace(/\.mrxs$/i, '');
+    members = [{ name: mrxsStems[0], relPath: `${stem}/${mrxsStems[0]}`, p: path.join(MRXS, mrxsStems[0]) }];
+    for (const f of fs.readdirSync(path.join(MRXS, stem)).sort()) {
+      members.push({ name: f, relPath: `${stem}/${stem}/${f}`, p: path.join(MRXS, stem, f) });
+    }
+  } else {
+    throw new Error(`expected exactly one .mrxs OR one .vms entry in ${MRXS}`);
   }
   const server = await L.startServer(PORT);
   process.on('exit', () => { try { server.kill('SIGKILL'); } catch { /* */ } });
@@ -98,18 +116,15 @@ async function mainMrsx() {
           file: new File([u8], m.name, { type: 'application/octet-stream' }) });
       }
       window.__bundleRows = rows;
-    }, await Promise.all(members.map(async (m) => {
-      const rel = m.name === stems[0]
-        ? path.join(MRXS, m.name)
-        : path.join(MRXS, stem, m.name);
-      return { name: m.name, relPath: m.relPath,
-        b64: (await fs.promises.readFile(rel)).toString('base64') };
-    })));
+    }, await Promise.all(members.map(async (m) => ({
+      name: m.name, relPath: m.relPath,
+      b64: (await fs.promises.readFile(m.p)).toString('base64'),
+    }))));
 
     for (const profile of ['bf-ome', 'bf-classic']) {
       const tag = profile === 'bf-ome' ? 'ome' : 'classic';
       const nativeOut = path.join(outDir, `mrxs-native-${tag}.tif`);
-      execFileSync(L.CLI, ['convert', path.join(MRXS, stems[0]), nativeOut,
+      execFileSync(L.CLI, ['convert', path.join(MRXS, entryFile), nativeOut,
         '--overwrite', '--profile', profile,
         ...(COMPACT ? ['--encoding', 'compact'] : [])]);
       const nativeSha = await L.sha256File(nativeOut);
@@ -127,7 +142,7 @@ async function mainMrsx() {
       const rec = await page.evaluate((id) => window.__c2.jobRecord(id), jobId);
       const equal = hash.sha256 === nativeSha;
       results.runs.push({
-        input: stems[0], bundleMembers: members.length,
+        input: entryFile, bundleKind: kind, bundleMembers: members.length,
         sourceFormat: rec.result && rec.result.source_format,
         outputProfile: profile,
         encoding: COMPACT ? 'compact-jpeg-v1' : 'preserve-source-v1',

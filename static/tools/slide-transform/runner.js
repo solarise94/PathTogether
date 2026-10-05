@@ -956,6 +956,14 @@ export class SlideToolsRunner {
           `v${E.MRXS_ADAPTER_VERSION}（金字塔 ${E.MRXS_PYRAMID_METHOD}）：两种几何配方不得混合`,
           { kind: 'source-adapter' });
       }
+      // F4: same contract for the SCN adapter (the fill/pyramid recipe of
+      // one adapter generation must never be continued by another)
+      if (recordAdapter === E.SCN_SOURCE_ADAPTER &&
+          (st.gen.adapterVersion || '1') !== E.SCN_ADAPTER_VERSION) {
+        refuse(`进度记录属于 SCN 适配器 v${st.gen.adapterVersion || '1'}，当前为 ` +
+          `v${E.SCN_ADAPTER_VERSION}：两种适配器配方不得混合`,
+          { kind: 'source-adapter' });
+      }
       // same contract for the encoding: the journal generation and every
       // committed state must agree with the record (missing = preserve)
       const journalledEnc = st.gen.encodingProfile || E.ENCODING_PROFILES.PRESERVE;

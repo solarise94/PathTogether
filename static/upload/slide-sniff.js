@@ -12,11 +12,13 @@
                         upload_direct_class / Rust convert_*.rs 同一词表）
                         → 直接上传（direct_class="converter-bigtiff"）
      convert            有浏览器转换器的格式：KFB、KFBF、JPEG 编码的
-                        Aperio SVS（IFD0 压缩 = 7）、MRXS（.mrxs/.dat
+                        Aperio SVS（IFD0 压缩 = 7）、JPEG 编码明场
+                        Leica SCN（描述是 SCN XML）、MRXS（.mrxs/.dat
                         成员）→ 本机转换后上传（工作台交接）
      temporary          暂时直传：尚无浏览器转换器的格式/变体（JPEG2000
-                        编码 SVS（压缩 33003/33005）、NDPI、VMS、VMU、
-                        SCN、BIF、SVSlide、BMP/JPEG、普通 TIFF、zip）
+                        编码 SVS（压缩 33003/33005）、荧光/非 JPEG 编码
+                        SCN、NDPI、VMS、VMU、BIF、SVSlide、BMP/JPEG、
+                        普通 TIFF、zip）
      unsupported        未登记扩展名
 
    形态约束：classic script（window.HP_SLIDE_SNIFF；与 cos-uploader.js
@@ -34,6 +36,7 @@
     "kfb_kfbio_jpeg": 1,
     "aperio-svs-jpeg": 1,
     "mirax-bundle": 1,
+    "leica-scn-jpeg": 1,
   };
 
   // 结果类别
@@ -215,8 +218,32 @@
       // JPEG 编码 Aperio SVS：浏览器转换器覆盖 → 本机转换后上传
       result.cls = CLS.CONVERT;
       result.directClass = null;
+      return result;
+    }
+    if (ext === ".scn" && looksLikeLeicaScnXml(text)) {
+      if (compression === 7 && scnBrightfield(text)) {
+        // JPEG 编码明场 Leica SCN：浏览器转换器覆盖 → 本机转换后上传
+        //（荧光/非 JPEG 编码的 SCN 落到默认 temporary = 暂时直传）
+        result.cls = CLS.CONVERT;
+        result.directClass = null;
+      }
+      return result;
     }
     return result;
+  }
+
+  // Leica SCN XML 描述（leica-microsystems.com/scn 命名空间）；
+  // 明场判定与 Rust scn.rs / engine.js 嗅探同一规则（主图 illuminationSource）
+  function looksLikeLeicaScnXml(text) {
+    return !!text && text.indexOf("<scn") !== -1 &&
+           text.indexOf("leica-microsystems.com/scn") !== -1;
+  }
+
+  function scnBrightfield(text) {
+    if (!text) return false;
+    var m = text.match(/<illuminationSource>\s*([A-Za-z]+)/);
+    // 没有 illuminationSource 时不猜荧光：按明场放行（转换器核心再终审）
+    return !m || m[1].toLowerCase() === "brightfield";
   }
 
   // ---- 区域读取辅助（head 优先，越界落到续读段 more={bytes,baseOffset}) --
@@ -280,6 +307,8 @@
         return { cls: CLS.CONVERT, ext: ext, bundle: true };
       case ".svs":
         return { route: "tiff", ext: ext, svs: true };
+      case ".scn":
+        return { route: "tiff", ext: ext, scn: true };
       case ".zip":
         // zip 是运输容器（MRXS 包/多文件），不是切片直传类别——不携带
         // direct_class 声明（服务端词表里 zip 只在受理词表，不在
@@ -288,7 +317,6 @@
       case ".ndpi":
       case ".vms":
       case ".vmu":
-      case ".scn":
       case ".bif":
       case ".svslide":
       case ".bmp":

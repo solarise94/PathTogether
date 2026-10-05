@@ -130,7 +130,7 @@ describe("slide-sniff：扩展名快路径（不读字节）", () => {
 	});
 
 	it("暂无浏览器转换器的格式/变体 → temporary（直传声明 legacy-direct）", () => {
-		for (const n of ["a.ndpi", "a.vms", "a.vmu", "a.scn", "a.bif",
+		for (const n of ["a.ndpi", "a.vms", "a.vmu", "a.bif",
 			"a.svslide", "a.bmp", "a.jpg", "a.jpeg"]) {
 			const r = S.classifyExt(n);
 			expect(r.cls, n).toBe("temporary");
@@ -152,6 +152,48 @@ describe("slide-sniff：扩展名快路径（不读字节）", () => {
 	});
 });
 
+describe("slide-sniff：Leica SCN（F4）", () => {
+	const SCN_XML_HEAD =
+		'<?xml version="1.0"?><scn xmlns="http://www.leica-microsystems.com/scn/2010/10/01">' +
+		"<collection><image><pixels sizeX=\"100\" sizeY=\"100\">" +
+		'<dimension sizeX="100" sizeY="100" r="0" ifd="0" /></pixels>' +
+		"<view sizeX=\"50000\" sizeY=\"50000\" />" +
+		"<scanSettings><illuminationSettings><illuminationSource>ILLUM" +
+		"</illuminationSource></illuminationSettings></scanSettings>" +
+		"</image></collection></scn>\x00";
+	const scnDesc = (illum: string) =>
+		descBytes(SCN_XML_HEAD.replace("ILLUM", illum));
+
+	it("JPEG 编码明场 SCN → convert（需要转换）", async () => {
+		const bytes = classicTiff([[259, 3, 7], [322, 3, 512], [323, 3, 512]],
+			scnDesc("brightfield"));
+		const r = await S.classifyFile(fakeFile("a.scn", bytes));
+		expect(r.cls).toBe("convert");
+		expect(r.ext).toBe(".scn");
+	});
+
+	it("荧光 SCN → temporary（暂时直传变体）", async () => {
+		const bytes = classicTiff([[259, 3, 7], [322, 3, 512], [323, 3, 512]],
+			scnDesc("fluorescence"));
+		const r = await S.classifyFile(fakeFile("b.scn", bytes));
+		expect(r.cls).toBe("temporary");
+		expect(r.directClass).toBe("legacy-direct");
+	});
+
+	it("非 JPEG 编码 SCN（压缩 8）→ temporary（暂时直传变体）", async () => {
+		const bytes = classicTiff([[259, 3, 8], [322, 3, 512], [323, 3, 512]],
+			scnDesc("brightfield"));
+		const r = await S.classifyFile(fakeFile("c.scn", bytes));
+		expect(r.cls).toBe("temporary");
+	});
+
+	it("描述不是 SCN XML 的 .scn → temporary", async () => {
+		const bytes = classicTiff([[259, 3, 7]], PLAIN_DESC);
+		const r = await S.classifyFile(fakeFile("d.scn", bytes));
+		expect(r.cls).toBe("temporary");
+	});
+});
+
 describe("slide-sniff：TIFF 头解析（手工夹具，≤128KB 预算）", () => {
 	it("ImageDescription 含 OME-XML → ome-tiff + direct_class=ome-tiff", async () => {
 		const bytes = classicTiff([], OME_DESC);
@@ -160,9 +202,9 @@ describe("slide-sniff：TIFF 头解析（手工夹具，≤128KB 预算）", () 
 		expect(r.directClass).toBe("ome-tiff");
 	});
 
-	it("描述 JSON 带转换器来源标记 → converter-bigtiff（四种来源）", async () => {
+	it("描述 JSON 带转换器来源标记 → converter-bigtiff（五种来源）", async () => {
 		for (const sf of ["kfb_bf_v1", "kfb_kfbio_jpeg", "aperio-svs-jpeg",
-			"mirax-bundle"]) {
+			"leica-scn-jpeg", "mirax-bundle"]) {
 			const bytes = classicTiff([], descBytes(
 				JSON.stringify({ source_format: sf }) + "\x00"));
 			const r = await S.classifyFile(fakeFile("out.tif", bytes));

@@ -296,10 +296,12 @@ _CATALOG_DISPLAY = (
         "capability": CAP_NATIVE_SINGLE_FILE,
         "canonical_format": None,
         "bundle_required": False,
-        "browser_convert": "unavailable",
+        "browser_convert": "available",
         "direct_import": "open",
-        "import_mode": "direct-temporary",
-        "limits": ["暂时直接导入（本阶段尚无本机转换器）"],
+        "import_mode": "convert",
+        "limits": ["可在本机浏览器转换为 OME-TIFF 后上传（转换工具识别 "
+                   "JPEG 编码的明场 SCN）；平台当前仍受理 .scn 直接导入"
+                   "（荧光/非 JPEG 编码变体走暂时直传）"],
         "selectable_for_upload": True,
     },
     {

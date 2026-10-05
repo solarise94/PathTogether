@@ -442,6 +442,34 @@ export function inputExtensionHint(name) {
 ///         adapter: 'aperio-svs-jpeg' }
 ///     | { supported: false, modality: null, reason: '<typed reason>' }
 export const SVS_SOURCE_ADAPTER = 'aperio-svs-jpeg';
+/// F4: Leica SCN（BigTIFF + SCN XML 描述；JPEG tile 原样搬运）。
+/// Must equal the Rust `ADAPTER_VERSION` (resume refuses on mismatch).
+export const SCN_SOURCE_ADAPTER = 'leica-scn-jpeg';
+export const SCN_ADAPTER_VERSION = '1';
+/// Converter-output source_format ids (same vocabulary as the Rust core's
+/// `CONVERTER_SOURCE_FORMATS` and upload_direct_class.py): a TIFF whose
+/// IFD-0 description JSON carries one of these is THIS TOOL's own output —
+/// not a conversion input.
+export const CONVERTER_SOURCE_FORMATS = [
+  'kfb_bf_v1',
+  'kfb_kfbio_jpeg',
+  'aperio-svs-jpeg',
+  'mirax-bundle',
+  SCN_SOURCE_ADAPTER,
+];
+const LEICA_SCN_XML_NS = /leica-microsystems\.com\/scn/;
+/// Pure helpers (vitest-covered): OME-XML and converter-marked description
+/// detection with the exact same shape as the Rust `classify_description`.
+function looksLikeOmeXml(desc) {
+  const head = desc.slice(0, 4096);
+  return /^\s*<\?xml/i.test(head) && head.slice(0, 2048).includes('OME');
+}
+function isConverterMarkedDescription(desc) {
+  const body = desc.split('\0')[0].trim();
+  if (!body.startsWith('{')) return false;
+  return CONVERTER_SOURCE_FORMATS.some((id) =>
+    body.includes(`"source_format": "${id}"`) || body.includes(`"source_format":"${id}"`));
+}
 const SNIFF_MAX_ENTRIES = 512;
 const SNIFF_DESC_MAX = 64 * 2 ** 10;
 
@@ -513,6 +541,19 @@ export async function sniffTiffSlideCapability(file) {
         : u32(en.val, 0);
       return new TextDecoder().decode(await readAt(off, len));
     };
+    const desc = await descBytes();
+    // F4: vendor dispatch BEFORE the structural verdicts — OME-TIFF and
+    // this converter's own BigTIFF are NOT conversion inputs at all (they
+    // are already platform-readable), so they must never surface as
+    // "unsupported variant" of anything.
+    if (looksLikeOmeXml(desc)) {
+      return bad('OME-TIFF 不是转换输入：平台可直接读取 OME-TIFF，请直接上传该文件');
+    }
+    if (isConverterMarkedDescription(desc)) {
+      return bad('本工具导出的 BigTIFF 不是转换输入：请直接上传该产物（或选择原始切片）');
+    }
+    const vendor = desc.includes('Aperio') ? 'aperio'
+      : (LEICA_SCN_XML_NS.test(desc) ? 'leica-scn' : 'unknown');
     if (!entries[322] || !entries[323]) return bad('主图不是分块（tiled）存储：该 TIFF 变体不在支持集');
     const comp = scalar(259);
     if (comp === 33003 || comp === 33005) {
@@ -525,9 +566,23 @@ export async function sniffTiffSlideCapability(file) {
     if (planar !== 1) return bad(`PlanarConfiguration=${planar}（平面存储）不在支持集`);
     const photo = scalar(262);
     if (photo !== 2 && photo !== 6) return bad(`PhotometricInterpretation=${photo} 不在支持集（RGB=2 / YCbCr=6）`);
-    const desc = await descBytes();
-    if (!desc.includes('Aperio')) {
-      return bad('TIFF 结构合法但未标识 Aperio：未知厂商变体不猜');
+    if (vendor === 'leica-scn') {
+      // the fluorescence SCN variant is rejected BEFORE any copy; the main
+      // pyramid selection itself is the wasm core's job (multiple <image>).
+      if (/<illuminationSource>\s*fluorescence/i.test(desc)) {
+        return bad('荧光 Leica SCN 不在明场转换支持集（复制前拒绝）');
+      }
+      return {
+        supported: true,
+        modality: 'brightfield',
+        format: SCN_SOURCE_ADAPTER,
+        adapter: SCN_SOURCE_ADAPTER,
+        bigtiff,
+        littleEndian: little,
+      };
+    }
+    if (vendor !== 'aperio') {
+      return bad('TIFF 结构合法但描述未标识 Aperio / Leica SCN：未知厂商变体不猜');
     }
     return {
       supported: true,
@@ -1007,7 +1062,7 @@ export function isOmeProfile(profile) {
 /// CMU-1.ome.tif); MRXS bundle jobs are named after the entry stem.
 export function outputFileName(sourceName, job) {
   const base = String(sourceName || 'slide')
-    .replace(/\.(kfb|kfbf|svs|mrxs)$/i, '') || 'slide';
+    .replace(/\.(kfb|kfbf|svs|scn|mrxs)$/i, '') || 'slide';
   return isOmeProfile(jobOutputProfile(job)) ? `${base}.ome.tif` : `${base}.tif`;
 }
 

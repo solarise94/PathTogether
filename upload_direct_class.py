@@ -66,6 +66,7 @@ CONVERTER_SOURCE_FORMATS = frozenset({
     "kfb_bf_v1",          # 明场 KFB → 经典多 IFD BigTIFF（kfb/converter.py）
     "kfb_kfbio_jpeg",     # 明场 KFB 旧版本头
     "aperio-svs-jpeg",    # SVS → classic/ome（classic 描述 JSON 带 adapter）
+    "leica-scn-jpeg",     # SCN → classic/ome（F4；描述 JSON 带 adapter）
     "mirax-bundle",       # MRXS → 经典 BigTIFF
 })
 

@@ -1,5 +1,5 @@
 {
-  "built_at_utc": "2026-10-05T13:52:56Z",
+  "built_at_utc": "2026-10-05T14:00:59Z",
   "toolchain": {
     "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
     "wasm_bindgen_cli": "wasm-bindgen 0.2.129",
@@ -12,7 +12,7 @@
     "runner.js": "46fd8ded5d2107c13961ee47bfbd7a6fb38bfaba28cddffacb1876a86c272395",
     "engine.js": "3614d40b1cc76452b1ac1b02f5d9a6e564e02252eee7f95f48b298193de0b5e7",
     "worker.js": "e20f3bf357a4e6c0a14b937d49f6dcb5a61cc43c59330030182ed73e73d77952",
-    "slide-transform": "65fc3bc3c07f35a7e766240d16babb0a537f973ab7b5fde2fdf226d12fa4c36d"
+    "slide-transform": "be1b98512e28b90ebb40228e2c82e9de91780a551c9a5a784846f949dcfa6d79"
   },
   "dependencies": [
     {

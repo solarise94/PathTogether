@@ -1722,6 +1722,7 @@ fn cmd_gen_gtiff(args: &[String]) -> Result<String, CoreError> {
     let mut shared_tables = false;
     let mut no_xres = false;
     let mut icc = false;
+    let mut gradient = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1743,6 +1744,7 @@ fn cmd_gen_gtiff(args: &[String]) -> Result<String, CoreError> {
             "--shared-tables" => shared_tables = true,
             "--no-xres" => no_xres = true,
             "--icc" => icc = true,
+            "--gradient" => gradient = true,
             _ => path = Some(&args[i]),
         }
         i += 1;
@@ -1777,6 +1779,11 @@ fn cmd_gen_gtiff(args: &[String]) -> Result<String, CoreError> {
         shared_tables,
         xres: if no_xres { None } else { Some(10.0) },
         icc,
+        pattern: if gradient {
+            slide_transform_core::gtiff_fixture::FixturePattern::Gradient
+        } else {
+            slide_transform_core::gtiff_fixture::FixturePattern::Noise
+        },
         ..Default::default()
     };
     let mut sink = FileSink::create(Path::new(path))?;

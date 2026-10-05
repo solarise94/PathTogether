@@ -80,6 +80,10 @@ pub enum TiffVendor {
     /// Leica SCN (`<scn>` XML with a leica-microsystems.com/scn namespace)
     /// → this module.
     LeicaScn,
+    /// Hamamatsu NDPI (`Make` (271) names Hamamatsu; classic TIFF whose
+    /// IFD 0 usually has NO description at all) → `ndpi.rs`. The Make is
+    /// only consulted when the description matched no other vendor.
+    HamamatsuNdpi,
     /// OME-TIFF — already platform-readable, NOT a conversion input.
     OmeTiff,
     /// This converter's own output (description JSON with a `source_format`
@@ -142,7 +146,23 @@ pub fn sniff_tiff_vendor(src: &dyn ByteSource) -> CoreResult<TiffVendor> {
         }
         None => String::new(),
     };
-    Ok(classify_description(&desc))
+    let vendor = classify_description(&desc);
+    if vendor != TiffVendor::Unknown {
+        return Ok(vendor);
+    }
+    // F6: the description matched nothing. NDPI's IFD 0 usually has NO
+    // description at all — the vendor lives in Make (271), read with the
+    // same bounded tag-value path.
+    let make = match first.find(271) {
+        Some(e) => {
+            if e.value_len().unwrap_or(u64::MAX) > MAX_XML_BYTES {
+                return Err(CoreError::oob("IFD 0 Make 长度异常"));
+            }
+            String::from_utf8_lossy(&tiff_read::entry_value(src, &hdr, e)?).to_string()
+        }
+        None => String::new(),
+    };
+    Ok(classify_make(&make))
 }
 
 /// Pure description classifier (unit-tested without IO).
@@ -158,6 +178,15 @@ pub fn classify_description(desc: &str) -> TiffVendor {
     }
     if desc.contains("Aperio") {
         return TiffVendor::AperioSvs;
+    }
+    TiffVendor::Unknown
+}
+
+/// Pure Make classifier (unit-tested without IO): only reached when the
+/// description matched no vendor (NDPI puts its vendor in Make).
+pub fn classify_make(make: &str) -> TiffVendor {
+    if make.contains("Hamamatsu") {
+        return TiffVendor::HamamatsuNdpi;
     }
     TiffVendor::Unknown
 }

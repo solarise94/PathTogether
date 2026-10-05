@@ -61,6 +61,8 @@ fn main() -> ExitCode {
         #[cfg(feature = "synth-gen")]
         "gen-gtiff" => cmd_gen_gtiff(&args[1..]),
         #[cfg(feature = "synth-gen")]
+        "gen-ndpi" => cmd_gen_ndpi(&args[1..]),
+        #[cfg(feature = "synth-gen")]
         "gen-mrxs" => cmd_gen_mrxs(&args[1..]),
         _ => Err(CoreError::validation(format!("未知子命令 {}", args[0]))),
     };
@@ -420,6 +422,68 @@ fn gtiff_doc_json(doc: &slide_transform_core::gtiff::GtiffDoc) -> String {
     ])
 }
 
+/// Capability report for a Hamamatsu NDPI input (F6).
+fn ndpi_doc_json(doc: &slide_transform_core::ndpi::NdpiDoc) -> String {
+    let l0 = &doc.levels[0];
+    let levels: Vec<String> = std::iter::once({
+        obj(&[
+            ju("level", 0),
+            ju("ifd", l0.ifd_index as u64),
+            ju("width", l0.width as u64),
+            ju("height", l0.height as u64),
+            ju("mcu_w", l0.mcu_w() as u64),
+            ju("mcu_h", l0.mcu_h() as u64),
+            ju("restart_interval", l0.restart_interval as u64),
+            ju("segments", l0.segments),
+            jstr(
+                "color",
+                match l0.color {
+                    slide_transform_core::ndpi::PayloadColor::Rgb => "rgb",
+                    slide_transform_core::ndpi::PayloadColor::YCbCr => "ycbcr",
+                },
+            ),
+            jb("reencoded", true),
+        ])
+    })
+    .chain(doc.generated.iter().enumerate().map(|(i, (w, h))| {
+        obj(&[
+            ju("level", (i + 1) as u64),
+            ju("width", *w as u64),
+            ju("height", *h as u64),
+            ju("tiles_across", w.div_ceil(256) as u64),
+            ju("tiles_down", h.div_ceil(256) as u64),
+            jstr("color", "ycbcr"),
+            jb("reencoded", true),
+            jb("generated", true),
+        ])
+    }))
+    .collect();
+    let assoc: Vec<String> = doc
+        .associated
+        .iter()
+        .map(|a| obj(&[jstr("name", &a.name), ju("width", a.width as u64), ju("height", a.height as u64)]))
+        .collect();
+    obj(&[
+        jstr("format", slide_transform_core::ndpi::SOURCE_FORMAT),
+        jstr("adapter", slide_transform_core::ndpi::SOURCE_FORMAT),
+        jstr("adapter_version", slide_transform_core::ndpi::ADAPTER_VERSION),
+        jstr("modality", "brightfield"),
+        jstr("tiff_kind", "classic"),
+        ju("width", l0.width as u64),
+        ju("height", l0.height as u64),
+        jraw("mpp_x", &doc.mpp.map(|v| v.0.to_string()).unwrap_or_else(|| "null".into())),
+        jraw("mpp_y", &doc.mpp.map(|v| v.1.to_string()).unwrap_or_else(|| "null".into())),
+        jraw("objective", &doc.objective.map(|v| v.to_string()).unwrap_or_else(|| "null".into())),
+        jstr("mpp_source", if doc.mpp.is_some() { "ndpi-vendor-mpp-tags" } else { "unknown" }),
+        jstr("objective_source", if doc.objective.is_some() { "ndpi-sourcelens" } else { "unknown" }),
+        jstr("pyramid_method", slide_transform_core::ndpi::PYRAMID_METHOD),
+        jarr("levels", &levels),
+        jarr("associated", &assoc),
+        jb("icc_profile", doc.icc.is_some()),
+        jstr("codec", "restart-segment-compose-reencode"),
+    ])
+}
+
 /// Capability report for a Leica SCN input (F4).
 fn scn_doc_json(doc: &slide_transform_core::scn::ScnDoc) -> String {
     let levels: Vec<String> = doc
@@ -527,6 +591,12 @@ fn cmd_probe(args: &[String]) -> Result<String, CoreError> {
             slide_transform_core::scn::TiffVendor::AperioSvs => svs_doc_json(
                 &slide_transform_core::svs::probe_svs(&src)?,
             ),
+            slide_transform_core::scn::TiffVendor::HamamatsuNdpi => {
+                ndpi_doc_json(&slide_transform_core::ndpi::probe_ndpi_with_budget(
+                    &src,
+                    memory_budget,
+                )?)
+            }
             slide_transform_core::scn::TiffVendor::Unknown => {
                 gtiff_doc_json(&slide_transform_core::gtiff::probe_gtiff_with_budget(
                     &src,
@@ -652,6 +722,11 @@ fn cmd_probe(args: &[String]) -> Result<String, CoreError> {
             slide_transform_core::scn::TiffVendor::LeicaScn => {
                 slide_transform_core::scn::estimate_scn(
                     &slide_transform_core::scn::probe_scn_with_budget(&src, memory_budget)?,
+                )
+            }
+            slide_transform_core::scn::TiffVendor::HamamatsuNdpi => {
+                slide_transform_core::ndpi::estimate_ndpi(
+                    &slide_transform_core::ndpi::probe_ndpi_with_budget(&src, memory_budget)?,
                 )
             }
             slide_transform_core::scn::TiffVendor::Unknown => {
@@ -934,11 +1009,16 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
     // 多通道等「暂时直传」变体在复制前拒绝）
     let is_gtiff = is_tiff_magic(&magic)
         && vendor == slide_transform_core::scn::TiffVendor::Unknown;
+    let is_ndpi = is_tiff_magic(&magic)
+        && !is_scn
+        && !is_gtiff
+        && vendor == slide_transform_core::scn::TiffVendor::HamamatsuNdpi;
     let is_svs = is_tiff_magic(&magic)
         && !is_scn
         && !is_gtiff
+        && !is_ndpi
         && vendor == slide_transform_core::scn::TiffVendor::AperioSvs;
-    if is_tiff_magic(&magic) && !is_svs && !is_scn && !is_gtiff {
+    if is_tiff_magic(&magic) && !is_svs && !is_scn && !is_gtiff && !is_ndpi {
         return Err(vendor_rejection(vendor));
     }
     let enc_profile = match encoding.as_str() {
@@ -955,9 +1035,9 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
             "compact-jpeg-v1 编码仅适用于明场；荧光不支持有损重编码",
         ));
     }
-    if (is_svs || is_scn || is_gtiff) && is_fl {
+    if (is_svs || is_scn || is_gtiff || is_ndpi) && is_fl {
         return Err(CoreError::variant(
-            "荧光 OME profile 不适用于明场 SVS/SCN/通用 TIFF 输入",
+            "荧光 OME profile 不适用于明场 SVS/SCN/通用 TIFF/NDPI 输入",
         ));
     }
     let pixel_policy = match policy.as_str() {
@@ -1027,6 +1107,15 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
             .with_encoding(enc_profile);
         plan.profile = out_profile;
         slide_transform_core::convert_gtiff::convert_gtiff_to_bigtiff(
+            &src, &mut sink, &mut scratch, &plan, &job,
+        )
+    } else if is_ndpi {
+        let mut plan = TransformPlan::brightfield(identity)
+            .with_policy(pixel_policy)
+            .with_limits(limits)
+            .with_encoding(enc_profile);
+        plan.profile = out_profile;
+        slide_transform_core::convert_ndpi::convert_ndpi_to_bigtiff(
             &src, &mut sink, &mut scratch, &plan, &job,
         )
     } else if is_svs {
@@ -1819,6 +1908,73 @@ fn cmd_gen_gtiff(args: &[String]) -> Result<String, CoreError> {
     };
     let mut sink = FileSink::create(Path::new(path))?;
     let n = slide_transform_core::gtiff_fixture::build_synthetic_gtiff(&mut sink, &p)?;
+    sink.flush()?;
+    Ok(obj(&[jstr("path", path), ju("bytes", n)]))
+}
+
+// --------------------------------------------------------------------------- //
+// synthetic Hamamatsu NDPI generator（F6 测试数据；无患者数据）
+// --------------------------------------------------------------------------- //
+
+#[cfg(feature = "synth-gen")]
+fn cmd_gen_ndpi(args: &[String]) -> Result<String, CoreError> {
+    let mut path = None;
+    let mut width = 512u32;
+    let mut height = 320u32;
+    let mut restart_rows = 2u32;
+    let mut levels = 2u32;
+    let mut associated = false;
+    let mut no_restart = false;
+    let mut progressive = false;
+    let mut jp2k = false;
+    let mut make = "Hamamatsu".to_string();
+    let mut no_mpp = false;
+    let mut noise = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--width" => { i += 1; width = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--width"))?; }
+            "--height" => { i += 1; height = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--height"))?; }
+            "--restart-rows" => { i += 1; restart_rows = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--restart-rows"))?; }
+            "--levels" => { i += 1; levels = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--levels"))?; }
+            "--associated" => associated = true,
+            "--no-restart" => no_restart = true,
+            "--progressive" => progressive = true,
+            "--jp2k" => jp2k = true,
+            "--noise" => noise = true,
+            "--no-mpp" => no_mpp = true,
+            "--make" => { i += 1; make = args.get(i).cloned().ok_or_else(|| CoreError::validation("--make"))?; }
+            _ => {
+                if args[i].starts_with('-') && args[i] != "-" {
+                    return Err(CoreError::validation(format!("gen-ndpi 未知旗标 {}", args[i])));
+                }
+                path = Some(&args[i]);
+            }
+        }
+        i += 1;
+    }
+    let path = path.ok_or_else(|| CoreError::validation("gen-ndpi 需要 <out>"))?;
+    let p = slide_transform_core::ndpi_fixture::NdpiGenParams {
+        width,
+        height,
+        restart_rows,
+        levels,
+        macro_page: associated,
+        focus_map: associated,
+        make,
+        no_restart,
+        compression: if jp2k { 33005 } else { 7 },
+        progressive,
+        mpp: if no_mpp { None } else { Some(0.4990) },
+        pattern: if noise {
+            slide_transform_core::ndpi_fixture::FixturePattern::Noise
+        } else {
+            slide_transform_core::ndpi_fixture::FixturePattern::Gradient
+        },
+        ..Default::default()
+    };
+    let mut sink = FileSink::create(Path::new(path))?;
+    let n = slide_transform_core::ndpi_fixture::build_synthetic_ndpi(&mut sink, &p)?;
     sink.flush()?;
     Ok(obj(&[jstr("path", path), ju("bytes", n)]))
 }

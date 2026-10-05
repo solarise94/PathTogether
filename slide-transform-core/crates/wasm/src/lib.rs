@@ -538,6 +538,10 @@ enum InputKind {
     /// Generic tiled JPEG TIFF/BigTIFF (F5): a TIFF container whose IFD 0
     /// description names NO known vendor — decided by the same sniff.
     Gtiff,
+    /// Hamamatsu NDPI (F6): a classic TIFF whose IFD 0 Make names
+    /// Hamamatsu (its IFD 0 usually has no description at all) — decided by
+    /// the same sniff.
+    Ndpi,
 }
 
 fn input_kind(magic: &[u8; 8]) -> InputKind {
@@ -570,6 +574,7 @@ fn adapter_of(kind: InputKind) -> Option<&'static str> {
         InputKind::Svs => Some(slide_transform_core::svs::SOURCE_FORMAT),
         InputKind::Scn => Some(slide_transform_core::scn::SOURCE_FORMAT),
         InputKind::Gtiff => Some(slide_transform_core::gtiff::SOURCE_FORMAT),
+        InputKind::Ndpi => Some(slide_transform_core::ndpi::SOURCE_FORMAT),
         _ => None,
     }
 }
@@ -581,6 +586,7 @@ fn adapter_version_of(kind: InputKind) -> Option<&'static str> {
         InputKind::Svs => Some(slide_transform_core::svs::ADAPTER_VERSION),
         InputKind::Scn => Some(slide_transform_core::scn::ADAPTER_VERSION),
         InputKind::Gtiff => Some(slide_transform_core::gtiff::ADAPTER_VERSION),
+        InputKind::Ndpi => Some(slide_transform_core::ndpi::ADAPTER_VERSION),
         _ => None,
     }
 }
@@ -588,12 +594,13 @@ fn adapter_version_of(kind: InputKind) -> Option<&'static str> {
 /// Vendor-aware classification of a TIFF-magic source. OME-TIFF and this
 /// converter's own BigTIFF are NOT conversion inputs — typed rejection
 /// before anything is staged or written. An unknown vendor (no known
-/// vendor description) routes to the F5 generic tiled-JPEG adapter, whose
-/// own structural walk types the「暂时直传」variants.
+/// vendor description or Make) routes to the F5 generic tiled-JPEG
+/// adapter, whose own structural walk types the「暂时直传」variants.
 fn tiff_route(src: &dyn ByteSource) -> CoreResult<InputKind> {
     use slide_transform_core::scn::TiffVendor;
     match slide_transform_core::scn::sniff_tiff_vendor(src)? {
         TiffVendor::LeicaScn => Ok(InputKind::Scn),
+        TiffVendor::HamamatsuNdpi => Ok(InputKind::Ndpi),
         TiffVendor::Unknown => Ok(InputKind::Gtiff),
         TiffVendor::OmeTiff => Err(CoreError::variant(
             "OME-TIFF 不是转换输入：平台可直接读取 OME-TIFF，请直接上传该文件",
@@ -807,15 +814,71 @@ fn gtiff_doc_json(doc: &slide_transform_core::gtiff::GtiffDoc) -> String {
     )
 }
 
+/// NDPI capability document (probe result), mirroring the CLI's report.
+fn ndpi_doc_json(doc: &slide_transform_core::ndpi::NdpiDoc) -> String {
+    let l0 = &doc.levels[0];
+    let mut levels: Vec<String> = vec![format!(
+        "{{\"level\":0,\"ifd\":{},\"width\":{},\"height\":{},\"mcu_w\":{},\"mcu_h\":{},\"restart_interval\":{},\"segments\":{},\"color\":\"{}\",\"reencoded\":true}}",
+        l0.ifd_index,
+        l0.width,
+        l0.height,
+        l0.mcu_w(),
+        l0.mcu_h(),
+        l0.restart_interval,
+        l0.segments,
+        match l0.color {
+            slide_transform_core::ndpi::PayloadColor::Rgb => "rgb",
+            slide_transform_core::ndpi::PayloadColor::YCbCr => "ycbcr",
+        },
+    )];
+    for (i, (w, h)) in doc.generated.iter().enumerate() {
+        levels.push(format!(
+            "{{\"level\":{},\"width\":{w},\"height\":{h},\"tiles_across\":{},\"tiles_down\":{},\"color\":\"ycbcr\",\"reencoded\":true,\"generated\":true}}",
+            i + 1,
+            w.div_ceil(256),
+            h.div_ceil(256),
+        ));
+    }
+    let assoc: Vec<String> = doc
+        .associated
+        .iter()
+        .map(|a| format!("{{\"name\":\"{}\",\"width\":{},\"height\":{}}}", a.name, a.width, a.height))
+        .collect();
+    let mpp_x = doc.mpp.map(|v| v.0).map(json_num).unwrap_or_else(|| "null".into());
+    let mpp_y = doc.mpp.map(|v| v.1).map(json_num).unwrap_or_else(|| "null".into());
+    let objective = doc.objective.map(json_num).unwrap_or_else(|| "null".into());
+    format!(
+        "{{\"format\":\"{}\",\"adapter\":\"{}\",\"adapter_version\":\"{}\",\"modality\":\"brightfield\",\"tiff_kind\":\"classic\",\"width\":{},\"height\":{},\"mpp_x\":{},\"mpp_y\":{},\"objective\":{},\"mpp_source\":\"{}\",\"objective_source\":\"{}\",\"pyramid_method\":\"{}\",\"levels\":[{}],\"associated\":[{}],\"icc_profile\":{},\"codec\":\"restart-segment-compose-reencode\",\"estimate\":{}}}",
+        slide_transform_core::ndpi::SOURCE_FORMAT,
+        slide_transform_core::ndpi::SOURCE_FORMAT,
+        slide_transform_core::ndpi::ADAPTER_VERSION,
+        l0.width,
+        l0.height,
+        mpp_x,
+        mpp_y,
+        objective,
+        if doc.mpp.is_some() { "ndpi-vendor-mpp-tags" } else { "unknown" },
+        if doc.objective.is_some() { "ndpi-sourcelens" } else { "unknown" },
+        slide_transform_core::ndpi::PYRAMID_METHOD,
+        levels.join(","),
+        assoc.join(","),
+        doc.icc.is_some(),
+        estimate_json(&slide_transform_core::ndpi::estimate_ndpi(doc))
+    )
+}
+
 /// TIFF-container probe dispatch (host-free so it is unit-testable):
 /// SCN vendor → the SCN adapter, unknown vendors → the generic tiled-JPEG
-/// adapter, Aperio → the SVS adapter, and a routing Err (OME-TIFF /
-/// converter BigTIFF / structural failure) is returned VERBATIM — never
-/// masked by another adapter's message.
+/// adapter, Hamamatsu → the NDPI adapter, Aperio → the SVS adapter, and a
+/// routing Err (OME-TIFF / converter BigTIFF / structural failure) is
+/// returned VERBATIM — never masked by another adapter's message.
 fn probe_tiff_doc(src: &dyn ByteSource) -> CoreResult<String> {
     match tiff_route(src)? {
         InputKind::Scn => {
             slide_transform_core::scn::probe_scn(src).map(|doc| scn_doc_json(&doc))
+        }
+        InputKind::Ndpi => {
+            slide_transform_core::ndpi::probe_ndpi(src).map(|doc| ndpi_doc_json(&doc))
         }
         InputKind::Gtiff => {
             slide_transform_core::gtiff::probe_gtiff(src).map(|doc| gtiff_doc_json(&doc))
@@ -1165,6 +1228,25 @@ fn run_convert(
                 &src, &mut sink, &mut scratch, &plan, &job,
             ),
         }
+    } else if kind == InputKind::Ndpi {
+        // Review §1 parity: the adapter bounds its band/segment-decode
+        // working set by the host's memory budget (like gtiff/MRXS).
+        let mut plan = TransformPlan::brightfield(identity)
+            .with_policy(policy)
+            .with_encoding(enc_profile);
+        plan.profile = out_profile;
+        plan.limits.memory_budget_bytes = budget_bytes
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|v| v as u64)
+            .unwrap_or(slide_transform_core::budget::SAVER_BUDGET_BYTES);
+        match resume.as_ref() {
+            Some(rp) => slide_transform_core::convert_ndpi::convert_ndpi_to_bigtiff_resume(
+                &src, &mut sink, &mut scratch, &plan, &job, rp,
+            ),
+            None => slide_transform_core::convert_ndpi::convert_ndpi_to_bigtiff(
+                &src, &mut sink, &mut scratch, &plan, &job,
+            ),
+        }
     } else if kind == InputKind::Svs {
         let mut plan = TransformPlan::brightfield(identity)
             .with_policy(policy)
@@ -1209,8 +1291,16 @@ fn run_convert(
                 ),
                 None => ("false", "null".to_string()),
             };
+            let composed_json = match &r.composed {
+                Some(c) => format!(
+                    "{{\"mode\":\"{}\",\"fingerprint\":\"{}\",\"quality\":{},\"sampling\":\"{}\",\"huffman\":\"{}\",\"tiles_composed\":{},\"tiles_filled\":{},\"tiles_deduped\":{},\"pyramid\":\"{}\"}}",
+                    c.mode, c.fingerprint, c.quality, c.sampling, c.huffman,
+                    c.tiles_composed, c.tiles_filled, c.tiles_deduped, c.pyramid
+                ),
+                None => "null".to_string(),
+            };
             format!(
-                "{{{}\"format\":\"{}\",\"source_format\":{},\"adapter_version\":{},\"output_profile\":\"{}\",\"encoding\":\"{}\",\"lossy_reencode\":{},\"lossy_reencode_params\":{},\"output_bytes\":{},\"width\":{},\"height\":{},\"ifd_count\":{},\"tiles_raw_copied\":{},\"tiles_reencoded\":{},\"resumed\":{},\"channels\":{},\"warnings\":[{}]}}",
+                "{{{}\"format\":\"{}\",\"source_format\":{},\"adapter_version\":{},\"output_profile\":\"{}\",\"encoding\":\"{}\",\"lossy_reencode\":{},\"lossy_reencode_params\":{},\"composed\":{},\"output_bytes\":{},\"width\":{},\"height\":{},\"ifd_count\":{},\"tiles_raw_copied\":{},\"tiles_reencoded\":{},\"resumed\":{},\"channels\":{},\"warnings\":[{}]}}",
                 companion_json_warning,
                 r.format,
                 r.source_format.map(|f| format!("\"{f}\"")).unwrap_or_else(|| "null".into()),
@@ -1219,6 +1309,7 @@ fn run_convert(
                 enc_profile.id(),
                 lossy_flag,
                 lossy_json,
+                composed_json,
                 r.output_bytes,
                 r.width,
                 r.height,

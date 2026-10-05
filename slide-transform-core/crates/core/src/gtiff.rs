@@ -233,6 +233,9 @@ fn require_unknown_vendor(src: &dyn ByteSource, hdr: &TiffHeader, ifd: &Ifd) -> 
         TiffVendor::LeicaScn => Err(CoreError::variant(
             "Leica SCN XML 不走通用 TIFF 适配器（应由 SCN 适配器处理）",
         )),
+        TiffVendor::HamamatsuNdpi => Err(CoreError::variant(
+            "Hamamatsu NDPI 不走通用 TIFF 适配器（应由 NDPI 适配器分段解码）",
+        )),
         TiffVendor::OmeTiff => Err(CoreError::variant(
             "OME-TIFF 不是转换输入：平台可直接读取 OME-TIFF，请直接上传该文件",
         )),

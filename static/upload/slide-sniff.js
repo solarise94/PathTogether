@@ -13,14 +13,17 @@
                         → 直接上传（direct_class="converter-bigtiff"）
      convert            有浏览器转换器的格式：KFB、KFBF、JPEG 编码的
                         Aperio SVS（IFD0 压缩 = 7）、JPEG 编码明场
-                        Leica SCN（描述是 SCN XML）、通用瓦片 JPEG
+                        Leica SCN（描述是 SCN XML）、Hamamatsu NDPI
+                        （Make 标识 Hamamatsu、整层单条带、压缩 = 7、
+                        3 采样、photo 2/6）、通用瓦片 JPEG
                         TIFF/BigTIFF（无厂商描述、tiled、压缩 = 7、
                         3 采样、photo 2/6）、MRXS（.mrxs/.dat 成员）
                         → 本机转换后上传（工作台交接）
      temporary          暂时直传：尚无浏览器转换器的格式/变体（JPEG2000
-                        编码 SVS（压缩 33003/33005）、荧光/非 JPEG 编码
+                        编码 SVS（压缩 33003/33005）、JPEG2000/条带/
+                        多通道变体的 NDPI、荧光/非 JPEG 编码
                         SCN、条带/LZW/deflate/非 8 位/多通道的通用
-                        TIFF 变体、NDPI、VMS、VMU、BIF、SVSlide、
+                        TIFF 变体、VMS、VMU、BIF、SVSlide、
                         BMP/JPEG、zip）
      unsupported        未登记扩展名
 
@@ -233,6 +236,17 @@
       }
       return result;
     }
+    if (ext === ".ndpi") {
+      // F6：Hamamatsu NDPI 浏览器转换器覆盖。IFD0 的 Make（271）标识
+      // Hamamatsu 且 IFD0 为整层单条带 JPEG 明场（压缩 7、3 采样、
+      // photo 2/6、非分块）→ 本机转换后上传；JPEG2000（33003/33005）、
+      // 分块存储或多通道变体不满足判定 → 默认 temporary = 暂时直传。
+      if (compression === 7 && ndpiConvertible(ifdBytes, idv, little, hdr.bigtiff)) {
+        result.cls = CLS.CONVERT;
+        result.directClass = null;
+      }
+      return result;
+    }
     if (compression === 7 && genericTiledConvertible(ifdBytes, idv, little, hdr.bigtiff)) {
       // F5：通用瓦片 JPEG TIFF/BigTIFF（无厂商描述 + tiled + 3 采样 +
       // photo 2/6）：浏览器转换器覆盖 → 本机转换后上传。条带/LZW/
@@ -252,6 +266,35 @@
     var tileW = findIfdEntry(ifdBytes, little, 322, bigtiff);
     var tileH = findIfdEntry(ifdBytes, little, 323, bigtiff);
     if (!tileW || !tileH) return false;
+    var spp = findIfdEntry(ifdBytes, little, 277, bigtiff);
+    if (spp && ifdUint(spp, idv, little) !== 3) return false;
+    var photo = findIfdEntry(ifdBytes, little, 262, bigtiff);
+    var photoVal = photo ? ifdUint(photo, idv, little) : 0;
+    return photoVal === 2 || photoVal === 6;
+  }
+
+  // F6：Hamamatsu NDPI 的可转换结构判定（与 Rust ndpi.rs / engine.js 嗅探
+  // 同一契约的 IFD0 快判）：Make（271）含 Hamamatsu、整层单条带（273/279
+  // 在场且无 322/323）、SamplesPerPixel=3、PhotometricInterpretation ∈
+  // {2, 6}。restart marker/层级/关联图分类由核心在复制后终审。
+  function ndpiConvertible(ifdBytes, idv, little, bigtiff) {
+    var make = findIfdEntry(ifdBytes, little, 271, bigtiff);
+    if (!make) return false;
+    var makeLoc = descTextAt(ifdBytes, make, little);
+    var makeText = "";
+    if (makeLoc && makeLoc.count > 0) {
+      var raw = readRegion(ifdBytes, makeLoc.offset,
+        Math.min(makeLoc.count, 4096), null);
+      if (raw) {
+        try { makeText = new TextDecoder("utf-8", { fatal: false }).decode(raw); }
+        catch (e) { makeText = ""; }
+      }
+    }
+    if (makeText.indexOf("Hamamatsu") === -1) return false;
+    if (findIfdEntry(ifdBytes, little, 322, bigtiff) ||
+        findIfdEntry(ifdBytes, little, 323, bigtiff)) return false;
+    if (!findIfdEntry(ifdBytes, little, 273, bigtiff) ||
+        !findIfdEntry(ifdBytes, little, 279, bigtiff)) return false;
     var spp = findIfdEntry(ifdBytes, little, 277, bigtiff);
     if (spp && ifdUint(spp, idv, little) !== 3) return false;
     var photo = findIfdEntry(ifdBytes, little, 262, bigtiff);
@@ -336,12 +379,15 @@
         return { route: "tiff", ext: ext, svs: true };
       case ".scn":
         return { route: "tiff", ext: ext, scn: true };
+      case ".ndpi":
+        // F6：头解析分派（Make 标识 Hamamatsu + 整层单条带 JPEG →
+        // convert；JP2K/多通道/分块变体 → temporary）
+        return { route: "tiff", ext: ext, ndpi: true };
       case ".zip":
         // zip 是运输容器（MRXS 包/多文件），不是切片直传类别——不携带
         // direct_class 声明（服务端词表里 zip 只在受理词表，不在
         // direct_upload；声明 legacy-direct 会被 422 invalid_direct_class）
         return { cls: CLS.TEMPORARY, ext: ext };
-      case ".ndpi":
       case ".vms":
       case ".vmu":
       case ".bif":

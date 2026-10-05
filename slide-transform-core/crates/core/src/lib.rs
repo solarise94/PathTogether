@@ -25,6 +25,8 @@ pub mod convert_gtiff;
 #[cfg(feature = "codecs")]
 pub mod convert_mirax;
 #[cfg(feature = "codecs")]
+pub mod convert_ndpi;
+#[cfg(feature = "codecs")]
 pub mod convert_scn;
 #[cfg(feature = "codecs")]
 pub mod convert_svs;
@@ -37,6 +39,7 @@ pub mod job;
 pub mod kfb;
 pub mod kfbf;
 pub mod mirax;
+pub mod ndpi;
 pub mod ome;
 pub mod scn;
 pub mod ome_writer;
@@ -68,6 +71,9 @@ pub mod scn_fixture;
 
 #[cfg(all(feature = "codecs", feature = "fixtures"))]
 pub mod gtiff_fixture;
+
+#[cfg(all(feature = "codecs", feature = "fixtures"))]
+pub mod ndpi_fixture;
 
 pub use error::{CoreError, CoreResult};
 pub use plan::{

@@ -455,6 +455,13 @@ export const GTIFF_SOURCE_ADAPTER = 'generic-tiled-jpeg-tiff';
 export const GTIFF_ADAPTER_VERSION = '1';
 /// Must equal the Rust `PYRAMID_METHOD` / `GEN_MIN_SIDE` (gtiff.rs).
 export const GTIFF_PYRAMID_METHOD = 'l0-box2';
+/// F6: Hamamatsu NDPI（经典 TIFF + 厂商标签；整层单条带 JPEG 按 restart
+/// 区间有界分段解码后重编码，降采样层 l0-box2 生成）。Must equal the Rust
+/// `ADAPTER_VERSION` (resume refuses on mismatch).
+export const NDPI_SOURCE_ADAPTER = 'hamamatsu-ndpi-jpeg';
+export const NDPI_ADAPTER_VERSION = '1';
+/// Must equal the Rust `PYRAMID_METHOD` (ndpi.rs).
+export const NDPI_PYRAMID_METHOD = 'l0-box2';
 /// Converter-output source_format ids (same vocabulary as the Rust core's
 /// `CONVERTER_SOURCE_FORMATS` and upload_direct_class.py): a TIFF whose
 /// IFD-0 description JSON carries one of these is THIS TOOL's own output —
@@ -540,8 +547,8 @@ export async function sniffTiffSlideCapability(file) {
       if (en.typ === 4) return u32(en.val, 0);
       return undefined;
     };
-    const descBytes = async () => {
-      const en = entries[270];
+    const inlineText = async (tag) => {
+      const en = entries[tag];
       if (!en) return '';
       const len = Math.min(en.count, SNIFF_DESC_MAX);
       const inline = bigtiff ? 8 : 4;
@@ -551,7 +558,7 @@ export async function sniffTiffSlideCapability(file) {
         : u32(en.val, 0);
       return new TextDecoder().decode(await readAt(off, len));
     };
-    const desc = await descBytes();
+    const desc = await inlineText(270);
     // F4: vendor dispatch BEFORE the structural verdicts — OME-TIFF and
     // this converter's own BigTIFF are NOT conversion inputs at all (they
     // are already platform-readable), so they must never surface as
@@ -562,9 +569,26 @@ export async function sniffTiffSlideCapability(file) {
     if (isConverterMarkedDescription(desc)) {
       return bad('本工具导出的 BigTIFF 不是转换输入：请直接上传该产物（或选择原始切片）');
     }
-    const vendor = desc.includes('Aperio') ? 'aperio'
+    // F6: NDPI 的 IFD 0 通常没有 ImageDescription——厂商在 Make（271）里，
+    // 描述未命中时按 Make 分派
+    let vendor = desc.includes('Aperio') ? 'aperio'
       : (LEICA_SCN_XML_NS.test(desc) ? 'leica-scn' : 'unknown');
-    if (!entries[322] || !entries[323]) return bad('主图不是分块（tiled）存储：该 TIFF 变体不在支持集');
+    if (vendor === 'unknown') {
+      const make = await inlineText(271);
+      if (make.includes('Hamamatsu')) vendor = 'hamamatsu-ndpi';
+    }
+    if (vendor !== 'hamamatsu-ndpi' && (!entries[322] || !entries[323])) {
+      return bad('主图不是分块（tiled）存储：该 TIFF 变体不在支持集');
+    }
+    if (vendor === 'hamamatsu-ndpi') {
+      // NDPI 是整层单条带布局：分块存储反而不是 NDPI 变体
+      if (entries[322] || entries[323]) {
+        return bad('带 tile 标签的分块存储不是 NDPI 布局（NDPI 为整层单条带 JPEG）');
+      }
+      if (!entries[273] || !entries[279]) {
+        return bad('缺少 StripOffsets/StripByteCounts：不是整层单条带 NDPI 布局');
+      }
+    }
     const comp = scalar(259);
     if (comp === 33003 || comp === 33005) {
       return bad('JPEG 2000 压缩不在当前支持集（需要独立解码器）');
@@ -597,6 +621,22 @@ export async function sniffTiffSlideCapability(file) {
         modality: 'brightfield',
         format: SVS_SOURCE_ADAPTER,
         adapter: SVS_SOURCE_ADAPTER,
+        bigtiff,
+        littleEndian: little,
+      };
+    }
+    if (vendor === 'hamamatsu-ndpi') {
+      // F6：NDPI 本身即经典 TIFF（BigTIFF 容器不是 NDPI），其余结构门槛
+      // （SourceLens 层级/关联图分类、restart marker 有界解码单元、>4 GiB
+      // 扩展）由 wasm 核心在复制后的同一份副本上给类型化终审
+      if (bigtiff) {
+        return bad('NDPI 是经典 TIFF（42）；BigTIFF 容器不是 NDPI 输入');
+      }
+      return {
+        supported: true,
+        modality: 'brightfield',
+        format: NDPI_SOURCE_ADAPTER,
+        adapter: NDPI_SOURCE_ADAPTER,
         bigtiff,
         littleEndian: little,
       };
@@ -1084,7 +1124,7 @@ export function isOmeProfile(profile) {
 /// after the entry stem.
 export function outputFileName(sourceName, job) {
   const base = String(sourceName || 'slide')
-    .replace(/\.(kfb|kfbf|svs|scn|tif|tiff|mrxs)$/i, '') || 'slide';
+    .replace(/\.(kfb|kfbf|svs|scn|ndpi|tif|tiff|mrxs)$/i, '') || 'slide';
   return isOmeProfile(jobOutputProfile(job)) ? `${base}.ome.tif` : `${base}.tif`;
 }
 

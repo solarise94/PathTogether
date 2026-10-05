@@ -54,6 +54,7 @@ const els = {
   qualityConflict: $('quality-conflict'),
   qualityFieldset: $('quality-fieldset'),
   qualityMrsxNote: $('quality-mrxs-note'),
+  qualityNdpiNote: $('quality-ndpi-note'),
   qualityLocked: $('quality-locked'),
   moreOptions: $('more-options'),
   probeSection: $('probe-section'),
@@ -526,6 +527,7 @@ function resetFlowPanels() {
   els.qualityFieldset.hidden = true;
   els.qualityFieldset.disabled = false;
   els.qualityMrsxNote.hidden = true;
+  els.qualityNdpiNote.hidden = true;
   els.qualityLocked.hidden = true;
   els.qualityConflict.hidden = true;
   els.moreOptions.open = false;
@@ -747,6 +749,7 @@ function formatFamilyLabel(id) {
   if (s.startsWith('leica-scn')) return 'SCN (Leica)';
   if (s.startsWith('generic-tiled-jpeg-tiff')) return 'Generic TIFF';
   if (s.startsWith('mirax')) return 'MRXS';
+  if (s.startsWith('hamamatsu-ndpi')) return 'NDPI (Hamamatsu)';
   return s;
 }
 
@@ -971,13 +974,14 @@ function renderQualitySection() {
   updateQualityPolicyGate();
 }
 
-/// F3（MRXS）画质说明：MRXS 瓦片总是拼接后重编码——「保留画质」是高质量
-/// 重编码而非字节复制，输出可能大于源包。仅 MRXS（mirax*）识别后显示。
+/// F3（MRXS）/F6（NDPI）画质说明：两者的瓦片都是拼接/分段解码后重编码——
+/// 「保留画质」是高质量重编码而非字节复制。仅 MRXS（mirax*）/NDPI
+/// （hamamatsu-ndpi*）识别后显示对应说明行。
 function updateMrsxQualityNote() {
-  const show = !!page.prep
-    && String(probeDoc().format || '').startsWith('mirax')
-    && probeDoc().modality !== 'fluorescence';
-  els.qualityMrsxNote.hidden = !show;
+  const fmt = String(probeDoc().format || '');
+  const bf = probeDoc().modality !== 'fluorescence';
+  els.qualityMrsxNote.hidden = !(!!page.prep && fmt.startsWith('mirax') && bf);
+  els.qualityNdpiNote.hidden = !(!!page.prep && fmt.startsWith('hamamatsu-ndpi') && bf);
 }
 
 /// 「像素严格无损」与「更小文件（有损）」互斥（U2 要求在 UI 也阻止，核心

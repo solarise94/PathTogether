@@ -1424,8 +1424,18 @@ async function scenarioZ() {
       qualityHidden: document.getElementById('quality-fieldset').hidden,
     }));
     if (after.moreOptionsOpen) throw new Error('more options not collapsed by default after identification');
-    if (!after.jobsOpen) throw new Error('job records not opened once a job exists');
     if (after.qualityHidden) throw new Error('quality choice hidden for brightfield on narrow viewport');
+    // 任务记录「有任务即展开一次」是 refreshJobs 的异步收尾（runner.listJobs
+    // 读 OPFS 后 renderJobs 才置 open）——与本文件其他异步条件一样等待它，
+    // 而不是在摘要可见的第一拍一次性读取（同代码多次运行会间歇失败）。
+    try {
+      await page.waitForFunction(
+        () => document.getElementById('jobs-details').open,
+        null, { timeout: 60000 });
+      after.jobsOpen = true;
+    } catch {
+      throw new Error('job records not opened once a job exists');
+    }
     await L.shot(page, 'narrow-identified');
     // 英文窄屏截图（语言切换动态文案与折叠结构同查）
     await page.click('.lang-toggle');

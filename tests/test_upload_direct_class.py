@@ -99,11 +99,44 @@ def _ome_tiff_bytes():
 
 #: 转换器描述 JSON（kfb/converter.py · convert_svs.rs · convert_mirax.rs
 #: 的 `json.dumps(sort_keys=True) + NUL` 约定；来源标记取值白名单见模块）
+#: Aperio SVS 的真实描述形态（openslide svs 读取器按 "Aperio" 识别厂商）
+def _aperio_description():
+    return (b"Aperio Image Lib v1.4.1 |AppMag = 20|MPP = 0.4990\x00")
+
+
 def _converter_description(source_format):
     return (json.dumps({
         "source_format": source_format,
         "mpp_x": 0.5, "mpp_y": 0.5, "objective": 20.0,
     }, ensure_ascii=True, sort_keys=True) + "\x00").encode("ascii")
+
+
+def _classic_bigtiff(entries=None, description=b""):
+    """最小小端 BigTIFF（魔数 43；20 字节条目、8 字节偏移）。"""
+    entries = list(entries or [])
+    if description:
+        entries.append((270, 2, description))
+    entries.sort(key=lambda e: e[0])
+    # BigTIFF 头 16 字节：II(2) 43(2) offsetsizes=2(2) reserved(2) IFD 偏移(8)
+    header = struct.pack("<2sHHHQ", b"II", 43, 2, 0, 16)
+    # IFD = 条目数(8) + 条目(20n) + 下一 IFD 指针(8)；堆紧随其后
+    heap_offset = 16 + 8 + 20 * len(entries) + 8
+    heap = b""
+    ifd = struct.pack("<Q", len(entries))
+    for tag, typ, val in entries:
+        if typ == 2:
+            payload = val if isinstance(val, bytes) else val.encode("ascii")
+            count = len(payload)
+            if count <= 8:
+                field = payload.ljust(8, b"\x00")
+            else:
+                field = struct.pack("<Q", heap_offset + len(heap))
+                heap += payload
+            ifd += struct.pack("<HHQ", tag, typ, count) + field
+        else:
+            ifd += struct.pack("<HHQ", tag, typ, 1) + struct.pack("<Q", val)
+    ifd += struct.pack("<Q", 0)
+    return header + ifd + heap
 
 
 def _write(tmp_path, name, data):
@@ -135,6 +168,113 @@ def test_sniff_plain_tiff_and_non_tiff(tmp_path):
     assert udc.sniff_tiff_class(str(p2)) == udc.ACTUAL_NON_TIFF
 
 
+def test_sniff_bigtiff_layouts(tmp_path):
+    """BigTIFF（魔数 43）解析：转换器描述 JSON / OME-XML 均按同一有界
+    路径识别（真实转换产物是 BigTIFF——声明核验必须覆盖该容器）。"""
+    p = _write(tmp_path, "classic-out.tif",
+               _classic_bigtiff(description=_converter_description(
+                   "aperio-svs-jpeg")))
+    assert udc.sniff_tiff_class(str(p)) == udc.ACTUAL_CONVERTER
+    ome = (b'<?xml version="1.0" encoding="UTF-8"?>'
+           b'<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">'
+           b"</OME>\x00")
+    p2 = _write(tmp_path, "ome-out.tif", _classic_bigtiff(description=ome))
+    assert udc.sniff_tiff_class(str(p2)) == udc.ACTUAL_OME
+    p3 = _write(tmp_path, "plain-bt.tif", _classic_bigtiff())
+    assert udc.sniff_tiff_class(str(p3)) == udc.ACTUAL_TIFF_OTHER
+
+
+def test_sniff_reads_description_bounded(tmp_path, monkeypatch):
+    """内存合同：描述标签只定长读取 ≤ 1 MiB——绝不按声明的 count 全量
+    读取（count 可以和文件一样大；审查实测 tifffile 路径峰值 434 MiB）。"""
+    reads = []
+    real_open = open
+
+    class RecordingFile:
+        def __init__(self, fh):
+            self._fh = fh
+
+        def read(self, n=-1):
+            reads.append(n)
+            return self._fh.read(n)
+
+        def seek(self, *a):
+            return self._fh.seek(*a)
+
+        def tell(self):
+            return self._fh.tell()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            self._fh.close()
+
+    import builtins
+    real_builtin_open = builtins.open
+
+    def rec_open(path, mode="r", *a, **kw):
+        fh = real_builtin_open(path, mode, *a, **kw)
+        if str(path).endswith(".tif") and "rb" in mode:
+            reads.append("open")
+            return RecordingFile(fh)
+        return fh
+
+    monkeypatch.setattr(builtins, "open", rec_open)
+    # 描述 count 声明 200 MiB（数据实际在盘上稀疏写 1 字节即可）
+    p = tmp_path / "huge-desc.tif"
+    header = struct.pack("<2sHI", b"II", 42, 8)
+    ifd = struct.pack("<HHI", 270, 2, 200 * 1024 * 1024)
+    ifd += struct.pack("<I", 30)          # 描述偏移
+    ifd += struct.pack("<I", 0)
+    with real_builtin_open(p, "wb") as fh:
+        fh.write(header + ifd + b"II*\x00 plain")
+        fh.truncate(200 * 1024 * 1024 + 64)   # 稀疏：不必真写 200 MiB
+    reads.clear()
+    assert udc.sniff_tiff_class(str(p)) == udc.ACTUAL_TIFF_OTHER
+    byte_reads = [n for n in reads if isinstance(n, int)]
+    assert byte_reads, "no reads recorded"
+    assert max(byte_reads) <= udc._DESC_READ_CAP, max(byte_reads)
+
+
+def test_sniff_huge_description_memory_bound(tmp_path):
+    """审查复现回归（进程级）：ImageDescription 声明 200 MiB 的文件——
+    旧实现（tifffile description 全量读取）峰值 RSS ≈ 434 MiB；有界实现
+    应在 ~15 MiB 内完成并返回 tiff-other。子进程测 ru_maxrss 高水位。"""
+    import resource
+    import subprocess
+    import sys
+
+    code = (
+        "import os, struct, sys, resource, tempfile\n"
+        "sys.path.insert(0, %r)\n"
+        "import upload_direct_class as udc\n"
+        "desc_count = 200 * 1024 * 1024\n"
+        "p = tempfile.mktemp(suffix='.tif')\n"
+        "header = struct.pack('<2sHI', b'II', 42, 8)\n"
+        "ifd = struct.pack('<HHI', 270, 2, desc_count)\n"
+        "ifd += struct.pack('<I', 30)\n"
+        "ifd += struct.pack('<I', 0)\n"
+        "with open(p, 'wb') as fh:\n"
+        "    fh.write(header + ifd + b'II*\\x00 plain')\n"
+        "    fh.truncate(desc_count + 64)\n"
+        "try:\n"
+        "    r = udc.sniff_tiff_class(p)\n"
+        "    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss\n"
+        "    print(r, peak)\n"
+        "finally:\n"
+        "    os.unlink(p)\n"
+    ) % os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    out = subprocess.run([sys.executable, "-c", code],
+                         capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr[-400:]
+    result, peak_kb = out.stdout.split()
+    assert result == udc.ACTUAL_TIFF_OTHER
+    # 有界实现实测 ≈14–81 MiB（子进程基线随环境浮动）；旧实现同场景
+    # ≈434 MiB。阈值取旧实现的 1/3——有界与全量读取之间隔一个量级。
+    assert int(peak_kb) < 150_000, int(peak_kb)
+
+
 def test_sniff_svs_compression_variant(tmp_path):
     # JPEG2000 编码 SVS：第 0 层压缩 33005（33003 同理）
     p = _write(tmp_path, "jp2k.svs",
@@ -149,6 +289,44 @@ def test_sniff_svs_compression_variant(tmp_path):
 # --------------------------------------------------------------------------- #
 # 2. 声明核验（正例 + 负例）
 # --------------------------------------------------------------------------- #
+def test_aperio_svs_jpeg_content_detection(tmp_path):
+    """内容级判定：Aperio 厂商标记 + 压缩 7 = JPEG 编码 SVS（无论扩展
+    名）；JP2K 压缩 / 无 Aperio 标记都不算。"""
+    svs_jpeg = _write(tmp_path, "a.tif",
+                      _classic_tiff(entries=[(259, 3, 7)],
+                                    description=_aperio_description()))
+    assert udc.is_aperio_svs_jpeg(str(svs_jpeg)) is True
+    # JP2K 编码 Aperio SVS：不是关闭对象（svs-jp2k 是放行的暂时变体）
+    svs_jp2k = _write(tmp_path, "b.tif",
+                      _classic_tiff(entries=[(259, 3, 33005)],
+                                    description=_aperio_description()))
+    assert udc.is_aperio_svs_jpeg(str(svs_jp2k)) is False
+    # 压缩 7 但无 Aperio 标记：普通 JPEG TIFF，不是 SVS
+    generic = _write(tmp_path, "c.tif", _classic_tiff(entries=[(259, 3, 7)]))
+    assert udc.is_aperio_svs_jpeg(str(generic)) is False
+    # 非 TIFF
+    junk = _write(tmp_path, "d.tif", b"JUNKJUNKJUNK")
+    assert udc.is_aperio_svs_jpeg(str(junk)) is False
+
+
+def test_enforcement_failure_scope(tmp_path):
+    """enforcement_failure 只作用于 tif/tiff 名 + 无声明/legacy-direct；
+    其余声明路径由 declaration_matches 裁定。"""
+    svs_jpeg = _write(tmp_path, "any.tif",
+                      _classic_tiff(entries=[(259, 3, 7)],
+                                    description=_aperio_description()))
+    assert udc.enforcement_failure(str(svs_jpeg), None, "tif") == \
+        "convert_in_browser"
+    assert udc.enforcement_failure(str(svs_jpeg), "legacy-direct",
+                                   "tiff") == "convert_in_browser"
+    # 其他扩展名（ndpi 等本就是暂时开放格式）与具体声明路径不在此执行
+    assert udc.enforcement_failure(str(svs_jpeg), None, "ndpi") is None
+    assert udc.enforcement_failure(str(svs_jpeg), "ome-tiff", "tif") is None
+    assert udc.enforcement_failure(str(svs_jpeg),
+                                   "unconverted-variant:svs-jp2k",
+                                   "tif") is None
+
+
 def test_declaration_matches_ome(tmp_path):
     p = _write(tmp_path, "a.ome.tif", _ome_tiff_bytes())
     assert udc.declaration_matches(str(p), "ome-tiff")
@@ -197,19 +375,30 @@ def test_declaration_vocab_guards(tmp_path):
     assert udc.variant_of("legacy-direct") is None
 
 
-def test_zip_contains_bundle_entry(tmp_path):
+def test_zip_closed_format_entries(tmp_path):
+    """zip 成员门：.mrxs 与 .svs 都是本阶段关闭成员；.tif 等照常放行。"""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr("CMU-1.mrxs", b"stub")
         zf.writestr("CMU-1/Slidedat.ini", b"stub")
+        zf.writestr("scan.svs", b"stub")
         zf.writestr("other.tif", b"stub")
     p = _write(tmp_path, "pack.zip", buf.getvalue())
-    assert udc.zip_contains_bundle_entry(str(p))
+    assert udc.zip_closed_format_entries(str(p)) == [
+        "CMU-1.mrxs", "scan.svs"]
+    assert udc.zip_contains_bundle_entry(str(p))  # 兼容别名
     buf2 = io.BytesIO()
     with zipfile.ZipFile(buf2, "w") as zf:
         zf.writestr("a.tif", b"stub")
     p2 = _write(tmp_path, "plain.zip", buf2.getvalue())
-    assert not udc.zip_contains_bundle_entry(str(p2))
+    assert udc.zip_closed_format_entries(str(p2)) == []
+    # 大小写不敏感、目录条目不误报
+    buf3 = io.BytesIO()
+    with zipfile.ZipFile(buf3, "w") as zf:
+        zf.writestr("Scan.SVS", b"stub")
+        zf.writestr("folder/", b"")
+    p3 = _write(tmp_path, "case.zip", buf3.getvalue())
+    assert udc.zip_closed_format_entries(str(p3)) == ["Scan.SVS"]
 
 
 # --------------------------------------------------------------------------- #
@@ -425,6 +614,63 @@ def test_worker_declared_converter_bigtiff_marked_passes(monkeypatch,
                                direct_class="converter-bigtiff")
     assert ciw.process_validating(cos=fake, state=st) == job["job_id"]
     assert ist.get_job(job["job_id"])["state"] == ist.READY
+
+
+def test_worker_svs_renamed_tif_fails_convert_in_browser(
+        monkeypatch, tmp_path):
+    """审查回归：JPEG 编码 SVS 改名 .tif（创建闸只看扩展名，open_slide 按
+    内容打开）→ worker 内容级执行拒绝（convert_in_browser），无声明与
+    legacy-direct 都拦；普通 TIFF 不受影响照常发布。"""
+    seen = {"open": 0}
+
+    def explode(path, format_hint=None):
+        seen["open"] += 1
+        raise AssertionError("内容级关闭命中后不得再调用 open_slide")
+
+    monkeypatch.setattr(slide_io, "open_slide", explode)
+    payload = _classic_tiff(entries=[(259, 3, 7)],
+                            description=_aperio_description())
+
+    for declared in (None, "legacy-direct"):
+        fake, st = _FakeCos(), {}
+        job = _drive_to_validating(fake, st, payload, "renamed.tif", "tif",
+                                   direct_class=declared)
+        assert ciw.process_validating(cos=fake, state=st) is None, declared
+        out = ist.get_job(job["job_id"])
+        assert out["state"] == ist.FAILED, declared
+        assert out["fail_code"] == "convert_in_browser", declared
+        assert not slide_storage.staging_task_dir(
+            job["job_id"], root=str(tmp_path)).exists()
+    assert seen["open"] == 0
+
+    # 对照：无 Aperio 标记的普通 TIFF + legacy-direct 照常发布
+    monkeypatch.setattr(slide_io, "open_slide",
+                        lambda p, format_hint=None: _ProbeSlide())
+    fake, st = _FakeCos(), {}
+    plain = _classic_tiff()
+    job = _drive_to_validating(fake, st, plain, "plain-renamed.tif", "tif",
+                               direct_class="legacy-direct")
+    assert ciw.process_validating(cos=fake, state=st) == job["job_id"]
+    assert ist.get_job(job["job_id"])["state"] == ist.READY
+
+
+def test_worker_zip_with_svs_member_fails_convert_in_browser(
+        monkeypatch, tmp_path):
+    """审查回归：zip 夹带 .svs 成员（此前只拒 .mrxs）→ 解包前拒绝；
+    .tif 成员的 zip 行为不变。"""
+    monkeypatch.setattr(slide_io, "open_slide",
+                        lambda p, format_hint=None: _ProbeSlide())
+    fake, st = _FakeCos(), {}
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("scan.svs", _classic_tiff(entries=[(259, 3, 7)]))
+        zf.writestr("other.tif", _classic_tiff())
+    job = _drive_to_validating(fake, st, buf.getvalue(), "w-svs.zip", "zip",
+                               kind="zip")
+    assert ciw.process_validating(cos=fake, state=st) is None
+    out = ist.get_job(job["job_id"])
+    assert out["state"] == ist.FAILED
+    assert out["fail_code"] == "convert_in_browser"
 
 
 def test_worker_zip_with_mrxs_entry_fails_convert_in_browser(

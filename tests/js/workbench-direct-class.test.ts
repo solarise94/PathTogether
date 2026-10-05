@@ -90,7 +90,11 @@ const COS_CAPS = {
 	url_ttl_seconds: 600,
 	max_concurrent_parts: 2,
 	sign_batch_max_parts: 8,
-	formats: ["svs", "tif", "tiff", "ome.tif", "ome.tiff", "zip", "kfb"],
+	// 与服务端 _cos_accepted_formats 同集（native 扩展 + zip；无 ome.tif —
+	// ext 取末段，无 kfb——转换关闭）。修复审查发现：夹具曾含服务端不下发
+	// 的词表项，掩盖了 zip 携带 direct_class 的回归。
+	formats: ["svs", "tif", "tiff", "ndpi", "vms", "vmu", "scn", "bif",
+		"svslide", "bmp", "jpg", "jpeg", "zip"],
 };
 
 function loadApp(caps: unknown, openImpl?: () => unknown) {
@@ -214,6 +218,18 @@ describe("工作台直传分流（阶段 1）", () => {
 		expect(btns.length).toBe(2);
 		// app.js 的 tt() 在无 HP_I18N 词条时回落内置 zh 文案
 		expect(String(btns[0].textContent)).toContain("在本机转换并上传");
+	});
+
+	it("zip（运输容器）→ 创建体不携带 direct_class", async () => {
+		const h = loadApp({ cos_upload: COS_CAPS });
+		h.up.uploadFile({ name: "pack.zip", size: 30, slice: () => null });
+		await flush(8);
+		const create = fetchCalls(h).find(
+			(c) => c.url === "/api/ingestions" && c.method === "POST");
+		expect(create).toBeTruthy();
+		const body = JSON.parse(String(create!.opts!.body));
+		expect(body.filename).toBe("pack.zip");
+		expect(body.direct_class).toBeUndefined();
 	});
 
 	it("未登记扩展名 → 明确错误 toast，不建任务", async () => {

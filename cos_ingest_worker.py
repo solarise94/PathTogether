@@ -915,7 +915,7 @@ def _validating_critical_section(job, state, cleanup_due):
             # 先转换后上传阶段 1（0078）：open_slide 试开**之前**核验创建时
             # 声明的直传类别（只读文件头/IFD，upload_direct_class 单一实现）。
             # 不符 → 确定性失败，错误码 convert_in_browser（引导本机转换）；
-            # NULL/legacy-direct 不做头级核验，字节合法性仍由 open_slide 终审。
+            # NULL/legacy-direct 不做声明核验，字节合法性仍由 open_slide 终审。
             declared_direct = (job.get("direct_class") or "").strip().lower()
             if declared_direct and not upload_direct_class.declaration_matches(
                     staged, declared_direct,
@@ -925,6 +925,17 @@ def _validating_critical_section(job, state, cleanup_due):
                 _log.warning(
                     "direct_class 声明与文件头不符（job=%s declared=%s）",
                     job_id, declared_direct)
+                return None
+            # 内容级关闭策略：JPEG 编码 Aperio SVS 改名 .tif（或无声明）绕过
+            # 创建闸——按内容（Aperio 厂商标记 + 压缩 7）拒绝。仅作用于
+            # tif/tiff 名 + 无声明/legacy-direct（其余声明已由上一步裁定）。
+            policy_fail = upload_direct_class.enforcement_failure(
+                staged, declared_direct or None, ext)
+            if policy_fail:
+                _fail(policy_fail)
+                _log.warning(
+                    "内容级直传关闭命中（job=%s ext=%s）：JPEG 编码 Aperio "
+                    "SVS 须在本机转换后上传", job_id, ext)
                 return None
             try:
                 # open_slide 试开+关（app.py:_validate_slide_file 同口径；
@@ -1108,13 +1119,17 @@ def _zip_critical_section(job, state, cleanup_due):
             if os.path.getsize(staged) != declared:
                 _fail("local_size_mismatch")
                 return None
-            # 先转换后上传阶段 1：关闭「zip 中含 MRXS 包」的上传——解包前扫
-            # 中央目录（不触碰成员字节）；命中即确定性失败 convert_in_browser
-            # （MRXS 改走工作台文件夹交接 → 本机浏览器转换）。
-            if upload_direct_class.zip_contains_bundle_entry(staged):
+            # 先转换后上传阶段 1：关闭「zip 中含关闭格式成员」的上传——解包
+            # 前扫中央目录（不触碰成员字节）；命中（.mrxs 包 / .svs——zip
+            # 成员无法逐个声明 JP2K 例外）即确定性失败 convert_in_browser
+            # （MRXS 改走工作台文件夹交接 → 本机浏览器转换；svs 请直传并带
+            # 声明）。
+            closed = upload_direct_class.zip_closed_format_entries(staged)
+            if closed:
                 _fail("convert_in_browser")
                 _log.warning(
-                    "zip 内含 MRXS 包，直传已关闭（job=%s）", job_id)
+                    "zip 内含关闭格式成员，直传已关闭（job=%s n=%d）",
+                    job_id, len(closed))
                 return None
             sha = (job.get("download_checkpoint_json") or {}).get("sha256") or ""
             if not sha:

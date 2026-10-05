@@ -131,10 +131,16 @@ describe("slide-sniff：扩展名快路径（不读字节）", () => {
 
 	it("暂无浏览器转换器的格式/变体 → temporary（直传声明 legacy-direct）", () => {
 		for (const n of ["a.ndpi", "a.vms", "a.vmu", "a.scn", "a.bif",
-			"a.svslide", "a.bmp", "a.jpg", "a.jpeg", "a.zip"]) {
+			"a.svslide", "a.bmp", "a.jpg", "a.jpeg"]) {
 			const r = S.classifyExt(n);
 			expect(r.cls, n).toBe("temporary");
+			expect(r.directClass, n).toBe("legacy-direct");
 		}
+		// zip 是运输容器，不是切片直传类别：不带声明（回归——曾对每个 zip
+		// 发 legacy-direct，服务端 422 invalid_direct_class）
+		const zip = S.classifyExt("a.zip");
+		expect(zip.cls).toBe("temporary");
+		expect(zip.directClass).toBeUndefined();
 	});
 
 	it("未登记扩展名 → unsupported；TIFF 类 → route=tiff（需头解析）", () => {

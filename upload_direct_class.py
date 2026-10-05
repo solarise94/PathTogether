@@ -25,13 +25,23 @@
     ``unconverted-variant:svs-jp2k``  JPEG2000 编码的 Aperio SVS——第 0 层
                                     压缩必须是 33003(JP2K)/33005(JPX)。
 
-核验**只读文件头/IFD，绝不读整个文件**：TIFF 魔数 + tifffile 的首 IFD
-惰性解析（is_ome/description/compression），zip 只扫中央目录文件名。
+内存合同（审查修复）：**所有读取都有界**——魔数 8 字节、IFD0 表
+≤ 1 MiB、描述标签 ≤ _DESC_READ_CAP（1 MiB，从标签偏移处定长读取）。
+不用 tifffile 的 page.description / is_ome（它们会把任意大的
+ImageDescription 全量读入内存——craft 出的描述可以和文件一样大，构成
+worker/百度路径的 OOM 面）。ZIP 检查只扫中央目录文件名。
+
+内容级关闭策略（防扩展名伪装，worker 用）：JPEG 编码 Aperio SVS 把扩展名
+改成 .tif/.tiff 后，创建闸（只看扩展名）放行、open_slide 按内容打开——
+``enforcement_failure`` 对 tif/tiff 名 + 无声明/legacy-direct 的任务按
+描述中的 Aperio 厂商标记 + 压缩 7 识别并拒绝（unconverted-variant:svs-jp2k
+与 ome/converter 声明路径不受影响——后者已由 declaration_matches 裁定）。
 """
 
 from __future__ import annotations
 
 import json
+import struct
 import zipfile
 
 #: 声明词表（``unconverted-variant:<variant>`` 按前缀匹配，variant 白名单
@@ -59,17 +69,28 @@ CONVERTER_SOURCE_FORMATS = frozenset({
     "mirax-bundle",       # MRXS → 经典 BigTIFF
 })
 
-#: snniff 结果词表（actual 类别）
+#: sniff 结果词表（actual 类别）
 ACTUAL_OME = "ome-tiff"
 ACTUAL_CONVERTER = "converter-bigtiff"
 ACTUAL_SVS_JP2K = "svs-jp2k"
 ACTUAL_TIFF_OTHER = "tiff-other"
 ACTUAL_NON_TIFF = "non-tiff"
 
-_TIFF_MAGICS = (b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+")
-
-#: 好奇心防护：描述标签理论上可巨大；只读前 1 MiB 判 OME/JSON 标记
+#: 描述标签的定长读取上限（OME-XML 头与转换器 JSON 都在头部；绝不按标签
+#: 声明的 count 全量读取——count 可以和文件一样大）
 _DESC_READ_CAP = 1 << 20
+
+#: IFD0 表读取上限（防御：条目数声明可以很大）
+_IFD_READ_CAP = 1 << 20
+
+#: TIFF 标签字节数：2(BYTE)/3(SHORT)/4(LONG)/16(LONG8)——本模块只消费这些
+_TYPE_UNIT = {1: 1, 2: 1, 3: 2, 4: 4, 16: 8}
+
+#: Aperio SVS 的厂商标记（openslide svs 读取器同判据：描述标识 Aperio）
+_APERIO_MARKER = "aperio"
+
+#: SVS 的 JPEG 编码压缩码（Aperio 明场）；33003/33005 是 JP2K/JPX
+_JPEG_COMPRESSION = 7
 
 
 def is_direct_class(value):
@@ -90,12 +111,117 @@ def variant_of(value):
     return None
 
 
-def _is_tiff_magic(path):
+# --------------------------------------------------------------------------- #
+# 有界 TIFF 头解析（魔数 + IFD0；classic 与 BigTIFF、双端序）
+# --------------------------------------------------------------------------- #
+def _parse_tiff_head(fh):
+    """解析魔数与 IFD0 条目。返回 dict 或 None（非 TIFF/坏头）。
+
+    每个条目 → tag: (type, count, data_offset|None, inline_bytes|None)。
+    内联值（total ≤ 值域字段）直接带字节；否则带 data_offset（绝不在此处
+    读取数据体）。全部读取有界：头 8/16 字节 + IFD 表 ≤ _IFD_READ_CAP。
+    """
+    head = fh.read(8)
+    if len(head) < 8:
+        return None
+    if head[:2] == b"II":
+        bo = "<"
+    elif head[:2] == b"MM":
+        bo = ">"
+    else:
+        return None
+    magic = struct.unpack(bo + "H", head[2:4])[0]
+    if magic == 42:
+        bigtiff = False
+    elif magic == 43:
+        bigtiff = True
+    else:
+        return None
+
+    if bigtiff:
+        # 头布局（16B）：II(2) 43(2) offsetsizes(2,须为 2) reserved(2) IFD 偏移(8)
+        if len(head) < 6 or head[4] != 2:
+            return None
+        extra = fh.read(8)
+        if len(extra) < 8:
+            return None
+        ifd_off = struct.unpack(bo + "Q", extra)[0]
+        ifd_cnt_size, entry_size, value_size = 8, 20, 8
+        ifd_cnt_fmt, field_cnt_fmt = "Q", "Q"    # 条目数与条目内 count 同宽
+    else:
+        ifd_off = struct.unpack(bo + "I", head[4:8])[0]
+        # classic：IFD 条目数是 2 字节 SHORT；条目内的 count 字段是 4 字节
+        ifd_cnt_size, entry_size, value_size = 2, 12, 4
+        ifd_cnt_fmt, field_cnt_fmt = "H", "I"
+
+    fh.seek(ifd_off)
+    cnt_raw = fh.read(ifd_cnt_size)
+    if len(cnt_raw) < ifd_cnt_size:
+        return None
+    count = struct.unpack(bo + ifd_cnt_fmt, cnt_raw)[0]
+    if count > _IFD_READ_CAP // entry_size:
+        return None                              # 防御：条目数声明离谱
+    raw = fh.read(count * entry_size)
+    entries = {}
+    # 条目内布局（classic 12B / bigtiff 20B）：
+    #   tag [0:2] | type [2:4] | count [4:4+cnt_w] | value [val_off:val_off+value_size]
+    cnt_w = 8 if bigtiff else 4
+    val_off = 4 + cnt_w
+    for i in range(count):
+        e = raw[i * entry_size:(i + 1) * entry_size]
+        if len(e) < entry_size:
+            break
+        tag = struct.unpack(bo + "H", e[0:2])[0]
+        typ = struct.unpack(bo + "H", e[2:4])[0]
+        cnt = struct.unpack(bo + ("Q" if bigtiff else "I"), e[4:val_off])[0]
+        vfield = e[val_off:val_off + value_size]
+        unit = _TYPE_UNIT.get(typ)
+        total = unit * cnt if unit else None
+        if total is not None and total <= value_size:
+            entries[tag] = (typ, cnt, None, vfield[:total])     # 内联
+        else:
+            entries[tag] = (typ, cnt,
+                            struct.unpack(bo + ("Q" if bigtiff else "I"),
+                                          vfield)[0], None)      # 偏移
+    return {"bo": bo, "bigtiff": bigtiff, "entries": entries}
+
+
+def _inline_uint(entry, bo):
+    """内联数值（SHORT/LONG/LONG8 的第一个值；本模块只对压缩码用）。"""
+    typ, cnt, offset, inline = entry
+    if offset is not None or cnt < 1 or inline is None:
+        return 0
+    width = _TYPE_UNIT.get(typ)
+    if width not in (2, 4, 8):
+        return 0
     try:
-        with open(path, "rb") as fh:
-            return fh.read(4) in _TIFF_MAGICS
-    except OSError:
-        return False
+        return struct.unpack(bo + {2: "H", 4: "I", 8: "Q"}[width],
+                             inline[:width])[0]
+    except struct.error:
+        return 0
+
+
+def _bounded_text(fh, bo, entry, bigtiff):
+    """描述标签（ASCII）的定长读取（≤ _DESC_READ_CAP）→ str。
+
+    只按 offset + min(count, cap) 读取——count 声明可以任意大（可以和
+    文件一样大），绝不按声明全量读。
+    """
+    typ, cnt, offset, inline = entry
+    if typ != 2:
+        return ""
+    if inline is not None:
+        data = inline
+    else:
+        if offset is None:
+            return ""
+        cap = min(cnt, _DESC_READ_CAP)
+        fh.seek(offset)
+        data = fh.read(cap)
+    try:
+        return data.decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 — 解码失败按无标记处理
+        return ""
 
 
 def _converter_marked(desc_text):
@@ -115,46 +241,100 @@ def _converter_marked(desc_text):
     return str(obj.get("source_format") or "") in CONVERTER_SOURCE_FORMATS
 
 
+def _looks_like_ome_xml(text):
+    """有界 OME-XML 判定：XML 声明开头 + OME 标记在头部窗口内
+    （OME-XML 的根元素紧跟 XML 声明，1 MiB 窗口覆盖任何真实文件）。"""
+    if not text:
+        return False
+    head = text.lstrip()[:4096]
+    return head.startswith("<?xml") and "OME" in head[:2048]
+
+
+def _is_aperio_svs(desc_text, compression):
+    """JPEG 编码 Aperio SVS：描述标识 Aperio（openslide svs 同判据）且
+    第 0 层压缩为 JPEG(7)。JP2K 压缩不算（svs-jp2k 是放行的暂时变体）。"""
+    if compression != _JPEG_COMPRESSION:
+        return False
+    return _APERIO_MARKER in (desc_text or "").lower()
+
+
 def sniff_tiff_class(path):
-    """按文件头/首 IFD 嗅探实际类别。
+    """按文件头/首 IFD 嗅探实际类别（**全部读取有界**）。
 
-    返回 ACTUAL_* 常量之一。只读魔数与首 IFD（tifffile 惰性解析；
-    is_ome/description/compression 都不触碰金字塔数据）。
+    返回 ACTUAL_* 常量之一。只读魔数、IFD0 表与描述标签前
+    _DESC_READ_CAP 字节；绝不按标签声明的 count 全量读取。
     """
-    if not _is_tiff_magic(path):
-        return ACTUAL_NON_TIFF
     try:
-        import tifffile
-
-        with tifffile.TiffFile(str(path)) as tf:
-            if bool(getattr(tf, "is_ome", False)):
-                return ACTUAL_OME
-            page0 = tf.pages[0] if tf.pages else None
-            if page0 is None:
-                return ACTUAL_TIFF_OTHER
+        with open(path, "rb") as fh:
+            head = _parse_tiff_head(fh)
+            if head is None:
+                return ACTUAL_NON_TIFF
+            bo, entries = head["bo"], head["entries"]
+            desc_entry = entries.get(270)
             desc = ""
-            try:
-                desc = page0.description or ""
-            except Exception:  # noqa: BLE001 — 描述标签损坏不猜测
-                desc = ""
-            if desc and len(desc) <= _DESC_READ_CAP and _converter_marked(desc):
+            if desc_entry is not None:
+                desc = _bounded_text(fh, bo, desc_entry, head["bigtiff"])
+            if _looks_like_ome_xml(desc):
+                return ACTUAL_OME
+            if _converter_marked(desc):
                 return ACTUAL_CONVERTER
-            try:
-                compression = int(page0.compression or 0)
-            except Exception:  # noqa: BLE001
-                compression = 0
+            comp_entry = entries.get(259)
+            compression = _inline_uint(comp_entry, bo) if comp_entry else 0
             if compression in (33003, 33005):
                 return ACTUAL_SVS_JP2K
             return ACTUAL_TIFF_OTHER
-    except Exception:  # noqa: BLE001 — 非法/截断字节按非 TIFF 处理，
-        return ACTUAL_NON_TIFF  # 声明核验判 False；open_slide 再给终审
+    except OSError:
+        return ACTUAL_NON_TIFF
+
+
+def is_aperio_svs_jpeg(path):
+    """内容级判定：JPEG 编码 Aperio SVS（厂商标记 + 压缩 7）。
+
+    「JPEG 编码 .svs 关闭直传」的内容级执行点：SVS 改名 .tif 后创建闸
+    （扩展名级）放行、open_slide 按内容打开——worker 在发布前用它拒绝。
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = _parse_tiff_head(fh)
+            if head is None:
+                return False
+            desc_entry = head["entries"].get(270)
+            desc = (_bounded_text(fh, head["bo"], desc_entry, head["bigtiff"])
+                    if desc_entry is not None else "")
+            comp_entry = head["entries"].get(259)
+            compression = _inline_uint(comp_entry, head["bo"]) \
+                if comp_entry else 0
+            return _is_aperio_svs(desc, compression)
+    except OSError:
+        return False
+
+
+def enforcement_failure(path, declared_class, format_ext):
+    """阶段 1 内容级关闭策略（worker 用，declaration_matches 之后调用）。
+
+    返回错误码（目前仅 ``convert_in_browser``）或 None：
+      仅对 .tif/.tiff 名 + 无声明/legacy-direct 的任务做 Aperio-SVS-JPEG
+      内容检查（伪装扩展名绕过创建闸的唯一现实通道——ndpi/vms 等本就是
+      暂时开放的格式）。其余声明路径由 declaration_matches 裁定；JP2K
+      变体是放行的暂时直传，不做此检查。
+    """
+    declared = str(declared_class or "").strip().lower()
+    if declared not in ("", "legacy-direct"):
+        return None
+    ext = str(format_ext or "").lstrip(".").lower()
+    if ext not in ("tif", "tiff"):
+        return None
+    if is_aperio_svs_jpeg(path):
+        return "convert_in_browser"
+    return None
 
 
 def declaration_matches(path, declared_class, filename=None):
     """声明 vs 实际字节：True=相符（可继续 open_slide 终审）。
 
-    - ``legacy-direct``：无头级合同 → True（字节合法性由 open_slide 裁定）；
-    - ``ome-tiff``：必须 is_ome；
+    - ``legacy-direct``：无头级合同 → True（字节合法性由 open_slide 裁定；
+      Aperio-SVS 伪装在 enforcement_failure 做内容级执行）；
+    - ``ome-tiff``：描述必须含 OME-XML（有界判定）；
     - ``converter-bigtiff``：描述必须带转换器来源标记；
     - ``unconverted-variant:svs-jp2k``：第 0 层压缩 ∈ {33003, 33005}；
     - 头部读不出来（损坏/截断）→ False（具体声明无法证实即不放行；
@@ -169,7 +349,6 @@ def declaration_matches(path, declared_class, filename=None):
         return False
     variant = variant_of(declared)
     if variant is not None:
-        _label, compressions = _VARIANT_CHECKS[variant]
         # 复用嗅探的压缩判定：svs-jp2k 的 actual 即代表第 0 层压缩命中
         return sniff_tiff_class(path) == ACTUAL_SVS_JP2K
     actual = sniff_tiff_class(path)
@@ -180,17 +359,30 @@ def declaration_matches(path, declared_class, filename=None):
     return False
 
 
-def zip_contains_bundle_entry(path):
-    """zip 中央目录里是否含 MRXS 主入口（.mrxs）。
+#: zip 内视为关闭的成员后缀：MRXS 包（本阶段 zip-MRXS 关闭）与 .svs
+#: （直传关闭；zip 成员无法逐个声明 JP2K 例外——svs 请直传并带声明）
+_ZIP_CLOSED_SUFFIXES = (".mrxs", ".svs")
 
-    先转换后上传阶段 1 关闭「zip 中含 MRXS 包」的上传：只扫中央目录文件名
-    （不触碰成员字节）。目录条目以 / 结尾，天然不匹配后缀。
+
+def zip_closed_format_entries(path):
+    """zip 中央目录里本阶段关闭的成员（.mrxs / .svs）→ 排序文件名列表。
+
+    只扫中央目录文件名（不触碰成员字节）。目录条目以 / 结尾，天然不匹配
+    后缀。空列表 = 无关闭成员（其余成员照旧走解包/验证/发布）。
     """
+    out = []
     try:
         with zipfile.ZipFile(path) as zf:
             for name in zf.namelist():
-                if str(name).lower().endswith(".mrxs"):
-                    return True
+                low = str(name).lower()
+                if low.endswith(_ZIP_CLOSED_SUFFIXES):
+                    out.append(str(name))
     except Exception:  # noqa: BLE001 — 坏 zip 交给解包路径给稳定错误码
-        return False
-    return False
+        return []
+    return sorted(out)
+
+
+def zip_contains_bundle_entry(path):
+    """兼容别名：zip 内是否含 MRXS 主入口（阶段 1 起请用
+    :func:`zip_closed_format_entries`，它同时覆盖 .svs 成员）。"""
+    return bool(zip_closed_format_entries(path))

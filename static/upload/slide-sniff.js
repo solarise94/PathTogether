@@ -281,8 +281,10 @@
       case ".svs":
         return { route: "tiff", ext: ext, svs: true };
       case ".zip":
-        return { cls: CLS.TEMPORARY, directClass: DIRECT_CLASS.LEGACY,
-                 ext: ext };
+        // zip 是运输容器（MRXS 包/多文件），不是切片直传类别——不携带
+        // direct_class 声明（服务端词表里 zip 只在受理词表，不在
+        // direct_upload；声明 legacy-direct 会被 422 invalid_direct_class）
+        return { cls: CLS.TEMPORARY, ext: ext };
       case ".ndpi":
       case ".vms":
       case ".vmu":

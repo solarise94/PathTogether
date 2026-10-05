@@ -227,6 +227,22 @@ def test_direct_class_svs_closed_unless_declared(owner_client):
     owner_client.post("/api/ingestions/%s/cancel" % job["job_id"])
 
 
+def test_direct_class_zip_container_has_no_class(owner_client):
+    """zip 是运输容器，不属于任何直传类别：不带声明照常受理（kind=zip）；
+    显式 legacy-direct 是词表↔扩展名错配 → 422 invalid_direct_class
+    （zip 只在受理词表 _cos_accepted_formats，不在 direct_upload 清单——
+    回归：工作台曾对每个 zip 上传都发 direct_class=legacy-direct）。"""
+    r = _create(owner_client, filename="dc-zip.zip", size=100_000)
+    assert r.status_code == 202, r.get_json()
+    assert r.get_json()["kind"] == "zip"
+    owner_client.post("/api/ingestions/%s/cancel" % r.get_json()["job_id"])
+    r = _create(owner_client, filename="dc-zip2.zip", size=100_000,
+                direct_class="legacy-direct")
+    assert r.status_code == 422
+    assert r.get_json()["code"] == "invalid_direct_class"
+    assert ist.waiting_and_holding_counts()["waiting"] == 0
+
+
 def test_direct_class_vocab_and_extension_matching(owner_client):
     """direct_class 词表校验 + 声明↔扩展名匹配（错配 422 invalid_direct_class）。"""
     for bad in ("ome-tiff-but-wrong", "UNCONVERTED-VARIANT:SVS-JP2K-ish", ""):

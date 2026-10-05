@@ -30,13 +30,22 @@
 导入抽屉徽标三种：「直接上传」「本机转换后上传」「暂时直接导入」。
 名称修正：VMS/VMU 属 Hamamatsu，SVSlide 属 Sakura（中英文案均已改）。
 
-### 1.2 本阶段关闭的直传
+### 1.2 本阶段关闭的直传（含内容级执行）
 
 - **JPEG 编码的 `.svs`**（目录行级关闭）：无声明 → 422；JPEG2000 变体凭
   `unconverted-variant:svs-jp2k` 声明例外放行（worker 核验第 0 层压缩）。
-- **zip 中含 MRXS 包**：worker 解包前扫中央目录，命中即终态失败。
+  内容级执行（防扩展名伪装）：worker 对 .tif/.tiff 名 + 无声明/
+  legacy-direct 的任务按内容识别 JPEG 编码 Aperio SVS（描述含 Aperio
+  厂商标记 + 压缩 7），命中即 `convert_in_browser`——改名 `.tif` 无法绕过
+  （`upload_direct_class.enforcement_failure`）。
+- **zip 中含关闭格式成员**：worker 解包前扫中央目录，`.mrxs` 包与 `.svs`
+  成员均拒绝（`convert_in_browser`）——zip 成员无法逐个声明 JP2K 例外，
+  svs 请直传并带声明。
 - **KFB/KFBF**：维持 R1 起的关闭（conversion 分支拒绝）。
 - 裸 `.mrxs`：维持不可直传（需整包，走本机文件夹转换）。
+- **zip 是运输容器，不是直传类别**：工作台对 zip 上传不携带
+  `direct_class`（声明 legacy-direct 会被创建闸 422
+  invalid_direct_class——词表↔扩展名匹配）。
 
 ## 2. 错误码
 
@@ -60,6 +69,12 @@
   为 33003/33005。不符 → 任务 FAILED，`fail_code=convert_in_browser`。
   `NULL`/`legacy-direct` 不做头级核验（字节合法性仍由 `open_slide` 终审）。
 - 核验实现集中在 `upload_direct_class.py`（摄取 worker 与百度路径共用）。
+内存合同：所有头级读取有界——魔数 8/16 字节、IFD0 表 ≤1 MiB、描述标签
+定长 ≤1 MiB（自实现 classic/BigTIFF 解析，不使用 tifffile 的
+`page.description`/`is_ome`——它们会把任意大的 ImageDescription 全量读入
+内存；200 MiB 描述声明文件的嗅探峰值 RSS ≈14 MiB，回归测试
+`test_sniff_huge_description_memory_bound`/
+`test_sniff_reads_description_bounded` 锁定）。
 - **已入库切片的读取路径不受任何影响**：本阶段不触碰 `slide_io`/阅读器/
   manifest 语义；`direct_class` 只是上传闸门的声明证据。
 
@@ -111,7 +126,9 @@
 ## 7. 测试
 
 - pytest：`tests/test_upload_direct_class.py`（嗅探/声明正负例、worker
-  集成负例：声明 ome 但非 OME、声明 svs-jp2k 但 JPEG SVS、zip 内藏 MRXS）；
+  集成负例：声明 ome 但非 OME、声明 svs-jp2k 但 JPEG SVS、zip 内藏
+  MRXS/.svs、SVS 改名 .tif 的内容级拒绝、BigTIFF 解析、巨大描述的内存
+  上界）；`tests/test_ingestion_api.py`（zip 不携带/错配 direct_class）；
   `tests/test_ingestion_api.py`（`convert_in_browser` 拒绝、词表/扩展名
   匹配、声明落库）；`tests/test_baidu_imports.py`/`test_baidu_ingest.py`
   （TIFF-only 筛选、KFB 不再转换）；`tests/test_slide_format_registry.py`/

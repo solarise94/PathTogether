@@ -57,6 +57,8 @@ fn main() -> ExitCode {
         #[cfg(feature = "synth-gen")]
         "gen-svs" => cmd_gen_svs(&args[1..]),
         #[cfg(feature = "synth-gen")]
+        "gen-scn" => cmd_gen_scn(&args[1..]),
+        #[cfg(feature = "synth-gen")]
         "gen-mrxs" => cmd_gen_mrxs(&args[1..]),
         _ => Err(CoreError::validation(format!("未知子命令 {}", args[0]))),
     };
@@ -323,6 +325,87 @@ fn svs_doc_json(doc: &slide_transform_core::svs::SvsDoc) -> String {
     ])
 }
 
+/// Typed rejection for TIFF containers that are NOT conversion inputs.
+fn vendor_rejection(v: slide_transform_core::scn::TiffVendor) -> CoreError {
+    match v {
+        slide_transform_core::scn::TiffVendor::OmeTiff => CoreError::variant(
+            "OME-TIFF 不是转换输入：平台可直接读取 OME-TIFF，请直接上传该文件",
+        ),
+        slide_transform_core::scn::TiffVendor::ConverterBigTiff => CoreError::variant(
+            "本工具导出的 BigTIFF 不是转换输入：请直接上传该产物（或选择原始切片）",
+        ),
+        _ => CoreError::variant(
+            "TIFF 结构合法但描述未标识 Aperio / Leica SCN：未知厂商变体不猜",
+        ),
+    }
+}
+
+/// Capability report for a Leica SCN input (F4).
+fn scn_doc_json(doc: &slide_transform_core::scn::ScnDoc) -> String {
+    let levels: Vec<String> = doc
+        .levels
+        .iter()
+        .map(|lv| {
+            obj(&[
+                ju("r", lv.r as u64),
+                ju("ifd", lv.ifd_index as u64),
+                ju("width", lv.width as u64),
+                ju("height", lv.height as u64),
+                ju("tile_w", lv.tile_w as u64),
+                ju("tile_h", lv.tile_h as u64),
+                ju("tiles_across", lv.tiles_across as u64),
+                ju("tiles_down", lv.tiles_down as u64),
+                ju("tiles_total", lv.tiles_total),
+                ju("tiles_present", lv.tiles_present),
+                ju("tiles_missing", lv.tiles_missing()),
+                jstr(
+                    "color",
+                    match lv.color {
+                        slide_transform_core::scn::PayloadColor::Rgb => "rgb",
+                        slide_transform_core::scn::PayloadColor::YCbCr => "ycbcr",
+                    },
+                ),
+            ])
+        })
+        .collect();
+    let assoc: Vec<String> = doc
+        .associated
+        .iter()
+        .map(|a| obj(&[jstr("name", &a.name), ju("width", a.width as u64), ju("height", a.height as u64)]))
+        .collect();
+    obj(&[
+        jstr("format", slide_transform_core::scn::SOURCE_FORMAT),
+        jstr("adapter", slide_transform_core::scn::SOURCE_FORMAT),
+        jstr("adapter_version", slide_transform_core::scn::ADAPTER_VERSION),
+        jstr("modality", "brightfield"),
+        jstr(
+            "tiff_kind",
+            match doc.kind {
+                slide_transform_core::tiff_read::TiffKind::Classic => "classic",
+                slide_transform_core::tiff_read::TiffKind::BigTiff => "bigtiff",
+            },
+        ),
+        ju("width", doc.levels[0].width as u64),
+        ju("height", doc.levels[0].height as u64),
+        jraw("mpp_x", &doc.mpp.map(|v| v.to_string()).unwrap_or_else(|| "null".into())),
+        jraw("mpp_y", &doc.mpp.map(|v| v.to_string()).unwrap_or_else(|| "null".into())),
+        jraw("objective", &doc.objective.map(|v| v.to_string()).unwrap_or_else(|| "null".into())),
+        jstr("illumination", doc.illumination.as_deref().unwrap_or("unknown")),
+        jstr(
+            "mpp_source",
+            if doc.mpp.is_some() { "scn-view-nanometers" } else { "unknown" },
+        ),
+        jstr(
+            "objective_source",
+            if doc.objective.is_some() { "scn-scanSettings-objective" } else { "unknown" },
+        ),
+        jarr("levels", &levels),
+        jarr("associated", &assoc),
+        ju("xml_bytes", doc.xml_bytes),
+        jstr("codec", "jpeg-baseline-passthrough"),
+    ])
+}
+
 fn cmd_probe(args: &[String]) -> Result<String, CoreError> {
     let mut path: Option<&String> = None;
     let mut want_hash = false;
@@ -351,8 +434,20 @@ fn cmd_probe(args: &[String]) -> Result<String, CoreError> {
     let magic = detect(&src)?;
     let mut scratch = FileScratch::new(&scratch_under(Path::new(path)));
     let doc_json = if is_tiff_magic(&magic) {
-        // F1: bounded TIFF walk + Aperio detection (typed rejection inside)
-        svs_doc_json(&slide_transform_core::svs::probe_svs(&src)?)
+        // F1/F4: bounded TIFF walk + vendor dispatch (typed rejections
+        // inside the adapters; OME-TIFF / converter BigTIFF are not inputs)
+        match slide_transform_core::scn::sniff_tiff_vendor(&src)? {
+            slide_transform_core::scn::TiffVendor::LeicaScn => {
+                scn_doc_json(&slide_transform_core::scn::probe_scn_with_budget(
+                    &src,
+                    memory_budget,
+                )?)
+            }
+            slide_transform_core::scn::TiffVendor::AperioSvs => svs_doc_json(
+                &slide_transform_core::svs::probe_svs(&src)?,
+            ),
+            v => return Err(vendor_rejection(v)),
+        }
     } else if magic == KFBF_MAGIC {
         let doc = slide_transform_core::kfbf::parse_kfbf(&src, &mut scratch)?;
         let channels: Vec<String> = doc
@@ -466,7 +561,16 @@ fn cmd_probe(args: &[String]) -> Result<String, CoreError> {
     };
     // disk-precheck estimate (same shape as the wasm probe's)
     let estimate = if is_tiff_magic(&magic) {
-        slide_transform_core::svs::estimate_svs(&slide_transform_core::svs::probe_svs(&src)?)
+        match slide_transform_core::scn::sniff_tiff_vendor(&src)? {
+            slide_transform_core::scn::TiffVendor::LeicaScn => {
+                slide_transform_core::scn::estimate_scn(
+                    &slide_transform_core::scn::probe_scn_with_budget(&src, memory_budget)?,
+                )
+            }
+            _ => slide_transform_core::svs::estimate_svs(
+                &slide_transform_core::svs::probe_svs(&src)?,
+            ),
+        }
     } else if magic == KFBF_MAGIC {
         let doc = slide_transform_core::kfbf::parse_kfbf(&src, &mut scratch)?;
         slide_transform_core::estimate::estimate_fl(&doc, src.size())
@@ -719,14 +823,25 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
 
     let out_profile = match profile.as_str() {
         // auto keeps the pre-profile default per input kind: KFB → classic
-        // (unattended Baidu import consumes classic), SVS → classic as well
+        // (unattended Baidu import consumes classic), SVS/SCN → classic too
         "auto" if magic == KFBF_MAGIC => OutputProfile::OmeBigTiffSubifd,
         "auto" => OutputProfile::ClassicJpegBigTiff,
         id => OutputProfile::from_id(id)
             .ok_or_else(|| CoreError::validation(format!("未知 profile {profile}")))?,
     };
     let is_fl = !out_profile.is_brightfield();
-    let is_svs = is_tiff_magic(&magic);
+    let vendor = if is_tiff_magic(&magic) {
+        slide_transform_core::scn::sniff_tiff_vendor(&src)?
+    } else {
+        slide_transform_core::scn::TiffVendor::Unknown
+    };
+    let is_svs = is_tiff_magic(&magic)
+        && vendor != slide_transform_core::scn::TiffVendor::LeicaScn;
+    let is_scn = is_tiff_magic(&magic)
+        && vendor == slide_transform_core::scn::TiffVendor::LeicaScn;
+    if is_tiff_magic(&magic) && !is_svs && !is_scn {
+        return Err(vendor_rejection(vendor));
+    }
     let enc_profile = match encoding.as_str() {
         "preserve" => slide_transform_core::plan::EncodingProfile::PreserveSource,
         "compact" => slide_transform_core::plan::EncodingProfile::CompactJpegV1,
@@ -741,8 +856,10 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
             "compact-jpeg-v1 编码仅适用于明场；荧光不支持有损重编码",
         ));
     }
-    if is_svs && is_fl {
-        return Err(CoreError::variant("荧光 OME profile 不适用于明场 SVS 输入"));
+    if (is_svs || is_scn) && is_fl {
+        return Err(CoreError::variant(
+            "荧光 OME profile 不适用于明场 SVS/SCN 输入",
+        ));
     }
     let pixel_policy = match policy.as_str() {
         "allow-edge" => PixelPolicy::AllowEdgeReencode,
@@ -794,6 +911,15 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
             &plan,
             &job,
             companion.as_ref(),
+        )
+    } else if is_scn {
+        let mut plan = TransformPlan::brightfield(identity)
+            .with_policy(pixel_policy)
+            .with_limits(limits)
+            .with_encoding(enc_profile);
+        plan.profile = out_profile;
+        slide_transform_core::convert_scn::convert_scn_to_bigtiff(
+            &src, &mut sink, &mut scratch, &plan, &job,
         )
     } else if is_svs {
         let mut plan = TransformPlan::brightfield(identity)
@@ -876,6 +1002,8 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
                 ju("tiles_raw_copied", l.tiles_raw_copied),
                 ju("tiles_reencoded", l.tiles_reencoded),
                 ju("cells_filled_black", l.cells_filled_black),
+                ju("tiles_filled", l.tiles_filled),
+                ju("tiles_deduped", l.tiles_deduped),
             ])
         })
         .collect();
@@ -1475,6 +1603,72 @@ fn cmd_gen_svs(args: &[String]) -> Result<String, CoreError> {
     };
     let mut sink = FileSink::create(Path::new(path))?;
     let n = slide_transform_core::svs_fixture::build_synthetic_svs(&mut sink, &p)?;
+    sink.flush()?;
+    Ok(obj(&[jstr("path", path), ju("bytes", n)]))
+}
+
+// --------------------------------------------------------------------------- //
+// synthetic Leica SCN generator（F4 测试数据；无患者数据）
+// --------------------------------------------------------------------------- //
+
+#[cfg(feature = "synth-gen")]
+fn cmd_gen_scn(args: &[String]) -> Result<String, CoreError> {
+    let mut path = None;
+    let mut width = 520u32;
+    let mut height = 300u32;
+    let mut tile = 128u32;
+    let mut levels = 3u32;
+    let mut label_w = 128u32;
+    let mut label_h = 96u32;
+    let mut big_endian = false;
+    let mut sparse = false;
+    let mut fluoro = false;
+    let mut non_jpeg = false;
+    let mut desc = "xml".to_string();
+    let mut objective = 20.0f64;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--width" => { i += 1; width = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--width"))?; }
+            "--height" => { i += 1; height = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--height"))?; }
+            "--tile" => { i += 1; tile = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--tile"))?; }
+            "--levels" => { i += 1; levels = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--levels"))?; }
+            "--label-width" => { i += 1; label_w = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--label-width"))?; }
+            "--label-height" => { i += 1; label_h = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--label-height"))?; }
+            "--big-endian" => big_endian = true,
+            "--sparse" => sparse = true,
+            "--fluoro" => fluoro = true,
+            "--non-jpeg" => non_jpeg = true,
+            "--objective" => { i += 1; objective = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--objective"))?; }
+            "--desc" => { i += 1; desc = args.get(i).cloned().ok_or_else(|| CoreError::validation("--desc"))?; }
+            _ => path = Some(&args[i]),
+        }
+        i += 1;
+    }
+    let path = path.ok_or_else(|| CoreError::validation("gen-scn 需要 <out>"))?;
+    let p = slide_transform_core::scn_fixture::ScnGenParams {
+        width,
+        height,
+        tile,
+        levels,
+        label_w,
+        label_h,
+        big_endian,
+        sparse,
+        fluoro,
+        non_jpeg,
+        desc_mode: match desc.as_str() {
+            "none" => slide_transform_core::scn_fixture::DescMode::None,
+            "ome" => slide_transform_core::scn_fixture::DescMode::Ome,
+            "converter" => slide_transform_core::scn_fixture::DescMode::Converter,
+            "foreign" => slide_transform_core::scn_fixture::DescMode::Foreign,
+            _ => slide_transform_core::scn_fixture::DescMode::Xml,
+        },
+        objective,
+        ..Default::default()
+    };
+    let mut sink = FileSink::create(Path::new(path))?;
+    let n = slide_transform_core::scn_fixture::build_synthetic_scn(&mut sink, &p)?;
     sink.flush()?;
     Ok(obj(&[jstr("path", path), ju("bytes", n)]))
 }

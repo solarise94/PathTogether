@@ -417,6 +417,10 @@ struct HostCheckpoint {
     profile: OutputProfile,
     encoding: slide_transform_core::plan::EncodingProfile,
     adapter: Option<&'static str>,
+    /// The adapter's OWN version (F4 fix: this used to hardcode the MRXS
+    /// adapter's version for every adapter; each adapter journals its own
+    /// generation now — the runner pins it next to the job record).
+    adapter_version: Option<&'static str>,
 }
 
 impl slide_transform_core::job::CheckpointCallback for HostCheckpoint {
@@ -425,12 +429,12 @@ impl slide_transform_core::job::CheckpointCallback for HostCheckpoint {
             return;
         }
         let ifds: Vec<String> = c.ifd_tiles.iter().map(|t| t.to_string()).collect();
-        let adapter = match self.adapter {
-            Some(a) => format!(
-                ",\"adapter\":\"{a}\",\"adapter_version\":\"{}\"",
-                slide_transform_core::mirax::ADAPTER_VERSION
+        let adapter = match (&self.adapter, &self.adapter_version) {
+            (Some(a), Some(v)) => format!(
+                ",\"adapter\":\"{a}\",\"adapter_version\":\"{v}\""
             ),
-            None => String::new(),
+            (Some(a), None) => format!(",\"adapter\":\"{a}\""),
+            _ => String::new(),
         };
         let json = format!(
             "{{\"level\":{},\"channel\":{},\"cell\":{},\"out\":{},\"ifds\":[{}],\"profile\":\"{}\",\"encoding\":\"{}\"{}}}",
@@ -527,6 +531,9 @@ enum InputKind {
     Kfb,
     Kfbf,
     Svs,
+    /// Leica SCN (F4): a TIFF container whose IFD 0 description is the SCN
+    /// XML — decided by the bounded vendor sniff, never by extension.
+    Scn,
 }
 
 fn input_kind(magic: &[u8; 8]) -> InputKind {
@@ -557,7 +564,36 @@ fn is_tiff_magic(m: &[u8; 8]) -> bool {
 fn adapter_of(kind: InputKind) -> Option<&'static str> {
     match kind {
         InputKind::Svs => Some(slide_transform_core::svs::SOURCE_FORMAT),
+        InputKind::Scn => Some(slide_transform_core::scn::SOURCE_FORMAT),
         _ => None,
+    }
+}
+
+/// Adapter VERSION of an input kind (journal/checkpoint identity; `None`
+/// for the KFB/KFBF readers, which predate adapters).
+fn adapter_version_of(kind: InputKind) -> Option<&'static str> {
+    match kind {
+        InputKind::Svs => Some(slide_transform_core::svs::ADAPTER_VERSION),
+        InputKind::Scn => Some(slide_transform_core::scn::ADAPTER_VERSION),
+        _ => None,
+    }
+}
+
+/// Vendor-aware classification of a TIFF-magic source. OME-TIFF and this
+/// converter's own BigTIFF are NOT conversion inputs — typed rejection
+/// before anything is staged or written. An unknown vendor stays on the SVS
+/// route so the SVS adapter's own "未标识 Aperio" contract is unchanged.
+fn tiff_route(src: &HostSource) -> CoreResult<InputKind> {
+    use slide_transform_core::scn::TiffVendor;
+    match slide_transform_core::scn::sniff_tiff_vendor(src)? {
+        TiffVendor::LeicaScn => Ok(InputKind::Scn),
+        TiffVendor::OmeTiff => Err(CoreError::variant(
+            "OME-TIFF 不是转换输入：平台可直接读取 OME-TIFF，请直接上传该文件",
+        )),
+        TiffVendor::ConverterBigTiff => Err(CoreError::variant(
+            "本工具导出的 BigTIFF 不是转换输入：请直接上传该产物（或选择原始切片）",
+        )),
+        _ => Ok(InputKind::Svs),
     }
 }
 
@@ -631,6 +667,69 @@ fn svs_doc_json(doc: &slide_transform_core::svs::SvsDoc) -> String {
     )
 }
 
+/// SCN capability document (probe result), mirroring the CLI's report.
+fn scn_doc_json(doc: &slide_transform_core::scn::ScnDoc) -> String {
+    let levels: Vec<String> = doc
+        .levels
+        .iter()
+        .map(|lv| {
+            format!(
+                "{{\"r\":{},\"ifd\":{},\"width\":{},\"height\":{},\"tile_w\":{},\"tile_h\":{},\"tiles_across\":{},\"tiles_down\":{},\"tiles_total\":{},\"tiles_present\":{},\"tiles_missing\":{},\"color\":\"{}\"}}",
+                lv.r,
+                lv.ifd_index,
+                lv.width,
+                lv.height,
+                lv.tile_w,
+                lv.tile_h,
+                lv.tiles_across,
+                lv.tiles_down,
+                lv.tiles_total,
+                lv.tiles_present,
+                lv.tiles_missing(),
+                match lv.color {
+                    slide_transform_core::scn::PayloadColor::Rgb => "rgb",
+                    slide_transform_core::scn::PayloadColor::YCbCr => "ycbcr",
+                }
+            )
+        })
+        .collect();
+    let assoc: Vec<String> = doc
+        .associated
+        .iter()
+        .map(|a| format!("{{\"name\":\"{}\",\"width\":{},\"height\":{}}}", a.name, a.width, a.height))
+        .collect();
+    let mpp = doc
+        .mpp
+        .map(|v| json_num(v))
+        .unwrap_or_else(|| "null".into());
+    let obj_v = doc
+        .objective
+        .map(|v| json_num(v))
+        .unwrap_or_else(|| "null".into());
+    format!(
+        "{{\"format\":\"{}\",\"adapter\":\"{}\",\"adapter_version\":\"{}\",\"modality\":\"brightfield\",\"tiff_kind\":\"{}\",\"width\":{},\"height\":{},\"mpp_x\":{},\"mpp_y\":{},\"objective\":{},\"illumination\":\"{}\",\"mpp_source\":\"{}\",\"objective_source\":\"{}\",\"levels\":[{}],\"associated\":[{}],\"xml_bytes\":{},\"codec\":\"jpeg-baseline-passthrough\",\"estimate\":{}}}",
+        slide_transform_core::scn::SOURCE_FORMAT,
+        slide_transform_core::scn::SOURCE_FORMAT,
+        slide_transform_core::scn::ADAPTER_VERSION,
+        match doc.kind {
+            slide_transform_core::tiff_read::TiffKind::Classic => "classic",
+            slide_transform_core::tiff_read::TiffKind::BigTiff => "bigtiff",
+        },
+        doc.levels[0].width,
+        doc.levels[0].height,
+        mpp,
+        mpp,
+        obj_v,
+        doc.illumination.as_deref().unwrap_or("unknown"),
+        if doc.mpp.is_some() { "scn-view-nanometers" } else { "unknown" },
+        if doc.objective.is_some() { "scn-scanSettings-objective" } else { "unknown" },
+        levels.join(","),
+        assoc.join(","),
+        doc.xml_bytes,
+        estimate_json(&slide_transform_core::scn::estimate_scn(doc))
+    )
+}
+
 /// Probe the input through host reads; returns a JSON string. Includes the
 /// C2 disk-precheck estimate (`estimate.output_upper_bound_bytes` etc.).
 #[wasm_bindgen(js_name = "probe")]
@@ -642,7 +741,13 @@ pub fn probe() -> String {
         Err(e) => return err_json(&e),
     };
     let res = if is_tiff_magic(&magic) {
-        slide_transform_core::svs::probe_svs(&src).map(|doc| svs_doc_json(&doc))
+        // F1/F4: bounded TIFF walk + vendor dispatch (typed rejections for
+        // OME-TIFF / converter BigTIFF inside tiff_route)
+        match tiff_route(&src) {
+            Ok(InputKind::Scn) => slide_transform_core::scn::probe_scn(&src)
+                .map(|doc| scn_doc_json(&doc)),
+            _ => slide_transform_core::svs::probe_svs(&src).map(|doc| svs_doc_json(&doc)),
+        }
     } else if magic == slide_transform_core::kfbf::KFBF_MAGIC {
         slide_transform_core::kfbf::parse_kfbf(&src, &mut scratch).map(|doc| {
             let est = slide_transform_core::estimate::estimate_fl(&doc, src.size());
@@ -821,7 +926,15 @@ fn run_convert(
         Ok(m) => m,
         Err(e) => return err_json(&e),
     };
-    let kind = input_kind(&magic);
+    let mut kind = input_kind(&magic);
+    if kind == InputKind::Svs {
+        // F4: vendor dispatch inside the TIFF container; OME-TIFF and this
+        // converter's own BigTIFF are typed rejections before any output
+        kind = match tiff_route(&src) {
+            Ok(k) => k,
+            Err(e) => return err_json(&e),
+        };
+    }
     let is_fl = kind == InputKind::Kfbf;
     let adapter = adapter_of(kind);
     let out_profile = match resolve_profile(is_fl, profile) {
@@ -908,7 +1021,12 @@ fn run_convert(
     let mut sink = HostSink;
     let mut scratch = HostScratchFactory;
     let progress = HostProgress;
-    let checkpoint = HostCheckpoint { profile: out_profile, encoding: enc_profile, adapter };
+    let checkpoint = HostCheckpoint {
+        profile: out_profile,
+        encoding: enc_profile,
+        adapter,
+        adapter_version: adapter_version_of(kind),
+    };
     let mut job = JobControl::new(&progress);
     if CHECKPOINT_ENABLED.load(Ordering::Relaxed) {
         job = job.with_checkpoint(&checkpoint);
@@ -921,6 +1039,19 @@ fn run_convert(
             ),
             None => slide_transform_core::convert_fl::convert_kfbf_to_ome(
                 &src, &mut sink, &mut scratch, &plan, &job, companion.as_ref(),
+            ),
+        }
+    } else if kind == InputKind::Scn {
+        let mut plan = TransformPlan::brightfield(identity)
+            .with_policy(policy)
+            .with_encoding(enc_profile);
+        plan.profile = out_profile;
+        match resume.as_ref() {
+            Some(rp) => slide_transform_core::convert_scn::convert_scn_to_bigtiff_resume(
+                &src, &mut sink, &mut scratch, &plan, &job, rp,
+            ),
+            None => slide_transform_core::convert_scn::convert_scn_to_bigtiff(
+                &src, &mut sink, &mut scratch, &plan, &job,
             ),
         }
     } else if kind == InputKind::Svs {
@@ -1107,7 +1238,12 @@ fn run_convert_bundle(
     let mut sink = HostSink;
     let mut scratch = HostScratchFactory;
     let progress = HostProgress;
-    let checkpoint = HostCheckpoint { profile: out_profile, encoding: enc_profile, adapter };
+    let checkpoint = HostCheckpoint {
+        profile: out_profile,
+        encoding: enc_profile,
+        adapter,
+        adapter_version: Some(slide_transform_core::mirax::ADAPTER_VERSION),
+    };
     let mut job = JobControl::new(&progress);
     if CHECKPOINT_ENABLED.load(Ordering::Relaxed) {
         job = job.with_checkpoint(&checkpoint);
@@ -1471,6 +1607,14 @@ mod tests {
         assert_eq!(resume_profile_field(legacy), None);
         assert_eq!(resume_encoding_field(legacy), None);
         assert_eq!(resume_adapter_field(legacy), None);
+    }
+
+    #[test]
+    fn scn_input_kind_carries_its_own_adapter_identity() {
+        assert_eq!(adapter_of(InputKind::Scn), Some("leica-scn-jpeg"));
+        assert_eq!(adapter_version_of(InputKind::Scn), Some("1"));
+        assert_eq!(adapter_version_of(InputKind::Svs), Some("1"));
+        assert_eq!(adapter_version_of(InputKind::Kfb), None);
     }
 
     #[test]

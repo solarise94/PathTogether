@@ -23,6 +23,8 @@ pub mod convert_fl;
 #[cfg(feature = "codecs")]
 pub mod convert_mirax;
 #[cfg(feature = "codecs")]
+pub mod convert_scn;
+#[cfg(feature = "codecs")]
 pub mod convert_svs;
 pub mod error;
 pub mod estimate;
@@ -33,6 +35,7 @@ pub mod kfb;
 pub mod kfbf;
 pub mod mirax;
 pub mod ome;
+pub mod scn;
 pub mod ome_writer;
 pub mod paged_index;
 pub mod pagereader;
@@ -56,6 +59,9 @@ pub mod svs_fixture;
 
 #[cfg(all(feature = "codecs", feature = "fixtures"))]
 pub mod mirax_fixture;
+
+#[cfg(all(feature = "codecs", feature = "fixtures"))]
+pub mod scn_fixture;
 
 pub use error::{CoreError, CoreResult};
 pub use plan::{

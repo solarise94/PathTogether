@@ -19,9 +19,13 @@
 use crate::error::{CoreError, CoreResult};
 use crate::io::ByteSource;
 
-/// Defensive caps (structural walk mirrors `validate.rs`).
+/// Defensive caps (structural walk mirrors `validate.rs`). MAX_IFDS was
+/// raised 64 → 256 for the Leica SCN adapter (F4): a multi-ROI SCN file
+/// chains every ROI's label + pyramid levels into ONE main IFD chain, which
+/// can pass ~100 IFDs on a 2010/10/01 slide; the walk stays bounded and
+/// loop-checked exactly as before.
 pub const MAX_IFD_ENTRIES: usize = 512;
-pub const MAX_IFDS: usize = 64;
+pub const MAX_IFDS: usize = 256;
 /// Entries read per bounded source read while scanning an entry table.
 const ENTRY_CHUNK: usize = 128;
 /// Tile (offset,count) pairs buffered per source read.
@@ -521,6 +525,21 @@ impl<'a> TileCursor<'a> {
     /// Next (payload offset, payload length) pair; `None` at the end. Every
     /// returned interval is bounds-checked against the file size.
     pub fn next_pair(&mut self) -> CoreResult<Option<(u64, u64)>> {
+        match self.next_pair_allow_zero()? {
+            Some((o, c)) if o == 0 || c == 0 => Err(CoreError::oob(format!(
+                "tile {} 偏移/长度为 0（{o}/{c}）",
+                self.done - 1
+            ))),
+            other => Ok(other),
+        }
+    }
+
+    /// Next (offset,count) pair WITHOUT the zero rejection — the Leica SCN
+    /// sparse-grid quirk (F4) encodes a missing tile as the (0, 0) entry.
+    /// Non-zero intervals are still bounds-checked against the file size;
+    /// half-zero records ((0,c)/(o,0)) pass through so the caller decides
+    /// (the SCN adapter treats them as corruption, not absence).
+    pub fn next_pair_allow_zero(&mut self) -> CoreResult<Option<(u64, u64)>> {
         if self.buf_at >= self.buf.len() {
             if self.done >= self.total {
                 return Ok(None);
@@ -533,11 +552,8 @@ impl<'a> TileCursor<'a> {
         let (o, c) = self.buf[self.buf_at];
         self.buf_at += 1;
         self.done += 1;
-        if o == 0 || c == 0 {
-            return Err(CoreError::oob(format!(
-                "tile {} 偏移/长度为 0（{o}/{c}）",
-                self.done - 1
-            )));
+        if o == 0 && c == 0 {
+            return Ok(Some((0, 0)));
         }
         let end = o
             .checked_add(c)

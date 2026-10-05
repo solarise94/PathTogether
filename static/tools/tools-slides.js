@@ -337,15 +337,6 @@ async function prepareSource(fileList) {
     showInputMessage('tools.drop.multiple', { n: String(route.files.length) });
     return;
   }
-  // 阶段 1（先转换后上传）：OME-TIFF/转换器 BigTIFF 不进转换——「已是可
-  // 上传格式」面板 +「上传到工作台」（嗅探只读 ≤128KB 头；分类表见
-  // slide-sniff.js）
-  const file = route.file;
-  const cls = await sniffOrNull(file);
-  if (cls && (cls.cls === 'ome-tiff' || cls.cls === 'converter-bigtiff')) {
-    showDirectReady(file, cls);
-    return;
-  }
   await onFilePicked(route.file);
 }
 
@@ -555,6 +546,15 @@ async function onFilePicked(explicitFile) {
   // 类型化信息在任何复制之前出现
   if (E.inputExtensionHint(file.name) === 'bundle') {
     await prepareBundleSource([file]);
+    return;
+  }
+  // 阶段 1（先转换后上传）：OME-TIFF/转换器 BigTIFF 不进转换——「已是可
+  // 上传格式」面板 +「上传到工作台」（嗅探只读 ≤128KB 头；分类表见
+  // slide-sniff.js）。input 与 drop 的唯一汇合点在此。
+  const directCls = await sniffOrNull(file);
+  if (directCls && (directCls.cls === 'ome-tiff'
+                    || directCls.cls === 'converter-bigtiff')) {
+    showDirectReady(file, directCls);
     return;
   }
   clearInputMessage();

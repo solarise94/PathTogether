@@ -240,13 +240,19 @@ def test_sniff_reads_description_bounded(tmp_path, monkeypatch):
 def test_sniff_huge_description_memory_bound(tmp_path):
     """审查复现回归（进程级）：ImageDescription 声明 200 MiB 的文件——
     旧实现（tifffile description 全量读取）峰值 RSS ≈ 434 MiB；有界实现
-    应在 ~15 MiB 内完成并返回 tiff-other。子进程测 ru_maxrss 高水位。"""
-    import resource
+    应在 ~15 MiB 内完成并返回 tiff-other。
+
+    子进程用 /proc/self/status 的 VmHWM（当前 mm 的高水位，exec 时重置）
+    而非 getrusage ru_maxrss——后者跨 fork+exec **继承父进程**的高水位
+    （实测：父进程 RSS 421 MB 时 fork，子进程 ru_maxrss≈421 MB 而自身
+    VmHWM≈10 MB），在 pytest 大进程里测到的是父进程而不是被测实现。"""
+    if not os.path.exists("/proc/self/status"):
+        pytest.skip("Linux-only: /proc/self/status VmHWM")
     import subprocess
     import sys
 
     code = (
-        "import os, struct, sys, resource, tempfile\n"
+        "import os, struct, sys, tempfile\n"
         "sys.path.insert(0, %r)\n"
         "import upload_direct_class as udc\n"
         "desc_count = 200 * 1024 * 1024\n"
@@ -260,8 +266,12 @@ def test_sniff_huge_description_memory_bound(tmp_path):
         "    fh.truncate(desc_count + 64)\n"
         "try:\n"
         "    r = udc.sniff_tiff_class(p)\n"
-        "    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss\n"
-        "    print(r, peak)\n"
+        "    hwm = 0\n"
+        "    with open('/proc/self/status') as fh:\n"
+        "        for line in fh:\n"
+        "            if line.startswith('VmHWM'):\n"
+        "                hwm = int(line.split()[1])\n"
+        "    print(r, hwm)\n"
         "finally:\n"
         "    os.unlink(p)\n"
     ) % os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -270,8 +280,8 @@ def test_sniff_huge_description_memory_bound(tmp_path):
     assert out.returncode == 0, out.stderr[-400:]
     result, peak_kb = out.stdout.split()
     assert result == udc.ACTUAL_TIFF_OTHER
-    # 有界实现实测 ≈14–81 MiB（子进程基线随环境浮动）；旧实现同场景
-    # ≈434 MiB。阈值取旧实现的 1/3——有界与全量读取之间隔一个量级。
+    # 有界实现实测 ≈14 MiB（VmHWM，exec 后重置）；旧实现同场景 ≈434 MiB。
+    # 阈值留足余量，仍与全量读取的量级区分。
     assert int(peak_kb) < 150_000, int(peak_kb)
 
 

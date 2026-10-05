@@ -46,3 +46,16 @@
 - 验收边界：Windows 按用户决定不测；Linux Docker 限制内存已通过；真实 OS 保存对话框仍未验证。视觉验收是用户接受，不代表像素相等。
 
 相关：[有损视觉验收](ux-formats-compact-visual-acceptance-20261005.md)、[MRXS 视觉验收](ux-formats-mrxs-visual-acceptance-20261005.md)、[Linux 内存验收](ux-formats-linux-memory-20261005.md)、[独立发布复核](ux-formats-release-recheck-20261004.md)。
+
+## 官网更新说明补发（2026-10-05 11:15 CST）
+
+用户随后授权推送 Git，并在官网补充更新内容。
+
+- 应用提交 `e46d37e9e146f1301879a7df0301f5ce75ad6a99` 已推送 `origin/ux-formats`；未合并 main。
+- 首页“更新内容”新增 2026.10.05 中英文五条：转换入口、格式范围、有损模式、本地保存／一键上传、上传阶段及字节进度。
+- 镜像 `localhost/pathtogether-demo:suite-20261005-notes`，ID `39bc8dcbb57bb666c09f6c43df15bfd3a1c9c9a0cb6c705d0bcb7da478b23e3f`，digest `sha256:682e42d1ef378ee0c5507aaff0d94c0100a943bf406ce32b531f4a4158f55a76`。
+- 与上一生产镜像逐文件比较，仅 `static/releases.json` 不同。现有更新内容单元测试 4 个通过（vitest 同时发现 scratch 副本另跑 4 个，不计作额外覆盖）。
+- 按原流程完成候选验收、备份、停机前后零进行中任务检查、切换及两域名 90 个静态文件校验；CSP、预算不变。
+- 公网 Chromium 确认 histopilot.cn 中文与 pt.solarise94.fun 英文均将本次版本展示在最前、各五条。
+- 当前回滚 helper：homePC `~/releases/suite-20261005-notes/deploy.py rollback`，恢复 `pathtogether-demo-pre-suite-20261005-notes`（保留全部转换功能的 suite-20261005）。
+- 本次备份 3,317,346 B，632 行 restore TOC；私有证据位于本地 `.gate-tmp/release-20261005-notes/` 及 homePC 同名发布目录。

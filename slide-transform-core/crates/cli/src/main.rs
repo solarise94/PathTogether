@@ -835,10 +835,17 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
     } else {
         slide_transform_core::scn::TiffVendor::Unknown
     };
-    let is_svs = is_tiff_magic(&magic)
-        && vendor != slide_transform_core::scn::TiffVendor::LeicaScn;
     let is_scn = is_tiff_magic(&magic)
         && vendor == slide_transform_core::scn::TiffVendor::LeicaScn;
+    // 未知厂商留在 SVS 路由（由 SVS 适配器给出原「未标识 Aperio」文案）；
+    // OME-TIFF / 转换器 BigTIFF 在下面显式拒绝
+    let is_svs = is_tiff_magic(&magic)
+        && !is_scn
+        && matches!(
+            vendor,
+            slide_transform_core::scn::TiffVendor::AperioSvs
+                | slide_transform_core::scn::TiffVendor::Unknown
+        );
     if is_tiff_magic(&magic) && !is_svs && !is_scn {
         return Err(vendor_rejection(vendor));
     }

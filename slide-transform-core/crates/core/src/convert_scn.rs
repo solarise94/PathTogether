@@ -691,7 +691,14 @@ fn convert_inner(
                 src, &hdr, ifd, lv, u64::MAX, compact, &mut stats, &mut edge_regions,
                 &mut warnings,
             )?;
-            writer.end(&meta, &[])?;
+            // the description must be restaged for a fully-resumed level too
+            // (end_level stages it into the IFD; an empty vec here would drop
+            // the tag from the resumed output and break byte identity)
+            let desc: Vec<u8> = match &writer {
+                ScnWriter::Classic { description, .. } => description.clone(),
+                ScnWriter::Ome { .. } => Vec::new(),
+            };
+            writer.end(&meta, &desc)?;
             ifd_chain.push((li as u32, None));
             level_stats.push(stats);
             continue;

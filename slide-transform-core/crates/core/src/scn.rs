@@ -92,11 +92,12 @@ pub enum TiffVendor {
 /// Converter output ids (the same vocabulary as `upload_direct_class.py`
 /// and `static/upload/slide-sniff.js`; a description JSON carrying one of
 /// these as `source_format` marks a converter-produced BigTIFF).
-pub const CONVERTER_SOURCE_FORMATS: [&str; 5] = [
+pub const CONVERTER_SOURCE_FORMATS: [&str; 6] = [
     "kfb_bf_v1",
     "kfb_kfbio_jpeg",
     "aperio-svs-jpeg",
     "mirax-bundle",
+    crate::gtiff::SOURCE_FORMAT,
     SOURCE_FORMAT,
 ];
 

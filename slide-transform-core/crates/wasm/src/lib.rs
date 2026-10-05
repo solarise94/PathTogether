@@ -1325,10 +1325,36 @@ fn run_convert(
     }
 }
 
-/// Bundle (F3 MRXS) conversion path: the host owns the member files; the
-/// adapter resolves them by flat name. The output/encoding refusals mirror
-/// the single-file path; committed progress belongs to the `mirax-bundle`
-/// adapter and a state journalled under another adapter is refused.
+/// Bundle entry kind (the manifest member list decides; the adapter id and
+/// its version travel with every journal so committed progress can never be
+/// continued under another source adapter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BundleKind {
+    Mrxs,
+    Vms,
+}
+
+fn bundle_kind_and_stem(fs: &HostBundle) -> Option<(BundleKind, String)> {
+    for (kind, ext) in [(BundleKind::Mrxs, ".mrxs"), (BundleKind::Vms, ".vms")] {
+        if let Some(m) = fs.members().iter().find(|m| {
+            m.name.rsplit('/').next().map(|n| n.to_ascii_lowercase().ends_with(ext)).unwrap_or(false)
+        }) {
+            let leaf = m.name.rsplit('/').next().unwrap_or(&m.name);
+            let stem = leaf
+                .strip_suffix(ext)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "slide".to_string());
+            return Some((kind, stem));
+        }
+    }
+    None
+}
+
+/// Bundle (F3 MRXS / VMS) conversion path: the host owns the member files;
+/// the adapter resolves them by flat name. The output/encoding refusals
+/// mirror the single-file path; committed progress belongs to the source
+/// adapter that wrote it and a state journalled under another adapter is
+/// refused.
 fn run_convert_bundle(
     profile: Option<&str>,
     encoding: Option<&str>,
@@ -1342,19 +1368,21 @@ fn run_convert_bundle(
         Err(e) => return err_json(&e),
     };
     // the stem comes from the entry member name (probe_bundle does the same)
-    let stem = fs
-        .members()
-        .iter()
-        .find(|m| m.name.rsplit('/').next().map(|n| n.to_ascii_lowercase().ends_with(".mrxs")).unwrap_or(false))
-        .and_then(|m| {
-            let leaf = m.name.rsplit('/').next().unwrap_or(&m.name);
-            leaf.strip_suffix(".mrxs").or_else(|| {
-                leaf.char_indices().rfind(|(_, c)| *c == '.').map(|(i, _)| &leaf[..i])
-            })
-        })
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "slide".to_string());
-    let adapter = Some(slide_transform_core::mirax::SOURCE_FORMAT);
+    let Some((kind, stem)) = bundle_kind_and_stem(&fs) else {
+        return err_json(&CoreError::validation(
+            "包内没有 .mrxs/.vms 主入口（MRXS 需要完整包目录，VMS 需要入口 + 同目录 tile JPEG）",
+        ));
+    };
+    let (adapter, adapter_version): (&'static str, &'static str) = match kind {
+        BundleKind::Mrxs => (
+            slide_transform_core::mirax::SOURCE_FORMAT,
+            slide_transform_core::mirax::ADAPTER_VERSION,
+        ),
+        BundleKind::Vms => (
+            slide_transform_core::vms::SOURCE_FORMAT,
+            slide_transform_core::vms::ADAPTER_VERSION,
+        ),
+    };
     let out_profile = match resolve_profile(false, profile) {
         Ok(p) => p,
         Err(e) => return err_json(&e),
@@ -1371,7 +1399,7 @@ fn run_convert_bundle(
     if strict_lossless {
         // composition + JPEG re-encode is inherently lossy for this format
         return err_json(&CoreError::policy(
-            "strict-lossless 与 MRXS 组合输出互斥：拼接 tile 必然重编码（有损），无逐字节搬运路径",
+            "strict-lossless 与拼接包输出互斥：拼接 tile 必然重编码（有损），无逐字节搬运路径",
         ));
     }
     let resume = match resume {
@@ -1400,16 +1428,12 @@ fn run_convert_bundle(
                 )));
             }
             let state_adapter = journalled_adapter;
-            let same = match (&state_adapter, adapter) {
-                (None, None) => true,
-                (Some(a), Some(b)) => a == b,
-                _ => false,
-            };
+            let same = state_adapter.as_deref() == Some(adapter);
             if !same {
                 return err_json(&CoreError::validation(format!(
                     "resume: 已提交进度属于输入适配器 {}，拒绝以 {} 续跑",
                     state_adapter.as_deref().unwrap_or("kfb"),
-                    adapter.unwrap_or("kfb")
+                    adapter
                 )));
             }
             Some(rp)
@@ -1443,16 +1467,21 @@ fn run_convert_bundle(
     let checkpoint = HostCheckpoint {
         profile: out_profile,
         encoding: enc_profile,
-        adapter,
-        adapter_version: Some(slide_transform_core::mirax::ADAPTER_VERSION),
+        adapter: Some(adapter),
+        adapter_version: Some(adapter_version),
     };
     let mut job = JobControl::new(&progress);
     if CHECKPOINT_ENABLED.load(Ordering::Relaxed) {
         job = job.with_checkpoint(&checkpoint);
     }
-    let result = slide_transform_core::convert_mirax::convert_mirax_to_bigtiff(
-        &fs, &stem, &mut sink, &mut scratch, &plan, &job,
-    );
+    let result = match kind {
+        BundleKind::Mrxs => slide_transform_core::convert_mirax::convert_mirax_to_bigtiff(
+            &fs, &stem, &mut sink, &mut scratch, &plan, &job,
+        ),
+        BundleKind::Vms => slide_transform_core::convert_vms::convert_vms_to_bigtiff(
+            &fs, &stem, &mut sink, &mut scratch, &plan, &job,
+        ),
+    };
     // the job borrowed the checkpoint handle; drop it before reusing fields
     drop(job);
     match result {
@@ -1502,7 +1531,77 @@ fn run_convert_bundle(
     }
 }
 
-/// Probe a bundle input (F3 MRXS) through the bundle host callbacks.
+/// VMS capability document (probe result), mirroring the CLI's report.
+fn probe_vms_doc(fs: &HostBundle, stem: &str, budget: u64) -> String {
+    match slide_transform_core::vms::probe_vms_with_budget(fs, stem, budget) {
+        Ok(doc) => {
+            let tiles: Vec<String> = doc
+                .tiles
+                .iter()
+                .map(|t| {
+                    format!(
+                        "{{\"name\":{},\"col\":{},\"row\":{},\"width\":{},\"height\":{},\"x0\":{},\"y0\":{},\"restart_interval\":{},\"segments\":{}}}",
+                        json_str(&t.name), t.col, t.row, t.width, t.height, t.x0, t.y0,
+                        t.restart_interval, t.segments
+                    )
+                })
+                .collect();
+            let levels: Vec<String> = std::iter::once(format!(
+                "{{\"level\":0,\"width\":{},\"height\":{},\"tiles_across\":{},\"tiles_down\":{},\"generated\":false}}",
+                doc.width,
+                doc.height,
+                (doc.width as u64).div_ceil(256),
+                (doc.height as u64).div_ceil(256),
+            ))
+            .chain(doc.generated.iter().enumerate().map(|(i, (w, h))| {
+                format!(
+                    "{{\"level\":{},\"width\":{w},\"height\":{h},\"tiles_across\":{},\"tiles_down\":{},\"generated\":true}}",
+                    i + 1,
+                    (*w as u64).div_ceil(256),
+                    (*h as u64).div_ceil(256),
+                )
+            }))
+            .collect();
+            let assoc: Vec<String> = doc
+                .associated
+                .iter()
+                .map(|a| format!("{{\"name\":\"{}\",\"width\":{},\"height\":{}}}", a.name, a.width, a.height))
+                .collect();
+            let (mx, my) = doc.mpp.unwrap_or((f64::NAN, f64::NAN));
+            let est = slide_transform_core::vms::estimate_vms(&doc);
+            let doc_json = format!(
+                "{{\"format\":\"{}\",\"adapter\":\"{}\",\"adapter_version\":\"{}\",\"modality\":\"brightfield\",\"width\":{},\"height\":{},\"mpp_x\":{},\"mpp_y\":{},\"objective\":{},\"mpp_source\":\"{}\",\"pyramid_method\":\"{}\",\"grid_cols\":{},\"grid_rows\":{},\"map_file\":{},\"opt_file\":{},\"tiles\":[{}],\"levels\":[{}],\"associated\":[{}],\"codec\":\"mosaic-compose-reencode\",\"estimate\":{}}}",
+                slide_transform_core::vms::SOURCE_FORMAT,
+                slide_transform_core::vms::SOURCE_FORMAT,
+                slide_transform_core::vms::ADAPTER_VERSION,
+                doc.width,
+                doc.height,
+                json_num(mx),
+                json_num(my),
+                doc.objective.map(json_num).unwrap_or_else(|| "null".into()),
+                if doc.mpp.is_some() { "vms-physicalwidth-nm" } else { "unknown" },
+                slide_transform_core::vms::PYRAMID_METHOD,
+                doc.cols,
+                doc.rows,
+                doc.map_present,
+                doc.opt_present,
+                tiles.join(","),
+                levels.join(","),
+                assoc.join(","),
+                estimate_json(&est)
+            );
+            format!(
+                "{{\"core_version\":\"{}\",\"size\":{},\"document\":{}}}",
+                slide_transform_core::CORE_VERSION,
+                fs.members().iter().map(|m| m.size).sum::<u64>(),
+                doc_json
+            )
+        }
+        Err(e) => err_json(&e),
+    }
+}
+
+/// Probe a bundle input (F3 MRXS / VMS) through the bundle host callbacks.
 /// `budget_bytes` is the browser resource profile's budget (review §1): the
 /// probe refuses with `resource_profile_insufficient` when its metadata
 /// working set would exceed it — before any large allocation. `undefined`
@@ -1513,21 +1612,19 @@ pub fn probe_bundle(budget_bytes: Option<f64>) -> String {
         Ok(f) => f,
         Err(e) => return err_json(&e),
     };
-    // the entry name ends with .mrxs; resolve the stem from the members
-    let entry = fs
-        .members()
-        .iter()
-        .find(|m| m.name.rsplit('/').next().map(|n| n.to_ascii_lowercase().ends_with(".mrxs")).unwrap_or(false));
-    let Some(entry) = entry else {
+    // the entry name ends with .mrxs/.vms; resolve the stem from the members
+    let Some((kind, stem)) = bundle_kind_and_stem(&fs) else {
         return err_json(&CoreError::validation(
-            "包内没有 .mrxs 主入口（MRXS 需要完整包）",
+            "包内没有 .mrxs/.vms 主入口（MRXS 需要完整包目录，VMS 需要入口 + 同目录 tile JPEG）",
         ));
     };
-    let stem = entry.name.trim_end_matches(".mrxs").to_string();
     let budget = budget_bytes
         .filter(|v| v.is_finite() && *v > 0.0)
         .map(|v| v as u64)
         .unwrap_or(slide_transform_core::budget::SAVER_BUDGET_BYTES);
+    if kind == BundleKind::Vms {
+        return probe_vms_doc(&fs, &stem, budget);
+    }
     match slide_transform_core::mirax::probe_mirax_with_budget(&fs, &stem, budget) {
         Ok(doc) => {
             let levels: Vec<String> = doc

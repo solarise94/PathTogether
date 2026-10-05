@@ -30,6 +30,8 @@ pub mod convert_ndpi;
 pub mod convert_scn;
 #[cfg(feature = "codecs")]
 pub mod convert_svs;
+#[cfg(feature = "codecs")]
+pub mod convert_vms;
 pub mod error;
 pub mod estimate;
 pub mod gtiff;
@@ -48,11 +50,14 @@ pub mod pagereader;
 pub mod plan;
 pub mod report;
 pub mod resume;
+pub mod segment;
 pub mod validate;
 pub mod bigtiff;
 pub mod tiff_read;
 #[cfg(feature = "codecs")]
 pub mod svs;
+#[cfg(feature = "codecs")]
+pub mod vms;
 
 #[cfg(feature = "codecs")]
 pub mod jpeg;
@@ -74,6 +79,9 @@ pub mod gtiff_fixture;
 
 #[cfg(all(feature = "codecs", feature = "fixtures"))]
 pub mod ndpi_fixture;
+
+#[cfg(all(feature = "codecs", feature = "fixtures"))]
+pub mod vms_fixture;
 
 pub use error::{CoreError, CoreResult};
 pub use plan::{

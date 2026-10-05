@@ -216,6 +216,79 @@ impl DirBundle {
         let infos = members.iter().map(|m| m.info.clone()).collect();
         Ok(DirBundle { members, infos, by_name })
     }
+
+    /// Open a FLAT bundle: `<dir>/<stem>.vms` (the INI entry) plus every
+    /// regular file directly inside `<dir>`, named by their bare file name
+    /// (the Hamamatsu VMS layout — the entry and its tile JPEGs are
+    /// siblings, no same-name subdirectory). `stem` must not contain path
+    /// separators.
+    pub fn open_flat(dir: &Path, stem: &str) -> CoreResult<Self> {
+        if stem.is_empty()
+            || stem.contains('/')
+            || stem.contains('\\')
+            || stem == "."
+            || stem == ".."
+        {
+            return Err(CoreError::validation(format!("非法包名 {stem:?}")));
+        }
+        let mut members: Vec<DirMember> = Vec::new();
+        let mut add = |name: String, path: PathBuf| -> CoreResult<()> {
+            if !valid_member_name(&name) {
+                return Err(CoreError::validation(format!("成员名非法：{name}")));
+            }
+            let meta = fs::metadata(&path)
+                .map_err(|e| CoreError::io(format!("读取成员 {} 失败: {e}", name)))?;
+            if !meta.is_file() {
+                return Err(CoreError::validation(format!("成员 {} 不是普通文件", name)));
+            }
+            let file = fs::File::open(&path)
+                .map_err(|e| CoreError::io(format!("打开成员 {} 失败: {e}", name)))?;
+            members.push(DirMember { info: MemberInfo { name, size: meta.len() }, path, file: Mutex::new(file) });
+            Ok(())
+        };
+        let entry = dir.join(format!("{stem}.vms"));
+        if !entry.exists() {
+            return Err(CoreError::validation(format!(
+                "缺少主入口 {entry_display}（VMS 以 .vms 文本入口 + 同目录 tile JPEG 组成完整包）",
+                entry_display = entry.display()
+            )));
+        }
+        add(format!("{stem}.vms"), entry)?;
+        let rd = fs::read_dir(dir)
+            .map_err(|e| CoreError::io(format!("打开目录 {} 失败: {e}", dir.display())))?;
+        let mut names: Vec<(String, PathBuf)> = Vec::new();
+        for ent in rd {
+            let ent = ent.map_err(|e| CoreError::io(format!("列目录失败: {e}")))?;
+            let Ok(name) = ent.file_name().into_string() else {
+                return Err(CoreError::validation("目录内含非 UTF-8 文件名"));
+            };
+            if name.starts_with('.') || name == format!("{stem}.vms") {
+                continue; // editor/cruft; the entry is added explicitly
+            }
+            let p = ent.path();
+            if !p.is_file() {
+                continue; // nested directories are not flat-bundle members
+            }
+            names.push((name, p));
+        }
+        names.sort();
+        if names.len() + 1 > MAX_MEMBERS {
+            return Err(CoreError::validation(format!(
+                "成员数 {} 超过上限 {MAX_MEMBERS}",
+                names.len() + 1
+            )));
+        }
+        for (name, path) in names {
+            add(name, path)?;
+        }
+        let by_name = members
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.info.name.clone(), i))
+            .collect();
+        let infos = members.iter().map(|m| m.info.clone()).collect();
+        Ok(DirBundle { members, infos, by_name })
+    }
 }
 
 impl BundleFs for DirBundle {

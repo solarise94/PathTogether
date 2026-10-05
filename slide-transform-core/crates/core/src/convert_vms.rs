@@ -1,47 +1,55 @@
-//! NDPI → brightfield conversion (F6): whole-layer restart-segmented JPEG
-//! strips → classic multi-IFD JPEG tiled BigTIFF pyramid or RGB OME-BigTIFF.
+//! VMS bundle → brightfield conversion: concatenated tile JPEGs stitched at
+//! their true mosaic positions, re-encoded into the output pyramid.
 //!
-//! **What `preserve-source-v1` means for NDPI** (stated honestly): an NDPI
-//! layer is ONE whole-layer JPEG strip — there are no source tiles to copy,
-//! so no byte-passthrough exists for this format. `preserve` means: decode
-//! the layer strip restart segment by restart segment (each segment is a
-//! self-contained MCU run with reset DC predictors — the only bounded decode
-//! unit the format offers), paste the decoded MCU rects into the output tile
-//! grid and re-encode every 256×256 output tile at the documented
-//! high-fidelity setting **YCbCr 4:2:2 · quality 96 · standard Huffman**
-//! (fingerprint [`PRESERVE_COMPOSE_FINGERPRINT`], reported as `composed`).
-//! `compact-jpeg-v1` composes identically and re-encodes at the locked U3
+//! **What `preserve-source-v1` means for VMS** (stated honestly, unlike a
+//! byte-passthrough claim): a VMS level-0 is a *mosaic* of huge (≈64K px)
+//! baseline JPEGs abutting exactly. Only output tiles at the source-tile
+//! grid could ever be byte copies — and the output grid is 256 px, so an
+//! output tile straddles source tiles for all but degenerate grids.
+//! `preserve` means: decode each tile JPEG restart segment by restart
+//! segment (each segment an independent MCU run with reset DC predictors —
+//! a 64K×64K tile is ~11 GB decoded RGB, so bounded segments are the only
+//! decode unit), paste the decoded MCU rects at the tile's mosaic position
+//! and re-encode every 256×256 output tile at the documented high-fidelity
+//! setting **YCbCr 4:2:2 · quality 96 · standard Huffman** (fingerprint
+//! [`PRESERVE_COMPOSE_FINGERPRINT`], reported as `composed`). `compact
+//! -jpeg-v1` composes identically and re-encodes at the locked U3
 //! parameters.
 //!
 //! Reduced output levels are the `l0-box2` chain (the 2×2 area-average of
-//! output level 0, read back from the committed sink): the source's own
-//! reduced layers are never decoded for pixels, exactly like the MRXS v2 and
-//! generic-TIFF adapters. The macro/focus-map/z-stack pages are excluded at
-//! the probe.
+//! output level 0, read back from the committed sink): the source's map
+//! image is never decoded for pixels, exactly like the MRXS v2 / NDPI /
+//! generic-TIFF adapters. The macro image is excluded at the probe.
+//!
+//! Sparse areas do not exist in a well-formed VMS grid (the tiles abut and
+//! cover the whole mosaic), so there is no fill-tile path — a decode
+//! failure is a typed error, never a filled tile.
 //!
 //! Strict-lossless is refused (typed, before any output byte): every output
 //! tile is a re-encode by construction.
 //!
-//! Memory (review §1): the band buffer (⌈256/mcu_h⌉ MCU rows × padded
-//! width), the tile canvas + encode buffers, and every segment decode
-//! (read + decoder transient + decoded pixels) are charged against the
-//! host budget BEFORE the allocation — an over-budget strip is a typed
+//! Memory (review §1): the band buffer (256 mosaic rows × full width), the
+//! tile canvas + encode buffers, and every segment decode (read + decoder
+//! transient + decoded pixels) are charged against the host budget BEFORE
+//! the allocation — an over-budget mosaic is a typed
 //! `resource_profile_insufficient` refusal, never an OOM mid-decode.
 //!
-//! Resume mirrors the other adapters: checkpoints per committed tile row;
-//! a resumed L0 fast-forwards the segment scanner to the tile row's first
-//! segment (marker scan only, no decode) and the fresh path stays
-//! byte-identical.
+//! Resume mirrors the other adapters: checkpoints per committed tile row; a
+//! resumed L0 fast-forwards every intersecting tile's segment scanner to
+//! the band's first segment (marker scan only, no decode) and the fresh
+//! path stays byte-identical.
 
 use crate::bigtiff::{BigTiffPyramidWriter, LevelExtras};
 use crate::budget::MemBudget;
+use crate::bundle::BundleFs;
 use crate::convert_bf::{compact_sampling_label, compact_sampling_tiff};
 use crate::error::{CoreError, CoreResult};
 use crate::io::{ByteSource, RandomAccessSink, ScratchFactory};
 use crate::job::{JobControl, NullProgress, Progress, ProgressUnit};
 use crate::jpeg;
-use crate::ndpi::{
-    probe_ndpi_with_budget, NdpiDoc, NdpiLevel, ADAPTER_VERSION, OUT_TILE,
+use crate::segment::{SegmentRead, SegmentReader};
+use crate::vms::{
+    probe_vms_with_budget, VmsDoc, VmsTile, ADAPTER_VERSION, OUT_TILE,
     PRESERVE_COMPOSE_FINGERPRINT, PRESERVE_COMPOSE_HUFFMAN, PRESERVE_COMPOSE_QUALITY,
     PRESERVE_COMPOSE_SAMPLING, PYRAMID_METHOD, SOURCE_FORMAT,
 };
@@ -55,11 +63,10 @@ use crate::report::{
     AssociatedSummary, ComposedSummary, LevelStats, LossyReencode, TransformResult,
 };
 use crate::resume::ResumePoint;
-use crate::segment::{SegmentRead, SegmentReader, StripGeom};
 
 pub use crate::convert_bf::{FORMAT_CLASSIC, FORMAT_OME_RGB};
 
-/// Row-boundary progress + checkpoint emission (the MRXS macro's shape).
+/// Row-boundary progress + checkpoint emission (the MRXS/NDPI macro shape).
 macro_rules! maybe_progress_and_checkpoint {
     ($writer:expr, $job:expr, $stats:expr, $li:expr, $cell:expr, $total:expr, $row:expr) => {
         if $cell % $stats.tiles_across as u64 == 0 || $cell == $total {
@@ -84,64 +91,123 @@ macro_rules! maybe_progress_and_checkpoint {
     };
 }
 
-pub const WARN_ASSOC_NOT_EXPORTED: &str = "ndpi_associated_not_exported";
+pub const WARN_ASSOC_NOT_EXPORTED: &str = "vms_associated_not_exported";
 pub const WARN_NO_ICC: &str = "color_management_not_applied";
 
 fn preserve_cfg() -> jpeg::EncoderCfg {
-    // Same parameters as the MRXS compose / generic-TIFF generated tiles:
-    // YCbCr 4:2:2 at quality 96 (the (2,1) TIFF layout every reader decodes).
+    // Same parameters as the MRXS/NDPI compose / generic-TIFF generated
+    // tiles: YCbCr 4:2:2 at quality 96 (the (2,1) TIFF layout every reader
+    // decodes).
     jpeg::EncoderCfg::with_quality(PRESERVE_COMPOSE_QUALITY, PRESERVE_COMPOSE_SAMPLING)
 }
 
 // --------------------------------------------------------------------------- //
-// restart-segment reader (shared module: crates/core/src/segment.rs — the
-// VMS adapter consumes the exact same scanning/decoding rules)
+// bundle-member source (one tile JPEG = one strip of a member)
 // --------------------------------------------------------------------------- //
 
-/// Paste one decoded segment's MCU rects into the band buffer. `band`
-/// covers global pixel rows `[band_y0, band_y0 + band_rows)` and all
-/// columns `[0, padded_w)`; MCU rects above/below the band or beyond the
-/// level height are skipped (the band stays white there and no tile reads
-/// those rows).
-fn paste_segment(band: &mut [u8], seg: &SegmentRead, lv: &NdpiLevel, band_y0: u64, band_rows: u64) {
+/// A read-only view of ONE bundle member as a `ByteSource` (offsets are
+/// member-relative; the segment reader's strip_offset is 0).
+struct MemberSource<'a> {
+    fs: &'a dyn BundleFs,
+    member: usize,
+    size: u64,
+}
+
+impl<'a> MemberSource<'a> {
+    fn new(fs: &'a dyn BundleFs, member: usize) -> CoreResult<Self> {
+        let size = fs
+            .members()
+            .get(member)
+            .map(|m| m.size)
+            .ok_or_else(|| CoreError::oob(format!("成员序号 {member} 不存在")))?;
+        Ok(MemberSource { fs, member, size })
+    }
+}
+
+impl ByteSource for MemberSource<'_> {
+    fn size(&self) -> u64 {
+        self.size
+    }
+    fn read_at(&self, offset: u64, len: usize) -> CoreResult<Vec<u8>> {
+        self.fs.read_member_at(self.member, offset, len)
+    }
+}
+
+// --------------------------------------------------------------------------- //
+// mosaic paste (clip at the tile's own extent AND the band window)
+// --------------------------------------------------------------------------- //
+
+/// Paste one decoded segment's MCU rects into the band buffer at the tile's
+/// mosaic position. `band` covers mosaic rows `[band_y0, band_y0 +
+/// band_rows)` and ALL mosaic columns `[0, band_w)`; MCU rects outside the
+/// tile's true pixel extent (padded MCU columns/rows of the source JPEG) or
+/// outside the band window are clipped.
+#[allow(clippy::too_many_arguments)]
+fn paste_segment_mosaic(
+    band: &mut [u8],
+    band_w: usize,
+    band_rows: usize,
+    seg: &SegmentRead,
+    t: &VmsTile,
+    band_y0: u64,
+) {
     let img = &seg.img;
     let img_w = img.width as usize;
-    let mcu_w = lv.mcu_w() as usize;
-    let mcu_h = lv.mcu_h() as usize;
-    let padded_w = (lv.mcus_x as usize) * mcu_w;
+    let mcu_w = t.mcu_w() as usize;
+    let mcu_h = t.mcu_h() as usize;
+    let mcus_x = t.mcus_x as usize;
+    let file_w = t.width as usize;
+    let file_h = t.height as usize;
     for i in 0..seg.mcus {
         let g = seg.mcu_start + i;
-        let gc = (g % lv.mcus_x as u64) as usize;
-        let gr = (g / lv.mcus_x as u64) as u64;
-        // MCU rect in the segment image (segment grid: grid_w MCUs/row)
+        let gc = (g % mcus_x as u64) as usize;
+        let gr = (g / mcus_x as u64) as u64;
+        // MCU rect in the segment image (segment grid: seg.grid_w MCUs/row)
         let sx = (i % seg.grid_w) as usize * mcu_w;
         let sy = (i / seg.grid_w) as usize * mcu_h;
-        let rel_y = (gr * mcu_h as u64) as i64 - band_y0 as i64;
+        // the tile's MCU row in BAND rows (tiles below the band start paint
+        // at a positive offset; rows above the band window go negative)
+        let rel_y = (t.y0 + gr * mcu_h as u64) as i64 - band_y0 as i64;
         if rel_y < 0 {
             continue; // above the band (carried segments' head)
         }
         let by0 = rel_y as usize;
-        if by0 >= band_rows as usize {
+        if by0 >= band_rows {
             continue; // below the band
         }
-        let dst_x = gc * mcu_w;
-        if dst_x >= padded_w {
+        let dst_x = t.x0 as usize + gc * mcu_w;
+        if dst_x >= band_w {
+            continue;
+        }
+        // clip the MCU rect at the file's true extent and the band width
+        let pw = mcu_w
+            .min(file_w.saturating_sub(gc * mcu_w))
+            .min(band_w - dst_x);
+        if pw == 0 {
             continue;
         }
         for r in 0..mcu_h {
-            let world_y = gr as usize * mcu_h + r;
-            if world_y >= lv.height as usize {
-                break; // beyond the image (MCU padding rows)
+            let world_y = t.y0 as usize + gr as usize * mcu_h + r;
+            if world_y >= t.y0 as usize + file_h {
+                break; // beyond the tile's true height (MCU padding rows)
             }
             let by = by0 + r;
-            if by >= band_rows as usize {
+            if by >= band_rows {
                 break;
             }
             let s = (sy + r) * img_w * 3 + sx * 3;
-            let d = by * padded_w * 3 + dst_x * 3;
-            band[d..d + mcu_w * 3].copy_from_slice(&img.data[s..s + mcu_w * 3]);
+            let d = by * band_w * 3 + dst_x * 3;
+            band[d..d + pw * 3].copy_from_slice(&img.data[s..s + pw * 3]);
         }
     }
+}
+
+/// First segment index of tile `t` whose MCU rows intersect the band row
+/// `ty` (resume fast-forward; marker scan only).
+fn first_band_segment(t: &VmsTile, band_y0: u64) -> u64 {
+    let local_y0 = band_y0.saturating_sub(t.y0);
+    let mcu_row = local_y0 / t.mcu_h() as u64;
+    mcu_row * t.mcus_x as u64 / t.restart_interval as u64
 }
 
 // --------------------------------------------------------------------------- //
@@ -155,15 +221,14 @@ struct LevelMeta {
     tiff_sub: (u16, u16),
     reduced: bool,
     mpp: Option<(f64, f64)>,
-    icc: Option<Vec<u8>>,
 }
 
-enum NdpiWriter<'a> {
+enum VmsWriter<'a> {
     Classic { w: BigTiffPyramidWriter<'a>, description: Vec<u8> },
     Ome { w: OmeBigTiffWriter<'a>, ome_xml: Option<Vec<u8>>, levels: usize },
 }
 
-impl NdpiWriter<'_> {
+impl VmsWriter<'_> {
     fn begin(
         &mut self,
         scratch: &mut dyn ScratchFactory,
@@ -171,11 +236,11 @@ impl NdpiWriter<'_> {
         committed: Option<u64>,
     ) -> CoreResult<()> {
         match self {
-            NdpiWriter::Classic { w, .. } => match committed {
+            VmsWriter::Classic { w, .. } => match committed {
                 None => w.begin_level(scratch),
                 Some(t) => w.begin_level_resume(scratch, t),
             },
-            NdpiWriter::Ome { w, ome_xml, levels } => {
+            VmsWriter::Ome { w, ome_xml, levels } => {
                 let desc = if m.reduced { None } else { ome_xml.take() };
                 *levels += 1;
                 w.begin_rgb_ifd_ex(
@@ -191,7 +256,7 @@ impl NdpiWriter<'_> {
                         tile: (OUT_TILE, OUT_TILE),
                         photometric: m.photometric,
                         jpeg_tables: None,
-                        icc: m.icc.clone(),
+                        icc: None,
                     },
                 )
             }
@@ -200,7 +265,7 @@ impl NdpiWriter<'_> {
 
     fn end(&mut self, m: &LevelMeta, description: &[u8]) -> CoreResult<()> {
         match self {
-            NdpiWriter::Classic { w, .. } => w.end_level_ex(
+            VmsWriter::Classic { w, .. } => w.end_level_ex(
                 m.width,
                 m.height,
                 m.tiff_sub,
@@ -211,52 +276,52 @@ impl NdpiWriter<'_> {
                     tile: (OUT_TILE, OUT_TILE),
                     photometric: m.photometric,
                     jpeg_tables: None,
-                    icc: m.icc.clone(),
+                    icc: None,
                 },
             ),
-            NdpiWriter::Ome { .. } => Ok(()),
+            VmsWriter::Ome { .. } => Ok(()),
         }
     }
 
     fn write_tile(&mut self, data: &[u8]) -> CoreResult<()> {
         match self {
-            NdpiWriter::Classic { w, .. } => w.write_tile(data).map(|_| ()),
-            NdpiWriter::Ome { w, .. } => w.write_tile(data).map(|_| ()),
+            VmsWriter::Classic { w, .. } => w.write_tile(data).map(|_| ()),
+            VmsWriter::Ome { w, .. } => w.write_tile(data).map(|_| ()),
         }
     }
 
     fn cursor(&self) -> u64 {
         match self {
-            NdpiWriter::Classic { w, .. } => w.cursor(),
-            NdpiWriter::Ome { w, .. } => w.cursor(),
+            VmsWriter::Classic { w, .. } => w.cursor(),
+            VmsWriter::Ome { w, .. } => w.cursor(),
         }
     }
 
     fn tile_record(&self, ifd: usize, index: usize) -> CoreResult<(u64, u32)> {
         match self {
-            NdpiWriter::Classic { w, .. } => w.tile_record(ifd, index),
-            NdpiWriter::Ome { w, .. } => w.tile_record(ifd, index),
+            VmsWriter::Classic { w, .. } => w.tile_record(ifd, index),
+            VmsWriter::Ome { w, .. } => w.tile_record(ifd, index),
         }
     }
 
     fn read_output_at(&self, offset: u64, len: usize) -> CoreResult<Vec<u8>> {
         match self {
-            NdpiWriter::Classic { w, .. } => w.read_output_at(offset, len),
-            NdpiWriter::Ome { w, .. } => w.read_output_at(offset, len),
+            VmsWriter::Classic { w, .. } => w.read_output_at(offset, len),
+            VmsWriter::Ome { w, .. } => w.read_output_at(offset, len),
         }
     }
 
     fn ifd_tile_counts(&self) -> Vec<u64> {
         match self {
-            NdpiWriter::Classic { w, .. } => w.ifd_tile_counts(),
-            NdpiWriter::Ome { w, .. } => w.ifd_tile_counts(),
+            VmsWriter::Classic { w, .. } => w.ifd_tile_counts(),
+            VmsWriter::Ome { w, .. } => w.ifd_tile_counts(),
         }
     }
 
     fn finish(&mut self) -> CoreResult<u64> {
         match self {
-            NdpiWriter::Classic { w, .. } => w.finish(),
-            NdpiWriter::Ome { w, levels, .. } => {
+            VmsWriter::Classic { w, .. } => w.finish(),
+            VmsWriter::Ome { w, levels, .. } => {
                 if *levels > 1 {
                     w.set_subifds_for(0, (1..*levels).collect())?;
                 }
@@ -266,7 +331,7 @@ impl NdpiWriter<'_> {
     }
 }
 
-fn ndpi_description_bytes(doc: &NdpiDoc) -> Vec<u8> {
+fn vms_description_bytes(doc: &VmsDoc) -> Vec<u8> {
     let (mx, my) = doc.mpp.unwrap_or((f64::NAN, f64::NAN));
     let fmt = |v: f64| {
         if v.is_finite() {
@@ -303,8 +368,7 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
-fn ndpi_ome_xml(doc: &NdpiDoc, plan: &TransformPlan) -> Vec<u8> {
-    let main = &doc.levels[0];
+fn vms_ome_xml(doc: &VmsDoc, plan: &TransformPlan) -> Vec<u8> {
     let compact = plan.encoding == EncodingProfile::CompactJpegV1;
     let mut provenance: Vec<(&str, String)> = vec![
         ("converter", "slide-transform-core".to_string()),
@@ -315,7 +379,8 @@ fn ndpi_ome_xml(doc: &NdpiDoc, plan: &TransformPlan) -> Vec<u8> {
         ("adapter_version", ADAPTER_VERSION.to_string()),
         (
             "compose_mode",
-            "whole-layer JPEG strip decoded restart-segment by restart segment and \
+            "concatenated tile JPEGs decoded restart-segment by restart segment and \
+             stitched at their true mosaic positions (exact abutment, no overlap), then \
              re-encoded into 256px output tiles; every tile re-encoded (no byte \
              passthrough exists for this format)"
                 .to_string(),
@@ -323,18 +388,17 @@ fn ndpi_ome_xml(doc: &NdpiDoc, plan: &TransformPlan) -> Vec<u8> {
         (
             "pyramid_method",
             "l0-box2: reduced output levels are the 2x2 area-average (box) downsample \
-             chain of output level 0 — the source's own reduced layers are not used \
-             for pixels"
+             chain of output level 0 — the source's map image is not used for pixels"
                 .to_string(),
         ),
         ("preserve_compose_fingerprint", PRESERVE_COMPOSE_FINGERPRINT.to_string()),
         (
             "mpp_source",
-            if doc.mpp.is_some() { "ndpi-vendor-mpp-tags" } else { "unknown" }.to_string(),
+            if doc.mpp.is_some() { "vms-physicalwidth-nm" } else { "unknown" }.to_string(),
         ),
         (
             "objective_source",
-            if doc.objective.is_some() { "ndpi-sourcelens" } else { "unknown" }.to_string(),
+            if doc.objective.is_some() { "vms-sourcelens" } else { "unknown" }.to_string(),
         ),
         ("pyramid_levels", (1 + doc.generated.len()).to_string()),
     ];
@@ -346,18 +410,18 @@ fn ndpi_ome_xml(doc: &NdpiDoc, plan: &TransformPlan) -> Vec<u8> {
         "tile_payloads",
         if compact {
             format!(
-                "decoded from restart segments, then re-encoded at the locked compact \
-                 parameters (quality {}, subsampling {}, standard Annex-K Huffman, \
-                 fingerprint {}); lossy",
+                "decoded from restart segments, stitched at true positions, then re-encoded \
+                 at the locked compact parameters (quality {}, subsampling {}, standard \
+                 Annex-K Huffman, fingerprint {}); lossy",
                 COMPACT_JPEG_V1_QUALITY,
                 compact_sampling_label(),
                 COMPACT_JPEG_V1_FINGERPRINT
             )
         } else {
             format!(
-                "decoded from restart segments, then re-encoded at the documented \
-                 high-fidelity compose setting (YCbCr 4:2:2, quality {}, standard \
-                 Annex-K Huffman, fingerprint {}); lossy generation on a lossy \
+                "decoded from restart segments, stitched at true positions, then re-encoded \
+                 at the documented high-fidelity compose setting (YCbCr 4:2:2, quality {}, \
+                 standard Annex-K Huffman, fingerprint {}); lossy generation on a lossy \
                  source, never claimed lossless",
                 PRESERVE_COMPOSE_QUALITY,
                 PRESERVE_COMPOSE_FINGERPRINT
@@ -422,18 +486,17 @@ SizeX=\"{}\" SizeY=\"{}\" SizeC=\"3\" SizeZ=\"1\" SizeT=\"1\"{phys}>\
 <Channel ID=\"Channel:0:0\" SamplesPerPixel=\"3\"/>\
 <TiffData IFD=\"0\" PlaneCount=\"1\"/>\
 </Pixels>{ann_ref}</Image>{ann}</OME>",
-        main.width, main.height,
+        doc.width, doc.height,
     );
     let mut out = xml.into_bytes();
     out.push(0);
     out
 }
 
-fn level_meta(doc: &NdpiDoc, li: usize, compact: bool, dims: (u32, u32)) -> LevelMeta {
-    let l0 = &doc.levels[0];
+fn level_meta(doc: &VmsDoc, li: usize, compact: bool, dims: (u32, u32)) -> LevelMeta {
     let mpp = doc.mpp.map(|(mx, my)| {
-        let rx = l0.width as f64 / dims.0 as f64;
-        let ry = l0.height as f64 / dims.1 as f64;
+        let rx = doc.width as f64 / dims.0 as f64;
+        let ry = doc.height as f64 / dims.1 as f64;
         (mx * rx, my * ry)
     });
     let (photometric, tiff_sub) = if compact {
@@ -448,16 +511,15 @@ fn level_meta(doc: &NdpiDoc, li: usize, compact: bool, dims: (u32, u32)) -> Leve
         tiff_sub,
         reduced: li > 0,
         mpp,
-        icc: if li == 0 { doc.icc.clone() } else { None },
     }
 }
 
 /// Compose ONE generated tile: the 2×2 area-average of the previous output
 /// level's tiles (read back from the committed sink; same method and
-/// geometry as the generic-TIFF adapter's generated tail).
+/// geometry as the NDPI/generic-TIFF adapters' generated tail).
 #[allow(clippy::too_many_arguments)]
 fn pyramid_tile_from_prev(
-    writer: &NdpiWriter<'_>,
+    writer: &VmsWriter<'_>,
     prev_ifd: usize,
     prev_across: u32,
     prev_down: u32,
@@ -490,14 +552,9 @@ fn pyramid_tile_from_prev(
             if ptx >= prev_across as usize || pty >= prev_down as usize {
                 continue; // beyond the previous level's edge: never read below
             }
-            let (off, cnt) =
-                writer.tile_record(prev_ifd, pty * prev_across as usize + ptx)?;
+            let (off, cnt) = writer.tile_record(prev_ifd, pty * prev_across as usize + ptx)?;
             let raw = writer.read_output_at(off, cnt as usize)?;
-            let img = jpeg::decode_ex(
-                &raw,
-                (OUT_TILE as u64) * (OUT_TILE as u64),
-                false,
-            )?;
+            let img = jpeg::decode_ex(&raw, (OUT_TILE as u64) * (OUT_TILE as u64), false)?;
             if img.width != OUT_TILE || img.height != OUT_TILE {
                 return Err(CoreError::variant(format!(
                     "金字塔读取：层 {prev_ifd} tile {} 尺寸 {}×{} ≠ {OUT_TILE}",
@@ -511,8 +568,19 @@ fn pyramid_tile_from_prev(
             for row in 0..OUT_TILE as usize {
                 let s = row * OUT_TILE as usize * 3;
                 let d = (by + row) * side + bx;
-                canvas[d * 3..(d + OUT_TILE as usize) * 3]
-                    .copy_from_slice(&img.data[s..s + OUT_TILE as usize * 3]);
+                match img.kind {
+                    jpeg::ColorKind::Rgb => {
+                        canvas[d * 3..(d + OUT_TILE as usize) * 3]
+                            .copy_from_slice(&img.data[s..s + OUT_TILE as usize * 3]);
+                    }
+                    jpeg::ColorKind::Gray => {
+                        for col in 0..OUT_TILE as usize {
+                            let g = img.data[s + col];
+                            let o = (d + col) * 3;
+                            canvas[o..o + 3].copy_from_slice(&[g, g, g]);
+                        }
+                    }
+                }
             }
         }
     }
@@ -538,40 +606,43 @@ fn pyramid_tile_from_prev(
 // conversion
 // --------------------------------------------------------------------------- //
 
-pub fn convert_ndpi_to_bigtiff(
-    src: &dyn ByteSource,
+pub fn convert_vms_to_bigtiff(
+    fs: &dyn BundleFs,
+    stem: &str,
     sink: &mut dyn RandomAccessSink,
     scratch: &mut dyn ScratchFactory,
     plan: &TransformPlan,
     job: &JobControl,
 ) -> CoreResult<TransformResult> {
-    convert_inner(src, sink, scratch, plan, job, None)
+    convert_inner(fs, stem, sink, scratch, plan, job, None)
 }
 
-/// Resume an NDPI conversion from `resume` (see [`crate::resume`]).
-pub fn convert_ndpi_to_bigtiff_resume(
-    src: &dyn ByteSource,
+/// Resume a VMS conversion from `resume` (see [`crate::resume`]).
+pub fn convert_vms_to_bigtiff_resume(
+    fs: &dyn BundleFs,
+    stem: &str,
     sink: &mut dyn RandomAccessSink,
     scratch: &mut dyn ScratchFactory,
     plan: &TransformPlan,
     job: &JobControl,
     resume: &ResumePoint,
 ) -> CoreResult<TransformResult> {
-    // Adapter-version pin, enforced in the CORE (SCN/gtiff parity): a state
-    // WITHOUT the field is foreign as well — never mix two adapter
+    // Adapter-version pin, enforced in the CORE (SCN/gtiff/NDPI parity): a
+    // state WITHOUT the field is foreign as well — never mix two adapter
     // generations into one output.
     if resume.adapter_version.as_deref() != Some(ADAPTER_VERSION) {
         return Err(CoreError::validation(format!(
-            "resume: 已提交进度属于 NDPI 适配器 v{}，当前为 v{ADAPTER_VERSION}：两种适配器配方不得混合进同一输出",
+            "resume: 已提交进度属于 VMS 适配器 v{}，当前为 v{ADAPTER_VERSION}：两种适配器配方不得混合进同一输出",
             resume.adapter_version.as_deref().unwrap_or("1（字段缺失）"),
         )));
     }
-    convert_inner(src, sink, scratch, plan, job, Some(resume))
+    convert_inner(fs, stem, sink, scratch, plan, job, Some(resume))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn convert_inner(
-    src: &dyn ByteSource,
+    fs: &dyn BundleFs,
+    stem: &str,
     sink: &mut dyn RandomAccessSink,
     scratch: &mut dyn ScratchFactory,
     plan: &TransformPlan,
@@ -579,10 +650,9 @@ fn convert_inner(
     resume: Option<&ResumePoint>,
 ) -> CoreResult<TransformResult> {
     let started = crate::job::WallInstant::now();
-    let doc = probe_ndpi_with_budget(src, plan.limits.memory_budget_bytes)?;
+    let doc = probe_vms_with_budget(fs, stem, plan.limits.memory_budget_bytes)?;
     let mut budget: MemBudget = doc.budget.clone();
-    let l0 = &doc.levels[0];
-    let out_levels: Vec<(u32, u32)> = std::iter::once((l0.width, l0.height))
+    let out_levels: Vec<(u32, u32)> = std::iter::once((doc.width, doc.height))
         .chain(doc.generated.iter().copied())
         .collect();
     if let Some(r) = resume {
@@ -600,11 +670,11 @@ fn convert_inner(
         }
     }
     if plan.profile == OutputProfile::OmeBigTiffSubifd {
-        return Err(CoreError::variant("荧光 OME profile 不适用于明场 NDPI 输入"));
+        return Err(CoreError::variant("荧光 OME profile 不适用于明场 VMS 输入"));
     }
     if plan.pixel_policy == PixelPolicy::StrictLossless {
         return Err(CoreError::policy(
-            "strict-lossless 与 NDPI 输出互斥：整层条带必须分段解码后重编码（有损），无逐字节搬运路径",
+            "strict-lossless 与 VMS 输出互斥：拼接 tile 必然分段解码后重编码（有损），无逐字节搬运路径",
         ));
     }
     let compact = plan.encoding == EncodingProfile::CompactJpegV1;
@@ -619,26 +689,22 @@ fn convert_inner(
         warnings.push(WARN_ASSOC_NOT_EXPORTED.to_string());
     }
     if !doc.generated.is_empty() {
-        warnings.push(format!("ndpi_levels_generated:{}", doc.generated.len()));
+        warnings.push(format!("vms_levels_generated:{}", doc.generated.len()));
     }
-    if doc.icc.is_none() {
-        warnings.push(WARN_NO_ICC.to_string());
+    if doc.map_present {
+        warnings.push("vms_map_not_used".to_string());
     }
+    warnings.push(WARN_NO_ICC.to_string()); // the .vms INI carries no ICC
 
     // ---- working set, charged BEFORE any allocation (review §1) ---------- //
-    let band_rows_mcu = (OUT_TILE as u64).div_ceil(l0.mcu_h() as u64);
-    let band_rows_px = band_rows_mcu * l0.mcu_h() as u64;
-    let padded_w = l0.mcus_x as u64 * l0.mcu_w() as u64;
-    let band_bytes = band_rows_px
-        .saturating_mul(padded_w)
+    let band_bytes = (OUT_TILE as u64)
+        .saturating_mul(doc.width as u64)
         .saturating_mul(3);
     let canvas_bytes = (OUT_TILE as u64)
         .saturating_mul(OUT_TILE as u64)
         .saturating_mul(6); // tile canvas + encode buffers
-    let max_seg_px = (l0.restart_interval as u64)
-        .saturating_mul(l0.mcu_w() as u64)
-        .saturating_mul(l0.mcu_h() as u64);
-    budget.charge(band_bytes, "L0 条带缓冲（MCU 行带 × padded 宽 × 3）")?;
+    let max_seg_px = doc.tiles.iter().map(|t| t.strip_geom().max_segment_px()).max().unwrap_or(0);
+    budget.charge(band_bytes, "L0 拼接条带缓冲（256 行 × 拼接宽 × 3）")?;
     budget.charge(canvas_bytes, "tile 画布与编码缓冲")?;
     budget.charge(
         max_seg_px.saturating_mul(6),
@@ -647,31 +713,33 @@ fn convert_inner(
     // the generated-pyramid working set (f² decoded prev tiles + canvases)
     let pyramid_ws = 4u64
         .saturating_mul((OUT_TILE as u64) * (OUT_TILE as u64) * 6)
-        .saturating_add((OUT_TILE as u64 * 2).saturating_mul(OUT_TILE as u64 * 2).saturating_mul(3));
+        .saturating_add(
+            (OUT_TILE as u64 * 2).saturating_mul(OUT_TILE as u64 * 2).saturating_mul(3),
+        );
     if !doc.generated.is_empty() {
         budget.charge(pyramid_ws, "l0-box2 合成画布与输出缓冲")?;
     }
 
     let mut writer = match plan.profile {
-        OutputProfile::ClassicJpegBigTiff => NdpiWriter::Classic {
+        OutputProfile::ClassicJpegBigTiff => VmsWriter::Classic {
             w: match resume {
                 None => BigTiffPyramidWriter::new(sink)?,
                 Some(r) => BigTiffPyramidWriter::resume_new(sink, r.committed_output)?,
             },
-            description: ndpi_description_bytes(&doc),
+            description: vms_description_bytes(&doc),
         },
-        OutputProfile::OmeBigTiffRgbSubifd => NdpiWriter::Ome {
+        OutputProfile::OmeBigTiffRgbSubifd => VmsWriter::Ome {
             w: match resume {
                 None => OmeBigTiffWriter::new_rgb(sink)?,
                 Some(r) => OmeBigTiffWriter::resume_new_rgb(sink, r.committed_output)?,
             },
-            ome_xml: Some(ndpi_ome_xml(&doc, plan)),
+            ome_xml: Some(vms_ome_xml(&doc, plan)),
             levels: 0,
         },
         OutputProfile::OmeBigTiffSubifd => unreachable!(),
     };
     let format =
-        if matches!(writer, NdpiWriter::Classic { .. }) { FORMAT_CLASSIC } else { FORMAT_OME_RGB };
+        if matches!(writer, VmsWriter::Classic { .. }) { FORMAT_CLASSIC } else { FORMAT_OME_RGB };
     let mut level_stats: Vec<LevelStats> = Vec::new();
     let mut ifd_chain: Vec<(u32, Option<usize>)> = Vec::new();
 
@@ -712,64 +780,103 @@ fn convert_inner(
         }
 
         if li == 0 {
-            // ---- level 0: restart-segmented decode → paste → re-encode -- //
+            // ---- level 0: per-tile restart-segmented decode → mosaic paste
+            // → re-encode ----------------------------------------------------
             if resume_done {
                 // no pixels needed; counts only — but the description must be
                 // restaged for a fully-resumed level too (end_level stages it
                 // into the IFD; an empty vec here would drop tag 270 from the
                 // resumed output and break byte identity; convert_scn 同款)
                 let desc: Vec<u8> = match &writer {
-                    NdpiWriter::Classic { description, .. } => description.clone(),
-                    NdpiWriter::Ome { .. } => Vec::new(),
+                    VmsWriter::Classic { description, .. } => description.clone(),
+                    VmsWriter::Ome { .. } => Vec::new(),
                 };
                 level_stats.push(stats);
                 ifd_chain.push((li as u32, None));
                 writer.end(&meta, &desc)?;
                 continue;
             }
-            let mut reader = SegmentReader::new(src, &l0.strip_geom());
-            if resume_current && skip_until > 0 {
-                reader.skip_to(&mut budget, first_band_segment(l0, skip_until / across)?)?;
-            }
-            let mut cell = skip_until;
+            let mut ty = skip_until / across;
+            // member sources live for the whole level (readers borrow them);
+            // one forward-only reader + carry per tile, created lazily as
+            // bands reach the tile and persisted across bands
+            let srcs: Vec<MemberSource> = doc
+                .tiles
+                .iter()
+                .map(|t| MemberSource::new(fs, t.member as usize))
+                .collect::<CoreResult<Vec<_>>>()?;
+            let mut readers: Vec<Option<SegmentReader>> =
+                (0..doc.tiles.len()).map(|_| None).collect();
+            let mut carries: Vec<Option<SegmentRead>> =
+                (0..doc.tiles.len()).map(|_| None).collect();
             let mut band = vec![255u8; band_bytes as usize];
             let mut canvas = vec![255u8; (OUT_TILE as usize) * (OUT_TILE as usize) * 3];
-            let mut carry: Option<SegmentRead> = None;
-            let mut ty = skip_until / across;
+            let mut cell = skip_until;
             while ty < down {
                 job.check()?;
-                // decode the segments covering this band's MCU rows (strictly
-                // sequential; a segment crossing the band edge is carried)
                 let band_y0 = ty * OUT_TILE as u64;
-                let band_rows_px_u = band_rows_px.min((l0.height as u64) - band_y0);
+                let band_rows_u = (OUT_TILE as u64).min((doc.height as u64) - band_y0);
                 for px in band.iter_mut() {
                     *px = 255;
                 }
-                // first MCU index past the band's valid rows (MCU-row aligned)
-                let mcu_end = band_y0.saturating_add(band_rows_px_u)
-                    .div_ceil(l0.mcu_h() as u64)
-                    * l0.mcus_x as u64;
-                loop {
-                    let next_mcu = match &carry {
-                        Some(c) => c.mcu_start,
-                        None => reader.next_k() * l0.restart_interval as u64,
-                    };
-                    if next_mcu >= mcu_end {
-                        break;
+                // decode + paste every tile whose rows intersect the band
+                for (ti, t) in doc.tiles.iter().enumerate() {
+                    // the tile's rows inside THIS band, both in band space
+                    // ([band_lo, band_hi)) and tile space ([local_y0,
+                    // local_y0 + local_rows))
+                    let band_lo = band_y0.max(t.y0);
+                    let band_hi = (band_y0 + band_rows_u).min(t.y0 + t.height as u64);
+                    if band_lo >= band_hi {
+                        continue; // this tile never reaches the band
                     }
-                    let seg = match carry.take() {
-                        Some(c) => c,
-                        None => reader.decode_next(&mut budget)?,
-                    };
-                    paste_segment(&mut band, &seg, l0, band_y0, band_rows_px_u);
-                    let seg_bottom =
-                        (seg.mcu_start + seg.mcus).div_ceil(l0.mcus_x as u64)
-                            * l0.mcu_h() as u64;
-                    if seg_bottom > band_y0 + band_rows_px_u && reader.next_k() < l0.segments {
-                        // crosses into the next band: keep the decoded pixels
-                        carry = Some(seg);
-                    } else {
-                        budget.release(seg.charged);
+                    let local_y0 = band_lo - t.y0;
+                    let local_rows = band_hi - band_lo;
+                    if readers[ti].is_none() {
+                        let mut r = SegmentReader::new(&srcs[ti], &t.strip_geom());
+                        // fast-forward past the tile's segments above this
+                        // band (marker scan only, no decode): a no-op on the
+                        // fresh path's first band, and what makes a resumed
+                        // run skip the already-committed rows
+                        let want = first_band_segment(t, band_y0);
+                        if want > 0 {
+                            r.skip_to(&mut budget, want)?;
+                        }
+                        readers[ti] = Some(r);
+                    }
+                    // first MCU index past the band's painted rows of this tile
+                    let mcu_end = (local_y0 + local_rows)
+                        .div_ceil(t.mcu_h() as u64)
+                        * t.mcus_x as u64;
+                    let reader = readers[ti].as_mut().expect("just created");
+                    loop {
+                        let next_mcu = match &carries[ti] {
+                            Some(c) => c.mcu_start,
+                            None => reader.next_k() * t.restart_interval as u64,
+                        };
+                        if next_mcu >= mcu_end {
+                            break;
+                        }
+                        let seg = match carries[ti].take() {
+                            Some(c) => c,
+                            None => reader.decode_next(&mut budget)?,
+                        };
+                        paste_segment_mosaic(
+                            &mut band,
+                            doc.width as usize,
+                            band_rows_u as usize,
+                            &seg,
+                            t,
+                            band_y0,
+                        );
+                        let seg_bottom = (seg.mcu_start + seg.mcus)
+                            .div_ceil(t.mcus_x as u64)
+                            * t.mcu_h() as u64;
+                        if seg_bottom > local_y0 + local_rows && reader.next_k() < t.segments {
+                            // crosses into the next band: keep the decoded pixels
+                            carries[ti] = Some(seg);
+                        } else {
+                            budget.release(seg.charged);
+                        }
                     }
                 }
                 // tiles of this row: canvas from the band (row 0 of the band
@@ -783,7 +890,7 @@ fn convert_inner(
                         *px = 255;
                     }
                     for r in 0..valid_h {
-                        let srow = r * padded_w as usize * 3 + tx0 as usize * 3;
+                        let srow = r * doc.width as usize * 3 + tx0 as usize * 3;
                         let drow = r * OUT_TILE as usize * 3;
                         canvas[drow..drow + valid_w * 3]
                             .copy_from_slice(&band[srow..srow + valid_w * 3]);
@@ -797,10 +904,10 @@ fn convert_inner(
                 }
                 ty += 1;
             }
-            if let Some(c) = carry.take() {
+            for c in carries.into_iter().flatten() {
                 budget.release(c.charged);
             }
-            drop(reader);
+            drop(readers);
             if cell != tiles_total {
                 return Err(CoreError::validation(format!(
                     "层 0 tile 游标 {cell} ≠ 网格总数 {tiles_total}"
@@ -813,8 +920,8 @@ fn convert_inner(
                 // the description must be restaged for a fully-resumed level
                 // too (see the L0 resume_done arm; convert_scn 同款预防)
                 let desc: Vec<u8> = match &writer {
-                    NdpiWriter::Classic { description, .. } => description.clone(),
-                    NdpiWriter::Ome { .. } => Vec::new(),
+                    VmsWriter::Classic { description, .. } => description.clone(),
+                    VmsWriter::Ome { .. } => Vec::new(),
                 };
                 level_stats.push(stats);
                 ifd_chain.push((li as u32, None));
@@ -859,8 +966,8 @@ fn convert_inner(
             )));
         }
         let desc: Vec<u8> = match &writer {
-            NdpiWriter::Classic { description, .. } => description.clone(),
-            NdpiWriter::Ome { .. } => Vec::new(),
+            VmsWriter::Classic { description, .. } => description.clone(),
+            VmsWriter::Ome { .. } => Vec::new(),
         };
         writer.end(&meta, &desc)?;
         ifd_chain.push((li as u32, None));
@@ -885,8 +992,8 @@ fn convert_inner(
         adapter_version: Some(ADAPTER_VERSION),
         output_bytes,
         output_sha256: None,
-        width: l0.width,
-        height: l0.height,
+        width: doc.width,
+        height: doc.height,
         levels: level_stats,
         edge_regions: Vec::new(),
         warnings,
@@ -912,7 +1019,7 @@ fn convert_inner(
             tiles_padded: 0,
         }),
         composed: Some(ComposedSummary {
-            mode: "segment-compose-reencode".to_string(),
+            mode: "mosaic-compose-reencode".to_string(),
             fingerprint: PRESERVE_COMPOSE_FINGERPRINT.to_string(),
             quality: PRESERVE_COMPOSE_QUALITY,
             sampling: "4:2:2".to_string(),
@@ -940,20 +1047,15 @@ fn convert_inner(
     Ok(result)
 }
 
-/// First segment index whose MCU range intersects tile row `ty`'s MCU rows.
-fn first_band_segment(l0: &NdpiLevel, ty: u64) -> CoreResult<u64> {
-    let mcu_row = (ty * OUT_TILE as u64) / l0.mcu_h() as u64;
-    Ok(mcu_row * l0.mcus_x as u64 / l0.restart_interval as u64)
-}
-
 /// Convenience wrapper without progress (tests).
-pub fn convert_ndpi(
-    src: &dyn ByteSource,
+pub fn convert_vms(
+    fs: &dyn BundleFs,
+    stem: &str,
     sink: &mut dyn RandomAccessSink,
     scratch: &mut dyn ScratchFactory,
     plan: &TransformPlan,
 ) -> CoreResult<TransformResult> {
     let null = NullProgress;
     let job = JobControl::new(&null).with_timeout(plan.limits.timeout_seconds);
-    convert_ndpi_to_bigtiff(src, sink, scratch, plan, &job)
+    convert_vms_to_bigtiff(fs, stem, sink, scratch, plan, &job)
 }

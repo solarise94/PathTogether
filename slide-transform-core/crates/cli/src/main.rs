@@ -64,6 +64,8 @@ fn main() -> ExitCode {
         "gen-ndpi" => cmd_gen_ndpi(&args[1..]),
         #[cfg(feature = "synth-gen")]
         "gen-mrxs" => cmd_gen_mrxs(&args[1..]),
+        #[cfg(feature = "synth-gen")]
+        "gen-vms" => cmd_gen_vms(&args[1..]),
         _ => Err(CoreError::validation(format!("未知子命令 {}", args[0]))),
     };
     match result {
@@ -192,6 +194,15 @@ fn is_mrxs_path(path: &Path) -> bool {
     path.extension().map(|e| e.to_ascii_lowercase().to_string_lossy() == "mrxs").unwrap_or(false)
 }
 
+/// Hamamatsu bundle entry: `.vms` (supported) and `.vmu` (typed refusal
+/// inside the adapter) route to the VMS bundle adapter; both live in a
+/// flat folder (entry + sibling tile JPEGs).
+fn is_vms_path(path: &Path) -> bool {
+    path.extension()
+        .map(|e| matches!(e.to_ascii_lowercase().to_string_lossy().as_ref(), "vms" | "vmu"))
+        .unwrap_or(false)
+}
+
 fn mrxs_stem(path: &Path) -> String {
     path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
 }
@@ -250,6 +261,81 @@ fn mrxs_doc_json(doc: &slide_transform_core::mirax::MiraxDoc) -> String {
         ju("images_x", doc.images_x),
         ju("images_y", doc.images_y),
         ju("divisions", doc.divisions),
+        jarr("levels", &levels),
+        jarr("associated", &assoc),
+        jstr("codec", "mosaic-compose-reencode"),
+    ])
+}
+
+/// Capability report for a Hamamatsu VMS bundle input.
+fn vms_doc_json(doc: &slide_transform_core::vms::VmsDoc) -> String {
+    let tiles: Vec<String> = doc
+        .tiles
+        .iter()
+        .map(|t| {
+            obj(&[
+                jstr("name", &t.name),
+                ju("col", t.col as u64),
+                ju("row", t.row as u64),
+                ju("width", t.width as u64),
+                ju("height", t.height as u64),
+                ju("x0", t.x0),
+                ju("y0", t.y0),
+                ju("restart_interval", t.restart_interval as u64),
+                ju("segments", t.segments),
+                jstr(
+                    "color",
+                    match t.color {
+                        slide_transform_core::vms::PayloadColor::Rgb => "rgb",
+                        slide_transform_core::vms::PayloadColor::YCbCr => "ycbcr",
+                    },
+                ),
+            ])
+        })
+        .collect();
+    let assoc: Vec<String> = doc
+        .associated
+        .iter()
+        .map(|a| obj(&[jstr("name", &a.name), ju("width", a.width as u64), ju("height", a.height as u64)]))
+        .collect();
+    let (mx, my) = doc.mpp.unwrap_or((f64::NAN, f64::NAN));
+    let levels: Vec<String> = std::iter::once(obj(&[
+        ju("level", 0),
+        ju("width", doc.width as u64),
+        ju("height", doc.height as u64),
+        ju("tiles_across", (doc.width as u64).div_ceil(256)),
+        ju("tiles_down", (doc.height as u64).div_ceil(256)),
+        jb("generated", false),
+    ]))
+    .chain(doc.generated.iter().enumerate().map(|(i, (w, h))| {
+        obj(&[
+            ju("level", (i + 1) as u64),
+            ju("width", *w as u64),
+            ju("height", *h as u64),
+            ju("tiles_across", (*w as u64).div_ceil(256)),
+            ju("tiles_down", (*h as u64).div_ceil(256)),
+            jb("generated", true),
+        ])
+    }))
+    .collect();
+    obj(&[
+        jstr("format", slide_transform_core::vms::SOURCE_FORMAT),
+        jstr("adapter", slide_transform_core::vms::SOURCE_FORMAT),
+        jstr("adapter_version", slide_transform_core::vms::ADAPTER_VERSION),
+        jstr("modality", "brightfield"),
+        ju("width", doc.width as u64),
+        ju("height", doc.height as u64),
+        jf("mpp_x", mx),
+        jf("mpp_y", my),
+        jf("objective", doc.objective.unwrap_or(f64::NAN)),
+        jstr("mpp_source", if doc.mpp.is_some() { "vms-physicalwidth-nm" } else { "unknown" }),
+        jstr("objective_source", if doc.objective.is_some() { "vms-sourcelens" } else { "unknown" }),
+        jstr("pyramid_method", slide_transform_core::vms::PYRAMID_METHOD),
+        ju("grid_cols", doc.cols as u64),
+        ju("grid_rows", doc.rows as u64),
+        jb("map_file", doc.map_present),
+        jb("opt_file", doc.opt_present),
+        jarr("tiles", &tiles),
         jarr("levels", &levels),
         jarr("associated", &assoc),
         jstr("codec", "mosaic-compose-reencode"),
@@ -574,6 +660,9 @@ fn cmd_probe(args: &[String]) -> Result<String, CoreError> {
     if is_mrxs_path(Path::new(path)) {
         return cmd_probe_mrxs(path, want_hash, memory_budget);
     }
+    if is_vms_path(Path::new(path)) {
+        return cmd_probe_vms(path, want_hash, memory_budget);
+    }
     let src = FileSource::open(Path::new(path))?;
     let magic = detect(&src)?;
     let mut scratch = FileScratch::new(&scratch_under(Path::new(path)));
@@ -816,6 +905,54 @@ fn cmd_probe_mrxs(path: &str, want_hash: bool, memory_budget: u64) -> Result<Str
 }
 
 // --------------------------------------------------------------------------- //
+// probe (VMS bundle, flat layout)
+// --------------------------------------------------------------------------- //
+
+/// `memory_budget`: the host memory budget for the probe (review §1) —
+/// conservative default = the browser saver profile's 192 MiB. `.vmu`
+/// entries route here too and get the adapter's typed VMU refusal.
+fn cmd_probe_vms(path: &str, want_hash: bool, memory_budget: u64) -> Result<String, CoreError> {
+    let p = Path::new(path);
+    let dir = p.parent().map(|d| d.to_path_buf()).unwrap_or_else(|| Path::new(".").to_path_buf());
+    let stem = mrxs_stem(p);
+    let fs = slide_transform_core::bundle::DirBundle::open_flat(&dir, &stem)?;
+    let doc = slide_transform_core::vms::probe_vms_with_budget(&fs, &stem, memory_budget)?;
+    let doc_json = vms_doc_json(&doc);
+    let estimate = slide_transform_core::vms::estimate_vms(&doc);
+    let est_json = obj(&[
+        ju("payload_bytes", estimate.payload_bytes),
+        ju("tiles_present", estimate.tiles_present),
+        ju("cells_total", estimate.cells_total),
+        ju("cells_missing", estimate.cells_missing),
+        ju("edge_tiles", estimate.edge_tiles),
+        ju("ifds", estimate.ifds),
+        ju("output_upper_bound_bytes", estimate.output_upper_bound_bytes),
+        ju("compact_upper_bound_bytes", estimate.compact_upper_bound_bytes),
+    ]);
+    let bundle_bytes: u64 = fs.members().iter().map(|m| m.size).sum();
+    let hash = if want_hash {
+        // hash of the .vms INI entry (the parse input; data members are
+        // covered by their per-tile extents)
+        let e = fs.find(&format!("{stem}.vms")).unwrap();
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&fs.read_small_member(e, 1 << 20)?);
+        json_str(&format!("{:x}", h.finalize()))
+    } else {
+        "null".to_string()
+    };
+    Ok(obj(&[
+        jstr("tool", "slide-transform"),
+        jstr("core_version", slide_transform_core::CORE_VERSION),
+        jstr("path", path),
+        ju("size", bundle_bytes),
+        jraw("document", &doc_json),
+        jraw("estimate", &est_json),
+        jraw("sha256", &hash),
+    ]))
+}
+
+// --------------------------------------------------------------------------- //
 // validate (C2): streamed sha256 + structural BigTIFF walk over a finished
 // output; mirrors the wasm finalizeValidate path for evidence parity.
 // --------------------------------------------------------------------------- //
@@ -936,6 +1073,18 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
     }
     if positional.len() != 2 {
         return Err(CoreError::validation("convert 需要 <input> <output>"));
+    }
+    if is_vms_path(Path::new(positional[0])) {
+        return cmd_convert_vms(
+            &positional,
+            &profile,
+            &policy,
+            &encoding,
+            timeout,
+            max_out,
+            memory_budget,
+            overwrite,
+        );
     }
     if is_mrxs_path(Path::new(positional[0])) {
         let r = cmd_convert_mrxs(
@@ -1595,6 +1744,117 @@ fn cmd_convert_mrxs(
     emit_convert_json(&result, &out_profile, &enc_profile, output)
 }
 
+// --------------------------------------------------------------------------- //
+// convert (VMS bundle, flat layout)
+// --------------------------------------------------------------------------- //
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_convert_vms(
+    positional: &[&String],
+    profile: &str,
+    policy: &str,
+    encoding: &str,
+    timeout: Option<f64>,
+    max_out: Option<u64>,
+    memory_budget: Option<u64>,
+    overwrite: bool,
+) -> Result<String, CoreError> {
+    let input = Path::new(positional[0]);
+    let output = Path::new(positional[1]);
+    if output.exists() && !overwrite {
+        return Err(CoreError::validation(format!(
+            "输出已存在：{}",
+            output.display()
+        )));
+    }
+    let out_profile = match profile {
+        // auto keeps the unattended mapping: VMS → bf-classic (same as MRXS)
+        "auto" => OutputProfile::ClassicJpegBigTiff,
+        id => OutputProfile::from_id(id)
+            .ok_or_else(|| CoreError::validation(format!("未知 profile {profile}")))?,
+    };
+    if !out_profile.is_brightfield() {
+        return Err(CoreError::variant("荧光 OME profile 不适用于明场 VMS 输入"));
+    }
+    let enc_profile = match encoding {
+        "preserve" => slide_transform_core::plan::EncodingProfile::PreserveSource,
+        "compact" => slide_transform_core::plan::EncodingProfile::CompactJpegV1,
+        _ => {
+            return Err(CoreError::validation(format!(
+                "未知 encoding {encoding}（preserve|compact）"
+            )))
+        }
+    };
+    let pixel_policy = match policy {
+        "allow-edge" => PixelPolicy::AllowEdgeReencode,
+        "strict-lossless" => PixelPolicy::StrictLossless,
+        _ => return Err(CoreError::validation(format!("未知 policy {policy}"))),
+    };
+    if pixel_policy == PixelPolicy::StrictLossless {
+        return Err(CoreError::policy(
+            "strict-lossless 与 VMS 拼接输出互斥：拼接 tile 必然分段解码后重编码（有损），无逐字节搬运路径",
+        ));
+    }
+    let limits = ResourceLimits {
+        timeout_seconds: timeout.unwrap_or(600.0),
+        max_output_bytes: max_out.unwrap_or(64 * 1024 * 1024 * 1024),
+        min_free_bytes: 256 * 1024 * 1024,
+        memory_budget_bytes: memory_budget
+            .unwrap_or(slide_transform_core::budget::SAVER_BUDGET_BYTES),
+    };
+    {
+        let dir = scratch_under(output);
+        let free = free_bytes(&dir);
+        if free < limits.min_free_bytes {
+            return Err(CoreError::disk_low(format!(
+                "目标盘剩余 {free} < {}",
+                limits.min_free_bytes
+            )));
+        }
+    }
+    let dir = input.parent().map(|d| d.to_path_buf()).unwrap_or_else(|| Path::new(".").to_path_buf());
+    let stem = mrxs_stem(input);
+    let identity = InputIdentity {
+        name: input
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        size: 0,
+        sha256: None,
+    };
+    let mut plan = TransformPlan::brightfield(identity)
+        .with_policy(pixel_policy)
+        .with_limits(limits.clone())
+        .with_encoding(enc_profile);
+    plan.profile = out_profile;
+    let part = {
+        let name = output.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        scratch_under(output).join(format!("{name}.part"))
+    };
+    let mut scratch = FileScratch::new(&scratch_under(output));
+    let mut sink = FileSink::create(&part)?;
+    let null = NullProgress;
+    let job = JobControl::new(&null).with_timeout(limits.timeout_seconds);
+    let fs = slide_transform_core::bundle::DirBundle::open_flat(&dir, &stem)?;
+    let mut result =
+        slide_transform_core::convert_vms::convert_vms_to_bigtiff(
+            &fs, &stem, &mut sink, &mut scratch, &plan, &job,
+        )?;
+    sink.flush()?;
+    drop(sink);
+    if output.exists() && !overwrite {
+        let _ = std::fs::remove_file(&part);
+        return Err(CoreError::validation(format!(
+            "输出已存在：{}",
+            output.display()
+        )));
+    }
+    std::fs::rename(&part, output)
+        .map_err(|e| CoreError::io(format!("转正失败: {e}")))?;
+    result.output_sha256 = Some(sha256_file(output)?);
+    emit_convert_json(&result, &out_profile, &enc_profile, output)
+}
+
 /// Shared convert report JSON (used by both the MRXS and generic paths so
 /// the contract stays identical).
 fn emit_convert_json(
@@ -1756,6 +2016,94 @@ fn cmd_gen_mrxs(args: &[String]) -> Result<String, CoreError> {
     Ok(obj(&[
         jstr("dir", &out_dir),
         jstr("entry", &format!("{}/synthetic.mrxs", out_dir)),
+        ju("members", bundle.members().len() as u64),
+        ju("bytes", bytes),
+    ]))
+}
+
+// --------------------------------------------------------------------------- //
+// synthetic Hamamatsu VMS bundle generator（测试数据；无患者数据）
+// --------------------------------------------------------------------------- //
+
+#[cfg(feature = "synth-gen")]
+fn cmd_gen_vms(args: &[String]) -> Result<String, CoreError> {
+    use slide_transform_core::bundle::BundleFs;
+    let mut out_dir = None;
+    let mut cols = 2u32;
+    let mut rows = 2u32;
+    let mut width0 = 96u32;
+    let mut width1 = 64u32;
+    let mut height0 = 80u32;
+    let mut height1 = 48u32;
+    let mut macro_image = true;
+    let mut map_file = true;
+    let mut opt_file = true;
+    let mut no_restart = false;
+    let mut progressive = false;
+    let mut missing_member = false;
+    let mut vmu = false;
+    let mut multi_layer = false;
+    let mut traversal = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--cols" => { i += 1; cols = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--cols"))?; }
+            "--rows" => { i += 1; rows = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--rows"))?; }
+            "--width0" => { i += 1; width0 = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--width0"))?; }
+            "--width1" => { i += 1; width1 = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--width1"))?; }
+            "--height0" => { i += 1; height0 = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--height0"))?; }
+            "--height1" => { i += 1; height1 = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--height1"))?; }
+            "--no-macro" => macro_image = false,
+            "--no-map" => map_file = false,
+            "--no-opt" => opt_file = false,
+            "--no-restart" => no_restart = true,
+            "--progressive" => progressive = true,
+            "--missing-member" => missing_member = true,
+            "--vmu" => vmu = true,
+            "--multi-layer" => multi_layer = true,
+            "--traversal" => traversal = true,
+            _ => {
+                if args[i].starts_with('-') && args[i] != "-" {
+                    return Err(CoreError::validation(format!("gen-vms 未知旗标 {}", args[i])));
+                }
+                out_dir = Some(args[i].clone());
+            }
+        }
+        i += 1;
+    }
+    let out_dir = out_dir.ok_or_else(|| CoreError::validation("gen-vms 需要 <out-dir>"))?;
+    let p = std::path::Path::new(&out_dir);
+    std::fs::create_dir_all(p)?;
+    let params = slide_transform_core::vms_fixture::VmsGenParams {
+        stem: "synthetic".to_string(),
+        cols,
+        rows,
+        // MCU 网格对齐（S422：16×8）；末列/末行可不同（真实扫描仪的边缘
+        // tile 布局）
+        widths: vec![width0, width1],
+        heights: vec![height0, height1],
+        macro_image,
+        map_file,
+        opt_file,
+        no_restart,
+        progressive,
+        missing_member,
+        vmu,
+        multi_layer,
+        traversal_name: traversal,
+        ..Default::default()
+    };
+    let bundle = slide_transform_core::vms_fixture::build_synthetic_vms(&params)?;
+    let mut bytes = 0u64;
+    for m in bundle.members() {
+        let idx = bundle.find(&m.name).unwrap();
+        let data = bundle.read_member_at(idx, 0, m.size as usize)?;
+        std::fs::write(p.join(&m.name), &data)?;
+        bytes += m.size;
+    }
+    Ok(obj(&[
+        jstr("dir", &out_dir),
+        jstr("entry", &format!("{}/synthetic.vms", out_dir)),
         ju("members", bundle.members().len() as u64),
         ju("bytes", bytes),
     ]))

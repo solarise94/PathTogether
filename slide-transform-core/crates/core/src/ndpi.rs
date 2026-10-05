@@ -135,6 +135,23 @@ impl NdpiLevel {
     pub fn mcu_h(&self) -> u32 {
         self.mcu.1
     }
+    /// The shared restart-segment reader's view of this strip
+    /// (crates/core/src/segment.rs).
+    pub fn strip_geom(&self) -> crate::segment::StripGeom {
+        crate::segment::StripGeom {
+            strip_offset: self.strip_offset,
+            strip_bytes: self.strip_bytes,
+            mcu_w: self.mcu.0,
+            mcu_h: self.mcu.1,
+            mcus_x: self.mcus_x,
+            total_mcus: self.total_mcus,
+            restart_interval: self.restart_interval,
+            segments: self.segments,
+            header_bytes: self.header_bytes.clone(),
+            sof_hw_at: self.sof_hw_at,
+            dri_at: self.dri_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -83,7 +83,7 @@ Code:
 | 工具页文件夹入口识别 VMS 包；accept、格式名称、i18n 中英 | **PASS** — `.vms/.vmu` 进束包路由（`bundleRoute`/`looksLikeBundleMember`）与 accept；文件夹选择/目录 drop → 同一 `prepareBundleSource`；`VMS (Hamamatsu)` 格式族名；VMS 画质说明行（`tools.quality.vms.note` 中英） |
 | slide-sniff 从「暂时直传」改「需要转换」；注册表 `browser_convert=available`；`direct_import` 保持 open | **PASS** — .vms → convert（bundle 标记）；注册表 vms 行改 available/convert，`direct_import` 保持 open（是否关闭直传由用户看本报告后决定，未动）；.vmu 维持 temporary |
 | 原生 CLI 在默认 192 MiB 预算下转换真实样本成功（MemoryMax=320M 实跑） | **PASS** — `systemd-run -p MemoryMax=320M` + 默认预算转换成功（输出 1,761,618,512 B，149,850 瓦片，validate 通过；compact 276 s 实跑见 §3） |
-| 浏览器 == 原生逐字节一致（保留画质与 compact 各一次） | **PASS** — 合成 VMS 包（C2 `run_parity.js --bundle`）bf-ome `96369f59…` / bf-classic `5104e3de…` 与原生 equal=true；真实样本页面场景见 §5（C3 `vm-vms-folder-e2e`，VMS_SAMPLE_DIR 门控） |
+| 浏览器 == 原生逐字节一致（保留画质与 compact 各一次） | **PASS** — 合成 VMS 包（C2 `run_parity.js --bundle`）bf-ome `96369f59…` / bf-classic `5104e3de…` 与原生 equal=true；真实样本页面场景（C3 `vm-vms-folder-e2e`，本次实跑 PASS）：页面文件夹选择识别 `VMS (Hamamatsu)`，preserve sha `cf9ca6c5…` 与 compact sha `b851932e…`（与独立 CLI compact 实跑逐位一致）均等于原生，no-restart 变体复制前拒绝且无任务目录 |
 
 ## 1. 设计
 
@@ -234,8 +234,8 @@ macro 44,802 B + map 12,448,223 B）逐字节确认：
    访问加速」可复用 NDPI 的 `unreliable_mcu_starts` 思路。
 7. **浏览器端真实样本端到端**：C2 parity 与故障矩阵用合成包（逐字节
    断言）；真实样本的页面场景（C3 `vm-vms-folder-e2e`）由
-   VMS_SAMPLE_DIR 门控——两次浏览器内完整转换（保留画质/compact 各
-   一次）耗时约 20 分钟量级，适合门禁按需运行而非每次全量。
+   VMS_SAMPLE_DIR 门控——本次实跑 PASS（两次浏览器内完整转换约
+   25 分钟），适合门禁按需运行而非每次全量。
 
 ## 5. 门禁与后续
 

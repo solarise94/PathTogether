@@ -3,6 +3,30 @@
   "version_scheme": "YYYY.MM.DD product release. Do not use PathTogether package.json 0.1.0 (test package) as the product version.",
   "releases": [
     {
+      "version": "2026.10.05",
+      "date": "2026-10-05",
+      "published": true,
+      "components": {
+        "pathtogether": "suite-20261005-notes"
+      },
+      "items": {
+        "zh": [
+          "切片格式转换工具上线：首页首屏可直接进入，拖入文件即可识别并转换，无需登录。",
+          "支持 KFB、KFBF、JPEG 编码的 Aperio SVS，以及完整 MRXS 文件夹；可输出 OME-TIFF 或经典金字塔 TIFF，荧光输出多通道 OME-TIFF。",
+          "明场默认保留画质，新增“更小文件（有损）”选项；有损结果不适合颜色定量。",
+          "转换在本机浏览器完成，可保存到本机，也可登录后一键转换并上传到工作台；支持刷新后续跑。",
+          "上传显示字节进度，并区分排队、云端上传、工作台接收及发布状态。"
+        ],
+        "en": [
+          "The slide format converter is now featured on the homepage. Drop in a file to identify and convert it without signing in.",
+          "Supports KFB, KFBF, JPEG-compressed Aperio SVS and complete MRXS folders. Export OME-TIFF or classic pyramidal TIFF; fluorescence uses multichannel OME-TIFF.",
+          "Brightfield preserves quality by default, with an optional smaller-file lossy mode. Lossy output is not suitable for color quantification.",
+          "Conversion runs in your browser. Save locally, or sign in to convert and upload to the workbench in one step. Jobs can resume after a refresh.",
+          "Uploads now show byte progress with separate queued, cloud upload, workbench receiving and publishing stages."
+        ]
+      }
+    },
+    {
       "version": "2026.09.20",
       "date": "2026-09-20",
       "published": true,

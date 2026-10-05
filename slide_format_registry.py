@@ -215,11 +215,13 @@ _CATALOG_DISPLAY = (
         "capability": CAP_NATIVE_SINGLE_FILE,
         "canonical_format": None,
         "bundle_required": False,
-        "browser_convert": "unavailable",
+        "browser_convert": "available",
         "direct_import": "open",
-        "import_mode": "direct-temporary",
-        "limits": ["暂时直接导入；本机转换工具导出的 BigTIFF 会被识别并"
-                   "按「直接上传」处理"],
+        "import_mode": "convert",
+        "limits": ["通用瓦片 JPEG TIFF/BigTIFF（无厂商描述的明场金字塔）"
+                   "可在本机浏览器转换后上传；条带 / LZW / deflate / "
+                   "非 8 位 / 多通道变体暂直接导入；本机转换工具导出的 "
+                   "BigTIFF 会被识别并按「直接上传」处理"],
         "selectable_for_upload": True,
     },
     {

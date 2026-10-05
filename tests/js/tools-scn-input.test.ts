@@ -157,12 +157,16 @@ describe("TIFF 厂商分派（OME-TIFF / 转换器 BigTIFF 不是转换输入）
 		}
 	});
 
-	it("未知厂商维持「不猜」拒绝（提到 Aperio / Leica SCN）", async () => {
+	it("未知厂商 → F5 起路由进通用瓦片 JPEG 适配器（不再「不猜」拒绝）", async () => {
+		// F4 时未知厂商一律拒绝；F5 把结构合法的无厂商 TIFF 交给通用瓦片
+		// 适配器（结构性变体由嗅探的结构门槛与核心的类型化拒绝处理）
 		const cap = await E.sniffTiffSlideCapability(
 			asFile(buildTiff({ desc: "Some Other Scanner v1", photo: 2 })));
-		expect(cap.supported).toBe(false);
-		expect(cap.reason).toContain("Aperio");
-		expect(cap.reason).toContain("Leica SCN");
+		expect(cap).toMatchObject({
+			supported: true,
+			modality: "brightfield",
+			adapter: "generic-tiled-jpeg-tiff",
+		});
 	});
 
 	it("SVS 路由行为不变：Aperio 描述仍给 aperio-svs-jpeg", async () => {

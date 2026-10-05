@@ -67,6 +67,7 @@ CONVERTER_SOURCE_FORMATS = frozenset({
     "kfb_kfbio_jpeg",     # 明场 KFB 旧版本头
     "aperio-svs-jpeg",    # SVS → classic/ome（classic 描述 JSON 带 adapter）
     "leica-scn-jpeg",     # SCN → classic/ome（F4；描述 JSON 带 adapter）
+    "generic-tiled-jpeg-tiff",  # 通用瓦片 JPEG TIFF → classic/ome（F5）
     "mirax-bundle",       # MRXS → 经典 BigTIFF
 })
 

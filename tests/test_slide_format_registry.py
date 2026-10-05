@@ -203,9 +203,14 @@ def test_public_catalog_direct_class_flags():
     assert rows["scn"]["import_mode"] == "convert"
     assert rows["scn"]["browser_convert"] == "available"
     assert rows["scn"]["direct_import"] == "open"
-    # 暂时直接导入：尚无浏览器转换器的格式（scn 的荧光/非 JPEG 变体在
-    # 头级嗅探按 temporary 分流，行级无法区分编码变体，同 svs 的处理）
-    for rid in ("tif", "ndpi", "vms", "vmu", "bif", "svslide",
+    # F5：tif/tiff 转换可用（通用瓦片 JPEG TIFF/BigTIFF），直传同样保持
+    # 开放——条带/LZW/deflate/非 8 位/多通道变体在头级嗅探按 temporary
+    # 分流，行级无法区分结构变体（同 svs/scn 的处理）
+    assert rows["tif"]["import_mode"] == "convert"
+    assert rows["tif"]["browser_convert"] == "available"
+    assert rows["tif"]["direct_import"] == "open"
+    # 暂时直接导入：尚无浏览器转换器的格式
+    for rid in ("ndpi", "vms", "vmu", "bif", "svslide",
                 "raster-image"):
         assert rows[rid]["import_mode"] == "direct-temporary", rid
         assert rows[rid]["direct_import"] == "open", rid
@@ -216,8 +221,9 @@ def test_catalog_flag_derived_vocabularies():
     """catalog_rows_by_flag 派生两张词表（app 能力下发/关闭闸共用）。"""
     closed = reg.catalog_rows_by_flag("direct_import", "closed")
     assert closed == {"svs", "mrxs", "kfb", "kfbf"}
+    # F5：tif/tiff 加入 browser_convert 集合（direct_import 仍 open）
     bc = reg.catalog_rows_by_flag("browser_convert", "available")
-    assert bc == {"svs", "mrxs", "kfb", "kfbf", "scn"}
+    assert bc == {"svs", "mrxs", "kfb", "kfbf", "scn", "tif", "tiff"}
 
 
 def test_vendor_names_corrected():

@@ -202,9 +202,9 @@ describe("slide-sniff：TIFF 头解析（手工夹具，≤128KB 预算）", () 
 		expect(r.directClass).toBe("ome-tiff");
 	});
 
-	it("描述 JSON 带转换器来源标记 → converter-bigtiff（五种来源）", async () => {
+	it("描述 JSON 带转换器来源标记 → converter-bigtiff（六种来源）", async () => {
 		for (const sf of ["kfb_bf_v1", "kfb_kfbio_jpeg", "aperio-svs-jpeg",
-			"leica-scn-jpeg", "mirax-bundle"]) {
+			"leica-scn-jpeg", "mirax-bundle", "generic-tiled-jpeg-tiff"]) {
 			const bytes = classicTiff([], descBytes(
 				JSON.stringify({ source_format: sf }) + "\x00"));
 			const r = await S.classifyFile(fakeFile("out.tif", bytes));

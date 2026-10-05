@@ -964,6 +964,15 @@ export class SlideToolsRunner {
           `v${E.SCN_ADAPTER_VERSION}：两种适配器配方不得混合`,
           { kind: 'source-adapter' });
       }
+      // F5: same contract for the generic tiled-JPEG adapter (the l0-box2
+      // generated-tail recipe of one adapter generation must never be
+      // continued by another)
+      if (recordAdapter === E.GTIFF_SOURCE_ADAPTER &&
+          (st.gen.adapterVersion || '1') !== E.GTIFF_ADAPTER_VERSION) {
+        refuse(`进度记录属于通用 TIFF 适配器 v${st.gen.adapterVersion || '1'}，当前为 ` +
+          `v${E.GTIFF_ADAPTER_VERSION}：两种适配器配方不得混合`,
+          { kind: 'source-adapter' });
+      }
       // same contract for the encoding: the journal generation and every
       // committed state must agree with the record (missing = preserve)
       const journalledEnc = st.gen.encodingProfile || E.ENCODING_PROFILES.PRESERVE;

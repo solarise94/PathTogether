@@ -13,12 +13,15 @@
                         → 直接上传（direct_class="converter-bigtiff"）
      convert            有浏览器转换器的格式：KFB、KFBF、JPEG 编码的
                         Aperio SVS（IFD0 压缩 = 7）、JPEG 编码明场
-                        Leica SCN（描述是 SCN XML）、MRXS（.mrxs/.dat
-                        成员）→ 本机转换后上传（工作台交接）
+                        Leica SCN（描述是 SCN XML）、通用瓦片 JPEG
+                        TIFF/BigTIFF（无厂商描述、tiled、压缩 = 7、
+                        3 采样、photo 2/6）、MRXS（.mrxs/.dat 成员）
+                        → 本机转换后上传（工作台交接）
      temporary          暂时直传：尚无浏览器转换器的格式/变体（JPEG2000
                         编码 SVS（压缩 33003/33005）、荧光/非 JPEG 编码
-                        SCN、NDPI、VMS、VMU、BIF、SVSlide、BMP/JPEG、
-                        普通 TIFF、zip）
+                        SCN、条带/LZW/deflate/非 8 位/多通道的通用
+                        TIFF 变体、NDPI、VMS、VMU、BIF、SVSlide、
+                        BMP/JPEG、zip）
      unsupported        未登记扩展名
 
    形态约束：classic script（window.HP_SLIDE_SNIFF；与 cos-uploader.js
@@ -37,6 +40,7 @@
     "aperio-svs-jpeg": 1,
     "mirax-bundle": 1,
     "leica-scn-jpeg": 1,
+    "generic-tiled-jpeg-tiff": 1,
   };
 
   // 结果类别
@@ -229,7 +233,30 @@
       }
       return result;
     }
+    if (compression === 7 && genericTiledConvertible(ifdBytes, idv, little, hdr.bigtiff)) {
+      // F5：通用瓦片 JPEG TIFF/BigTIFF（无厂商描述 + tiled + 3 采样 +
+      // photo 2/6）：浏览器转换器覆盖 → 本机转换后上传。条带/LZW/
+      // deflate/非 8 位/多通道变体不满足判定 → 默认 temporary = 暂时直传。
+      result.cls = CLS.CONVERT;
+      result.directClass = null;
+      return result;
+    }
     return result;
+  }
+
+  // F5：通用瓦片 JPEG TIFF 的可转换结构判定（与 Rust gtiff.rs / engine.js
+  // 嗅探同一契约的 IFD0 快判）：tiled（322/323 在场）、SamplesPerPixel=3、
+  // PhotometricInterpretation ∈ {2 RGB, 6 YCbCr}。只做分流提示——核心在
+  // 复制前做同一批类型化终审。
+  function genericTiledConvertible(ifdBytes, idv, little, bigtiff) {
+    var tileW = findIfdEntry(ifdBytes, little, 322, bigtiff);
+    var tileH = findIfdEntry(ifdBytes, little, 323, bigtiff);
+    if (!tileW || !tileH) return false;
+    var spp = findIfdEntry(ifdBytes, little, 277, bigtiff);
+    if (spp && ifdUint(spp, idv, little) !== 3) return false;
+    var photo = findIfdEntry(ifdBytes, little, 262, bigtiff);
+    var photoVal = photo ? ifdUint(photo, idv, little) : 0;
+    return photoVal === 2 || photoVal === 6;
   }
 
   // Leica SCN XML 描述（leica-microsystems.com/scn 命名空间）；

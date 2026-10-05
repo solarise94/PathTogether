@@ -745,6 +745,7 @@ function formatFamilyLabel(id) {
   if (s.startsWith('kfb')) return 'KFB';
   if (s.startsWith('aperio-svs')) return 'SVS (Aperio)';
   if (s.startsWith('leica-scn')) return 'SCN (Leica)';
+  if (s.startsWith('generic-tiled-jpeg-tiff')) return 'Generic TIFF';
   if (s.startsWith('mirax')) return 'MRXS';
   return s;
 }

@@ -434,18 +434,27 @@ export function inputExtensionHint(name) {
 /// the authoritative capability report still comes from the wasm core's
 /// probe on the staged copy). Reads at most ~78 KiB: header, one IFD entry
 /// table (≤512 entries) and one bounded description value. Mirrors the
-/// core's accept rule for IFD 0: tiled, baseline JPEG (not JPEG 2000),
-/// chunky, 3 samples, Aperio description.
+/// routing layers: vendor dispatch on the IFD 0 description (Aperio →
+/// SVS, Leica SCN XML → SCN, OME-TIFF / converter BigTIFF → typed
+/// rejections, unknown → the generic tiled-JPEG adapter) plus the shared
+/// IFD 0 structural gate (tiled, baseline JPEG, chunky, 3 samples).
 ///
 ///   await sniffTiffSlideCapability(file)
-///     → { supported: true, modality: 'brightfield', format: 'aperio-svs-jpeg',
-///         adapter: 'aperio-svs-jpeg' }
+///     → { supported: true, modality: 'brightfield', format: '<adapter id>',
+///         adapter: '<adapter id>' }
 ///     | { supported: false, modality: null, reason: '<typed reason>' }
 export const SVS_SOURCE_ADAPTER = 'aperio-svs-jpeg';
 /// F4: Leica SCN（BigTIFF + SCN XML 描述；JPEG tile 原样搬运）。
 /// Must equal the Rust `ADAPTER_VERSION` (resume refuses on mismatch).
 export const SCN_SOURCE_ADAPTER = 'leica-scn-jpeg';
 export const SCN_ADAPTER_VERSION = '1';
+/// F5: 通用瓦片 JPEG TIFF/BigTIFF（无厂商描述的明场金字塔，OpenSlide
+/// generic-tiff 家族；JPEG tile 原样搬运，缺失降采样层按 l0-box2 生成）。
+/// Must equal the Rust `ADAPTER_VERSION` (resume refuses on mismatch).
+export const GTIFF_SOURCE_ADAPTER = 'generic-tiled-jpeg-tiff';
+export const GTIFF_ADAPTER_VERSION = '1';
+/// Must equal the Rust `PYRAMID_METHOD` / `GEN_MIN_SIDE` (gtiff.rs).
+export const GTIFF_PYRAMID_METHOD = 'l0-box2';
 /// Converter-output source_format ids (same vocabulary as the Rust core's
 /// `CONVERTER_SOURCE_FORMATS` and upload_direct_class.py): a TIFF whose
 /// IFD-0 description JSON carries one of these is THIS TOOL's own output —
@@ -455,6 +464,7 @@ export const CONVERTER_SOURCE_FORMATS = [
   'kfb_kfbio_jpeg',
   'aperio-svs-jpeg',
   'mirax-bundle',
+  GTIFF_SOURCE_ADAPTER,
   SCN_SOURCE_ADAPTER,
 ];
 const LEICA_SCN_XML_NS = /leica-microsystems\.com\/scn/;
@@ -581,14 +591,25 @@ export async function sniffTiffSlideCapability(file) {
         littleEndian: little,
       };
     }
-    if (vendor !== 'aperio') {
-      return bad('TIFF 结构合法但描述未标识 Aperio / Leica SCN：未知厂商变体不猜');
+    if (vendor === 'aperio') {
+      return {
+        supported: true,
+        modality: 'brightfield',
+        format: SVS_SOURCE_ADAPTER,
+        adapter: SVS_SOURCE_ADAPTER,
+        bigtiff,
+        littleEndian: little,
+      };
     }
+    // F5: 无已知厂商描述 + 上面结构门槛全过 = 通用瓦片 JPEG TIFF（OpenSlide
+    // generic-tiff 家族）→ 转换；上面任一结构门槛未过（条带/非 JPEG 编码/
+    // 多通道/非 8 位/平面存储）=「暂时直传」变体，核心在复制前给同一批
+    // 类型化拒绝
     return {
       supported: true,
       modality: 'brightfield',
-      format: SVS_SOURCE_ADAPTER,
-      adapter: SVS_SOURCE_ADAPTER,
+      format: GTIFF_SOURCE_ADAPTER,
+      adapter: GTIFF_SOURCE_ADAPTER,
       bigtiff,
       littleEndian: little,
     };
@@ -1059,10 +1080,11 @@ export function isOmeProfile(profile) {
 /// Local/uploaded file name for a job's artifact: `.ome.tif` for both OME
 /// profiles (Bio-Formats and the platform registry key OME on it), `.tif`
 /// for the classic pyramid. The source extension is dropped (CMU-1.svs →
-/// CMU-1.ome.tif); MRXS bundle jobs are named after the entry stem.
+/// CMU-1.ome.tif, CMU-1.tiff → CMU-1.ome.tif); MRXS bundle jobs are named
+/// after the entry stem.
 export function outputFileName(sourceName, job) {
   const base = String(sourceName || 'slide')
-    .replace(/\.(kfb|kfbf|svs|scn|mrxs)$/i, '') || 'slide';
+    .replace(/\.(kfb|kfbf|svs|scn|tif|tiff|mrxs)$/i, '') || 'slide';
   return isOmeProfile(jobOutputProfile(job)) ? `${base}.ome.tif` : `${base}.tif`;
 }
 

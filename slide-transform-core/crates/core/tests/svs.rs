@@ -15,6 +15,7 @@ use slide_transform_core::plan::{
     COMPACT_JPEG_V1_FINGERPRINT,
 };
 use slide_transform_core::report::TransformResult;
+use slide_transform_core::resume::ResumePoint;
 use slide_transform_core::svs;
 use slide_transform_core::svs_fixture::{build_synthetic_svs, FixtureColor, SvsGenParams};
 use slide_transform_core::validate::validate_output;
@@ -584,6 +585,39 @@ fn compact_svs_cropped_tiles_padded_and_recorded() {
         let probe = slide_transform_core::jpeg::scan_jpeg(&t).unwrap();
         assert_eq!(probe.width as u64, tw, "padded tile fills the nominal rect");
     }
+}
+
+#[test]
+fn resume_refuses_a_foreign_adapter_version() {
+    // review #4: a checkpoint journalled under another SVS adapter version
+    // must be refused in the CORE (None = a legacy pre-adapter journal and
+    // stays resumable, as documented on ADAPTER_VERSION)
+    let data = gen(&SvsGenParams { width: 300, height: 200, ..Default::default() });
+    let src = MemSource::new(data);
+    let mut sink = MemSink::new();
+    let mut scratch = MemScratch::default();
+    let null = slide_transform_core::job::NullProgress;
+    let job = slide_transform_core::job::JobControl::new(&null);
+    let rp = ResumePoint {
+        level: 0,
+        channel: 0,
+        cell: 0,
+        committed_output: 0,
+        ifd_tiles: vec![],
+        adapter_version: Some("2".to_string()),
+    };
+    let e = convert_svs::convert_svs_to_bigtiff_resume(
+        &src,
+        &mut sink,
+        &mut scratch,
+        &plan_for(OutputProfile::ClassicJpegBigTiff, PixelPolicy::AllowEdgeReencode),
+        &job,
+        &rp,
+    )
+    .err()
+    .expect("foreign version must refuse");
+    assert_eq!(e.code, slide_transform_core::error::ErrorCode::ConversionValidationFailed);
+    assert!(e.message.contains("适配器"), "{}", e.message);
 }
 
 #[test]

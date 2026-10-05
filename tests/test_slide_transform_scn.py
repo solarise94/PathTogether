@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -36,8 +37,11 @@ CLI_ENV = os.environ.get(
 CLI_DEBUG = REPO / "slide-transform-core" / "target" / "debug" / "slide-transform"
 CLI = CLI_ENV if Path(CLI_ENV).exists() else (CLI_DEBUG if CLI_DEBUG.exists() else None)
 
-#: 公开 OpenSlide 样本（Leica-1.scn，CC0；路径仅经环境变量传入）
-SCN_SAMPLE = Path(os.environ.get("SCN_SAMPLE", ""))
+#: 公开 OpenSlide 样本（Leica-1.scn，CC0；路径仅经环境变量传入）。
+#: 未设置时必须解析为**不存在的路径**：Path("") 会变成 Path(".") 而
+#: .exists() 为真，skipif 失效（回归审查 2026-10-05 #1）。
+_SCN_SAMPLE_UNSET = "/nonexistent/scn-sample-unset"
+SCN_SAMPLE = Path(os.environ.get("SCN_SAMPLE") or _SCN_SAMPLE_UNSET)
 
 
 def _cli(*args, check=True):
@@ -53,6 +57,22 @@ def _cli(*args, check=True):
 @pytest.fixture(scope="module")
 def workdir(tmp_path_factory):
     return tmp_path_factory.mktemp("f4-scn")
+
+
+def test_sample_env_unset_means_skip_not_fail(tmp_path):
+    """回归（审查 #1）：SCN_SAMPLE 未设置时两个真实样本测试必须 skip，
+    绝不能执行（曾因 Path("") → Path(".") 且 .exists()==True 而失败）。"""
+    env = {k: v for k, v in os.environ.items() if k != "SCN_SAMPLE"}
+    env["TMPDIR"] = str(tmp_path)
+    r = subprocess.run(
+        [sys.executable, "-m", "pytest",
+         "tests/test_slide_transform_scn.py", "-q",
+         "-k", "real_sample"],
+        capture_output=True, text=True, timeout=600,
+        cwd=str(REPO), env=env,
+    )
+    assert r.returncode == 0, f"真实样本门未跳过: {r.stdout[-2000:]}"
+    assert "skipped" in r.stdout, r.stdout[-500:]
 
 
 # --------------------------------------------------------------------------- #

@@ -141,10 +141,14 @@ image 记录（96 B/个）、层记录；转换期再收填充画布
 ### 1.5 Resume
 
 checkpoint 携带 `adapter` + `adapter_version`（本次修复：此前所有适配器
-的 checkpoint 都硬编码 MRXS 的版本号）。runner 在 resume 时对 SCN 适配器
-做版本钉扎（与 MRXS 同一契约）；换适配器（任务记录被改成其他 adapter 或
-副本 probe 出不同 adapter）与源副本被改（staged sha256 不符）都是类型化
-拒绝（`resume_refused/source-adapter`、`source_changed_refuse_resume`）。
+的 checkpoint 都硬编码 MRXS 的版本号）。适配器版本钉扎在**核心层**强制
+（`convert_scn_to_bigtiff_resume` 拒绝版本不符或字段缺失的 checkpoint；
+`convert_svs_to_bigtiff_resume` 拒绝点名其他版本的 checkpoint，无版本
+字段的 legacy journal 保持可续跑并在文档中写明），与 MRXS 同一契约；
+runner 在 resume 时再做一次 SCN 版本钉扎。换适配器（任务记录被改成其他
+adapter 或副本 probe 出不同 adapter）与源副本被改（staged sha256 不符）
+都是类型化拒绝（`resume_refused/source-adapter`、
+`source_changed_refuse_resume`）。
 
 ## 2. 实测（真实样本：公开 OpenSlide `Leica-1.scn`，CC0）
 
@@ -205,7 +209,8 @@ compact 再各一次亦一致。
 ## 4. 证据索引
 
 - Rust：`cargo test -p slide-transform-core --features fixtures` 全绿
-  （含 `tests/scn.rs` 12 项；运行记录见提交 3c9c695）
+  （含 `tests/scn.rs` 15 项；审查 2026-10-05 回归后：单边上限、
+  vendor 路由、核心层适配器版本钉扎各带回归测试）
 - pytest：`tests/test_slide_transform_scn.py` 11 项全绿
   （SCN_SAMPLE 设置时含真实样本像素门；缺失自动跳过）
 - vitest：`tools-scn-input.test.ts` 11 项、`slide-sniff.test.ts`

@@ -37,8 +37,11 @@ use crate::tiff_read::{self, Ifd, TiffHeader, TiffKind, TileCursor};
 
 /// Stable source-format id recorded in plans/reports/provenance/journals.
 pub const SOURCE_FORMAT: &str = "aperio-svs-jpeg";
-/// Adapter version (bump on any output-affecting change; resume refuses on
-/// mismatch, mirroring the output-profile refusal).
+/// Adapter version (bump on any output-affecting change). Enforced in the
+/// core's resume entry: a checkpoint that NAMES another generation is
+/// refused. A state with NO version field is a legacy pre-adapter journal
+/// and stays resumable (the browser layer pins those to the recorded
+/// default).
 pub const ADAPTER_VERSION: &str = "1";
 
 /// TIFF tags used here.

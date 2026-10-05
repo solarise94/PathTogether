@@ -583,7 +583,7 @@ fn adapter_version_of(kind: InputKind) -> Option<&'static str> {
 /// converter's own BigTIFF are NOT conversion inputs — typed rejection
 /// before anything is staged or written. An unknown vendor stays on the SVS
 /// route so the SVS adapter's own "未标识 Aperio" contract is unchanged.
-fn tiff_route(src: &HostSource) -> CoreResult<InputKind> {
+fn tiff_route(src: &dyn ByteSource) -> CoreResult<InputKind> {
     use slide_transform_core::scn::TiffVendor;
     match slide_transform_core::scn::sniff_tiff_vendor(src)? {
         TiffVendor::LeicaScn => Ok(InputKind::Scn),
@@ -730,6 +730,19 @@ fn scn_doc_json(doc: &slide_transform_core::scn::ScnDoc) -> String {
     )
 }
 
+/// TIFF-container probe dispatch (host-free so it is unit-testable):
+/// SCN vendor → the SCN adapter, every other vendor → the SVS adapter, and
+/// a routing Err (OME-TIFF / converter BigTIFF / structural failure) is
+/// returned VERBATIM — never masked by the SVS adapter's "未标识 Aperio".
+fn probe_tiff_doc(src: &dyn ByteSource) -> CoreResult<String> {
+    match tiff_route(src)? {
+        InputKind::Scn => {
+            slide_transform_core::scn::probe_scn(src).map(|doc| scn_doc_json(&doc))
+        }
+        _ => slide_transform_core::svs::probe_svs(src).map(|doc| svs_doc_json(&doc)),
+    }
+}
+
 /// Probe the input through host reads; returns a JSON string. Includes the
 /// C2 disk-precheck estimate (`estimate.output_upper_bound_bytes` etc.).
 #[wasm_bindgen(js_name = "probe")]
@@ -742,12 +755,9 @@ pub fn probe() -> String {
     };
     let res = if is_tiff_magic(&magic) {
         // F1/F4: bounded TIFF walk + vendor dispatch (typed rejections for
-        // OME-TIFF / converter BigTIFF inside tiff_route)
-        match tiff_route(&src) {
-            Ok(InputKind::Scn) => slide_transform_core::scn::probe_scn(&src)
-                .map(|doc| scn_doc_json(&doc)),
-            _ => slide_transform_core::svs::probe_svs(&src).map(|doc| svs_doc_json(&doc)),
-        }
+        // OME-TIFF / converter BigTIFF inside tiff_route — an Err must
+        // surface as-is, never fall through to the SVS probe; review 2026-10-05 #2)
+        probe_tiff_doc(&src)
     } else if magic == slide_transform_core::kfbf::KFBF_MAGIC {
         slide_transform_core::kfbf::parse_kfbf(&src, &mut scratch).map(|doc| {
             let est = slide_transform_core::estimate::estimate_fl(&doc, src.size());
@@ -1607,6 +1617,109 @@ mod tests {
         assert_eq!(resume_profile_field(legacy), None);
         assert_eq!(resume_encoding_field(legacy), None);
         assert_eq!(resume_adapter_field(legacy), None);
+    }
+
+    /// Minimal little-endian BigTIFF with one IFD (16×16 single 16×16 tile
+    /// for the SCN-positive case; other cases only need the description so
+    /// the vendor routing fires before any payload is touched).
+    fn one_ifd_bigtiff(
+        desc: &str,
+        jpeg_payload: bool,
+        compression: u16,
+        photo: u16,
+        width: u32,
+        height: u32,
+    ) -> Vec<u8> {
+        let desc = desc.as_bytes();
+        let payload = jpeg_payload.then(|| {
+            slide_transform_core::jpeg::encode_rgb(
+                &[255u8; 16 * 16 * 3],
+                16,
+                16,
+                &slide_transform_core::jpeg::EncoderCfg::with_quality(
+                    90,
+                    slide_transform_core::jpeg::Sampling::S444,
+                ),
+            )
+            .unwrap()
+        });
+        let payload_at = 16 + desc.len() as u64 + 1;
+        let mut entries: Vec<(u16, u16, u64, Vec<u8>)> = vec![
+            (256, 4, 1, width.to_le_bytes().to_vec()),
+            (257, 4, 1, height.to_le_bytes().to_vec()),
+            (259, 3, 1, compression.to_le_bytes().to_vec()),
+            (262, 3, 1, photo.to_le_bytes().to_vec()),
+            // description is EXTERNAL: it sits at offset 16 (right after
+            // the header); the entry carries its length + offset
+            (270, 2, desc.len() as u64 + 1, 16u64.to_le_bytes().to_vec()),
+            (277, 3, 1, 3u16.to_le_bytes().to_vec()),
+            (284, 3, 1, 1u16.to_le_bytes().to_vec()),
+        ];
+        if let Some(p) = &payload {
+            entries.push((322, 3, 1, 16u16.to_le_bytes().to_vec()));
+            entries.push((323, 3, 1, 16u16.to_le_bytes().to_vec()));
+            entries.push((324, 16, 1, payload_at.to_le_bytes().to_vec()));
+            entries.push((325, 16, 1, (p.len() as u64).to_le_bytes().to_vec()));
+        }
+        entries.sort_by_key(|e| e.0);
+        // layout: header [0,16) | description [16, …) | payload | IFD last
+        let ifd_at = payload_at + payload.as_ref().map_or(0, |p| p.len() as u64);
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&43u16.to_le_bytes());
+        buf.extend_from_slice(&8u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&ifd_at.to_le_bytes());
+        buf.extend_from_slice(desc);
+        buf.push(0);
+        if let Some(p) = payload {
+            buf.extend_from_slice(&p);
+        }
+        buf.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for (tag, typ, count, val) in &entries {
+            buf.extend_from_slice(&tag.to_le_bytes());
+            buf.extend_from_slice(&typ.to_le_bytes());
+            buf.extend_from_slice(&count.to_le_bytes());
+            let mut v = val.clone();
+            v.resize(8, 0);
+            buf.extend_from_slice(&v);
+        }
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf
+    }
+
+    const SCN_XML_DESC: &str = "<?xml version=\"1.0\"?><scn xmlns=\"http://www.leica-microsystems.com/scn/2010/10/01\"><collection><image><pixels sizeX=\"16\" sizeY=\"16\"><dimension sizeX=\"16\" sizeY=\"16\" r=\"0\" ifd=\"0\" /></pixels><view sizeX=\"8000\" sizeY=\"8000\" /><scanSettings><illuminationSettings><illuminationSource>brightfield</illuminationSource></illuminationSettings></scanSettings></image></collection></scn>";
+    const OME_XML_DESC: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><OME xmlns=\"http://www.openmicroscopy.org/Schemas/OME/2016-06\"></OME>";
+    const CONVERTER_DESC: &str = "{\"adapter\": \"aperio-svs-jpeg\", \"adapter_version\": \"1\", \"mpp_x\": 0.5, \"mpp_y\": 0.5, \"objective\": 20.0, \"source_format\": \"aperio-svs-jpeg\"}";
+
+    #[test]
+    fn probe_tiff_doc_routes_by_vendor_and_surfaces_rejections() {
+        use slide_transform_core::error::ErrorCode::*;
+        use slide_transform_core::io::MemSource;
+
+        // SCN XML → the SCN adapter document (16×16 single-tile mini slide)
+        let doc = probe_tiff_doc(&MemSource::new(one_ifd_bigtiff(
+            SCN_XML_DESC, true, 7, 6, 16, 16,
+        )))
+        .unwrap();
+        assert!(doc.contains("\"format\":\"leica-scn-jpeg\""), "{doc}");
+
+        // OME-TIFF → the typed routing refusal, NEVER the SVS "未标识
+        // Aperio" fallback (review #2 regression)
+        let e = probe_tiff_doc(&MemSource::new(one_ifd_bigtiff(
+            OME_XML_DESC, false, 7, 2, 520, 300,
+        )))
+        .unwrap_err();
+        assert_eq!(e.code, UnsupportedKfbVariant);
+        assert!(e.message.contains("OME-TIFF 不是转换输入"), "{}", e.message);
+        assert!(!e.message.contains("未标识 Aperio"));
+
+        // converter BigTIFF → same
+        let e = probe_tiff_doc(&MemSource::new(one_ifd_bigtiff(
+            CONVERTER_DESC, false, 7, 2, 520, 300,
+        )))
+        .unwrap_err();
+        assert!(e.message.contains("不是转换输入"), "{}", e.message);
     }
 
     #[test]

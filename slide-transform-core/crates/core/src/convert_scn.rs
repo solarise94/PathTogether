@@ -520,6 +520,15 @@ pub fn convert_scn_to_bigtiff_resume(
     job: &JobControl,
     resume: &ResumePoint,
 ) -> CoreResult<TransformResult> {
+    // Adapter-version pin, enforced in the CORE (review #4; mrxs parity):
+    // the field has existed since SCN adapter v1, so a state WITHOUT it is
+    // foreign as well — never mix two adapter generations into one output.
+    if resume.adapter_version.as_deref() != Some(ADAPTER_VERSION) {
+        return Err(CoreError::validation(format!(
+            "resume: 已提交进度属于 SCN 适配器 v{}，当前为 v{ADAPTER_VERSION}：两种适配器配方不得混合进同一输出",
+            resume.adapter_version.as_deref().unwrap_or("1（字段缺失）"),
+        )));
+    }
     convert_inner(src, sink, scratch, plan, job, Some(resume))
 }
 

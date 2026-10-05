@@ -555,6 +555,16 @@ pub fn convert_svs_to_bigtiff_resume(
     job: &JobControl,
     resume: &ResumePoint,
 ) -> CoreResult<TransformResult> {
+    // Adapter-version pin, enforced in the CORE (review #4). `None` means a
+    // legacy state journalled by a pre-adapter core and stays resumable
+    // (the browser layer pins those to the recorded default); anything that
+    // NAMES another generation is refused.
+    if resume.adapter_version.as_deref().is_some_and(|v| v != ADAPTER_VERSION) {
+        return Err(CoreError::validation(format!(
+            "resume: 已提交进度属于 SVS 适配器 v{}，当前为 v{ADAPTER_VERSION}：两种适配器配方不得混合进同一输出",
+            resume.adapter_version.as_deref().unwrap_or("?"),
+        )));
+    }
     convert_inner(src, sink, scratch, plan, job, Some(resume))
 }
 

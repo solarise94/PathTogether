@@ -44,8 +44,10 @@ use crate::tiff_read::{self, Ifd, TiffHeader, TiffKind};
 
 /// Stable source-format id recorded in plans/reports/provenance/journals.
 pub const SOURCE_FORMAT: &str = "leica-scn-jpeg";
-/// Adapter version (bump on any output-affecting change; resume refuses on
-/// mismatch, mirroring the output-profile refusal).
+/// Adapter version (bump on any output-affecting change). Enforced in the
+/// core's resume entry: a checkpoint whose recorded version differs from
+/// this one — or that carries NO version at all (the field has existed
+/// since SCN adapter v1) — is refused, mirroring the output-profile refusal.
 pub const ADAPTER_VERSION: &str = "1";
 
 /// Sane geometric caps (a real SCN400 level 0 is ≲ 300 000 px per side).
@@ -415,6 +417,13 @@ fn inspect_level(
 ) -> CoreResult<ScnLevel> {
     let width = get_u64(src, hdr, ifd, 256)?.unwrap_or(0);
     let height = get_u64(src, hdr, ifd, 257)?.unwrap_or(0);
+    // per-side cap (SVS parity): the 4 M tile-grid cap alone does not bound
+    // a single side (u32-max × 1 passes it), so enforce MAX_SIDE explicitly
+    if !(1..=MAX_SIDE).contains(&width) || !(1..=MAX_SIDE).contains(&height) {
+        return Err(CoreError::variant(format!(
+            "层级尺寸 {width}×{height} 越界（单边上限 {MAX_SIDE}）"
+        )));
+    }
     if width != xml_w as u64 || height != xml_h as u64 {
         return Err(CoreError::validation(format!(
             "层 IFD{ifd_index} 尺寸 {width}×{height} 与 XML dimension {}×{} 不符",

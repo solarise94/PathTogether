@@ -335,6 +335,35 @@ fn sha256(data: &[u8]) -> String {
 }
 
 #[test]
+fn resume_refuses_a_foreign_or_absent_adapter_version() {
+    // review #4: the core enforces the adapter-version pin the doc claims
+    // (mrxs parity) — a state journalled by another SCN adapter generation
+    // (or with the field stripped) must not continue
+    let data = gen(&ScnGenParams { width: 300, height: 200, ..default_params() });
+    let plan = plan_for(OutputProfile::ClassicJpegBigTiff, PixelPolicy::AllowEdgeReencode);
+    for version in [Some("2".to_string()), None] {
+        let src = MemSource::new(data.clone());
+        let mut sink = MemSink::new();
+        let mut scratch = MemScratch::default();
+        let null = NullProgress;
+        let job = JobControl::new(&null);
+        let rp = slide_transform_core::resume::ResumePoint {
+            level: 0,
+            channel: 0,
+            cell: 0,
+            committed_output: 0,
+            ifd_tiles: vec![],
+            adapter_version: version.clone(),
+        };
+        let e = convert_scn::convert_scn_to_bigtiff_resume(&src, &mut sink, &mut scratch, &plan, &job, &rp)
+            .err()
+            .expect("version-mismatched resume must refuse");
+        assert_eq!(e.code, slide_transform_core::error::ErrorCode::ConversionValidationFailed);
+        assert!(e.message.contains("适配器"), "{}", e.message);
+    }
+}
+
+#[test]
 fn resume_from_mid_level_checkpoint_is_byte_identical() {
     use slide_transform_core::io::{FileScratch, FileSink, FileSource};
     use slide_transform_core::resume::ResumePoint;
@@ -454,6 +483,114 @@ fn resume_from_mid_level_checkpoint_is_byte_identical() {
     assert_eq!(resumed.levels.len(), reference.levels.len());
     let filled: u64 = resumed.levels.iter().map(|l| l.tiles_filled).sum();
     assert_eq!(filled, ref_filled, "fill counts must survive resume");
+}
+
+/// Minimal little-endian BigTIFF: header | desc@16 | IFD (tags 256/257/259/
+/// 262/270/277/284/322/323/324/325; one 16×16 white JPEG tile when `tiles`).
+/// Used for the hand-built geometry/routing rejections the fixture knobs
+/// cannot express.
+fn hand_bigtiff(desc: &str, width: u32, height: u32, tiles: bool) -> Vec<u8> {
+    use slide_transform_core::jpeg::{encode_rgb, EncoderCfg, Sampling};
+    let desc = desc.as_bytes();
+    let payload = tiles.then(|| {
+        encode_rgb(
+            &[255u8; 16 * 16 * 3],
+            16,
+            16,
+            &EncoderCfg::with_quality(90, Sampling::S444),
+        )
+        .unwrap()
+    });
+    let payload_at = 16 + desc.len() as u64 + 1;
+    let mut entries: Vec<(u16, u16, u64, Vec<u8>)> = vec![
+        (256, 4, 1, width.to_le_bytes().to_vec()),
+        (257, 4, 1, height.to_le_bytes().to_vec()),
+        (259, 3, 1, 7u16.to_le_bytes().to_vec()),
+        (262, 3, 1, 6u16.to_le_bytes().to_vec()),
+        (270, 2, desc.len() as u64 + 1, 16u64.to_le_bytes().to_vec()),
+        (277, 3, 1, 3u16.to_le_bytes().to_vec()),
+        (284, 3, 1, 1u16.to_le_bytes().to_vec()),
+    ];
+    if let Some(p) = &payload {
+        entries.push((322, 3, 1, 16u16.to_le_bytes().to_vec()));
+        entries.push((323, 3, 1, 16u16.to_le_bytes().to_vec()));
+        entries.push((324, 16, 1, payload_at.to_le_bytes().to_vec()));
+        entries.push((325, 16, 1, (p.len() as u64).to_le_bytes().to_vec()));
+    }
+    entries.sort_by_key(|e| e.0);
+    let ifd_at = payload_at + payload.as_ref().map_or(0, |p| p.len() as u64);
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"II");
+    buf.extend_from_slice(&43u16.to_le_bytes());
+    buf.extend_from_slice(&8u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&ifd_at.to_le_bytes());
+    buf.extend_from_slice(desc);
+    buf.push(0);
+    if let Some(p) = payload {
+        buf.extend_from_slice(&p);
+    }
+    buf.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+    for (tag, typ, count, val) in &entries {
+        buf.extend_from_slice(&tag.to_le_bytes());
+        buf.extend_from_slice(&typ.to_le_bytes());
+        buf.extend_from_slice(&count.to_le_bytes());
+        let mut v = val.clone();
+        v.resize(8, 0);
+        buf.extend_from_slice(&v);
+    }
+    buf.extend_from_slice(&0u64.to_le_bytes());
+    buf
+}
+
+fn scn_xml_desc(size_x: u64, size_y: u64) -> String {
+    format!(
+        "<?xml version=\"1.0\"?><scn xmlns=\"http://www.leica-microsystems.com/scn/2010/10/01\">\
+<collection><image><pixels sizeX=\"{sx}\" sizeY=\"{sy}\">\
+<dimension sizeX=\"{sx}\" sizeY=\"{sy}\" r=\"0\" ifd=\"0\" /></pixels>\
+<view sizeX=\"{vx}\" sizeY=\"{vy}\" /><scanSettings><illuminationSettings>\
+<illuminationSource>brightfield</illuminationSource></illuminationSettings>\
+</scanSettings></image></collection></scn>",
+        sx = size_x,
+        sy = size_y,
+        vx = size_x * 500,
+        vy = size_y * 500,
+    )
+}
+
+#[test]
+fn absurd_level_side_is_a_typed_rejection() {
+    // review #3: MAX_SIDE must bound each side (SVS parity) — a
+    // u32-max × 1 level fits the 4 M tile-grid cap but is not a slide
+    let data = hand_bigtiff(&scn_xml_desc(4_294_967_295, 1), 4_294_967_295, 1, true);
+    let src = MemSource::new(data);
+    let e = probe_scn(&src).unwrap_err();
+    assert_eq!(e.code, UnsupportedKfbVariant, "{}", e.message);
+    assert!(e.message.contains("越界"), "{}", e.message);
+}
+
+#[test]
+fn vendor_routing_on_hand_built_containers() {
+    // SCN XML routes to the SCN adapter (probe succeeds on the mini slide)
+    let ok = MemSource::new(hand_bigtiff(&scn_xml_desc(16, 16), 16, 16, true));
+    let doc = probe_scn(&ok).unwrap();
+    assert_eq!(doc.levels[0].width, 16);
+    // OME description → sniff_tiff_vendor classifies OmeTiff (the CLI/wasm
+    // layers turn that into the typed "OME-TIFF 不是转换输入" refusal before
+    // any adapter walk); probe_scn itself answers with the SCN adapter's own
+    // typed rejection — also before any payload is copied
+    let ome_bytes = hand_bigtiff(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><OME xmlns=\"http://www.openmicroscopy.org/Schemas/OME/2016-06\"></OME>",
+        520, 300, false,
+    );
+    let ome = MemSource::new(ome_bytes.clone());
+    assert_eq!(
+        scn::sniff_tiff_vendor(&ome).unwrap(),
+        TiffVendor::OmeTiff
+    );
+    let e = probe_scn(&MemSource::new(ome_bytes)).unwrap_err();
+    assert_eq!(e.code, UnsupportedKfbVariant);
+    assert!(e.message.contains("不是 Leica SCN XML"), "{}", e.message);
 }
 
 // --------------------------------------------------------------------------- //

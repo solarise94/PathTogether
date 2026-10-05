@@ -452,49 +452,28 @@ def test_crash_between_ingest_and_token_recovers_native(
     assert (c["transfer"], c["download"]) == (1, 1)
 
 
-def test_crash_between_ingest_and_token_recovers_convert_kfbf(
-        monkeypatch, tmp_path):
-    # P4-c convert 路径：conversion job 已 ready 但 token 未落库 → 恢复按
-    # 转换幂等锚点（owner+source_sha256+state）对账直接按成功路径落库
-    # （canonical 名不再是对账依据）。
-    import baidu_ingest
+def test_convert_kfbf_batch_no_longer_creatable(monkeypatch, tmp_path):
+    """先转换后上传阶段 1：KFBF 候选在筛选层即不可选——convert 条目从根上
+    进不了批次，本文件原「convert 崩溃恢复」场景按构造不可能（下载后的
+    字节级复查见 tests/test_baidu_ingest.py；保留函数的收口合同由
+    _ingest_convert 直接调用锁定）。"""
     from kfb.fixture_fl import build_synthetic_kfbf
     payload = build_synthetic_kfbf(tmp_path / "src.kfbf").read_bytes()
     entries = [{"path": "/fl.kfbf", "size": len(payload),
                 "content": payload}]
-    fake, batch = _make_batch(monkeypatch, ["/fl.kfbf"], tmp_path,
-                              entries=entries, idempotency_key="w3f")
-    real_ingest = baidu_ingest.ingest_staging
-
-    def crash_after_ingest(**kw):
-        real_ingest(**kw)
-        raise Crash("token 未落库即进程死亡")
-
-    monkeypatch.setattr(baidu_ingest, "ingest_staging", crash_after_ingest)
-    with pytest.raises(Crash):
-        store.run_batch(batch["id"], fake, staging_root=tmp_path)
-    row = _item_rows(batch["id"])[0]
-    assert row["stage"] == "converting" and not row["ingest_token"]
-    expire_batch_lease(batch["id"])
-    view = store.run_batch(batch["id"], fake, staging_root=tmp_path)
-    assert view["state"] == "succeeded"
-    row = _item_rows(batch["id"])[0]
-    assert row["stage"] == "ready"
-    assert row["ingest_token"] and row["ingest_token"].startswith("cvj:")
-    assert row["slide_name"] == "fl.ome.tif"
-    assert row["slide_id"]  # P4-app：convert 产物按 job.slide_id 回填
-    # 无重复产物：产物在 objects/<slide_id>/（manifest/associated 同包，
-    # 不算平铺重复）；源副本平铺一份；conversion job 仅一条
-    names = _upload_names()
-    assert "fl.kfbf" in names
-    assert "fl.ome.tif" not in names
-    up = Path(os.environ["UPLOAD_DIR"])
-    assert (up / "objects" / row["slide_id"] / "data.tif").is_file()
+    fake = install_fake(monkeypatch, entries=entries)
+    _, enum_id, by_path = make_ready_enumeration(
+        monkeypatch, owner=OWNER, entries=entries)
+    with pytest.raises(store.ValidationError) as ei:
+        _make_batch(monkeypatch, ["/fl.kfbf"], tmp_path,
+                    entries=entries, idempotency_key="w3f")
+    assert ei.value.code == "candidate_not_selectable"
+    assert fake.transfers == []
     conn = psycopg.connect(os.environ["DATABASE_URL"])
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM conversion_jobs")
-            assert int(cur.fetchone()[0]) == 1
+            assert int(cur.fetchone()[0]) == 0
     finally:
         conn.close()
 

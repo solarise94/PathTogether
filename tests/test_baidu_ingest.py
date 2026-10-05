@@ -63,17 +63,29 @@ def _tree(tmp_path):
     ]
 
 
-def test_b06_native_kfb_kfbf_real_ingest_and_project(tmp_path, monkeypatch):
+def test_b06_tiff_only_filter_kfb_never_converts(tmp_path, monkeypatch):
+    """先转换后上传阶段 1：百度侧只放行 TIFF 类——KFB/KFBF 候选不可选
+    （candidate_not_selectable，筛选层原因码 convert_in_browser_first），
+    下载后的 ingest_staging 复核也拒绝（KFB 不再触发服务端转换）；
+    TIFF 类照常入库并入项目。"""
+    import baidu_ingest
     entries = _tree(tmp_path)
     fake, enum_id, by_path = make_ready_enumeration(
         monkeypatch, owner=OWNER, entries=entries)
     proj = share_store.create_project(
         "百度入库", owner_user_id=OWNER, requester_role="user")
-    ids = [
-        by_path["keep/slide.tif"]["id"],
-        by_path["keep/panel.kfb"]["id"],
-        by_path["keep/fl.kfbf"]["id"],
-    ]
+
+    # ① 筛选层：KFB/KFBF 不可选 → 建批 400 candidate_not_selectable
+    with pytest.raises(store.ValidationError) as ei:
+        store.create_import(
+            OWNER, enum_id,
+            [by_path["keep/slide.tif"]["id"], by_path["keep/panel.kfb"]["id"],
+             by_path["keep/fl.kfbf"]["id"]],
+            idempotency_key="b06-0")
+    assert ei.value.code == "candidate_not_selectable"
+
+    # ② TIFF 类照常入库（暂时直传规则）并入项目
+    ids = [by_path["keep/slide.tif"]["id"]]
     batch = store.create_import(
         OWNER, enum_id, ids, target_project_id=proj["pid"],
         idempotency_key="b06-1")
@@ -81,60 +93,39 @@ def test_b06_native_kfb_kfbf_real_ingest_and_project(tmp_path, monkeypatch):
     assert view["state"] == "succeeded", view
     names = {i["name"]: i for i in view["items"]}
     assert names["slide.tif"]["stage"] == "ready"
-    assert names["panel.kfb"]["stage"] == "ready"
-    assert names["fl.kfbf"]["stage"] == "ready"
-    # slide_name 是展示快照（不再作定位键）
     assert names["slide.tif"]["slide_name"] == "slide.tif"
-    assert names["panel.kfb"]["slide_name"] == "panel.tif"
-    assert names["fl.kfbf"]["slide_name"] == "fl.ome.tif"
-    # P4-app：native 与 convert 条目都预分配 slide_id 并经统一发布
-    # （objects/<id>/，不写根；convert 产物 ID 由 conversion_jobs.slide_id
-    # 回填——P4-c 消费侧已就绪）
     sid_tif = names["slide.tif"]["slide_id"]
-    sid_panel = names["panel.kfb"]["slide_id"]
-    sid_fl = names["fl.kfbf"]["slide_id"]
-    assert sid_tif and sid_panel and sid_fl
-    assert len({sid_tif, sid_panel, sid_fl}) == 3
+    assert sid_tif
     up = Path(UPLOAD_DIR)
     assert (up / "objects" / sid_tif / "data.tif").is_file()
-    assert (up / "objects" / sid_panel / "data.tif").is_file()
-    assert (up / "objects" / sid_fl / "data.tif").is_file()
     assert not (up / "slide.tif").exists()  # 不写 UPLOAD_DIR 根
-    assert not (up / "panel.tif").exists()
-    assert not (up / "fl.ome.tif").exists()
     s = slide_io.open_slide(str(up / "objects" / sid_tif / "data.tif"))
     try:
         assert s.level_count >= 1
     finally:
         s.close()
-    s2 = slide_io.open_slide(str(up / "objects" / sid_fl / "data.tif"))
-    try:
-        assert getattr(s2, "channel_count", 0) == 2
-    finally:
-        s2.close()
     got = share_store.get_project(proj["pid"])
-    # 项目关联（P4-app）：native 与 convert 都按 slide_id（convert 产物
-    # job.slide_id 预分配回填——名快照列不再承载关联）
-    got_ids = set(got.get("slide_ids") or [])
-    assert {sid_tif, sid_panel, sid_fl} <= got_ids
-    assert sid_tif in (got["slide_ids"] or [])
+    assert sid_tif in (got.get("slide_ids") or [])
     assert names["slide.tif"]["project_associate_state"] == "succeeded"
-    # 未选中 notes.txt 无转存
-    skip_fs = fake._files["skip/notes.txt"]["fs_id"]
-    selected_fs = {
-        fake._files["keep/slide.tif"]["fs_id"],
-        fake._files["keep/panel.kfb"]["fs_id"],
-        fake._files["keep/fl.kfbf"]["fs_id"],
-    }
-    transferred = [t[-1] for t in fake.transfers]
-    for fs_ids in transferred:
-        assert set(fs_ids) <= selected_fs
-        assert skip_fs not in fs_ids
-    # 配额：三次入库各一次关联，无重复
-    store.run_batch(batch["id"], fake, staging_root=str(tmp_path / "st"))
-    got2 = share_store.get_project(proj["pid"])
-    assert got2["slides"] == got["slides"]
-    assert got2["slide_ids"] == got["slide_ids"]
+
+    # ③ 下载后复核：绕过筛选（直接调 ingest_staging）KFB 也不再触发转换——
+    #    确定性拒绝，原因码与筛选层一致（convert_in_browser_first）；
+    #    不建转换任务、不写 UPLOAD_DIR 根
+    kfb_path = tmp_path / "panel.kfb"
+    with pytest.raises(baidu_ingest.IngestError) as ei2:
+        baidu_ingest.ingest_staging(
+            owner_user_id=OWNER, original_name="panel.kfb",
+            staging_path=str(kfb_path), source_sha256=None,
+            source_size=kfb_path.stat().st_size)
+    assert ei2.value.code == "convert_in_browser_first"
+    assert not (Path(UPLOAD_DIR) / "panel.kfb").exists()
+    conn = psycopg.connect(os.environ["DATABASE_URL"])
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM conversion_jobs")
+            assert cur.fetchone()[0] == 0
+    finally:
+        conn.close()
 
 
 def test_b08_source_changed_and_same_name_independent(tmp_path, monkeypatch):
@@ -273,18 +264,37 @@ def test_race_native_same_name_is_independent_asset(tmp_path):
 
 
 def test_race_convert_must_not_overwrite_existing_file(tmp_path, monkeypatch):
-    """convert 竞态：同 native，且失败必须发生在 create_job 之前（无任务残留）。"""
+    """阶段 1：KFB 经 ingest_staging 先被直传关闭闸拒绝（不再触发转换，
+    无任务残留、既有文件不受扰）；保留函数的 O_EXCL 名占用行为用直接调用
+    单独锁定。"""
     import baidu_ingest
     kfb_path = build_synthetic_kfb(tmp_path / "gen.kfb")
-    staging = _stage_file(tmp_path, "panel.kfb", kfb_path.read_bytes())
+    kfb_bytes = kfb_path.read_bytes()
+    staging = _stage_file(tmp_path, "panel.kfb", kfb_bytes)
     victim = Path(UPLOAD_DIR) / "panel.kfb"
     victim.write_bytes(_VICTIM)
-    _patch_exists_lie(monkeypatch, victim)
     with pytest.raises(baidu_ingest.IngestError) as ei:
         baidu_ingest.ingest_staging(
             owner_user_id=OWNER, original_name="panel.kfb",
             staging_path=str(staging), source_sha256=None, source_size=0)
-    assert ei.value.code == "name_unavailable"
+    assert ei.value.code == "convert_in_browser_first"
+    assert victim.read_bytes() == _VICTIM
+    conn = psycopg.connect(os.environ["DATABASE_URL"])
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM conversion_jobs "
+                "WHERE canonical_name=%s", ("panel.tif",))
+            n = cur.fetchone()[0]
+    finally:
+        conn.close()
+    assert n == 0
+    # 保留函数直接调用：磁盘 O_EXCL 名占用 → name_unavailable（副本清理）
+    _patch_exists_lie(monkeypatch, victim)
+    with pytest.raises(baidu_ingest.IngestError) as ei2:
+        _convert_direct(tmp_path, "panel.kfb", kfb_bytes)
+    assert ei2.value.code == "name_unavailable"
+    assert victim.read_bytes() == _VICTIM
     assert victim.read_bytes() == _VICTIM
     conn = psycopg.connect(os.environ["DATABASE_URL"])
     try:
@@ -347,13 +357,11 @@ def test_ingest_native_success_unaffected(tmp_path):
 
 
 def test_ingest_convert_success_unaffected(tmp_path):
-    """正常 convert 入库不受独占创建改造影响。"""
+    """convert 收口（保留函数 _ingest_convert 直接调用——阶段 1 起
+    ingest_staging 层 convert-required 分支不可达，见 B06）。"""
     import baidu_ingest
     kfb_path = build_synthetic_kfb(tmp_path / "gen.kfb")
-    staging = _stage_file(tmp_path, "direct.kfb", kfb_path.read_bytes())
-    out = baidu_ingest.ingest_staging(
-        owner_user_id=OWNER, original_name="direct.kfb",
-        staging_path=str(staging), source_sha256=None, source_size=0)
+    out = _convert_direct(tmp_path, "direct.kfb", kfb_path.read_bytes())
     assert out["slide_name"] == "direct.tif"  # 展示快照
     assert out.get("slide_id")  # P4-app：convert 产物按 job.slide_id 回填
     assert out["conversion_job_id"]
@@ -382,6 +390,24 @@ def _ingest(tmp_path, name, content, *, owner=OWNER, project_id=None):
         target_project_id=project_id)
 
 
+def _convert_direct(tmp_path, name, content, *, owner=OWNER, project_id=None):
+    """直接调 _ingest_convert（保留的兼容实现）。
+
+    先转换后上传阶段 1 起 ``ingest_staging`` 对 convert-required 一律先拒绝
+    （convert_in_browser_first），转换分支不可达——下列 P1/P2 行为合同
+    （create_job 幂等复用、忙等、失败清理）锁定在保留函数本身。
+    """
+    import baidu_ingest
+    staging = _stage_file(tmp_path, name, content)
+    digest = baidu_ingest._sha256_file(staging)
+    dest_dir = Path(UPLOAD_DIR)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    return baidu_ingest._ingest_convert(
+        owner_user_id=owner, name=name, staging=staging, digest=digest,
+        dest_dir=dest_dir, source_dest=dest_dir / name,
+        target_project_id=project_id)
+
+
 def _count_jobs(owner=OWNER):
     conn = psycopg.connect(os.environ["DATABASE_URL"])
     try:
@@ -399,7 +425,7 @@ def test_ready_job_reuse_renamed_kfb_no_reprocess(tmp_path):
     canonical、删除本次副本、conversion job 恰 1 个、别名已登记。"""
     kfb = _make_kfb_bytes(tmp_path)
     up = Path(UPLOAD_DIR)
-    first = _ingest(tmp_path, "first.kfb", kfb)
+    first = _convert_direct(tmp_path, "first.kfb", kfb)
     assert first["slide_name"] == "first.tif"
     assert (up / "first.kfb").is_file()  # baidu 源副本（平铺，baidu 侧语义）
     sid = first["slide_id"]  # P4-app：产物预分配 ID（复用任务随任务复用）
@@ -408,7 +434,8 @@ def test_ready_job_reuse_renamed_kfb_no_reprocess(tmp_path):
     assert not (up / "first.tif").exists()
     proj = share_store.create_project(
         "复用关联", owner_user_id=OWNER, requester_role="user")
-    second = _ingest(tmp_path, "second.kfb", kfb, project_id=proj["pid"])
+    second = _convert_direct(tmp_path, "second.kfb", kfb,
+                             project_id=proj["pid"])
     assert second["ingest_token"] == first["ingest_token"]
     assert second["slide_name"] == "first.tif"  # 原 canonical，不改绑
     assert second["slide_id"] == sid
@@ -449,9 +476,7 @@ def test_running_job_reuse_waits_until_ready(tmp_path, monkeypatch):
     t.start()
     monkeypatch.setattr(baidu_ingest, "RUNNING_POLL_SECONDS", 0.05)
     try:
-        out = baidu_ingest.ingest_staging(
-            owner_user_id=OWNER, original_name="second.kfb",
-            staging_path=str(staging), source_sha256=None, source_size=0)
+        out = _convert_direct(tmp_path, "second.kfb", kfb)
     finally:
         t.join()
     assert out["slide_name"] == "first.tif"
@@ -476,9 +501,7 @@ def test_running_job_reuse_timeout_conversion_busy(tmp_path, monkeypatch):
     monkeypatch.setattr(baidu_ingest, "RUNNING_POLL_SECONDS", 0.02)
     monkeypatch.setattr(baidu_ingest, "RUNNING_TIMEOUT_SECONDS", 0.15)
     with pytest.raises(baidu_ingest.IngestError) as ei:
-        baidu_ingest.ingest_staging(
-            owner_user_id=OWNER, original_name="second.kfb",
-            staging_path=str(staging), source_sha256=None, source_size=0)
+        _convert_direct(tmp_path, "second.kfb", kfb)
     assert ei.value.code == "conversion_busy"
     assert "conversion_busy" not in NON_RETRYABLE_ERROR_CODES
     assert not (Path(UPLOAD_DIR) / "second.kfb").exists()
@@ -504,9 +527,7 @@ def test_create_job_name_conflict_cleans_copied_source(tmp_path, monkeypatch):
     assert not hasattr(conversion_store, "canonical_is_live")
     monkeypatch.setattr(conversion_store, "create_job", _conflict)
     with pytest.raises(baidu_ingest.IngestError) as ei:
-        baidu_ingest.ingest_staging(
-            owner_user_id=OWNER, original_name="panel.kfb",
-            staging_path=str(staging), source_sha256=None, source_size=0)
+        _convert_direct(tmp_path, "panel.kfb", kfb)
     assert ei.value.code == "conversion_failed"
     assert not (Path(UPLOAD_DIR) / "panel.kfb").exists()
 
@@ -524,46 +545,24 @@ def test_create_job_generic_error_becomes_conversion_failed(
 
     monkeypatch.setattr(conversion_store, "create_job", _boom)
     with pytest.raises(baidu_ingest.IngestError) as ei:
-        baidu_ingest.ingest_staging(
-            owner_user_id=OWNER, original_name="panel.kfb",
-            staging_path=str(staging), source_sha256=None, source_size=0)
+        _convert_direct(tmp_path, "panel.kfb", kfb)
     assert ei.value.code == "conversion_failed"
     assert isinstance(ei.value.__cause__, RuntimeError)
     assert not (Path(UPLOAD_DIR) / "panel.kfb").exists()
 
 
-def test_batch_same_content_renamed_kfb_succeeds(tmp_path, monkeypatch):
-    """P1 批次级：同内容改名 KFB 走 run_batch → 条目 ready、批次
-    succeeded、无孤立文件、conversion job 仍恰 1 个。"""
+def test_batch_kfb_candidates_not_selectable(tmp_path, monkeypatch):
+    """阶段 1 批次级：KFB 候选在筛选层即不可选（convert_in_browser_first）
+    ——建批 400 candidate_not_selectable，无批次/条目/转存副作用。"""
     kfb = _make_kfb_bytes(tmp_path)
-    entries1 = [{"path": "/keep/alpha.kfb", "size": len(kfb),
-                 "content": kfb}]
-    fake1, enum1, by1 = make_ready_enumeration(
-        monkeypatch, owner=OWNER, entries=entries1)
-    b1 = store.create_import(
-        OWNER, enum1, [by1["keep/alpha.kfb"]["id"]],
-        idempotency_key="reuse-b1")
-    v1 = store.run_batch(b1["id"], fake1,
-                         staging_root=str(tmp_path / "st1"))
-    assert v1["state"] == "succeeded", v1
-    entries2 = [{"path": "/keep/beta.kfb", "size": len(kfb),
-                 "content": kfb}]
-    fake2, enum2, by2 = make_ready_enumeration(
-        monkeypatch, owner=OWNER, entries=entries2,
-        share_text="https://pan.baidu.com/s/1SecondShareZZ")
-    b2 = store.create_import(
-        OWNER, enum2, [by2["keep/beta.kfb"]["id"]],
-        idempotency_key="reuse-b2")
-    v2 = store.run_batch(b2["id"], fake2,
-                         staging_root=str(tmp_path / "st2"))
-    assert v2["state"] == "succeeded", v2
-    item = v2["items"][0]
-    assert item["stage"] == "ready", item
-    assert item["slide_name"] == "alpha.tif"  # 原 canonical（展示快照）
-    assert item["slide_id"]  # P4-app：convert 产物按 job.slide_id 回填
-    up = Path(UPLOAD_DIR)
-    assert (up / "objects" / item["slide_id"] / "data.tif").is_file()
-    assert not (up / "alpha.tif").exists()
-    assert not (up / "beta.kfb").exists()  # 副本清理，无孤立文件
-    assert not (up / "beta.tif").exists()
-    assert _count_jobs() == 1
+    entries = [{"path": "/keep/alpha.kfb", "size": len(kfb),
+                "content": kfb}]
+    fake, enum_id, by_path = make_ready_enumeration(
+        monkeypatch, owner=OWNER, entries=entries)
+    with pytest.raises(store.ValidationError) as ei:
+        store.create_import(
+            OWNER, enum_id, [by_path["keep/alpha.kfb"]["id"]],
+            idempotency_key="reuse-b1")
+    assert ei.value.code == "candidate_not_selectable"
+    assert fake.transfers == []
+    assert _count_jobs() == 0

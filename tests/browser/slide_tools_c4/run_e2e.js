@@ -816,6 +816,93 @@ async function main() {
     }
   }
 
+  // ---------------------------------------------------------------- (p) --
+  // 阶段 1（先转换后上传）：工具页直接选择/拖入 OME-TIFF → 不进转换，
+  // 显示「已是可上传格式」，点击「上传到工作台」后才发 /api 请求；创建体
+  // 携带 direct_class=ome-tiff，数据源是用户的 File（无 OPFS 任务）。
+  async function scenarioDirectOmeUpload() {
+    const { context, page } = await L.launch('p-direct-ome', [L.downloadGuard()]);
+    const fake = await L.fakeUploadRoutes(page, creds.cosOrigin, { partsCount: 2 });
+    try {
+      // 磁盘 OME-TIFF 夹具（最小 classic TIFF + OME-XML 描述）
+      const omeXml = '<?xml version="1.0"?><OME xmlns=' +
+        '"http://www.openmicroscopy.org/Schemas/OME/2016-06"></OME>\0';
+      const desc = Buffer.from(omeXml, 'utf8');
+      const ifd = Buffer.alloc(2 + 12 + 4);
+      ifd.writeUInt16LE(1, 0);            // entry count
+      ifd.writeUInt16LE(270, 2);          // ImageDescription
+      ifd.writeUInt16LE(2, 4);            // ASCII
+      ifd.writeUInt32LE(desc.length, 6);  // count
+      ifd.writeUInt32LE(8 + ifd.length, 10);  // heap offset
+      const head = Buffer.alloc(8);
+      head.write('II', 0, 'ascii');
+      head.writeUInt16LE(42, 2);
+      head.writeUInt32LE(8, 4);
+      const fixture = path.join(L.GATE, 'fixtures', 'direct-ome.tif');
+      fs.mkdirSync(path.dirname(fixture), { recursive: true });
+      fs.writeFileSync(fixture, Buffer.concat([head, ifd, desc]));
+
+      await L.login(page, PORT, creds, 'user');
+      await L.C3.openTools(page, PORT);
+      // 不能用 L.setFile（其 waitFor 等 files[0]）：直传面板出现时
+      // showDirectReady 会清空 file input——这里只等面板本身。
+      // change 监听在 init（runner/WASM 加载）末尾才挂上：先等页面就绪
+      await waitFor(async () => (await page.evaluate(() => window.__stToolsReady)) === true,
+        60000, 'tools page init');
+      await page.evaluate(() => {
+        const el = document.getElementById('file-input');
+        if (el) el.value = '';
+      });
+      await page.setInputFiles('#file-input', fixture);
+      // 「已是可上传格式」面板出现；转换流程（复制/识别）不启动
+      await waitFor(async () => (await page.$('#direct-section:not([hidden])')) !== null,
+        30000, 'direct-ready panel');
+      const stageHidden = await page.$eval('#stage-section', (el) => el.hidden);
+      if (!stageHidden) throw new Error('conversion prepare started for OME input');
+      // 点击之前零 /api 请求（C3 合同：能力在点击后才拉取）
+      if (fake.st.creates.length !== 0) throw new Error('pre-click ingestion created');
+      const title = await i18nLabel(page, 'tools.direct.ready.title');
+      const heading = await textOf(page, '#direct-section h2');
+      if (!heading.includes(title.slice(0, 4))) {
+        throw new Error(`panel heading "${heading}" vs ${title}`);
+      }
+      await page.click('#direct-upload-btn');
+      await waitFor(async () => /已发布|Published/.test(await textOf(page, '#direct-status')),
+        60000, 'direct published');
+      if (fake.st.creates.length !== 1) throw new Error(`creates=${fake.st.creates.length}`);
+      const create = fake.st.creates[0];
+      if (create.filename !== 'direct-ome.tif') throw new Error(`filename ${create.filename}`);
+      if (create.direct_class !== 'ome-tiff') {
+        throw new Error(`direct_class=${create.direct_class}`);
+      }
+      const putBytes = fake.st.puts.reduce((a, p) => a + p.bytes, 0);
+      if (putBytes !== desc.length + head.length + ifd.length) {
+        throw new Error(`PUT bytes ${putBytes} != file size`);
+      }
+      record('p-direct-ome-upload', true, {
+        filename: create.filename, direct_class: create.direct_class, putBytes,
+      });
+    } catch (e) {
+      let diag = {};
+      try {
+        diag = await page.evaluate(() => ({
+          directHidden: document.getElementById('direct-section').hidden,
+          stageHidden: document.getElementById('stage-section').hidden,
+          inputMsg: document.getElementById('input-message').textContent,
+          pageErr: document.getElementById('page-error').textContent,
+          toolsReady: window.__stToolsReady,
+          sniff: typeof window.HP_SLIDE_SNIFF,
+          fileVal: document.getElementById('file-input').value,
+          url: location.href,
+        }));
+      } catch (e2) { diag = { diagError: String(e2).slice(0, 120) }; }
+      record('p-direct-ome-upload', false,
+        { error: String(e).slice(0, 300), diag });
+    } finally {
+      await context.close();
+    }
+  }
+
   const all = [
     ['a-bf', () => scenarioHappy('bf', bf)],
     ['a-fl', () => scenarioHappy('fl', fl)],
@@ -834,6 +921,7 @@ async function main() {
     ['m2-cancel-during-backoff', () => scenarioCancelDuringWait('backoff')],
     ['n-classic-upload', scenarioClassicUpload],
     ['o-throttled-bytes', scenarioThrottledBytes],
+    ['p-direct-ome-upload', scenarioDirectOmeUpload],
   ];
   for (const [id, fn] of all) {
     if (ONLY && id !== ONLY) continue;

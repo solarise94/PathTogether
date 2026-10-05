@@ -308,33 +308,33 @@ def test_classification_matrix(monkeypatch, tmp_path, _c6_dirs, _fake_probe):
     # baidu：按领取资格顺序构造（claim_batch 取最旧可领取批次）
     h._mk_user("c6b")
     fake_b2, _e, b2 = create_batch(
-        monkeypatch, owner="c6b", entries=_baidu_entries("/k2.kfb", 100),
-        paths=["k2.kfb"], quota_hook=_quota_hook)
+        monkeypatch, owner="c6b", entries=_baidu_entries("/k2.tif", 100),
+        paths=["k2.tif"], quota_hook=_quota_hook)
     assert bstore.claim_batch(worker_id="legacy-live")["batch"]["id"] \
         == b2["id"]
     ids["baidu_inprocess_live"] = b2["id"]
     fake_b4, _e, b4 = create_batch(
-        monkeypatch, owner="c6b", entries=_baidu_entries("/k4.kfb", 100),
-        paths=["k4.kfb"], quota_hook=_quota_hook)
+        monkeypatch, owner="c6b", entries=_baidu_entries("/k4.tif", 100),
+        paths=["k4.tif"], quota_hook=_quota_hook)
     claim = bstore.plugin_claim_batch(worker_id="plugin:c6")
     assert claim["batch"]["id"] == b4["id"]
     ids["baidu_plugin"] = b4["id"]
     fake_b3, _e, b3 = create_batch(
-        monkeypatch, owner="c6b", entries=_baidu_entries("/k3.kfb", 100),
-        paths=["k3.kfb"], quota_hook=_quota_hook)
+        monkeypatch, owner="c6b", entries=_baidu_entries("/k3.tif", 100),
+        paths=["k3.tif"], quota_hook=_quota_hook)
     assert bstore.claim_batch(worker_id="legacy-dead")["batch"]["id"] \
         == b3["id"]
     expire_batch_lease(b3["id"])
     ids["baidu_inprocess_expired"] = b3["id"]
     fake_b1, _e, b1 = create_batch(
-        monkeypatch, owner="c6b", entries=_baidu_entries("/k1.kfb", 100),
-        paths=["k1.kfb"], quota_hook=_quota_hook)
+        monkeypatch, owner="c6b", entries=_baidu_entries("/k1.tif", 100),
+        paths=["k1.tif"], quota_hook=_quota_hook)
     ids["baidu_queued"] = b1["id"]
     # 终态批次（下载失败注入 → failed）+ 本地暂存残留
     fake_b5, _e, b5 = create_batch(
-        monkeypatch, owner="c6b", entries=_baidu_entries("/bad.kfb", 90),
-        paths=["bad.kfb"], quota_hook=_quota_hook)
-    fake_b5.fail_download_names = {"bad.kfb"}
+        monkeypatch, owner="c6b", entries=_baidu_entries("/bad.tif", 90),
+        paths=["bad.tif"], quota_hook=_quota_hook)
+    fake_b5.fail_download_names = {"bad.tif"}
     view = bstore.run_batch(b5["id"], fake_b5, staging_root=str(bs),
                             worker_id="w-b5")
     assert view["state"] == "failed"
@@ -343,11 +343,11 @@ def test_classification_matrix(monkeypatch, tmp_path, _c6_dirs, _fake_probe):
     ids["baidu_terminal_residue"] = b5["id"]
     # 终态 + reserved 预约（无 API 可造——纯 SQL 种子）；清理义务（无预约）
     fake_b6, _e, b6 = create_batch(
-        monkeypatch, owner="c6b", entries=_baidu_entries("/k6.kfb", 80),
-        paths=["k6.kfb"], quota_hook=_quota_hook)
+        monkeypatch, owner="c6b", entries=_baidu_entries("/k6.tif", 80),
+        paths=["k6.tif"], quota_hook=_quota_hook)
     fake_b7, _e, b7 = create_batch(
-        monkeypatch, owner="c6b", entries=_baidu_entries("/k7.kfb", 70),
-        paths=["k7.kfb"])
+        monkeypatch, owner="c6b", entries=_baidu_entries("/k7.tif", 70),
+        paths=["k7.tif"])
     _sql(lambda cur: cur.execute(
         "UPDATE baidu_import_batches SET state='cancelled' WHERE id=%s",
         (b6["id"],)))

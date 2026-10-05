@@ -80,8 +80,9 @@ def test_capability_routes_convert_required_to_browser(monkeypatch):
     with app_mod.app.test_request_context("/"):
         p = app_mod._cos_upload_capability_payload(demo=False)
     assert "kfb" not in p["formats"] and "kfbf" not in p["formats"]
-    # 阶段 1：browser_convert 词表扩展到目录行级（kfb/kfbf + svs + mrxs）
-    assert {"kfb", "kfbf", "svs", "mrxs"} == \
+    # 阶段 1：browser_convert 词表扩展到目录行级（kfb/kfbf + svs + mrxs）；
+    # F4：scn 转换可用（direct_import 仍 open，不在直传关闭集）
+    assert {"kfb", "kfbf", "svs", "mrxs", "scn"} == \
         set(p["browser_convert"]["formats"])
     assert p["browser_convert"]["url"] == "/tools/slides"
     # direct_upload 清单：直传开放格式（不含 svs/kfb/kfbf/mrxs/zip）

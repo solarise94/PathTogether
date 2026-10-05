@@ -17,13 +17,14 @@
                         （Make 标识 Hamamatsu、整层单条带、压缩 = 7、
                         3 采样、photo 2/6）、通用瓦片 JPEG
                         TIFF/BigTIFF（无厂商描述、tiled、压缩 = 7、
-                        3 采样、photo 2/6）、MRXS（.mrxs/.dat 成员）
+                        3 采样、photo 2/6）、MRXS（.mrxs/.dat 成员）、
+                        VMS（.vms 入口，完整包经文件夹选择交接）
                         → 本机转换后上传（工作台交接）
      temporary          暂时直传：尚无浏览器转换器的格式/变体（JPEG2000
                         编码 SVS（压缩 33003/33005）、JPEG2000/条带/
                         多通道变体的 NDPI、荧光/非 JPEG 编码
                         SCN、条带/LZW/deflate/非 8 位/多通道的通用
-                        TIFF 变体、VMS、VMU、BIF、SVSlide、
+                        TIFF 变体、VMU、BIF、SVSlide、
                         BMP/JPEG、zip）
      unsupported        未登记扩展名
 
@@ -45,6 +46,7 @@
     "leica-scn-jpeg": 1,
     "generic-tiled-jpeg-tiff": 1,
     "hamamatsu-ndpi-jpeg": 1,
+    "hamamatsu-vms-bundle": 1,
   };
 
   // 结果类别
@@ -377,6 +379,11 @@
       case ".mrxs":
       case ".dat":
         return { cls: CLS.CONVERT, ext: ext, bundle: true };
+      case ".vms":
+        // VMS 浏览器转换器已覆盖：入口 + 同目录 tile JPEG 的完整包经
+        // 文件夹选择/整目录交接本机转换后上传（散入口在工具页得到列出
+        // 缺成员的类型化信息；单文件直传不再声明）
+        return { cls: CLS.CONVERT, ext: ext, bundle: true };
       case ".svs":
         return { route: "tiff", ext: ext, svs: true };
       case ".scn":
@@ -390,7 +397,6 @@
         // direct_class 声明（服务端词表里 zip 只在受理词表，不在
         // direct_upload；声明 legacy-direct 会被 422 invalid_direct_class）
         return { cls: CLS.TEMPORARY, ext: ext };
-      case ".vms":
       case ".vmu":
       case ".bif":
       case ".svslide":

@@ -122,16 +122,19 @@ function fakeFile(name: string, bytes: Uint8Array) {
 }
 
 describe("slide-sniff：扩展名快路径（不读字节）", () => {
-	it("浏览器转换器覆盖的格式 → convert（MRXS 成员带 bundle 标记）", () => {
+	it("浏览器转换器覆盖的格式 → convert（MRXS/VMS 成员带 bundle 标记）", () => {
 		expect(S.classifyExt("a.KFB").cls).toBe("convert");
 		expect(S.classifyExt("b.kfbf").cls).toBe("convert");
 		expect(S.classifyExt("scan.mrxs").cls).toBe("convert");
 		expect(S.classifyExt("scan.mrxs").bundle).toBe(true);
 		expect(S.classifyExt("Data0000.dat").cls).toBe("convert");
+		// VMS 转换器已覆盖：入口文件按 bundle 分流（整包经文件夹交接）
+		expect(S.classifyExt("scan.vms").cls).toBe("convert");
+		expect(S.classifyExt("scan.vms").bundle).toBe(true);
 	});
 
 	it("暂无浏览器转换器的格式/变体 → temporary（直传声明 legacy-direct）", () => {
-		for (const n of ["a.vms", "a.vmu", "a.bif",
+		for (const n of ["a.vmu", "a.bif",
 			"a.svslide", "a.bmp", "a.jpg", "a.jpeg"]) {
 			const r = S.classifyExt(n);
 			expect(r.cls, n).toBe("temporary");

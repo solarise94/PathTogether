@@ -70,7 +70,7 @@ describe("U2 default view (template structure)", () => {
 	it("drop zone + pick button + hidden-but-focusable file input, one accept list", () => {
 		expect(shellSrc).toContain('id="drop-zone"');
 		expect(shellSrc).toContain('id="pick-file-btn"');
-		expect(shellSrc).toMatch(/<input id="file-input" name="file" type="file" accept="\.kfb,\.kfbf,\.svs,\.scn,\.ndpi,\.ome\.tif,\.ome\.tiff,\.tif,\.tiff" class="visually-hidden-input"/);
+		expect(shellSrc).toMatch(/<input id="file-input" name="file" type="file" accept="\.kfb,\.kfbf,\.svs,\.scn,\.ndpi,\.ome\.tif,\.ome\.tiff,\.tif,\.tiff,\.vms,\.vmu,\.mrxs,\.dat" class="visually-hidden-input"/);
 		expect(cssSrc).toContain(".visually-hidden-input");
 		expect(cssSrc).not.toMatch(/#file-input\s*\{[^}]*display:\s*none/);
 		expect(cssSrc).toContain(".drop-zone.dragover");
@@ -188,9 +188,9 @@ describe("U2 entry flow (page source wiring)", () => {
 		expect(pageSrc).toMatch(/route\.route === 'bundle'[\s\S]*?await prepareBundleSource\(route\.files\)/);
 		// file-input route (a .mrxs picked manually) has the same planner delegation
 		expect(pageSrc).toMatch(/inputExtensionHint\(file\.name\) === 'bundle'[\s\S]*?await prepareBundleSource\(\[file\]\)/);
-		// the planner (engine.planMrxBundle via runner.prepareBundle) refuses
+		// the planner (engine.planBundle 按入口类型分派 via runner.prepareBundle) refuses
 		// incomplete bundles BEFORE any copy; the page shows its typed message
-		expect(runnerSrc).toMatch(/const plan = await E\.planMrxBundle\(files\)/);
+		expect(runnerSrc).toMatch(/const plan = await E\.planBundle\(files\)/);
 		expect(i18nSrc).toMatch(/"tools\.drop\.bundle": "[^"]*完整包[^"]*"/);
 	});
 
@@ -307,9 +307,9 @@ describe("U2 i18n (zh/en pairs for the new concepts)", () => {
 		expect(i18nSrc).toMatch(/"tools\.drop\.bundle": "[^"]*complete bundle[^"]*Slidedat\.ini[^"]*"/);
 		expect(i18nSrc).toContain('"tools.drop.bundle.multiple"');
 		// subtitle / hint / unsupported-input message now include MRXS
-		expect(i18nSrc).toMatch(/"tools\.subtitle": "[^"]*MRXS 完整包[^"]*"/);
-		expect(i18nSrc).toMatch(/"tools\.subtitle": "[^"]*complete MRXS bundles[^"]*"/);
-		expect(i18nSrc).toMatch(/"tools\.input\.file\.hint": "[^"]*MRXS 完整包[^"]*"/);
+		expect(i18nSrc).toMatch(/"tools\.subtitle": "[^"]*MRXS \/ VMS 完整包[^"]*"/);
+		expect(i18nSrc).toMatch(/"tools\.subtitle": "[^"]*complete MRXS \/ VMS bundles[^"]*"/);
+		expect(i18nSrc).toMatch(/"tools\.input\.file\.hint": "[^"]*(?:MRXS 完整包|VMS 完整包)[^"]*"/);
 		expect(i18nSrc).toMatch(/"tools\.input\.folder\.label"[\s\S]*"tools\.input\.folder\.label"/);
 		expect(i18nSrc).toMatch(/"tools\.err\.unsupported_input": "[^"]*MRXS 完整包[^"]*"/);
 		expect(i18nSrc).toMatch(/"tools\.err\.unsupported_input": "[^"]*complete MRXS bundles[^"]*"/);
@@ -353,6 +353,8 @@ describe("bundle input routing (tools-slides-bundle.js, pure)", () => {
 		expect(bundleRoute([{ name: "a.kfb" }, { name: "Index.dat" }]).route).toBe("bundle");
 		expect(looksLikeBundleMember("SLIDE.MRXS")).toBe(true);
 		expect(looksLikeBundleMember("Data0000.dat")).toBe(true);
+		expect(looksLikeBundleMember("scan.VMS")).toBe(true);
+		expect(looksLikeBundleMember("raw.vmu")).toBe(true);
 		expect(looksLikeBundleMember("a.kfb")).toBe(false);
 	});
 	it("rows normalise File objects (webkitRelativePath) and {name, relPath, file} alike", () => {

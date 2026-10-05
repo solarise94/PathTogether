@@ -55,6 +55,7 @@ const els = {
   qualityFieldset: $('quality-fieldset'),
   qualityMrsxNote: $('quality-mrxs-note'),
   qualityNdpiNote: $('quality-ndpi-note'),
+  qualityVmsNote: $('quality-vms-note'),
   qualityLocked: $('quality-locked'),
   moreOptions: $('more-options'),
   probeSection: $('probe-section'),
@@ -313,11 +314,12 @@ async function probeWithDiskFlow(file, opts = {}) {
 // ------------------------------------------------------- prepareSource --
 //
 // file input 与 drop 的唯一汇合点（计划 §3.2.1）。一次只接受一个切片文件：
-// 多文件 → 明确提示、什么都不开始；含 .mrxs/.dat 的输入（单独主文件、散装
-// 成员或恰好完整的包）一律交给 MRXS planner（engine.planMrxBundle 经
-// runner.prepareBundle）：缺成员 → 类型化信息列出还差什么，任何复制之前
-// 拒绝——绝不静默丢弃。扩展名只是提示：真正的识别在运行器的
-// 文件头魔数检查（_prepare 在完整复制之前拒绝已知不支持的文件）。
+// 多文件 → 明确提示、什么都不开始；含 .mrxs/.dat（MRXS）或 .vms/.vmu
+// （VMS/VMU）的输入（单独主文件、散装成员或恰好完整的包）一律交给束包
+// planner（engine.planBundle 按入口类型分派，经 runner.prepareBundle）：
+// 缺成员 → 类型化信息列出还差什么，任何复制之前拒绝——绝不静默丢弃。
+// 扩展名只是提示：真正的识别在运行器的文件头魔数检查（_prepare 在完整
+// 复制之前拒绝已知不支持的文件）。
 
 async function prepareSource(fileList) {
   const route = bundleRoute(fileList);
@@ -329,8 +331,9 @@ async function prepareSource(fileList) {
     return;
   }
   if (route.route === 'bundle') {
-    // .mrxs / .dat（单个或散装多个）→ 同一 planner；文件夹/目录 drop 见
-    // handleDropData（带相对路径的完整包在这里被接受）
+    // .mrxs/.dat（MRXS）或 .vms/.vmu（VMS/VMU）（单个或散装多个）→ 同一
+    // planner 分派；文件夹/目录 drop 见 handleDropData（带相对路径的完整
+    // 包在这里被接受）
     await prepareBundleSource(route.files);
     return;
   }
@@ -528,6 +531,7 @@ function resetFlowPanels() {
   els.qualityFieldset.disabled = false;
   els.qualityMrsxNote.hidden = true;
   els.qualityNdpiNote.hidden = true;
+  els.qualityVmsNote.hidden = true;
   els.qualityLocked.hidden = true;
   els.qualityConflict.hidden = true;
   els.moreOptions.open = false;
@@ -749,6 +753,7 @@ function formatFamilyLabel(id) {
   if (s.startsWith('leica-scn')) return 'SCN (Leica)';
   if (s.startsWith('generic-tiled-jpeg-tiff')) return 'Generic TIFF';
   if (s.startsWith('mirax')) return 'MRXS';
+  if (s.startsWith('hamamatsu-vms')) return 'VMS (Hamamatsu)';
   if (s.startsWith('hamamatsu-ndpi')) return 'NDPI (Hamamatsu)';
   return s;
 }
@@ -974,14 +979,15 @@ function renderQualitySection() {
   updateQualityPolicyGate();
 }
 
-/// F3（MRXS）/F6（NDPI）画质说明：两者的瓦片都是拼接/分段解码后重编码——
-/// 「保留画质」是高质量重编码而非字节复制。仅 MRXS（mirax*）/NDPI
-/// （hamamatsu-ndpi*）识别后显示对应说明行。
+/// F3（MRXS）/F6（NDPI）/VMS 画质说明：三者的瓦片都是拼接/分段解码后
+/// 重编码——「保留画质」是高质量重编码而非字节复制。仅 MRXS（mirax*）/
+/// NDPI（hamamatsu-ndpi*）/VMS（hamamatsu-vms*）识别后显示对应说明行。
 function updateMrsxQualityNote() {
   const fmt = String(probeDoc().format || '');
   const bf = probeDoc().modality !== 'fluorescence';
   els.qualityMrsxNote.hidden = !(!!page.prep && fmt.startsWith('mirax') && bf);
   els.qualityNdpiNote.hidden = !(!!page.prep && fmt.startsWith('hamamatsu-ndpi') && bf);
+  els.qualityVmsNote.hidden = !(!!page.prep && fmt.startsWith('hamamatsu-vms') && bf);
 }
 
 /// 「像素严格无损」与「更小文件（有损）」互斥（U2 要求在 UI 也阻止，核心

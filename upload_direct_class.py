@@ -70,6 +70,7 @@ CONVERTER_SOURCE_FORMATS = frozenset({
     "generic-tiled-jpeg-tiff",  # 通用瓦片 JPEG TIFF → classic/ome（F5）
     "mirax-bundle",       # MRXS → 经典 BigTIFF
     "hamamatsu-ndpi-jpeg",  # NDPI → classic/ome（F6；描述 JSON 带 adapter）
+    "hamamatsu-vms-bundle",  # VMS → classic/ome（描述 JSON 带 adapter）
 })
 
 #: sniff 结果词表（actual 类别）

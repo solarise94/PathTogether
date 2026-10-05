@@ -10,16 +10,17 @@
 //  - readEntries 每批最多返回 100 项，必须循环到空批为止。
 'use strict';
 
-/// 拖入/选择的散文件里是否有 MRXS 成员（.mrxs 主入口或 .dat 数据文件）。
-/// 只是提示：接受与否由 engine.planMrxBundle 决定（缺成员 → 类型化信息）。
+/// 拖入/选择的散文件里是否是束包成员/入口（MRXS：.mrxs 主入口或 .dat 数据
+/// 文件；VMS：.vms 入口；.vmu 也交给 planner 以得到专门的类型化拒绝）。
+/// 只是提示：接受与否由 engine.planBundle 决定（缺成员 → 类型化信息）。
 export function looksLikeBundleMember(name) {
-  return /\.(mrxs|dat)$/i.test(String(name || ''));
+  return /\.(mrxs|dat|vms|vmu)$/i.test(String(name || ''));
 }
 
 /// 散文件路由判定（纯函数）：
 ///   'empty'    没有文件
-///   'bundle'   含 .mrxs/.dat → 交给 planner（单独/散装文件会得到缺失成员
-///              信息；恰好组成完整包则接受——绝不静默丢弃）
+///   'bundle'   含 .mrxs/.dat/.vms/.vmu → 交给 planner（单独/散装文件会得
+///              到缺失成员信息；恰好组成完整包则接受——绝不静默丢弃）
 ///   'multiple' 多个普通文件 → 「一次只处理一个切片文件」
 ///   'single'   单个普通切片文件 → 单文件流程
 export function bundleRoute(fileList) {

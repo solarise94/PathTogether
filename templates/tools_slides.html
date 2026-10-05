@@ -21,7 +21,7 @@
       <div class="brand-block">
         <p class="brand-tag" data-i18n="tools.brand">HistoPilot · 切片格式转换</p>
         <h1 data-i18n="tools.title">切片格式转换工具</h1>
-        <p class="subtitle" data-i18n="tools.subtitle">在本机浏览器内完成 KFB / KFBF / SVS / SCN / NDPI / 通用 TIFF 单文件与 MRXS 完整包的识别、转换与保存（BigTIFF / OME-TIFF）</p>
+        <p class="subtitle" data-i18n="tools.subtitle">在本机浏览器内完成 KFB / KFBF / SVS / SCN / NDPI / 通用 TIFF 单文件与 MRXS / VMS 完整包的识别、转换与保存（BigTIFF / OME-TIFF）</p>
       </div>
       <div class="topbar-actions">
         <a class="btn btn-secondary" href="/" data-i18n="tools.back.home">返回主页</a>
@@ -59,8 +59,8 @@
           <button type="button" id="pick-folder-btn" class="btn btn-secondary" data-i18n="tools.drop.pick.folder">选择文件夹（MRXS）</button>
         </div>
       </div>
-      <input id="file-input" name="file" type="file" accept=".kfb,.kfbf,.svs,.scn,.ndpi,.ome.tif,.ome.tiff,.tif,.tiff" class="visually-hidden-input" data-i18n-aria="tools.input.file.label" aria-label="切片文件（KFB / KFBF / SVS / SCN / NDPI / 通用 TIFF / OME-TIFF）" />
-      <input id="folder-input" name="folder" type="file" webkitdirectory multiple class="visually-hidden-input" data-i18n-aria="tools.input.folder.label" aria-label="MRXS 切片文件夹（完整包）" />
+      <input id="file-input" name="file" type="file" accept=".kfb,.kfbf,.svs,.scn,.ndpi,.ome.tif,.ome.tiff,.tif,.tiff,.vms,.vmu,.mrxs,.dat" class="visually-hidden-input" data-i18n-aria="tools.input.file.label" aria-label="切片文件（KFB / KFBF / SVS / SCN / NDPI / 通用 TIFF / OME-TIFF / VMS / MRXS）" />
+      <input id="folder-input" name="folder" type="file" webkitdirectory multiple class="visually-hidden-input" data-i18n-aria="tools.input.folder.label" aria-label="MRXS / VMS 切片文件夹（完整包）" />
       <p id="input-message" class="status-panel" role="status"></p>
       <!-- 阶段 1（先转换后上传）：OME-TIFF/转换器 BigTIFF 不进转换——
            「已是可上传格式」面板 + 「上传到工作台」（用户点击前零 /api 请求） -->
@@ -72,7 +72,7 @@
         </div>
         <p id="direct-status" class="status-panel" role="status" aria-live="polite"></p>
       </section>
-      <p id="input-hint" class="hint" data-i18n="tools.input.file.hint">支持已验证的 KFB（明场）、KFBF（荧光）、Aperio SVS、Leica SCN（明场，JPEG 编码）、Hamamatsu NDPI（明场，带 restart marker 的整层 JPEG）与通用瓦片 JPEG TIFF/BigTIFF（无厂商描述的明场金字塔）单文件，以及标准 MRXS 完整包（.mrxs 主文件 + 同名数据目录，含 Slidedat.ini、Index.dat、Data*.dat——用「选择文件夹（MRXS）」或拖入整个文件夹）；JPEG 2000 编码的 SVS、荧光/非 JPEG 编码的 SCN、无 restart marker 的 NDPI 层，以及条带存储 / LZW / deflate / 非 8 位 / 多通道的通用 TIFF 变体暂不支持。扩展名只是提示——页面按文件头识别，不支持的其他格式会在复制前被拒绝。</p>
+      <p id="input-hint" class="hint" data-i18n="tools.input.file.hint">支持已验证的 KFB（明场）、KFBF（荧光）、Aperio SVS、Leica SCN（明场，JPEG 编码）、Hamamatsu NDPI（明场，带 restart marker 的整层 JPEG）与通用瓦片 JPEG TIFF/BigTIFF（无厂商描述的明场金字塔）单文件，标准 MRXS 完整包（.mrxs 主文件 + 同名数据目录，含 Slidedat.ini、Index.dat、Data*.dat）与 Hamamatsu VMS 完整包（.vms 入口 + 同目录全部 tile JPEG——用「选择文件夹」或拖入整个文件夹）；JPEG 2000 编码的 SVS、荧光/非 JPEG 编码的 SCN、无 restart marker 的 NDPI/VMS tile，VMU（未压缩原始数据），以及条带存储 / LZW / deflate / 非 8 位 / 多通道的通用 TIFF 变体暂不支持。扩展名只是提示——页面按文件头识别，不支持的其他格式会在复制前被拒绝。</p>
     </section>
 
     <!-- 2 · 准备（复制与识别）：与转换阶段分开显示；可取消准备（U2） -->
@@ -115,6 +115,7 @@
       <!-- F3（MRXS）/F6（NDPI）：画质正下方一行格式特定说明——瓦片总是拼接后重编码 -->
       <p id="quality-mrxs-note" class="hint" role="note" data-i18n="tools.quality.mrxs.note" hidden>MRXS 的瓦片总是先按真实位置拼接、再重编码：「保留画质」指高质量重编码（不是字节复制），输出文件可能大于源包。</p>
       <p id="quality-ndpi-note" class="hint" role="note" data-i18n="tools.quality.ndpi.note" hidden>NDPI 的层是整层单条带 JPEG，总是先按 restart 区间有界分段解码、再重编码成瓦片：「保留画质」指高质量重编码（不是字节复制）。</p>
+      <p id="quality-vms-note" class="hint" role="note" data-i18n="tools.quality.vms.note" hidden>VMS 的巨型 tile JPEG 总是先按 restart 区间有界分段解码、按真实位置拼接、再重编码成瓦片：「保留画质」指高质量重编码（不是字节复制），输出文件可能大于源包。</p>
       <p id="quality-locked" class="hint" role="note" hidden></p>
 
       <!-- 更多选项（默认折叠）：输出目标软件 / 内存档位 / 像素策略 / 通道信息

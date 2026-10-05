@@ -702,8 +702,9 @@ async function prepareScratch(levels, ifdCount, modality, adapter) {
   const dirHandle = await jobDir.getDirectoryHandle('scratch', { create: true });
   const names = [];
   for (let l = 0; l < levels; l++) {
-    // MRXS composes from in-memory placements: no index spill, offcnt only
-    if (adapter !== E.MRXS_SOURCE_ADAPTER) {
+    // MRXS/VMS compose from in-memory placements/segment decodes: no index
+    // spill, offcnt only
+    if (adapter !== E.MRXS_SOURCE_ADAPTER && adapter !== E.VMS_SOURCE_ADAPTER) {
       names.push(modality === 'fluorescence' ? `kfbf-cells-l${l}` : `grid-l${l}`);
     }
   }
@@ -992,12 +993,14 @@ self.onmessage = async (ev) => {
       const members = await stageBundle(m.jobId, m.members, (done, total, mi, mc) => {
         post({ type: 'progress', progress: { unit: 'stage-bundle', done, total, member: mi, members: mc } });
       }, m.faults || null);
-      // manifest: root digest over (path, size, sha256) lines
+      // manifest: root digest over (path, size, sha256) lines; the adapter
+      // id comes from the runner's plan (MRXS 同名目录 / VMS 平铺文件夹)
       const rootDigest = E.bundleRootDigest(members);
       const manifest = {
         v: 1,
-        adapter: E.MRXS_SOURCE_ADAPTER,
-        adapterVersion: E.MRXS_ADAPTER_VERSION,
+        adapter: m.adapter || E.MRXS_SOURCE_ADAPTER,
+        adapterVersion: m.adapter === E.VMS_SOURCE_ADAPTER
+          ? E.VMS_ADAPTER_VERSION : E.MRXS_ADAPTER_VERSION,
         entry: m.entryName,
         stem: m.stem,
         members,

@@ -449,10 +449,13 @@ export class SlideToolsRunner {
     try {
       this._state = null;
       this._setState('selected');
-      const plan = await E.planMrxBundle(files);
+      // the entry kind picks the planner (MRXS 同名目录 / VMS 平铺文件夹；
+      // .vmu 在这里得到专门的类型化拒绝)
+      const plan = await E.planBundle(files);
+      const kind = plan.adapter === E.VMS_SOURCE_ADAPTER ? 'vms-bundle' : 'mrxs-bundle';
       const totalBytes = plan.members.reduce((a, m) => a + m.file.size, 0);
       if (totalBytes === 0) {
-        throw E.stError(E.ERROR_CODES.UNSUPPORTED_INPUT, '包成员为空', { kind: 'mrxs-bundle' });
+        throw E.stError(E.ERROR_CODES.UNSUPPORTED_INPUT, '包成员为空', { kind });
       }
       this._setState('probing');
       jobId = opts.jobId || E.newJobId();
@@ -469,6 +472,7 @@ export class SlideToolsRunner {
           members: plan.members,
           stem: plan.stem,
           entryName: plan.entryName,
+          adapter: plan.adapter || E.MRXS_SOURCE_ADAPTER,
           faults: this.testMode ? (opts.faults || null) : null,
         }, 60 * 60 * 1000);
         probeResult = await this._request('probe-bundle', {
@@ -515,8 +519,10 @@ export class SlideToolsRunner {
           core: this.coreVersion,
           estimate,
           modality: doc.modality,
-          sourceAdapter: doc.adapter || E.MRXS_SOURCE_ADAPTER,
-          adapterVersion: doc.adapter_version || E.MRXS_ADAPTER_VERSION,
+          sourceAdapter: doc.adapter || plan.adapter || E.MRXS_SOURCE_ADAPTER,
+          adapterVersion: doc.adapter_version
+            || (plan.adapter === E.VMS_SOURCE_ADAPTER ? E.VMS_ADAPTER_VERSION
+              : E.MRXS_ADAPTER_VERSION),
           outputProfile,
           encodingProfile: preparedEncoding,
           channelJson: null,
@@ -954,6 +960,13 @@ export class SlideToolsRunner {
           (st.gen.adapterVersion || '1') !== E.MRXS_ADAPTER_VERSION) {
         refuse(`进度记录属于 MRXS 适配器 v${st.gen.adapterVersion || '1'}，当前为 ` +
           `v${E.MRXS_ADAPTER_VERSION}（金字塔 ${E.MRXS_PYRAMID_METHOD}）：两种几何配方不得混合`,
+          { kind: 'source-adapter' });
+      }
+      // VMS：同一合同（分段解码拼接配方随适配器代际固定）
+      if (recordAdapter === E.VMS_SOURCE_ADAPTER &&
+          (st.gen.adapterVersion || '1') !== E.VMS_ADAPTER_VERSION) {
+        refuse(`进度记录属于 VMS 适配器 v${st.gen.adapterVersion || '1'}，当前为 ` +
+          `v${E.VMS_ADAPTER_VERSION}（金字塔 ${E.VMS_PYRAMID_METHOD}）：两种适配器配方不得混合`,
           { kind: 'source-adapter' });
       }
       // F4: same contract for the SCN adapter (the fill/pyramid recipe of

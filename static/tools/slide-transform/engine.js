@@ -412,10 +412,11 @@ export function magicModality(head) {
 /// in `_prepare` decides, so a disguised extension is still probed and a
 /// wrong extension on a real KFB still works). Used by the tool page to
 /// explain likely-unsupported inputs before attempting any read. Adding an
-/// input format (F1 SVS, F3 MRXS) means touching this table together with
-/// SUPPORTED_MAGICS above — one place for input capabilities.
+/// input format (F1 SVS, F3 MRXS, VMS) means touching this table together
+/// with SUPPORTED_MAGICS above — one place for input capabilities.
 export const INPUT_EXTENSION_HINTS = [
   { ext: /\.(mrxs|dat)$/i, kind: 'bundle' }, // MRXS needs the whole bundle
+  { ext: /\.(vms|vmu)$/i, kind: 'bundle' }, // VMS needs entry + sibling JPEGs; VMU → typed refusal
 ];
 
 /// 'bundle' | null for a file name (SVS is identified by its TIFF header).
@@ -462,6 +463,17 @@ export const NDPI_SOURCE_ADAPTER = 'hamamatsu-ndpi-jpeg';
 export const NDPI_ADAPTER_VERSION = '1';
 /// Must equal the Rust `PYRAMID_METHOD` (ndpi.rs).
 export const NDPI_PYRAMID_METHOD = 'l0-box2';
+/// Hamamatsu VMS bundle（.vms INI 入口 + 同目录拼接 tile JPEG；逐 tile 按
+/// restart 区间有界分段解码后按真实位置拼接重编码，降采样层 l0-box2 生成）。
+/// Must equal the Rust `ADAPTER_VERSION` / `MAX_MEMBERS` (bundle.rs).
+export const VMS_SOURCE_ADAPTER = 'hamamatsu-vms-bundle';
+export const VMS_ADAPTER_VERSION = '1';
+export const VMS_PYRAMID_METHOD = 'l0-box2';
+/// Must equal the Rust `MRAX_PRESERVE_COMPOSE_FINGERPRINT` family (the
+/// compose summary the core reports for VMS jobs).
+export const VMS_PRESERVE_COMPOSE_FINGERPRINT = 'vms-mosaic-compose:q96:y422:hstd:v1';
+/// The .vms INI entry is a small text file (the core caps it at 1 MiB).
+export const VMS_ENTRY_MAX_BYTES = 1 << 20;
 /// Converter-output source_format ids (same vocabulary as the Rust core's
 /// `CONVERTER_SOURCE_FORMATS` and upload_direct_class.py): a TIFF whose
 /// IFD-0 description JSON carries one of these is THIS TOOL's own output —
@@ -474,6 +486,7 @@ export const CONVERTER_SOURCE_FORMATS = [
   GTIFF_SOURCE_ADAPTER,
   SCN_SOURCE_ADAPTER,
   NDPI_SOURCE_ADAPTER,
+  VMS_SOURCE_ADAPTER,
 ];
 const LEICA_SCN_XML_NS = /leica-microsystems\.com\/scn/;
 /// Pure helpers (vitest-covered): OME-XML and converter-marked description
@@ -919,6 +932,177 @@ export async function planMrxBundle(files, readSlidedat) {
     members: required.map((n) => ({ name: n, file: sniff.files.get(n).file })) };
 }
 
+// --------------------------------------------- VMS bundle input (flat) --
+
+/// Bounded .vms INI parse: only the keys the bundle plan needs (the tile
+/// grid + optional map/opt/macro names). `iniBytes` must be
+/// ≤ VMS_ENTRY_MAX_BYTES. Pure (vitest-covered); throws typed
+/// unsupported_input errors the page shows verbatim.
+export function parseVmsMembers(iniBytes) {
+  const text = new TextDecoder('utf-8', { fatal: false }).decode(iniBytes).replace(/^\uFEFF/, '');
+  const kv = {};
+  let group = null;
+  for (const raw of text.split(/[\r\n]/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith(';') || line.startsWith('#')) continue;
+    if (line.startsWith('[') && line.endsWith(']')) { group = line.slice(1, -1); continue; }
+    const at = line.indexOf('=');
+    if (at > 0 && group !== null) kv[`${group}.${line.slice(0, at).trim()}`] = line.slice(at + 1).trim();
+  }
+  const G = 'Virtual Microscope Specimen';
+  const VMU = 'Uncompressed Virtual Microscope Specimen';
+  if (kv[`${VMU}.NoLayers`] !== undefined) {
+    throw stError(ERROR_CODES.UNSUPPORTED_INPUT,
+      'VMU（未压缩 Virtual Microscope Specimen）不在支持集：原始未压缩数据需要独立合同，'
+      + '本适配器只接受 VMS（[Virtual Microscope Specimen] 组）');
+  }
+  if (kv[`${G}.NoLayers`] === undefined) {
+    throw stError(ERROR_CODES.UNSUPPORTED_INPUT, '不是 VMS 包：入口缺少 [Virtual Microscope Specimen] 组');
+  }
+  if (kv[`${G}.NoLayers`] !== '1') {
+    throw stError(ERROR_CODES.UNSUPPORTED_INPUT,
+      `NoLayers=${kv[`${G}.NoLayers`]}：多焦面/多层 VMS 不在支持集（仅单层）`);
+  }
+  const cols = Number(kv[`${G}.NoJpegColumns`]);
+  const rows = Number(kv[`${G}.NoJpegRows`]);
+  if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || rows < 1
+    || cols > 4096 || rows > 4096) {
+    throw stError(ERROR_CODES.UNSUPPORTED_INPUT,
+      `网格 ${kv[`${G}.NoJpegColumns`]}×${kv[`${G}.NoJpegRows`]} 越界（NoJpegColumns/NoJpegRows 需在 1..=4096）`);
+  }
+  const imageFile = (c, r) => (c === 0 && r === 0 ? kv[`${G}.ImageFile`] : kv[`${G}.ImageFile(${c},${r})`]);
+  const tiles = [];
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const name = imageFile(c, r);
+      if (!name) {
+        throw stError(ERROR_CODES.UNSUPPORTED_INPUT,
+          `.vms 缺少 ${c === 0 && r === 0 ? 'ImageFile' : `ImageFile(${c},${r})`}`);
+      }
+      tiles.push(name);
+    }
+  }
+  const optional = ['MapFile', 'OptimisationFile', 'MacroImage']
+    .map((k) => kv[`${G}.${k}`])
+    .filter((v) => typeof v === 'string' && v.length > 0);
+  return { cols, rows, tiles, optional };
+}
+
+/// Pre-copy capability sniff of a VMS folder selection (flat bundle: the
+/// .vms entry plus its sibling tile JPEGs — NO same-name subdirectory).
+/// Decides BEFORE any large copy: exactly one entry (a .vmu entry gets the
+/// dedicated refusal), name normalisation, duplicates/case conflicts.
+/// Same input shape and result contract as sniffMrxBundle.
+export function sniffVmsBundle(files) {
+  const bad = (reason, extra = {}) => ({ supported: false, reason, ...extra });
+  if (!Array.isArray(files) || !files.length) return bad('没有选择任何文件');
+  if (files.length > MRXS_MAX_MEMBERS) {
+    return bad(`文件数 ${files.length} 超过包成员上限 ${MRXS_MAX_MEMBERS}`);
+  }
+  const entries = [];
+  for (const f of files) {
+    const rel = normaliseBundlePath(f.webkitRelativePath || f.relPath || f.name);
+    if (!rel) return bad(`成员路径非法：${f.webkitRelativePath || f.name}`);
+    entries.push({ rel, file: f.file || f });
+  }
+  const leaf = (rel) => rel.split('/').pop();
+  const vmsEntries = entries.filter((e) => /\.vms$/i.test(leaf(e.rel)));
+  const vmuEntries = entries.filter((e) => /\.vmu$/i.test(leaf(e.rel)));
+  if (vmuEntries.length > 0) {
+    return bad('VMU（未压缩 Virtual Microscope Specimen）不在支持集：原始未压缩数据需要独立合同，'
+      + '本适配器只接受 VMS');
+  }
+  if (vmsEntries.length === 0) {
+    return bad('缺少 .vms 主入口（VMS 需要入口文件 + 同目录 tile JPEG 的完整文件夹）',
+      { missing: ['<slide>.vms'] });
+  }
+  if (vmsEntries.length > 1) return bad('选择了多个 .vms 主入口（一次只转换一张切片）');
+  const entry = vmsEntries[0];
+  const segs = entry.rel.split('/');
+  const stem = leaf(entry.rel).replace(/\.vms$/i, '');
+  const rootLen = segs.length - 1;
+  if (!stem || stem === '.' || stem === '..') return bad('主入口文件名非法');
+  // member names are relative to the ENTRY's directory (the flat layout)
+  const seen = new Map();
+  const seenLower = new Map();
+  for (const e of entries) {
+    const esegs = e.rel.split('/');
+    if (esegs.length <= rootLen) continue;
+    const name = esegs.slice(rootLen).join('/');
+    if (!name) continue;
+    if (seen.has(name)) return bad(`成员重复：${name}`);
+    const lower = name.toLowerCase();
+    if (seenLower.has(lower) && seenLower.get(lower) !== name) {
+      return bad(`成员名大小写冲突：${name} 与 ${seenLower.get(lower)}`);
+    }
+    seen.set(name, e);
+    seenLower.set(lower, name);
+  }
+  return { supported: true, stem, entryName: leaf(entry.rel), files: seen, rootLen };
+}
+
+/// Full pre-copy plan for a VMS folder: sniff + bounded INI parse + the
+/// required-member set (entry, every ImageFile tile, optional map/opt/
+/// macro). Missing members are LISTED in one typed error before any copy.
+/// `readEntry(file, cap)` reads the entry bytes (injectable for vitest).
+export async function planVmsBundle(files, readEntry) {
+  const sniff = sniffVmsBundle(files);
+  if (!sniff.supported) {
+    throw stError(ERROR_CODES.UNSUPPORTED_INPUT, sniff.reason,
+      { kind: 'vms-bundle', missing: sniff.missing || undefined });
+  }
+  const { stem, entryName } = sniff;
+  const entryFile = sniff.files.get(entryName).file;
+  if (entryFile.size > VMS_ENTRY_MAX_BYTES) {
+    throw stError(ERROR_CODES.UNSUPPORTED_INPUT,
+      `.vms 入口大小 ${entryFile.size} 超过上限（文件异常）`, { kind: 'vms-bundle' });
+  }
+  const read = readEntry
+    ? readEntry
+    : (file, cap) => file.slice(0, cap).arrayBuffer();
+  let ini;
+  try {
+    ini = parseVmsMembers(new Uint8Array(await read(entryFile, VMS_ENTRY_MAX_BYTES)));
+  } catch (e) {
+    if (e && e.error) throw e;
+    throw stError(ERROR_CODES.UNSUPPORTED_INPUT, errText(e), { kind: 'vms-bundle' });
+  }
+  const safe = (name) => !name.includes('..') && !/[\\:]/.test(name) && name.length > 0
+    && name.length <= 255;
+  const required = [entryName, ...ini.tiles, ...ini.optional];
+  for (const n of [...ini.tiles, ...ini.optional]) {
+    if (!safe(n)) {
+      throw stError(ERROR_CODES.UNSUPPORTED_INPUT,
+        `引用文件名 ${n} 非法（路径穿越被拒绝）`, { kind: 'vms-bundle' });
+    }
+  }
+  const missing = required.filter((n) => !sniff.files.has(n));
+  if (missing.length) {
+    throw stError(ERROR_CODES.UNSUPPORTED_INPUT,
+      `包不完整，缺少成员：${missing.join('、')}（VMS 需要 .vms 入口 + 同目录全部 tile JPEG）`,
+      { kind: 'vms-bundle', missing });
+  }
+  return { stem, entryName, required, adapter: VMS_SOURCE_ADAPTER,
+    members: required.map((n) => ({ name: n, file: sniff.files.get(n).file })) };
+}
+
+/// Bundle plan dispatch by entry kind: `.mrxs` → the MRXS planner,
+/// `.vms` → the VMS planner, `.vmu` → the dedicated refusal. Same result
+/// shape either way ({ stem, entryName, required, members }).
+export async function planBundle(files, readSmall) {
+  const has = (re) => (Array.isArray(files) ? files : []).some((f) => {
+    const rel = String((f && (f.webkitRelativePath || f.relPath || f.name)) || '');
+    return re.test(rel.split('/').pop());
+  });
+  if (has(/\.vmu$/i)) {
+    throw stError(ERROR_CODES.UNSUPPORTED_INPUT,
+      'VMU（未压缩 Virtual Microscope Specimen）不在支持集：原始未压缩数据需要独立合同，'
+      + '本适配器只接受 VMS', { kind: 'vms-bundle' });
+  }
+  if (has(/\.vms$/i)) return planVmsBundle(files, readSmall);
+  return planMrxBundle(files, readSmall);
+}
+
 /// Manifest root digest: sha256 over `name\0size\0sha256\n` lines in
 /// member order — any member change (path, size, bytes) changes it.
 export function bundleRootDigest(members) {
@@ -1125,7 +1309,7 @@ export function isOmeProfile(profile) {
 /// after the entry stem.
 export function outputFileName(sourceName, job) {
   const base = String(sourceName || 'slide')
-    .replace(/\.(kfb|kfbf|svs|scn|ndpi|tif|tiff|mrxs)$/i, '') || 'slide';
+    .replace(/\.(kfb|kfbf|svs|scn|ndpi|tif|tiff|mrxs|vms)$/i, '') || 'slide';
   return isOmeProfile(jobOutputProfile(job)) ? `${base}.ome.tif` : `${base}.tif`;
 }
 

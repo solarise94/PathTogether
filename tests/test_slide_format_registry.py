@@ -215,8 +215,14 @@ def test_public_catalog_direct_class_flags():
     assert rows["ndpi"]["import_mode"] == "convert"
     assert rows["ndpi"]["browser_convert"] == "available"
     assert rows["ndpi"]["direct_import"] == "open"
+    # VMS：转换可用（.vms 入口 + 同目录 tile JPEG 的完整包），直传同样
+    # 保持开放——VMU 等在头级/入口级嗅探按 temporary 分流（同 ndpi/scn 的
+    # 处理：转换器落地与直传关闭是两个独立决定）
+    assert rows["vms"]["import_mode"] == "convert"
+    assert rows["vms"]["browser_convert"] == "available"
+    assert rows["vms"]["direct_import"] == "open"
     # 暂时直接导入：尚无浏览器转换器的格式
-    for rid in ("vms", "vmu", "bif", "svslide",
+    for rid in ("vmu", "bif", "svslide",
                 "raster-image"):
         assert rows[rid]["import_mode"] == "direct-temporary", rid
         assert rows[rid]["direct_import"] == "open", rid
@@ -227,10 +233,10 @@ def test_catalog_flag_derived_vocabularies():
     """catalog_rows_by_flag 派生两张词表（app 能力下发/关闭闸共用）。"""
     closed = reg.catalog_rows_by_flag("direct_import", "closed")
     assert closed == {"svs", "mrxs", "kfb", "kfbf"}
-    # F5/F6：tif/tiff 与 ndpi 加入 browser_convert 集合（direct_import 仍
-    # open）
+    # F5/F6：tif/tiff、ndpi 与 vms 加入 browser_convert 集合
+    #（direct_import 仍 open）
     bc = reg.catalog_rows_by_flag("browser_convert", "available")
-    assert bc == {"svs", "mrxs", "kfb", "kfbf", "scn", "tif", "tiff", "ndpi"}
+    assert bc == {"svs", "mrxs", "kfb", "kfbf", "scn", "tif", "tiff", "ndpi", "vms"}
 
 
 def test_vendor_names_corrected():

@@ -82,9 +82,11 @@ def test_capability_routes_convert_required_to_browser(monkeypatch):
     assert "kfb" not in p["formats"] and "kfbf" not in p["formats"]
     # 阶段 1：browser_convert 词表扩展到目录行级（kfb/kfbf + svs + mrxs）；
     # F4：scn 转换可用（direct_import 仍 open，不在直传关闭集）；
-    # F5：tif/tiff 转换可用（通用瓦片 JPEG TIFF；direct_import 仍 open）
-    assert {"kfb", "kfbf", "svs", "mrxs", "scn", "tif", "tiff"} == \
-        set(p["browser_convert"]["formats"])
+    # F5：tif/tiff 转换可用（通用瓦片 JPEG TIFF；direct_import 仍 open）；
+    # F6：ndpi 转换可用（带 restart marker 的整层 JPEG 明场；direct_import
+    # 仍 open——JPEG2000 等变体在头级嗅探按 temporary 分流）
+    assert {"kfb", "kfbf", "svs", "mrxs", "scn", "tif", "tiff",
+            "ndpi"} == set(p["browser_convert"]["formats"])
     assert p["browser_convert"]["url"] == "/tools/slides"
     # direct_upload 清单：直传开放格式（不含 svs/kfb/kfbf/mrxs/zip）
     du = set(p["direct_upload"]["formats"])

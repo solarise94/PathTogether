@@ -160,8 +160,11 @@ def test_sparse_grid_tiles_are_filled(workdir):
         (["--non-jpeg"], "基线 JPEG"),
         (["--desc", "ome"], "OME-TIFF"),
         (["--desc", "converter"], "不是转换输入"),
-        (["--desc", "foreign"], "不猜"),
-        (["--desc", "none"], "不猜"),
+        # F5 起无厂商描述（foreign/none）路由进通用瓦片 TIFF 适配器：
+        # 仍是复制前类型化拒绝（unsupported_kfb_variant），文案改为通用
+        # 适配器的结构拒绝（SCN 夹具 label 层在前、主图更大 → 金字塔检查）
+        (["--desc", "foreign"], "不是严格递减金字塔"),
+        (["--desc", "none"], "不是严格递减金字塔"),
     ],
 )
 def test_variant_rejections_before_copy(workdir, knobs, frag):

@@ -588,7 +588,7 @@ async function scenarioL() {
       save: document.getElementById('save-btn').textContent,
     }));
     record('l-zh-en-toggle', audit.rawKeys.length === 0 && audit.cjkSample === ''
-      && /保存到电脑/.test(backZh.save) && /本地切片工具/.test(backZh.h1),
+      && /保存到电脑/.test(backZh.save) && /切片格式转换工具/.test(backZh.h1),
       { ...audit, backZhH1: backZh.h1, backZhSave: backZh.save });
   } catch (e) {
     record('l-zh-en-toggle', false, { error: String(e).slice(0, 400) });

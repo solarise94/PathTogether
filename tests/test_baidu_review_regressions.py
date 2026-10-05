@@ -24,10 +24,10 @@ def _sql(query, args=()):
 def test_duplicate_names_rejected_before_quota_or_transfer(monkeypatch, second_size):
     fake, enum_id, cands = make_ready_enumeration(
         monkeypatch, owner=OWNER, entries=[
-            {"path": "/A/sample.svs", "size": 4},
-            {"path": "/B/sample.svs", "size": second_size},
+            {"path": "/A/sample.tif", "size": 4},
+            {"path": "/B/sample.tif", "size": second_size},
         ])
-    ids = [cands[p]["id"] for p in ("A/sample.svs", "B/sample.svs")]
+    ids = [cands[p]["id"] for p in ("A/sample.tif", "B/sample.tif")]
     def quota(*args):
         pytest.fail("同名拒绝必须发生在配额预占之前")
     with pytest.raises(store.ValidationError) as exc:
@@ -44,11 +44,11 @@ def test_duplicate_names_rejected_before_quota_or_transfer(monkeypatch, second_s
 def test_legacy_duplicate_batch_stops_before_external_actions(monkeypatch, tmp_path):
     fake, enum_id, cands = make_ready_enumeration(
         monkeypatch, owner=OWNER, entries=[
-            {"path": "/A/sample.svs", "size": 4},
-            {"path": "/B/other.svs", "size": 4},
+            {"path": "/A/sample.tif", "size": 4},
+            {"path": "/B/other.tif", "size": 4},
         ])
     batch = store.create_import(OWNER, enum_id, [
-        cands["A/sample.svs"]["id"], cands["B/other.svs"]["id"]])
+        cands["A/sample.tif"]["id"], cands["B/other.tif"]["id"]])
     # 模拟旧版本已经接受的冲突批次。
     _sql("UPDATE baidu_import_items SET name='sample.svs' WHERE batch_id=%s",
          (batch["id"],))
@@ -65,7 +65,7 @@ def test_legacy_duplicate_batch_stops_before_external_actions(monkeypatch, tmp_p
 @pytest.mark.parametrize("old_failure", [False, True])
 @pytest.mark.parametrize("new_owner", ["baidu-worker", "another-worker"])
 def test_stale_enumerator_cannot_overwrite_new_result(monkeypatch, old_failure, new_owner):
-    fake = install_fake(monkeypatch, entries=[{"path": "/old.svs", "size": 4}])
+    fake = install_fake(monkeypatch, entries=[{"path": "/old.tif", "size": 4}])
     enum_id = store.create_enumeration(OWNER, "https://pan.baidu.com/s/1Review")['id']
     old = store.claim_enumeration("baidu-worker")
     original = fake.list_share_page
@@ -79,7 +79,7 @@ def test_stale_enumerator_cannot_overwrite_new_result(monkeypatch, old_failure, 
             enum_id, old["lease_owner"], 999, old["lease_token"]) is False
         assert store.heartbeat_enumeration(
             enum_id, old["lease_owner"], old["lease_token"]) is False
-        winner = FakeBaiduAdapter(entries=[{"path": "/new.svs", "size": 8}])
+        winner = FakeBaiduAdapter(entries=[{"path": "/new.tif", "size": 8}])
         assert store.run_one_enumeration(new, winner)["state"] == "ready"
         if old_failure:
             raise AdapterError("connector_timeout", "injected")
@@ -92,11 +92,11 @@ def test_stale_enumerator_cannot_overwrite_new_result(monkeypatch, old_failure, 
     assert view["scanned_count"] == view["candidate_count"] == 1
     assert view["error_code"] is None
     assert [c["relative_path"] for c in store.list_candidates(
-        enum_id, OWNER)["items"]] == ["new.svs"]
+        enum_id, OWNER)["items"]] == ["new.tif"]
 
 
 def test_candidates_and_terminal_state_commit_atomically(monkeypatch):
-    fake = install_fake(monkeypatch, entries=[{"path": "/a.svs", "size": 4}])
+    fake = install_fake(monkeypatch, entries=[{"path": "/a.tif", "size": 4}])
     enum_id = store.create_enumeration(OWNER, "https://pan.baidu.com/s/1Atomic")['id']
     claim = store.claim_enumeration()
     original = store._insert_candidates
@@ -118,8 +118,8 @@ def test_candidates_and_terminal_state_commit_atomically(monkeypatch):
 
 def test_copy_reconciliation_error_reaches_terminal_state(monkeypatch, tmp_path):
     fake, enum_id, cands = make_ready_enumeration(
-        monkeypatch, owner=OWNER, entries=[{"path": "/a.svs", "size": 4}])
-    batch = store.create_import(OWNER, enum_id, [cands['a.svs']['id']])
+        monkeypatch, owner=OWNER, entries=[{"path": "/a.tif", "size": 4}])
+    batch = store.create_import(OWNER, enum_id, [cands['a.tif']['id']])
     def fail(*args):
         raise AdapterError('connector_failed', 'injected list error')
     monkeypatch.setattr(fake, 'list_batch_copies', fail)

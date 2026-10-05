@@ -94,8 +94,9 @@ def batch(env):
     result = bstore.run_enumeration(out["id"], fake)
     assert result["state"] == "ready", result
     cands = bstore.list_candidates(out["id"], env.uid)
+    # 先转换后上传阶段 1：筛选层只放行 TIFF 类候选（sample.svs 不可选）
     cand = [c for c in cands["items"]
-            if c["name"] == "sample.svs"][0]
+            if c["name"] == "scan.ome.tif"][0]
 
     def hook(user_id, nbytes):
         res = upload_guard.reserve_upload(user_id, nbytes)

@@ -58,17 +58,11 @@ CLI = Path(__file__).resolve().parents[1] / "slide-transform-core" / \
 
 @pytest.fixture(scope="module")
 def kfb_bytes():
-    """合成 KFB（原生 CLI 生成；不使用任何私有样本）。"""
-    import subprocess
-    if not CLI.is_file():
-        pytest.skip("native CLI missing: %s" % CLI)
-    out = Path(os.environ.get("TMPDIR", "/tmp")) / (
-        "c5b-integr-%s.kfb" % os.urandom(3).hex())
-    subprocess.run([str(CLI), "gen-kfb", str(out), "--width", "580",
-                    "--height", "300"], check=True)
-    data = out.read_bytes()
-    out.unlink(missing_ok=True)
-    return data
+    """合成源字节（先转换后上传阶段 1：百度筛选只放行 TIFF 类候选，插件
+    worker 对 native 条目直接交付不做转换——用最小 TIFF，不用任何私有
+    样本；名字沿用 kfb_bytes 以减少测试面改动）。"""
+    from _tiff_fixtures import make_tiff_bytes
+    return make_tiff_bytes(h=300, w=580)
 
 
 @pytest.fixture(autouse=True)
@@ -133,14 +127,14 @@ def _sql_one(query, args=()):
 def batch(env, kfb_bytes, monkeypatch):
     """queued 批次（真实枚举→导入；fake 适配器只供分享元数据）。"""
     install_fake(monkeypatch, entries=[
-        {"path": "/B1/big.kfb", "size": len(kfb_bytes)}])
+        {"path": "/B1/big.tif", "size": len(kfb_bytes)}])
     fake = bstore.get_adapter()
     out = bstore.create_enumeration(
         env.uid, "https://pan.baidu.com/s/1TestShareId77")
     result = bstore.run_enumeration(out["id"], fake)
     assert result["state"] == "ready", result
     cands = bstore.list_candidates(out["id"], env.uid)
-    cand = [c for c in cands["items"] if c["name"] == "big.kfb"][0]
+    cand = [c for c in cands["items"] if c["name"] == "big.tif"][0]
 
     def hook(user_id, nbytes):
         res = upload_guard.reserve_upload(user_id, nbytes)
@@ -178,12 +172,12 @@ def test_worker_full_chain_against_real_app(http_app, env, batch, kfb_bytes,
     platform = PlatformClient(cfg)
     # fake 源：批次副本已转存（fs_id 缺口的对账路径；内容 = 合成 KFB）
     source = FakeSource(entries=[
-        {"path": "/B1/big.kfb", "fs_id": "7000001",
+        {"path": "/B1/big.tif", "fs_id": "7000001",
          "size": len(kfb_bytes), "content": kfb_bytes}])
     batch_id = batch["id"]
     source.copies[batch_id] = {
-        "big.kfb": {"fs_id": "7000001", "path": "/B1/big.kfb",
-                    "name": "big.kfb", "size": len(kfb_bytes),
+        "big.tif": {"fs_id": "7000001", "path": "/B1/big.tif",
+                    "name": "big.tif", "size": len(kfb_bytes),
                     "content": kfb_bytes}}
     converter = Converter(cfg.slide_transform_bin,
                           timeout=cfg.convert_timeout)
@@ -280,11 +274,11 @@ def test_worker_claim_reports_lease_fence_against_real_app(
         "PT_CLEANUP_BACKOFF_BASE": "0.05",
     })
     source = FakeSource(entries=[
-        {"path": "/B1/big.kfb", "fs_id": "7000001",
+        {"path": "/B1/big.tif", "fs_id": "7000001",
          "size": len(kfb_bytes), "content": kfb_bytes}])
     source.copies[batch["id"]] = {
-        "big.kfb": {"fs_id": "7000001", "path": "/B1/big.kfb",
-                    "name": "big.kfb", "size": len(kfb_bytes),
+        "big.tif": {"fs_id": "7000001", "path": "/B1/big.tif",
+                    "name": "big.tif", "size": len(kfb_bytes),
                     "content": kfb_bytes}}
     ctx = ItemContext(
         cfg, PlatformClient(cfg), source,
@@ -330,14 +324,14 @@ def test_worker_retry_after_failed_item_against_real_app(
         "PT_RECEIPT_POLL_MAX": "60",
     })
     source = FakeSource(entries=[
-        {"path": "/B1/big.kfb", "fs_id": "7000001",
+        {"path": "/B1/big.tif", "fs_id": "7000001",
          "size": len(kfb_bytes), "content": kfb_bytes}])
     batch_id = batch["id"]
     source.copies[batch_id] = {
-        "big.kfb": {"fs_id": "7000001", "path": "/B1/big.kfb",
-                    "name": "big.kfb", "size": len(kfb_bytes),
+        "big.tif": {"fs_id": "7000001", "path": "/B1/big.tif",
+                    "name": "big.tif", "size": len(kfb_bytes),
                     "content": kfb_bytes}}
-    source.fail_download_names.add("big.kfb")
+    source.fail_download_names.add("big.tif")
     ctx = ItemContext(
         cfg, PlatformClient(cfg), source,
         Converter(cfg.slide_transform_bin, timeout=cfg.convert_timeout),

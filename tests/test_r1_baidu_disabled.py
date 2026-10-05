@@ -85,7 +85,7 @@ def _counts():
 def _failed_batch(monkeypatch):
     """一个已终态 failed、条目可重试的批次（生产盘点中的形态）。"""
     _fake, _enum_id, batch = create_batch(
-        monkeypatch, owner=USER, paths=["A1/sample.svs"],
+        monkeypatch, owner=USER, paths=["A1/scan.ome.tif"],
         idempotency_key="r1-failed")
     _sql("UPDATE baidu_import_items SET stage='failed',"
          " error_code='download_failed' WHERE batch_id=%s", (batch["id"],))
@@ -119,7 +119,7 @@ def test_both_flags_off_rejects_all_new_work_over_http(_iso, monkeypatch):
 
     r = client.post("/api/remote-imports/baidu/imports",
                     json={"enumeration_id": enum_id,
-                          "candidate_ids": [by_path["A1/sample.svs"]["id"]]},
+                          "candidate_ids": [by_path["A1/scan.ome.tif"]["id"]]},
                     headers={"Idempotency-Key": "r1-new"})
     assert r.status_code == 503, r.get_json()
     assert r.get_json()["code"] == "enumeration_disabled"
@@ -152,7 +152,7 @@ def test_import_flag_off_alone_rejects_batches(_iso, monkeypatch):
 
     r = client.post("/api/remote-imports/baidu/imports",
                     json={"enumeration_id": enum_id,
-                          "candidate_ids": [by_path["A1/sample.svs"]["id"]]},
+                          "candidate_ids": [by_path["A1/scan.ome.tif"]["id"]]},
                     headers={"Idempotency-Key": "r1-new2"})
     assert r.status_code == 503
     assert r.get_json()["code"] == "import_disabled"

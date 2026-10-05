@@ -279,15 +279,43 @@ pub fn ndpi_find_f64(
     if raw.len() < 8 && e.typ == 5 || raw.len() < 8 && e.typ == 12 {
         return Err(CoreError::metadata(format!("tag {t} 值过短")));
     }
+    // 数值一律按文件字节序解析（SourceLens/MPP 都走此路径；大端文件曾因
+    // 无条件 from_le_bytes 解析出错误值——macro 的 -1.0 被读成正数）
     Ok(Some(match e.typ {
-        3 => u16::from_le_bytes([raw[0], raw[1]]) as f64,
-        4 => u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as f64,
-        9 => i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as f64,
-        11 => f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as f64,
-        12 => f64::from_le_bytes(raw[..8].try_into().unwrap()),
+        3 => u16_at_val(&e.val, hdr.little) as f64,
+        4 => u32_at_val(&e.val, hdr.little) as f64,
+        9 => u32_at_val(&e.val, hdr.little) as i32 as f64,
+        11 => {
+            let w = if hdr.little {
+                u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])
+            } else {
+                u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]])
+            };
+            f32::from_bits(w) as f64
+        }
+        12 => {
+            let mut b8 = [0u8; 8];
+            b8.copy_from_slice(&raw[..8]);
+            if hdr.little {
+                f64::from_le_bytes(b8)
+            } else {
+                f64::from_be_bytes(b8)
+            }
+        }
         5 => {
-            let num = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-            let den = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+            // RATIONAL 是外联值：num/den 都取自 raw（entry_value 的 8 字节）
+            let num_w = [raw[0], raw[1], raw[2], raw[3]];
+            let num = if hdr.little {
+                u32::from_le_bytes(num_w)
+            } else {
+                u32::from_be_bytes(num_w)
+            };
+            let den_w = [raw[4], raw[5], raw[6], raw[7]];
+            let den = if hdr.little {
+                u32::from_le_bytes(den_w)
+            } else {
+                u32::from_be_bytes(den_w)
+            };
             if den == 0 {
                 return Err(CoreError::metadata(format!("tag {t} RATIONAL 分母为 0")));
             }
@@ -829,8 +857,13 @@ pub fn probe_ndpi(src: &dyn ByteSource) -> CoreResult<NdpiDoc> {
 // estimate
 // --------------------------------------------------------------------------- //
 
-/// Disk-precheck estimate for the NDPI adapter (MRXS 同族上界：输出 tile 全部
-/// 按「保留画质」重编码，源条带字节数只是像素代理；运行时输出上限兜底).
+/// Disk-precheck estimate for the NDPI adapter. 输出 tile 全部按「保留画质」
+/// 重编码，源条带字节数只是像素代理：实测公开样本（CMU-1.ndpi，q≈85 4:4:4
+/// 源条带 183,585,327 B）的 preserve 输出 502,582,927 B ≈ 2.74× payload，
+/// 2× 上界被突破（浏览器磁盘预检按上界预留 OPFS 配额）——preserve 取 4×
+/// payload（bound/actual ≈ 1.47）；compact 实测 201,041,264 B ≈ 1.10×
+/// payload，1.5× 成立。病态低画质源仍可能超出倍数外推——运行时输出上限
+/// 与逐写盘检查是最后的硬闸（engine.js 磁盘闸取这里的安全上界）。
 pub fn estimate_ndpi(doc: &NdpiDoc) -> crate::estimate::OutputEstimate {
     let l0 = &doc.levels[0];
     let payload = l0.strip_bytes;
@@ -857,7 +890,7 @@ pub fn estimate_ndpi(doc: &NdpiDoc) -> crate::estimate::OutputEstimate {
         edge_tiles: 0, // every tile is a full 256×256 canvas re-encode
         ifds,
         output_upper_bound_bytes: payload
-            .saturating_mul(2)
+            .saturating_mul(4)
             .saturating_add(tiles.saturating_mul(16))
             .saturating_add(base),
         compact_upper_bound_bytes: payload

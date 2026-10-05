@@ -69,6 +69,7 @@ CONVERTER_SOURCE_FORMATS = frozenset({
     "leica-scn-jpeg",     # SCN → classic/ome（F4；描述 JSON 带 adapter）
     "generic-tiled-jpeg-tiff",  # 通用瓦片 JPEG TIFF → classic/ome（F5）
     "mirax-bundle",       # MRXS → 经典 BigTIFF
+    "hamamatsu-ndpi-jpeg",  # NDPI → classic/ome（F6；描述 JSON 带 adapter）
 })
 
 #: sniff 结果词表（actual 类别）
@@ -141,8 +142,9 @@ def _parse_tiff_head(fh):
         return None
 
     if bigtiff:
-        # 头布局（16B）：II(2) 43(2) offsetsizes(2,须为 2) reserved(2) IFD 偏移(8)
-        if len(head) < 6 or head[4] != 2:
+        # 头布局（16B）：II(2) 43(2) offsetsizes(2,须为 8——BigTIFF 规格与
+        # 本工具产物/OME-TIFF 一致) reserved(2) IFD 偏移(8)
+        if len(head) < 6 or head[4] != 8:
             return None
         extra = fh.read(8)
         if len(extra) < 8:

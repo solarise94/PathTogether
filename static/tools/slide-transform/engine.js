@@ -473,6 +473,7 @@ export const CONVERTER_SOURCE_FORMATS = [
   'mirax-bundle',
   GTIFF_SOURCE_ADAPTER,
   SCN_SOURCE_ADAPTER,
+  NDPI_SOURCE_ADAPTER,
 ];
 const LEICA_SCN_XML_NS = /leica-microsystems\.com\/scn/;
 /// Pure helpers (vitest-covered): OME-XML and converter-marked description

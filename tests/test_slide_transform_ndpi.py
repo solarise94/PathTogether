@@ -259,6 +259,19 @@ def test_real_sample_probe_and_default_budget_conversion(workdir):
     assert rj["tiles_raw_copied"] == 0
     assert rj["composed"]["fingerprint"] == "ndpi-segment-compose:q96:y422:hstd:v1"
     assert sum(l["tiles_total"] for l in rj["levels"]) == rj["validation"]["tile_records_emitted"]
+    # 审查回归（medium）：磁盘预检上界必须是实际上界的真上界——真实样本
+    # preserve 输出 ≈ 2.74× 源条带字节，2× 上界曾被突破（浏览器磁盘闸按
+    # 该上界预留 OPFS 配额）
+    est = json.loads(_cli("probe", NDPI_SAMPLE).stdout)["estimate"]
+    assert est["output_upper_bound_bytes"] >= rj["output_bytes"], (
+        f"output_upper_bound {est['output_upper_bound_bytes']} < actual {rj['output_bytes']}")
+    rj_c = json.loads(
+        _cli("convert", NDPI_SAMPLE, workdir / "cmu1-ndpi-compact.ome.tif",
+             "--overwrite", "--profile", "bf-ome", "--encoding", "compact",
+             "--timeout", "3600").stdout)
+    est_c = est["compact_upper_bound_bytes"]
+    assert est_c >= rj_c["output_bytes"], (
+        f"compact_upper_bound {est_c} < actual {rj_c['output_bytes']}")
     vj = json.loads(
         _cli("validate", out, "--expect-ifd", str(rj["validation"]["ifd_count"])).stdout
     )

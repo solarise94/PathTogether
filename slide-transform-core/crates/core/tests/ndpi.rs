@@ -553,6 +553,215 @@ fn resume_from_a_crash_inside_l0_is_byte_identical() {
 }
 
 #[test]
+fn resume_from_a_crash_inside_a_generated_level_is_byte_identical() {
+    // 审查回归（high）：崩溃落在生成层（level ≥ 1）时，resume 对已完成层
+    // 必须 restage 描述 JSON——空描述会丢 tag 270，产物与不中断运行不再
+    // 逐字节一致（convert_scn.rs 同一坑的显式预防）。
+    use slide_transform_core::io::{FileSink, FileScratch, FileSource};
+    use slide_transform_core::resume::ResumePoint;
+
+    // 1024×640：L0 = 4×3 tiles = 3 checkpoint 行；生成层 512×320 = 2×2
+    // tiles = 2 行 → 崩溃点 4 落在生成层的第一行（cell=2 未提交）
+    let data = gen(&NdpiGenParams { width: 1024, height: 640, levels: 1, ..Default::default() });
+    let dir = std::env::temp_dir().join(format!(
+        "stc6-ndpi-resume-gen-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src_path = dir.join("in.ndpi");
+    std::fs::write(&src_path, &data).unwrap();
+    let plan = || plan_for(OutputProfile::ClassicJpegBigTiff, PixelPolicy::AllowEdgeReencode);
+    let src = || FileSource::open(&src_path).unwrap();
+
+    // reference run
+    let ref_out = dir.join("ref.tif");
+    let mut scratch = FileScratch::new(&dir);
+    {
+        let mut out = FileSink::create(&ref_out).unwrap();
+        let null = NullProgress;
+        let job = JobControl::new(&null);
+        convert_ndpi::convert_ndpi_to_bigtiff(&src(), &mut out, &mut scratch, &plan(), &job)
+            .unwrap();
+        out.flush().unwrap();
+    }
+    let ref_sha = sha256(&std::fs::read(&ref_out).unwrap());
+
+    // crashed run: cancel from checkpoint 4（L0 有 3 行 → 必落在生成层）
+    let crash_dir = dir.join("crash");
+    std::fs::create_dir_all(&crash_dir).unwrap();
+    let part_out = dir.join("part.tif");
+    let cancel = CancelFlag::new();
+    let collector = Collector {
+        states: Mutex::new(Vec::new()),
+        stop_after: Some(4),
+        cancel: cancel.clone(),
+        count: AtomicUsize::new(0),
+    };
+    let mut scratch2 = FileScratch::new(&crash_dir);
+    {
+        let mut out = FileSink::create(&part_out).unwrap();
+        let null = NullProgress;
+        let job = JobControl::new(&null).with_cancel(cancel).with_checkpoint(&collector);
+        let res = convert_ndpi::convert_ndpi_to_bigtiff(&src(), &mut out, &mut scratch2, &plan(), &job);
+        match res {
+            Err(e) => assert!(e.message.contains("已取消"), "unexpected err {e:?}"),
+            Ok(_) => panic!("expected the injected cancel to abort"),
+        }
+        out.flush().unwrap();
+    }
+    let states = collector.states.lock().unwrap().clone();
+    let last = states.last().unwrap();
+    assert!(
+        last.level >= 1,
+        "the crash must sit inside a GENERATED level for this test to mean anything (got level {})",
+        last.level
+    );
+    let rp = ResumePoint {
+        level: last.level as usize,
+        channel: last.channel.unwrap_or(0),
+        cell: last.cell_done,
+        committed_output: last.committed_output,
+        ifd_tiles: last.ifd_tiles.clone(),
+        adapter_version: Some(ADAPTER_VERSION.to_string()),
+    };
+    // crash aftermath the host guarantees: output + offcnt scratch truncated
+    {
+        let f = std::fs::OpenOptions::new().write(true).open(&part_out).unwrap();
+        f.set_len(rp.committed_output).unwrap();
+    }
+    for (i, &tiles) in rp.ifd_tiles.iter().enumerate() {
+        let p = crash_dir.join(format!(".kfb2tiff-scratch-offcnt-l{i}"));
+        if p.exists() {
+            let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+            f.set_len(tiles * 12).unwrap();
+        }
+    }
+
+    // resume run
+    let resumed;
+    {
+        let mut out = FileSink::open_preserve(&part_out).unwrap();
+        let null = NullProgress;
+        let job = JobControl::new(&null);
+        let r = convert_ndpi::convert_ndpi_to_bigtiff_resume(
+            &src(),
+            &mut out,
+            &mut scratch2,
+            &plan(),
+            &job,
+            &rp,
+        )
+        .unwrap();
+        out.flush().unwrap();
+        assert_eq!(r.output_bytes, std::fs::metadata(&part_out).unwrap().len());
+        resumed = r;
+    }
+    assert_eq!(
+        sha256(&std::fs::read(&part_out).unwrap()),
+        ref_sha,
+        "resumed bytes differ (description restage / out-of-level determinism)"
+    );
+    // 1024×640 → L0 + 生成尾 (512×320) + (256×160) = 3 层
+    assert_eq!(resumed.levels.len(), 3);
+}
+
+/// 审查回归（medium）：本转换器自己的 classic BigTIFF 产物（描述 JSON 带
+/// "source_format": "hamamatsu-ndpi-jpeg"）必须被厂商嗅探识别为转换器输出，
+/// 绝不能落进通用 TIFF 适配器做第二次有损重编码。
+#[test]
+fn converter_output_is_typed_rejected_not_reconvertible() {
+    let data = gen(&default_params());
+    let (_r, out) = convert(&data, OutputProfile::ClassicJpegBigTiff).expect("convert");
+    let out_src = MemSource::new(out);
+    use slide_transform_core::scn::{classify_description, sniff_tiff_vendor, TiffVendor};
+    assert_eq!(
+        sniff_tiff_vendor(&out_src).unwrap(),
+        TiffVendor::ConverterBigTiff,
+        "NDPI converter output must be recognized as converter output"
+    );
+    // 纯描述分类器同一判定（词表逐条核对）
+    let hdr = slide_transform_core::tiff_read::read_header(&out_src).unwrap();
+    let chain = slide_transform_core::tiff_read::ifd_chain(&out_src, &hdr).unwrap();
+    let desc = match chain[0].find(270) {
+        Some(e) => String::from_utf8_lossy(&slide_transform_core::tiff_read::entry_value(&out_src, &hdr, e).unwrap())
+            .to_string(),
+        None => String::new(),
+    };
+    assert!(desc.contains("\"source_format\": \"hamamatsu-ndpi-jpeg\""), "{desc}");
+    assert_eq!(classify_description(&desc), TiffVendor::ConverterBigTiff);
+    assert!(slide_transform_core::scn::CONVERTER_SOURCE_FORMATS
+        .contains(&"hamamatsu-ndpi-jpeg"));
+}
+
+/// 审查回归（medium）：ndpi_find_f64 必须按文件字节序解析（SourceLens /
+/// MPP），大端文件曾因无条件 from_le_bytes 解析出错误值（macro 的
+/// SourceLens=-1 会被读成正数）。
+#[test]
+fn f64_tags_parse_per_byte_order() {
+    use slide_transform_core::ndpi::ndpi_find_f64;
+    use slide_transform_core::tiff_read::{read_header, read_ifd};
+
+    // 手工构造一条 IFD：FLOAT SourceLens=20.0、FLOAT macro-lens=-1.0、
+    // DOUBLE MPP=0.499、RATIONAL 1/2（DOUBLE/RATIONAL 为外联值）——
+    // LE/BE 两种字节序编码，解析出的数值必须一致。
+    fn build(little: bool) -> (MemSource, u64) {
+        let p16 = |v: u16| if little { v.to_le_bytes().to_vec() } else { v.to_be_bytes().to_vec() };
+        let p32 = |v: u32| if little { v.to_le_bytes().to_vec() } else { v.to_be_bytes().to_vec() };
+        let f32b = |v: f32| if little { v.to_le_bytes().to_vec() } else { v.to_be_bytes().to_vec() };
+        let f64b = |v: f64| if little { v.to_le_bytes().to_vec() } else { v.to_be_bytes().to_vec() };
+        let ifd_at: u64 = 8;
+        let heap_at: u64 = ifd_at + 2 + 4 * 12 + 4; // count + 4 entries + next
+        let mut b: Vec<u8> = Vec::new();
+        b.extend_from_slice(if little { b"II" } else { b"MM" });
+        b.extend_from_slice(&p16(42));
+        b.extend_from_slice(&p32(ifd_at as u32));
+        b.extend_from_slice(&p16(4));
+        let mut entry = |tag: u16, typ: u16, val: &[u8]| {
+            b.extend_from_slice(&p16(tag));
+            b.extend_from_slice(&p16(typ));
+            b.extend_from_slice(&p32(1));
+            if typ == 12 || typ == 5 {
+                // 外联：值域字段是绝对偏移（DOUBBLE 8 B / RATIONAL 8 B）
+                let off = heap_at
+                    + if tag == 65441 { 0 } else { 8 };
+                b.extend_from_slice(&p32(off as u32));
+            } else {
+                let mut v = val.to_vec();
+                v.resize(4, 0);
+                b.extend_from_slice(&v);
+            }
+        };
+        entry(65421, 11, &f32b(20.0));
+        entry(65422, 11, &f32b(-1.0));
+        entry(65441, 12, &f64b(0.499));
+        entry(65442, 5, &[&p32(1)[..], &p32(2)[..]].concat());
+        b.extend_from_slice(&p32(0)); // next
+        b.extend_from_slice(&f64b(0.499)); // heap: DOUBLE
+        b.extend_from_slice(&p32(1));
+        b.extend_from_slice(&p32(2)); // heap: RATIONAL 1/2
+        (MemSource::new(b), ifd_at)
+    }
+    for little in [true, false] {
+        let (src, ifd_at) = build(little);
+        let hdr = read_header(&src).unwrap();
+        let ifd = read_ifd(&src, &hdr, ifd_at).unwrap();
+        let ext: Vec<u32> = vec![0; ifd.entries.len()];
+        let lens = ndpi_find_f64(&src, &hdr, &ifd, 65421).unwrap().unwrap();
+        assert_eq!(lens, 20.0, "little={little}: SourceLens");
+        let macro_lens = ndpi_find_f64(&src, &hdr, &ifd, 65422).unwrap().unwrap();
+        assert_eq!(macro_lens, -1.0, "little={little}: negative SourceLens");
+        let mpp = ndpi_find_f64(&src, &hdr, &ifd, 65441).unwrap().unwrap();
+        assert!((mpp - 0.499).abs() < 1e-12, "little={little}: MPP {mpp}");
+        let rat = ndpi_find_f64(&src, &hdr, &ifd, 65442).unwrap().unwrap();
+        assert_eq!(rat, 0.5, "little={little}: RATIONAL");
+    }
+}
+
+#[test]
 fn resume_refuses_a_foreign_or_absent_adapter_version() {
     use slide_transform_core::io::{FileScratch, FileSink, FileSource};
     use slide_transform_core::resume::ResumePoint;

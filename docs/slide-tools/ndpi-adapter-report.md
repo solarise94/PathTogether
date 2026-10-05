@@ -56,7 +56,7 @@ Code:
 | source_format + `ADAPTER_VERSION="1"`；续跑 journal 携带转换器 id/版本 | **PASS** — 报告/provenance/journal/checkpoint 携带 `hamamatsu-ndpi-jpeg`/`1`；换版本（或字段缺失）的 checkpoint 在核心入口拒绝 |
 | 换转换器或源文件被改拒绝续跑 | **PASS** — `run_faults.js --only ndpi`：`ndpi-adapter-change-refused`（resume_refused / source-adapter）与 `ndpi-source-changed-refused`（source_changed_refuse_resume）两行 PASS；诚实续跑 == 原生字节（Rust resume 测试逐字节一致） |
 | CLI 路由 + `gen-ndpi` 子命令 | **PASS** — probe/convert 按厂商分派；`gen-ndpi` 无样本单测夹具 |
-| wasm probe/convert/resume 路由；engine.js 嗅探按厂商分派；OME-TIFF 与转换器 BigTIFF 不是转换输入 | **PASS** — 嗅探先 OME/转换器标记、再厂商（Aperio/Leica/Hamamatsu-Make/未知），OME-TIFF 与转换器 BigTIFF 在 staging 前类型化拒绝（行为与词表不变，本次未改其语义） |
+| wasm probe/convert/resume 路由；engine.js 嗅探按厂商分派；OME-TIFF 与转换器 BigTIFF 不是转换输入 | **PASS** — 嗅探先 OME/转换器标记、再厂商（Aperio/Leica/Hamamatsu-Make/未知），OME-TIFF 与转换器 BigTIFF 在 staging 前类型化拒绝；独立审查修正：`hamamatsu-ndpi-jpeg` 已加入 Rust/engine.js/upload_direct_class.py/slide-sniff.js 四层「转换器产物」词表——本适配器自己的 classic BigTIFF 产物在 staging 前即被识别并类型化拒绝，不会落进通用 TIFF 适配器做第二次有损重编码（回归：`converter_output_is_typed_rejected_not_reconvertible`、vitest `转换器产物…→ 不是转换输入`、pytest `test_sniff_converter_bigtiff` 参数化） |
 | 工具页 accept、格式名称、i18n 中英 | **PASS** — accept 加 `.ndpi`；`NDPI (Hamamatsu)` 格式族名；NDPI 画质说明行（`tools.quality.ndpi.note` 中英）；`nd-ndpi-page-e2e` 识别断言 |
 | slide-sniff 从「暂时直传」改「需要转换」；注册表 `browser_convert=available`；`direct_import` 保持 open | **PASS** — Make 标识 Hamamatsu + 整层单条带 JPEG 明场 → convert（JP2K/多通道变体仍 temporary）；注册表 ndpi 行改 available/convert；直传是否关闭由用户看本报告后决定（未动） |
 | 原生 CLI 在默认 192 MiB 预算下转换真实样本成功（MemoryMax=320M 实跑） | **PASS** — `systemd-run -p MemoryMax=320M` + 默认预算转换成功（release CLI 1 m27 s，输出 502,582,927 B，39,857 瓦片；pytest 内复跑 3 m05 s 含两组转换与像素比对） |
@@ -154,8 +154,14 @@ header（classic II*\0；首 IFD 偏移按 64 位写，≤4 GiB 文件高 32 位
   DRI=256、119,200 段、macro 被排除、输出金字塔 9 层至 200×149。
 - **转换（保留画质）**：`systemd-run --user --scope -p MemoryMax=320M`
   + release CLI、默认 192 MiB 预算：**成功**，1 m27 s，
-  输出 502,582,927 B（≈2.5×源，q96 4:2:2 对 4:4:4 源的预期膨胀），
+  输出 501,836,506 B（≈2.7×源，q96 4:2:2 对 4:4:4 源的预期膨胀），
   39,857 瓦片（L0 29,800 + 生成层），`validate` 通过。
+  （独立审查前的构建为 502,582,927 B/sha 6afd6cff…；审查修复引入
+  out-of-level 行的确定性白填充后字节变化，见 §6。）
+- **估算上界**：preserve `output_upper_bound_bytes` = 736,702,172
+  （4× payload + 瓦片记录；实际 501,836,506 的 1.47 倍）；compact
+  `compact_upper_bound_bytes` = 277,738,855（实测 compact 输出
+  201,041,264 ≈ 1.10× payload，上界成立）。
 - **像素门**（pytest `test_real_sample_l0_mean_error_and_pyramid_geometry`，
   slide_io/openslide 读产物 vs OpenSlide 读原文件）：
   - L0 三组织 ROI 均值绝对误差 **0.040 / 0.055 / 0.044**（max ≤ 5），
@@ -207,16 +213,52 @@ header（classic II*\0；首 IFD 偏移按 64 位写，≤4 GiB 文件高 32 位
 - 合成夹具：`node tests/browser/slide_tools_c2/run_parity.js --input
   <gen-ndpi 夹具>` 与 `--compact`（端口 8949/8950）→ bf-ome/bf-classic
   × preserve/compact **全部 equal=true**（本次运行记录）。
-- 真实样本（本次运行记录）：
-  - 保留画质：`run_parity.js --input <CMU-1.ndpi> --label ndpi-real`
-    → bf-ome `6afd6cff…` / bf-classic `41753084…` 均 **equal=true**
-    （浏览器内转换 ~113 s/次；bf-classic 哈希与 §3.1 的 320M 原生转换
-    完全一致）；
-  - compact：`--compact --label ndpi-real-compact` → bf-ome
-    `d300012b…` / bf-classic `9124b616…` 均 **equal=true**（~92 s/次）。
-- C2 faults：`run_faults.js --only ndpi` → `ndpi-adapter-change-refused`
-  （PASS，2.9 s）与 `ndpi-source-changed-refused`（PASS，2.8 s）。
+- 真实样本（审查修复后重建的 wasm/CLI，本次运行记录）：
+  - 保留画质：`run_parity.js --input <CMU-1.ndpi> --label ndpi-real-r2`
+    → bf-ome `8071e31b…` / bf-classic `e86c8e5b…` 均 **equal=true**
+    （浏览器内转换 ~113 s/次；bf-ome 与 §6 的 320M 原生转换逐字节一致）；
+  - compact：`--compact --label ndpi-real-compact-r2` → bf-ome
+    `fa6892bd…` / bf-classic `9ccd8475…` 均 **equal=true**（~92 s/次）。
+- C2 faults：`run_faults.js`（全量矩阵，新 wasm）→ **49/49 PASS**，含
+  `ndpi-adapter-change-refused` 与 `ndpi-source-changed-refused`。
 - C3 页面场景：`run_e2e.js --only nd` → **PASS** `nd-ndpi-page-e2e`
-  （385 s；识别 `NDPI (Hamamatsu)` → NDPI 画质说明行显示 → 保留画质
-  保存 sha `6afd6cff…` == 原生、compact 保存 sha `d300012b…` == 原生
+  （386 s；识别 `NDPI (Hamamatsu)` → NDPI 画质说明行显示 → 保留画质
+  保存 sha `8071e31b…` == 原生、compact 保存 sha `fa6892bd…` == 原生
   → 无 restart marker 变体在复制前被拒、无任务目录）。
+
+## 6. 独立审查修复记录（2026-10-06）
+
+五项发现全部修复，每项先写复现（回归测试）再修：
+
+1. **high · 续跑丢描述**（convert_ndpi.rs）：resume 对已完成层曾以空描述
+   `end(&meta, &[])` 收尾——classic 产物这些层丢 tag 270，与不中断运行
+   不再逐字节一致。修复：两处 resume_done 臂 restage Classic writer 保存
+   的描述（convert_scn.rs 同款预防）。回归：
+   `resume_from_a_crash_inside_a_generated_level_is_byte_identical`
+   （崩溃点落在生成层，此前绕开）。
+2. **修复 #1 时发现的连带确定性缺陷（一并修复）**：l0-box2 合成的
+   `out` 缓冲 out-of-level 行（层高非 tile 高整数倍时）在全新运行携带
+   上一 cell 的陈旧内容、在续跑运行是初始 255 → 全新/续跑产物必然不同。
+   修复：每次合成前 `out` 白填充（行带外区域读者不可见，但字节一致性
+   不豁免）。真实样本输出字节因此变化（502,582,927 → 501,836,506 B）。
+3. **medium · 转换器产物词表**：见 §0 嗅探行（四处词表 + 回归测试）。
+4. **high（范围外既有）· upload_direct_class BigTIFF 头校验**：要求
+   offsetsize==2，规格与一切真实 BigTIFF（转换器产物/OME-TIFF）都是 8
+   → sniff_tiff_class 恒 non-tiff。修复为 8；测试夹具同步修正并新增
+   offsetsize=2 → non-tiff 的规格锁断言。
+5. **medium · estimate 上界被真实样本突破**：preserve 输出实测
+   ≈2.74× 源条带字节 > 旧 2× 上界（浏览器磁盘闸按上界预留配额）。
+   修复：preserve 上界改 4× payload（bound/actual ≈ 1.47）；compact
+   实测 ≈1.10×，1.5× 上界成立。回归：真实样本 pytest 断言
+   `output_upper_bound_bytes`/`compact_upper_bound_bytes` ≥ 实际输出。
+6. **medium · ndpi_find_f64 忽略字节序**：SHORT/LONG/SLONG/FLOAT/
+   DOUBLE/RATIONAL 曾一律 from_le_bytes——大端文件 SourceLens/MPP 错误
+   （macro 的 -1.0 被读成正数）。修复：全部按 `hdr.little` 解析。回归：
+   `f64_tags_parse_per_byte_order`（LE/BE 双编码逐 tag 数值一致）。
+
+**gtiff 适配器的同类潜在隐患（本次未改，如实记录）**：gtiff 的
+`generated_tile_from_prev` 同样只重置 canvas、不重置 `out`——其生成层
+高度非 tile 高整数倍时，全新/续跑产物在 out-of-level 行不确定（其现有
+续跑测试的夹具几何恰好整除，未触发）。修复需要改动 gtiff 输出字节并
+重调其两条 box2 阈值测试（mean < 1.0 对边界块敏感），超出本次审查范围，
+留给 gtiff 适配器负责人跟进。

@@ -44,6 +44,7 @@
     "mirax-bundle": 1,
     "leica-scn-jpeg": 1,
     "generic-tiled-jpeg-tiff": 1,
+    "hamamatsu-ndpi-jpeg": 1,
   };
 
   // 结果类别

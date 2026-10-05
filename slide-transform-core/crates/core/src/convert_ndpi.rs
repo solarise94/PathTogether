@@ -690,6 +690,14 @@ fn pyramid_tile_from_prev(
     for px in canvas.iter_mut() {
         *px = 255;
     }
+    // rows ≥ valid (out-of-level) must be DETERMINISTIC white — never stale
+    // bytes from a previously composed cell (fresh run) or the buffer's
+    // initial content (a run resumed mid-level): those rows are never read
+    // by readers, but byte identity between fresh and resumed runs does not
+    // forgive them.
+    for px in out.iter_mut() {
+        *px = 255;
+    }
     let tx = tile % cur_across as usize;
     let ty = tile / cur_across as usize;
     let valid_w = (OUT_TILE as usize).min(cur_w as usize - tx * OUT_TILE as usize);
@@ -923,10 +931,17 @@ fn convert_inner(
         if li == 0 {
             // ---- level 0: restart-segmented decode → paste → re-encode -- //
             if resume_done {
-                // no pixels needed; counts only
+                // no pixels needed; counts only — but the description must be
+                // restaged for a fully-resumed level too (end_level stages it
+                // into the IFD; an empty vec here would drop tag 270 from the
+                // resumed output and break byte identity; convert_scn 同款)
+                let desc: Vec<u8> = match &writer {
+                    NdpiWriter::Classic { description, .. } => description.clone(),
+                    NdpiWriter::Ome { .. } => Vec::new(),
+                };
                 level_stats.push(stats);
                 ifd_chain.push((li as u32, None));
-                writer.end(&meta, &[])?;
+                writer.end(&meta, &desc)?;
                 continue;
             }
             let mut reader = SegmentReader::new(src, l0);
@@ -1012,9 +1027,15 @@ fn convert_inner(
         } else {
             // ---- reduced level: the L0-derived pyramid (l0-box2) -------- //
             if resume_done {
+                // the description must be restaged for a fully-resumed level
+                // too (see the L0 resume_done arm; convert_scn 同款预防)
+                let desc: Vec<u8> = match &writer {
+                    NdpiWriter::Classic { description, .. } => description.clone(),
+                    NdpiWriter::Ome { .. } => Vec::new(),
+                };
                 level_stats.push(stats);
                 ifd_chain.push((li as u32, None));
-                writer.end(&meta, &[])?;
+                writer.end(&meta, &desc)?;
                 continue;
             }
             let prev_w = out_levels[li - 1].0;

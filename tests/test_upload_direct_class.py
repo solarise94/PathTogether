@@ -117,8 +117,8 @@ def _classic_bigtiff(entries=None, description=b""):
     if description:
         entries.append((270, 2, description))
     entries.sort(key=lambda e: e[0])
-    # BigTIFF 头 16 字节：II(2) 43(2) offsetsizes=2(2) reserved(2) IFD 偏移(8)
-    header = struct.pack("<2sHHHQ", b"II", 43, 2, 0, 16)
+    # BigTIFF 头 16 字节：II(2) 43(2) offsetsizes=8(2) reserved(2) IFD 偏移(8)
+    header = struct.pack("<2sHHHQ", b"II", 43, 8, 0, 16)
     # IFD = 条目数(8) + 条目(20n) + 下一 IFD 指针(8)；堆紧随其后
     heap_offset = 16 + 8 + 20 * len(entries) + 8
     heap = b""
@@ -155,7 +155,7 @@ def test_sniff_ome_tiff(tmp_path):
 
 @pytest.mark.parametrize("source_format", [
     "kfb_bf_v1", "kfb_kfbio_jpeg", "aperio-svs-jpeg", "leica-scn-jpeg",
-    "mirax-bundle"])
+    "mirax-bundle", "hamamatsu-ndpi-jpeg"])
 def test_sniff_converter_bigtiff(tmp_path, source_format):
     p = _write(tmp_path, "out.tif",
                _classic_tiff(description=_converter_description(source_format)))
@@ -183,6 +183,11 @@ def test_sniff_bigtiff_layouts(tmp_path):
     assert udc.sniff_tiff_class(str(p2)) == udc.ACTUAL_OME
     p3 = _write(tmp_path, "plain-bt.tif", _classic_bigtiff())
     assert udc.sniff_tiff_class(str(p3)) == udc.ACTUAL_TIFF_OTHER
+    # 规格锁：offsetsize 字段必须是 8（BigTIFF 规格/转换器产物/OME-TIFF）；
+    # 曾误写 2——真实 BigTIFF 全部被嗅探成 non-tiff（审查 F6 #3）
+    bad = struct.pack("<2sHHHQ", b"II", 43, 2, 0, 16)
+    p4 = _write(tmp_path, "bad-offsetsize.tif", bad)
+    assert udc.sniff_tiff_class(str(p4)) == udc.ACTUAL_NON_TIFF
 
 
 def test_sniff_reads_description_bounded(tmp_path, monkeypatch):

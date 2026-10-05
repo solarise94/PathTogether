@@ -32,6 +32,7 @@ function buildNdpi({
 	photo = 6,
 	make = "Hamamatsu",
 	strips = true,
+	desc = "",
 } = {}) {
 	const le = little;
 	const u16 = (v: number) => {
@@ -48,8 +49,10 @@ function buildNdpi({
 		return le ? [...u32(lo), ...u32(hi)] : [...u32(hi), ...u32(lo)];
 	};
 	const makeBytes = [...new TextEncoder().encode(make), 0];
+	const descBytes = [...new TextEncoder().encode(desc)];
 	const hdrLen = bigtiff ? 16 : 8;
-	const makeAt = hdrLen;
+	const descAt = hdrLen;
+	const makeAt = descAt + descBytes.length;
 	const ifdAt = makeAt + makeBytes.length;
 	const entries: number[][] = [];
 	const push = (tag: number, typ: number, count: number, val: number[]) =>
@@ -61,6 +64,7 @@ function buildNdpi({
 	push(256, 4, 1, inline(u32(512)));
 	push(257, 4, 1, inline(u32(384)));
 	push(259, 3, 1, inline(u16(compression)));
+	if (descBytes.length) push(270, 2, descBytes.length, bigtiff ? u64(descAt) : u32(descAt));
 	push(262, 3, 1, inline(u16(photo)));
 	push(271, 2, makeBytes.length, bigtiff ? u64(makeAt) : u32(makeAt));
 	if (strips) {
@@ -87,7 +91,7 @@ function buildNdpi({
 		bytes.push(...u32(ifdAt));
 	}
 	while (bytes.length < hdrLen) bytes.push(0);
-	bytes.push(...makeBytes, ...new Array(ifdAt - hdrLen - makeBytes.length).fill(0));
+	bytes.push(...descBytes, ...makeBytes, ...new Array(ifdAt - hdrLen - descBytes.length - makeBytes.length).fill(0));
 	if (bigtiff) bytes.push(...u64(entries.length));
 	else bytes.push(...u16(entries.length));
 	for (const e of entries) bytes.push(...e, ...new Array(esize - e.length).fill(0));
@@ -165,6 +169,19 @@ describe("NDPI 命名与常量", () => {
 		expect(E.NDPI_SOURCE_ADAPTER).toBe("hamamatsu-ndpi-jpeg");
 		expect(E.NDPI_ADAPTER_VERSION).toBe("1");
 		expect(E.NDPI_PYRAMID_METHOD).toBe("l0-box2");
+		// 审查回归：NDPI 转换器自己的产物必须进「转换器输出」词表——
+		// 否则其 classic BigTIFF 会被当普通输入做第二次有损重编码
+		expect(E.CONVERTER_SOURCE_FORMATS).toContain("hamamatsu-ndpi-jpeg");
+	});
+
+	it("转换器产物（描述 JSON 带 hamamatsu-ndpi-jpeg 来源标记）→ 不是转换输入", async () => {
+		const desc = '{"adapter": "hamamatsu-ndpi-jpeg", "adapter_version": "1", "composed": "ndpi-segment-compose:q96:y422:hstd:v1", "pyramid": "l0-box2", "mpp_x": null, "mpp_y": null, "objective": 20, "source_format": "hamamatsu-ndpi-jpeg"}\u0000';
+		// 产物是 BigTIFF（带 322/323 tile 标签）：先命中转换器标记，绝不
+		// 落进 NDPI/通用 TIFF 适配器
+		const out = buildNdpi({ tiled: true, desc });
+		const cap = await E.sniffTiffSlideCapability(new File([out], "out.tif"));
+		expect(cap.supported).toBe(false);
+		expect(cap.reason).toContain("不是转换输入");
 	});
 });
 

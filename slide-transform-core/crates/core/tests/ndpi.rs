@@ -104,7 +104,8 @@ fn probe_and_convert_synthetic() {
     // single strip, restarts present, segments = ceil(total/DRI)
     let mcus_x = (l0.width / l0.mcu_w()) as u64;
     let mcus_y = (l0.height / l0.mcu_h()) as u64;
-    assert_eq!(u64::from(l0.restart_interval), 2 * mcus_x);
+    // default restart_rows = 1 → DRI = MCUs per row（真实条带的约定）
+    assert_eq!(u64::from(l0.restart_interval), mcus_x);
     assert_eq!(l0.total_mcus, mcus_x * mcus_y);
     assert_eq!(u64::from(l0.segments), l0.total_mcus.div_ceil(u64::from(l0.restart_interval)));
     // generated tail per the gtiff rule
@@ -201,6 +202,52 @@ fn l0_tiles_match_whole_strip_decode() {
     }
     let mean = acc as f64 / ((img.width as u64 * img.height as u64 * 3) as f64);
     assert!(mean < 3.0, "tile(0,0) vs whole-strip decode mean abs diff {mean}");
+}
+
+#[test]
+fn l0_carry_path_multi_band_segments() {
+    // restart_rows=40 → 每段 40 MCU 行（320 px），横跨 256 px 行带边界：
+    // 触发段的跨带携带（carry）路径，输出仍必须与整层解码一致
+    let p = NdpiGenParams {
+        restart_rows: 40,
+        levels: 1,
+        pattern: FixturePattern::Gradient,
+        ..Default::default()
+    };
+    let data = gen(&p);
+    let src = MemSource::new(data.clone());
+    let doc = probe_ndpi(&src).expect("probe");
+    let l0 = &doc.levels[0];
+    assert_eq!(l0.segments, (l0.height as u64).div_ceil(320));
+    let (r, _out) = convert(&data, OutputProfile::ClassicJpegBigTiff).expect("convert");
+    assert_eq!(r.levels[0].tiles_reencoded, r.levels[0].tiles_total);
+    // pixel spot check: tile(0,0) against a whole-strip decode
+    let strip = src.read_at(l0.strip_offset, l0.strip_bytes as usize).unwrap();
+    let whole = slide_transform_core::jpeg::decode(&strip, (l0.width as u64) * (l0.height as u64))
+        .expect("whole strip decode");
+    let (_r2, out) = convert(&data, OutputProfile::ClassicJpegBigTiff).unwrap();
+    let out_src = MemSource::new(out);
+    let hdr = slide_transform_core::tiff_read::read_header(&out_src).unwrap();
+    let chain = slide_transform_core::tiff_read::ifd_chain(&out_src, &hdr).unwrap();
+    let mut cur = slide_transform_core::tiff_read::TileCursor::new(&out_src, &hdr, &chain[0]).unwrap();
+    let (off, len) = cur.next_pair().unwrap().unwrap();
+    let img = slide_transform_core::jpeg::decode(
+        &out_src.read_at(off, len as usize).unwrap(),
+        (OUT_TILE as u64) * (OUT_TILE as u64),
+    )
+    .expect("tile decode");
+    let mut acc = 0u64;
+    for y in 0..img.height as usize {
+        for x in 0..img.width as usize {
+            let t = (y * img.width as usize + x) * 3;
+            let s = (y * whole.width as usize + x) * 3;
+            for c in 0..3 {
+                acc += (img.data[t + c] as i32 - whole.data[s + c] as i32).unsigned_abs() as u64;
+            }
+        }
+    }
+    let mean = acc as f64 / ((img.width as u64 * img.height as u64 * 3) as f64);
+    assert!(mean < 3.0, "carry path tile(0,0) mean abs diff {mean}");
 }
 
 // --------------------------------------------------------------------------- //
@@ -316,6 +363,7 @@ fn value_extensions_widen_inline_longs() {
     put(256, 0x1234_5678);
     put(257, 64);
     b.extend_from_slice(&0u32.to_le_bytes()); // next
+    b.extend_from_slice(&0u32.to_le_bytes()); // 4 reserved bytes
     // extension words in entry order: 0xAB for WIDTH, 0 for HEIGHT
     b.extend_from_slice(&0xABu32.to_le_bytes());
     b.extend_from_slice(&0u32.to_le_bytes());

@@ -166,11 +166,12 @@ pub struct NdpiDoc {
 
 /// Read the per-entry 4-byte extension words of an NDPI IFD. Non-standard
 /// layout (F6): every IFD entry's value field is a 64-bit value whose HIGH
-/// 32 bits are written as one u32 per entry AFTER the IFD's next pointer,
-/// in entry order (the layout OpenSlide's tifflike reads in `ndpi` mode:
-/// words at diroff + 12·count + 8). Files ≤ 4 GiB carry all-zero extensions
-/// (verified on the public CMU-1 sample); a truncated area reads as zeros
-/// for the missing tail.
+/// 32 bits are written as one u32 per entry in an array that follows the
+/// IFD's next pointer AND 4 reserved bytes (the layout OpenSlide's tifflike
+/// reads in `ndpi` mode: `fseek(12·dircount + 8, SEEK_CUR)` past the
+/// directory count — words at diroff + 2 + 12·count + 8). Files ≤ 4 GiB
+/// carry all-zero extensions (verified on the public CMU-1 sample); a
+/// truncated area reads as zeros for the missing tail.
 ///
 /// The words are only MEANINGFUL in NDPI mode (see
 /// [`ndpi_extension_mode`]); callers gate on that before trusting them.
@@ -183,7 +184,7 @@ pub fn ndpi_value_extensions(
     let base = ifd.offset
         + 2u64
         + ifd.entries.len() as u64 * 12
-        + 4; // classic: count + entries + next
+        + 8; // classic: count + entries + next + 4 reserved bytes
     let total = n as u64 * 4;
     if base > hdr.size || total > hdr.size.saturating_sub(base) {
         // absent/truncated extension area: zeros (the 32-bit values stand)
@@ -671,11 +672,31 @@ pub fn probe_ndpi_with_budget(src: &dyn ByteSource, budget_bytes: u64) -> CoreRe
         (tiff_read::MAX_IFDS * tiff_read::MAX_IFD_ENTRIES * 32) as u64,
         "IFD 链结构预留",
     )?;
-    let hdr = tiff_read::read_header(src)?;
+    let mut hdr = tiff_read::read_header(src)?;
     if hdr.kind != TiffKind::Classic {
         return Err(CoreError::variant(
             "NDPI 是经典 TIFF（42）；BigTIFF 容器不是 NDPI 输入",
         ));
+    }
+    // Real NDPI headers carry the first-IFD offset as a 64-bit value
+    // (tifffile reads NDPI classic files with offsetsize 8): when the
+    // classic 32-bit field cannot name a valid IFD, the u64 at bytes 4..12
+    // decides (high word lives at bytes 8..12 — zero on ≤4 GiB files).
+    if hdr.first_ifd == 0 || hdr.first_ifd >= src.size() {
+        if hdr.size >= 12 {
+            let b = src.read_at(4, 8)?;
+            let v: u64 = if hdr.little {
+                u64::from_le_bytes(b.try_into().unwrap())
+            } else {
+                u64::from_be_bytes(b.try_into().unwrap())
+            };
+            if v > u32::MAX as u64 && v < src.size() {
+                hdr.first_ifd = v;
+            }
+        }
+        if hdr.first_ifd == 0 || hdr.first_ifd >= src.size() {
+            return Err(CoreError::header("首 IFD 偏移非法"));
+        }
     }
     let chain = tiff_read::ifd_chain(src, &hdr)?;
     if chain.len() > MAX_LEVELS + 16 {

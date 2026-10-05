@@ -1288,6 +1288,22 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
         ),
         None => (false, "null".to_string()),
     };
+    // mosaic/segment compose summary (F3/F6): present whenever the output was
+    // composed and re-encoded (NDPI has no byte-passthrough path).
+    let composed_obj = match &result.composed {
+        Some(c) => obj(&[
+            jstr("mode", &c.mode),
+            jstr("fingerprint", &c.fingerprint),
+            ju("quality", c.quality as u64),
+            jstr("sampling", &c.sampling),
+            jstr("huffman", &c.huffman),
+            ju("tiles_composed", c.tiles_composed),
+            ju("tiles_filled", c.tiles_filled),
+            ju("tiles_deduped", c.tiles_deduped),
+            jstr("pyramid", &c.pyramid),
+        ]),
+        None => "null".to_string(),
+    };
 
     Ok(obj(&[
         jstr("tool", "slide-transform"),
@@ -1305,6 +1321,7 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
         jstr("encoding", enc_profile.id()),
         jb("lossy_reencode", lossy_flag),
         jraw("lossy_reencode_params", &lossy_obj),
+        jraw("composed", &composed_obj),
         jstr("format", result.format),
         jstr("output", &output.display().to_string()),
         ju("output_bytes", result.output_bytes),
@@ -1921,7 +1938,7 @@ fn cmd_gen_ndpi(args: &[String]) -> Result<String, CoreError> {
     let mut path = None;
     let mut width = 512u32;
     let mut height = 320u32;
-    let mut restart_rows = 2u32;
+    let mut restart_rows = 1u32;
     let mut levels = 2u32;
     let mut associated = false;
     let mut no_restart = false;

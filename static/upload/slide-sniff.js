@@ -241,7 +241,7 @@
       // Hamamatsu 且 IFD0 为整层单条带 JPEG 明场（压缩 7、3 采样、
       // photo 2/6、非分块）→ 本机转换后上传；JPEG2000（33003/33005）、
       // 分块存储或多通道变体不满足判定 → 默认 temporary = 暂时直传。
-      if (compression === 7 && ndpiConvertible(ifdBytes, idv, little, hdr.bigtiff)) {
+      if (compression === 7 && ndpiConvertible(headBytes, ifdBytes, idv, little, hdr.bigtiff)) {
         result.cls = CLS.CONVERT;
         result.directClass = null;
       }
@@ -277,13 +277,14 @@
   // 同一契约的 IFD0 快判）：Make（271）含 Hamamatsu、整层单条带（273/279
   // 在场且无 322/323）、SamplesPerPixel=3、PhotometricInterpretation ∈
   // {2, 6}。restart marker/层级/关联图分类由核心在复制后终审。
-  function ndpiConvertible(ifdBytes, idv, little, bigtiff) {
+  function ndpiConvertible(headBytes, ifdBytes, idv, little, bigtiff) {
     var make = findIfdEntry(ifdBytes, little, 271, bigtiff);
     if (!make) return false;
     var makeLoc = descTextAt(ifdBytes, make, little);
     var makeText = "";
     if (makeLoc && makeLoc.count > 0) {
-      var raw = readRegion(ifdBytes, makeLoc.offset,
+      // Make 值是绝对文件偏移（count > 4 恒为外联），从头缓冲读取
+      var raw = readRegion(headBytes, makeLoc.offset,
         Math.min(makeLoc.count, 4096), null);
       if (raw) {
         try { makeText = new TextDecoder("utf-8", { fatal: false }).decode(raw); }

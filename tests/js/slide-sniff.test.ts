@@ -3,8 +3,9 @@
  *
  * 先转换后上传阶段 1：分类是**分流提示**（服务端创建闸 + worker 头级核验
  * 才是权威）。这里锁定：
- *   1. 扩展名快路径：KFB/KFBF/MRXS 成员 → convert；NDPI/VMS/VMU/SCN/BIF/
- *      SVSlide/BMP/JPEG/zip → temporary；未登记 → unsupported；
+ *   1. 扩展名快路径：KFB/KFBF/MRXS 成员 → convert；NDPI → tiff 路由
+ *      （F6 头解析分派）；VMS/VMU/SCN/BIF/SVSlide/BMP/JPEG/zip →
+ *      temporary；未登记 → unsupported；
  *   2. TIFF 头解析（手工构造的最小 classic TIFF，≤128KB 头预算）：
  *      - ImageDescription 含 OME-XML → ome-tiff（direct_class=ome-tiff）；
  *      - 描述 JSON 带转换器来源标记（source_format ∈ 转换器词表）→
@@ -130,7 +131,7 @@ describe("slide-sniff：扩展名快路径（不读字节）", () => {
 	});
 
 	it("暂无浏览器转换器的格式/变体 → temporary（直传声明 legacy-direct）", () => {
-		for (const n of ["a.ndpi", "a.vms", "a.vmu", "a.bif",
+		for (const n of ["a.vms", "a.vmu", "a.bif",
 			"a.svslide", "a.bmp", "a.jpg", "a.jpeg"]) {
 			const r = S.classifyExt(n);
 			expect(r.cls, n).toBe("temporary");
@@ -148,6 +149,7 @@ describe("slide-sniff：扩展名快路径（不读字节）", () => {
 		expect(S.classifyExt("noext").cls).toBe("unsupported");
 		expect(S.classifyExt("a.tif").route).toBe("tiff");
 		expect(S.classifyExt("a.svs").route).toBe("tiff");
+		expect(S.classifyExt("a.ndpi").route).toBe("tiff");
 		expect(S.classifyExt("a.ome.tif").route).toBe("tiff");
 	});
 });

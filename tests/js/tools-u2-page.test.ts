@@ -70,7 +70,7 @@ describe("U2 default view (template structure)", () => {
 	it("drop zone + pick button + hidden-but-focusable file input, one accept list", () => {
 		expect(shellSrc).toContain('id="drop-zone"');
 		expect(shellSrc).toContain('id="pick-file-btn"');
-		expect(shellSrc).toMatch(/<input id="file-input" name="file" type="file" accept="\.kfb,\.kfbf,\.svs,\.scn,\.ome\.tif,\.ome\.tiff,\.tif,\.tiff" class="visually-hidden-input"/);
+		expect(shellSrc).toMatch(/<input id="file-input" name="file" type="file" accept="\.kfb,\.kfbf,\.svs,\.scn,\.ndpi,\.ome\.tif,\.ome\.tiff,\.tif,\.tiff" class="visually-hidden-input"/);
 		expect(cssSrc).toContain(".visually-hidden-input");
 		expect(cssSrc).not.toMatch(/#file-input\s*\{[^}]*display:\s*none/);
 		expect(cssSrc).toContain(".drop-zone.dragover");
@@ -88,15 +88,22 @@ describe("U2 default view (template structure)", () => {
 		expect(pageSrc).toContain("els.folderInput.addEventListener('change', () => { onFolderPicked(); })");
 	});
 
-	it("F3: one-line MRXS quality note under the radios, MRXS-only", () => {
+	it("F3/F6: one-line MRXS/NDPI quality note under the radios, format-specific", () => {
 		const fieldsetEnd = shellSrc.indexOf("</fieldset>", shellSrc.indexOf('id="quality-fieldset"'));
 		const noteAt = shellSrc.indexOf('id="quality-mrxs-note"');
 		expect(noteAt).toBeGreaterThan(fieldsetEnd);
 		expect(shellSrc).toContain('data-i18n="tools.quality.mrxs.note"');
-		expect(pageSrc).toMatch(/String\(probeDoc\(\)\.format \|\| ''\)\.startsWith\('mirax'\)/);
-		expect(pageSrc).toContain("els.qualityMrsxNote.hidden = !show");
-		// reset hides it again (a later single-file pick must not keep the note)
+		// F6: NDPI 的分段解码重编码说明行（同样常重编码语义）
+		const ndpiAt = shellSrc.indexOf('id="quality-ndpi-note"');
+		expect(ndpiAt).toBeGreaterThan(fieldsetEnd);
+		expect(shellSrc).toContain('data-i18n="tools.quality.ndpi.note"');
+		expect(pageSrc).toMatch(/const fmt = String\(probeDoc\(\)\.format \|\| ''\)/);
+		expect(pageSrc).toMatch(/fmt\.startsWith\('mirax'\) && bf\)/);
+		expect(pageSrc).toContain("els.qualityMrsxNote.hidden = !(!!page.prep && fmt.startsWith('mirax') && bf)");
+		expect(pageSrc).toMatch(/els\.qualityNdpiNote\.hidden = !\(!!page\.prep && fmt\.startsWith\('hamamatsu-ndpi'\) && bf\)/);
+		// reset hides them again (a later single-file pick must not keep a note)
 		expect(pageSrc).toMatch(/resetFlowPanels\(\)[\s\S]*?els\.qualityMrsxNote\.hidden = true/);
+		expect(pageSrc).toMatch(/resetFlowPanels\(\)[\s\S]*?els\.qualityNdpiNote\.hidden = true/);
 	});
 
 	it("one-line local explanation with the full privacy items folded", () => {

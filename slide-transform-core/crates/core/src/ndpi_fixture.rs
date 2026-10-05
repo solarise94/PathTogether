@@ -45,6 +45,8 @@ pub struct NdpiGenParams {
     pub width: u32,
     pub height: u32,
     /// MCU rows per restart segment (DRI = restart_rows × mcus_x).
+    /// Default 1 (real NanoZoomer strips keep DRI ≤ MCUs per row —
+    /// OpenSlide refuses larger DRIs as corrupt JPEG).
     pub restart_rows: u32,
     /// Pyramid level count (L0 + reduced, ÷4 per step like the real files).
     pub levels: u32,
@@ -78,7 +80,7 @@ impl Default for NdpiGenParams {
         NdpiGenParams {
             width: 512,
             height: 320,
-            restart_rows: 2,
+            restart_rows: 1,
             levels: 3,
             macro_page: false,
             focus_map: false,
@@ -288,6 +290,9 @@ impl IfdB {
     fn add_long(&mut self, tag: u16, v: u32) {
         self.add(tag, 4, 1, v.to_le_bytes().to_vec());
     }
+    fn add_slong(&mut self, tag: u16, v: i32) {
+        self.add(tag, 9, 1, v.to_le_bytes().to_vec());
+    }
     fn add_float(&mut self, tag: u16, v: f32) {
         self.add(tag, 11, 1, v.to_le_bytes().to_vec());
     }
@@ -310,7 +315,7 @@ impl IfdB {
     fn serialize(&self, at: u64, next: u32, ext_words: bool) -> Vec<u8> {
         let mut sorted = self.entries.clone();
         sorted.sort_by_key(|e| e.0);
-        let ifd_len = 2 + 12 * sorted.len() as u64 + 4;
+        let ifd_len = 2 + 12 * sorted.len() as u64 + 8;
         let ext_area = if ext_words { 4 * sorted.len() as u64 } else { 0 };
         let mut out = Vec::new();
         out.extend_from_slice(&(sorted.len() as u16).to_le_bytes());
@@ -335,6 +340,7 @@ impl IfdB {
             }
         }
         out.extend_from_slice(&next.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // 4 reserved bytes
         if ext_words {
             for _ in 0..sorted.len() {
                 out.extend_from_slice(&0u32.to_le_bytes());
@@ -411,13 +417,14 @@ pub fn build_synthetic_ndpi(out: &mut dyn RandomAccessSink, p: &NdpiGenParams) -
     } else {
         None
     };
-    let macro_at = 8u64 + strips.iter().map(|s| s.len() as u64).sum::<u64>();
+    const HDR_LEN: u64 = 16;
+    let macro_at = HDR_LEN + strips.iter().map(|s| s.len() as u64).sum::<u64>();
     let focus_at = macro_at + macro_jpg.as_ref().map_or(0, |m| m.len() as u64);
 
     // ---- IFDs -------------------------------------------------------------- //
     let mut ifds: Vec<IfdB> = Vec::new();
     let strip_at = |li: usize| -> u32 {
-        8 + strips[..li].iter().map(|s| s.len() as u64).sum::<u64>() as u32
+        16 + strips[..li].iter().map(|s| s.len() as u64).sum::<u64>() as u32
     };
     for (li, &(w, h)) in levels.iter().enumerate() {
         let mut ifd = IfdB::new();
@@ -432,13 +439,16 @@ pub fn build_synthetic_ndpi(out: &mut dyn RandomAccessSink, p: &NdpiGenParams) -
         ifd.add_long(278, h);
         ifd.add_long(279, strips[li].len() as u32);
         ifd.add_short(284, 1);
+        // NDPI_FORMAT_FLAG（65420）：OpenSlide/tifffile 用它检测 NDPI 模式
+        //（每条目扩展字与 64 位首 IFD 偏移都以此为门）
+        ifd.add_short(65420, 1);
         if p.extra_samples {
             // one extra sample (alpha-ish): the fluorescence-ish refusal
             ifd.add_short(277, 4);
             ifd.add_short(338, 2);
         }
         ifd.add_float(65421, objectives[li]);
-        ifd.add_long(65424, 0);
+        ifd.add_slong(65424, 0);
         if let Some(mpp) = p.mpp {
             ifd.add_double(65441, mpp);
             ifd.add_double(65442, mpp);
@@ -479,9 +489,14 @@ pub fn build_synthetic_ndpi(out: &mut dyn RandomAccessSink, p: &NdpiGenParams) -
     }
 
     // ---- assemble: header | payloads | IFD chain (with extension areas) ---- //
+    // Real NDPI headers carry the first-IFD offset as a 64-bit value
+    // (tifffile reads NDPI classic files with offsetsize 8): the header is
+    // 16 bytes — u32 magic, u64 first-IFD offset (patched below), 4 bytes
+    // reserved zero — and the payload area starts at 16.
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"II*\0");
-    buf.extend_from_slice(&0u32.to_le_bytes()); // first IFD, patched below
+    buf.extend_from_slice(&0u64.to_le_bytes()); // first IFD, patched below
+    buf.extend_from_slice(&0u32.to_le_bytes());
     for s in &strips {
         buf.extend_from_slice(s);
     }
@@ -505,7 +520,8 @@ pub fn build_synthetic_ndpi(out: &mut dyn RandomAccessSink, p: &NdpiGenParams) -
         let at = *off as usize + 2 + 12 * ifds[i].entries.len();
         buf[at..at + 4].copy_from_slice(&next.to_le_bytes());
     }
-    buf[4..8].copy_from_slice(&ifd_offsets[0].to_le_bytes());
+    let _ = &ifds;
+    buf[4..12].copy_from_slice(&(ifd_offsets[0] as u64).to_le_bytes());
 
     out.write_at(0, &buf)?;
     out.flush()?;

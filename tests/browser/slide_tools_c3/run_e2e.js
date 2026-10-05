@@ -1633,6 +1633,73 @@ async function scenarioGT() {
   }
 }
 
+// (nd) F6 NDPI 页面入口：真实 CC0 Hamamatsu 样本（NDPI_SAMPLE，缺省跳过）
+// 经页面识别为 NDPI (Hamamatsu) 明场 → 默认 bf-ome/保留画质转换 → 保存
+// sha == 原生；compact 一次 == 原生 compact。变体拒绝（本地 gen-ndpi 无
+// restart marker 夹具）在页面上复制前被拒且无任务目录。
+async function scenarioND() {
+  const ndpi = process.env.NDPI_SAMPLE;
+  if (!ndpi || !fs.existsSync(ndpi)) {
+    record('nd-ndpi-page-e2e', true, { skipped: 'NDPI_SAMPLE not set or missing' });
+    return;
+  }
+  const nativeSha = await L.sha256File(L.nativeConvert(ndpi,
+    path.join(L.GATE, 'fixtures', 'ndpi-native-bf-ome.ome.tif'),
+    ['--profile', 'bf-ome', '--timeout', '3600']));
+  const nativeCompactSha = await L.sha256File(L.nativeConvert(ndpi,
+    path.join(L.GATE, 'fixtures', 'ndpi-native-bf-ome-compact.ome.tif'),
+    ['--profile', 'bf-ome', '--encoding', 'compact', '--timeout', '3600']));
+  const { context, page } = await L.launch('nd', [L.savePickerStub()]);
+  try {
+    await L.openTools(page, PORT);
+    const runOnce = async (compact) => {
+      await L.clearJobs(page);
+      await page.reload({ waitUntil: 'load' });
+      await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
+      await L.setFile(page, ndpi);
+      await waitVisible(page, '#summary-section:not([hidden])', 120000);
+      const fmt = (await page.textContent('#summary-format')).trim();
+      if (fmt !== 'NDPI (Hamamatsu)') throw new Error(`summary format "${fmt}"`);
+      const qShown = await page.evaluate(() => !document.getElementById('quality-fieldset').hidden);
+      if (!qShown) throw new Error('quality choice hidden for NDPI');
+      // F6 画质说明行：NDPI 识别后显示「分段解码重编码」说明
+      await page.waitForFunction(() => !document.getElementById('quality-ndpi-note').hidden,
+        null, { timeout: 10000 });
+      if (compact) await page.check('#quality-compact');
+      await page.click('#convert-btn');
+      await waitVisible(page, '#result-section:not([hidden])', 1200000);
+      await page.click('#save-btn');
+      await waitText(page, '#save-status', /已保存|Saved/);
+      return { fmt, sha: (await L.opfsSha256(page)).sha256 };
+    };
+    const pres = await runOnce(false);
+    if (pres.sha !== nativeSha) throw new Error(`ndpi preserve sha ${pres.sha} != native ${nativeSha}`);
+    const comp = await runOnce(true);
+    if (comp.sha !== nativeCompactSha) throw new Error(`ndpi compact sha ${comp.sha} != native ${nativeCompactSha}`);
+    // 变体拒绝：无 restart marker 夹具在复制前被拒（无任务目录）
+    const fixtureDir = path.join(L.GATE, 'fixtures');
+    fs.mkdirSync(fixtureDir, { recursive: true });
+    const noRestart = path.join(fixtureDir, 'ndpi-no-restart.ndpi');
+    if (!fs.existsSync(noRestart)) {
+      const { execFileSync } = require('child_process');
+      execFileSync(L.CLI, ['gen-ndpi', noRestart, '--width', '512', '--height', '320',
+        '--levels', '1', '--no-restart']);
+    }
+    await L.clearJobs(page);
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
+    await L.setFile(page, noRestart);
+    await waitText(page, '#page-error', /restart marker/, 60000);
+    if ((await L.jobDirs(page)).length !== 0) throw new Error('no-restart NDPI left a job dir');
+    record('nd-ndpi-page-e2e', true, { format: pres.fmt, preserveSha: pres.sha, compactSha: comp.sha,
+      variant: 'no-restart rejected before copy' });
+  } catch (e) {
+    record('nd-ndpi-page-e2e', false, { error: String(e).slice(0, 400) });
+  } finally {
+    await context.close();
+  }
+}
+
 // (mx) F3 MRXS 页面入口：真实 CC0 完整包（MRXS_SAMPLE_DIR，缺省跳过并记录）
 // 经「选择文件夹（MRXS）」input（page.setInputFiles 目录 → webkitRelativePath）
 // → 摘要 MRXS/明场/画质 + 拼接重编码说明 → 转换（保留画质，bf-ome）→ 保存
@@ -1748,7 +1815,7 @@ const SCENARIOS = [
   ['r', scenarioR], ['s', scenarioS], ['t', scenarioT], ['u', scenarioU],
   ['v', scenarioV], ['w', scenarioW], ['x', scenarioX], ['y', scenarioY],
   ['z', scenarioZ], ['sv', scenarioSV], ['mx', scenarioMX], ['sc', scenarioSC],
-  ['gt', scenarioGT],
+  ['gt', scenarioGT], ['nd', scenarioND],
 ];
 
 async function main() {

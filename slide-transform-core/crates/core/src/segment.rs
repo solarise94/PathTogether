@@ -78,6 +78,62 @@ pub struct SegmentRead {
     pub charged: u64,
 }
 
+/// Paste one decoded segment's MCU rects into a band buffer (shared by the
+/// NDPI whole-layer strips and the raster JPEG segment path). `band` covers
+/// global pixel rows `[band_y0, band_y0 + band_rows)` and all columns
+/// `[0, strip.padded_w())`; MCU rects above/below the band or beyond the
+/// image height are skipped (the band stays white there and no tile reads
+/// those rows).
+pub fn paste_segment_rects(
+    band: &mut [u8],
+    seg: &SegmentRead,
+    mcu_w: u32,
+    mcu_h: u32,
+    mcus_x: u32,
+    height: u32,
+    band_y0: u64,
+    band_rows: u64,
+) {
+    let img = &seg.img;
+    let img_w = img.width as usize;
+    let mcu_w = mcu_w as usize;
+    let mcu_h = mcu_h as usize;
+    let padded_w = (mcus_x as usize) * mcu_w;
+    for i in 0..seg.mcus {
+        let g = seg.mcu_start + i;
+        let gc = (g % mcus_x as u64) as usize;
+        let gr = (g / mcus_x as u64) as u64;
+        // MCU rect in the segment image (segment grid: grid_w MCUs/row)
+        let sx = (i % seg.grid_w) as usize * mcu_w;
+        let sy = (i / seg.grid_w) as usize * mcu_h;
+        let rel_y = (gr * mcu_h as u64) as i64 - band_y0 as i64;
+        if rel_y < 0 {
+            continue; // above the band (carried segments' head)
+        }
+        let by0 = rel_y as usize;
+        if by0 >= band_rows as usize {
+            continue; // below the band
+        }
+        let dst_x = gc * mcu_w;
+        if dst_x >= padded_w {
+            continue;
+        }
+        for r in 0..mcu_h {
+            let world_y = gr as usize * mcu_h + r;
+            if world_y >= height as usize {
+                break; // beyond the image (MCU padding rows)
+            }
+            let by = by0 + r;
+            if by >= band_rows as usize {
+                break;
+            }
+            let s = (sy + r) * img_w * 3 + sx * 3;
+            let d = by * padded_w * 3 + dst_x * 3;
+            band[d..d + mcu_w * 3].copy_from_slice(&img.data[s..s + mcu_w * 3]);
+        }
+    }
+}
+
 /// Forward-only restart-segment reader over one strip of a `ByteSource`.
 pub struct SegmentReader<'a> {
     src: &'a dyn ByteSource,

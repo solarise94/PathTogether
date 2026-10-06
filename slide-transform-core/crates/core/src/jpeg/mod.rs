@@ -7,6 +7,10 @@ pub mod decoder;
 pub mod encoder;
 pub mod tables;
 
+/// F8: streaming MCU-row band decoder for restart-less scans (raster
+/// adapter) — additive; `decode`/`decode_ex` keep the whole-buffer contract.
+pub mod band;
+
 pub use decoder::{decode, decode_ex, scan_jpeg, ColorKind, DecodedImage, JpegProbe};
 pub use encoder::{encode_gray, encode_rgb, EncoderCfg, Sampling};
 

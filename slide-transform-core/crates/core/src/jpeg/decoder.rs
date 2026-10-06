@@ -54,7 +54,7 @@ pub struct JpegProbe {
 /// `RANGE_LIMIT[v & 1023]` where `v = pixel - 128` in the IDCT output domain:
 /// segments map to 128+v, clamp-high, clamp-low, and the folded tail for
 /// mild undershoot (v ∈ [-128,-1]).
-fn build_range_limit() -> [u8; 1024] {
+pub(crate) fn build_range_limit() -> [u8; 1024] {
     let mut t = [0u8; 1024];
     for (j, slot) in t.iter_mut().enumerate() {
         *slot = match j {
@@ -194,14 +194,14 @@ pub fn idct_islow_block(
 // Fixed-point YCbCr → RGB (jdcolor.c build_ycc_rgb_table + jdcolext.c)
 // --------------------------------------------------------------------------- //
 
-const SCALEBITS: i32 = 16;
+pub(crate) const SCALEBITS: i32 = 16;
 const ONE_HALF: i64 = 1 << (SCALEBITS - 1);
 const FIX_1_40200: i64 = 91881;
 const FIX_1_77200: i64 = 116130;
 const FIX_0_34414: i64 = 22554;
 const FIX_0_71414: i64 = 46802;
 
-fn ycc_tables() -> ([i32; 256], [i32; 256], [i32; 256], [i32; 256]) {
+pub(crate) fn ycc_tables() -> ([i32; 256], [i32; 256], [i32; 256], [i32; 256]) {
     // (Cr_r, Cb_b, Cb_g, Cr_g)
     let mut cr_r = [0i32; 256];
     let mut cb_b = [0i32; 256];
@@ -218,7 +218,7 @@ fn ycc_tables() -> ([i32; 256], [i32; 256], [i32; 256], [i32; 256]) {
 }
 
 #[inline]
-fn clamp_u8(v: i32) -> u8 {
+pub(crate) fn clamp_u8(v: i32) -> u8 {
     v.clamp(0, 255) as u8
 }
 
@@ -227,19 +227,19 @@ fn clamp_u8(v: i32) -> u8 {
 // --------------------------------------------------------------------------- //
 
 #[derive(Clone)]
-struct CompSpec {
-    id: u8,
-    h: u8,
-    v: u8,
-    tq: u8,
-    dc_tbl: u8,
-    ac_tbl: u8,
+pub(crate) struct CompSpec {
+    pub(crate) id: u8,
+    pub(crate) h: u8,
+    pub(crate) v: u8,
+    pub(crate) tq: u8,
+    pub(crate) dc_tbl: u8,
+    pub(crate) ac_tbl: u8,
 }
 
-struct Frame {
-    width: u32,
-    height: u32,
-    comps: Vec<CompSpec>,
+pub(crate) struct Frame {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) comps: Vec<CompSpec>,
 }
 
 fn is_sof(m: u8) -> bool {
@@ -509,8 +509,8 @@ pub fn decode_ex(data: &[u8], max_pixels: u64, force_rgb: bool) -> CoreResult<De
     Ok(DecodedImage { width: w, height: h, kind, data })
 }
 
-fn decode_block(
-    br: &mut BitReader,
+pub(crate) fn decode_block<B: BitSource>(
+    br: &mut B,
     dc_t: &HuffTable,
     ac_t: &HuffTable,
     last_dc: &mut i32,
@@ -553,7 +553,17 @@ fn decode_block(
 
 /// Canonical Huffman decode; an unmatchable 16-bit code decodes as 0
 /// (libjpeg's warning path).
-fn huff_decode(br: &mut BitReader, t: &HuffTable) -> u8 {
+pub(crate) trait BitSource {
+    fn get(&mut self, n: u32) -> u32;
+}
+
+impl BitSource for BitReader<'_> {
+    fn get(&mut self, n: u32) -> u32 {
+        BitReader::get(self, n)
+    }
+}
+
+pub(crate) fn huff_decode<B: BitSource>(br: &mut B, t: &HuffTable) -> u8 {
     let mut code: i32 = 0;
     for len in 1..=16usize {
         code = (code << 1) | br.get(1) as i32;
@@ -716,7 +726,7 @@ fn upsample_all(
 }
 
 /// One output row of h2v1: fancy (ds_w > 2) or duplication.
-fn h2v1_upsample_row(src: &[u8], ds_w: usize, dst: &mut [u8], out_w: usize) {
+pub(crate) fn h2v1_upsample_row(src: &[u8], ds_w: usize, dst: &mut [u8], out_w: usize) {
     if ds_w > 2 {
         // fancy (jdsample.c h2v1_fancy_upsample)
         let mut o = 0usize;
@@ -809,7 +819,7 @@ fn h2v2_upsample(
 
 /// One output row of the fancy h2v2: `nb` is the neighbouring chroma row
 /// (above for even output rows, below for odd), `cur` the current one.
-fn h2v2_fancy_row(
+pub(crate) fn h2v2_fancy_row(
     nb: &[u8],
     cur: &[u8],
     ds_w: usize,
@@ -903,7 +913,7 @@ fn int_upsample(
 // Marker segment parsers
 // --------------------------------------------------------------------------- //
 
-fn parse_sos(seg: &[u8], frame: &mut Frame) -> CoreResult<()> {
+pub(crate) fn parse_sos(seg: &[u8], frame: &mut Frame) -> CoreResult<()> {
     if seg.is_empty() {
         return Err(CoreError::jpeg("SOS 段残缺"));
     }
@@ -931,7 +941,7 @@ fn parse_sos(seg: &[u8], frame: &mut Frame) -> CoreResult<()> {
     Ok(())
 }
 
-fn parse_sof(seg: &[u8]) -> CoreResult<Frame> {
+pub(crate) fn parse_sof(seg: &[u8]) -> CoreResult<Frame> {
     if seg.len() < 6 {
         return Err(CoreError::jpeg("SOF 段残缺"));
     }
@@ -957,7 +967,7 @@ fn parse_sof(seg: &[u8]) -> CoreResult<Frame> {
     Ok(Frame { width, height, comps })
 }
 
-fn parse_dqt(seg: &[u8], quant: &mut [Option<[u16; 64]>]) -> CoreResult<()> {
+pub(crate) fn parse_dqt(seg: &[u8], quant: &mut [Option<[u16; 64]>]) -> CoreResult<()> {
     let mut p = 0usize;
     while p < seg.len() {
         let pq = seg[p] >> 4;
@@ -994,7 +1004,7 @@ fn parse_dqt(seg: &[u8], quant: &mut [Option<[u16; 64]>]) -> CoreResult<()> {
     Ok(())
 }
 
-fn parse_dht(
+pub(crate) fn parse_dht(
     seg: &[u8],
     dc: &mut [Option<HuffTable>],
     ac: &mut [Option<HuffTable>],

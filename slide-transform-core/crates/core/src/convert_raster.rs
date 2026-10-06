@@ -1,36 +1,33 @@
-//! NDPI → brightfield conversion (F6): whole-layer restart-segmented JPEG
-//! strips → classic multi-IFD JPEG tiled BigTIFF pyramid or RGB OME-BigTIFF.
+//! 普通图片（BMP/JPEG）→ brightfield conversion (F8): one plain image →
+//! classic multi-IFD JPEG tiled BigTIFF pyramid or RGB OME-BigTIFF.
 //!
-//! **What `preserve-source-v1` means for NDPI** (stated honestly): an NDPI
-//! layer is ONE whole-layer JPEG strip — there are no source tiles to copy,
-//! so no byte-passthrough exists for this format. `preserve` means: decode
-//! the layer strip restart segment by restart segment (each segment is a
-//! self-contained MCU run with reset DC predictors — the only bounded decode
-//! unit the format offers), paste the decoded MCU rects into the output tile
-//! grid and re-encode every 256×256 output tile at the documented
-//! high-fidelity setting **YCbCr 4:2:2 · quality 96 · standard Huffman**
-//! (fingerprint [`PRESERVE_COMPOSE_FINGERPRINT`], reported as `composed`).
-//! `compact-jpeg-v1` composes identically and re-encodes at the locked U3
-//! parameters.
+//! **What `preserve-source-v1` means for raster inputs** (stated honestly):
+//! a plain image has no tiles to copy, so no byte-passthrough exists.
+//! `preserve` means: decode the image through its bounded unit (BMP: exact
+//! rows; JPEG with restart markers: restart segments; JPEG without
+//! restarts: MCU-row bands) and re-encode every 256×256 output tile at the
+//! documented high-fidelity setting **YCbCr 4:2:2 · quality 96 · standard
+//! Huffman** (fingerprint [`PRESERVE_COMPOSE_FINGERPRINT`], reported as
+//! `composed`). `compact-jpeg-v1` composes identically and re-encodes at
+//! the locked U3 parameters.
 //!
 //! Reduced output levels are the `l0-box2` chain (the 2×2 area-average of
-//! output level 0, read back from the committed sink): the source's own
-//! reduced layers are never decoded for pixels, exactly like the MRXS v2 and
-//! generic-TIFF adapters. The macro/focus-map/z-stack pages are excluded at
-//! the probe.
+//! output level 0, read back from the committed sink).
+//!
+//! No physical scale exists in a BMP/JPEG: MPP stays unknown and the OME
+//! output deliberately writes NO PhysicalSize (nothing is invented).
 //!
 //! Strict-lossless is refused (typed, before any output byte): every output
 //! tile is a re-encode by construction.
 //!
-//! Memory (review §1): the band buffer (⌈256/mcu_h⌉ MCU rows × padded
-//! width), the tile canvas + encode buffers, and every segment decode
-//! (read + decoder transient + decoded pixels) are charged against the
-//! host budget BEFORE the allocation — an over-budget strip is a typed
+//! Memory (review §1): band buffers, tile canvases and every decode
+//! (segment decode / band scan / BMP row read) are charged against the host
+//! budget BEFORE the allocation — an over-budget input is a typed
 //! `resource_profile_insufficient` refusal, never an OOM mid-decode.
 //!
 //! Resume mirrors the other adapters: checkpoints per committed tile row;
-//! a resumed L0 fast-forwards the segment scanner to the tile row's first
-//! segment (marker scan only, no decode) and the fresh path stays
+//! a resumed JPEG fast-forwards its decoder to the tile row's first decode
+//! unit (segment scan-only / band decode-and-drop) and the fresh path stays
 //! byte-identical.
 
 use crate::bigtiff::{BigTiffPyramidWriter, LevelExtras};
@@ -40,22 +37,20 @@ use crate::error::{CoreError, CoreResult};
 use crate::io::{ByteSource, RandomAccessSink, ScratchFactory};
 use crate::job::{JobControl, NullProgress, Progress, ProgressUnit};
 use crate::jpeg;
-use crate::ndpi::{
-    probe_ndpi_with_budget, NdpiDoc, NdpiLevel, ADAPTER_VERSION, OUT_TILE,
-    PRESERVE_COMPOSE_FINGERPRINT, PRESERVE_COMPOSE_HUFFMAN, PRESERVE_COMPOSE_QUALITY,
-    PRESERVE_COMPOSE_SAMPLING, PYRAMID_METHOD, SOURCE_FORMAT,
-};
-use crate::ome::py_repr_f64;
+use crate::jpeg::band::BandScanner;
 use crate::ome_writer::{OmeBigTiffWriter, RgbIfdExtras};
 use crate::plan::{
     EncodingProfile, OutputProfile, PixelPolicy, TransformPlan, COMPACT_JPEG_V1_FINGERPRINT,
     COMPACT_JPEG_V1_HUFFMAN, COMPACT_JPEG_V1_QUALITY,
 };
-use crate::report::{
-    AssociatedSummary, ComposedSummary, LevelStats, LossyReencode, TransformResult,
+use crate::raster::{
+    probe_raster_with_budget, BmpLayout, RasterDoc, RasterJpeg, ADAPTER_VERSION, OUT_TILE,
+    PRESERVE_COMPOSE_FINGERPRINT, PRESERVE_COMPOSE_HUFFMAN, PRESERVE_COMPOSE_QUALITY,
+    PRESERVE_COMPOSE_SAMPLING, PYRAMID_METHOD, SOURCE_FORMAT,
 };
+use crate::report::{ComposedSummary, LevelStats, LossyReencode, TransformResult};
 use crate::resume::ResumePoint;
-use crate::segment::{SegmentRead, SegmentReader};
+use crate::segment::{SegmentReader, StripGeom};
 
 pub use crate::convert_bf::{FORMAT_CLASSIC, FORMAT_OME_RGB};
 
@@ -84,34 +79,13 @@ macro_rules! maybe_progress_and_checkpoint {
     };
 }
 
-pub const WARN_ASSOC_NOT_EXPORTED: &str = "ndpi_associated_not_exported";
 pub const WARN_NO_ICC: &str = "color_management_not_applied";
+pub const WARN_NO_PHYSICAL_SIZE: &str = "raster_no_physical_size";
 
 fn preserve_cfg() -> jpeg::EncoderCfg {
-    // Same parameters as the MRXS compose / generic-TIFF generated tiles:
-    // YCbCr 4:2:2 at quality 96 (the (2,1) TIFF layout every reader decodes).
+    // Same parameters as the MRXS compose / NDPI segment compose:
+    // YCbCr 4:2:2 at quality 96.
     jpeg::EncoderCfg::with_quality(PRESERVE_COMPOSE_QUALITY, PRESERVE_COMPOSE_SAMPLING)
-}
-
-// --------------------------------------------------------------------------- //
-// restart-segment reader (shared module: crates/core/src/segment.rs — the
-// VMS adapter consumes the exact same scanning/decoding rules)
-// --------------------------------------------------------------------------- //
-
-/// Paste one decoded segment's MCU rects into the band buffer — the shared
-/// [`crate::segment::paste_segment_rects`] with this strip's geometry (the
-/// raster adapter's JPEG segment path consumes the same rule).
-fn paste_segment(band: &mut [u8], seg: &SegmentRead, lv: &NdpiLevel, band_y0: u64, band_rows: u64) {
-    crate::segment::paste_segment_rects(
-        band,
-        seg,
-        lv.mcu_w(),
-        lv.mcu_h(),
-        lv.mcus_x,
-        lv.height,
-        band_y0,
-        band_rows,
-    );
 }
 
 // --------------------------------------------------------------------------- //
@@ -124,16 +98,15 @@ struct LevelMeta {
     photometric: u16,
     tiff_sub: (u16, u16),
     reduced: bool,
-    mpp: Option<(f64, f64)>,
     icc: Option<Vec<u8>>,
 }
 
-enum NdpiWriter<'a> {
+enum RasterWriter<'a> {
     Classic { w: BigTiffPyramidWriter<'a>, description: Vec<u8> },
     Ome { w: OmeBigTiffWriter<'a>, ome_xml: Option<Vec<u8>>, levels: usize },
 }
 
-impl NdpiWriter<'_> {
+impl RasterWriter<'_> {
     fn begin(
         &mut self,
         scratch: &mut dyn ScratchFactory,
@@ -141,11 +114,11 @@ impl NdpiWriter<'_> {
         committed: Option<u64>,
     ) -> CoreResult<()> {
         match self {
-            NdpiWriter::Classic { w, .. } => match committed {
+            RasterWriter::Classic { w, .. } => match committed {
                 None => w.begin_level(scratch),
                 Some(t) => w.begin_level_resume(scratch, t),
             },
-            NdpiWriter::Ome { w, ome_xml, levels } => {
+            RasterWriter::Ome { w, ome_xml, levels } => {
                 let desc = if m.reduced { None } else { ome_xml.take() };
                 *levels += 1;
                 w.begin_rgb_ifd_ex(
@@ -153,7 +126,7 @@ impl NdpiWriter<'_> {
                     m.width,
                     m.height,
                     m.reduced,
-                    m.mpp,
+                    None, // no MPP: a plain image carries no physical scale
                     m.tiff_sub,
                     desc,
                     committed,
@@ -170,11 +143,11 @@ impl NdpiWriter<'_> {
 
     fn end(&mut self, m: &LevelMeta, description: &[u8]) -> CoreResult<()> {
         match self {
-            NdpiWriter::Classic { w, .. } => w.end_level_ex(
+            RasterWriter::Classic { w, .. } => w.end_level_ex(
                 m.width,
                 m.height,
                 m.tiff_sub,
-                m.mpp,
+                None,
                 description,
                 m.reduced,
                 &LevelExtras {
@@ -184,49 +157,49 @@ impl NdpiWriter<'_> {
                     icc: m.icc.clone(),
                 },
             ),
-            NdpiWriter::Ome { .. } => Ok(()),
+            RasterWriter::Ome { .. } => Ok(()),
         }
     }
 
     fn write_tile(&mut self, data: &[u8]) -> CoreResult<()> {
         match self {
-            NdpiWriter::Classic { w, .. } => w.write_tile(data).map(|_| ()),
-            NdpiWriter::Ome { w, .. } => w.write_tile(data).map(|_| ()),
+            RasterWriter::Classic { w, .. } => w.write_tile(data).map(|_| ()),
+            RasterWriter::Ome { w, .. } => w.write_tile(data).map(|_| ()),
         }
     }
 
     fn cursor(&self) -> u64 {
         match self {
-            NdpiWriter::Classic { w, .. } => w.cursor(),
-            NdpiWriter::Ome { w, .. } => w.cursor(),
+            RasterWriter::Classic { w, .. } => w.cursor(),
+            RasterWriter::Ome { w, .. } => w.cursor(),
         }
     }
 
     fn tile_record(&self, ifd: usize, index: usize) -> CoreResult<(u64, u32)> {
         match self {
-            NdpiWriter::Classic { w, .. } => w.tile_record(ifd, index),
-            NdpiWriter::Ome { w, .. } => w.tile_record(ifd, index),
+            RasterWriter::Classic { w, .. } => w.tile_record(ifd, index),
+            RasterWriter::Ome { w, .. } => w.tile_record(ifd, index),
         }
     }
 
     fn read_output_at(&self, offset: u64, len: usize) -> CoreResult<Vec<u8>> {
         match self {
-            NdpiWriter::Classic { w, .. } => w.read_output_at(offset, len),
-            NdpiWriter::Ome { w, .. } => w.read_output_at(offset, len),
+            RasterWriter::Classic { w, .. } => w.read_output_at(offset, len),
+            RasterWriter::Ome { w, .. } => w.read_output_at(offset, len),
         }
     }
 
     fn ifd_tile_counts(&self) -> Vec<u64> {
         match self {
-            NdpiWriter::Classic { w, .. } => w.ifd_tile_counts(),
-            NdpiWriter::Ome { w, .. } => w.ifd_tile_counts(),
+            RasterWriter::Classic { w, .. } => w.ifd_tile_counts(),
+            RasterWriter::Ome { w, .. } => w.ifd_tile_counts(),
         }
     }
 
     fn finish(&mut self) -> CoreResult<u64> {
         match self {
-            NdpiWriter::Classic { w, .. } => w.finish(),
-            NdpiWriter::Ome { w, levels, .. } => {
+            RasterWriter::Classic { w, .. } => w.finish(),
+            RasterWriter::Ome { w, levels, .. } => {
                 if *levels > 1 {
                     w.set_subifds_for(0, (1..*levels).collect())?;
                 }
@@ -236,24 +209,15 @@ impl NdpiWriter<'_> {
     }
 }
 
-fn ndpi_description_bytes(doc: &NdpiDoc) -> Vec<u8> {
-    let (mx, my) = doc.mpp.unwrap_or((f64::NAN, f64::NAN));
-    let fmt = |v: f64| {
-        if v.is_finite() {
-            py_repr_f64(v)
-        } else {
-            "null".into()
-        }
-    };
+fn raster_description_bytes() -> Vec<u8> {
+    // MPP/objective are always null: nothing in a BMP/JPEG names a physical
+    // scale and none is invented (the OME output writes no PhysicalSize).
     let s = format!(
-        "{{\"adapter\": \"{}\", \"adapter_version\": \"{}\", \"composed\": \"{}\", \"pyramid\": \"{}\", \"mpp_x\": {}, \"mpp_y\": {}, \"objective\": {}, \"source_format\": \"{}\"}}\u{0}",
+        "{{\"adapter\": \"{}\", \"adapter_version\": \"{}\", \"composed\": \"{}\", \"pyramid\": \"{}\", \"mpp_x\": null, \"mpp_y\": null, \"objective\": null, \"source_format\": \"{}\"}}\u{0}",
         SOURCE_FORMAT,
         ADAPTER_VERSION,
         PRESERVE_COMPOSE_FINGERPRINT,
         PYRAMID_METHOD,
-        fmt(mx),
-        fmt(my),
-        doc.objective.map(py_repr_f64).unwrap_or_else(|| "null".into()),
         SOURCE_FORMAT,
     );
     s.into_bytes()
@@ -273,8 +237,7 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
-fn ndpi_ome_xml(doc: &NdpiDoc, plan: &TransformPlan) -> Vec<u8> {
-    let main = &doc.levels[0];
+fn raster_ome_xml(doc: &RasterDoc, plan: &TransformPlan) -> Vec<u8> {
     let compact = plan.encoding == EncodingProfile::CompactJpegV1;
     let mut provenance: Vec<(&str, String)> = vec![
         ("converter", "slide-transform-core".to_string()),
@@ -285,27 +248,33 @@ fn ndpi_ome_xml(doc: &NdpiDoc, plan: &TransformPlan) -> Vec<u8> {
         ("adapter_version", ADAPTER_VERSION.to_string()),
         (
             "compose_mode",
-            "whole-layer JPEG strip decoded restart-segment by restart segment and \
-             re-encoded into 256px output tiles; every tile re-encoded (no byte \
-             passthrough exists for this format)"
-                .to_string(),
+            format!(
+                "plain image decoded through its bounded unit ({}) and re-encoded \
+                 into 256px output tiles; every tile re-encoded (no byte passthrough \
+                 exists for this format)",
+                match doc.kind {
+                    crate::raster::RasterKind::Bmp24 => "BMP rows",
+                    crate::raster::RasterKind::Bmp32 => "BMP rows",
+                    crate::raster::RasterKind::JpegBaseline => {
+                        if doc.jpeg.as_ref().is_some_and(|j| j.restart_interval > 0) {
+                            "JPEG restart segments"
+                        } else {
+                            "JPEG MCU-row bands"
+                        }
+                    }
+                }
+            ),
         ),
         (
             "pyramid_method",
             "l0-box2: reduced output levels are the 2x2 area-average (box) downsample \
-             chain of output level 0 — the source's own reduced layers are not used \
-             for pixels"
+             chain of output level 0"
                 .to_string(),
         ),
         ("preserve_compose_fingerprint", PRESERVE_COMPOSE_FINGERPRINT.to_string()),
-        (
-            "mpp_source",
-            if doc.mpp.is_some() { "ndpi-vendor-mpp-tags" } else { "unknown" }.to_string(),
-        ),
-        (
-            "objective_source",
-            if doc.objective.is_some() { "ndpi-sourcelens" } else { "unknown" }.to_string(),
-        ),
+        // 无物理标尺：BMP/JPEG 不携带 µm/px，OME 刻意不写 PhysicalSize
+        ("mpp_source", "none (plain image: no physical scale in BMP/JPEG)".to_string()),
+        ("physical_size_written", "false".to_string()),
         ("pyramid_levels", (1 + doc.generated.len()).to_string()),
     ];
     if compact {
@@ -316,7 +285,7 @@ fn ndpi_ome_xml(doc: &NdpiDoc, plan: &TransformPlan) -> Vec<u8> {
         "tile_payloads",
         if compact {
             format!(
-                "decoded from restart segments, then re-encoded at the locked compact \
+                "decoded from source pixels, then re-encoded at the locked compact \
                  parameters (quality {}, subsampling {}, standard Annex-K Huffman, \
                  fingerprint {}); lossy",
                 COMPACT_JPEG_V1_QUALITY,
@@ -325,7 +294,7 @@ fn ndpi_ome_xml(doc: &NdpiDoc, plan: &TransformPlan) -> Vec<u8> {
             )
         } else {
             format!(
-                "decoded from restart segments, then re-encoded at the documented \
+                "decoded from source pixels, then re-encoded at the documented \
                  high-fidelity compose setting (YCbCr 4:2:2, quality {}, standard \
                  Annex-K Huffman, fingerprint {}); lossy generation on a lossy \
                  source, never claimed lossless",
@@ -341,71 +310,35 @@ fn ndpi_ome_xml(doc: &NdpiDoc, plan: &TransformPlan) -> Vec<u8> {
             PixelPolicy::StrictLossless => "strict-lossless".to_string(),
         },
     ));
-    let has_objective = doc.objective.is_some_and(|m| m.is_finite() && m > 0.0);
-    let instrument = if has_objective {
-        format!(
-            "<Instrument ID=\"Instrument:0\"><Objective ID=\"Objective:0:0\" NominalMagnification=\"{}\"/></Instrument>",
-            crate::ome::py_g17(doc.objective.unwrap_or(0.0))
-        )
-    } else {
-        String::new()
-    };
-    let refs = if has_objective {
-        "<InstrumentRef ID=\"Instrument:0\"/><ObjectiveSettings ID=\"Objective:0:0\"/>"
-    } else {
-        ""
-    };
     let mut kv = String::new();
     for (k, v) in &provenance {
         kv.push_str(&format!("<M K=\"{}\">{}</M>", xml_escape(k), xml_escape(v)));
     }
-    let (phys, ann_ref, ann) = match doc.mpp {
-        Some((mx, my)) if mx.is_finite() && mx > 0.0 && my.is_finite() && my > 0.0 => (
-            format!(
-                " PhysicalSizeX=\"{}\" PhysicalSizeXUnit=\"µm\" PhysicalSizeY=\"{}\" PhysicalSizeYUnit=\"µm\"",
-                py_repr_f64(mx),
-                py_repr_f64(my)
-            ),
-            "<AnnotationRef ID=\"Annotation:0\"/>".to_string(),
-            format!(
-                "<StructuredAnnotations><MapAnnotation ID=\"Annotation:0\" Namespace=\"{}\"><Value>{kv}</Value></MapAnnotation></StructuredAnnotations>",
-                crate::ome::PROVENANCE_NS
-            ),
-        ),
-        _ => (
-            String::new(),
-            "<AnnotationRef ID=\"Annotation:0\"/>".to_string(),
-            format!(
-                "<StructuredAnnotations><MapAnnotation ID=\"Annotation:0\" Namespace=\"{}\"><Value>{kv}</Value></MapAnnotation></StructuredAnnotations>",
-                crate::ome::PROVENANCE_NS
-            ),
-        ),
-    };
+    let ann_ref = "<AnnotationRef ID=\"Annotation:0\"/>";
+    let ann = format!(
+        "<StructuredAnnotations><MapAnnotation ID=\"Annotation:0\" Namespace=\"{}\"><Value>{kv}</Value></MapAnnotation></StructuredAnnotations>",
+        crate::ome::PROVENANCE_NS
+    );
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
 <OME xmlns=\"http://www.openmicroscopy.org/Schemas/OME/2016-06\" \
 xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" \
 xsi:schemaLocation=\"http://www.openmicroscopy.org/Schemas/OME/2016-06 http://www.openmicroscopy.org/Schemas/OME/2016-06/ome.xsd\">\
-{instrument}<Image ID=\"Image:0\">{refs}\
+<Image ID=\"Image:0\">{refs}\
 <Pixels ID=\"Pixels:0\" DimensionOrder=\"XYCZT\" Type=\"uint8\" SignificantBits=\"8\" Interleaved=\"true\" \
-SizeX=\"{}\" SizeY=\"{}\" SizeC=\"3\" SizeZ=\"1\" SizeT=\"1\"{phys}>\
+SizeX=\"{}\" SizeY=\"{}\" SizeC=\"3\" SizeZ=\"1\" SizeT=\"1\">\
 <Channel ID=\"Channel:0:0\" SamplesPerPixel=\"3\"/>\
 <TiffData IFD=\"0\" PlaneCount=\"1\"/>\
 </Pixels>{ann_ref}</Image>{ann}</OME>",
-        main.width, main.height,
+        doc.width, doc.height,
+        refs = "",
     );
     let mut out = xml.into_bytes();
     out.push(0);
     out
 }
 
-fn level_meta(doc: &NdpiDoc, li: usize, compact: bool, dims: (u32, u32)) -> LevelMeta {
-    let l0 = &doc.levels[0];
-    let mpp = doc.mpp.map(|(mx, my)| {
-        let rx = l0.width as f64 / dims.0 as f64;
-        let ry = l0.height as f64 / dims.1 as f64;
-        (mx * rx, my * ry)
-    });
+fn level_meta(doc: &RasterDoc, li: usize, compact: bool, dims: (u32, u32)) -> LevelMeta {
     let (photometric, tiff_sub) = if compact {
         (6u16, compact_sampling_tiff())
     } else {
@@ -417,7 +350,6 @@ fn level_meta(doc: &NdpiDoc, li: usize, compact: bool, dims: (u32, u32)) -> Leve
         photometric,
         tiff_sub,
         reduced: li > 0,
-        mpp,
         icc: if li == 0 { doc.icc.clone() } else { None },
     }
 }
@@ -427,7 +359,7 @@ fn level_meta(doc: &NdpiDoc, li: usize, compact: bool, dims: (u32, u32)) -> Leve
 /// geometry as the generic-TIFF adapter's generated tail).
 #[allow(clippy::too_many_arguments)]
 fn pyramid_tile_from_prev(
-    writer: &NdpiWriter<'_>,
+    writer: &RasterWriter<'_>,
     prev_ifd: usize,
     prev_across: u32,
     prev_down: u32,
@@ -505,10 +437,59 @@ fn pyramid_tile_from_prev(
 }
 
 // --------------------------------------------------------------------------- //
+// row feeds: the three bounded decode units
+// --------------------------------------------------------------------------- //
+
+/// Fill `band[rows × width × 3]` with output pixel rows `[y0, y0 + rows)` of
+/// the BMP (exact per-row reads; 24 bpp BGR / 32 bpp BGRA → RGB).
+fn bmp_fill_band(
+    src: &dyn ByteSource,
+    layout: &BmpLayout,
+    bpp32: bool,
+    width: u32,
+    height: u32,
+    y0: u64,
+    rows: u64,
+    band: &mut [u8],
+) -> CoreResult<()> {
+    let w = width as usize;
+    let step = if layout.top_down { 1i64 } else { -1i64 };
+    let first = if layout.top_down {
+        y0 as i64
+    } else {
+        height as i64 - 1 - y0 as i64
+    };
+    let row_bytes = layout.row_bytes as usize;
+    for r in 0..rows as usize {
+        let src_row_idx = first + step * r as i64;
+        if src_row_idx < 0 || src_row_idx >= height as i64 {
+            return Err(CoreError::oob(format!("BMP 行 {src_row_idx} 越界")));
+        }
+        let off = layout.data_offset + src_row_idx as u64 * layout.row_bytes;
+        let raw = src.read_at(off, row_bytes)?;
+        let d = &mut band[r * w * 3..][..w * 3];
+        if bpp32 {
+            for x in 0..w {
+                d[x * 3] = raw[x * 4 + 2];
+                d[x * 3 + 1] = raw[x * 4 + 1];
+                d[x * 3 + 2] = raw[x * 4];
+            }
+        } else {
+            for x in 0..w {
+                d[x * 3] = raw[x * 3 + 2];
+                d[x * 3 + 1] = raw[x * 3 + 1];
+                d[x * 3 + 2] = raw[x * 3];
+            }
+        }
+    }
+    Ok(())
+}
+
+// --------------------------------------------------------------------------- //
 // conversion
 // --------------------------------------------------------------------------- //
 
-pub fn convert_ndpi_to_bigtiff(
+pub fn convert_raster_to_bigtiff(
     src: &dyn ByteSource,
     sink: &mut dyn RandomAccessSink,
     scratch: &mut dyn ScratchFactory,
@@ -518,8 +499,8 @@ pub fn convert_ndpi_to_bigtiff(
     convert_inner(src, sink, scratch, plan, job, None)
 }
 
-/// Resume an NDPI conversion from `resume` (see [`crate::resume`]).
-pub fn convert_ndpi_to_bigtiff_resume(
+/// Resume a raster conversion from `resume` (see [`crate::resume`]).
+pub fn convert_raster_to_bigtiff_resume(
     src: &dyn ByteSource,
     sink: &mut dyn RandomAccessSink,
     scratch: &mut dyn ScratchFactory,
@@ -527,12 +508,12 @@ pub fn convert_ndpi_to_bigtiff_resume(
     job: &JobControl,
     resume: &ResumePoint,
 ) -> CoreResult<TransformResult> {
-    // Adapter-version pin, enforced in the CORE (SCN/gtiff parity): a state
+    // Adapter-version pin, enforced in the CORE (SCN/NDPI parity): a state
     // WITHOUT the field is foreign as well — never mix two adapter
     // generations into one output.
     if resume.adapter_version.as_deref() != Some(ADAPTER_VERSION) {
         return Err(CoreError::validation(format!(
-            "resume: 已提交进度属于 NDPI 适配器 v{}，当前为 v{ADAPTER_VERSION}：两种适配器配方不得混合进同一输出",
+            "resume: 已提交进度属于普通图片适配器 v{}，当前为 v{ADAPTER_VERSION}：两种适配器配方不得混合进同一输出",
             resume.adapter_version.as_deref().unwrap_or("1（字段缺失）"),
         )));
     }
@@ -549,10 +530,10 @@ fn convert_inner(
     resume: Option<&ResumePoint>,
 ) -> CoreResult<TransformResult> {
     let started = crate::job::WallInstant::now();
-    let doc = probe_ndpi_with_budget(src, plan.limits.memory_budget_bytes)?;
+    let doc = probe_raster_with_budget(src, plan.limits.memory_budget_bytes)?;
     let mut budget: MemBudget = doc.budget.clone();
-    let l0 = &doc.levels[0];
-    let out_levels: Vec<(u32, u32)> = std::iter::once((l0.width, l0.height))
+    let (w, h) = (doc.width, doc.height);
+    let out_levels: Vec<(u32, u32)> = std::iter::once((w, h))
         .chain(doc.generated.iter().copied())
         .collect();
     if let Some(r) = resume {
@@ -570,11 +551,11 @@ fn convert_inner(
         }
     }
     if plan.profile == OutputProfile::OmeBigTiffSubifd {
-        return Err(CoreError::variant("荧光 OME profile 不适用于明场 NDPI 输入"));
+        return Err(CoreError::variant("荧光 OME profile 不适用于明场普通图片输入"));
     }
     if plan.pixel_policy == PixelPolicy::StrictLossless {
         return Err(CoreError::policy(
-            "strict-lossless 与 NDPI 输出互斥：整层条带必须分段解码后重编码（有损），无逐字节搬运路径",
+            "strict-lossless 与普通图片输出互斥：像素必须解码后重编码（有损），无逐字节搬运路径",
         ));
     }
     let compact = plan.encoding == EncodingProfile::CompactJpegV1;
@@ -585,35 +566,52 @@ fn convert_inner(
     };
 
     let mut warnings: Vec<String> = Vec::new();
-    if !doc.associated.is_empty() {
-        warnings.push(WARN_ASSOC_NOT_EXPORTED.to_string());
-    }
     if !doc.generated.is_empty() {
-        warnings.push(format!("ndpi_levels_generated:{}", doc.generated.len()));
+        warnings.push(format!("raster_levels_generated:{}", doc.generated.len()));
     }
     if doc.icc.is_none() {
         warnings.push(WARN_NO_ICC.to_string());
     }
+    warnings.push(WARN_NO_PHYSICAL_SIZE.to_string());
 
     // ---- working set, charged BEFORE any allocation (review §1) ---------- //
-    let band_rows_mcu = (OUT_TILE as u64).div_ceil(l0.mcu_h() as u64);
-    let band_rows_px = band_rows_mcu * l0.mcu_h() as u64;
-    let padded_w = l0.mcus_x as u64 * l0.mcu_w() as u64;
-    let band_bytes = band_rows_px
-        .saturating_mul(padded_w)
-        .saturating_mul(3);
     let canvas_bytes = (OUT_TILE as u64)
         .saturating_mul(OUT_TILE as u64)
         .saturating_mul(6); // tile canvas + encode buffers
-    let max_seg_px = (l0.restart_interval as u64)
-        .saturating_mul(l0.mcu_w() as u64)
-        .saturating_mul(l0.mcu_h() as u64);
-    budget.charge(band_bytes, "L0 条带缓冲（MCU 行带 × padded 宽 × 3）")?;
     budget.charge(canvas_bytes, "tile 画布与编码缓冲")?;
-    budget.charge(
-        max_seg_px.saturating_mul(6),
-        "单段解码峰值预留（读取 + 解码器临时 + RGB）",
-    )?;
+    let band_bytes: u64;
+    match (&doc.bmp, &doc.jpeg) {
+        (Some(_), _) => {
+            band_bytes = w as u64 * OUT_TILE as u64 * 3;
+            budget.charge(band_bytes, "BMP 行带缓冲（宽 × 256 行 × 3）")?;
+            budget.charge(
+                doc.bmp.as_ref().map(|b| b.row_bytes).unwrap_or(0),
+                "BMP 单行读取窗口",
+            )?;
+        }
+        (_, Some(j)) => {
+            if j.restart_interval > 0 {
+                // segment path: the band buffer is MCU-padded like NDPI's
+                let band_rows_mcu = (OUT_TILE as u64).div_ceil(j.mcu.1 as u64);
+                let band_rows_px = band_rows_mcu * j.mcu.1 as u64;
+                let padded_w = j.mcus_x as u64 * j.mcu.0 as u64;
+                band_bytes = band_rows_px.saturating_mul(padded_w).saturating_mul(3);
+                budget.charge(band_bytes, "JPEG 条带缓冲（MCU 行带 × padded 宽 × 3）")?;
+                let max_seg_px = (j.restart_interval as u64)
+                    .saturating_mul(j.mcu.0 as u64)
+                    .saturating_mul(j.mcu.1 as u64);
+                budget.charge(
+                    max_seg_px.saturating_mul(6),
+                    "单段解码峰值预留（读取 + 解码器临时 + RGB）",
+                )?;
+            } else {
+                // band path: BandScanner charges its own working set at open
+                band_bytes = w as u64 * OUT_TILE as u64 * 3;
+                budget.charge(band_bytes, "JPEG band 缓冲（宽 × 256 行 × 3）")?;
+            }
+        }
+        _ => return Err(CoreError::header("probe 文档既非 BMP 也非 JPEG")),
+    }
     // the generated-pyramid working set (f² decoded prev tiles + canvases)
     let pyramid_ws = 4u64
         .saturating_mul((OUT_TILE as u64) * (OUT_TILE as u64) * 6)
@@ -623,25 +621,25 @@ fn convert_inner(
     }
 
     let mut writer = match plan.profile {
-        OutputProfile::ClassicJpegBigTiff => NdpiWriter::Classic {
+        OutputProfile::ClassicJpegBigTiff => RasterWriter::Classic {
             w: match resume {
                 None => BigTiffPyramidWriter::new(sink)?,
                 Some(r) => BigTiffPyramidWriter::resume_new(sink, r.committed_output)?,
             },
-            description: ndpi_description_bytes(&doc),
+            description: raster_description_bytes(),
         },
-        OutputProfile::OmeBigTiffRgbSubifd => NdpiWriter::Ome {
+        OutputProfile::OmeBigTiffRgbSubifd => RasterWriter::Ome {
             w: match resume {
                 None => OmeBigTiffWriter::new_rgb(sink)?,
                 Some(r) => OmeBigTiffWriter::resume_new_rgb(sink, r.committed_output)?,
             },
-            ome_xml: Some(ndpi_ome_xml(&doc, plan)),
+            ome_xml: Some(raster_ome_xml(&doc, plan)),
             levels: 0,
         },
         OutputProfile::OmeBigTiffSubifd => unreachable!(),
     };
     let format =
-        if matches!(writer, NdpiWriter::Classic { .. }) { FORMAT_CLASSIC } else { FORMAT_OME_RGB };
+        if matches!(writer, RasterWriter::Classic { .. }) { FORMAT_CLASSIC } else { FORMAT_OME_RGB };
     let mut level_stats: Vec<LevelStats> = Vec::new();
     let mut ifd_chain: Vec<(u32, Option<usize>)> = Vec::new();
 
@@ -682,109 +680,62 @@ fn convert_inner(
         }
 
         if li == 0 {
-            // ---- level 0: restart-segmented decode → paste → re-encode -- //
             if resume_done {
                 // no pixels needed; counts only — but the description must be
-                // restaged for a fully-resumed level too (end_level stages it
-                // into the IFD; an empty vec here would drop tag 270 from the
-                // resumed output and break byte identity; convert_scn 同款)
+                // restaged for a fully-resumed level too (convert_ndpi 同款)
                 let desc: Vec<u8> = match &writer {
-                    NdpiWriter::Classic { description, .. } => description.clone(),
-                    NdpiWriter::Ome { .. } => Vec::new(),
+                    RasterWriter::Classic { description, .. } => description.clone(),
+                    RasterWriter::Ome { .. } => Vec::new(),
                 };
                 level_stats.push(stats);
                 ifd_chain.push((li as u32, None));
                 writer.end(&meta, &desc)?;
                 continue;
             }
-            let mut reader = SegmentReader::new(src, &l0.strip_geom());
-            if resume_current && skip_until > 0 {
-                reader.skip_to(&mut budget, first_band_segment(l0, skip_until / across)?)?;
-            }
-            let mut cell = skip_until;
-            let mut band = vec![255u8; band_bytes as usize];
-            let mut canvas = vec![255u8; (OUT_TILE as usize) * (OUT_TILE as usize) * 3];
-            let mut carry: Option<SegmentRead> = None;
-            let mut ty = skip_until / across;
-            while ty < down {
-                job.check()?;
-                // decode the segments covering this band's MCU rows (strictly
-                // sequential; a segment crossing the band edge is carried)
-                let band_y0 = ty * OUT_TILE as u64;
-                let band_rows_px_u = band_rows_px.min((l0.height as u64) - band_y0);
-                for px in band.iter_mut() {
-                    *px = 255;
+            match (&doc.bmp, &doc.jpeg) {
+                (Some(layout), _) => {
+                    l0_bmp(
+                        src,
+                        layout,
+                        doc.kind == crate::raster::RasterKind::Bmp32,
+                        w,
+                        h,
+                        across,
+                        down,
+                        &mut writer,
+                        job,
+                        &mut stats,
+                        skip_until,
+                        &cfg,
+                    )?;
                 }
-                // first MCU index past the band's valid rows (MCU-row aligned)
-                let mcu_end = band_y0.saturating_add(band_rows_px_u)
-                    .div_ceil(l0.mcu_h() as u64)
-                    * l0.mcus_x as u64;
-                loop {
-                    let next_mcu = match &carry {
-                        Some(c) => c.mcu_start,
-                        None => reader.next_k() * l0.restart_interval as u64,
-                    };
-                    if next_mcu >= mcu_end {
-                        break;
-                    }
-                    let seg = match carry.take() {
-                        Some(c) => c,
-                        None => reader.decode_next(&mut budget)?,
-                    };
-                    paste_segment(&mut band, &seg, l0, band_y0, band_rows_px_u);
-                    let seg_bottom =
-                        (seg.mcu_start + seg.mcus).div_ceil(l0.mcus_x as u64)
-                            * l0.mcu_h() as u64;
-                    if seg_bottom > band_y0 + band_rows_px_u && reader.next_k() < l0.segments {
-                        // crosses into the next band: keep the decoded pixels
-                        carry = Some(seg);
-                    } else {
-                        budget.release(seg.charged);
-                    }
+                (_, Some(j)) if j.restart_interval > 0 => {
+                    l0_jpeg_segments(
+                        src, j, doc.kind, w, h, across, down, &mut writer, job, &mut budget,
+                        &mut stats, skip_until, &cfg,
+                    )?;
                 }
-                // tiles of this row: canvas from the band (row 0 of the band
-                // IS the tile row's first pixel row), clipped at the level
-                for txc in 0..across {
-                    let tx0 = txc * OUT_TILE as u64;
-                    let valid_w = (OUT_TILE as u64).min(dims.0 as u64 - tx0) as usize;
-                    let valid_h =
-                        (OUT_TILE as u64).min(dims.1 as u64 - ty * OUT_TILE as u64) as usize;
-                    for px in canvas.iter_mut() {
-                        *px = 255;
-                    }
-                    for r in 0..valid_h {
-                        let srow = r * padded_w as usize * 3 + tx0 as usize * 3;
-                        let drow = r * OUT_TILE as usize * 3;
-                        canvas[drow..drow + valid_w * 3]
-                            .copy_from_slice(&band[srow..srow + valid_w * 3]);
-                    }
-                    let enc = jpeg::encode_rgb(&canvas, OUT_TILE, OUT_TILE, &cfg)?;
-                    writer.write_tile(&enc)?;
-                    stats.tiles_reencoded += 1;
-                    cell += 1;
-                    let row_done = cell.div_ceil(across);
-                    maybe_progress_and_checkpoint!(writer, job, stats, li, cell, tiles_total, row_done);
+                (_, Some(j)) => {
+                    l0_jpeg_bands(
+                        src, j, w, h, across, down, &mut writer, job, &mut budget, &mut stats,
+                        skip_until, &cfg,
+                    )?;
                 }
-                ty += 1;
+                _ => return Err(CoreError::header("probe 文档既非 BMP 也非 JPEG")),
             }
-            if let Some(c) = carry.take() {
-                budget.release(c.charged);
-            }
-            drop(reader);
-            if cell != tiles_total {
+            if stats.tiles_reencoded != tiles_total {
                 return Err(CoreError::validation(format!(
-                    "层 0 tile 游标 {cell} ≠ 网格总数 {tiles_total}"
+                    "层 0 tile 游标 {} ≠ 网格总数 {tiles_total}",
+                    stats.tiles_reencoded
                 )));
             }
             budget.release(band_bytes);
         } else {
             // ---- reduced level: the L0-derived pyramid (l0-box2) -------- //
             if resume_done {
-                // the description must be restaged for a fully-resumed level
-                // too (see the L0 resume_done arm; convert_scn 同款预防)
                 let desc: Vec<u8> = match &writer {
-                    NdpiWriter::Classic { description, .. } => description.clone(),
-                    NdpiWriter::Ome { .. } => Vec::new(),
+                    RasterWriter::Classic { description, .. } => description.clone(),
+                    RasterWriter::Ome { .. } => Vec::new(),
                 };
                 level_stats.push(stats);
                 ifd_chain.push((li as u32, None));
@@ -829,8 +780,8 @@ fn convert_inner(
             )));
         }
         let desc: Vec<u8> = match &writer {
-            NdpiWriter::Classic { description, .. } => description.clone(),
-            NdpiWriter::Ome { .. } => Vec::new(),
+            RasterWriter::Classic { description, .. } => description.clone(),
+            RasterWriter::Ome { .. } => Vec::new(),
         };
         writer.end(&meta, &desc)?;
         ifd_chain.push((li as u32, None));
@@ -855,8 +806,8 @@ fn convert_inner(
         adapter_version: Some(ADAPTER_VERSION),
         output_bytes,
         output_sha256: None,
-        width: l0.width,
-        height: l0.height,
+        width: w,
+        height: h,
         levels: level_stats,
         edge_regions: Vec::new(),
         warnings,
@@ -882,7 +833,7 @@ fn convert_inner(
             tiles_padded: 0,
         }),
         composed: Some(ComposedSummary {
-            mode: "segment-compose-reencode".to_string(),
+            mode: "raster-compose-reencode".to_string(),
             fingerprint: PRESERVE_COMPOSE_FINGERPRINT.to_string(),
             quality: PRESERVE_COMPOSE_QUALITY,
             sampling: "4:2:2".to_string(),
@@ -892,17 +843,7 @@ fn convert_inner(
             tiles_deduped: 0,
             pyramid: PYRAMID_METHOD.to_string(),
         }),
-        associated: doc
-            .associated
-            .iter()
-            .map(|a| AssociatedSummary {
-                name: a.name.clone(),
-                source_offset: 0,
-                source_length: 0,
-                width: a.width,
-                height: a.height,
-            })
-            .collect(),
+        associated: Vec::new(),
         elapsed_seconds: started.elapsed().as_secs_f64(),
     };
     result.validation.tile_records_emitted =
@@ -910,14 +851,251 @@ fn convert_inner(
     Ok(result)
 }
 
-/// First segment index whose MCU range intersects tile row `ty`'s MCU rows.
-fn first_band_segment(l0: &NdpiLevel, ty: u64) -> CoreResult<u64> {
-    let mcu_row = (ty * OUT_TILE as u64) / l0.mcu_h() as u64;
-    Ok(mcu_row * l0.mcus_x as u64 / l0.restart_interval as u64)
+/// L0 loop, BMP feed: exact row reads → band → tiles.
+#[allow(clippy::too_many_arguments)]
+fn l0_bmp(
+    src: &dyn ByteSource,
+    layout: &BmpLayout,
+    bpp32: bool,
+    w: u32,
+    h: u32,
+    across: u64,
+    down: u64,
+    writer: &mut RasterWriter<'_>,
+    job: &JobControl,
+    stats: &mut LevelStats,
+    skip_until: u64,
+    cfg: &jpeg::EncoderCfg,
+) -> CoreResult<()> {
+    let band_rows = OUT_TILE as u64;
+    let mut band = vec![255u8; w as usize * band_rows as usize * 3];
+    let mut canvas = vec![255u8; (OUT_TILE as usize) * (OUT_TILE as usize) * 3];
+    let mut cell = skip_until;
+    let mut ty = skip_until / across;
+    while ty < down {
+        job.check()?;
+        let y0 = ty * band_rows;
+        let rows = band_rows.min(h as u64 - y0);
+        for px in band.iter_mut() {
+            *px = 255;
+        }
+        bmp_fill_band(src, layout, bpp32, w, h, y0, rows, &mut band)?;
+        for txc in 0..across {
+            let tx0 = txc * OUT_TILE as u64;
+            let valid_w = (OUT_TILE as u64).min(w as u64 - tx0) as usize;
+            let valid_h = (OUT_TILE as u64).min(h as u64 - ty * OUT_TILE as u64) as usize;
+            for px in canvas.iter_mut() {
+                *px = 255;
+            }
+            for r in 0..valid_h {
+                let srow = (r as u64 * w as u64 + tx0) as usize * 3;
+                let drow = r * OUT_TILE as usize * 3;
+                canvas[drow..drow + valid_w * 3]
+                    .copy_from_slice(&band[srow..srow + valid_w * 3]);
+            }
+            let enc = jpeg::encode_rgb(&canvas, OUT_TILE, OUT_TILE, cfg)?;
+            writer.write_tile(&enc)?;
+            stats.tiles_reencoded += 1;
+            cell += 1;
+            let row_done = cell.div_ceil(across);
+            maybe_progress_and_checkpoint!(writer, job, stats, 0, cell, across * down, row_done);
+        }
+        ty += 1;
+    }
+    Ok(())
+}
+
+/// L0 loop, JPEG feed with restart markers: restart-segment decode → paste
+/// → tiles (the NDPI band loop, over the whole file as one strip).
+#[allow(clippy::too_many_arguments)]
+fn l0_jpeg_segments(
+    src: &dyn ByteSource,
+    j: &RasterJpeg,
+    kind: crate::raster::RasterKind,
+    w: u32,
+    h: u32,
+    across: u64,
+    down: u64,
+    writer: &mut RasterWriter<'_>,
+    job: &JobControl,
+    budget: &mut MemBudget,
+    stats: &mut LevelStats,
+    skip_until: u64,
+    cfg: &jpeg::EncoderCfg,
+) -> CoreResult<()> {
+    let _ = kind;
+    let geom = StripGeom {
+        strip_offset: 0,
+        strip_bytes: src.size(),
+        mcu_w: j.mcu.0,
+        mcu_h: j.mcu.1,
+        mcus_x: j.mcus_x,
+        total_mcus: j.total_mcus,
+        restart_interval: j.restart_interval,
+        segments: j.segments,
+        header_bytes: j.header_bytes.clone(),
+        sof_hw_at: j.sof_hw_at,
+        dri_at: j.dri_at,
+    };
+    let band_rows_mcu = (OUT_TILE as u64).div_ceil(j.mcu.1 as u64);
+    let band_rows_px = band_rows_mcu * j.mcu.1 as u64;
+    let padded_w = j.mcus_x as u64 * j.mcu.0 as u64;
+    let mut reader = SegmentReader::new(src, &geom);
+    if skip_until > 0 {
+        let ty = skip_until / across;
+        let first_seg = ty * (OUT_TILE as u64) / j.mcu.1 as u64 * j.mcus_x as u64
+            / j.restart_interval as u64;
+        reader.skip_to(budget, first_seg)?;
+    }
+    let mut band = vec![255u8; band_rows_px as usize * padded_w as usize * 3];
+    let mut canvas = vec![255u8; (OUT_TILE as usize) * (OUT_TILE as usize) * 3];
+    let mut carry: Option<crate::segment::SegmentRead> = None;
+    let mut cell = skip_until;
+    let mut ty = skip_until / across;
+    while ty < down {
+        job.check()?;
+        let band_y0 = ty * OUT_TILE as u64;
+        let band_rows_u = band_rows_px.min(h as u64 - band_y0);
+        for px in band.iter_mut() {
+            *px = 255;
+        }
+        let mcu_end = band_y0.saturating_add(band_rows_u)
+            .div_ceil(j.mcu.1 as u64)
+            * j.mcus_x as u64;
+        loop {
+            let next_mcu = match &carry {
+                Some(c) => c.mcu_start,
+                None => reader.next_k() * j.restart_interval as u64,
+            };
+            if next_mcu >= mcu_end {
+                break;
+            }
+            let seg = match carry.take() {
+                Some(c) => c,
+                None => reader.decode_next(budget)?,
+            };
+            crate::segment::paste_segment_rects(
+                &mut band,
+                &seg,
+                j.mcu.0,
+                j.mcu.1,
+                j.mcus_x,
+                h,
+                band_y0,
+                band_rows_u,
+            );
+            let seg_bottom =
+                (seg.mcu_start + seg.mcus).div_ceil(j.mcus_x as u64) * j.mcu.1 as u64;
+            if seg_bottom > band_y0 + band_rows_u && reader.next_k() < j.segments {
+                carry = Some(seg);
+            } else {
+                budget.release(seg.charged);
+            }
+        }
+        for txc in 0..across {
+            let tx0 = txc * OUT_TILE as u64;
+            let valid_w = (OUT_TILE as u64).min(w as u64 - tx0) as usize;
+            let valid_h = (OUT_TILE as u64).min(h as u64 - ty * OUT_TILE as u64) as usize;
+            for px in canvas.iter_mut() {
+                *px = 255;
+            }
+            for r in 0..valid_h {
+                let srow = r * padded_w as usize * 3 + tx0 as usize * 3;
+                let drow = r * OUT_TILE as usize * 3;
+                canvas[drow..drow + valid_w * 3]
+                    .copy_from_slice(&band[srow..srow + valid_w * 3]);
+            }
+            let enc = jpeg::encode_rgb(&canvas, OUT_TILE, OUT_TILE, cfg)?;
+            writer.write_tile(&enc)?;
+            stats.tiles_reencoded += 1;
+            cell += 1;
+            let row_done = cell.div_ceil(across);
+            maybe_progress_and_checkpoint!(writer, job, stats, 0, cell, across * down, row_done);
+        }
+        ty += 1;
+    }
+    if let Some(c) = carry.take() {
+        budget.release(c.charged);
+    }
+    Ok(())
+}
+
+/// L0 loop, JPEG feed WITHOUT restart markers: MCU-row band decode
+/// ([`BandScanner`]) → band → tiles.
+#[allow(clippy::too_many_arguments)]
+fn l0_jpeg_bands(
+    src: &dyn ByteSource,
+    j: &RasterJpeg,
+    w: u32,
+    h: u32,
+    across: u64,
+    down: u64,
+    writer: &mut RasterWriter<'_>,
+    job: &JobControl,
+    budget: &mut MemBudget,
+    stats: &mut LevelStats,
+    skip_until: u64,
+    cfg: &jpeg::EncoderCfg,
+) -> CoreResult<()> {
+    let force_rgb = j.color == jpeg::TiffJpegColor::Rgb;
+    let mut scanner =
+        BandScanner::open(src, &j.header_bytes, j.header_offset, src.size(), force_rgb, budget)?;
+    if skip_until > 0 {
+        let ty = skip_until / across;
+        let first_band = ty * OUT_TILE as u64 / j.mcu.1 as u64;
+        scanner.skip_to(first_band as u32)?;
+    }
+    let band_rows = OUT_TILE as u64;
+    let mut band = vec![255u8; w as usize * band_rows as usize * 3];
+    let mut canvas = vec![255u8; (OUT_TILE as usize) * (OUT_TILE as usize) * 3];
+    let mut cell = skip_until;
+    let mut ty = skip_until / across;
+    while ty < down {
+        job.check()?;
+        let y0 = ty * band_rows;
+        let rows = band_rows.min(h as u64 - y0);
+        for px in band.iter_mut() {
+            *px = 255;
+        }
+        // decode the MCU-row bands covering this tile row
+        while scanner.next_band_y0() < y0 + rows {
+            let b = scanner
+                .next_band()?
+                .ok_or_else(|| CoreError::jpeg("JPEG 扫描在 tile 行结束前耗尽（熵数据截断）"))?;
+            let dst0 = (b.y0 as u64 - y0) as usize;
+            for r in 0..b.rows as usize {
+                let s = r * w as usize * 3;
+                let d = (dst0 + r) * w as usize * 3;
+                band[d..d + w as usize * 3].copy_from_slice(&b.data[s..s + w as usize * 3]);
+            }
+        }
+        for txc in 0..across {
+            let tx0 = txc * OUT_TILE as u64;
+            let valid_w = (OUT_TILE as u64).min(w as u64 - tx0) as usize;
+            let valid_h = (OUT_TILE as u64).min(h as u64 - ty * OUT_TILE as u64) as usize;
+            for px in canvas.iter_mut() {
+                *px = 255;
+            }
+            for r in 0..valid_h {
+                let srow = (r as u64 * w as u64 + tx0) as usize * 3;
+                let drow = r * OUT_TILE as usize * 3;
+                canvas[drow..drow + valid_w * 3]
+                    .copy_from_slice(&band[srow..srow + valid_w * 3]);
+            }
+            let enc = jpeg::encode_rgb(&canvas, OUT_TILE, OUT_TILE, cfg)?;
+            writer.write_tile(&enc)?;
+            stats.tiles_reencoded += 1;
+            cell += 1;
+            let row_done = cell.div_ceil(across);
+            maybe_progress_and_checkpoint!(writer, job, stats, 0, cell, across * down, row_done);
+        }
+        ty += 1;
+    }
+    Ok(())
 }
 
 /// Convenience wrapper without progress (tests).
-pub fn convert_ndpi(
+pub fn convert_raster(
     src: &dyn ByteSource,
     sink: &mut dyn RandomAccessSink,
     scratch: &mut dyn ScratchFactory,
@@ -925,5 +1103,5 @@ pub fn convert_ndpi(
 ) -> CoreResult<TransformResult> {
     let null = NullProgress;
     let job = JobControl::new(&null).with_timeout(plan.limits.timeout_seconds);
-    convert_ndpi_to_bigtiff(src, sink, scratch, plan, &job)
+    convert_raster_to_bigtiff(src, sink, scratch, plan, &job)
 }

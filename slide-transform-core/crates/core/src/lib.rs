@@ -27,6 +27,8 @@ pub mod convert_mirax;
 #[cfg(feature = "codecs")]
 pub mod convert_ndpi;
 #[cfg(feature = "codecs")]
+pub mod convert_raster;
+#[cfg(feature = "codecs")]
 pub mod convert_scn;
 #[cfg(feature = "codecs")]
 pub mod convert_svs;
@@ -43,6 +45,7 @@ pub mod kfbf;
 pub mod mirax;
 pub mod ndpi;
 pub mod ome;
+pub mod raster;
 pub mod scn;
 pub mod ome_writer;
 pub mod paged_index;
@@ -79,6 +82,9 @@ pub mod gtiff_fixture;
 
 #[cfg(all(feature = "codecs", feature = "fixtures"))]
 pub mod ndpi_fixture;
+
+#[cfg(all(feature = "codecs", feature = "fixtures"))]
+pub mod raster_fixture;
 
 #[cfg(all(feature = "codecs", feature = "fixtures"))]
 pub mod vms_fixture;

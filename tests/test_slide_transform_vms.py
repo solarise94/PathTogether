@@ -335,11 +335,12 @@ def test_real_sample_l0_mean_error_and_pyramid_geometry(workdir):
     import slide_io
 
     entry = _sample_entry(VMS_SAMPLE_DIR)
-    out = workdir / "cmu1-vms-pix.ome.tif"
-    rj = json.loads(
+    out = workdir / "cmu1-vms.ome.tif"
+    # The 320M conversion test above already produced this exact output
+    # (same input, bf-ome, preserve); convert only when run on its own.
+    if not out.exists():
         _cli("convert", entry, out, "--overwrite", "--profile", "bf-ome",
-             "--timeout", "7200").stdout
-    )
+             "--timeout", "7200")
     src = openslide.OpenSlide(str(entry))
     dst = slide_io.open_slide(str(out))
     assert getattr(dst, "is_native_rgb", True), "VMS 转换产物必须是原生 RGB"

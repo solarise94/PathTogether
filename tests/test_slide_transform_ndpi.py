@@ -292,11 +292,12 @@ def test_real_sample_l0_mean_error_and_pyramid_geometry(workdir):
 
     import slide_io
 
-    out = workdir / "cmu1-ndpi-pix.ome.tif"
-    rj = json.loads(
+    out = workdir / "cmu1-ndpi.ome.tif"
+    # The 320M conversion test above already produced this exact output
+    # (same input, bf-ome, preserve); convert only when run on its own.
+    if not out.exists():
         _cli("convert", NDPI_SAMPLE, out, "--overwrite", "--profile", "bf-ome",
-             "--timeout", "3600").stdout
-    )
+             "--timeout", "3600")
     src = openslide.OpenSlide(str(NDPI_SAMPLE))
     dst = slide_io.open_slide(str(out))
     assert getattr(dst, "is_native_rgb", True), "NDPI 转换产物必须是原生 RGB"

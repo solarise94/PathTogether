@@ -326,6 +326,25 @@ def test_aperio_svs_jpeg_content_detection(tmp_path):
     assert udc.is_aperio_svs_jpeg(str(junk)) is False
 
 
+def test_converter_output_of_svs_is_not_closed_svs(tmp_path):
+    """Converter output of an SVS keeps "aperio-svs-jpeg" provenance in its
+    description and level 0 is JPEG; the tool page uploads it without a
+    direct_class declaration. It must not be refused as a disguised SVS."""
+    ome_desc = ('<?xml version="1.0" encoding="UTF-8"?><OME xmlns="http://www.openmicroscopy.org/'
+                'Schemas/OME/2016-06"><StructuredAnnotations><XMLAnnotation><Value><M K="source_format">'
+                'aperio-svs-jpeg</M></Value></XMLAnnotation></StructuredAnnotations></OME>')
+    ome = _write(tmp_path, "x.ome.tif",
+                 _classic_tiff(entries=[(259, 3, 7)], description=ome_desc))
+    classic = _write(tmp_path, "x.tif",
+                     _classic_tiff(entries=[(259, 3, 7)],
+                                   description='{"source_format":"aperio-svs-jpeg","adapter_version":"1"}\x00'))
+    for p in (ome, classic):
+        assert udc.sniff_tiff_class(str(p)) in (udc.ACTUAL_OME, udc.ACTUAL_CONVERTER)
+        assert udc.is_aperio_svs_jpeg(str(p)) is False
+        assert udc.enforcement_failure(str(p), None, "tif") is None
+        assert udc.enforcement_failure(str(p), "legacy-direct", "tif") is None
+
+
 def test_enforcement_failure_scope(tmp_path):
     """enforcement_failure 只作用于 tif/tiff 名 + 无声明/legacy-direct；
     其余声明路径由 declaration_matches 裁定。"""

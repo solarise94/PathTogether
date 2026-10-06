@@ -307,6 +307,11 @@ def is_aperio_svs_jpeg(path):
             desc_entry = head["entries"].get(270)
             desc = (_bounded_text(fh, head["bo"], desc_entry, head["bigtiff"])
                     if desc_entry is not None else "")
+            # 转换器产物（OME-XML 或带来源标记的经典描述）会把
+            # "aperio-svs-jpeg" 写进来源信息，且第 0 层同样是 JPEG——它们是
+            # 转换后的合法产物，不是改名的 SVS。
+            if _looks_like_ome_xml(desc) or _converter_marked(desc):
+                return False
             comp_entry = head["entries"].get(259)
             compression = _inline_uint(comp_entry, head["bo"]) \
                 if comp_entry else 0

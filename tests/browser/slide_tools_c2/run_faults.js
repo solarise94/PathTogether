@@ -56,6 +56,7 @@ async function prepareFixtures() {
   const scn = path.join(dir, 'syn.scn'); // F4: SCN adapter rows
   const gtiff = path.join(dir, 'syn.tiff'); // F5: generic tiled-JPEG adapter rows
   const ndpi = path.join(dir, 'syn.ndpi'); // F6: NDPI adapter rows
+  const raster = path.join(dir, 'syn.jpg'); // F8: plain-image adapter rows (band path)
   const mrxsDir = path.join(dir, 'mrxs'); // F3: bundle rows (entry + dir)
   const vmsDir = path.join(dir, 'vms'); // F7: VMS flat-bundle rows
   if (!fs.existsSync(bf)) execFileSync(L.CLI, ['gen-kfb', bf, '--width', '700', '--height', '500']);
@@ -65,6 +66,7 @@ async function prepareFixtures() {
   if (!fs.existsSync(scn)) execFileSync(L.CLI, ['gen-scn', scn, '--sparse']);
   if (!fs.existsSync(gtiff)) execFileSync(L.CLI, ['gen-gtiff', gtiff, '--levels', '1']);
   if (!fs.existsSync(ndpi)) execFileSync(L.CLI, ['gen-ndpi', ndpi, '--width', '512', '--height', '320', '--levels', '2']);
+  if (!fs.existsSync(raster)) execFileSync(L.CLI, ['gen-raster', raster, '--kind', 'jpeg', '--width', '512', '--height', '320', '--no-restart']);
   if (!fs.existsSync(path.join(mrxsDir, 'synthetic.mrxs'))) {
     execFileSync(L.CLI, ['gen-mrxs', mrxsDir, '--images-x', '24', '--images-y', '18']);
   }
@@ -82,6 +84,7 @@ async function prepareFixtures() {
     ['scn', scn, 'bf-ome', null],
     ['gtiff', gtiff, 'bf-ome', null],
     ['ndpi', ndpi, 'bf-ome', null],
+    ['raster', raster, 'bf-ome', null],
     ['mrxs', path.join(mrxsDir, 'synthetic.mrxs'), 'bf-ome', null],
     ['vms', path.join(vmsDir, 'synthetic.vms'), 'bf-ome', null]]) {
     const out = path.join(dir, `${k}-native.tif`);
@@ -89,7 +92,7 @@ async function prepareFixtures() {
       ...(enc ? ['--encoding', enc] : [])]);
     native[k] = await L.sha256File(out);
   }
-  return { bf, bf2, fl, svs, scn, gtiff, ndpi, mrxsDir, vmsDir, native, dir };
+  return { bf, bf2, fl, svs, scn, gtiff, ndpi, raster, mrxsDir, vmsDir, native, dir };
 }
 
 // ---------------------------------------------------------------- scenarios
@@ -851,6 +854,39 @@ function makeScenarios(F) {
       sha: await shaOf(page, jobId), expect: F.native.ndpi };
   }]);
 
+  S.push(['raster-adapter-change-refused', async (page) => {
+    // F8 换转换器拒绝续跑：committed progress belongs to the input adapter
+    // that wrote it (plain-image-bmp-jpeg); a record tampered to another
+    // adapter kind is refused, the honest resume completes at the native
+    // bytes (raster-compose + l0-box2 tail).
+    const b = await begin(page, F.raster, { profileId: 'saver', faults: { crashAtWrite: 6 } }); const jobId = b.jobId; const base = b.base;
+    await waitForFault(page, 'crashAtWrite', base, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    const rec0 = await page.evaluate((id) => window.__c2.jobRecord(id), jobId);
+    await page.evaluate(() => window.__c2.tamperJobRecord({ sourceAdapter: null }));
+    const asKfb = await page.evaluate((id) => window.__c2.tryResume({ jobId: id }), jobId);
+    await page.evaluate(() => window.__c2.tamperJobRecord({ sourceAdapter: 'plain-image-bmp-jpeg' }));
+    await page.evaluate((id) => window.__c2.resume({ jobId: id }), jobId);
+    const done = await page.evaluate(() => window.__c2.awaitDone());
+    return { recAdapter: rec0.sourceAdapter, asKfb, done,
+      sha: await shaOf(page, jobId), expect: F.native.raster };
+  }]);
+
+  S.push(['raster-source-changed-refused', async (page) => {
+    // F8 源文件被改拒绝续跑：flip a byte inside the staged OPFS copy after
+    // a mid-write crash → the resume refuses with the source-changed code
+    // and writes nothing.
+    const b = await begin(page, F.raster, { profileId: 'saver', faults: { crashAtWrite: 6 } }); const jobId = b.jobId; const base = b.base;
+    await waitForFault(page, 'crashAtWrite', base, jobId);
+    await page.evaluate(() => window.__c2.terminateWorker());
+    const outBefore = await page.evaluate((id) => window.__c2.outputInfo(id), jobId);
+    await page.evaluate((id) => window.__c2.tamperSource(id, 'flip'), jobId);
+    const refused = await page.evaluate((id) => window.__c2.tryResume({ jobId: id }), jobId);
+    const outAfter = await page.evaluate((id) => window.__c2.outputInfo(id), jobId);
+    return { refused,
+      outBefore: outBefore && outBefore.size, outAfter: outAfter && outAfter.size };
+  }]);
+
   S.push(['ndpi-source-changed-refused', async (page) => {
     // F6: the staged copy must still be exactly the bytes hashed at staging.
     const b = await begin(page, F.ndpi, { profileId: 'saver', faults: { crashAtWrite: 6 } }); const jobId = b.jobId; const base = b.base;
@@ -1185,6 +1221,20 @@ function verdict(name, r) {
         && r.done && r.done.ok && r.sha === r.expect
         ? ok() : fail(safeJson({ rec: r.recAdapter, asKfb: m, done: r.done && r.done.ok,
           sha: r.sha && r.sha.slice(0, 8) }));
+    }
+    case 'raster-adapter-change-refused': {
+      const m = r.asKfb || {};
+      return r.recAdapter === 'plain-image-bmp-jpeg' && m.refused && m.code === 'resume_refused'
+        && m.kind === 'source-adapter' && m.message.includes('适配器')
+        && r.done && r.done.ok && r.sha === r.expect
+        ? ok() : fail(safeJson({ rec: r.recAdapter, asKfb: m, done: r.done && r.done.ok,
+          sha: r.sha && r.sha.slice(0, 8) }));
+    }
+    case 'raster-source-changed-refused': {
+      const m = r.refused || {};
+      return m.refused && m.code === 'source_changed_refuse_resume'
+        && r.outAfter === r.outBefore
+        ? ok({ code: m.code }) : fail(safeJson({ refused: m, out: [r.outBefore, r.outAfter] }));
     }
     case 'ndpi-source-changed-refused': {
       const m = r.refused || {};

@@ -1700,6 +1700,73 @@ async function scenarioND() {
   }
 }
 
+// (ra) F8 普通图片页面入口：真实 CC0 样本（RASTER_SAMPLE，缺省跳过——
+// 6000×4000 基线 JPEG，无 restart marker → 页面识别为普通图片 (BMP/JPEG)
+// 明场 → 默认 bf-ome/保留画质转换 → 保存 sha == 原生；compact 一次 ==
+// 原生 compact。变体拒绝（gen-raster 渐进夹具）在页面上复制前被拒且无
+// 任务目录。
+async function scenarioRA() {
+  const raster = process.env.RASTER_SAMPLE;
+  if (!raster || !fs.existsSync(raster)) {
+    record('ra-raster-page-e2e', true, { skipped: 'RASTER_SAMPLE not set or missing' });
+    return;
+  }
+  const nativeSha = await L.sha256File(L.nativeConvert(raster,
+    path.join(L.GATE, 'fixtures', 'raster-native-bf-ome.ome.tif'), ['--profile', 'bf-ome']));
+  const nativeCompactSha = await L.sha256File(L.nativeConvert(raster,
+    path.join(L.GATE, 'fixtures', 'raster-native-bf-ome-compact.ome.tif'),
+    ['--profile', 'bf-ome', '--encoding', 'compact']));
+  const { context, page } = await L.launch('ra', [L.savePickerStub()]);
+  try {
+    await L.openTools(page, PORT);
+    const runOnce = async (compact) => {
+      await L.clearJobs(page);
+      await page.reload({ waitUntil: 'load' });
+      await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
+      await L.setFile(page, raster);
+      await waitVisible(page, '#summary-section:not([hidden])', 120000);
+      const fmt = (await page.textContent('#summary-format')).trim();
+      if (fmt !== '普通图片 (BMP/JPEG)') throw new Error(`summary format "${fmt}"`);
+      const qShown = await page.evaluate(() => !document.getElementById('quality-fieldset').hidden);
+      if (!qShown) throw new Error('quality choice hidden for plain image');
+      // F8 画质说明行：普通图片识别后显示「有界解码重编码 + 无物理标尺」说明
+      await page.waitForFunction(() => !document.getElementById('quality-raster-note').hidden,
+        null, { timeout: 10000 });
+      if (compact) await page.check('#quality-compact');
+      await page.click('#convert-btn');
+      await waitVisible(page, '#result-section:not([hidden])', 600000);
+      await page.click('#save-btn');
+      await waitText(page, '#save-status', /已保存|Saved/);
+      return { fmt, sha: (await L.opfsSha256(page)).sha256 };
+    };
+    const pres = await runOnce(false);
+    if (pres.sha !== nativeSha) throw new Error(`raster preserve sha ${pres.sha} != native ${nativeSha}`);
+    const comp = await runOnce(true);
+    if (comp.sha !== nativeCompactSha) throw new Error(`raster compact sha ${comp.sha} != native ${nativeCompactSha}`);
+    // 变体拒绝：渐进 JPEG 夹具在复制前被拒（无任务目录）
+    const fixtureDir = path.join(L.GATE, 'fixtures');
+    fs.mkdirSync(fixtureDir, { recursive: true });
+    const prog = path.join(fixtureDir, 'raster-progressive.jpg');
+    if (!fs.existsSync(prog)) {
+      const { execFileSync } = require('child_process');
+      execFileSync(L.CLI, ['gen-raster', prog, '--kind', 'jpeg', '--width', '512',
+        '--height', '320', '--progressive']);
+    }
+    await L.clearJobs(page);
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
+    await L.setFile(page, prog);
+    await waitText(page, '#page-error', /渐进/, 60000);
+    if ((await L.jobDirs(page)).length !== 0) throw new Error('progressive JPEG left a job dir');
+    record('ra-raster-page-e2e', true, { format: pres.fmt, preserveSha: pres.sha, compactSha: comp.sha,
+      variant: 'progressive rejected before copy' });
+  } catch (e) {
+    record('ra-raster-page-e2e', false, { error: String(e).slice(0, 400) });
+  } finally {
+    await context.close();
+  }
+}
+
 // (mx) F3 MRXS 页面入口：真实 CC0 完整包（MRXS_SAMPLE_DIR，缺省跳过并记录）
 // 经「选择文件夹（MRXS）」input（page.setInputFiles 目录 → webkitRelativePath）
 // → 摘要 MRXS/明场/画质 + 拼接重编码说明 → 转换（保留画质，bf-ome）→ 保存
@@ -1897,6 +1964,7 @@ const SCENARIOS = [
   ['v', scenarioV], ['w', scenarioW], ['x', scenarioX], ['y', scenarioY],
   ['z', scenarioZ], ['sv', scenarioSV], ['mx', scenarioMX], ['sc', scenarioSC],
   ['gt', scenarioGT], ['nd', scenarioND], ['vm', scenarioVM],
+  ['ra', scenarioRA],
 ];
 
 async function main() {

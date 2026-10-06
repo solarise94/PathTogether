@@ -239,6 +239,19 @@ macro 44,802 B + map 12,448,223 B）逐字节确认：
 
 ## 5. 门禁与后续
 
+### 5.1 统一门禁修复记录（adapter-20261006-072429）
+
+- `parity-vms` 首跑 rc=1（4 s）：门禁把**真实样本**（617 MB 平铺包）传给
+  `run_parity.js --bundle`，旧实现用**单个** `page.evaluate` 以 base64
+  一次性传输全部成员（≈822 MB 的 CDP 消息），渲染进程被杀
+  （"Execution context was destroyed"）。合成夹具（48 KB）从未触发。
+  修复：成员按 **8 MiB 有界切片**流式传输（每条消息 ≈10.7 MB base64），
+  页面侧按成员累积、末片用 `new File(parts, …)` 惰性组装，并断言成员
+  数完整（`member transfer incomplete` 兜底）。合成 parity 复跑
+  equal=true；真实样本 parity 用门禁同款命令复跑（见 §3.1）。
+- `mem192-vms` rc=0：320M 上限 + 默认预算转换成功（339 s，输出
+  1,761,618,512 B，sha `cf9ca6c5…`，与 C3 浏览器 preserve 产物逐位一致）。
+
 - `direct_import` 对 .vms **保持 open**：转换器落地与直传关闭是两个
   独立决定——是否关闭直传由用户看完本报告后决定（注册表行级字段未动，
   与 SVS/SCN/NDPI 的处理一致）。

@@ -102,24 +102,49 @@ async function mainMrsx() {
   const { context, page } = await L.launch({ label: 'parity-mrxs' });
   try {
     await L.open(page, PORT);
-    // hand the members to the page as File rows (base64 transport —
+    // Hand the members to the page as File rows (base64 transport —
     // Playwright serializes evaluate args as JSON, so binary buffers must
-    // not cross as typed arrays). Saved-1_16 ≈ 5.5 MB; the page keeps the
-    // rows for both profile runs (clearJobs only wipes OPFS).
+    // not cross as typed arrays). Members stream in BOUNDED slices: one
+    // giant evaluate ships a ~800 MB CDP payload for the real VMS bundle
+    // and kills the renderer ("Execution context was destroyed" — gate
+    // adapter-20261006-072429, parity-vms). A slice appends to a page-side
+    // accumulator; on the last slice the File is built from the part array
+    // (Chromium assembles Blob parts lazily — no double buffer). The page
+    // keeps the rows for both profile runs (clearJobs only wipes OPFS).
+    const SLICE = 8 * 2 ** 20; // 8 MiB raw → ~10.7 MiB base64 per message
     await page.evaluate((list) => {
-      const rows = [];
-      for (const m of list) {
-        const bin = atob(m.b64);
-        const u8 = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-        rows.push({ name: m.name, relPath: m.relPath,
-          file: new File([u8], m.name, { type: 'application/octet-stream' }) });
+      window.__bundleRows = [];
+      window.__bundleAcc = new Map(
+        list.map((m) => [m.name, { relPath: m.relPath, parts: [], len: 0 }]));
+    }, members.map((m) => ({ name: m.name, relPath: m.relPath })));
+    for (const m of members) {
+      const size = fs.statSync(m.p).size;
+      for (let at = 0; at < size; at += SLICE) {
+        const n = Math.min(SLICE, size - at);
+        const buf = Buffer.alloc(n);
+        const fd = fs.openSync(m.p, 'r');
+        try { fs.readSync(fd, buf, 0, n, at); } finally { fs.closeSync(fd); }
+        const last = at + n >= size;
+        // eslint-disable-next-line no-await-in-loop
+        await page.evaluate(({ name, b64, last }) => {
+          const bin = atob(b64);
+          const u8 = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+          const acc = window.__bundleAcc.get(name);
+          acc.parts.push(u8);
+          acc.len += u8.length;
+          if (last) {
+            window.__bundleRows.push({ name, relPath: acc.relPath,
+              file: new File(acc.parts, name, { type: 'application/octet-stream' }) });
+            window.__bundleAcc.delete(name);
+          }
+        }, { name: m.name, b64: buf.toString('base64'), last });
       }
-      window.__bundleRows = rows;
-    }, await Promise.all(members.map(async (m) => ({
-      name: m.name, relPath: m.relPath,
-      b64: (await fs.promises.readFile(m.p)).toString('base64'),
-    }))));
+    }
+    const staged = await page.evaluate(() => window.__bundleRows.length);
+    if (staged !== members.length) {
+      throw new Error(`member transfer incomplete: ${staged}/${members.length}`);
+    }
 
     for (const profile of ['bf-ome', 'bf-classic']) {
       const tag = profile === 'bf-ome' ? 'ome' : 'classic';

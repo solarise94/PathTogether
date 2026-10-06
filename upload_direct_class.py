@@ -72,6 +72,7 @@ CONVERTER_SOURCE_FORMATS = frozenset({
     "hamamatsu-ndpi-jpeg",  # NDPI → classic/ome（F6；描述 JSON 带 adapter）
     "hamamatsu-vms-bundle",  # VMS → classic/ome（描述 JSON 带 adapter）
     "plain-image-bmp-jpeg",  # 普通图片 BMP/JPEG → classic/ome（F8；描述 JSON 带 adapter）
+    "ventana-bif-jpeg",  # Ventana BIF → classic/ome（重叠瓦片拼接重编码；描述 JSON 带 adapter）
 })
 
 #: sniff 结果词表（actual 类别）

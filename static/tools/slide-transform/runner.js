@@ -999,6 +999,13 @@ export class SlideToolsRunner {
           `v${E.GTIFF_ADAPTER_VERSION}：两种适配器配方不得混合`,
           { kind: 'source-adapter' });
       }
+      // Ventana BIF：同一合同（重叠拼接 + l0-box2 配方随适配器代际固定）
+      if (recordAdapter === E.BIF_SOURCE_ADAPTER &&
+          (st.gen.adapterVersion || '1') !== E.BIF_ADAPTER_VERSION) {
+        refuse(`进度记录属于 Ventana BIF 适配器 v${st.gen.adapterVersion || '1'}，当前为 ` +
+          `v${E.BIF_ADAPTER_VERSION}（金字塔 ${E.BIF_PYRAMID_METHOD}）：两种适配器配方不得混合`,
+          { kind: 'source-adapter' });
+      }
       // same contract for the encoding: the journal generation and every
       // committed state must agree with the record (missing = preserve)
       const journalledEnc = st.gen.encodingProfile || E.ENCODING_PROFILES.PRESERVE;

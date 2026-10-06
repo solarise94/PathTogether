@@ -489,6 +489,14 @@ export const VMS_PYRAMID_METHOD = 'l0-box2';
 export const VMS_PRESERVE_COMPOSE_FINGERPRINT = 'vms-mosaic-compose:q96:y422:hstd:v1';
 /// The .vms INI entry is a small text file (the core caps it at 1 MiB).
 export const VMS_ENTRY_MAX_BYTES = 1 << 20;
+/// Ventana BIF（BigTIFF + iScan/EncodeInfo XML；重叠瓦片按记录位置拼接
+/// 重编码，降采样层 l0-box2 生成）。Must equal the Rust `ADAPTER_VERSION`
+/// (resume refuses on mismatch).
+export const BIF_SOURCE_ADAPTER = 'ventana-bif-jpeg';
+export const BIF_ADAPTER_VERSION = '1';
+export const BIF_PYRAMID_METHOD = 'l0-box2';
+/// Must equal the Rust `PRESERVE_COMPOSE_FINGERPRINT` (bif.rs).
+export const BIF_PRESERVE_COMPOSE_FINGERPRINT = 'bif-mosaic-compose:q96:y422:hstd:v1';
 /// F8: 普通图片（BMP / 基线 JPEG；单张大图，无瓦片无物理标尺）。BMP 逐行
 /// 有界读取，JPEG 带 restart 走分段、无 restart 走 MCU 行 band 解码；
 /// 全部 256px tile 重编码，降采样层 l0-box2 生成。Must equal the Rust
@@ -522,6 +530,7 @@ export const CONVERTER_SOURCE_FORMATS = [
   NDPI_SOURCE_ADAPTER,
   VMS_SOURCE_ADAPTER,
   RASTER_SOURCE_ADAPTER,
+  BIF_SOURCE_ADAPTER,
 ];
 const LEICA_SCN_XML_NS = /leica-microsystems\.com\/scn/;
 /// Pure helpers (vitest-covered): OME-XML and converter-marked description
@@ -625,6 +634,32 @@ export async function sniffTiffSlideCapability(file) {
     if (vendor === 'unknown') {
       const make = await inlineText(271);
       if (make.includes('Hamamatsu')) vendor = 'hamamatsu-ndpi';
+    }
+    // Ventana BIF: the vendor lives in IFD 0's XMLPacket (700) — the
+    // description is "Label Image" and there is no Make (ventana.c
+    // `ventana_detect` looks for the iScan element the same way)
+    if (vendor === 'unknown' && (await inlineText(700)).includes('iScan')) {
+      vendor = 'ventana-bif';
+    }
+    if (vendor === 'ventana-bif') {
+      // BIF 是 BigTIFF + 重叠瓦片拼接重编码；LEFT/DOWN 走向、多 z、
+      // 无 EncodeInfo 等变体由 wasm 核心在复制前给类型化终审
+      if (!bigtiff) {
+        return bad('Ventana BIF 是 BigTIFF（43）容器；经典 TIFF 的 ventana tif 变体不在支持集');
+      }
+      const bifComp = scalar(259);
+      if (bifComp === 33003 || bifComp === 33005) {
+        return bad('JPEG 2000 压缩不在当前支持集（需要独立解码器）');
+      }
+      if (bifComp !== 7) return bad(`压缩编码 ${bifComp} 不是基线 JPEG，无法拼接重编码`);
+      return {
+        supported: true,
+        modality: 'brightfield',
+        format: BIF_SOURCE_ADAPTER,
+        adapter: BIF_SOURCE_ADAPTER,
+        bigtiff,
+        littleEndian: little,
+      };
     }
     if (vendor !== 'hamamatsu-ndpi' && (!entries[322] || !entries[323])) {
       return bad('主图不是分块（tiled）存储：该 TIFF 变体不在支持集');
@@ -1484,7 +1519,7 @@ export function isOmeProfile(profile) {
 /// after the entry stem.
 export function outputFileName(sourceName, job) {
   const base = String(sourceName || 'slide')
-    .replace(/\.(kfb|kfbf|svs|scn|ndpi|tif|tiff|mrxs|vms|bmp|jpg|jpeg)$/i, '') || 'slide';
+    .replace(/\.(kfb|kfbf|svs|scn|ndpi|bif|tif|tiff|mrxs|vms|bmp|jpg|jpeg)$/i, '') || 'slide';
   return isOmeProfile(jobOutputProfile(job)) ? `${base}.ome.tif` : `${base}.tif`;
 }
 

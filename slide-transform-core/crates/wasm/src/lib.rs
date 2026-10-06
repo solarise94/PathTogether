@@ -545,6 +545,9 @@ enum InputKind {
     /// 普通图片（F8）：BMP（BM）或基线 JPEG（FF D8 FF）魔数——按魔数在
     /// TIFF/厂商嗅探之前路由，不依赖扩展名。
     Raster,
+    /// Ventana BIF：BigTIFF，IFD 0 XMLPacket 携带 iScan 厂商块——由同一
+    /// 有界嗅探分派（重叠瓦片拼接重编码）。
+    Bif,
 }
 
 fn input_kind(magic: &[u8; 8]) -> InputKind {
@@ -581,6 +584,7 @@ fn adapter_of(kind: InputKind) -> Option<&'static str> {
         InputKind::Gtiff => Some(slide_transform_core::gtiff::SOURCE_FORMAT),
         InputKind::Ndpi => Some(slide_transform_core::ndpi::SOURCE_FORMAT),
         InputKind::Raster => Some(slide_transform_core::raster::SOURCE_FORMAT),
+        InputKind::Bif => Some(slide_transform_core::bif::SOURCE_FORMAT),
         _ => None,
     }
 }
@@ -594,6 +598,7 @@ fn adapter_version_of(kind: InputKind) -> Option<&'static str> {
         InputKind::Gtiff => Some(slide_transform_core::gtiff::ADAPTER_VERSION),
         InputKind::Ndpi => Some(slide_transform_core::ndpi::ADAPTER_VERSION),
         InputKind::Raster => Some(slide_transform_core::raster::ADAPTER_VERSION),
+        InputKind::Bif => Some(slide_transform_core::bif::ADAPTER_VERSION),
         _ => None,
     }
 }
@@ -608,6 +613,7 @@ fn tiff_route(src: &dyn ByteSource) -> CoreResult<InputKind> {
     match slide_transform_core::scn::sniff_tiff_vendor(src)? {
         TiffVendor::LeicaScn => Ok(InputKind::Scn),
         TiffVendor::HamamatsuNdpi => Ok(InputKind::Ndpi),
+        TiffVendor::VentanaBif => Ok(InputKind::Bif),
         TiffVendor::Unknown => Ok(InputKind::Gtiff),
         TiffVendor::OmeTiff => Err(CoreError::variant(
             "OME-TIFF 不是转换输入：平台可直接读取 OME-TIFF，请直接上传该文件",
@@ -923,6 +929,75 @@ fn raster_doc_json(doc: &slide_transform_core::raster::RasterDoc, size: u64) -> 
     )
 }
 
+/// Ventana BIF capability document（与 CLI 的 bif_doc_json 同一契约）。
+fn bif_doc_json(doc: &slide_transform_core::bif::BifDoc) -> String {
+    let l0 = &doc.levels[0];
+    let mut levels = vec![format!(
+        "{{\"level\":0,\"ifd\":{},\"width\":{},\"height\":{},\"canvas_w\":{},\"canvas_h\":{},\"tile_w\":{},\"tile_h\":{},\"tiles_across\":{},\"tiles_down\":{},\"advance_x_micro\":{},\"advance_y_micro\":{},\"areas\":{},\"tiles_present\":{},\"color\":\"{}\",\"reencoded\":true}}",
+        l0.ifd_index,
+        doc.width,
+        doc.height,
+        l0.canvas_w,
+        l0.canvas_h,
+        l0.tile_w,
+        l0.tile_h,
+        l0.tiles_across,
+        l0.tiles_down,
+        (doc.advance_x * 1e6) as u64,
+        (doc.advance_y * 1e6) as u64,
+        doc.areas.len(),
+        doc.tiles_present,
+        match doc.color {
+            slide_transform_core::bif::PayloadColor::Rgb => "rgb",
+            slide_transform_core::bif::PayloadColor::YCbCr => "ycbcr",
+        },
+    )];
+    for (i, (w, h)) in doc.generated.iter().enumerate() {
+        levels.push(format!(
+            "{{\"level\":{},\"width\":{w},\"height\":{h},\"tiles_across\":{},\"tiles_down\":{},\"color\":\"ycbcr\",\"reencoded\":true,\"generated\":true}}",
+            i + 1,
+            (*w as u64).div_ceil(256),
+            (*h as u64).div_ceil(256),
+        ));
+    }
+    let source_levels: Vec<String> = doc
+        .levels
+        .iter()
+        .skip(1)
+        .map(|lv| {
+            format!(
+                "{{\"ifd\":{},\"canvas_w\":{},\"canvas_h\":{},\"magnification\":{}}}",
+                lv.ifd_index, lv.canvas_w, lv.canvas_h, lv.magnification
+            )
+        })
+        .collect();
+    let assoc: Vec<String> = doc
+        .associated
+        .iter()
+        .map(|a| format!("{{\"name\":\"{}\",\"width\":{},\"height\":{}}}", a.name, a.width, a.height))
+        .collect();
+    let mpp_x = doc.mpp.map(|v| json_num(v.0)).unwrap_or_else(|| "null".into());
+    let mpp_y = doc.mpp.map(|v| json_num(v.1)).unwrap_or_else(|| "null".into());
+    let obj = doc.objective.map(|v| json_num(v)).unwrap_or_else(|| "null".into());
+    format!(
+        "{{\"format\":\"{}\",\"adapter\":\"{}\",\"adapter_version\":\"{}\",\"modality\":\"brightfield\",\"tiff_kind\":\"bigtiff\",\"width\":{},\"height\":{},\"mpp_x\":{mpp_x},\"mpp_y\":{mpp_y},\"objective\":{obj},\"mpp_source\":\"{}\",\"objective_source\":\"{}\",\"pyramid_method\":\"{}\",\"levels\":[{}],\"source_levels\":[{}],\"associated\":[{}],\"icc_profile\":{},\"jpeg_tables\":{},\"codec\":\"stitch-compose-reencode\",\"estimate\":{}}}",
+        slide_transform_core::bif::SOURCE_FORMAT,
+        slide_transform_core::bif::SOURCE_FORMAT,
+        slide_transform_core::bif::ADAPTER_VERSION,
+        doc.width,
+        doc.height,
+        if doc.mpp.is_some() { "bif-iscan-scanres" } else { "unknown" },
+        if doc.objective.is_some() { "bif-iscan-magnification" } else { "unknown" },
+        slide_transform_core::bif::PYRAMID_METHOD,
+        levels.join(","),
+        source_levels.join(","),
+        assoc.join(","),
+        doc.icc.is_some(),
+        doc.jpeg_tables.is_some(),
+        estimate_json(&slide_transform_core::bif::estimate_bif(doc))
+    )
+}
+
 /// TIFF-container probe dispatch (host-free so it is unit-testable):
 /// SCN vendor → the SCN adapter, unknown vendors → the generic tiled-JPEG
 /// adapter, Hamamatsu → the NDPI adapter, Aperio → the SVS adapter, and a
@@ -935,6 +1010,9 @@ fn probe_tiff_doc(src: &dyn ByteSource) -> CoreResult<String> {
         }
         InputKind::Ndpi => {
             slide_transform_core::ndpi::probe_ndpi(src).map(|doc| ndpi_doc_json(&doc))
+        }
+        InputKind::Bif => {
+            slide_transform_core::bif::probe_bif(src).map(|doc| bif_doc_json(&doc))
         }
         InputKind::Gtiff => {
             slide_transform_core::gtiff::probe_gtiff(src).map(|doc| gtiff_doc_json(&doc))
@@ -1324,6 +1402,25 @@ fn run_convert(
                 &src, &mut sink, &mut scratch, &plan, &job, rp,
             ),
             None => slide_transform_core::convert_raster::convert_raster_to_bigtiff(
+                &src, &mut sink, &mut scratch, &plan, &job,
+            ),
+        }
+    } else if kind == InputKind::Bif {
+        // Review §1 parity: the adapter bounds its band/scanner working
+        // set by the host's memory budget (like gtiff/ndpi/raster).
+        let mut plan = TransformPlan::brightfield(identity)
+            .with_policy(policy)
+            .with_encoding(enc_profile);
+        plan.profile = out_profile;
+        plan.limits.memory_budget_bytes = budget_bytes
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|v| v as u64)
+            .unwrap_or(slide_transform_core::budget::SAVER_BUDGET_BYTES);
+        match resume.as_ref() {
+            Some(rp) => slide_transform_core::convert_bif::convert_bif_to_bigtiff_resume(
+                &src, &mut sink, &mut scratch, &plan, &job, rp,
+            ),
+            None => slide_transform_core::convert_bif::convert_bif_to_bigtiff(
                 &src, &mut sink, &mut scratch, &plan, &job,
             ),
         }

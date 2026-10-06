@@ -22,13 +22,16 @@
                         普通图片（未压缩 24/32 位 BMP——头解析判定位深
                         与压缩；基线 JPEG——FF D8 FF 魔数 + 头内 SOF0/1
                         三分量；渐进/灰度 JPEG 与 RLE/位域/调色板 BMP
-                        不满足判定 → temporary）
+                        不满足判定 → temporary）、Ventana BIF（BigTIFF +
+                        IFD0 XMLPacket 带 iScan + JPEG 压缩；JPEG2000/
+                        经典 TIFF/无 iScan 变体 → temporary）
                         → 本机转换后上传（工作台交接）
      temporary          暂时直传：尚无浏览器转换器的格式/变体（JPEG2000
                         编码 SVS（压缩 33003/33005）、JPEG2000/条带/
                         多通道变体的 NDPI、荧光/非 JPEG 编码
                         SCN、条带/LZW/deflate/非 8 位/多通道的通用
-                        TIFF 变体、VMU、BIF、SVSlide、
+                        TIFF 变体、VMU、JPEG2000/经典 TIFF 的 BIF 变体、
+                        SVSlide、
                         不满足可转换判定的 BMP/JPEG 变体、zip）
      unsupported        未登记扩展名
 
@@ -52,6 +55,7 @@
     "hamamatsu-ndpi-jpeg": 1,
     "hamamatsu-vms-bundle": 1,
     "plain-image-bmp-jpeg": 1,
+    "ventana-bif-jpeg": 1,
   };
 
   // 结果类别
@@ -90,7 +94,17 @@
     if (dv.byteLength < 8) return null;
     var magic = dv.getUint16(2, little);
     if (magic !== 42 && magic !== 43) return null;   // 43 = BigTIFF
-    var ifdOff = dv.getUint32(4, little);
+    var ifdOff;
+    if (magic === 43) {
+      // BigTIFF：offset size/reserved 校验 + 8 字节首 IFD 偏移（在 8..16）
+      if (dv.byteLength < 16) return null;
+      if (dv.getUint16(4, little) !== 8 || dv.getUint16(6, little) !== 0) {
+        return null;
+      }
+      ifdOff = dv.getUint32(8, little) + dv.getUint32(12, little) * 4294967296;
+    } else {
+      ifdOff = dv.getUint32(4, little);
+    }
     if (ifdOff <= 0) return null;
     return { ifdOffset: ifdOff, bigtiff: magic === 43 };
   }
@@ -101,7 +115,9 @@
       var dv = new DataView(ifdBytes.buffer, ifdBytes.byteOffset,
                             ifdBytes.byteLength);
       var entrySize = bigtiff ? 20 : 12;
-      var count = bigtiff ? dv.getUint64(0, true) : dv.getUint16(0, true);
+      // BigTIFF 条目数是 u64：DataView 只有 getBigUint64（BigInt）——曾误
+      // 写 getUint64（不存在），BigTIFF 的 IFD 解析整体落空
+      var count = bigtiff ? Number(dv.getBigUint64(0, true)) : dv.getUint16(0, true);
       if (count > 4096) return null;   // 防御：坏头不猜
       for (var i = 0; i < count; i++) {
         var at = (bigtiff ? 8 : 2) + i * entrySize;
@@ -109,7 +125,7 @@
         var t = bigtiff ? dv.getUint16(at, true) : dv.getUint16(at, true);
         if (t !== tag) continue;
         var type = dv.getUint16(at + 2, little);
-        var num = bigtiff ? dv.getUint64(at + 4, true)
+        var num = bigtiff ? Number(dv.getBigUint64(at + 4, true))
                           : dv.getUint32(at + 4, little);
         // 值内联在值域字段（≤4/8 字节）或值域字段是偏移
         return { type: type, count: num,
@@ -241,6 +257,33 @@
         //（荧光/非 JPEG 编码的 SCN 落到默认 temporary = 暂时直传）
         result.cls = CLS.CONVERT;
         result.directClass = null;
+      }
+      return result;
+    }
+    if (ext === ".bif") {
+      // Ventana BIF：IFD0 的 XMLPacket（700）携带 iScan 厂商块；BIF 是
+      // BigTIFF，重叠瓦片拼接重编码已覆盖。JPEG2000（33003/33005）、
+      // 经典 TIFF 容器或无 iScan 块 → 默认 temporary = 暂时直传。
+      var xmpEntry = findIfdEntry(ifdBytes, little, 700, hdr.bigtiff);
+      var xmpText = "";
+      if (xmpEntry) {
+        var xloc = descTextAt(ifdBytes, xmpEntry, little);
+        if (xloc && xloc.count > 0) {
+          var xcap = Math.min(xloc.count, 4096);
+          var xraw = readRegion(headBytes, xloc.offset, xcap, more);
+          if (xraw) {
+            try { xmpText = new TextDecoder("utf-8", { fatal: false }).decode(xraw); }
+            catch (e) { xmpText = ""; }
+          }
+        }
+      }
+      if (xmpText.indexOf("iScan") !== -1) {
+        if (!hdr.bigtiff) return result;  // 经典 TIFF 的 ventana tif 变体
+        if (compression === 7) {
+          result.cls = CLS.CONVERT;
+          result.directClass = null;
+        }
+        // JPEG2000/其他压缩 → temporary（声明例外由服务端词表校验）
       }
       return result;
     }
@@ -461,8 +504,12 @@
         // direct_class 声明（服务端词表里 zip 只在受理词表，不在
         // direct_upload；声明 legacy-direct 会被 422 invalid_direct_class）
         return { cls: CLS.TEMPORARY, ext: ext };
-      case ".vmu":
       case ".bif":
+        // Ventana BIF 浏览器转换器已覆盖（JPEG 编码 + RIGHT/UP 拼接）——
+        // 头解析分派（IFD0 XMLPacket 带 iScan + BigTIFF + JPEG 压缩 →
+        // convert；JPEG2000/经典 TIFF/其余变体 → temporary）
+        return { route: "tiff", ext: ext, bif: true };
+      case ".vmu":
       case ".svslide":
         return { cls: CLS.TEMPORARY, directClass: DIRECT_CLASS.LEGACY,
                  ext: ext };
@@ -523,6 +570,30 @@
           if (first.cls === CLS.TEMPORARY &&
               first.directClass === DIRECT_CLASS.LEGACY &&
               first.compression === 0) {
+            // BIF：IFD0 常在标签图载荷之后（真实样本约 0.5 MB 处），超出
+            // 头窗口——按头字段指向的首 IFD 偏移再补读一段（≤ 96 KiB，
+            // 合计仍有界）
+            if (routed.bif && head.length >= 16) {
+              var dv0 = new DataView(head.buffer, head.byteOffset, head.byteLength);
+              var isBig = dv0.getUint16(2, true) === 43;
+              var ifdOff0 = isBig
+                ? dv0.getUint32(8, true) + dv0.getUint32(12, true) * 4294967296
+                : dv0.getUint32(4, true);
+              if (ifdOff0 > 0 && ifdOff0 < (file.size || Infinity)) {
+                // 窗口从 IFD 前 64 KiB 起：外联值（描述/XMLPacket）既可能
+                // 排在 IFD 表之后（真实布局），也可能排在前面
+                var wFrom = Math.max(0, ifdOff0 - 64 * 1024);
+                var wLen = Math.min(160 * 1024, Math.max(0, (file.size || ifdOff0) - wFrom));
+                return read(wFrom, wFrom + wLen).then(function (ifdBuf) {
+                  var more2 = ifdBuf && ifdBuf.byteLength
+                    ? { bytes: new Uint8Array(ifdBuf), baseOffset: wFrom }
+                    : null;
+                  return classifyTiffHead(head, more2, routed.ext);
+                }, function () {
+                  return first;
+                });
+              }
+            }
             return read(HEAD_BYTES, HEAD_BYTES * 2).then(function (moreBuf) {
               var more = moreBuf && moreBuf.byteLength
                 ? { bytes: new Uint8Array(moreBuf), baseOffset: HEAD_BYTES }

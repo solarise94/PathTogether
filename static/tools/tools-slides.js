@@ -57,6 +57,7 @@ const els = {
   qualityNdpiNote: $('quality-ndpi-note'),
   qualityVmsNote: $('quality-vms-note'),
   qualityRasterNote: $('quality-raster-note'),
+  qualityBifNote: $('quality-bif-note'),
   qualityLocked: $('quality-locked'),
   moreOptions: $('more-options'),
   probeSection: $('probe-section'),
@@ -756,6 +757,7 @@ function formatFamilyLabel(id) {
   if (s.startsWith('mirax')) return 'MRXS';
   if (s.startsWith('hamamatsu-vms')) return 'VMS (Hamamatsu)';
   if (s.startsWith('hamamatsu-ndpi')) return 'NDPI (Hamamatsu)';
+  if (s.startsWith('ventana-bif')) return 'BIF (Ventana)';
   if (s.startsWith('plain-image')) return '普通图片 (BMP/JPEG)';
   return s;
 }
@@ -993,6 +995,9 @@ function updateMrsxQualityNote() {
   // F8（普通图片 BMP/JPEG）：像素必须解码后重编码——「保留画质」是
   // 高质量重编码而非字节复制
   els.qualityRasterNote.hidden = !(!!page.prep && fmt.startsWith('plain-image') && bf);
+  // Ventana BIF：瓦片带重叠，必须拼接后重编码——「保留画质」是高质量
+  // 重编码而非字节复制
+  els.qualityBifNote.hidden = !(!!page.prep && fmt.startsWith('ventana-bif') && bf);
 }
 
 /// 「像素严格无损」与「更小文件（有损）」互斥（U2 要求在 UI 也阻止，核心

@@ -1340,10 +1340,24 @@ fn bundle_kind_and_stem(fs: &HostBundle) -> Option<(BundleKind, String)> {
             m.name.rsplit('/').next().map(|n| n.to_ascii_lowercase().ends_with(ext)).unwrap_or(false)
         }) {
             let leaf = m.name.rsplit('/').next().unwrap_or(&m.name);
-            let stem = leaf
-                .strip_suffix(ext)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "slide".to_string());
+            // the entry MATCH above is case-insensitive, so the strip must be
+            // too: `S.VMS` resolves to stem `S` — a case-sensitive
+            // strip_suffix would fall back to "slide" and the probe would
+            // then report a missing entry `slide.vms` that nobody staged
+            // (independent review, medium; the browser chain is
+            // case-insensitive by design and test)
+            let stem = if leaf.len() >= ext.len()
+                && leaf[leaf.len() - ext.len()..].eq_ignore_ascii_case(ext)
+            {
+                leaf[..leaf.len() - ext.len()].to_string()
+            } else {
+                // unreachable while the match above drives `ext`; kept as the
+                // pre-F7 last-dot fallback so the two can never disagree
+                leaf.char_indices()
+                    .rfind(|(_, c)| *c == '.')
+                    .map(|(i, _)| leaf[..i].to_string())
+                    .unwrap_or_else(|| "slide".to_string())
+            };
             return Some((kind, stem));
         }
     }
@@ -2055,6 +2069,39 @@ mod tests {
         assert_eq!(input_kind(&[0x49, 0x49, 45, 0, 8, 0, 0, 0]), InputKind::Kfb);
         assert_eq!(adapter_of(InputKind::Svs), Some("aperio-svs-jpeg"));
         assert_eq!(adapter_of(InputKind::Kfb), None);
+    }
+
+    /// 独立审查回归（medium）：bundle_kind_and_stem 的入口匹配是大小写
+    /// 不敏感的，stem 解析也必须如此——`S.VMS` 的 stem 是 `S`，绝不是
+    /// "slide" 兜底（否则 probe 会报「缺少主入口 slide.vms」这种指向
+    /// 不存在文件的错误；browser 链路按大小写不敏感设计并测试）。
+    #[test]
+    fn bundle_stem_parses_entries_case_insensitively() {
+        fn host(names: &[&str]) -> HostBundle {
+            HostBundle {
+                infos: names
+                    .iter()
+                    .map(|n| slide_transform_core::bundle::MemberInfo {
+                        name: n.to_string(),
+                        size: 16,
+                    })
+                    .collect(),
+            }
+        }
+        // uppercase VMS entry → VMS kind, stem without the extension
+        let (kind, stem) = bundle_kind_and_stem(&host(&["S.VMS", "S-0-0.JPG"])).unwrap();
+        assert_eq!(kind, BundleKind::Vms);
+        assert_eq!(stem, "S");
+        // uppercase MRXS entry (the pre-F7 behaviour the old rfind fallback had)
+        let (kind, stem) = bundle_kind_and_stem(&host(&["CMU.MRXS", "CMU/Slidedat.ini"])).unwrap();
+        assert_eq!(kind, BundleKind::Mrxs);
+        assert_eq!(stem, "CMU");
+        // lowercase unchanged
+        let (kind, stem) = bundle_kind_and_stem(&host(&["s.vms", "s-0-0.jpg"])).unwrap();
+        assert_eq!(kind, BundleKind::Vms);
+        assert_eq!(stem, "s");
+        // no entry at all stays None
+        assert!(bundle_kind_and_stem(&host(&["a.jpg"])).is_none());
     }
 
     #[test]

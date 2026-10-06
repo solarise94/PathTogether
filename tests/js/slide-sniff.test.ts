@@ -188,11 +188,16 @@ describe("slide-sniff：扩展名快路径（不读字节）", () => {
 	});
 
 	it("暂无浏览器转换器的格式/变体 → temporary（直传声明 legacy-direct）", () => {
-		for (const n of ["a.vmu", "a.bif", "a.svslide"]) {
+		for (const n of ["a.vmu", "a.svslide"]) {
 			const r = S.classifyExt(n);
 			expect(r.cls, n).toBe("temporary");
 			expect(r.directClass, n).toBe("legacy-direct");
 		}
+		// Ventana BIF：浏览器转换器已覆盖——扩展名改走头解析分派
+		//（IFD0 XMLPacket 带 iScan + BigTIFF + JPEG → convert）
+		const bif = S.classifyExt("a.bif");
+		expect(bif.cls).toBeUndefined();
+		expect(bif.route).toBe("tiff");
 		// zip 是运输容器，不是切片直传类别：不带声明（回归——曾对每个 zip
 		// 发 legacy-direct，服务端 422 invalid_direct_class）
 		const zip = S.classifyExt("a.zip");

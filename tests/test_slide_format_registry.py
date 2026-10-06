@@ -234,8 +234,13 @@ def test_public_catalog_direct_class_flags():
     assert rows["raster-image"]["import_mode"] == "convert"
     assert rows["raster-image"]["browser_convert"] == "available"
     assert rows["raster-image"]["direct_import"] == "open"
+    # Ventana BIF 浏览器转换器已落地（重叠瓦片拼接重编码）；直传保持
+    # 开放（转换器落地与直传关闭是两个独立决定）
+    assert rows["bif"]["import_mode"] == "convert"
+    assert rows["bif"]["browser_convert"] == "available"
+    assert rows["bif"]["direct_import"] == "open"
     # 暂时直接导入：尚无浏览器转换器的格式
-    for rid in ("vmu", "bif", "svslide"):
+    for rid in ("vmu", "svslide"):
         assert rows[rid]["import_mode"] == "direct-temporary", rid
         assert rows[rid]["direct_import"] == "open", rid
         assert rows[rid]["browser_convert"] == "unavailable", rid
@@ -249,7 +254,7 @@ def test_catalog_flag_derived_vocabularies():
     # browser_convert 集合（direct_import 仍 open）
     bc = reg.catalog_rows_by_flag("browser_convert", "available")
     assert bc == {"svs", "mrxs", "kfb", "kfbf", "scn", "tif", "tiff", "ndpi",
-                  "vms", "bmp", "jpg", "jpeg"}
+                  "vms", "bif", "bmp", "jpg", "jpeg"}
 
 
 def test_vendor_names_corrected():

@@ -156,7 +156,7 @@ def test_sniff_ome_tiff(tmp_path):
 @pytest.mark.parametrize("source_format", [
     "kfb_bf_v1", "kfb_kfbio_jpeg", "aperio-svs-jpeg", "leica-scn-jpeg",
     "mirax-bundle", "hamamatsu-ndpi-jpeg", "hamamatsu-vms-bundle",
-    "plain-image-bmp-jpeg"])
+    "plain-image-bmp-jpeg", "ventana-bif-jpeg"])
 def test_sniff_converter_bigtiff(tmp_path, source_format):
     p = _write(tmp_path, "out.tif",
                _classic_tiff(description=_converter_description(source_format)))

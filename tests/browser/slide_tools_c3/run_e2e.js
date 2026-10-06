@@ -1687,6 +1687,21 @@ async function scenarioND() {
   });
 }
 
+// (bi) Ventana BIF 页面入口（合成夹具）。真实 BIF 字节一致 → gate
+// parity-bif。画质说明行（重叠拼接重编码、输出尺寸 = OpenSlide 拼接结
+// 果）与变体拒绝（LEFT 拼接走向——复制后的 wasm 终审）沿用本地夹具。
+async function scenarioBI() {
+  await syntheticFileScenario({
+    id: 'bi-bif-page-e2e',
+    fixture: ['bif-704x1120.bif', ['gen-bif']],
+    formatLabel: 'BIF (Ventana)',
+    noteId: 'quality-bif-note',
+    variant: { file: 'bif-left-direction.bif',
+      gen: ['gen-bif', '--left-direction'],
+      errRe: /Direction/, note: 'LEFT-direction rejected at probe' },
+  });
+}
+
 // (ra) F8 普通图片页面入口（合成夹具，基线 JPEG——与真实样本同类）。
 // 真实 JPEG 字节一致 → gate parity-raster。画质说明行（有界解码重编码 +
 // 无物理标尺）与变体拒绝（渐进 JPEG）不变。
@@ -1780,7 +1795,7 @@ const SCENARIOS = [
   ['v', scenarioV], ['w', scenarioW], ['x', scenarioX], ['y', scenarioY],
   ['z', scenarioZ], ['sv', scenarioSV], ['mx', scenarioMX], ['sc', scenarioSC],
   ['gt', scenarioGT], ['nd', scenarioND], ['vm', scenarioVM],
-  ['ra', scenarioRA],
+  ['ra', scenarioRA], ['bi', scenarioBI],
 ];
 
 async function main() {

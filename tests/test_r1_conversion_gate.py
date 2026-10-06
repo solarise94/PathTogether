@@ -91,7 +91,7 @@ def test_capability_routes_convert_required_to_browser(monkeypatch):
     # direct_import 仍 open——RLE/位域/调色板位深 BMP 与渐进/灰度 JPEG 在
     # 头级嗅探按 temporary 分流）
     assert {"kfb", "kfbf", "svs", "mrxs", "scn", "tif", "tiff",
-            "ndpi", "vms", "bmp", "jpg", "jpeg"} == set(p["browser_convert"]["formats"])
+            "ndpi", "vms", "bif", "bmp", "jpg", "jpeg"} == set(p["browser_convert"]["formats"])
     assert p["browser_convert"]["url"] == "/tools/slides"
     # direct_upload 清单：直传开放格式（不含 svs/kfb/kfbf/mrxs/zip）
     du = set(p["direct_upload"]["formats"])

@@ -325,6 +325,11 @@ def test_schema_migrations_recorded(conn):
         # §2/§3）：producer_imports/producer_import_events/plugin_import_grants
         # 三表 + plugin_installations.approved_scopes（安装行批准权限面）。
         "0077_producer_imports.sql",
+        # 先转换后上传阶段 1（docs/slide-tools/upload-convert-first-phase1.md
+        # §3）：ingestion_jobs.direct_class 直传类别声明列——浏览器端嗅探
+        # 文件头后随创建声明，摄取 worker 在 open_slide 之前按
+        # upload_direct_class 核验声明与实际字节相符。
+        "0078_ingestion_direct_class.sql",
     ]
 
 

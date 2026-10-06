@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const { spawn, execFileSync } = require('child_process');
 const { chromium } = require('playwright');
+const nativeCache = require('../native_cache.js');
 
 const HERE = __dirname;
 const REPO = path.resolve(HERE, '../../..');
@@ -120,6 +121,15 @@ function ensureFixture(name, args) {
   return p;
 }
 
+/// 目录版 ensureFixture：gen-vms / gen-mrxs 产出的完整包目录（入口 + 成员）。
+function ensureFixtureDir(name, args) {
+  const dir = path.join(GATE, 'fixtures');
+  fs.mkdirSync(dir, { recursive: true });
+  const p = path.join(dir, name);
+  if (!fs.existsSync(p)) execFileSync(CLI, [args[0], p, ...args.slice(1)], { stdio: 'inherit' });
+  return p;
+}
+
 /// 8 B KFB magic + 截断到 ~5.2 GiB 的稀疏文件：pre-stage 磁盘门在复制前
 /// 就会触发 uncertain（need ≈ 源+输出 > 10 GiB 报告上限），不会真的复制。
 function sparseLargeKfb(name, sizeBytes) {
@@ -146,11 +156,27 @@ async function sha256File(p) {
 
 /// Native reference for the page's default output: brightfield inputs use
 /// bf-ome (the browser default for new jobs) unless `extra` names a profile.
+/// 走共享原生参考缓存（tests/browser/native_cache.js）：键 = CLI sha +
+/// 输入指纹 + 参数——同一 (CLI, 输入, 参数) 的原生转换在门禁各场景/各轮
+/// 之间只真正跑一次，之后命中缓存以 hardlink 交付（返回输出路径不变；
+/// 缓存失效逻辑的单测见 tests/js/native-convert-cache.test.ts）。
 function nativeConvert(input, output, extra = []) {
   const profile = extra.includes('--profile') ? []
     : ['--profile', /\.kfbf$/i.test(input) ? 'fl-ome' : 'bf-ome'];
-  execFileSync(CLI, ['convert', input, output, '--overwrite', ...profile, ...extra]);
+  nativeCache.nativeConvertCached({
+    cli: CLI, input, output, args: [...profile, ...extra],
+  });
   return output;
+}
+
+/// nativeConvert 的缓存 sha 直取（命中不重哈希）：需要参考 sha 的场景用
+/// 这个，避免对（可能数 GB 的）产物再流式哈希一遍。
+function nativeConvertSha(input, output, extra = []) {
+  const profile = extra.includes('--profile') ? []
+    : ['--profile', /\.kfbf$/i.test(input) ? 'fl-ome' : 'bf-ome'];
+  return nativeCache.nativeConvertCached({
+    cli: CLI, input, output, args: [...profile, ...extra],
+  }).sha256;
 }
 
 // ---------------------------------------------------------------- OPFS --
@@ -284,7 +310,8 @@ async function shot(page, name) {
 module.exports = {
   arg, testLocale, startServer, launch, openTools, openMoreOptions, savePickerStub,
   downloadGuard, setFile,
-  ensureFixture, sparseLargeKfb, sha256File, nativeConvert, opfsSha256,
+  ensureFixture, ensureFixtureDir, sparseLargeKfb, sha256File,
+  nativeConvert, nativeConvertSha, opfsSha256,
   clearJobs, jobDirs, writeJson, shot,
   GATE, REPO, CLI, SCREENS, chromium,
 };

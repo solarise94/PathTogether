@@ -355,6 +355,18 @@ def _tifffile_open_check(path, expected_pages_min=1):
     return len(pages)
 
 
+#: showinf 输出里真正代表「打开失败」的堆栈行（行首锚定）：showinf 正常
+#: 运行也可能在幻灯片元数据/描述文本等处出现 "Exception" 字样，历史实现用
+#: 宽泛子串 ``"Exception" not in out`` 判断曾在门禁里对同一产物偶发失败
+#: （重跑通过、rc=0）——改为以返回码为准 + 只认这些真正的异常行。
+_BF_FATAL_LINE_RES = (
+    "Exception in thread",
+    "FormatException",
+    "IOException",
+    "OutOfMemoryError",
+)
+
+
 def _bioformats_open_check(path):
     """Bio-Formats showinf（无像素）——打开成功且 series/level 数 > 1。"""
     import platform
@@ -378,7 +390,13 @@ def _bioformats_open_check(path):
         timeout=600,
     )
     out = r.stdout + r.stderr
-    assert "Exception" not in out or "Reading pixel" in out, out[-800:]
+    # 失败判据：showinf 返回码非 0；或输出含真正的异常堆栈行（行首锚定，
+    # 见 _BF_FATAL_LINE_RES——不再用宽泛子串）。失败信息附这些异常行
+    # （而非「最后 800 字符」：rc=0 的正常输出尾巴没有诊断价值）。
+    fatal = [ln for ln in out.splitlines()
+             if any(ln.lstrip().startswith(pfx) for pfx in _BF_FATAL_LINE_RES)]
+    assert r.returncode == 0 and not fatal, (
+        "showinf rc=%s fatal_lines=%r" % (r.returncode, fatal[:8]))
     return r.returncode, out
 
 

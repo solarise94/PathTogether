@@ -711,8 +711,8 @@ def test_ui_budget_card_and_max_steps_sync_present():
     assert '"admin.turnBudgets.newPeriod"' not in bridge_js
     assert '"admin:turn-budgets:read"' not in bridge_js
     assert '"/api/admin/v1/settings/runtime", "PUT"' in bridge_js
-    manifest = json.loads((REPO_ROOT / "plugins" / "pathtogether-admin"
-                           / "manifest.json").read_text(encoding="utf-8"))
+    manifest_path = REPO_ROOT / "plugins" / "pathtogether-admin" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     # 2026-09-06：插件版本 0.3.6（升级批次 0–5 工作区收录语义）；turn/acquisition/billing
     # write 权限全部退役（§Batch E 1 / §Batch C 6 / §Batch D1 4/15）。
     # 2026-09-07 升 0.4.0：展示 J（身份主列=完整邮箱用户名，main.js/pin 同步）。
@@ -726,7 +726,18 @@ def test_ui_budget_card_and_max_steps_sync_present():
     # 爬虫。hashes/pin 同步
     # 2026-09-21 0.4.12：新增研究删除任务管理页（终态 failed 复活重试、无置
     # completed 入口）；hashes/pin 同步
-    assert manifest["pluginVersion"] == "0.4.12"
+    # 版本断言不再写死具体号（曾钉 0.4.12，交付 0.4.14 起即过时失效）：改为
+    # 锚定「真实交付的插件包」——plugins/source-policy.json 的 pin
+    # （sha256(manifest.json)，交付信任链，同 test_plugin_source_policy.py
+    # 一级锁）证明本用例读到的是交付 manifest；版本只锁下界（turn 预算
+    # UI/权限退役契约在 0.4.12 已完成，其后任意版本都满足本契约）。
+    import hashlib
+    policy = json.loads((REPO_ROOT / "plugins" / "source-policy.json")
+                        .read_text(encoding="utf-8"))
+    assert hashlib.sha256(manifest_path.read_bytes()).hexdigest() \
+        == policy["pathtogether-admin"], "manifest 与交付 pin 不一致"
+    ver_parts = tuple(int(x) for x in manifest["pluginVersion"].split("."))
+    assert ver_parts >= (0, 4, 12), manifest["pluginVersion"]
     for perm in ("admin:turn-budgets:read", "admin:turn-budgets:write",
                  "admin:acquisition:read", "admin:billing:write"):
         assert perm not in manifest["adminPermissions"], perm

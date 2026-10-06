@@ -1452,347 +1452,113 @@ async function scenarioZ() {
   }
 }
 
-// (sv) F1 SVS 页面入口：真实 CC0 Aperio 样本（SVS_SAMPLE，缺省跳过）经页面
-// 识别为 SVS (Aperio) 明场 → 默认 bf-ome/保留画质转换 → 保存 sha == 原生；
-// 同页 compact 也 == 原生 compact。JPEG 2000 SVS（SVS_JP2K_SAMPLE）在复制前
-// 被拒绝且无任务目录。
-async function scenarioSV() {
-  const svs = process.env.SVS_SAMPLE;
-  if (!svs || !fs.existsSync(svs)) {
-    record('sv-svs-page-e2e', true, { skipped: 'SVS_SAMPLE not set or missing' });
-    return;
-  }
-  const nativeSha = await L.sha256File(L.nativeConvert(svs,
-    path.join(L.GATE, 'fixtures', 'svs-native-bf-ome.ome.tif')));
-  const nativeCompactSha = await L.sha256File(L.nativeConvert(svs,
-    path.join(L.GATE, 'fixtures', 'svs-native-bf-ome-compact.ome.tif'), ['--encoding', 'compact']));
-  const { context, page } = await L.launch('sv', [L.savePickerStub()]);
-  try {
-    await L.openTools(page, PORT);
-    const runOnce = async (compact) => {
-      await L.clearJobs(page);
-      await page.reload({ waitUntil: 'load' });
-      await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
-      await L.setFile(page, svs);
-      await waitVisible(page, '#summary-section:not([hidden])', 120000);
-      const fmt = (await page.textContent('#summary-format')).trim();
-      if (fmt !== 'SVS (Aperio)') throw new Error(`summary format "${fmt}"`);
-      const qShown = await page.evaluate(() => !document.getElementById('quality-fieldset').hidden);
-      if (!qShown) throw new Error('quality choice hidden for SVS');
-      if (compact) await page.check('#quality-compact');
-      await page.click('#convert-btn');
-      await waitVisible(page, '#result-section:not([hidden])', 180000);
-      await page.click('#save-btn');
-      await waitText(page, '#save-status', /已保存|Saved/);
-      return { fmt, sha: (await L.opfsSha256(page)).sha256 };
-    };
-    const pres = await runOnce(false);
-    if (pres.sha !== nativeSha) throw new Error(`svs preserve sha ${pres.sha} != native ${nativeSha}`);
-    const comp = await runOnce(true);
-    if (comp.sha !== nativeCompactSha) throw new Error(`svs compact sha ${comp.sha} != native ${nativeCompactSha}`);
-    let jp2k = 'skipped (SVS_JP2K_SAMPLE not set)';
-    const j = process.env.SVS_JP2K_SAMPLE;
-    if (j && fs.existsSync(j)) {
-      await L.clearJobs(page);
-      await page.reload({ waitUntil: 'load' });
-      await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
-      await L.setFile(page, j);
-      await waitText(page, '#page-error', /JPEG 2000/, 60000);
-      if ((await L.jobDirs(page)).length !== 0) throw new Error('JP2K SVS left a job dir');
-      jp2k = 'rejected before copy';
-    }
-    record('sv-svs-page-e2e', true, { format: pres.fmt, preserveSha: pres.sha, compactSha: comp.sha, jp2k });
-  } catch (e) {
-    record('sv-svs-page-e2e', false, { error: String(e).slice(0, 400) });
-  } finally {
-    await context.close();
-  }
-}
+// ---------------------------------------------------------------------- --
+// F1/F4/F5/F6/F7/F8 真实格式页面场景（合成夹具版，2026-10 门禁去重）
+//
+// 分工（去重前的状态见 git 历史）：这些场景曾各自用真实样本（SVS_SAMPLE/
+// SCN_SAMPLE/GTIFF_SAMPLE/NDPI_SAMPLE/VMS_SAMPLE_DIR/MRXS_SAMPLE_DIR/
+// RASTER_SAMPLE）做两遍浏览器转换（preserve + compact）并与原生 CLI 比对
+// sha——与 C2 `run_parity.js`（gate 的 c2-parity-svs / c2-parity-mrxs /
+// parity-<fmt>）对同一批真实样本的「浏览器 == 原生」字节一致证明完全重复
+// （C3 里 vm=1476s、nd=382s、sc=100s、gt=99s 大头全是这两遍转换）。
+//
+// 现在：真实样本的字节一致只留 C2 parity（两边都保留 bf-ome 与
+// bf-classic profile 的 preserve 比对）；C3 用 CLI `gen-<格式>` 的小合成
+// 夹具验证**页面行为**：文件/文件夹入口、摘要格式名（formatFamilyLabel
+// 按引擎 format id 前缀映射——合成夹具与真实样本命中同一 adapter 与同一
+// 标签分支）、画质选项与格式说明行、保存 sha == 原生对同一合成夹具
+// （preserve + compact 各一遍，保住「页面画质选择端到端生效」的覆盖）、
+// 刷新后任务行仍在且可再次导出、变体在复制前被拒绝且无任务目录。
+//
+// 唯一保留的真实样本断言：JPEG 2000 SVS 的复制前拒绝（gen-svs 无法生成
+// JP2K 编码——这是真实布局才有的分支），且只做拒绝、零转换。
 
-// (sc) F4 SCN 页面入口：真实 CC0 Leica 样本（SCN_SAMPLE，缺省跳过）经页面
-// 识别为 SCN (Leica) 明场 → 默认 bf-ome/保留画质转换 → 保存 sha == 原生；
-// compact 一次 == 原生 compact。荧光/非 JPEG 变体（本地 gen-scn 夹具）在
-// 页面上复制前被拒绝且无任务目录。
-async function scenarioSC() {
-  const scn = process.env.SCN_SAMPLE;
-  if (!scn || !fs.existsSync(scn)) {
-    record('sc-scn-page-e2e', true, { skipped: 'SCN_SAMPLE not set or missing' });
-    return;
-  }
-  const nativeSha = await L.sha256File(L.nativeConvert(scn,
-    path.join(L.GATE, 'fixtures', 'scn-native-bf-ome.ome.tif'), ['--profile', 'bf-ome']));
-  const nativeCompactSha = await L.sha256File(L.nativeConvert(scn,
-    path.join(L.GATE, 'fixtures', 'scn-native-bf-ome-compact.ome.tif'),
-    ['--profile', 'bf-ome', '--encoding', 'compact']));
-  const { context, page } = await L.launch('sc', [L.savePickerStub()]);
-  try {
-    await L.openTools(page, PORT);
-    const runOnce = async (compact) => {
-      await L.clearJobs(page);
-      await page.reload({ waitUntil: 'load' });
-      await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
-      await L.setFile(page, scn);
-      await waitVisible(page, '#summary-section:not([hidden])', 120000);
-      const fmt = (await page.textContent('#summary-format')).trim();
-      if (fmt !== 'SCN (Leica)') throw new Error(`summary format "${fmt}"`);
-      const qShown = await page.evaluate(() => !document.getElementById('quality-fieldset').hidden);
-      if (!qShown) throw new Error('quality choice hidden for SCN');
-      if (compact) await page.check('#quality-compact');
-      await page.click('#convert-btn');
-      await waitVisible(page, '#result-section:not([hidden])', 300000);
-      await page.click('#save-btn');
-      await waitText(page, '#save-status', /已保存|Saved/);
-      return { fmt, sha: (await L.opfsSha256(page)).sha256 };
-    };
-    const pres = await runOnce(false);
-    if (pres.sha !== nativeSha) throw new Error(`scn preserve sha ${pres.sha} != native ${nativeSha}`);
-    const comp = await runOnce(true);
-    if (comp.sha !== nativeCompactSha) throw new Error(`scn compact sha ${comp.sha} != native ${nativeCompactSha}`);
-    // 变体拒绝：荧光 SCN 夹具在复制前被拒（无任务目录）
-    const fixtureDir = path.join(L.GATE, 'fixtures');
-    fs.mkdirSync(fixtureDir, { recursive: true });
-    const fluoro = path.join(fixtureDir, 'scn-fluoro.scn');
-    if (!fs.existsSync(fluoro)) {
-      const { execFileSync } = require('child_process');
-      execFileSync(L.CLI, ['gen-scn', fluoro, '--fluoro']);
-    }
-    await L.clearJobs(page);
-    await page.reload({ waitUntil: 'load' });
-    await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
-    await L.setFile(page, fluoro);
-    await waitText(page, '#page-error', /荧光/, 60000);
-    if ((await L.jobDirs(page)).length !== 0) throw new Error('fluorescent SCN left a job dir');
-    record('sc-scn-page-e2e', true, { format: pres.fmt, preserveSha: pres.sha, compactSha: comp.sha,
-      variant: 'fluorescent rejected before copy' });
-  } catch (e) {
-    record('sc-scn-page-e2e', false, { error: String(e).slice(0, 400) });
-  } finally {
-    await context.close();
-  }
-}
+/// 单文件格式的合成夹具页面场景（sv/sc/gt/nd/ra 共用）。
+async function syntheticFileScenario(opts) {
+  const fx = L.ensureFixture(opts.fixture[0], opts.fixture[1]);
+  const nativeSha = L.nativeConvertSha(fx,
+    path.join(L.GATE, 'fixtures', `${opts.fixture[0]}.native-ome.tif`),
+    ['--profile', 'bf-ome']);
+  const nativeCompactSha = L.nativeConvertSha(fx,
+    path.join(L.GATE, 'fixtures', `${opts.fixture[0]}.native-compact.tif`),
+    ['--profile', 'bf-ome', '--encoding', 'compact']);
 
-// (gt) F5 通用 TIFF 页面入口：真实 CC0 样本（GTIFF_SAMPLE，缺省跳过）经页面
-// 识别为 Generic TIFF 明场 → 默认 bf-ome/保留画质转换 → 保存 sha == 原生；
-// compact 一次 == 原生 compact。变体拒绝（本地 gen-gtiff 条带夹具）在页面
-// 上复制前被拒且无任务目录（暂时直传变体）。
-async function scenarioGT() {
-  const gtiff = process.env.GTIFF_SAMPLE;
-  if (!gtiff || !fs.existsSync(gtiff)) {
-    record('gt-gtiff-page-e2e', true, { skipped: 'GTIFF_SAMPLE not set or missing' });
-    return;
-  }
-  const nativeSha = await L.sha256File(L.nativeConvert(gtiff,
-    path.join(L.GATE, 'fixtures', 'gtiff-native-bf-ome.ome.tif'), ['--profile', 'bf-ome']));
-  const nativeCompactSha = await L.sha256File(L.nativeConvert(gtiff,
-    path.join(L.GATE, 'fixtures', 'gtiff-native-bf-ome-compact.ome.tif'),
-    ['--profile', 'bf-ome', '--encoding', 'compact']));
-  const { context, page } = await L.launch('gt', [L.savePickerStub()]);
+  const { context, page } = await L.launch(opts.id, [L.savePickerStub()]);
+  page.on('dialog', (d) => d.accept());
   try {
     await L.openTools(page, PORT);
     const runOnce = async (compact) => {
       await L.clearJobs(page);
       await page.reload({ waitUntil: 'load' });
       await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
-      await L.setFile(page, gtiff);
+      await L.setFile(page, fx);
       await waitVisible(page, '#summary-section:not([hidden])', 120000);
       const fmt = (await page.textContent('#summary-format')).trim();
-      if (fmt !== 'Generic TIFF') throw new Error(`summary format "${fmt}"`);
+      if (fmt !== opts.formatLabel) throw new Error(`summary format "${fmt}" != "${opts.formatLabel}"`);
       const qShown = await page.evaluate(() => !document.getElementById('quality-fieldset').hidden);
-      if (!qShown) throw new Error('quality choice hidden for generic TIFF');
+      if (!qShown) throw new Error('quality choice hidden');
+      if (opts.noteId) {
+        // 格式专属画质说明行（如 NDPI 分段解码 / 普通图片有界解码）
+        await page.waitForFunction((id) => !document.getElementById(id).hidden,
+          opts.noteId, { timeout: 10000 });
+      }
       if (compact) await page.check('#quality-compact');
       await page.click('#convert-btn');
       await waitVisible(page, '#result-section:not([hidden])', 600000);
       await page.click('#save-btn');
-      await waitText(page, '#save-status', /已保存|Saved/);
+      await waitText(page, '#save-status', /已保存|Saved/, 120000);
       return { fmt, sha: (await L.opfsSha256(page)).sha256 };
     };
     const pres = await runOnce(false);
-    if (pres.sha !== nativeSha) throw new Error(`gtiff preserve sha ${pres.sha} != native ${nativeSha}`);
-    const comp = await runOnce(true);
-    if (comp.sha !== nativeCompactSha) throw new Error(`gtiff compact sha ${comp.sha} != native ${nativeCompactSha}`);
-    // 变体拒绝：条带通用 TIFF 夹具在复制前被拒（无任务目录）
-    const fixtureDir = path.join(L.GATE, 'fixtures');
-    fs.mkdirSync(fixtureDir, { recursive: true });
-    const stripped = path.join(fixtureDir, 'gtiff-stripped.tiff');
-    if (!fs.existsSync(stripped)) {
-      const { execFileSync } = require('child_process');
-      execFileSync(L.CLI, ['gen-gtiff', stripped, '--stripped']);
-    }
-    await L.clearJobs(page);
+    if (pres.sha !== nativeSha) throw new Error(`preserve sha ${pres.sha} != native ${nativeSha}`);
+
+    // 刷新后任务行：ready 任务从 OPFS 恢复在列表（无需重选文件），可再次导出
     await page.reload({ waitUntil: 'load' });
     await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
-    await L.setFile(page, stripped);
-    await waitText(page, '#page-error', /tiled|分块/, 60000);
-    if ((await L.jobDirs(page)).length !== 0) throw new Error('stripped generic TIFF left a job dir');
-    record('gt-gtiff-page-e2e', true, { format: pres.fmt, preserveSha: pres.sha, compactSha: comp.sha,
-      variant: 'stripped rejected before copy' });
-  } catch (e) {
-    record('gt-gtiff-page-e2e', false, { error: String(e).slice(0, 400) });
-  } finally {
-    await context.close();
-  }
-}
+    await waitVisible(page, '.job-row[data-next-action="export"] button[data-action="export"]', 60000);
+    const rowAfterReload = ((await page.textContent('.job-row')) || '').trim();
 
-// (nd) F6 NDPI 页面入口：真实 CC0 Hamamatsu 样本（NDPI_SAMPLE，缺省跳过）
-// 经页面识别为 NDPI (Hamamatsu) 明场 → 默认 bf-ome/保留画质转换 → 保存
-// sha == 原生；compact 一次 == 原生 compact。变体拒绝（本地 gen-ndpi 无
-// restart marker 夹具）在页面上复制前被拒且无任务目录。
-async function scenarioND() {
-  const ndpi = process.env.NDPI_SAMPLE;
-  if (!ndpi || !fs.existsSync(ndpi)) {
-    record('nd-ndpi-page-e2e', true, { skipped: 'NDPI_SAMPLE not set or missing' });
-    return;
-  }
-  const nativeSha = await L.sha256File(L.nativeConvert(ndpi,
-    path.join(L.GATE, 'fixtures', 'ndpi-native-bf-ome.ome.tif'),
-    ['--profile', 'bf-ome', '--timeout', '3600']));
-  const nativeCompactSha = await L.sha256File(L.nativeConvert(ndpi,
-    path.join(L.GATE, 'fixtures', 'ndpi-native-bf-ome-compact.ome.tif'),
-    ['--profile', 'bf-ome', '--encoding', 'compact', '--timeout', '3600']));
-  const { context, page } = await L.launch('nd', [L.savePickerStub()]);
-  try {
-    await L.openTools(page, PORT);
-    const runOnce = async (compact) => {
+    const comp = await runOnce(true);
+    if (comp.sha !== nativeCompactSha) throw new Error(`compact sha ${comp.sha} != native ${nativeCompactSha}`);
+
+    // 变体拒绝：复制前被拒（无任务目录）
+    let variant = 'n/a';
+    if (opts.variant) {
+      const v = L.ensureFixture(opts.variant.file, opts.variant.gen);
       await L.clearJobs(page);
       await page.reload({ waitUntil: 'load' });
       await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
-      await L.setFile(page, ndpi);
-      await waitVisible(page, '#summary-section:not([hidden])', 120000);
-      const fmt = (await page.textContent('#summary-format')).trim();
-      if (fmt !== 'NDPI (Hamamatsu)') throw new Error(`summary format "${fmt}"`);
-      const qShown = await page.evaluate(() => !document.getElementById('quality-fieldset').hidden);
-      if (!qShown) throw new Error('quality choice hidden for NDPI');
-      // F6 画质说明行：NDPI 识别后显示「分段解码重编码」说明
-      await page.waitForFunction(() => !document.getElementById('quality-ndpi-note').hidden,
-        null, { timeout: 10000 });
-      if (compact) await page.check('#quality-compact');
-      await page.click('#convert-btn');
-      await waitVisible(page, '#result-section:not([hidden])', 1200000);
-      await page.click('#save-btn');
-      await waitText(page, '#save-status', /已保存|Saved/);
-      return { fmt, sha: (await L.opfsSha256(page)).sha256 };
-    };
-    const pres = await runOnce(false);
-    if (pres.sha !== nativeSha) throw new Error(`ndpi preserve sha ${pres.sha} != native ${nativeSha}`);
-    const comp = await runOnce(true);
-    if (comp.sha !== nativeCompactSha) throw new Error(`ndpi compact sha ${comp.sha} != native ${nativeCompactSha}`);
-    // 变体拒绝：无 restart marker 夹具在复制前被拒（无任务目录）
-    const fixtureDir = path.join(L.GATE, 'fixtures');
-    fs.mkdirSync(fixtureDir, { recursive: true });
-    const noRestart = path.join(fixtureDir, 'ndpi-no-restart.ndpi');
-    if (!fs.existsSync(noRestart)) {
-      const { execFileSync } = require('child_process');
-      execFileSync(L.CLI, ['gen-ndpi', noRestart, '--width', '512', '--height', '320',
-        '--levels', '1', '--no-restart']);
+      await L.setFile(page, v);
+      await waitText(page, '#page-error', opts.variant.errRe, 60000);
+      if ((await L.jobDirs(page)).length !== 0) throw new Error('variant left a job dir');
+      variant = opts.variant.note;
     }
-    await L.clearJobs(page);
-    await page.reload({ waitUntil: 'load' });
-    await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
-    await L.setFile(page, noRestart);
-    await waitText(page, '#page-error', /restart marker/, 60000);
-    if ((await L.jobDirs(page)).length !== 0) throw new Error('no-restart NDPI left a job dir');
-    record('nd-ndpi-page-e2e', true, { format: pres.fmt, preserveSha: pres.sha, compactSha: comp.sha,
-      variant: 'no-restart rejected before copy' });
+    record(opts.id, true, { fixture: opts.fixture[0], format: pres.fmt,
+      preserveSha: pres.sha, nativeSha, compactSha: comp.sha, nativeCompactSha,
+      rowAfterReload: rowAfterReload.slice(0, 60), variant });
   } catch (e) {
-    record('nd-ndpi-page-e2e', false, { error: String(e).slice(0, 400) });
+    record(opts.id, false, { error: String(e).slice(0, 400) });
   } finally {
     await context.close();
   }
 }
 
-// (ra) F8 普通图片页面入口：真实 CC0 样本（RASTER_SAMPLE，缺省跳过——
-// 6000×4000 基线 JPEG，无 restart marker → 页面识别为普通图片 (BMP/JPEG)
-// 明场 → 默认 bf-ome/保留画质转换 → 保存 sha == 原生；compact 一次 ==
-// 原生 compact。变体拒绝（gen-raster 渐进夹具）在页面上复制前被拒且无
-// 任务目录。
-async function scenarioRA() {
-  const raster = process.env.RASTER_SAMPLE;
-  if (!raster || !fs.existsSync(raster)) {
-    record('ra-raster-page-e2e', true, { skipped: 'RASTER_SAMPLE not set or missing' });
-    return;
-  }
-  const nativeSha = await L.sha256File(L.nativeConvert(raster,
-    path.join(L.GATE, 'fixtures', 'raster-native-bf-ome.ome.tif'), ['--profile', 'bf-ome']));
-  const nativeCompactSha = await L.sha256File(L.nativeConvert(raster,
-    path.join(L.GATE, 'fixtures', 'raster-native-bf-ome-compact.ome.tif'),
-    ['--profile', 'bf-ome', '--encoding', 'compact']));
-  const { context, page } = await L.launch('ra', [L.savePickerStub()]);
-  try {
-    await L.openTools(page, PORT);
-    const runOnce = async (compact) => {
-      await L.clearJobs(page);
-      await page.reload({ waitUntil: 'load' });
-      await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
-      await L.setFile(page, raster);
-      await waitVisible(page, '#summary-section:not([hidden])', 120000);
-      const fmt = (await page.textContent('#summary-format')).trim();
-      if (fmt !== '普通图片 (BMP/JPEG)') throw new Error(`summary format "${fmt}"`);
-      const qShown = await page.evaluate(() => !document.getElementById('quality-fieldset').hidden);
-      if (!qShown) throw new Error('quality choice hidden for plain image');
-      // F8 画质说明行：普通图片识别后显示「有界解码重编码 + 无物理标尺」说明
-      await page.waitForFunction(() => !document.getElementById('quality-raster-note').hidden,
-        null, { timeout: 10000 });
-      if (compact) await page.check('#quality-compact');
-      await page.click('#convert-btn');
-      await waitVisible(page, '#result-section:not([hidden])', 600000);
-      await page.click('#save-btn');
-      await waitText(page, '#save-status', /已保存|Saved/);
-      return { fmt, sha: (await L.opfsSha256(page)).sha256 };
-    };
-    const pres = await runOnce(false);
-    if (pres.sha !== nativeSha) throw new Error(`raster preserve sha ${pres.sha} != native ${nativeSha}`);
-    const comp = await runOnce(true);
-    if (comp.sha !== nativeCompactSha) throw new Error(`raster compact sha ${comp.sha} != native ${nativeCompactSha}`);
-    // 变体拒绝：渐进 JPEG 夹具在复制前被拒（无任务目录）
-    const fixtureDir = path.join(L.GATE, 'fixtures');
-    fs.mkdirSync(fixtureDir, { recursive: true });
-    const prog = path.join(fixtureDir, 'raster-progressive.jpg');
-    if (!fs.existsSync(prog)) {
-      const { execFileSync } = require('child_process');
-      execFileSync(L.CLI, ['gen-raster', prog, '--kind', 'jpeg', '--width', '512',
-        '--height', '320', '--progressive']);
-    }
-    await L.clearJobs(page);
-    await page.reload({ waitUntil: 'load' });
-    await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
-    await L.setFile(page, prog);
-    await waitText(page, '#page-error', /渐进/, 60000);
-    if ((await L.jobDirs(page)).length !== 0) throw new Error('progressive JPEG left a job dir');
-    record('ra-raster-page-e2e', true, { format: pres.fmt, preserveSha: pres.sha, compactSha: comp.sha,
-      variant: 'progressive rejected before copy' });
-  } catch (e) {
-    record('ra-raster-page-e2e', false, { error: String(e).slice(0, 400) });
-  } finally {
-    await context.close();
-  }
-}
-
-// (mx) F3 MRXS 页面入口：真实 CC0 完整包（MRXS_SAMPLE_DIR，缺省跳过并记录）
-// 经「选择文件夹（MRXS）」input（page.setInputFiles 目录 → webkitRelativePath）
-// → 摘要 MRXS/明场/画质 + 拼接重编码说明 → 转换（保留画质，bf-ome）→ 保存
-// sha == 原生 CLI（期望 62da50da…：适配器 v2 = review §4 的 l0-box2 金字塔，
-// 缩减层像素全部改变，v1 的 42f3c650… 随之作废）→ 刷新后任务列表显示文件夹名；compact 一次
-// == 原生 --encoding compact；单独 .mrxs 经 file input → 缺失成员信息、无任务目录。
-async function scenarioMX() {
-  const dir = process.env.MRXS_SAMPLE_DIR;
-  if (!dir || !fs.existsSync(dir)) {
-    record('mx-mrxs-folder-e2e', true, { skipped: 'MRXS_SAMPLE_DIR not set or missing' });
-    return;
-  }
-  const stems = fs.readdirSync(dir).filter((f) => /\.mrxs$/i.test(f)).sort();
-  if (stems.length !== 1) throw new Error(`expected exactly one .mrxs entry in ${dir}`);
+/// 文件夹（完整包）格式的合成夹具页面场景（mx/vm 共用）：入口走真实
+/// 「选择文件夹」input（webkitdirectory → webkitRelativePath）。
+async function syntheticFolderScenario(opts) {
+  const dir = L.ensureFixtureDir(opts.dirName, opts.gen);
+  const stems = fs.readdirSync(dir).filter((f) => opts.entryRe.test(f)).sort();
+  if (stems.length !== 1) throw new Error(`expected exactly one ${opts.entryRe} entry in ${dir}`);
   const entryRel = path.join(dir, stems[0]);
-  const native = L.nativeConvert(entryRel,
-    path.join(L.GATE, 'fixtures', 'mrxs-native-bf-ome.ome.tif'), ['--profile', 'bf-ome']);
-  const nativeSha = await L.sha256File(native);
-  if (!nativeSha.startsWith('62da50da')) {
-    throw new Error(`native preserve sha ${nativeSha} != expected 62da50da…`);
-  }
-  const nativeCompactSha = await L.sha256File(L.nativeConvert(entryRel,
-    path.join(L.GATE, 'fixtures', 'mrxs-native-bf-ome-compact.ome.tif'),
-    ['--profile', 'bf-ome', '--encoding', 'compact']));
+  const nativeSha = L.nativeConvertSha(entryRel,
+    path.join(L.GATE, 'fixtures', `${opts.dirName}-native-ome.tif`),
+    ['--profile', 'bf-ome']);
+  const nativeCompactSha = L.nativeConvertSha(entryRel,
+    path.join(L.GATE, 'fixtures', `${opts.dirName}-native-compact.tif`),
+    ['--profile', 'bf-ome', '--encoding', 'compact']);
 
-  const { context, page } = await L.launch('mx', [L.savePickerStub(), READ_JOB_RECORDS]);
+  const { context, page } = await L.launch(opts.id, [L.savePickerStub()]);
+  page.on('dialog', (d) => d.accept());
   try {
     await L.openTools(page, PORT);
     const runOnce = async (compact) => {
@@ -1803,154 +1569,204 @@ async function scenarioMX() {
       await page.setInputFiles('#folder-input', dir);
       await waitVisible(page, '#summary-section:not([hidden])', 300000);
       const fmt = (await page.textContent('#summary-format')).trim();
-      if (fmt !== 'MRXS') throw new Error(`summary format "${fmt}"`);
-      const modality = (await page.textContent('#summary-modality')).trim();
-      const qShown = await page.evaluate(() => ({
+      if (fmt !== opts.formatLabel) throw new Error(`summary format "${fmt}" != "${opts.formatLabel}"`);
+      const qShown = await page.evaluate((id) => ({
         quality: !document.getElementById('quality-fieldset').hidden,
-        note: !document.getElementById('quality-mrxs-note').hidden,
-      }));
-      if (!qShown.quality) throw new Error('quality choice hidden for MRXS');
-      if (!qShown.note) throw new Error('MRXS quality note hidden');
-      const noteText = (await page.textContent('#quality-mrxs-note')).trim();
-      if (!/重编码|re-encode/.test(noteText)) throw new Error(`mrxs note "${noteText}"`);
-      if (!compact) {
-        // 窄屏（400px）MRXS 摘要截图（报告用；恢复默认视口再继续）
-        await page.setViewportSize({ width: 400, height: 900 });
-        await L.shot(page, 'mrxs-summary-narrow');
-        await page.setViewportSize({ width: 1120, height: 900 });
-      }
+        note: !document.getElementById(id).hidden,
+      }), opts.noteId);
+      if (!qShown.quality) throw new Error('quality choice hidden');
+      if (!qShown.note) throw new Error('quality note hidden');
+      const noteText = (await page.textContent(`#${opts.noteId}`)).trim();
+      if (opts.noteRe && !opts.noteRe.test(noteText)) throw new Error(`note "${noteText}"`);
       if (compact) await page.check('#quality-compact');
       await page.click('#convert-btn');
       await waitVisible(page, '#result-section:not([hidden])', 600000);
       const composed = (await page.textContent('#result-composed')) || '';
-      if (!composed.trim()) throw new Error('composed summary row missing');
+      if (opts.composedRow && !composed.trim()) throw new Error('composed summary row missing');
       await page.click('#save-btn');
       await waitText(page, '#save-status', /已保存|Saved/, 120000);
       const saved = await L.opfsSha256(page);
-      return { fmt, modality, note: noteText, composed: composed.trim(), sha: saved.sha256 };
+      return { fmt, note: noteText, composed: composed.trim(), sha: saved.sha256 };
     };
     const pres = await runOnce(false);
-    if (pres.sha !== nativeSha) throw new Error(`mrxs preserve sha ${pres.sha} != native ${nativeSha}`);
+    if (pres.sha !== nativeSha) throw new Error(`preserve sha ${pres.sha} != native ${nativeSha}`);
+    // 任务行显示所选文件夹名
     const jobName = await page.textContent('.job-row .job-name');
-    if (!jobName || jobName.trim() !== 'CMU-1-Saved-1_16') {
+    if (!jobName || jobName.trim() !== opts.dirName) {
       throw new Error(`bundle job row name "${jobName}" (want the picked folder name)`);
     }
-
-    // 刷新后：任务从 OPFS 恢复（无需重选文件夹）——行仍在、显示文件夹名，
-    // 产物可再次保存（nextAction=export）
+    // 刷新后：任务从 OPFS 恢复——行仍在、显示文件夹名、产物可再次导出
     await page.reload({ waitUntil: 'load' });
     await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
-    const exportBtn = '.job-row[data-next-action="export"] button[data-action="export"]';
-    await waitVisible(page, exportBtn, 30000);
+    await waitVisible(page, '.job-row[data-next-action="export"] button[data-action="export"]', 60000);
     const rowAfterReload = await page.textContent('.job-row .job-name');
-    if (!rowAfterReload || rowAfterReload.trim() !== 'CMU-1-Saved-1_16') {
+    if (!rowAfterReload || rowAfterReload.trim() !== opts.dirName) {
       throw new Error(`row name after reload "${rowAfterReload}"`);
     }
-
     const comp = await runOnce(true);
-    if (comp.sha !== nativeCompactSha) throw new Error(`mrxs compact sha ${comp.sha} != native ${nativeCompactSha}`);
-
-    // 单独 .mrxs（file input 手动选到）：planner 缺失成员信息，无任务目录
-    await L.clearJobs(page);
-    await page.reload({ waitUntil: 'load' });
-    await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
-    await L.setFile(page, entryRel);
-    await waitText(page, '#page-error', /Slidedat\.ini|complete bundle/, 60000);
-    if ((await L.jobDirs(page)).length !== 0) throw new Error('.mrxs-only pick left a job dir');
-
-    record('mx-mrxs-folder-e2e', true, {
-      folder: 'CMU-1-Saved-1_16', format: pres.fmt, modality: pres.modality,
-      preserveSha: pres.sha, nativeSha, expectedPrefix: '62da50da',
-      compactSha: comp.sha, nativeCompactSha,
+    if (comp.sha !== nativeCompactSha) throw new Error(`compact sha ${comp.sha} != native ${nativeCompactSha}`);
+    record(opts.id, true, { folder: opts.dirName, format: pres.fmt,
+      preserveSha: pres.sha, nativeSha, compactSha: comp.sha, nativeCompactSha,
       composedRow: pres.composed, qualityNote: pres.note.slice(0, 80),
-      rowNameAfterReload: rowAfterReload.trim(),
-    });
+      rowNameAfterReload: rowAfterReload.trim() });
   } catch (e) {
-    record('mx-mrxs-folder-e2e', false, { error: String(e).slice(0, 400) });
+    record(opts.id, false, { error: String(e).slice(0, 400) });
   } finally {
     await context.close();
   }
 }
 
-// (vm) F7 VMS 页面入口：真实 CC0 Hamamatsu 样本（VMS_SAMPLE_DIR，缺省跳过）
-// 经「选择文件夹」input（page.setInputFiles 目录 → webkitRelativePath；平铺
-// 布局：.vms 入口 + 同目录 tile JPEG）→ 摘要 VMS (Hamamatsu)/明场/画质 +
-// 拼接重编码说明 → 转换（保留画质，bf-ome）→ 保存 sha == 原生；compact 一次
-// == 原生 compact。变体拒绝（本地 gen-vms 无 restart marker 夹具）在页面上
-// 复制前被拒且无任务目录。
-async function scenarioVM() {
-  const dir = process.env.VMS_SAMPLE_DIR;
-  if (!dir || !fs.existsSync(dir)) {
-    record('vm-vms-folder-e2e', true, { skipped: 'VMS_SAMPLE_DIR not set or missing' });
+// (sv) F1 SVS 页面入口（合成夹具）：页面行为见 syntheticFileScenario 注释。
+// 真实 SVS 的浏览器==原生字节一致 → gate c2-parity-svs（bf-ome/bf-classic
+// preserve 各一遍）。JPEG 2000 SVS 的复制前拒绝是真实样本专属分支
+// （gen-svs 不能生成 JP2K），保留且零转换。
+async function scenarioSV() {
+  await syntheticFileScenario({
+    id: 'sv-svs-page-e2e',
+    fixture: ['svs-580x300.svs', ['gen-svs']],
+    formatLabel: 'SVS (Aperio)',
+  });
+  const j = process.env.SVS_JP2K_SAMPLE;
+  if (!j || !fs.existsSync(j)) {
+    record('sv-jp2k-reject', true, { skipped: 'SVS_JP2K_SAMPLE not set or missing' });
     return;
   }
-  const stems = fs.readdirSync(dir).filter((f) => /\.vms$/i.test(f)).sort();
-  if (stems.length !== 1) throw new Error(`expected exactly one .vms entry in ${dir}`);
-  const entryRel = path.join(dir, stems[0]);
-  const nativeSha = await L.sha256File(L.nativeConvert(entryRel,
-    path.join(L.GATE, 'fixtures', 'vms-native-bf-ome.ome.tif'),
-    ['--profile', 'bf-ome', '--timeout', '7200']));
-  const nativeCompactSha = await L.sha256File(L.nativeConvert(entryRel,
-    path.join(L.GATE, 'fixtures', 'vms-native-bf-ome-compact.ome.tif'),
-    ['--profile', 'bf-ome', '--encoding', 'compact', '--timeout', '7200']));
-
-  // 变体拒绝先行（廉价）：无 restart marker 的 VMS tile 在核心探测被拒——
-  // 复制后、任何输出前；任务目录必须被同步丢弃（release-bundle → OPFS
-  // 可删除），无遗留
-  const fixtureDir = path.join(L.GATE, 'fixtures');
-  fs.mkdirSync(fixtureDir, { recursive: true });
-  const noRestartDir = path.join(fixtureDir, 'vms-no-restart');
-  if (!fs.existsSync(path.join(noRestartDir, 'synthetic.vms'))) {
-    const { execFileSync } = require('child_process');
-    execFileSync(L.CLI, ['gen-vms', noRestartDir, '--no-restart']);
-  }
-
-  const { context, page } = await L.launch('vm', [L.savePickerStub()]);
+  const { context, page } = await L.launch('sv-jp2k', [L.savePickerStub()]);
   try {
     await L.openTools(page, PORT);
     await L.clearJobs(page);
     await page.reload({ waitUntil: 'load' });
     await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
-    await page.setInputFiles('#folder-input', noRestartDir);
-    await waitText(page, '#page-error', /restart marker/, 60000);
-    if ((await L.jobDirs(page)).length !== 0) throw new Error('no-restart VMS left a job dir');
-
-    const runOnce = async (compact) => {
-      await L.clearJobs(page);
-      await page.reload({ waitUntil: 'load' });
-      await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
-      await page.setInputFiles('#folder-input', dir);
-      await waitVisible(page, '#summary-section:not([hidden])', 600000);
-      const fmt = (await page.textContent('#summary-format')).trim();
-      if (fmt !== 'VMS (Hamamatsu)') throw new Error(`summary format "${fmt}"`);
-      const qShown = await page.evaluate(() => ({
-        quality: !document.getElementById('quality-fieldset').hidden,
-        note: !document.getElementById('quality-vms-note').hidden,
-      }));
-      if (!qShown.quality) throw new Error('quality choice hidden for VMS');
-      if (!qShown.note) throw new Error('VMS quality note hidden');
-      if (compact) await page.check('#quality-compact');
-      await page.click('#convert-btn');
-      await waitVisible(page, '#result-section:not([hidden])', 7200000);
-      const composed = (await page.textContent('#result-composed')) || '';
-      if (!composed.trim()) throw new Error('composed summary row missing');
-      await page.click('#save-btn');
-      await waitText(page, '#save-status', /已保存|Saved/, 120000);
-      const saved = await L.opfsSha256(page);
-      return { fmt, sha: saved.sha256 };
-    };
-    const pres = await runOnce(false);
-    if (pres.sha !== nativeSha) throw new Error(`vms preserve sha ${pres.sha} != native ${nativeSha}`);
-    const comp = await runOnce(true);
-    if (comp.sha !== nativeCompactSha) throw new Error(`vms compact sha ${comp.sha} != native ${nativeCompactSha}`);
-
-    record('vm-vms-folder-e2e', true, { format: pres.fmt, preserveSha: pres.sha,
-      compactSha: comp.sha, variant: 'no-restart rejected before copy' });
+    await L.setFile(page, j);
+    await waitText(page, '#page-error', /JPEG 2000/, 60000);
+    if ((await L.jobDirs(page)).length !== 0) throw new Error('JP2K SVS left a job dir');
+    record('sv-jp2k-reject', true, { rejected: 'before copy', jobDirs: 0 });
   } catch (e) {
-    record('vm-vms-folder-e2e', false, { error: String(e).slice(0, 400) });
+    record('sv-jp2k-reject', false, { error: String(e).slice(0, 400) });
   } finally {
     await context.close();
   }
+}
+
+// (sc) F4 SCN 页面入口（合成夹具）。真实 SCN 字节一致 → gate parity-scn。
+// 变体拒绝（荧光 SCN）沿用本地夹具。
+async function scenarioSC() {
+  await syntheticFileScenario({
+    id: 'sc-scn-page-e2e',
+    fixture: ['scn-520x300.scn', ['gen-scn']],
+    formatLabel: 'SCN (Leica)',
+    variant: { file: 'scn-fluoro.scn', gen: ['gen-scn', '--fluoro'],
+      errRe: /荧光/, note: 'fluorescent rejected before copy' },
+  });
+}
+
+// (gt) F5 通用 TIFF 页面入口（合成夹具）。真实 TIFF 字节一致 → gate
+// parity-gtiff。变体拒绝（条带存储）沿用本地夹具。
+async function scenarioGT() {
+  await syntheticFileScenario({
+    id: 'gt-gtiff-page-e2e',
+    fixture: ['gtiff-520x300.tiff', ['gen-gtiff']],
+    formatLabel: 'Generic TIFF',
+    variant: { file: 'gtiff-stripped.tiff', gen: ['gen-gtiff', '--stripped'],
+      errRe: /tiled|分块/, note: 'stripped rejected before copy' },
+  });
+}
+
+// (nd) F6 NDPI 页面入口（合成夹具）。真实 NDPI 字节一致 → gate
+// parity-ndpi。画质说明行（分段解码重编码）与变体拒绝（无 restart
+// marker）不变。
+async function scenarioND() {
+  await syntheticFileScenario({
+    id: 'nd-ndpi-page-e2e',
+    fixture: ['ndpi-512x320.ndpi', ['gen-ndpi']],
+    formatLabel: 'NDPI (Hamamatsu)',
+    noteId: 'quality-ndpi-note',
+    variant: { file: 'ndpi-no-restart.ndpi',
+      gen: ['gen-ndpi', '--width', '512', '--height', '320', '--levels', '1', '--no-restart'],
+      errRe: /restart marker/, note: 'no-restart rejected before copy' },
+  });
+}
+
+// (ra) F8 普通图片页面入口（合成夹具，基线 JPEG——与真实样本同类）。
+// 真实 JPEG 字节一致 → gate parity-raster。画质说明行（有界解码重编码 +
+// 无物理标尺）与变体拒绝（渐进 JPEG）不变。
+async function scenarioRA() {
+  await syntheticFileScenario({
+    id: 'ra-raster-page-e2e',
+    fixture: ['raster-512x320.jpg', ['gen-raster', '--kind', 'jpeg']],
+    formatLabel: '普通图片 (BMP/JPEG)',
+    noteId: 'quality-raster-note',
+    variant: { file: 'raster-progressive.jpg',
+      gen: ['gen-raster', '--kind', 'jpeg', '--width', '512', '--height', '320', '--progressive'],
+      errRe: /渐进/, note: 'progressive rejected before copy' },
+  });
+}
+
+// (mx) F3 MRXS 页面入口（合成夹具完整包）：文件夹选择入口、摘要/画质/
+// 拼接重编码说明、组成行、刷新后任务行（文件夹名）、保存 sha == 原生
+// （preserve + compact）。真实 MRXS 字节一致 → gate c2-parity-mrxs
+// （其原生侧保留 C3 原有的 62da50da 锚点断言）。单独 .mrxs 经 file
+// input → planner 类型化缺失成员信息、无任务目录（原断言保留）。
+async function scenarioMX() {
+  const dir = L.ensureFixtureDir('mrxs-synth', ['gen-mrxs']);
+  const entryRel = path.join(dir, 'synthetic.mrxs');
+  const { context, page } = await L.launch('mx', [L.savePickerStub()]);
+  try {
+    await L.openTools(page, PORT);
+    // 单独 .mrxs（file input 手动选到）：planner 缺失成员信息，无任务目录
+    await L.setFile(page, entryRel);
+    await waitText(page, '#page-error', /Slidedat\.ini|complete bundle/, 60000);
+    if ((await L.jobDirs(page)).length !== 0) throw new Error('.mrxs-only pick left a job dir');
+    await context.close();
+  } catch (e) {
+    record('mx-mrxs-folder-e2e', false, { error: String(e).slice(0, 400) });
+    await context.close();
+    return;
+  }
+  await syntheticFolderScenario({
+    id: 'mx-mrxs-folder-e2e',
+    dirName: 'mrxs-synth',
+    gen: ['gen-mrxs'],
+    entryRe: /\.mrxs$/i,
+    formatLabel: 'MRXS',
+    noteId: 'quality-mrxs-note',
+    noteRe: /重编码|re-encode/,
+    composedRow: true,
+  });
+}
+
+// (vm) F7 VMS 页面入口（合成夹具完整包）：文件夹选择入口、摘要/画质/
+// 拼接重编码说明、组成行、刷新后任务行、保存 sha == 原生（preserve +
+// compact）。真实 VMS 字节一致 → gate parity-vms。变体拒绝（无 restart
+// marker tile）先行（廉价）——复制后、任何输出前拒绝且任务目录同步丢弃。
+async function scenarioVM() {
+  const noRestartDir = L.ensureFixtureDir('vms-no-restart', ['gen-vms', '--no-restart']);
+  {
+    const { context, page } = await L.launch('vm-variant', [L.savePickerStub()]);
+    try {
+      await L.openTools(page, PORT);
+      await L.clearJobs(page);
+      await page.reload({ waitUntil: 'load' });
+      await page.waitForFunction(() => !!(window.__stToolsReady), null, { timeout: 30000 });
+      await page.setInputFiles('#folder-input', noRestartDir);
+      await waitText(page, '#page-error', /restart marker/, 60000);
+      if ((await L.jobDirs(page)).length !== 0) throw new Error('no-restart VMS left a job dir');
+    } catch (e) {
+      record('vm-vms-folder-e2e', false, { error: 'variant: ' + String(e).slice(0, 400) });
+      return;
+    } finally {
+      await context.close();
+    }
+  }
+  await syntheticFolderScenario({
+    id: 'vm-vms-folder-e2e',
+    dirName: 'vms-synth',
+    gen: ['gen-vms'],
+    entryRe: /\.vms$/i,
+    formatLabel: 'VMS (Hamamatsu)',
+    noteId: 'quality-vms-note',
+    composedRow: true,
+  });
 }
 
 // ------------------------------------------------------------------ main --

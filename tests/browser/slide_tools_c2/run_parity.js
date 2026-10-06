@@ -21,7 +21,7 @@
 'use strict';
 const fs = require('fs');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const nativeCache = require('../native_cache.js');
 const L = require('./lib.js');
 
 const PORT = Number(L.arg('port', '8944'));
@@ -61,11 +61,19 @@ async function convertInBrowser(page, input, profileId, outputProfile, encoding)
   return { jobId, done, hash, rec };
 }
 
+/// 原生参考（走共享缓存 tests/browser/native_cache.js）：同一
+/// (CLI, 输入, 参数) 的原生转换跨场景/跨轮次只真正跑一次，命中以
+/// hardlink 交付并直接复用存储时记下的 sha256。
+function nativeRef(input, output, args) {
+  return nativeCache.nativeConvertCached({ cli: L.CLI, input, output, args }).sha256;
+}
+
 /// F3/F7: one bundle (MRXS same-name dir, or a FLAT VMS folder: the .vms
 /// entry plus its sibling tile JPEGs), browser conversion (both brightfield
-/// profiles) vs the native CLI bytes of the same profile. The members are
-/// read in Node and handed to the page as {name, relPath, bytes} rows (the
-/// engine treats them exactly like picker files with webkitRelativePath).
+/// profiles) vs the native CLI bytes of the same profile. Members enter the
+/// page through the REAL folder-selection input (harness #dir
+/// webkitdirectory → File.webkitRelativePath — the engine treats them
+/// exactly like a user-picked folder).
 async function mainMrsx() {
   if (!MRXS || !fs.existsSync(MRXS)) throw new Error('--mrxs <bundle-dir> required');
   const outDir = path.join(L.GATE, 'parity-mrxs');
@@ -102,60 +110,36 @@ async function mainMrsx() {
   const { context, page } = await L.launch({ label: 'parity-mrxs' });
   try {
     await L.open(page, PORT);
-    // Hand the members to the page as File rows (base64 transport —
-    // Playwright serializes evaluate args as JSON, so binary buffers must
-    // not cross as typed arrays). Members stream in BOUNDED slices: one
-    // giant evaluate ships a ~800 MB CDP payload for the real VMS bundle
-    // and kills the renderer ("Execution context was destroyed" — gate
-    // adapter-20261006-072429, parity-vms). A slice appends to a page-side
-    // accumulator; on the last slice the File is built from the part array
-    // (Chromium assembles Blob parts lazily — no double buffer). The page
-    // keeps the rows for both profile runs (clearJobs only wipes OPFS).
-    const SLICE = 8 * 2 ** 20; // 8 MiB raw → ~10.7 MiB base64 per message
-    await page.evaluate((list) => {
-      window.__bundleRows = [];
-      window.__bundleAcc = new Map(
-        list.map((m) => [m.name, { relPath: m.relPath, parts: [], len: 0 }]));
-    }, members.map((m) => ({ name: m.name, relPath: m.relPath })));
-    for (const m of members) {
-      const size = fs.statSync(m.p).size;
-      for (let at = 0; at < size; at += SLICE) {
-        const n = Math.min(SLICE, size - at);
-        const buf = Buffer.alloc(n);
-        const fd = fs.openSync(m.p, 'r');
-        try { fs.readSync(fd, buf, 0, n, at); } finally { fs.closeSync(fd); }
-        const last = at + n >= size;
-        // eslint-disable-next-line no-await-in-loop
-        await page.evaluate(({ name, b64, last }) => {
-          const bin = atob(b64);
-          const u8 = new Uint8Array(bin.length);
-          for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-          const acc = window.__bundleAcc.get(name);
-          acc.parts.push(u8);
-          acc.len += u8.length;
-          if (last) {
-            window.__bundleRows.push({ name, relPath: acc.relPath,
-              file: new File(acc.parts, name, { type: 'application/octet-stream' }) });
-            window.__bundleAcc.delete(name);
-          }
-        }, { name: m.name, b64: buf.toString('base64'), last });
-      }
-    }
-    const staged = await page.evaluate(() => window.__bundleRows.length);
-    if (staged !== members.length) {
-      throw new Error(`member transfer incomplete: ${staged}/${members.length}`);
-    }
+    // 大包成员经真实「选择文件夹」入口（#dir webkitdirectory input）进入
+    // 页面：Playwright setInputFiles 走 DOM.setFileInputFiles 只传路径，
+    // 浏览器直接从磁盘读文件——替代此前的 8 MiB base64 切片 CDP evaluate
+    // 灌输（真实 VMS 617 MB → ~800 MB CDP 载荷，慢且压渲染进程；gate
+    // adapter-20261006-072429 曾因巨型单次 evaluate 炸过 renderer）。
+    // 两个 profile 轮共用同一 staged 输入（clearJobs 只清 OPFS）；重选前
+    // 清空 value，避免 Chromium 对同一路径跳过 change。
+    const pickFolder = async () => {
+      await page.evaluate(() => { const el = document.getElementById('dir'); el.value = ''; });
+      await page.setInputFiles('#dir', MRXS);
+      await page.waitForFunction((n) => document.getElementById('dir').files.length === n,
+        members.length, { timeout: 120000 });
+    };
+    await pickFolder();
 
     for (const profile of ['bf-ome', 'bf-classic']) {
       const tag = profile === 'bf-ome' ? 'ome' : 'classic';
       const nativeOut = path.join(outDir, `mrxs-native-${tag}.tif`);
-      execFileSync(L.CLI, ['convert', path.join(MRXS, entryFile), nativeOut,
-        '--overwrite', '--profile', profile,
-        ...(COMPACT ? ['--encoding', 'compact'] : [])]);
-      const nativeSha = await L.sha256File(nativeOut);
+      const nativeSha = nativeRef(path.join(MRXS, entryFile), nativeOut,
+        ['--profile', profile, ...(COMPACT ? ['--encoding', 'compact'] : [])]);
+      // F3 适配器 v2 锚点（自 C3 run_e2e 场景 mx 移入——真实 MRXS 的
+      // 浏览器转换已去重到本 parity，锚点跟着原生参考走，零额外成本）：
+      // preserve/bf-ome 的原生输出必须仍是 review §4 l0-box2 金字塔的
+      // 62da50da…（缩减层像素全部改变；v1 的 42f3c650… 已作废）。
+      if (!COMPACT && profile === 'bf-ome' && !nativeSha.startsWith('62da50da')) {
+        throw new Error(`native preserve sha ${nativeSha} != expected 62da50da…`);
+      }
       const t0 = Date.now();
       await L.clearJobs(page);
-      await page.evaluate(() => window.__c2.pickBundle(window.__bundleRows));
+      await pickFolder();
       await page.evaluate(async ({ p, e }) => {
         const prep = await window.__c2.probeBundle({ encoding: e, outputProfile: p });
         await window.__c2.start({ outputProfile: p, encoding: e, preparedJobId: prep.jobId });
@@ -211,9 +195,8 @@ async function mainInput() {
     for (const profile of ['bf-ome', 'bf-classic']) {
     const tag = `${profile === 'bf-ome' ? 'ome' : 'classic'}${COMPACT ? '-compact' : ''}`;
     const nativeOut = path.join(outDir, `${ext}-native-${tag}.tif`);
-    execFileSync(L.CLI, ['convert', input, nativeOut, '--overwrite', '--profile', profile,
-      ...(COMPACT ? ['--encoding', 'compact'] : [])]);
-    const nativeSha = await L.sha256File(nativeOut);
+    const nativeSha = nativeRef(input, nativeOut,
+      ['--profile', profile, ...(COMPACT ? ['--encoding', 'compact'] : [])]);
     const t0 = Date.now();
     const r = await convertInBrowser(page, input, 'saver', profile,
       COMPACT ? 'compact-jpeg-v1' : undefined);
@@ -262,18 +245,16 @@ async function main() {
   const results = { alias: {}, runs: [], startedAt: new Date().toISOString() };
   const nativeOf = {};
 
-  // native references (cli), aliased
+  // native references (cli, aliased; 走共享原生参考缓存)
   {
     const n1 = path.join(outDir, COMPACT ? 'kfb1-native-compact.tif' : 'kfb1-native.tif');
-    execFileSync(L.CLI, ['convert', kfb, n1, '--overwrite', '--profile', 'bf-ome',
-      ...(COMPACT ? ['--encoding', 'compact'] : [])]);
-    nativeOf['KFB-1'] = await L.sha256File(n1);
+    nativeOf['KFB-1'] = nativeRef(kfb, n1,
+      ['--profile', 'bf-ome', ...(COMPACT ? ['--encoding', 'compact'] : [])]);
     results.alias['KFB-1'] = { bytes: fs.statSync(kfb).size, sha256: await L.sha256File(kfb) };
     for (const [i, f] of (WITH_FL || FL_ALL ? kfbfs : []).entries()) {
       const a = `KFBF-${'ABCD'[i]}`;
       const n2 = path.join(outDir, `kfbf-${'abcd'[i]}-native.tif`);
-      execFileSync(L.CLI, ['convert', f, n2, '--overwrite']);
-      nativeOf[a] = await L.sha256File(n2);
+      nativeOf[a] = nativeRef(f, n2, []);
       results.alias[a] = { bytes: fs.statSync(f).size, sha256: await L.sha256File(f) };
       fs.rmSync(n2, { force: true });
     }

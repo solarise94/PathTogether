@@ -35,7 +35,8 @@ import pytest  # noqa: E402
 import app as app_mod  # noqa: E402
 import share_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import csrf_client, install_json_login_limits, isolate_app, FakeRequests # noqa: E402
+from _pt_helpers import (csrf_client, install_json_login_limits, isolate_app,  # noqa: E402
+                         FakeRequests, register_slide_row)
 from pg_compat import BACKEND  # noqa: E402
 
 
@@ -93,8 +94,16 @@ def _setup_users():
 
 
 def _touch(name):
+    """放一个 stub 切片并建**可读**资产行。
+
+    P6 运行时退役后 /api/slides 只列 id_bundle ready 行：仅落文件 +
+    set_slide_meta（legacy 懒建行）不再可见——先经 register_slide_row
+    发布为 objects/<slide_id>/ 包（与 test_admin_slide_visibility_by_id
+    同一夹具口径），set_slide_meta 随后回填归属仍兼容。
+    """
     p = Path(UPLOAD_DIR) / name
     p.write_bytes(b"svs-stub")
+    register_slide_row(name)
     return name
 
 
@@ -182,7 +191,10 @@ def test_write_guard_blocks_all_unsafe_methods():
     assert oc.post("/api/admin/preview/start",
                    json={"user_id": userb["user_id"]}).status_code == 200
     probes = [
-        ("POST", "/api/upload", None),
+        # /api/upload（V1 单请求上传）已随 R1 COS 直传迁移删除；写探针换
+        # 当前真实存在的写端点 POST /api/ingestions（创建直传任务）
+        ("POST", "/api/ingestions",
+         {"filename": "coop.svs", "declared_size": 8}),
         ("POST", "/api/annotation", {"slide": sa, "items": []}),
         ("POST", "/api/share/create", {"slides": [sa], "expires_hours": 1}),
         ("DELETE", "/api/slide/%s" % sa, None),

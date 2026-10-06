@@ -134,7 +134,10 @@ async function mainMrsx() {
       // 浏览器转换已去重到本 parity，锚点跟着原生参考走，零额外成本）：
       // preserve/bf-ome 的原生输出必须仍是 review §4 l0-box2 金字塔的
       // 62da50da…（缩减层像素全部改变；v1 的 42f3c650… 已作废）。
-      if (!COMPACT && profile === 'bf-ome' && !nativeSha.startsWith('62da50da')) {
+      // The anchor belongs to the CMU-1-Saved-1_16 MRXS sample only; --bundle
+      // also carries VMS and other bundles through this function.
+      if (!COMPACT && profile === 'bf-ome' && entryFile === 'CMU-1-Saved-1_16.mrxs'
+          && !nativeSha.startsWith('62da50da')) {
         throw new Error(`native preserve sha ${nativeSha} != expected 62da50da…`);
       }
       const t0 = Date.now();

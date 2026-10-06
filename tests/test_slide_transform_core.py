@@ -368,7 +368,10 @@ def _bioformats_open_check(path):
         env["JAVA_HOME"] = str(jdk)
         env["PATH"] = f"{jdk / 'bin'}:{env['PATH']}"
     r = subprocess.run(
-        [str(showinf), "-nopix", str(path)],
+        # -no-upgrade：关闭 Bio-Formats 启动时对 qa.openmicroscopy.org 的
+        # 升级/使用上报——远端 503 时 java.io.IOException 栈会打进输出，
+        # 被下方 "Exception" 断言误伤（与被测的打开行为无关）。
+        [str(showinf), "-nopix", "-no-upgrade", str(path)],
         capture_output=True,
         text=True,
         env=env,

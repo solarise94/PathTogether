@@ -143,7 +143,11 @@ def test_raster_image_whitelist_synced():
 
 
 def test_public_catalog_raster_image_row():
-    """目录单列一条 raster-image：暂时直传、可选上传、用户向短句。"""
+    """目录单列一条 raster-image：转换可用、可选上传、用户向短句（F8）。
+
+    直传仍开放（direct_import 行级字段），import_mode=convert 与
+    ndpi/vms/scn 的处理一致：转换器落地与直传关闭是两个独立决定。
+    """
     rows = {item["id"]: item for item in reg.public_catalog()}
     item = rows["raster-image"]
     assert item["display_name"] == "普通图片（BMP / JPEG）"
@@ -151,9 +155,11 @@ def test_public_catalog_raster_image_row():
     assert item["capability"] == reg.CAP_NATIVE_SINGLE_FILE
     assert item["canonical_format"] is None
     assert item["bundle_required"] is False
-    assert item["import_mode"] == "direct-temporary"
+    assert item["import_mode"] == "convert"
+    assert item["browser_convert"] == "available"
+    assert item["direct_import"] == "open"
     assert item["selectable_for_upload"] is True
-    assert item["limits"] == ["普通图片、支持像素坐标、无物理标尺；暂时直接导入"]
+    assert item["limits"], "用户向短句必须非空"
 
 
 def test_public_catalog_user_wording_no_internal_terms():
@@ -221,9 +227,15 @@ def test_public_catalog_direct_class_flags():
     assert rows["vms"]["import_mode"] == "convert"
     assert rows["vms"]["browser_convert"] == "available"
     assert rows["vms"]["direct_import"] == "open"
+    # F8：普通图片（BMP/JPEG）转换可用（未压缩 24/32 位 BMP、三分量基线
+    # JPEG），直传同样保持开放——RLE/位域/调色板位深 BMP 与渐进/灰度
+    # JPEG 在头级嗅探按 temporary 分流（同 ndpi/scn 的处理：转换器落地
+    # 与直传关闭是两个独立决定）
+    assert rows["raster-image"]["import_mode"] == "convert"
+    assert rows["raster-image"]["browser_convert"] == "available"
+    assert rows["raster-image"]["direct_import"] == "open"
     # 暂时直接导入：尚无浏览器转换器的格式
-    for rid in ("vmu", "bif", "svslide",
-                "raster-image"):
+    for rid in ("vmu", "bif", "svslide"):
         assert rows[rid]["import_mode"] == "direct-temporary", rid
         assert rows[rid]["direct_import"] == "open", rid
         assert rows[rid]["browser_convert"] == "unavailable", rid
@@ -233,10 +245,11 @@ def test_catalog_flag_derived_vocabularies():
     """catalog_rows_by_flag 派生两张词表（app 能力下发/关闭闸共用）。"""
     closed = reg.catalog_rows_by_flag("direct_import", "closed")
     assert closed == {"svs", "mrxs", "kfb", "kfbf"}
-    # F5/F6：tif/tiff、ndpi 与 vms 加入 browser_convert 集合
-    #（direct_import 仍 open）
+    # F5/F6/F8：tif/tiff、ndpi、vms 与 raster-image（bmp/jpg/jpeg）加入
+    # browser_convert 集合（direct_import 仍 open）
     bc = reg.catalog_rows_by_flag("browser_convert", "available")
-    assert bc == {"svs", "mrxs", "kfb", "kfbf", "scn", "tif", "tiff", "ndpi", "vms"}
+    assert bc == {"svs", "mrxs", "kfb", "kfbf", "scn", "tif", "tiff", "ndpi",
+                  "vms", "bmp", "jpg", "jpeg"}
 
 
 def test_vendor_names_corrected():

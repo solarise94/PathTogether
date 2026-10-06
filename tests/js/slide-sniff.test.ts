@@ -4,8 +4,8 @@
  * 先转换后上传阶段 1：分类是**分流提示**（服务端创建闸 + worker 头级核验
  * 才是权威）。这里锁定：
  *   1. 扩展名快路径：KFB/KFBF/MRXS 成员 → convert；NDPI → tiff 路由
- *      （F6 头解析分派）；VMS/VMU/SCN/BIF/SVSlide/BMP/JPEG/zip →
- *      temporary；未登记 → unsupported；
+ *      （F6 头解析分派）；VMS/VMU/SCN/BIF/SVSlide/zip → temporary；
+ *      BMP/JPEG → raster 路由（F8 头解析分派）；未登记 → unsupported；
  *   2. TIFF 头解析（手工构造的最小 classic TIFF，≤128KB 头预算）：
  *      - ImageDescription 含 OME-XML → ome-tiff（direct_class=ome-tiff）；
  *      - 描述 JSON 带转换器来源标记（source_format ∈ 转换器词表）→
@@ -133,9 +133,62 @@ describe("slide-sniff：扩展名快路径（不读字节）", () => {
 		expect(S.classifyExt("scan.vms").bundle).toBe(true);
 	});
 
+	it("F8 普通图片：扩展名走 raster 头解析路由（convert/temporary 由头判定）", () => {
+		for (const n of ["a.bmp", "b.JPG", "c.jpeg"]) {
+			const r = S.classifyExt(n);
+			expect(r.cls, n).toBeUndefined();
+			expect(r.route, n).toBe("raster");
+		}
+	});
+
+	it("F8 classifyRasterHead：未压缩 24/32 位 BMP 与三分量基线 JPEG → convert", () => {
+		const u8 = (a: number[]) => new Uint8Array(a);
+		const bmp24 = (dib: number, bpp: number, compression = 0) => {
+			const head = new Uint8Array(54);
+			head[0] = 0x42; head[1] = 0x4d;
+			const dv = new DataView(head.buffer);
+			dv.setUint32(10, 14 + dib, true);   // data offset
+			dv.setUint32(14, dib, true);        // DIB size
+			if (dib === 12) {
+				dv.setUint16(18, 512, true); dv.setUint16(20, 320, true);
+				dv.setUint16(24, bpp, true);
+			} else {
+				dv.setInt32(18, 512, true); dv.setInt32(22, 320, true);
+				dv.setUint16(26, 1, true);
+				dv.setUint16(28, bpp, true);
+				dv.setUint32(30, compression, true);
+			}
+			return head;
+		};
+		expect(S.classifyRasterHead(bmp24(40, 24)).cls).toBe("convert");
+		expect(S.classifyRasterHead(bmp24(40, 32)).cls).toBe("convert");
+		expect(S.classifyRasterHead(bmp24(124, 32)).cls).toBe("convert");
+		expect(S.classifyRasterHead(bmp24(12, 24)).cls).toBe("convert");
+		// 变体：RLE / 位域 / 调色板位深 → temporary
+		expect(S.classifyRasterHead(bmp24(40, 8, 1)).cls).toBe("temporary");
+		expect(S.classifyRasterHead(bmp24(40, 8, 3)).cls).toBe("temporary");
+		expect(S.classifyRasterHead(bmp24(40, 4)).cls).toBe("temporary");
+		expect(S.classifyRasterHead(bmp24(999, 24)).cls).toBe("temporary");
+
+		// JPEG：三分量基线 → convert
+		// 完整的最小 JFIF APP0（FF E0 00 10 'JFIF\0' 01 01 00 00 01 00 01 00 00）
+		const jfif = u8([0xff, 0xd8, 0xff, 0xe0, 0, 16, 0x4a, 0x46, 0x49, 0x46, 0,
+			1, 1, 0, 0, 1, 0, 1, 0, 0]);
+		const sof = [0xff, 0xc0, 0, 17, 8, 0x40, 0x20, 0x02, 0x58, 3,
+			1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1, 0xff, 0xda, 0, 4, 1, 0];
+		expect(S.classifyRasterHead(u8([...jfif, ...sof])).cls).toBe("convert");
+		// 灰度（1 分量）/ 渐进（SOF2）→ temporary
+		const gray = [0xff, 0xc0, 0, 11, 8, 0x40, 0x20, 1, 1, 0x11, 0, 0xff, 0xda, 0, 4, 1, 0];
+		expect(S.classifyRasterHead(u8([...jfif, ...gray])).cls).toBe("temporary");
+		const prog = [0xff, 0xc2, 0, 17, 8, 0x40, 0x20, 0x02, 0x58, 3,
+			1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1, 0xff, 0xda, 0, 4, 1, 0];
+		expect(S.classifyRasterHead(u8([...jfif, ...prog])).cls).toBe("temporary");
+		// 魔数不符 → temporary
+		expect(S.classifyRasterHead(u8([0x49, 0x49, 42, 0])).cls).toBe("temporary");
+	});
+
 	it("暂无浏览器转换器的格式/变体 → temporary（直传声明 legacy-direct）", () => {
-		for (const n of ["a.vmu", "a.bif",
-			"a.svslide", "a.bmp", "a.jpg", "a.jpeg"]) {
+		for (const n of ["a.vmu", "a.bif", "a.svslide"]) {
 			const r = S.classifyExt(n);
 			expect(r.cls, n).toBe("temporary");
 			expect(r.directClass, n).toBe("legacy-direct");

@@ -375,6 +375,18 @@ export const SUPPORTED_MAGICS = [
   [0xF1, 0x01, 0xEE, 0xEE, 0x4B, 0x46, 0x42, 0x46], // KFBF
 ];
 
+/// F8: plain-image header prefixes (BMP 'BM'; baseline JPEG FF D8 FF — the
+/// third byte is always FF for every JPEG marker). The core decides the
+/// variant; a disguised extension is still probed.
+export const BMP_HEADER_PREFIX = [0x42, 0x4D];
+export const JPEG_HEADER_PREFIX = [0xFF, 0xD8, 0xFF];
+
+export function isRasterHeader(head) {
+  if (!head || head.length < 2) return false;
+  if (JPEG_HEADER_PREFIX.every((b, i) => head[i] === b)) return true;
+  return BMP_HEADER_PREFIX.every((b, i) => head[i] === b);
+}
+
 /// F1: TIFF/BigTIFF container headers (classic II*\0 / MM\0*, BigTIFF
 /// II+\0 / MM\0+). The first-IFD offset differs per file, so these are
 /// 4-byte prefixes, not full 8-byte magics.
@@ -392,19 +404,22 @@ export function isTiffHeader(head) {
 
 export function magicSupported(head) {
   if (isTiffHeader(head)) return true; // staged only after sniffTiffSlideCapability
+  if (isRasterHeader(head)) return true; // staged only after sniffRasterCapability
   return SUPPORTED_MAGICS.some((m) => m.every((b, i) => head[i] === b));
 }
 
 /// Container magic → modality ('brightfield' KFB | 'fluorescence' KFBF;
 /// null = not a supported container). TIFF containers convert through the
 /// brightfield SVS adapter (the bounded sniff rejects anything else before
-/// staging), so they map to 'brightfield'. The core decides the variant from
-/// the same magic, so the page can offer the brightfield output-format choice
-/// (or withhold it for fluorescence) before the copy+probe round-trip.
+/// staging), so they map to 'brightfield'. Plain images (F8 BMP/JPEG) are
+/// brightfield by definition. The core decides the variant from the same
+/// magic, so the page can offer the brightfield output-format choice (or
+/// withhold it for fluorescence) before the copy+probe round-trip.
 export function magicModality(head) {
   if (SUPPORTED_MAGICS[1].every((b, i) => head[i] === b)) return 'fluorescence';
   if (SUPPORTED_MAGICS[0].every((b, i) => head[i] === b)) return 'brightfield';
   if (isTiffHeader(head)) return 'brightfield';
+  if (isRasterHeader(head)) return 'brightfield';
   return null;
 }
 
@@ -474,6 +489,19 @@ export const VMS_PYRAMID_METHOD = 'l0-box2';
 export const VMS_PRESERVE_COMPOSE_FINGERPRINT = 'vms-mosaic-compose:q96:y422:hstd:v1';
 /// The .vms INI entry is a small text file (the core caps it at 1 MiB).
 export const VMS_ENTRY_MAX_BYTES = 1 << 20;
+/// F8: 普通图片（BMP / 基线 JPEG；单张大图，无瓦片无物理标尺）。BMP 逐行
+/// 有界读取，JPEG 带 restart 走分段、无 restart 走 MCU 行 band 解码；
+/// 全部 256px tile 重编码，降采样层 l0-box2 生成。Must equal the Rust
+/// `ADAPTER_VERSION` (resume refuses on mismatch).
+export const RASTER_SOURCE_ADAPTER = 'plain-image-bmp-jpeg';
+export const RASTER_ADAPTER_VERSION = '1';
+export const RASTER_PYRAMID_METHOD = 'l0-box2';
+/// Must equal the Rust `MAX_SIDE` / `MAX_PIXELS` (raster.rs) — the pre-copy
+/// sniff refuses over-cap inputs BEFORE any staging.
+export const RASTER_MAX_SIDE = 1000000;
+export const RASTER_MAX_PIXELS = 2 ** 32;
+/// Must equal the Rust `PRESERVE_COMPOSE_FINGERPRINT` (raster.rs).
+export const RASTER_PRESERVE_COMPOSE_FINGERPRINT = 'raster-compose:q96:y422:hstd:v1';
 /// Converter-output source_format ids (same vocabulary as the Rust core's
 /// `CONVERTER_SOURCE_FORMATS` and upload_direct_class.py): a TIFF whose
 /// IFD-0 description JSON carries one of these is THIS TOOL's own output —
@@ -487,6 +515,7 @@ export const CONVERTER_SOURCE_FORMATS = [
   SCN_SOURCE_ADAPTER,
   NDPI_SOURCE_ADAPTER,
   VMS_SOURCE_ADAPTER,
+  RASTER_SOURCE_ADAPTER,
 ];
 const LEICA_SCN_XML_NS = /leica-microsystems\.com\/scn/;
 /// Pure helpers (vitest-covered): OME-XML and converter-marked description
@@ -670,6 +699,144 @@ export async function sniffTiffSlideCapability(file) {
   } catch (e) {
     return bad(`结构探测失败：${errText(e)}`);
   }
+}
+
+// ------------------------------------------------- raster input (F8) --
+
+/// Bounded pre-copy capability probe of a plain image (BMP / baseline
+/// JPEG) BEFORE staging — same contract as sniffTiffSlideCapability: reads
+/// at most 64 KiB (BMP header ≤ 138 B; JPEG marker walk to the SOF/SOS),
+/// refuses the known-rejected variants with typed reasons, and applies the
+/// pixel caps (RASTER_MAX_SIDE / RASTER_MAX_PIXELS) so an over-cap input
+/// never gets copied into OPFS. The authoritative structural report still
+/// comes from the wasm core's probe on the staged copy.
+///
+///   await sniffRasterCapability(file)
+///     → { supported: true, modality: 'brightfield',
+///         format: RASTER_SOURCE_ADAPTER, adapter: RASTER_SOURCE_ADAPTER }
+///     | { supported: false, modality: null, reason: '<typed reason>' }
+export async function sniffRasterCapability(file) {
+  const bad = (reason) => ({ supported: false, modality: null, reason });
+  const readAt = async (off, len) =>
+    new Uint8Array(await file.slice(off, off + len).arrayBuffer());
+  const overCap = (w, h) =>
+    `图片尺寸 ${w}×${h} 超出普通图片支持上限（每边 ≤ ${RASTER_MAX_SIDE}，` +
+    `总数 ≤ ${RASTER_MAX_PIXELS} 像素）：复制前拒绝`;
+  let head;
+  try {
+    // 64 字节：BMP InfoHeader/V4/V5 判定域（≤ 138）+ JPEG 魔数；JPEG 的
+    // 标记走查在下面单独读 ≤ 64 KiB
+    head = await readAt(0, 64);
+  } catch (e) {
+    return bad(`无法读取文件头：${errText(e)}`);
+  }
+  if (head.length < 2) return bad('文件太小，不是 BMP/JPEG');
+
+  // ---- BMP ------------------------------------------------------------- //
+  if (head[0] === 0x42 && head[1] === 0x4D) {
+    if (head.length < 16) return bad('BMP 头不完整');
+    const u16 = (b, at) => b[at] | (b[at + 1] << 8);
+    const u32 = (b, at) =>
+      (b[at] | (b[at + 1] << 8) | (b[at + 2] << 16) | (b[at + 3] << 24)) >>> 0;
+    const dib = u32(head, 14);
+    if (![12, 40, 52, 56, 108, 124].includes(dib)) {
+      return bad(`未知 DIB 头尺寸 ${dib}：不是 BITMAPCOREHEADER/BITMAPINFOHEADER/V4/V5 BMP 变体`);
+    }
+    let w, hRaw, bpp, compression = 0;
+    if (dib === 12) {
+      if (head.length < 26) return bad('BITMAPCOREHEADER 不完整');
+      w = u16(head, 18);
+      hRaw = u16(head, 20);
+      bpp = u16(head, 24);
+    } else {
+      if (head.length < 34) return bad('BITMAPINFOHEADER 不完整');
+      w = u32(head, 18);
+      hRaw = u32(head, 22) | 0; // signed: negative = top-down rows
+      bpp = u16(head, 28);
+      compression = u32(head, 30);
+    }
+    const h = Math.abs(hRaw);
+    if (w === 0 || h === 0) return bad('BMP 宽/高为 0：不是合法图片');
+    if (dib !== 12 && compression !== 0) {
+      const why =
+        compression === 1 || compression === 2 ? 'RLE 行程编码'
+        : compression === 3 ? 'BITFIELDS 位域掩码'
+        : compression === 4 ? 'JPEG-in-BMP'
+        : compression === 5 ? 'PNG-in-BMP'
+        : '未登记的压缩编码';
+      return bad(`BMP 压缩编码 ${compression}（${why}）不在支持集：只支持未压缩 BI_RGB`);
+    }
+    if (bpp !== 24 && bpp !== 32) {
+      return bad(`BMP 位深 ${bpp} 不在支持集（只支持未压缩 24/32 位）`);
+    }
+    if (w > RASTER_MAX_SIDE || h > RASTER_MAX_SIDE || w * h > RASTER_MAX_PIXELS) {
+      return bad(overCap(w, h));
+    }
+    return {
+      supported: true,
+      modality: 'brightfield',
+      format: RASTER_SOURCE_ADAPTER,
+      adapter: RASTER_SOURCE_ADAPTER,
+    };
+  }
+
+  // ---- baseline JPEG ----------------------------------------------------- //
+  if (head[0] === 0xFF && head[1] === 0xD8 && head[2] === 0xFF) {
+    const SNIFF = 64 * 1024;
+    let buf;
+    try {
+      buf = await readAt(0, SNIFF);
+    } catch (e) {
+      return bad(`无法读取文件头：${errText(e)}`);
+    }
+    let i = 2;
+    let sof = null;
+    while (i + 4 <= buf.length) {
+      if (buf[i] !== 0xFF) return bad('JPEG 标记流错位');
+      while (i < buf.length && buf[i] === 0xFF) i += 1;
+      if (i >= buf.length) break;
+      const m = buf[i];
+      i += 1;
+      if (m === 0xD9) break;
+      if (m === 0x01 || (m >= 0xD0 && m <= 0xD7)) continue;
+      if (i + 2 > buf.length) return bad('JPEG 头在有界探测范围内截断');
+      const segLen = (buf[i] << 8) | buf[i + 1];
+      if (segLen < 2 || i + segLen > buf.length) return bad('JPEG 头在有界探测范围内截断');
+      if (
+        m === 0xC2 || m === 0xC3 ||
+        (m >= 0xC5 && m <= 0xC7) ||
+        (m >= 0xC9 && m <= 0xCB) ||
+        (m >= 0xCD && m <= 0xCF)
+      ) {
+        // 与核心同一 SOF 集合（0xC4 = DHT、0xC8 = JPG 不在内）
+        return bad(`渐进/分层/无损 JPEG 不受支持（SOF FF${m.toString(16).padStart(2, '0')}）`);
+      }
+      if (m === 0xC8) return bad('JPG 扩展不受支持');
+      if (m === 0xCC) return bad('算术编码不受支持');
+      if (m === 0xC0 || m === 0xC1) sof = buf.subarray(i + 2, i + segLen);
+      if (m === 0xDA) break;
+      i += segLen;
+    }
+    if (!sof) {
+      return bad('JPEG 头范围内没有基线 SOF（不是基线 JPEG 或头超出有界探测范围）');
+    }
+    const h = (sof[1] << 8) | sof[2];
+    const w = (sof[3] << 8) | sof[4];
+    const ncomp = sof[5];
+    if (ncomp === 1) return bad('JPEG 是单分量（灰度）：普通图片转换输出 RGB 明场，灰度流不在支持集');
+    if (ncomp !== 3) return bad(`JPEG 分量数 ${ncomp} 不在支持集（需要 3 分量 RGB/YCbCr）`);
+    if (w === 0 || h === 0) return bad('JPEG SOF 尺寸为 0');
+    if (w > RASTER_MAX_SIDE || h > RASTER_MAX_SIDE || w * h > RASTER_MAX_PIXELS) {
+      return bad(overCap(w, h));
+    }
+    return {
+      supported: true,
+      modality: 'brightfield',
+      format: RASTER_SOURCE_ADAPTER,
+      adapter: RASTER_SOURCE_ADAPTER,
+    };
+  }
+  return bad('不是 BMP/JPEG（魔数不符）');
 }
 
 // ------------------------------------------------- MRXS bundle input (F3) --
@@ -1309,7 +1476,7 @@ export function isOmeProfile(profile) {
 /// after the entry stem.
 export function outputFileName(sourceName, job) {
   const base = String(sourceName || 'slide')
-    .replace(/\.(kfb|kfbf|svs|scn|ndpi|tif|tiff|mrxs|vms)$/i, '') || 'slide';
+    .replace(/\.(kfb|kfbf|svs|scn|ndpi|tif|tiff|mrxs|vms|bmp|jpg|jpeg)$/i, '') || 'slide';
   return isOmeProfile(jobOutputProfile(job)) ? `${base}.ome.tif` : `${base}.tif`;
 }
 

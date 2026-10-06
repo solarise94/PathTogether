@@ -7579,8 +7579,12 @@
       extensions: [".svs", ".tif", ".tiff", ".ome.tif", ".ome.tiff", ".ndpi", ".vms", ".vmu", ".scn", ".bif", ".svslide"],
       import_mode: "direct-temporary", limits: [] },
     { id: "raster-image", display_name: "普通图片（BMP / JPEG）",
-      extensions: [".bmp", ".jpg", ".jpeg"], import_mode: "direct-temporary",
-      limits: ["普通图片、支持像素坐标、无物理标尺；暂时直接导入"] },
+      extensions: [".bmp", ".jpg", ".jpeg"], import_mode: "convert",
+      limits: ["可在本机浏览器转换为 OME-TIFF 后上传（识别未压缩 "
+             + "24/32 位 BMP 与三分量基线 JPEG；整图按瓦片重编码，"
+             + "无物理标尺）；RLE / 位域 / 调色板位深 BMP 与渐进 / "
+             + "灰度 JPEG 走暂时直传；平台当前仍受理 .bmp / .jpg / "
+             + ".jpeg 直接导入"] },
     { id: "kfb-kfbf", display_name: "KFB / KFBF", extensions: [".kfb", ".kfbf"],
       import_mode: "convert",
       limits: ["在本机浏览器中转换后上传：KFB 转为 BigTIFF（明场），KFBF 转为多通道 OME-TIFF（荧光）"] },

@@ -18,14 +18,18 @@
                         3 采样、photo 2/6）、通用瓦片 JPEG
                         TIFF/BigTIFF（无厂商描述、tiled、压缩 = 7、
                         3 采样、photo 2/6）、MRXS（.mrxs/.dat 成员）、
-                        VMS（.vms 入口，完整包经文件夹选择交接）
+                        VMS（.vms 入口，完整包经文件夹选择交接）、
+                        普通图片（未压缩 24/32 位 BMP——头解析判定位深
+                        与压缩；基线 JPEG——FF D8 FF 魔数 + 头内 SOF0/1
+                        三分量；渐进/灰度 JPEG 与 RLE/位域/调色板 BMP
+                        不满足判定 → temporary）
                         → 本机转换后上传（工作台交接）
      temporary          暂时直传：尚无浏览器转换器的格式/变体（JPEG2000
                         编码 SVS（压缩 33003/33005）、JPEG2000/条带/
                         多通道变体的 NDPI、荧光/非 JPEG 编码
                         SCN、条带/LZW/deflate/非 8 位/多通道的通用
                         TIFF 变体、VMU、BIF、SVSlide、
-                        BMP/JPEG、zip）
+                        不满足可转换判定的 BMP/JPEG 变体、zip）
      unsupported        未登记扩展名
 
    形态约束：classic script（window.HP_SLIDE_SNIFF；与 cos-uploader.js
@@ -47,6 +51,7 @@
     "generic-tiled-jpeg-tiff": 1,
     "hamamatsu-ndpi-jpeg": 1,
     "hamamatsu-vms-bundle": 1,
+    "plain-image-bmp-jpeg": 1,
   };
 
   // 结果类别
@@ -361,6 +366,58 @@
     return out;
   }
 
+  // F8：普通图片的可转换头判定（与 Rust raster.rs / engine.js 嗅探同一
+  // 契约的头快判，只做分流提示——变体终审在工具页有界探测与核心）。
+  // BMP：DIB 头 12/40/52/56/108/124、未压缩、位深 24/32；JPEG：基线
+  // SOF0/1 三分量（渐进/灰度/算术不满足 → temporary）。
+  function classifyRasterHead(headBytes) {
+    var bad = { cls: CLS.TEMPORARY, directClass: DIRECT_CLASS.LEGACY,
+                compression: 0 };
+    if (!headBytes || headBytes.length < 3) return bad;
+    if (headBytes[0] === 0xFF && headBytes[1] === 0xD8 && headBytes[2] === 0xFF) {
+      var i = 2, sof = null;
+      while (i + 4 <= headBytes.length) {
+        if (headBytes[i] !== 0xFF) return bad;
+        while (i < headBytes.length && headBytes[i] === 0xFF) i++;
+        if (i >= headBytes.length) break;
+        var m = headBytes[i]; i++;
+        if (m === 0xD9) break;
+        if (m === 0x01 || (m >= 0xD0 && m <= 0xD7)) continue;
+        if (i + 2 > headBytes.length) return bad;
+        var ln = (headBytes[i] << 8) | headBytes[i + 1];
+        if (ln < 2 || i + ln > headBytes.length) return bad;
+        if (m === 0xC0 || m === 0xC1) sof = headBytes.subarray(i + 2, i + ln);
+        if (m === 0xDA) break;
+        i += ln;
+      }
+      if (sof && sof.length >= 6 && sof[5] === 3) {
+        return { cls: CLS.CONVERT, directClass: null, compression: 0 };
+      }
+      return bad;
+    }
+    if (headBytes[0] === 0x42 && headBytes[1] === 0x4D && headBytes.length >= 26) {
+      try {
+        var dv = new DataView(headBytes.buffer, headBytes.byteOffset,
+                              headBytes.byteLength);
+        var dib = dv.getUint32(14, true);
+        if ([12, 40, 52, 56, 108, 124].indexOf(dib) === -1) return bad;
+        var bpp, compression = 0;
+        if (dib === 12) {
+          // OS/2 BITMAPCOREHEADER 只有 26 字节头
+          bpp = dv.getUint16(24, true);
+        } else {
+          if (headBytes.length < 34) return bad;
+          bpp = dv.getUint16(28, true);
+          compression = dv.getUint32(30, true);
+        }
+        if (compression !== 0) return bad;
+        if (bpp !== 24 && bpp !== 32) return bad;
+        return { cls: CLS.CONVERT, directClass: null, compression: 0 };
+      } catch (e) { return bad; }
+    }
+    return bad;
+  }
+
   /**
    * classifyExt(name) — 纯扩展名快路径（不读字节）。
    * 返回 { route: 'tiff' | cls, ... }：tiff → 需要头解析；否则直接给类别。
@@ -384,6 +441,13 @@
         // 文件夹选择/整目录交接本机转换后上传（散入口在工具页得到列出
         // 缺成员的类型化信息；单文件直传不再声明）
         return { cls: CLS.CONVERT, ext: ext, bundle: true };
+      case ".bmp":
+      case ".jpg":
+      case ".jpeg":
+        // F8：普通图片浏览器转换器已覆盖（未压缩 24/32 位 BMP / 三分量
+        // 基线 JPEG）——头解析分派；RLE/位域/调色板位深 BMP 与渐进/
+        // 灰度 JPEG 不满足判定 → temporary（暂时直传，服务端终审）
+        return { route: "raster", ext: ext };
       case ".svs":
         return { route: "tiff", ext: ext, svs: true };
       case ".scn":
@@ -400,9 +464,6 @@
       case ".vmu":
       case ".bif":
       case ".svslide":
-      case ".bmp":
-      case ".jpg":
-      case ".jpeg":
         return { cls: CLS.TEMPORARY, directClass: DIRECT_CLASS.LEGACY,
                  ext: ext };
       default:
@@ -430,11 +491,29 @@
                  ext: routed.ext, bundle: !!routed.bundle, svsJp2k: false,
                  compression: 0 };
       }
-      // TIFF 类：读头（8 字节魔数定位 IFD；合计 ≤ HEAD_BYTES）
       var read = function (start, end) {
         return Promise.resolve(
           file.slice(start, end).arrayBuffer());
       };
+      // 普通图片类：读头（BMP ≤ 138 字节 / JPEG 标记走到 SOF；合计
+      // ≤ HEAD_BYTES），按头判定 convert / temporary
+      if (routed.route === "raster") {
+        return read(0, Math.min(HEAD_BYTES, file.size || HEAD_BYTES))
+          .then(function (headBuf) {
+            var r = classifyRasterHead(new Uint8Array(headBuf));
+            r.ext = routed.ext;
+            r.bundle = false;
+            r.svsJp2k = false;
+            r.directClass = r.directClass || null;
+            return r;
+          }, function () {
+            // 嗅探读失败：按暂时直传降级（服务端终审）
+            return { cls: CLS.TEMPORARY, directClass: DIRECT_CLASS.LEGACY,
+                     ext: routed.ext, bundle: false, svsJp2k: false,
+                     compression: 0 };
+          });
+      }
+      // TIFF 类：读头（8 字节魔数定位 IFD；合计 ≤ HEAD_BYTES）
       return read(0, Math.min(HEAD_BYTES, file.size || HEAD_BYTES))
         .then(function (headBuf) {
           var head = new Uint8Array(headBuf);
@@ -479,6 +558,7 @@
     CONVERTER_SOURCE_FORMATS: CONVERTER_SOURCE_FORMATS,
     classifyExt: classifyExt,
     classifyTiffHead: classifyTiffHead,
+    classifyRasterHead: classifyRasterHead,
     classifyFile: classifyFile,
     extOf: extOf,
   };

@@ -712,6 +712,15 @@ export class SlideToolsRunner {
           `不支持该 TIFF 文件：${cap.reason}`, { kind: 'tiff-sniff' });
       }
       sourceAdapter = cap.adapter;
+    } else if (E.isRasterHeader(head)) {
+      // F8: 普通图片（BMP/JPEG）——复制前的同一批类型化拒绝（变体/像素
+      // 上限），多 GiB 的超限输入不会进 OPFS
+      const cap = await E.sniffRasterCapability(file);
+      if (!cap.supported) {
+        throw E.stError(E.ERROR_CODES.UNSUPPORTED_INPUT,
+          `不支持该图片文件：${cap.reason}`, { kind: 'raster-sniff' });
+      }
+      sourceAdapter = cap.adapter;
     } else if (!E.magicSupported(head)) {
       throw E.stError(E.ERROR_CODES.UNSUPPORTED_INPUT, '不是本工具支持的 KFB/KFBF 文件（文件头不符）');
     }

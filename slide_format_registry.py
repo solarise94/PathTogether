@@ -343,10 +343,14 @@ _CATALOG_DISPLAY = (
         "capability": CAP_NATIVE_SINGLE_FILE,
         "canonical_format": None,
         "bundle_required": False,
-        "browser_convert": "unavailable",
+        "browser_convert": "available",
         "direct_import": "open",
-        "import_mode": "direct-temporary",
-        "limits": ["普通图片、支持像素坐标、无物理标尺；暂时直接导入"],
+        "import_mode": "convert",
+        "limits": ["可在本机浏览器转换为 OME-TIFF 后上传（识别未压缩 "
+                   "24/32 位 BMP 与三分量基线 JPEG；整图按瓦片重编码，"
+                   "无物理标尺）；RLE / 位域 / 调色板位深 BMP 与渐进 / "
+                   "灰度 JPEG 走暂时直传；平台当前仍受理 .bmp / .jpg / "
+                   ".jpeg 直接导入"],
         "selectable_for_upload": True,
     },
     {

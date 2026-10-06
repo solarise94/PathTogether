@@ -242,7 +242,13 @@ def test_slides_list_includes_raster_metadata():
 # 2. /api/slide-formats：注册表驱动的 raster-image 目录行
 # =========================================================================== #
 def test_slide_formats_endpoint_raster_image_row():
-    """/api/slide-formats 含 raster-image 行：direct、单文件、可选上传。"""
+    """/api/slide-formats 含 raster-image 行：单文件、可选上传。
+
+    F8 起 browser_convert=available、import_mode=convert（未压缩 24/32 位
+    BMP 与三分量基线 JPEG 可本机转换）；direct_import 保持 open（直传
+    是否关闭由用户看报告后决定，与 ndpi/vms/scn 的处理一致），目录行级
+    无法区分编码变体（RLE/位域 BMP、渐进/灰度 JPEG 走暂时直传）。
+    """
     c = _client()
     r = c.get("/api/slide-formats")
     assert r.status_code == 200, r.get_data(as_text=True)
@@ -253,7 +259,9 @@ def test_slide_formats_endpoint_raster_image_row():
     assert it["capability"] == "native-single-file"
     assert it["canonical_format"] is None
     assert it["bundle_required"] is False
-    assert it["import_mode"] == "direct-temporary"
+    assert it["import_mode"] == "convert"
+    assert it["browser_convert"] == "available"
+    assert it["direct_import"] == "open"
     assert it["selectable_for_upload"] is True
     assert any("无物理标尺" in lim for lim in it["limits"])  # 用户向短句
 

@@ -86,9 +86,12 @@ def test_capability_routes_convert_required_to_browser(monkeypatch):
     # F6：ndpi 转换可用（带 restart marker 的整层 JPEG 明场；direct_import
     # 仍 open——JPEG2000 等变体在头级嗅探按 temporary 分流）；
     # VMS：转换可用（.vms 入口 + 同目录 tile JPEG 完整包；direct_import 仍
-    # open——VMU 等在入口级嗅探按 temporary 分流）
+    # open——VMU 等在入口级嗅探按 temporary 分流）；
+    # F8：普通图片转换可用（未压缩 24/32 位 BMP 与三分量基线 JPEG；
+    # direct_import 仍 open——RLE/位域/调色板位深 BMP 与渐进/灰度 JPEG 在
+    # 头级嗅探按 temporary 分流）
     assert {"kfb", "kfbf", "svs", "mrxs", "scn", "tif", "tiff",
-            "ndpi", "vms"} == set(p["browser_convert"]["formats"])
+            "ndpi", "vms", "bmp", "jpg", "jpeg"} == set(p["browser_convert"]["formats"])
     assert p["browser_convert"]["url"] == "/tools/slides"
     # direct_upload 清单：直传开放格式（不含 svs/kfb/kfbf/mrxs/zip）
     du = set(p["direct_upload"]["formats"])

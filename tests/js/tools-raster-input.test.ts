@@ -89,6 +89,40 @@ function jpegBytes({ progressive = false, ncomp = 3, width = 64, height = 48 } =
 	return new Uint8Array(out);
 }
 
+/** 在 SOF 前插入共 `padKiB` KiB 的 APP2 段（ICC_PROFILE 形状，每段载荷
+ * ≤ 60000 字节）——审查回归夹具：真实相机/设计输出的 JPEG 带 >64 KiB
+ * EXIF 缩略图或 ICC 头并不罕见。 */
+function bigHeadJpeg({ base = jpegBytes(), padKiB = 120 } = {}): Uint8Array {
+	const i = 2;
+	let at = i;
+	for (;;) {
+		if (base[at] !== 0xff) throw new Error("marker desync");
+		while (base[at] === 0xff) at += 1;
+		const m = base[at];
+		if (m === 0xda) break;
+		if (m === 0x01 || (m >= 0xd0 && m <= 0xd7)) {
+			at += 1;
+			continue;
+		}
+		at += 1 + ((base[at + 1] << 8) | base[at + 2]);
+	}
+	const segs: number[][] = [];
+	let left = padKiB * 1024;
+	for (let n = 1; left > 0; n += 1) {
+		const payload = new Uint8Array(Math.min(60000, left)).fill(n & 0xff);
+		left -= payload.length;
+		const body = [0x49, 0x43, 0x43, 0x5f, 0x50, 0x52, 0x4f, 0x46, 0x49,
+			0x4c, 0x45, 0, 1, 1, ...payload];
+		const ln = body.length + 2;
+		segs.push([0xff, 0xe2, (ln >> 8) & 0xff, ln & 0xff, ...body]);
+	}
+	const out = [
+		...base.subarray(0, 2), ...segs.flat(),
+		...base.subarray(2, at), ...base.subarray(at),
+	];
+	return new Uint8Array(out);
+}
+
 // ---- engine sniff（有界 staging 前探测） -------------------------------- //
 
 describe("raster sniff（有界 staging 前探测）", () => {
@@ -162,6 +196,29 @@ describe("raster sniff（有界 staging 前探测）", () => {
 		expect(E.magicSupported(new Uint8Array([0xff, 0xd8, 0xff, 0, 0, 0, 0, 0]))).toBe(true);
 	});
 });
+
+	it("审查回归（medium）：>64 KiB 但 ≤256 KiB 的 JPEG 头不因嗅探窗口被拒", async () => {
+		// 核心探测窗口是 256 KiB（raster.rs PROBE_LIMIT）：CLI 能转的文件，
+		// 工具页复制前嗅探必须同样放行——否则工作台判 convert 交接过来，
+		// 工具页却拒绝（用户死路）。120 KiB 双段 APP2 头 = 审查实测夹具。
+		const bytes = bigHeadJpeg();
+		const cap = await E.sniffRasterCapability(fileOf(bytes));
+		expect(cap.supported).toBe(true);
+		expect(cap.adapter).toBe("plain-image-bmp-jpeg");
+		// 头真超出核心窗口（>256 KiB）：两个入口给同一类型化拒绝
+		const over = await E.sniffRasterCapability(fileOf(bigHeadJpeg({ padKiB: 300 })));
+		expect(over.supported).toBe(false);
+	});
+
+	it("审查回归（medium）：工具页嗅探窗口 ≥ 工作台头窗口（convert ⟹ 可决定）", () => {
+		// 不变量：工作台（slide-sniff，128 KiB）判 convert 的文件，工具页
+		// 嗅探（engine，必须 = 核心 256 KiB）必然能做出决定——窗口一旦
+		// 反向漂移，交接即死路。两处常量在此互锁。
+		expect(E.RASTER_SNIFF_WINDOW_BYTES).toBe(256 * 1024);
+		const m = sniffSrc.match(/HEAD_BYTES\s*=\s*(\d+)/);
+		expect(m).toBeTruthy();
+		expect(Number(m![1])).toBeLessThanOrEqual(E.RASTER_SNIFF_WINDOW_BYTES);
+	});
 
 // ---- 命名与常量 ---------------------------------------------------------- //
 

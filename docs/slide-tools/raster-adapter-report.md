@@ -46,7 +46,11 @@ Code:
 - `slide-transform-core/crates/wasm/src/lib.rs` — wasm probe/convert/resume
   路由；`InputKind::Raster` 携带 adapter id/版本进 journal 与 checkpoint
 - `static/tools/slide-transform/engine.js` — 魔数表 + `sniffRasterCapability`
-  （staging 前有界嗅探：变体/像素上限类型化拒绝）；`RASTER_SOURCE_ADAPTER`
+  （staging 前有界嗅探：变体/像素上限类型化拒绝；JPEG 标记走查窗口
+  `RASTER_SNIFF_WINDOW_BYTES = 256 KiB` == 核心 `PROBE_LIMIT`——独立审查
+  修正：曾为 64 KiB，一条核心支持、CLI 能转的 >64 KiB 头 JPEG 会被工具页
+  复制前拒绝而工作台判 convert，跨入口死路；vitest 回归钉住「工具页窗口
+  ≥ 工作台 128 KiB 头窗口」不变量）；`RASTER_SOURCE_ADAPTER`
   等常量；转换器产物词表
 - `static/tools/slide-transform/runner.js` — `_prepare` raster 分支（嗅探
   失败不进 OPFS）

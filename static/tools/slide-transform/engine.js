@@ -500,6 +500,12 @@ export const RASTER_PYRAMID_METHOD = 'l0-box2';
 /// sniff refuses over-cap inputs BEFORE any staging.
 export const RASTER_MAX_SIDE = 1000000;
 export const RASTER_MAX_PIXELS = 2 ** 32;
+/// Must equal the Rust `PROBE_LIMIT` (raster.rs): the tools-page pre-copy
+/// sniff may never be STRICTER than the core, or the workbench (128 KiB
+/// head window) hands off a convertible JPEG that the page then refuses —
+/// a dead end (independent review 2026-10-06, medium; regression-pinned in
+/// tests/js/tools-raster-input.test.ts together with slide-sniff.js).
+export const RASTER_SNIFF_WINDOW_BYTES = 256 * 1024;
 /// Must equal the Rust `PRESERVE_COMPOSE_FINGERPRINT` (raster.rs).
 export const RASTER_PRESERVE_COMPOSE_FINGERPRINT = 'raster-compose:q96:y422:hstd:v1';
 /// Converter-output source_format ids (same vocabulary as the Rust core's
@@ -705,7 +711,8 @@ export async function sniffTiffSlideCapability(file) {
 
 /// Bounded pre-copy capability probe of a plain image (BMP / baseline
 /// JPEG) BEFORE staging — same contract as sniffTiffSlideCapability: reads
-/// at most 64 KiB (BMP header ≤ 138 B; JPEG marker walk to the SOF/SOS),
+/// at most RASTER_SNIFF_WINDOW_BYTES = 256 KiB (BMP header ≤ 138 B; JPEG
+/// marker walk to the SOF/SOS — the same window the wasm core probes),
 /// refuses the known-rejected variants with typed reasons, and applies the
 /// pixel caps (RASTER_MAX_SIDE / RASTER_MAX_PIXELS) so an over-cap input
 /// never gets copied into OPFS. The authoritative structural report still
@@ -725,7 +732,8 @@ export async function sniffRasterCapability(file) {
   let head;
   try {
     // 64 字节：BMP InfoHeader/V4/V5 判定域（≤ 138）+ JPEG 魔数；JPEG 的
-    // 标记走查在下面单独读 ≤ 64 KiB
+    // 标记走查在下面单独读 ≤ RASTER_SNIFF_WINDOW_BYTES（256 KiB，与核心
+    // PROBE_LIMIT 同窗）
     head = await readAt(0, 64);
   } catch (e) {
     return bad(`无法读取文件头：${errText(e)}`);
@@ -782,7 +790,7 @@ export async function sniffRasterCapability(file) {
 
   // ---- baseline JPEG ----------------------------------------------------- //
   if (head[0] === 0xFF && head[1] === 0xD8 && head[2] === 0xFF) {
-    const SNIFF = 64 * 1024;
+    const SNIFF = RASTER_SNIFF_WINDOW_BYTES;
     let buf;
     try {
       buf = await readAt(0, SNIFF);

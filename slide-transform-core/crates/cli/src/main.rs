@@ -66,6 +66,8 @@ fn main() -> ExitCode {
         "gen-mrxs" => cmd_gen_mrxs(&args[1..]),
         #[cfg(feature = "synth-gen")]
         "gen-vms" => cmd_gen_vms(&args[1..]),
+        #[cfg(feature = "synth-gen")]
+        "gen-raster" => cmd_gen_raster(&args[1..]),
         _ => Err(CoreError::validation(format!("未知子命令 {}", args[0]))),
     };
     match result {
@@ -205,6 +207,75 @@ fn is_vms_path(path: &Path) -> bool {
 
 fn mrxs_stem(path: &Path) -> String {
     path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// F8: 普通图片（BMP/JPEG）魔数——BM / FF D8 FF（基线）。路由按魔数而非
+/// 扩展名：伪装扩展名的文件仍被探测，真正的 BMP/JPEG 换了名字照样进。
+fn is_raster_magic(m: &[u8; 8]) -> bool {
+    slide_transform_core::raster::is_raster_magic(m)
+}
+
+/// Capability report for a plain-image input (F8).
+fn raster_doc_json(doc: &slide_transform_core::raster::RasterDoc, size: u64) -> String {
+    let j = doc.jpeg.as_ref();
+    let levels: Vec<String> = std::iter::once(obj(&[
+        ju("level", 0),
+        ju("width", doc.width as u64),
+        ju("height", doc.height as u64),
+        ju("tiles_across", (doc.width as u64).div_ceil(256)),
+        ju("tiles_down", (doc.height as u64).div_ceil(256)),
+        jstr("kind", doc.kind.id()),
+        jstr(
+            "decode_unit",
+            match doc.kind {
+                slide_transform_core::raster::RasterKind::Bmp24 => "rows".into(),
+                slide_transform_core::raster::RasterKind::Bmp32 => "rows".into(),
+                slide_transform_core::raster::RasterKind::JpegBaseline => {
+                    if j.is_some_and(|x| x.restart_interval > 0) {
+                        "restart-segments".into()
+                    } else {
+                        "mcu-row-bands".into()
+                    }
+                }
+            },
+        ),
+        jraw(
+            "restart_interval",
+            &j.map(|x| x.restart_interval as u64).unwrap_or(0).to_string(),
+        ),
+        jraw("segments", &j.map(|x| x.segments).unwrap_or(0).to_string()),
+        jb("reencoded", true),
+    ]))
+    .chain(doc.generated.iter().enumerate().map(|(i, (w, h))| {
+        obj(&[
+            ju("level", (i + 1) as u64),
+            ju("width", *w as u64),
+            ju("height", *h as u64),
+            ju("tiles_across", w.div_ceil(256) as u64),
+            ju("tiles_down", h.div_ceil(256) as u64),
+            jstr("color", "ycbcr"),
+            jb("reencoded", true),
+            jb("generated", true),
+        ])
+    }))
+    .collect();
+    obj(&[
+        jstr("format", slide_transform_core::raster::SOURCE_FORMAT),
+        jstr("adapter", slide_transform_core::raster::SOURCE_FORMAT),
+        jstr("adapter_version", slide_transform_core::raster::ADAPTER_VERSION),
+        jstr("modality", "brightfield"),
+        jstr("kind", doc.kind.id()),
+        ju("size", size),
+        ju("width", doc.width as u64),
+        ju("height", doc.height as u64),
+        // 无物理标尺：BMP/JPEG 不携带 µm/px，恒为 null（OME 不写
+        // PhysicalSize）
+        jstr("mpp_source", "none (plain image: no physical scale in BMP/JPEG)"),
+        jstr("pyramid_method", slide_transform_core::raster::PYRAMID_METHOD),
+        jarr("levels", &levels),
+        jb("icc_profile", doc.icc.is_some()),
+        jstr("codec", "raster-compose-reencode"),
+    ])
 }
 
 /// Capability report for an MRXS bundle input (F3).
@@ -666,7 +737,19 @@ fn cmd_probe(args: &[String]) -> Result<String, CoreError> {
     let src = FileSource::open(Path::new(path))?;
     let magic = detect(&src)?;
     let mut scratch = FileScratch::new(&scratch_under(Path::new(path)));
-    let doc_json = if is_tiff_magic(&magic) {
+    // F8: 普通图片（BMP/JPEG）路由——按魔数，在 TIFF/厂商嗅探之前
+    let raster_doc: Option<String> = if is_raster_magic(&magic) {
+        let size = src.size();
+        Some(raster_doc_json(
+            &slide_transform_core::raster::probe_raster_with_budget(&src, memory_budget)?,
+            size,
+        ))
+    } else {
+        None
+    };
+    let doc_json = if let Some(raster_json) = raster_doc {
+        raster_json
+    } else if is_tiff_magic(&magic) {
         // F1/F4/F5: bounded TIFF walk + vendor dispatch (typed rejections
         // inside the adapters; OME-TIFF / converter BigTIFF are not inputs;
         // unknown vendors route to the generic tiled-JPEG adapter)
@@ -806,7 +889,13 @@ fn cmd_probe(args: &[String]) -> Result<String, CoreError> {
         "null".to_string()
     };
     // disk-precheck estimate (same shape as the wasm probe's)
-    let estimate = if is_tiff_magic(&magic) {
+    let estimate = if is_raster_magic(&magic) {
+        let size = src.size();
+        slide_transform_core::raster::estimate_raster(
+            &slide_transform_core::raster::probe_raster_with_budget(&src, memory_budget)?,
+            size,
+        )
+    } else if is_tiff_magic(&magic) {
         match slide_transform_core::scn::sniff_tiff_vendor(&src)? {
             slide_transform_core::scn::TiffVendor::LeicaScn => {
                 slide_transform_core::scn::estimate_scn(
@@ -1109,6 +1198,19 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
     }
     let src = FileSource::open(input)?;
     let magic = detect(&src)?;
+    // F8: 普通图片（BMP/JPEG）按魔数在 TIFF/厂商嗅探之前路由
+    if is_raster_magic(&magic) {
+        return cmd_convert_raster(
+            &positional,
+            &profile,
+            &policy,
+            &encoding,
+            timeout,
+            max_out,
+            memory_budget,
+            overwrite,
+        );
+    }
 
     let identity = InputIdentity {
         name: input
@@ -1634,6 +1736,121 @@ fn cmd_gen_kfbf(args: &[String]) -> Result<String, CoreError> {
 }
 
 // --------------------------------------------------------------------------- //
+// convert (plain image BMP/JPEG, F8)
+// --------------------------------------------------------------------------- //
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_convert_raster(
+    positional: &[&String],
+    profile: &str,
+    policy: &str,
+    encoding: &str,
+    timeout: Option<f64>,
+    max_out: Option<u64>,
+    memory_budget: Option<u64>,
+    overwrite: bool,
+) -> Result<String, CoreError> {
+    let input = Path::new(positional[0]);
+    let output = Path::new(positional[1]);
+    if output.exists() && !overwrite {
+        return Err(CoreError::validation(format!(
+            "输出已存在：{}",
+            output.display()
+        )));
+    }
+    let out_profile = match profile {
+        // auto keeps the unattended mapping: raster → bf-classic (same as SVS)
+        "auto" => OutputProfile::ClassicJpegBigTiff,
+        id => OutputProfile::from_id(id)
+            .ok_or_else(|| CoreError::validation(format!("未知 profile {profile}")))?,
+    };
+    if !out_profile.is_brightfield() {
+        return Err(CoreError::variant("荧光 OME profile 不适用于明场普通图片输入"));
+    }
+    let enc_profile = match encoding {
+        "preserve" => slide_transform_core::plan::EncodingProfile::PreserveSource,
+        "compact" => slide_transform_core::plan::EncodingProfile::CompactJpegV1,
+        _ => {
+            return Err(CoreError::validation(format!(
+                "未知 encoding {encoding}（preserve|compact）"
+            )))
+        }
+    };
+    let pixel_policy = match policy {
+        "allow-edge" => PixelPolicy::AllowEdgeReencode,
+        "strict-lossless" => PixelPolicy::StrictLossless,
+        _ => return Err(CoreError::validation(format!("未知 policy {policy}"))),
+    };
+    if pixel_policy == PixelPolicy::StrictLossless {
+        return Err(CoreError::policy(
+            "strict-lossless 与普通图片输出互斥：像素必须解码后重编码（有损），无逐字节搬运路径",
+        ));
+    }
+    if enc_profile == slide_transform_core::plan::EncodingProfile::CompactJpegV1
+        && pixel_policy == PixelPolicy::StrictLossless
+    {
+        return Err(CoreError::policy(
+            "compact-jpeg-v1 与 strict-lossless 互斥：逐 tile 重编码必然有损",
+        ));
+    }
+    let limits = ResourceLimits {
+        timeout_seconds: timeout.unwrap_or(600.0),
+        max_output_bytes: max_out.unwrap_or(64 * 1024 * 1024 * 1024),
+        min_free_bytes: 256 * 1024 * 1024,
+        memory_budget_bytes: memory_budget
+            .unwrap_or(slide_transform_core::budget::SAVER_BUDGET_BYTES),
+    };
+    {
+        let dir = scratch_under(output);
+        let free = free_bytes(&dir);
+        if free < limits.min_free_bytes {
+            return Err(CoreError::disk_low(format!(
+                "目标盘剩余 {free} < {}",
+                limits.min_free_bytes
+            )));
+        }
+    }
+    let identity = InputIdentity {
+        name: input
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        size: 0,
+        sha256: None,
+    };
+    let mut plan = TransformPlan::brightfield(identity)
+        .with_policy(pixel_policy)
+        .with_limits(limits.clone())
+        .with_encoding(enc_profile);
+    plan.profile = out_profile;
+    let part = {
+        let name = output.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        scratch_under(output).join(format!("{name}.part"))
+    };
+    let mut scratch = FileScratch::new(&scratch_under(output));
+    let mut sink = FileSink::create(&part)?;
+    let null = NullProgress;
+    let job = JobControl::new(&null).with_timeout(limits.timeout_seconds);
+    let src = FileSource::open(input)?;
+    let mut result = slide_transform_core::convert_raster::convert_raster_to_bigtiff(
+        &src, &mut sink, &mut scratch, &plan, &job,
+    )?;
+    sink.flush()?;
+    drop(sink);
+    if output.exists() && !overwrite {
+        let _ = std::fs::remove_file(&part);
+        return Err(CoreError::validation(format!(
+            "输出已存在：{}",
+            output.display()
+        )));
+    }
+    std::fs::rename(&part, output)
+        .map_err(|e| CoreError::io(format!("转正失败: {e}")))?;
+    result.output_sha256 = Some(sha256_file(output)?);
+    emit_convert_json(&result, &out_profile, &enc_profile, output)
+}
+
+// --------------------------------------------------------------------------- //
 // convert (MRXS bundle, F3)
 // --------------------------------------------------------------------------- //
 
@@ -2109,6 +2326,56 @@ fn cmd_gen_vms(args: &[String]) -> Result<String, CoreError> {
         jstr("entry", &format!("{}/synthetic.vms", out_dir)),
         ju("members", bundle.members().len() as u64),
         ju("bytes", bytes),
+    ]))
+}
+
+// --------------------------------------------------------------------------- //
+// synthetic plain-image generator（F8 测试数据；无患者数据）
+// --------------------------------------------------------------------------- //
+
+#[cfg(feature = "synth-gen")]
+fn cmd_gen_raster(args: &[String]) -> Result<String, CoreError> {
+    let mut path = None;
+    let mut p = slide_transform_core::raster_fixture::RasterGenParams::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--kind" => { i += 1; p.kind = args.get(i).cloned().ok_or_else(|| CoreError::validation("--kind 缺值"))?; }
+            "--width" => { i += 1; p.width = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--width"))?; }
+            "--height" => { i += 1; p.height = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--height"))?; }
+            "--bpp" => { i += 1; p.bpp = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--bpp"))?; }
+            "--topdown" => p.top_down = true,
+            "--core-header" => p.core_header = true,
+            "--compression" => { i += 1; p.compression = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--compression"))?; }
+            "--bits" => { i += 1; p.bits_override = Some(args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--bits"))?); }
+            "--truncated" => p.truncated = true,
+            "--no-restart" => p.no_restart = true,
+            "--restart-rows" => { i += 1; p.restart_rows = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--restart-rows"))?; }
+            "--progressive" => p.progressive = true,
+            "--gray" => p.gray = true,
+            "--noise" => p.pattern = slide_transform_core::raster_fixture::FixturePattern::Noise,
+            "--quality" => { i += 1; p.quality = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--quality"))?; }
+            _ => {
+                if args[i].starts_with('-') && args[i] != "-" {
+                    return Err(CoreError::validation(format!(
+                        "gen-raster 未知旗标 {}",
+                        args[i]
+                    )));
+                }
+                path = Some(&args[i]);
+            }
+        }
+        i += 1;
+    }
+    let path = path.ok_or_else(|| CoreError::validation("gen-raster 需要 <out>"))?;
+    let data = slide_transform_core::raster_fixture::build_synthetic_raster(&p)?;
+    std::fs::write(path, &data).map_err(|e| CoreError::io(format!("写入失败: {e}")))?;
+    Ok(obj(&[
+        jstr("path", path),
+        jstr("kind", &p.kind),
+        ju("width", p.width as u64),
+        ju("height", p.height as u64),
+        ju("bytes", data.len() as u64),
     ]))
 }
 

@@ -542,11 +542,16 @@ enum InputKind {
     /// Hamamatsu (its IFD 0 usually has no description at all) — decided by
     /// the same sniff.
     Ndpi,
+    /// 普通图片（F8）：BMP（BM）或基线 JPEG（FF D8 FF）魔数——按魔数在
+    /// TIFF/厂商嗅探之前路由，不依赖扩展名。
+    Raster,
 }
 
 fn input_kind(magic: &[u8; 8]) -> InputKind {
     if *magic == slide_transform_core::kfbf::KFBF_MAGIC {
         InputKind::Kfbf
+    } else if slide_transform_core::raster::is_raster_magic(magic) {
+        InputKind::Raster
     } else if is_tiff_magic(magic) {
         InputKind::Svs
     } else {
@@ -575,6 +580,7 @@ fn adapter_of(kind: InputKind) -> Option<&'static str> {
         InputKind::Scn => Some(slide_transform_core::scn::SOURCE_FORMAT),
         InputKind::Gtiff => Some(slide_transform_core::gtiff::SOURCE_FORMAT),
         InputKind::Ndpi => Some(slide_transform_core::ndpi::SOURCE_FORMAT),
+        InputKind::Raster => Some(slide_transform_core::raster::SOURCE_FORMAT),
         _ => None,
     }
 }
@@ -587,6 +593,7 @@ fn adapter_version_of(kind: InputKind) -> Option<&'static str> {
         InputKind::Scn => Some(slide_transform_core::scn::ADAPTER_VERSION),
         InputKind::Gtiff => Some(slide_transform_core::gtiff::ADAPTER_VERSION),
         InputKind::Ndpi => Some(slide_transform_core::ndpi::ADAPTER_VERSION),
+        InputKind::Raster => Some(slide_transform_core::raster::ADAPTER_VERSION),
         _ => None,
     }
 }
@@ -867,6 +874,55 @@ fn ndpi_doc_json(doc: &slide_transform_core::ndpi::NdpiDoc) -> String {
     )
 }
 
+/// 普通图片（BMP/JPEG）capability document (probe result), mirroring the
+/// CLI's report. 无物理标尺：mpp 恒为 null，OME 输出不写 PhysicalSize。
+fn raster_doc_json(doc: &slide_transform_core::raster::RasterDoc, size: u64) -> String {
+    let j = doc.jpeg.as_ref();
+    let mut levels: Vec<String> = vec![format!(
+        "{{\"level\":0,\"width\":{},\"height\":{},\"tiles_across\":{},\"tiles_down\":{},\"kind\":\"{}\",\"decode_unit\":\"{}\",\"restart_interval\":{},\"segments\":{},\"reencoded\":true}}",
+        doc.width,
+        doc.height,
+        (doc.width as u64).div_ceil(256),
+        (doc.height as u64).div_ceil(256),
+        doc.kind.id(),
+        match doc.kind {
+            slide_transform_core::raster::RasterKind::Bmp24 => "rows",
+            slide_transform_core::raster::RasterKind::Bmp32 => "rows",
+            slide_transform_core::raster::RasterKind::JpegBaseline => {
+                if j.is_some_and(|x| x.restart_interval > 0) {
+                    "restart-segments"
+                } else {
+                    "mcu-row-bands"
+                }
+            }
+        },
+        j.map(|x| x.restart_interval as u64).unwrap_or(0),
+        j.map(|x| x.segments).unwrap_or(0),
+    )];
+    for (i, (w, h)) in doc.generated.iter().enumerate() {
+        levels.push(format!(
+            "{{\"level\":{},\"width\":{w},\"height\":{h},\"tiles_across\":{},\"tiles_down\":{},\"color\":\"ycbcr\",\"reencoded\":true,\"generated\":true}}",
+            i + 1,
+            (*w as u64).div_ceil(256),
+            (*h as u64).div_ceil(256),
+        ));
+    }
+    format!(
+        "{{\"format\":\"{}\",\"adapter\":\"{}\",\"adapter_version\":\"{}\",\"modality\":\"brightfield\",\"kind\":\"{}\",\"size\":{},\"width\":{},\"height\":{},\"mpp_source\":\"none (plain image: no physical scale in BMP/JPEG)\",\"pyramid_method\":\"{}\",\"levels\":[{}],\"icc_profile\":{},\"codec\":\"raster-compose-reencode\",\"estimate\":{}}}",
+        slide_transform_core::raster::SOURCE_FORMAT,
+        slide_transform_core::raster::SOURCE_FORMAT,
+        slide_transform_core::raster::ADAPTER_VERSION,
+        doc.kind.id(),
+        size,
+        doc.width,
+        doc.height,
+        slide_transform_core::raster::PYRAMID_METHOD,
+        levels.join(","),
+        doc.icc.is_some(),
+        estimate_json(&slide_transform_core::raster::estimate_raster(doc, size))
+    )
+}
+
 /// TIFF-container probe dispatch (host-free so it is unit-testable):
 /// SCN vendor → the SCN adapter, unknown vendors → the generic tiled-JPEG
 /// adapter, Hamamatsu → the NDPI adapter, Aperio → the SVS adapter, and a
@@ -897,7 +953,12 @@ pub fn probe() -> String {
         Ok(m) => m,
         Err(e) => return err_json(&e),
     };
-    let res = if is_tiff_magic(&magic) {
+    let res = if slide_transform_core::raster::is_raster_magic(&magic) {
+        // F8: 普通图片（BMP/JPEG）——按魔数在 TIFF/厂商嗅探之前路由
+        let size = src.size();
+        slide_transform_core::raster::probe_raster(&src)
+            .map(|doc| raster_doc_json(&doc, size))
+    } else if is_tiff_magic(&magic) {
         // F1/F4: bounded TIFF walk + vendor dispatch (typed rejections for
         // OME-TIFF / converter BigTIFF inside tiff_route — an Err must
         // surface as-is, never fall through to the SVS probe; review 2026-10-05 #2)
@@ -1244,6 +1305,25 @@ fn run_convert(
                 &src, &mut sink, &mut scratch, &plan, &job, rp,
             ),
             None => slide_transform_core::convert_ndpi::convert_ndpi_to_bigtiff(
+                &src, &mut sink, &mut scratch, &plan, &job,
+            ),
+        }
+    } else if kind == InputKind::Raster {
+        // Review §1 parity: the adapter bounds its band/segment-decode
+        // working set by the host's memory budget (like gtiff/ndpi/MRXS).
+        let mut plan = TransformPlan::brightfield(identity)
+            .with_policy(policy)
+            .with_encoding(enc_profile);
+        plan.profile = out_profile;
+        plan.limits.memory_budget_bytes = budget_bytes
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|v| v as u64)
+            .unwrap_or(slide_transform_core::budget::SAVER_BUDGET_BYTES);
+        match resume.as_ref() {
+            Some(rp) => slide_transform_core::convert_raster::convert_raster_to_bigtiff_resume(
+                &src, &mut sink, &mut scratch, &plan, &job, rp,
+            ),
+            None => slide_transform_core::convert_raster::convert_raster_to_bigtiff(
                 &src, &mut sink, &mut scratch, &plan, &job,
             ),
         }
@@ -2055,6 +2135,53 @@ mod tests {
         )))
         .unwrap_err();
         assert!(e.message.contains("OME-TIFF 不是转换输入"), "{}", e.message);
+    }
+
+    #[test]
+    fn raster_magics_route_to_the_plain_image_adapter() {
+        use slide_transform_core::io::MemSource;
+        // BMP（BM）与基线 JPEG（FF D8 FF）按魔数路由；换扩展名不影响
+        assert_eq!(input_kind(&[b'B', b'M', 0, 0, 0, 0, 0, 0]), InputKind::Raster);
+        assert_eq!(input_kind(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 16, b'J', b'F']), InputKind::Raster);
+        assert_eq!(adapter_of(InputKind::Raster), Some("plain-image-bmp-jpeg"));
+        assert_eq!(adapter_version_of(InputKind::Raster), Some("1"));
+        // probe 文档：kind/decode_unit/estimate 齐备（64×48 S444 JPEG）
+        let jpg = slide_transform_core::jpeg::encode_rgb(
+            &[128u8; 64 * 48 * 3],
+            64,
+            48,
+            &slide_transform_core::jpeg::EncoderCfg::with_quality(
+                90,
+                slide_transform_core::jpeg::Sampling::S444,
+            ),
+        )
+        .unwrap();
+        let doc = probe_with_source(&MemSource::new(jpg));
+        assert!(doc.contains("\"format\":\"plain-image-bmp-jpeg\""), "{doc}");
+        assert!(doc.contains("\"adapter_version\":\"1\""), "{doc}");
+        assert!(doc.contains("\"decode_unit\":\"mcu-row-bands\""), "{doc}");
+    }
+
+    /// probe() against an in-memory source (the #[wasm_bindgen] export reads
+    /// the host callbacks; this keeps the routing test host-free).
+    fn probe_with_source(src: &dyn slide_transform_core::io::ByteSource) -> String {
+        let magic = match detect(src) {
+            Ok(m) => m,
+            Err(e) => return err_json(&e),
+        };
+        if slide_transform_core::raster::is_raster_magic(&magic) {
+            let size = src.size();
+            return match slide_transform_core::raster::probe_raster(src) {
+                Ok(doc) => format!(
+                    "{{\"core_version\":\"{}\",\"size\":{},\"document\":{}}}",
+                    slide_transform_core::CORE_VERSION,
+                    size,
+                    raster_doc_json(&doc, size)
+                ),
+                Err(e) => err_json(&e),
+            };
+        }
+        "{\"error\":{\"code\":\"unsupported_kfb_variant\",\"message\":\"test\"}}".into()
     }
 
     #[test]

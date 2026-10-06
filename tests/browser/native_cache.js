@@ -176,6 +176,9 @@ function nativeConvertCached(opts) {
       { stdio: ['ignore', 'ignore', 'inherit'] });
   });
   fs.mkdirSync(path.dirname(output), { recursive: true });
+  // output may be a hardlink to a cache entry from an earlier hit; never let a
+  // converter that writes in place touch the shared inode
+  fs.rmSync(output, { force: true });
   convert(output, { input, args });
   const sha = sha256FileChunks(output);
   const bytes = fs.statSync(output).size;

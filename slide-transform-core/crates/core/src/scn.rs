@@ -84,6 +84,9 @@ pub enum TiffVendor {
     /// IFD 0 usually has NO description at all) → `ndpi.rs`. The Make is
     /// only consulted when the description matched no other vendor.
     HamamatsuNdpi,
+    /// Ventana BIF (IFD 0 XMLPacket (700) carries an `iScan` element;
+    /// BigTIFF with stitched JPEG tiles) → `bif.rs`.
+    VentanaBif,
     /// OME-TIFF — already platform-readable, NOT a conversion input.
     OmeTiff,
     /// This converter's own output (description JSON with a `source_format`
@@ -96,7 +99,7 @@ pub enum TiffVendor {
 /// Converter output ids (the same vocabulary as `upload_direct_class.py`
 /// and `static/upload/slide-sniff.js`; a description JSON carrying one of
 /// these as `source_format` marks a converter-produced BigTIFF).
-pub const CONVERTER_SOURCE_FORMATS: [&str; 7] = [
+pub const CONVERTER_SOURCE_FORMATS: [&str; 8] = [
     "kfb_bf_v1",
     "kfb_kfbio_jpeg",
     "aperio-svs-jpeg",
@@ -104,6 +107,7 @@ pub const CONVERTER_SOURCE_FORMATS: [&str; 7] = [
     crate::gtiff::SOURCE_FORMAT,
     SOURCE_FORMAT,
     crate::ndpi::SOURCE_FORMAT,
+    crate::bif::SOURCE_FORMAT,
 ];
 
 fn desc_is_ome(desc: &str) -> bool {
@@ -163,7 +167,24 @@ pub fn sniff_tiff_vendor(src: &dyn ByteSource) -> CoreResult<TiffVendor> {
         }
         None => String::new(),
     };
-    Ok(classify_make(&make))
+    if classify_make(&make) != TiffVendor::Unknown {
+        return Ok(classify_make(&make));
+    }
+    // Ventana BIF: IFD 0 carries the vendor block in XMLPacket (700) — the
+    // description is "Label Image" and there is no Make. Same bounded
+    // tag-value path (ventana.c `ventana_detect` looks for the iScan
+    // element the same way).
+    if let Some(e) = first.find(700) {
+        if e.value_len().unwrap_or(u64::MAX) > MAX_XML_BYTES {
+            return Err(CoreError::oob("IFD 0 XMLPacket 长度异常"));
+        }
+        let xmp = tiff_read::entry_value(src, &hdr, e)?;
+        let head = &xmp[..xmp.len().min(4096)];
+        if head.windows(5).any(|w| w == b"iScan") {
+            return Ok(TiffVendor::VentanaBif);
+        }
+    }
+    Ok(TiffVendor::Unknown)
 }
 
 /// Pure description classifier (unit-tested without IO).

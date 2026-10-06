@@ -16,12 +16,15 @@
 pub mod budget;
 pub mod companion;
 pub mod bundle;
+pub mod bif;
 #[cfg(feature = "codecs")]
 pub mod convert_bf;
 #[cfg(feature = "codecs")]
 pub mod convert_fl;
 #[cfg(feature = "codecs")]
 pub mod convert_gtiff;
+#[cfg(feature = "codecs")]
+pub mod convert_bif;
 #[cfg(feature = "codecs")]
 pub mod convert_mirax;
 #[cfg(feature = "codecs")]
@@ -88,6 +91,9 @@ pub mod raster_fixture;
 
 #[cfg(all(feature = "codecs", feature = "fixtures"))]
 pub mod vms_fixture;
+
+#[cfg(all(feature = "codecs", feature = "fixtures"))]
+pub mod bif_fixture;
 
 pub use error::{CoreError, CoreResult};
 pub use plan::{

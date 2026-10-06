@@ -68,6 +68,8 @@ fn main() -> ExitCode {
         "gen-vms" => cmd_gen_vms(&args[1..]),
         #[cfg(feature = "synth-gen")]
         "gen-raster" => cmd_gen_raster(&args[1..]),
+        #[cfg(feature = "synth-gen")]
+        "gen-bif" => cmd_gen_bif(&args[1..]),
         _ => Err(CoreError::validation(format!("未知子命令 {}", args[0]))),
     };
     match result {
@@ -641,6 +643,93 @@ fn ndpi_doc_json(doc: &slide_transform_core::ndpi::NdpiDoc) -> String {
     ])
 }
 
+/// Capability report for a Ventana BIF input（第九个输入适配器）。
+fn bif_doc_json(doc: &slide_transform_core::bif::BifDoc) -> String {
+    let l0 = &doc.levels[0];
+    let levels: Vec<String> = std::iter::once({
+        obj(&[
+            ju("level", 0),
+            ju("ifd", l0.ifd_index as u64),
+            ju("width", doc.width as u64),
+            ju("height", doc.height as u64),
+            ju("canvas_w", l0.canvas_w as u64),
+            ju("canvas_h", l0.canvas_h as u64),
+            ju("tile_w", l0.tile_w as u64),
+            ju("tile_h", l0.tile_h as u64),
+            ju("tiles_across", l0.tiles_across),
+            ju("tiles_down", l0.tiles_down),
+            ju("advance_x", (doc.advance_x * 1e6) as u64),
+            ju("advance_y", (doc.advance_y * 1e6) as u64),
+            ju("areas", doc.areas.len() as u64),
+            ju("tiles_present", doc.tiles_present),
+            jstr(
+                "color",
+                match doc.color {
+                    slide_transform_core::bif::PayloadColor::Rgb => "rgb",
+                    slide_transform_core::bif::PayloadColor::YCbCr => "ycbcr",
+                },
+            ),
+            jb("reencoded", true),
+        ])
+    })
+    .chain(doc.generated.iter().enumerate().map(|(i, (w, h))| {
+        obj(&[
+            ju("level", (i + 1) as u64),
+            ju("width", *w as u64),
+            ju("height", *h as u64),
+            ju("tiles_across", w.div_ceil(256) as u64),
+            ju("tiles_down", h.div_ceil(256) as u64),
+            jstr("color", "ycbcr"),
+            jb("reencoded", true),
+            jb("generated", true),
+        ])
+    }))
+    .collect();
+    let assoc: Vec<String> = doc
+        .associated
+        .iter()
+        .map(|a| obj(&[jstr("name", &a.name), ju("width", a.width as u64), ju("height", a.height as u64)]))
+        .collect();
+    obj(&[
+        jstr("format", slide_transform_core::bif::SOURCE_FORMAT),
+        jstr("adapter", slide_transform_core::bif::SOURCE_FORMAT),
+        jstr("adapter_version", slide_transform_core::bif::ADAPTER_VERSION),
+        jstr("modality", "brightfield"),
+        jstr("tiff_kind", "bigtiff"),
+        ju("width", doc.width as u64),
+        ju("height", doc.height as u64),
+        jraw("mpp_x", &doc.mpp.map(|v| v.0.to_string()).unwrap_or_else(|| "null".into())),
+        jraw("mpp_y", &doc.mpp.map(|v| v.1.to_string()).unwrap_or_else(|| "null".into())),
+        jraw("objective", &doc.objective.map(|v| v.to_string()).unwrap_or_else(|| "null".into())),
+        jstr("mpp_source", if doc.mpp.is_some() { "bif-iscan-scanres" } else { "unknown" }),
+        jstr(
+            "objective_source",
+            if doc.objective.is_some() { "bif-iscan-magnification" } else { "unknown" },
+        ),
+        jstr("pyramid_method", slide_transform_core::bif::PYRAMID_METHOD),
+        jarr("levels", &levels),
+        jarr(
+            "source_levels",
+            &doc.levels
+                .iter()
+                .skip(1)
+                .map(|lv| {
+                    obj(&[
+                        ju("ifd", lv.ifd_index as u64),
+                        ju("canvas_w", lv.canvas_w as u64),
+                        ju("canvas_h", lv.canvas_h as u64),
+                        jf("magnification", lv.magnification),
+                    ])
+                })
+                .collect::<Vec<_>>(),
+        ),
+        jarr("associated", &assoc),
+        jb("icc_profile", doc.icc.is_some()),
+        jb("jpeg_tables", doc.jpeg_tables.is_some()),
+        jstr("codec", "stitch-compose-reencode"),
+    ])
+}
+
 /// Capability report for a Leica SCN input (F4).
 fn scn_doc_json(doc: &slide_transform_core::scn::ScnDoc) -> String {
     let levels: Vec<String> = doc
@@ -765,6 +854,12 @@ fn cmd_probe(args: &[String]) -> Result<String, CoreError> {
             ),
             slide_transform_core::scn::TiffVendor::HamamatsuNdpi => {
                 ndpi_doc_json(&slide_transform_core::ndpi::probe_ndpi_with_budget(
+                    &src,
+                    memory_budget,
+                )?)
+            }
+            slide_transform_core::scn::TiffVendor::VentanaBif => {
+                bif_doc_json(&slide_transform_core::bif::probe_bif_with_budget(
                     &src,
                     memory_budget,
                 )?)
@@ -905,6 +1000,11 @@ fn cmd_probe(args: &[String]) -> Result<String, CoreError> {
             slide_transform_core::scn::TiffVendor::HamamatsuNdpi => {
                 slide_transform_core::ndpi::estimate_ndpi(
                     &slide_transform_core::ndpi::probe_ndpi_with_budget(&src, memory_budget)?,
+                )
+            }
+            slide_transform_core::scn::TiffVendor::VentanaBif => {
+                slide_transform_core::bif::estimate_bif(
+                    &slide_transform_core::bif::probe_bif_with_budget(&src, memory_budget)?,
                 )
             }
             slide_transform_core::scn::TiffVendor::Unknown => {
@@ -1264,12 +1364,18 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
         && !is_scn
         && !is_gtiff
         && vendor == slide_transform_core::scn::TiffVendor::HamamatsuNdpi;
+    let is_bif = is_tiff_magic(&magic)
+        && !is_scn
+        && !is_gtiff
+        && !is_ndpi
+        && vendor == slide_transform_core::scn::TiffVendor::VentanaBif;
     let is_svs = is_tiff_magic(&magic)
         && !is_scn
         && !is_gtiff
         && !is_ndpi
+        && !is_bif
         && vendor == slide_transform_core::scn::TiffVendor::AperioSvs;
-    if is_tiff_magic(&magic) && !is_svs && !is_scn && !is_gtiff && !is_ndpi {
+    if is_tiff_magic(&magic) && !is_svs && !is_scn && !is_gtiff && !is_ndpi && !is_bif {
         return Err(vendor_rejection(vendor));
     }
     let enc_profile = match encoding.as_str() {
@@ -1286,9 +1392,9 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
             "compact-jpeg-v1 编码仅适用于明场；荧光不支持有损重编码",
         ));
     }
-    if (is_svs || is_scn || is_gtiff || is_ndpi) && is_fl {
+    if (is_svs || is_scn || is_gtiff || is_ndpi || is_bif) && is_fl {
         return Err(CoreError::variant(
-            "荧光 OME profile 不适用于明场 SVS/SCN/通用 TIFF/NDPI 输入",
+            "荧光 OME profile 不适用于明场 SVS/SCN/通用 TIFF/NDPI/BIF 输入",
         ));
     }
     let pixel_policy = match policy.as_str() {
@@ -1367,6 +1473,15 @@ fn cmd_convert(args: &[String]) -> Result<String, CoreError> {
             .with_encoding(enc_profile);
         plan.profile = out_profile;
         slide_transform_core::convert_ndpi::convert_ndpi_to_bigtiff(
+            &src, &mut sink, &mut scratch, &plan, &job,
+        )
+    } else if is_bif {
+        let mut plan = TransformPlan::brightfield(identity)
+            .with_policy(pixel_policy)
+            .with_limits(limits)
+            .with_encoding(enc_profile);
+        plan.profile = out_profile;
+        slide_transform_core::convert_bif::convert_bif_to_bigtiff(
             &src, &mut sink, &mut scratch, &plan, &job,
         )
     } else if is_svs {
@@ -2326,6 +2441,50 @@ fn cmd_gen_vms(args: &[String]) -> Result<String, CoreError> {
         jstr("entry", &format!("{}/synthetic.vms", out_dir)),
         ju("members", bundle.members().len() as u64),
         ju("bytes", bytes),
+    ]))
+}
+
+// --------------------------------------------------------------------------- //
+// synthetic Ventana BIF generator（测试数据；无患者数据）
+// --------------------------------------------------------------------------- //
+
+#[cfg(feature = "synth-gen")]
+fn cmd_gen_bif(args: &[String]) -> Result<String, CoreError> {
+    let mut path = None;
+    let mut p = slide_transform_core::bif_fixture::BifGenParams::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--overlap-x" => { i += 1; p.overlap_x = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--overlap-x"))?; }
+            "--overlap-y" => { i += 1; p.overlap_y = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--overlap-y"))?; }
+            "--big-endian" => p.big_endian = true,
+            "--jp2k" => p.jp2k = true,
+            "--left-direction" => p.left_direction = true,
+            "--z-layers" => p.z_layers = true,
+            "--no-xml" => p.no_xml = true,
+            "--classic" => p.classic = true,
+            "--gray" => p.gray = true,
+            "--sparse" => p.sparse = true,
+            "--quality" => { i += 1; p.quality = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--quality"))?; }
+            _ => {
+                if args[i].starts_with('-') && args[i] != "-" {
+                    return Err(CoreError::validation(format!("gen-bif 未知旗标 {}", args[i])));
+                }
+                path = Some(&args[i]);
+            }
+        }
+        i += 1;
+    }
+    let path = path.ok_or_else(|| CoreError::validation("gen-bif 需要 <out>"))?;
+    let mut sink = slide_transform_core::io::MemSink::new();
+    let size = slide_transform_core::bif_fixture::build_synthetic_bif(&mut sink, &p)?;
+    std::fs::write(path, &sink.data).map_err(|e| CoreError::io(format!("写入失败: {e}")))?;
+    let (sw, sh) = slide_transform_core::bif_fixture::default_stitched(&p);
+    Ok(obj(&[
+        jstr("path", path),
+        ju("bytes", size),
+        ju("stitched_width", sw as u64),
+        ju("stitched_height", sh as u64),
     ]))
 }
 

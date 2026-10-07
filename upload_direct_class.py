@@ -145,9 +145,11 @@ def _parse_tiff_head(fh):
         return None
 
     if bigtiff:
-        # 头布局（16B）：II(2) 43(2) offsetsizes(2,须为 8——BigTIFF 规格与
-        # 本工具产物/OME-TIFF 一致) reserved(2) IFD 偏移(8)
-        if len(head) < 6 or head[4] != 8:
+        # 头布局（16B）：II/MM(2) 43(2) offsetsizes(2,须为 8——BigTIFF 规格
+        # 与本工具产物/OME-TIFF 一致；按文件字节序读 u16，曾只查单字节
+        # head[4]——大端 offsetsizes 是 00 08，被误判非 BigTIFF)
+        # reserved(2) IFD 偏移(8)
+        if len(head) < 6 or struct.unpack(bo + "H", head[4:6])[0] != 8:
             return None
         extra = fh.read(8)
         if len(extra) < 8:

@@ -17,8 +17,11 @@
  *   4. 命名只是提示：.ome.tif 命名但字节非 OME → temporary（不谎报 ome）。
  */
 import { describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { readFileSync, existsSync, openSync, readSync, closeSync,
+	statSync, mkdtempSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { dirname, resolve, join, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -497,4 +500,299 @@ describe("slide-sniff：TIFF 头解析（手工夹具，≤128KB 预算）", () 
 		const r = await S.classifyFile(fakeFile("junk.tif", junk));
 		expect(r.cls).toBe("temporary");
 	});
+});
+
+// --------------------------------------------------------------------------- //
+// review 2026-10-07 #2：普通 TIFF 的分类必须按「魔数 → 首 IFD 偏移 → IFD 条目
+// → 标签值」做**有界随机读取**，不得假设 IFD/描述落在文件头两个 128 KiB 窗口。
+// 文档化预算（实现与测试同值）：单次 slice 读 ≤ 256 KiB；单文件嗅探累计读
+// ≤ 1 MiB；单个文本标签 ≤ 64 KiB；IFD 表窗口 ≤ 128 KiB。
+// --------------------------------------------------------------------------- //
+
+const SNIFF_READ_CAP = 256 * 1024;
+const SNIFF_TOTAL_BUDGET = 1024 * 1024;
+
+function readBudget(f: { slices: Array<[number, number]> }) {
+	return f.slices.reduce((a, [s, e]) => a + (e - s), 0);
+}
+
+/** BigTIFF/classic TIFF，IFD 放在任意偏移（前面补零）；描述外联跟随 IFD。 */
+function tiffWithIfdAt(opts: {
+	ifdAt: number; bigtiff?: boolean; bigEndian?: boolean;
+	desc?: Uint8Array; descCount?: number;   // descCount：谎报超大 count 用
+	entries?: Array<[number, number, number]>;
+}): Uint8Array {
+	const bigtiff = opts.bigtiff !== false;
+	const le = !opts.bigEndian;
+	const desc = opts.desc || new Uint8Array(0);
+	const all = [...(opts.entries || [])];
+	if (desc.length) all.push([270, 2, 0]);
+	all.sort((a, b) => a[0] - b[0]);
+	const hdrLen = bigtiff ? 16 : 8;
+	const entrySize = bigtiff ? 20 : 12;
+	const ifdSize = (bigtiff ? 8 : 2) + entrySize * all.length + (bigtiff ? 8 : 4);
+	const heapOffset = opts.ifdAt + ifdSize;
+	const total = heapOffset + desc.length;
+	const out = new Uint8Array(total);
+	const dv = new DataView(out.buffer);
+	out.set(le ? [0x49, 0x49] : [0x4d, 0x4d], 0);
+	dv.setUint16(2, bigtiff ? 43 : 42, le);
+	if (bigtiff) {
+		dv.setUint16(4, 8, le);
+		dv.setUint16(6, 0, le);
+		dv.setBigUint64(8, BigInt(opts.ifdAt), le);
+	} else {
+		dv.setUint32(4, opts.ifdAt, le);
+	}
+	const cntW = bigtiff ? 8 : 4;
+	if (bigtiff) {
+		dv.setBigUint64(opts.ifdAt, BigInt(all.length), le);
+	} else {
+		dv.setUint16(opts.ifdAt, all.length, le);
+	}
+	let at = opts.ifdAt + (bigtiff ? 8 : 2);
+	for (const [tag, typ] of all) {
+		dv.setUint16(at, tag, le);
+		dv.setUint16(at + 2, typ, le);
+		if (typ === 2 && desc.length) {
+			dv.setBigUint64(at + 4, BigInt(opts.descCount || desc.length), le);
+			dv.setBigUint64(at + 4 + cntW, BigInt(heapOffset), le);
+		} else {
+			dv.setBigUint64(at + 4, 1n, le);
+			dv.setBigUint64(at + 4 + cntW,
+				BigInt(all.find((e) => e[0] === tag)![2]), le);
+		}
+		at += entrySize;
+	}
+	// next IFD = 0（末尾 cntW 字节保持 0）
+	out.set(desc, heapOffset);
+	return out;
+}
+
+/** 磁盘文件的懒 slice 视图（只读请求区间，绝不整体读入）。 */
+function fileFromPath(p: string) {
+	const fd = openSync(p, "r");
+	const size = statSync(p).size;
+	const slices: Array<[number, number]> = [];
+	return {
+		name: basename(p),
+		size,
+		slices,
+		slice(start: number, end: number) {
+			slices.push([start, Math.min(end, size)]);
+			const len = Math.max(0, Math.min(end, size) - start);
+			const buf = new Uint8Array(len);
+			if (len) readSync(fd, buf, 0, len, start);
+			return { arrayBuffer: async () => buf.buffer };
+		},
+		close() { closeSync(fd); },
+	};
+}
+
+describe("slide-sniff：有界随机读取（review #2）", () => {
+	it("IFD 与描述位于 512 KiB 之后 → ome-tiff（按首 IFD 偏移定点读）", async () => {
+		const bytes = tiffWithIfdAt({ ifdAt: 524304, desc: OME_DESC });
+		expect(bytes.length).toBeGreaterThan(512 * 1024);
+		const f = fakeFile("late.ome.tif", bytes);
+		const r = await S.classifyFile(f);
+		expect(r.cls).toBe("ome-tiff");
+		expect(r.directClass).toBe("ome-tiff");
+		// 预算：任何单次读 ≤ 256 KiB（绝不顺序扫过 512 KiB 空洞）、累计 ≤ 1 MiB
+		for (const [s, e] of f.slices) {
+			expect(e - s, `slice ${s}..${e}`).toBeLessThanOrEqual(SNIFF_READ_CAP);
+		}
+		expect(readBudget(f)).toBeLessThanOrEqual(SNIFF_TOTAL_BUDGET);
+	});
+
+	it("IFD 位于 512 KiB 之后（大端 BigTIFF）→ ome-tiff", async () => {
+		const bytes = tiffWithIfdAt({
+			ifdAt: 524304, bigEndian: true, desc: OME_DESC,
+		});
+		const r = await S.classifyFile(fakeFile("late-be.ome.tif", bytes));
+		expect(r.cls).toBe("ome-tiff");
+	});
+
+	it("IFD 位于 512 KiB 之后（classic TIFF）→ ome-tiff", async () => {
+		const bytes = tiffWithIfdAt({ ifdAt: 524288, bigtiff: false, desc: OME_DESC });
+		const r = await S.classifyFile(fakeFile("late-classic.ome.tif", bytes));
+		expect(r.cls).toBe("ome-tiff");
+	});
+
+	it("转换器 JSON 描述外联在文件后部（own-output 布局）→ converter-bigtiff", async () => {
+		const bytes = tiffWithIfdAt({ ifdAt: 286247, desc: CONVERTER_DESC });
+		const r = await S.classifyFile(fakeFile("own-output.tif", bytes));
+		expect(r.cls).toBe("converter-bigtiff");
+		expect(r.directClass).toBe("converter-bigtiff");
+	});
+
+	it("描述 count 谎报 64 MiB：只按上限定长读，分类仍正确（不 OOM）", async () => {
+		const bytes = tiffWithIfdAt({
+			ifdAt: 524304, desc: OME_DESC, descCount: 64 * 1024 * 1024,
+		});
+		const f = fakeFile("huge-count.ome.tif", bytes);
+		const r = await S.classifyFile(f);
+		expect(r.cls).toBe("ome-tiff");
+		for (const [s, e] of f.slices) {
+			expect(e - s).toBeLessThanOrEqual(SNIFF_READ_CAP);
+		}
+		expect(readBudget(f)).toBeLessThanOrEqual(SNIFF_TOTAL_BUDGET);
+	});
+
+	it("IFD 偏移越界/头不完整 → 按 temporary 降级（服务端终审）", async () => {
+		const junk = new Uint8Array(64);
+		junk.set([0x49, 0x49, 43, 0, 8, 0, 0, 0, 0xff, 0xff, 0xff, 0xff,
+			0x7f, 0, 0, 0]);   // BigTIFF 头，IFD 偏移越界
+		const r = await S.classifyFile(fakeFile("bad.tif", junk));
+		expect(r.cls).toBe("temporary");
+	});
+});
+
+// --------------------------------------------------------------------------- //
+// review 2026-10-07 #2：真实公开样本（env 提供时才跑；缺样本/缺二进制跳过）
+// 与 CLI 转换器产物（bf-ome / bf-classic）的分类。env 见
+// .testdata/openslide/ucf-samples.env（NDPI_SAMPLE / SCN_SAMPLE / BIF_SAMPLE /
+// RASTER_SAMPLE）；转换器 slide-transform-core/target/release/slide-transform
+// 以 320M 内存门运行（与既有脚本一致）。
+// --------------------------------------------------------------------------- //
+
+const envSample = (name: string) => {
+	const v = process.env[name];
+	return v && existsSync(v) ? v : null;
+};
+const CONVERT_BIN = resolve(here,
+	"../../slide-transform-core/target/release/slide-transform");
+
+const fixtureDir = mkdtempSync(join(tmpdir(), "slide-sniff-"));
+const generated: Array<{ path: string; want: { cls: string; directClass: string | null } }> = [];
+
+function convert(src: string, out: string, profile: string): boolean {
+	if (!existsSync(CONVERT_BIN) || !envSample("RASTER_SAMPLE")) return false;
+	const wrap = ["systemd-run", "--user", "--scope", "-q",
+		"-p", "MemoryMax=320M", "-p", "MemorySwapMax=0", CONVERT_BIN];
+	const r = spawnSync(wrap[0], [...wrap.slice(1), "convert", src, out,
+		"--profile", profile], { encoding: "utf8", timeout: 300000 });
+	return r.status === 0 && existsSync(out);
+}
+
+const rasterSample = envSample("RASTER_SAMPLE");
+if (rasterSample && existsSync(CONVERT_BIN)) {
+	const ome = join(fixtureDir, "convert-bf-ome.tif");
+	const classic = join(fixtureDir, "convert-bf-classic.tif");
+	if (convert(rasterSample, ome, "bf-ome")) {
+		generated.push({ path: ome, want: { cls: "ome-tiff", directClass: "ome-tiff" } });
+	}
+	if (convert(rasterSample, classic, "bf-classic")) {
+		generated.push({ path: classic,
+			want: { cls: "converter-bigtiff", directClass: "converter-bigtiff" } });
+	}
+}
+
+const realSamples: Array<{ path: string; cls: string }> = [];
+for (const [env, cls] of [
+	["NDPI_SAMPLE", "convert"], ["SCN_SAMPLE", "convert"], ["BIF_SAMPLE", "convert"],
+] as Array<[string, string]>) {
+	const p = envSample(env);
+	if (p) realSamples.push({ path: p, cls });
+}
+
+describe("slide-sniff：真实样本与转换器产物（env 提供时）", () => {
+	it.runIf(generated.length > 0)(
+		"CLI 转换器产物（bf-ome → ome-tiff / bf-classic → converter-bigtiff）",
+		async () => {
+			expect(generated.length).toBeGreaterThanOrEqual(1);
+			for (const g of generated) {
+				const f = fileFromPath(g.path);
+				const r = await S.classifyFile(f);
+				f.close();
+				expect(r.cls, basename(g.path)).toBe(g.want.cls);
+				expect(r.directClass, basename(g.path)).toBe(g.want.directClass);
+				// 有界：MB 级产物分类只读 ≤ 1 MiB，且远小于文件本身
+				expect(readBudget(f as never)).toBeLessThanOrEqual(SNIFF_TOTAL_BUDGET);
+				expect(readBudget(f as never)).toBeLessThan(statSync(g.path).size);
+			}
+		});
+
+	it.runIf(realSamples.length > 0)("真实 NDPI/SCN/BIF 样本 → convert（分流到本机转换）",
+		async () => {
+			for (const s of realSamples) {
+				const f = fileFromPath(s.path);
+				const r = await S.classifyFile(f);
+				f.close();
+				expect(r.cls, basename(s.path)).toBe(s.cls);
+				expect(r.ext, basename(s.path)).toBe("." + basename(s.path).split(".").pop()!.toLowerCase());
+				for (const [a, b] of f.slices) {
+					expect(b - a).toBeLessThanOrEqual(SNIFF_READ_CAP);
+				}
+				expect(readBudget(f as never)).toBeLessThanOrEqual(SNIFF_TOTAL_BUDGET);
+			}
+		});
+});
+
+// --------------------------------------------------------------------------- //
+// review 2026-10-07 #2：JS 与 Python（upload_direct_class.sniff_tiff_class）
+// 对同一批夹具分类一致（词表映射：ome-tiff/converter-bigtiff/svs-jp2k/
+// tiff-other/non-tiff——convert/temporary 都对应 tiff-other）。
+// --------------------------------------------------------------------------- //
+
+function pythonSniffer(): ((p: string) => string) | null {
+	const candidates = [resolve(here, "../../.venv/bin/python3"), "python3"];
+	for (const py of candidates) {
+		const probe = spawnSync(py, ["-c", "import upload_direct_class"],
+			{ cwd: resolve(here, "../.."), encoding: "utf8" });
+		if (probe.status === 0) {
+			return (p: string) => {
+				const r = spawnSync(py, ["-c",
+					"import sys,upload_direct_class as u;"
+					+ "sys.stdout.write(u.sniff_tiff_class(sys.argv[1]))", p],
+					{ cwd: resolve(here, "../.."), encoding: "utf8", timeout: 60000 });
+				return r.status === 0 ? r.stdout : "error";
+			};
+		}
+	}
+	return null;
+}
+
+describe("slide-sniff：JS/Python 分类一致性（parity）", () => {
+	const py = pythonSniffer();
+	const t = py ? it : it.skip;
+
+	t("同一批夹具（合成 + 真实 + 转换器产物）两边分类一致", async () => {
+		// JS 词表 → Python sniff_tiff_class 词表
+		const toPy = (r: { cls: string; svsJp2k: boolean }) => {
+			if (r.cls === "ome-tiff") return "ome-tiff";
+			if (r.cls === "converter-bigtiff") return "converter-bigtiff";
+			if (r.svsJp2k) return "svs-jp2k";
+			return "tiff-other";   // convert/temporary 同属 tiff-other
+		};
+		const cases: Array<{ path: string; name: string }> = [];
+		const synth: Array<[string, Uint8Array]> = [
+			["parity-little.ome.tif", tiffWithIfdAt({ ifdAt: 524304, desc: OME_DESC })],
+			["parity-late-be.tif", tiffWithIfdAt({ ifdAt: 524304, bigEndian: true, desc: OME_DESC })],
+			["parity-converter.tif", tiffWithIfdAt({ ifdAt: 286247, desc: CONVERTER_DESC })],
+			["parity-plain.tif", tiffWithIfdAt({ ifdAt: 524288, bigtiff: false, desc: PLAIN_DESC })],
+			["parity-jp2k.svs", tiffWithIfdAt({
+				ifdAt: 8, bigtiff: false, entries: [[259, 3, 33005]] })],
+			["parity-gtiff.tif", tiffWithIfdAt({
+				ifdAt: 8, bigtiff: false,
+				entries: [[259, 3, 7], [262, 3, 2], [277, 3, 3], [322, 3, 512], [323, 3, 512]],
+			})],
+		];
+		const { writeFileSync } = await import("node:fs");
+		for (const [name, bytes] of synth) {
+			const p = join(fixtureDir, name);
+			writeFileSync(p, bytes);
+			cases.push({ path: p, name });
+		}
+		for (const g of generated) cases.push({ path: g.path, name: basename(g.path) });
+		for (const s of realSamples) cases.push({ path: s.path, name: basename(s.path) });
+		expect(cases.length).toBeGreaterThanOrEqual(synth.length);
+		for (const c of cases) {
+			const f = fileFromPath(c.path);
+			const js = await S.classifyFile(f);
+			f.close();
+			const expected = toPy({ cls: js.cls, svsJp2k: js.svsJp2k });
+			const actual = py(c.path);
+			expect(actual, `${c.name}: JS=${js.cls} py=${actual}`).toBe(expected);
+		}
+	}, 120000);
 });

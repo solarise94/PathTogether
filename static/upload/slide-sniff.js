@@ -1,8 +1,12 @@
 /* =========================================================================
    slide-sniff.js — 直传类别嗅探（共享；先转换后上传阶段 1）。
    工作台（static/app.js，classic script）与本地切片工具页（/tools/slides）
-   共用的纯函数模块：只用 Blob.slice 读文件头（合计 ≤ 128 KB，绝不读整个
-   文件），把文件判为：
+   共用的纯函数模块：绝不整体读取文件，只做**有界随机读取**——
+   普通图片（BMP/JPEG）读头窗口 ≤ 128 KB；TIFF 全部变体按「魔数/头 →
+   首 IFD 偏移 → IFD 条目 → 所需标签值偏移」定点小读（单次 ≤ 256 KiB、
+   单文件累计 ≤ 1 MiB、单文本标签 ≤ 64 KiB、IFD 表窗口 ≤ 128 KiB——
+   review 2026-10-07 #2：不再假设 IFD/描述落在文件头部窗口，本工具自己
+   导出的 OME-TIFF 首个 IFD 就在 ~286 KiB 处）。把文件判为：
 
      ome-tiff           TIFF 且 ImageDescription 含 OME-XML → 直接上传
                         （direct_class="ome-tiff"）
@@ -75,7 +79,19 @@
     SVS_JP2K: "unconverted-variant:svs-jp2k",
   };
 
-  var HEAD_BYTES = 128 * 1024;   // 阶段 1 合同：合计最多约 128 KB
+  var HEAD_BYTES = 128 * 1024;   // 普通图片（BMP/JPEG）头窗口（标记序列）
+
+  // review 2026-10-07 #2：TIFF 一律「魔数/头 → 首 IFD 偏移 → IFD 条目 →
+  // 所需标签值」做**有界随机读取**（Blob.slice 定点小读），不假设 IFD/描述
+  // 落在文件头部窗口。文档化预算（tests/js/slide-sniff.test.ts 同值断言）：
+  //   单次 slice 读 ≤ SNIFF_READ_CAP（256 KiB）
+  //   单文件嗅探累计读 ≤ SNIFF_TOTAL_BUDGET（1 MiB）
+  //   单个文本标签（描述/XMLPacket/Make）≤ SNIFF_TEXT_CAP（64 KiB）
+  //   IFD 表窗口 ≤ SNIFF_IFD_WINDOW（128 KiB ≈ 4096 条 BigTIFF 条目）
+  var SNIFF_READ_CAP = 256 * 1024;
+  var SNIFF_TOTAL_BUDGET = 1024 * 1024;
+  var SNIFF_TEXT_CAP = 64 * 1024;
+  var SNIFF_IFD_WINDOW = 128 * 1024;
 
   function extOf(name) {
     var base = String(name || "").replace(/\\/g, "/").split("/").pop();
@@ -166,20 +182,32 @@
     return little ? lo + hi * 4294967296 : hi + lo * 4294967296;
   }
 
-  function descTextAt(ifdBytes, entry, little, bigtiff) {
+  // 文本标签（270 描述 / 700 XMLPacket / 271 Make）的定位。
+  // → {inline, offset, count}：inline=true 时 offset 相对 ifdBytes（值内联在
+  // 值域字段）；否则 offset 是**文件绝对偏移**（外联，调用方定点读）。
+  // null = 无值/坏偏移。count 是标签声明的字节数（可以谎报任意大——读取方
+  // 必须按 SNIFF_TEXT_CAP 截断）。
+  function textLocation(entry, ifdDv, little, bigtiff) {
     try {
-      var dv = new DataView(ifdBytes.buffer, ifdBytes.byteOffset,
-                            ifdBytes.byteLength);
       var count = entry.count;
-      var offset;
+      if (!(count > 0)) return null;
       if (count <= entry.inlineMax) {
-        offset = entry.valueAt;
-      } else {
-        offset = valueOffset64(dv, entry.valueAt, little, bigtiff);
+        return { inline: true, offset: entry.valueAt, count: count };
       }
-      return { offset: offset, count: count };
+      var offset = valueOffset64(ifdDv, entry.valueAt, little, bigtiff);
+      if (offset <= 0 || offset > Number.MAX_SAFE_INTEGER) return null;
+      return { inline: false, offset: offset, count: count };
     } catch (e) {
       return null;
+    }
+  }
+
+  function decodeText(bytes) {
+    if (!bytes || !bytes.byteLength) return "";
+    try {
+      return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+    } catch (e) {
+      return "";
     }
   }
 
@@ -201,53 +229,19 @@
   }
 
   /**
-   * classifyTiffHead(headBytes, moreBytes, ext) — 纯函数（可注入字节，
-   * vitest 直用）。headBytes：文件前 8 字节起的整段头（≤HEAD_BYTES）；
-   * moreBytes：描述/IFD 超出 headBytes 时的**续读段**（可 null，带
-   * baseOffset 标注其在文件中的起点）。ext：小写扩展名（.svs 等）。
-   * 返回 { cls, directClass, compression }：
-   *   cls ∈ ome-tiff | converter-bigtiff | temporary（含 svs-jp2k / 普通
-   *   TIFF）——convert/unsupported 由扩展名快路径在 classifyExt 决定。
+   * decideTiff(ext, hdr, ifdBytes, idv, little, compression, texts) — 决策
+   * 核心（同步纯函数；文本已由调用方按预算解码）：
+   *   texts.desc  IFD0 ImageDescription（270）
+   *   texts.xmp   IFD0 XMLPacket（700，仅 .bif 需要）
+   *   texts.make  IFD0 Make（271，仅 .ndpi 需要）
+   * 返回 { cls, directClass, compression }。convert/unsupported 由扩展名
+   * 快路径在 classifyExt 决定（.svs 等 tiff 路由的 convert 也在此）。
    */
-  function classifyTiffHead(headBytes, more, ext) {
+  function decideTiff(ext, hdr, ifdBytes, idv, little, compression, texts) {
+    var bigtiff = hdr.bigtiff;
     var result = { cls: CLS.TEMPORARY, directClass: DIRECT_CLASS.LEGACY,
-                   compression: 0 };
-    if (!headBytes || headBytes.byteLength < 8) return result;
-    var h = new DataView(headBytes.buffer || headBytes,
-                         headBytes.byteOffset || 0,
-                         headBytes.byteLength);
-    var b0 = h.getUint8(0), b1 = h.getUint8(1);
-    var little;
-    if (b0 === 0x49 && b1 === 0x49) little = true;
-    else if (b0 === 0x4D && b1 === 0x4D) little = false;
-    else return result;
-    var hdr = readTiffHeader(h, little);
-    if (!hdr) return result;
-
-    // IFD 区可能位于头部之外：优先 headBytes，越界用续读段
-    var ifdBytes = sliceRegion(headBytes, hdr.ifdOffset, 4 + 4096 * 24 + 64,
-                               more);
-    if (!ifdBytes) return result;
-    var idv = new DataView(ifdBytes.buffer, ifdBytes.byteOffset,
-                           ifdBytes.byteLength);
-    var compEntry = findIfdEntry(ifdBytes, little, 259, hdr.bigtiff);
-    var compression = compEntry ? ifdUint(compEntry, idv, little) : 0;
-    result.compression = compression;
-
-    var descEntry = findIfdEntry(ifdBytes, little, 270, hdr.bigtiff);
-    var text = "";
-    if (descEntry) {
-      var loc = descTextAt(ifdBytes, descEntry, little, hdr.bigtiff);
-      if (loc && loc.count > 0) {
-        var cap = Math.min(loc.count, HEAD_BYTES);
-        var raw = readRegion(headBytes, loc.offset, cap, more);
-        if (raw) {
-          try {
-            text = new TextDecoder("utf-8", { fatal: false }).decode(raw);
-          } catch (e) { text = ""; }
-        }
-      }
-    }
+                   compression: compression };
+    var text = texts.desc || "";
     if (looksLikeOmeXml(text)) {
       result.cls = CLS.OME;
       result.directClass = DIRECT_CLASS.OME;
@@ -282,21 +276,8 @@
       // Ventana BIF：IFD0 的 XMLPacket（700）携带 iScan 厂商块；BIF 是
       // BigTIFF，重叠瓦片拼接重编码已覆盖。JPEG2000（33003/33005）、
       // 经典 TIFF 容器或无 iScan 块 → 默认 temporary = 暂时直传。
-      var xmpEntry = findIfdEntry(ifdBytes, little, 700, hdr.bigtiff);
-      var xmpText = "";
-      if (xmpEntry) {
-        var xloc = descTextAt(ifdBytes, xmpEntry, little, hdr.bigtiff);
-        if (xloc && xloc.count > 0) {
-          var xcap = Math.min(xloc.count, 4096);
-          var xraw = readRegion(headBytes, xloc.offset, xcap, more);
-          if (xraw) {
-            try { xmpText = new TextDecoder("utf-8", { fatal: false }).decode(xraw); }
-            catch (e) { xmpText = ""; }
-          }
-        }
-      }
-      if (xmpText.indexOf("iScan") !== -1) {
-        if (!hdr.bigtiff) return result;  // 经典 TIFF 的 ventana tif 变体
+      if ((texts.xmp || "").indexOf("iScan") !== -1) {
+        if (!bigtiff) return result;  // 经典 TIFF 的 ventana tif 变体
         if (compression === 7) {
           result.cls = CLS.CONVERT;
           result.directClass = null;
@@ -310,13 +291,13 @@
       // Hamamatsu 且 IFD0 为整层单条带 JPEG 明场（压缩 7、3 采样、
       // photo 2/6、非分块）→ 本机转换后上传；JPEG2000（33003/33005）、
       // 分块存储或多通道变体不满足判定 → 默认 temporary = 暂时直传。
-      if (compression === 7 && ndpiConvertible(headBytes, ifdBytes, idv, little, hdr.bigtiff)) {
+      if (compression === 7 && ndpiConvertible(texts.make || "", ifdBytes, idv, little, bigtiff)) {
         result.cls = CLS.CONVERT;
         result.directClass = null;
       }
       return result;
     }
-    if (compression === 7 && genericTiledConvertible(ifdBytes, idv, little, hdr.bigtiff)) {
+    if (compression === 7 && genericTiledConvertible(ifdBytes, idv, little, bigtiff)) {
       // F5：通用瓦片 JPEG TIFF/BigTIFF（无厂商描述 + tiled + 3 采样 +
       // photo 2/6）：浏览器转换器覆盖 → 本机转换后上传。条带/LZW/
       // deflate/非 8 位/多通道变体不满足判定 → 默认 temporary = 暂时直传。
@@ -325,6 +306,63 @@
       return result;
     }
     return result;
+  }
+
+  /** 从 IFD 区解析压缩码与所需文本标签（entries/内联值同区；外联值经
+   *  resolveText(loc) 回调读取——同步路径给缓冲回调，文件路径给定点读）。 */
+  function collectTiffParts(ifdBytes, little, bigtiff, ext, resolveText) {
+    var idv = new DataView(ifdBytes.buffer, ifdBytes.byteOffset,
+                           ifdBytes.byteLength);
+    var compEntry = findIfdEntry(ifdBytes, little, 259, bigtiff);
+    var compression = compEntry ? ifdUint(compEntry, idv, little) : 0;
+    function textOf(tag) {
+      var entry = findIfdEntry(ifdBytes, little, tag, bigtiff);
+      if (!entry) return "";
+      var loc = textLocation(entry, idv, little, bigtiff);
+      if (!loc) return "";
+      var cap = Math.min(loc.count, SNIFF_TEXT_CAP);
+      if (loc.inline) {
+        return decodeText(ifdBytes.subarray(
+          loc.offset, Math.min(ifdBytes.byteLength, loc.offset + cap)));
+      }
+      return resolveText(loc.offset, cap);
+    }
+    var texts = { desc: textOf(270), xmp: "", make: "" };
+    if (ext === ".bif") texts.xmp = textOf(700);
+    if (ext === ".ndpi") texts.make = textOf(271);
+    return { compression: compression, texts: texts };
+  }
+
+  /**
+   * classifyTiffHead(headBytes, moreBytes, ext) — 同步入口（注入字节，
+   * vitest 直用；外联值在 headBytes/more 覆盖范围内解析，覆盖不到 = 无值）。
+   * 生产路径是 classifyFile → classifyTiffReadable（有界随机读取）。
+   */
+  function classifyTiffHead(headBytes, more, ext) {
+    var result = { cls: CLS.TEMPORARY, directClass: DIRECT_CLASS.LEGACY,
+                   compression: 0 };
+    if (!headBytes || headBytes.byteLength < 8) return result;
+    var h = new DataView(headBytes.buffer || headBytes,
+                         headBytes.byteOffset || 0,
+                         headBytes.byteLength);
+    var b0 = h.getUint8(0), b1 = h.getUint8(1);
+    var little;
+    if (b0 === 0x49 && b1 === 0x49) little = true;
+    else if (b0 === 0x4D && b1 === 0x4D) little = false;
+    else return result;
+    var hdr = readTiffHeader(h, little);
+    if (!hdr) return result;
+    // IFD 区可能位于头部之外：优先 headBytes，越界用续读段
+    var ifdBytes = sliceRegion(headBytes, hdr.ifdOffset, SNIFF_IFD_WINDOW,
+                               more);
+    if (!ifdBytes) return result;
+    var parts = collectTiffParts(ifdBytes, little, hdr.bigtiff, ext,
+      function (offset, cap) {
+        return decodeText(readRegion(headBytes, offset, cap, more));
+      });
+    return decideTiff(ext, hdr, ifdBytes, new DataView(ifdBytes.buffer,
+      ifdBytes.byteOffset, ifdBytes.byteLength), little, parts.compression,
+      parts.texts);
   }
 
   // F5：通用瓦片 JPEG TIFF 的可转换结构判定（与 Rust gtiff.rs / engine.js
@@ -346,21 +384,9 @@
   // 同一契约的 IFD0 快判）：Make（271）含 Hamamatsu、整层单条带（273/279
   // 在场且无 322/323）、SamplesPerPixel=3、PhotometricInterpretation ∈
   // {2, 6}。restart marker/层级/关联图分类由核心在复制后终审。
-  function ndpiConvertible(headBytes, ifdBytes, idv, little, bigtiff) {
-    var make = findIfdEntry(ifdBytes, little, 271, bigtiff);
-    if (!make) return false;
-    var makeLoc = descTextAt(ifdBytes, make, little, bigtiff);
-    var makeText = "";
-    if (makeLoc && makeLoc.count > 0) {
-      // Make 值是绝对文件偏移（count > 4 恒为外联），从头缓冲读取
-      var raw = readRegion(headBytes, makeLoc.offset,
-        Math.min(makeLoc.count, 4096), null);
-      if (raw) {
-        try { makeText = new TextDecoder("utf-8", { fatal: false }).decode(raw); }
-        catch (e) { makeText = ""; }
-      }
-    }
-    if (makeText.indexOf("Hamamatsu") === -1) return false;
+  // makeText 由调用方按预算解码（值域字段是文件绝对偏移 → 定点读）。
+  function ndpiConvertible(makeText, ifdBytes, idv, little, bigtiff) {
+    if ((makeText || "").indexOf("Hamamatsu") === -1) return false;
     if (findIfdEntry(ifdBytes, little, 322, bigtiff) ||
         findIfdEntry(ifdBytes, little, 323, bigtiff)) return false;
     if (!findIfdEntry(ifdBytes, little, 273, bigtiff) ||
@@ -480,6 +506,91 @@
   }
 
   /**
+   * classifyTiffReadable(file, ext) — TIFF 生产路径（review 2026-10-07 #2）。
+   * 有界随机读取：头 16B → 首 IFD 偏移 → IFD 表（≤ SNIFF_IFD_WINDOW）→
+   * 所需标签值按其**文件绝对偏移**定点读（≤ SNIFF_TEXT_CAP）。
+   * 预算由 spent 累计约束：单次 ≤ SNIFF_READ_CAP、总计 ≤ SNIFF_TOTAL_BUDGET，
+   * 超预算按“读不到”处理（分类降级，服务端终审）。
+   * 返回 Promise<result|null>（null = 头/IFD 读不出或非 TIFF）。
+   */
+  function classifyTiffReadable(file, ext) {
+    var spent = 0;
+    var size = (file && typeof file.size === "number" &&
+                isFinite(file.size)) ? file.size : 0;
+
+    function readAt(offset, cap) {
+      // 定点读 [offset, offset+len)；预算耗尽/越界 → null（不当头处理）
+      if (!size || !(offset >= 0) || offset >= size) {
+        return Promise.resolve(null);
+      }
+      var len = Math.min(cap, SNIFF_READ_CAP, size - offset,
+                         SNIFF_TOTAL_BUDGET - spent);
+      if (len <= 0) return Promise.resolve(null);
+      spent += len;
+      return Promise.resolve()
+        .then(function () { return file.slice(offset, offset + len).arrayBuffer(); })
+        .then(function (buf) {
+          return (buf && buf.byteLength) ? new Uint8Array(buf) : null;
+        }, function () { return null; });
+    }
+
+    return readAt(0, 16).then(function (head) {
+      if (!head || head.byteLength < 8) return null;
+      var h = new DataView(head.buffer, head.byteOffset, head.byteLength);
+      var b0 = h.getUint8(0), b1 = h.getUint8(1);
+      var little;
+      if (b0 === 0x49 && b1 === 0x49) little = true;
+      else if (b0 === 0x4D && b1 === 0x4D) little = false;
+      else return null;
+      var hdr = readTiffHeader(h, little);
+      if (!hdr || hdr.ifdOffset >= size) return null;
+      return readAt(hdr.ifdOffset, SNIFF_IFD_WINDOW).then(function (ifdBytes) {
+        if (!ifdBytes || ifdBytes.byteLength < (hdr.bigtiff ? 8 : 2)) return null;
+        var idv = new DataView(ifdBytes.buffer, ifdBytes.byteOffset,
+                               ifdBytes.byteLength);
+        var compEntry = findIfdEntry(ifdBytes, little, 259, hdr.bigtiff);
+        var compression = compEntry ? ifdUint(compEntry, idv, little) : 0;
+        // 外联文本值（值域字段 = 文件绝对偏移）→ 定点读；内联值直接取。
+        // 先收集待读位置，再统一异步读取（读失败按“无值”降级）。
+        function pendingOf(tag) {
+          var entry = findIfdEntry(ifdBytes, little, tag, hdr.bigtiff);
+          if (!entry) return null;
+          var loc = textLocation(entry, idv, little, hdr.bigtiff);
+          if (!loc || loc.inline) return null;
+          return { offset: loc.offset, cap: Math.min(loc.count, SNIFF_TEXT_CAP) };
+        }
+        var pendings = { desc: pendingOf(270) };
+        if (ext === ".bif") pendings.xmp = pendingOf(700);
+        if (ext === ".ndpi") pendings.make = pendingOf(271);
+        var keys = Object.keys(pendings).filter(function (k) {
+          return pendings[k];
+        });
+        return Promise.all(keys.map(function (k) {
+          return readAt(pendings[k].offset, pendings[k].cap);
+        })).then(function (chunks) {
+          var texts = { desc: "", xmp: "", make: "" };
+          // 内联文本（值内联在 IFD 值域字段里）直接取自 ifdBytes
+          function inlineText(tag) {
+            var entry = findIfdEntry(ifdBytes, little, tag, hdr.bigtiff);
+            if (!entry) return "";
+            var loc = textLocation(entry, idv, little, hdr.bigtiff);
+            if (!loc || !loc.inline) return "";
+            var cap = Math.min(loc.count, SNIFF_TEXT_CAP);
+            return decodeText(ifdBytes.subarray(
+              loc.offset, Math.min(ifdBytes.byteLength, loc.offset + cap)));
+          }
+          texts.desc = inlineText(270);
+          if (ext === ".bif") texts.xmp = inlineText(700);
+          if (ext === ".ndpi") texts.make = inlineText(271);
+          keys.forEach(function (k, i) { texts[k] = decodeText(chunks[i]); });
+          return decideTiff(ext, hdr, ifdBytes, idv, little,
+            compression, texts);
+        });
+      });
+    });
+  }
+
+  /**
    * classifyExt(name) — 纯扩展名快路径（不读字节）。
    * 返回 { route: 'tiff' | cls, ... }：tiff → 需要头解析；否则直接给类别。
    */
@@ -578,50 +689,16 @@
                      compression: 0 };
           });
       }
-      // TIFF 类：读头（8 字节魔数定位 IFD；合计 ≤ HEAD_BYTES）
-      return read(0, Math.min(HEAD_BYTES, file.size || HEAD_BYTES))
-        .then(function (headBuf) {
-          var head = new Uint8Array(headBuf);
-          // 首轮：IFD/描述可能越出头部 → 解析失败再补读一段（IFD 常在
-          // 头部，二轮只是兜底；合计仍 ≤ 2×HEAD_BYTES 的头区域）
-          var first = classifyTiffHead(head, null, routed.ext);
-          if (first.cls === CLS.TEMPORARY &&
-              first.directClass === DIRECT_CLASS.LEGACY &&
-              first.compression === 0) {
-            // BIF：IFD0 常在标签图载荷之后（真实样本约 0.5 MB 处），超出
-            // 头窗口——按头字段指向的首 IFD 偏移再补读一段（≤ 96 KiB，
-            // 合计仍有界）
-            if (routed.bif && head.length >= 16) {
-              // 按文件自身的字节序读首 IFD 偏移（曾硬编码小端）
-              var dv0 = new DataView(head.buffer, head.byteOffset, head.byteLength);
-              var le0 = head[0] === 0x49 && head[1] === 0x49;
-              var isBig = dv0.getUint16(2, le0) === 43;
-              var ifdOff0 = valueOffset64(dv0, isBig ? 8 : 4, le0, isBig);
-              if (ifdOff0 > 0 && ifdOff0 < (file.size || Infinity)) {
-                // 窗口从 IFD 前 64 KiB 起：外联值（描述/XMLPacket）既可能
-                // 排在 IFD 表之后（真实布局），也可能排在前面
-                var wFrom = Math.max(0, ifdOff0 - 64 * 1024);
-                var wLen = Math.min(160 * 1024, Math.max(0, (file.size || ifdOff0) - wFrom));
-                return read(wFrom, wFrom + wLen).then(function (ifdBuf) {
-                  var more2 = ifdBuf && ifdBuf.byteLength
-                    ? { bytes: new Uint8Array(ifdBuf), baseOffset: wFrom }
-                    : null;
-                  return classifyTiffHead(head, more2, routed.ext);
-                }, function () {
-                  return first;
-                });
-              }
-            }
-            return read(HEAD_BYTES, HEAD_BYTES * 2).then(function (moreBuf) {
-              var more = moreBuf && moreBuf.byteLength
-                ? { bytes: new Uint8Array(moreBuf), baseOffset: HEAD_BYTES }
-                : null;
-              return classifyTiffHead(head, more, routed.ext);
-            }, function () {
-              return first;
-            });
-          }
-          return first;
+      // TIFF 类（review 2026-10-07 #2）：按「头 16B → 首 IFD 偏移 → IFD
+      // 表 → 标签值偏移」**有界随机读取**（每次 slice ≤ SNIFF_READ_CAP、
+      // 累计 ≤ SNIFF_TOTAL_BUDGET），不再假设 IFD/描述在头部两个 128 KiB
+      // 窗口。任何读失败/解析不出 → temporary 降级（服务端终审）。
+      return classifyTiffReadable(file, routed.ext)
+        .then(function (r) {
+          if (r) return r;
+          // 头/IFD 读不出（截断/伪裱）：按普通 TIFF 暂时直传降级
+          return { cls: CLS.TEMPORARY, directClass: DIRECT_CLASS.LEGACY,
+                   compression: 0 };
         })
         .then(function (r) {
           r.ext = routed.ext;
@@ -645,6 +722,11 @@
     CLS: CLS,
     DIRECT_CLASS: DIRECT_CLASS,
     CONVERTER_SOURCE_FORMATS: CONVERTER_SOURCE_FORMATS,
+    // 有界读取预算（文档化数字；tests/js/slide-sniff.test.ts 同值断言）
+    SNIFF_READ_CAP: SNIFF_READ_CAP,
+    SNIFF_TOTAL_BUDGET: SNIFF_TOTAL_BUDGET,
+    SNIFF_TEXT_CAP: SNIFF_TEXT_CAP,
+    SNIFF_IFD_WINDOW: SNIFF_IFD_WINDOW,
     classifyExt: classifyExt,
     classifyTiffHead: classifyTiffHead,
     classifyRasterHead: classifyRasterHead,

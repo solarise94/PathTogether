@@ -3201,6 +3201,104 @@
       item.slide_id || "—";
   }
 
+  // ------------------------------------------------------------------
+  // 失败资产的证据展示（inventory failure 字段；2026-10-03）：
+  //   - code 是任务表存储的稳定机器码（ingestion fail_code / conversion·
+  //     baidu error_code；回填行推断 missing_file 时 inferred=true）；
+  //   - source 是来源任务族（COS 上传 / KFB 转换 / 百度导入 / 直传 / 回填）；
+  //   - occurred_at 是失败时间（epoch 秒）。
+  // 词表按后端写入口径列举（ingestion_store/cos_ingest_worker/
+  // conversion_worker/kfb/baidu_import_store/baidu_ingest/backfill 脚本）；
+  // 未列举的码回显原文（绝不假装翻译），code 缺失时按终态给通用文案。
+  // ------------------------------------------------------------------
+  var SLIDE_FAIL_CODE_LABELS = {
+    // 回填/迁移（scripts/backfill_slide_asset_state 等）
+    missing_file: "源文件缺失",
+    // COS 摄取（ingestion_jobs.fail_code）
+    cancelled_by_user: "用户已取消上传",
+    local_quota_infeasible: "本地容量配额不足，任务未受理",
+    waiting_timeout: "等待上传超时（未在期限内开始）",
+    local_reservation_invalid: "本地容量预约异常，任务终止",
+    part_plan_lost: "分片计划丢失",
+    upload_lost_after_complete: "上传会话在完成后丢失",
+    source_version_missing: "源对象版本缺失",
+    source_size_mismatch: "源对象大小与声明不符",
+    source_not_pinned: "源对象版本未锁定",
+    download_budget_exceeded: "下载预算超限",
+    slide_binding_missing: "资产绑定缺失",
+    commit_recovery_failed: "提交恢复失败",
+    part_missing: "分片缺失",
+    local_size_mismatch: "本地落盘大小不符",
+    convert_in_browser: "浏览器端转换形态被拒",
+    validation_failed: "切片文件校验不通过",
+    hash_mismatch: "文件哈希与声明不符",
+    publish_conflict: "发布冲突",
+    reservation_expired: "上传容量预占失效",
+    owner_missing: "资产归属缺失",
+    zip_items_failed: "ZIP 条目全部发布失败",
+    // ZIP 条目（ingestion_job_items.fail_code）
+    item_source_missing: "ZIP 内源文件缺失",
+    // KFB 转换（conversion_jobs.error_code / kfb 词表）
+    invalid_kfb_header: "KFB 文件头无效",
+    kfb_bad: "KFB 数据损坏",
+    conversion_validation_failed: "转换产物校验失败",
+    conversion_disk_low: "磁盘空间不足",
+    conversion_timeout: "转换超时",
+    conversion_busy: "同内容转换进行中",
+    invalid_tile_index: "KFB 瓦片索引无效",
+    jpeg_decode_failed: "JPEG 解码失败",
+    metadata_missing_required: "KFB 必需元数据缺失",
+    tile_payload_out_of_bounds: "瓦片数据越界",
+    unsupported_kfb_variant: "不支持的 KFB 变体",
+    upload_terminated: "源上传已终止，转换取消",
+    // 百度导入（baidu_import_items.error_code / baidu_ingest）
+    share_invalid: "分享无效",
+    source_changed: "源文件已变更",
+    not_retryable: "不可重试错误",
+    duplicate_filename: "文件名重复",
+    transfer_failed: "转存失败",
+    download_output_missing: "下载产物缺失",
+    size_mismatch: "大小校验不符",
+    invalid_name: "非法文件名",
+    invalid_slide: "无法读取（非法切片文件）",
+    unsupported_format: "格式不支持",
+    name_unavailable: "名称不可用",
+  };
+
+  var SLIDE_FAIL_SOURCE_LABELS = {
+    ingestion: "COS 上传",
+    ingestion_item: "COS 上传（ZIP 条目）",
+    conversion: "KFB 转换",
+    baidu_import: "百度网盘导入",
+    upload_task: "直传上传",
+    upload_task_item: "直传上传（ZIP 条目）",
+    backfill: "回填/迁移盘点",
+    unknown: "来源未知",
+  };
+
+  // 失败码 → 中文；「conversion_failed[:code]」按前缀归一；未知码回显原文。
+  function slideFailCodeText(f) {
+    if (f && f.code) {
+      var code = String(f.code);
+      if (code.indexOf("conversion_failed") === 0) return "转换失败";
+      return SLIDE_FAIL_CODE_LABELS[code] || ("未知原因（" + code + "）");
+    }
+    if (f && f.source_state === "cancelled") return "已取消（原因未记录）";
+    return "原因未记录";
+  }
+
+  // failed 行的紧凑明细：原因 · 来源（任务号）· 时间；推断证据显式标注。
+  function slideFailDetailText(item) {
+    var f = item && item.failure;
+    if (!f) return "";
+    var parts = [slideFailCodeText(f)];
+    var src = SLIDE_FAIL_SOURCE_LABELS[f.source] || f.source;
+    if (src) parts.push(src + (f.source_ref ? "（" + f.source_ref + "）" : ""));
+    if (f.inferred) parts.push("依据现状推断");
+    if (f.occurred_at) parts.push(fmtTs(f.occurred_at));
+    return parts.join(" · ");
+  }
+
   // 资产状态 → {text, ok, reason}；reason 是「为什么不能加入」的说明。
   function slideAssetState(item) {
     if (item.unregistered) {
@@ -3215,7 +3313,13 @@
       return { text: "删除中", ok: false, reason: "资产正在删除，不能加入" };
     }
     if (st === "failed") {
-      return { text: "处理失败", ok: false, reason: "资产处理失败，不可读取，不能加入" };
+      var detail = slideFailDetailText(item);
+      return {
+        text: "处理失败", ok: false,
+        reason: detail
+          ? "资产处理失败：" + detail + "；不可读取，不能加入"
+          : "资产处理失败，不可读取，不能加入",
+      };
     }
     if (st === "staging") {
       return { text: "上传处理中", ok: false, reason: "资产尚未发布，完成后才能加入" };
@@ -3292,6 +3396,17 @@
     var stateCell = td(asset.text);
     stateCell.setAttribute("data-asset-state", item.unregistered
       ? "unregistered" : String(item.asset_state || "unknown"));
+    // failed 行在状态列追加紧凑明细（原因 · 来源任务 · 时间；textContent，
+    // 只消费 inventory failure 白名单字段，未知字段不进 DOM）
+    if (!item.unregistered && item.asset_state === "failed") {
+      var failDetail = slideFailDetailText(item);
+      if (failDetail) {
+        var failSub = document.createElement("div");
+        failSub.className = "adm-sub";
+        failSub.textContent = failDetail;
+        stateCell.appendChild(failSub);
+      }
+    }
     tr.appendChild(stateCell);
     tr.appendChild(td(ownerCellText(item)));
     tr.appendChild(td(item.public ? "是" : "—"));

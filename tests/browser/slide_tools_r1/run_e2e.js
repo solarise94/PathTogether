@@ -703,10 +703,12 @@ async function main() {
       await convertFixture(page, fl);
       await page.click('#convert-upload-btn');
       await waitFor(async () => /已发布|Published/.test(await textOf(page, '#upload-status')), 120000, 'published');
-      if (fake.st.completeReqs !== 2) throw new Error(`completeReqs=${fake.st.completeReqs}`);
+      // 完成已在服务端生效、响应丢失：先重查状态（已离开 uploading）→ 不重发
+      //（review 2026-10-07 #10；未生效时的重发由 C4 e2 场景覆盖）
+      if (fake.st.completeReqs !== 1) throw new Error(`completeReqs=${fake.st.completeReqs}`);
       if (fake.st.creates.length !== 1) throw new Error(`creates=${fake.st.creates.length}`);
       record('f3-replayed-complete-one-ingestion', true, {
-        completeReqs: 2, creates: 1,
+        completeReqs: 1, creates: 1,
       });
     } catch (e) {
       record('f3-replayed-complete-one-ingestion', false, { error: String(e).slice(0, 400) });

@@ -250,7 +250,9 @@ async function main() {
       const before = await L.opfsJobSha256(page, jobId);
       await page.click('#upload-btn');
       await waitFor(async () => /已发布|Published/.test(await textOf(page, '#upload-status')), 60000, 'published');
-      if (fake.st.completeReqs !== 2) throw new Error(`completeReqs=${fake.st.completeReqs}`);
+      // 完成请求已在服务端生效、只是响应丢失：客户端先重查状态（已离开
+      // uploading）→ 直接轮询收口，不再重发（review 2026-10-07 #10）
+      if (fake.st.completeReqs !== 1) throw new Error(`completeReqs=${fake.st.completeReqs}`);
       if (fake.st.creates.length !== 1) throw new Error(`creates=${fake.st.creates.length}`);
       const after = await L.opfsJobSha256(page, jobId);
       if (after.sha256 !== before.sha256) throw new Error('artifact sha changed');
@@ -259,6 +261,30 @@ async function main() {
       });
     } catch (e) {
       record('e-lost-complete', false, { error: String(e).slice(0, 400) });
+    } finally {
+      await context.close();
+    }
+  }
+
+  // 完成请求在到达服务端前丢失（状态仍 uploading）→ 重查后幂等重发一次
+  async function scenarioLostCompleteUnapplied() {
+    const { context, page } = await L.launch('e2-lost-unapplied');
+    const fake = await L.fakeUploadRoutes(page, creds.cosOrigin, { partsCount: 2 });
+    fake.behavior.dropCompleteBeforeApply = (job, nth) => nth === 1;
+    try {
+      await L.login(page, PORT, creds, 'user');
+      await L.C3.openTools(page, PORT);
+      const { jobId } = await convertFixture(context, page, fake, bf);
+      const before = await L.opfsJobSha256(page, jobId);
+      await page.click('#upload-btn');
+      await waitFor(async () => /已发布|Published/.test(await textOf(page, '#upload-status')), 60000, 'published');
+      if (fake.st.completeReqs !== 2) throw new Error(`completeReqs=${fake.st.completeReqs}`);
+      if (fake.st.creates.length !== 1) throw new Error(`creates=${fake.st.creates.length}`);
+      const after = await L.opfsJobSha256(page, jobId);
+      if (after.sha256 !== before.sha256) throw new Error('artifact sha changed');
+      record('e2-lost-complete-unapplied', true, { completeReqs: 2 });
+    } catch (e) {
+      record('e2-lost-complete-unapplied', false, { error: String(e).slice(0, 400) });
     } finally {
       await context.close();
     }
@@ -910,6 +936,7 @@ async function main() {
     ['c-refresh-continue', scenarioRefresh],
     ['d-repeated-clicks', scenarioRepeatClicks],
     ['e-lost-complete', scenarioLostComplete],
+    ['e2-lost-complete-unapplied', scenarioLostCompleteUnapplied],
     ['f-oversize', () => scenarioDisabled('f-oversize')],
     ['g-format-unsupported', () => scenarioDisabled('g-format-unsupported')],
     ['h-cancel-terminal', scenarioCancelTerminal],

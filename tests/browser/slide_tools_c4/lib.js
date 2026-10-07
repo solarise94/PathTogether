@@ -191,6 +191,10 @@ async function fakeUploadRoutes(page, cosOrigin, opts = {}) {
       st.completeReqs++;
       const nth = st.completeReqs;
       if (behavior.gateComplete) await behavior.gateComplete();
+      // 请求在到达服务端之前丢失：状态仍停在 uploading（客户端须重查后重发）
+      if (behavior.dropCompleteBeforeApply && behavior.dropCompleteBeforeApply(job, nth)) {
+        return route.abort('connectionfailed');
+      }
       // 服务端语义：complete 幂等且**先于响应**应用——响应丢失（abort）或
       // 重放（409 ingestion_state_conflict）时状态都已离开 uploading。
       if (job.stage === 'uploading') job.stage = 'awaiting_server';

@@ -83,6 +83,10 @@ async function fakeUploadRoutes(page, cosOrigin, opts = {}) {
     onCancel: null,
     // (job) => {status, body} | null —— resume
     onResume: null,
+    // async (body) => void —— POST /api/ingestions 创建响应前的闸（双标签
+    // 并发场景：第二个创建在途时立即放行；只有一个创建时由调用方在闸里
+    // 自设持有时长后放行）。挂起期间请求在途、任务尚未建立。
+    gateCreate: null,
     // () => {status, body} | 'abort' | null —— 能力端点（默认放行真服务端）
     onCapability: null,
     // async () => void | null —— 分块 PUT 前的闸（挂起指定分块供场景控制）
@@ -152,6 +156,7 @@ async function fakeUploadRoutes(page, cosOrigin, opts = {}) {
       if (over && over.status !== 202) {
         return route.fulfill({ status: over.status, contentType: 'application/json', body: JSON.stringify(over.body || {}) });
       }
+      if (behavior.gateCreate) await behavior.gateCreate(body);
       const jid = `inj_c4_${st.creates.length}`;
       const job = {
         id: jid, filename: body.filename, size: body.declared_size,

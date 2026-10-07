@@ -48,6 +48,42 @@ async function currentJobId(page) {
   return page.$eval('.job-row', (r) => r.dataset.jobId);
 }
 
+/// 磁盘 OME-TIFF 夹具（最小 classic TIFF + OME-XML 描述；场景 p/q 共用，
+/// 测试内自生成——不依赖任何 .gate-tmp 既有文件）。
+function directOmeFixture(name = 'direct-ome.tif') {
+  const omeXml = '<?xml version="1.0"?><OME xmlns=' +
+    '"http://www.openmicroscopy.org/Schemas/OME/2016-06"></OME>\0';
+  const desc = Buffer.from(omeXml, 'utf8');
+  const ifd = Buffer.alloc(2 + 12 + 4);
+  ifd.writeUInt16LE(1, 0);            // entry count
+  ifd.writeUInt16LE(270, 2);          // ImageDescription
+  ifd.writeUInt16LE(2, 4);            // ASCII
+  ifd.writeUInt32LE(desc.length, 6);  // count
+  ifd.writeUInt32LE(8 + ifd.length, 10);  // heap offset
+  const head = Buffer.alloc(8);
+  head.write('II', 0, 'ascii');
+  head.writeUInt16LE(42, 2);
+  head.writeUInt32LE(8, 4);
+  const fixture = path.join(L.GATE, 'fixtures', name);
+  fs.mkdirSync(path.dirname(fixture), { recursive: true });
+  fs.writeFileSync(fixture, Buffer.concat([head, ifd, desc]));
+  return fixture;
+}
+
+/// 直传面板就绪 + 装入磁盘文件（场景 p 的装入序列抽出共用）。
+async function loadDirectFixture(page, fixture) {
+  await waitFor(async () => (await page.evaluate(() => window.__stToolsReady)) === true,
+    60000, 'tools page init');
+  await page.evaluate(() => {
+    const el = document.getElementById('file-input');
+    if (el) el.value = '';
+  });
+  await page.setInputFiles('#file-input', fixture);
+  // 「已是可上传格式」面板出现；转换流程（复制/识别）不启动
+  await waitFor(async () => (await page.$('#direct-section:not([hidden])')) !== null,
+    30000, 'direct-ready panel');
+}
+
 async function rowUploadState(page) {
   const el = await page.$('.job-upload-state');
   if (!el) return null;
@@ -849,40 +885,15 @@ async function main() {
   async function scenarioDirectOmeUpload() {
     const { context, page } = await L.launch('p-direct-ome', [L.downloadGuard()]);
     const fake = await L.fakeUploadRoutes(page, creds.cosOrigin, { partsCount: 2 });
+    // 磁盘 OME-TIFF 夹具（最小 classic TIFF + OME-XML 描述）
+    const fixture = directOmeFixture('direct-ome.tif');
     try {
-      // 磁盘 OME-TIFF 夹具（最小 classic TIFF + OME-XML 描述）
-      const omeXml = '<?xml version="1.0"?><OME xmlns=' +
-        '"http://www.openmicroscopy.org/Schemas/OME/2016-06"></OME>\0';
-      const desc = Buffer.from(omeXml, 'utf8');
-      const ifd = Buffer.alloc(2 + 12 + 4);
-      ifd.writeUInt16LE(1, 0);            // entry count
-      ifd.writeUInt16LE(270, 2);          // ImageDescription
-      ifd.writeUInt16LE(2, 4);            // ASCII
-      ifd.writeUInt32LE(desc.length, 6);  // count
-      ifd.writeUInt32LE(8 + ifd.length, 10);  // heap offset
-      const head = Buffer.alloc(8);
-      head.write('II', 0, 'ascii');
-      head.writeUInt16LE(42, 2);
-      head.writeUInt32LE(8, 4);
-      const fixture = path.join(L.GATE, 'fixtures', 'direct-ome.tif');
-      fs.mkdirSync(path.dirname(fixture), { recursive: true });
-      fs.writeFileSync(fixture, Buffer.concat([head, ifd, desc]));
-
       await L.login(page, PORT, creds, 'user');
       await L.C3.openTools(page, PORT);
       // 不能用 L.setFile（其 waitFor 等 files[0]）：直传面板出现时
       // showDirectReady 会清空 file input——这里只等面板本身。
       // change 监听在 init（runner/WASM 加载）末尾才挂上：先等页面就绪
-      await waitFor(async () => (await page.evaluate(() => window.__stToolsReady)) === true,
-        60000, 'tools page init');
-      await page.evaluate(() => {
-        const el = document.getElementById('file-input');
-        if (el) el.value = '';
-      });
-      await page.setInputFiles('#file-input', fixture);
-      // 「已是可上传格式」面板出现；转换流程（复制/识别）不启动
-      await waitFor(async () => (await page.$('#direct-section:not([hidden])')) !== null,
-        30000, 'direct-ready panel');
+      await loadDirectFixture(page, fixture);
       const stageHidden = await page.$eval('#stage-section', (el) => el.hidden);
       if (!stageHidden) throw new Error('conversion prepare started for OME input');
       // 点击之前零 /api 请求（C3 合同：能力在点击后才拉取）
@@ -902,7 +913,7 @@ async function main() {
         throw new Error(`direct_class=${create.direct_class}`);
       }
       const putBytes = fake.st.puts.reduce((a, p) => a + p.bytes, 0);
-      if (putBytes !== desc.length + head.length + ifd.length) {
+      if (putBytes !== fs.statSync(fixture).size) {
         throw new Error(`PUT bytes ${putBytes} != file size`);
       }
       record('p-direct-ome-upload', true, {
@@ -929,6 +940,176 @@ async function main() {
     }
   }
 
+  // ---------------------------------------------------------------- (q) --
+  // 复核 8428f7f0（双标签并发直传同一文件）：同一 Chromium context 的两个
+  // 真实 page、同账号、同一磁盘文件（File 的 name/size/lastModified 一致），
+  // 并发实际点击「上传到工作台」。创建屏障按复核语义：第一个创建到达后扣
+  // 住，第二个创建在途立即放行（修复后只会有一个创建 → 按持有时长放行，
+  // 二者取先）。断言：两页合计创建数 == 1、PUT 字节 == 文件大小，且两页都
+  // 以已发布收口——后拿到锁的一页显示「未重复上传」复用入口，不是错误。
+  async function scenarioTwoTabsDirectUpload() {
+    const { context, page: a } = await L.launch('q-two-tabs');
+    const fake = await L.fakeUploadRoutes(context, creds.cosOrigin, { partsCount: 2 });
+    const b = await context.newPage();
+    let releaseCreate = null;
+    let createArrivals = 0;
+    fake.behavior.gateCreate = async () => {
+      createArrivals += 1;
+      if (createArrivals >= 2 && releaseCreate) {
+        const rel = releaseCreate;
+        releaseCreate = null;
+        rel();
+        return;
+      }
+      await new Promise((resolve) => {
+        releaseCreate = resolve;
+        setTimeout(resolve, 6000);   // 唯一创建：持有几秒后放行（取先）
+      });
+    };
+    try {
+      const fixture = directOmeFixture('two-tabs.ome.tif');
+      await L.login(a, PORT, creds, 'user');
+      await L.C3.openTools(a, PORT);
+      await L.C3.openTools(b, PORT);
+      for (const p of [a, b]) await loadDirectFixture(p, fixture);
+      await Promise.all([
+        a.click('#direct-upload-btn'),
+        b.click('#direct-upload-btn'),
+      ]);
+      await waitFor(async () => /已发布|Published/.test(await textOf(a, '#direct-status')),
+        90000, 'page A published');
+      await waitFor(async () => /已发布|Published/.test(await textOf(b, '#direct-status')),
+        90000, 'page B reuse/published');
+      if (fake.st.creates.length !== 1) {
+        throw new Error(`creates=${fake.st.creates.length} (want exactly 1)`);
+      }
+      const putBytes = fake.st.puts.reduce((s, p) => s + p.bytes, 0);
+      if (putBytes !== fs.statSync(fixture).size) {
+        throw new Error(`PUT bytes ${putBytes} != file size`);
+      }
+      // 两页都是已发布族文案；恰好一页是「未重复上传」复用入口；无失败文案
+      const reusePages = [];
+      for (const [p, who] of [[a, 'A'], [b, 'B']]) {
+        const txt = await textOf(p, '#direct-status');
+        if (/失败|failed/i.test(txt)) throw new Error(`page ${who} shows failure: ${txt}`);
+        if (/未重复上传|no duplicate upload/i.test(txt)) reusePages.push(who);
+      }
+      if (reusePages.length !== 1) {
+        throw new Error(`reuse pages=${JSON.stringify(reusePages)} (want exactly 1)`);
+      }
+      record('q-two-tabs-direct-upload', true, {
+        creates: fake.st.creates.length, putBytes, reusedBy: reusePages[0],
+      });
+    } catch (e) {
+      record('q-two-tabs-direct-upload', false,
+        { error: String(e).slice(0, 300), creates: fake.st.creates.length });
+    } finally {
+      await context.close();
+    }
+  }
+
+  // ---------------------------------------------------------------- (r) --
+  // 复核 8428f7f0（关联重试绑定）：同账号两条 pending 回执 A、B，页面显示
+  // 的是 B（重选 B → 回执命中 → 「已发布但加入项目失败」+ 重试按钮）。点击
+  // 「重试加入项目」必须只发 project-B / slide-B，A 原样 pending——修复前
+  // retryAssociation 取所有本地回执中第一条 pending，请求打到 project-A。
+  async function scenarioAssocRetryBinding() {
+    const { context, page } = await L.launch('r-assoc-binding');
+    const fake = await L.fakeUploadRoutes(page, creds.cosOrigin, { partsCount: 2 });
+    const assocReqs = [];
+    await context.route('**/api/project/**/slides', (route) => {
+      const req = route.request();
+      assocReqs.push({
+        pid: (new URL(req.url()).pathname.match(/\/api\/project\/([^/]+)\/slides/) || [])[1],
+        slideIds: (req.postDataJSON() || {}).slide_ids || null,
+      });
+      return route.fulfill({ status: 200, contentType: 'application/json',
+        body: JSON.stringify({ ok: true }) });
+    });
+    const nodeCrypto = require('crypto');
+    const sha256Hex = (buf) =>
+      nodeCrypto.createHash('sha256').update(buf).digest('hex');
+    try {
+      await L.login(page, PORT, creds, 'user');
+      // 回执的 account 必须等于能力端点的登录账号（receiptFor 才命中）
+      const account = await page.evaluate(async () => {
+        const r = await fetch('/api/tools/slides/upload-capability');
+        const body = await r.json();
+        return String((body && body.account) || '');
+      });
+      // 两条 pending 回执（同账号、不同文件；digests/plan 与夹具逐片一致，
+      // verifyReceipt 才放行）。A 先写、B 后写——修复前重试取第一条 = A。
+      const seeded = [];
+      for (const [name, slideId, pid] of [
+        ['assoc-a.ome.tif', 'sld_assoc_a', 'pj-A'],
+        ['assoc-b.ome.tif', 'sld_assoc_b', 'pj-B'],
+      ]) {
+        const fixture = directOmeFixture(name);
+        const buf = fs.readFileSync(fixture);
+        const first = 8 + (2 + 12 + 4);   // head + IFD，第二片为描述堆
+        seeded.push({
+          receipt: true,
+          account,
+          filename: name,
+          size: buf.length,
+          digests: { 1: sha256Hex(buf.subarray(0, first)),
+                     2: sha256Hex(buf.subarray(first)) },
+          plan: [{ part_number: 1, length: first },
+                 { part_number: 2, length: buf.length - first }],
+          job_id: `inj_assoc_${name}`,
+          slide_id: slideId,
+          target: { project: pid },
+          assoc: { state: 'pending', error: 'seeded 503' },
+        });
+      }
+      await page.evaluate((list) => {
+        localStorage.setItem('pt.tools.direct.published', JSON.stringify(list));
+      }, seeded);
+      await L.C3.openTools(page, PORT);
+      // 显示 B：重选 B → 回执命中（关联待完成）→ 重试按钮可见
+      await loadDirectFixture(page, directOmeFixture('assoc-b.ome.tif'));
+      await page.click('#direct-upload-btn');
+      await waitFor(async () =>
+        (await page.$('#direct-assoc-retry-btn:not([hidden])')) !== null,
+        30000, 'retry button visible');
+      const shown = await textOf(page, '#direct-status');
+      if (!shown.includes('sld_assoc_b')) {
+        throw new Error(`page shows wrong slide: "${shown.slice(0, 80)}"`);
+      }
+      await page.click('#direct-assoc-retry-btn');
+      await waitFor(async () =>
+        (await page.$eval('#direct-assoc-retry-btn', (el) => el.hidden)) === true,
+        30000, 'retry done (button hidden)');
+      if (assocReqs.length !== 1) {
+        throw new Error(`assoc requests=${JSON.stringify(assocReqs)} (want 1)`);
+      }
+      if (assocReqs[0].pid !== 'pj-B' ||
+          JSON.stringify(assocReqs[0].slideIds) !== '["sld_assoc_b"]') {
+        throw new Error(`wrong receipt retried: ${JSON.stringify(assocReqs[0])}`);
+      }
+      // 只有被点选的回执被修改：B 转 ok，A 原样 pending
+      const after = await page.evaluate(() =>
+        JSON.parse(localStorage.getItem('pt.tools.direct.published') || '[]'));
+      const aRec = after.find((r) => r.filename === 'assoc-a.ome.tif');
+      const bRec = after.find((r) => r.filename === 'assoc-b.ome.tif');
+      if (!aRec || !bRec) throw new Error(`receipts lost: ${after.length}`);
+      if ((aRec.assoc && aRec.assoc.state) !== 'pending') {
+        throw new Error(`receipt A modified: ${JSON.stringify(aRec.assoc)}`);
+      }
+      if ((bRec.assoc && bRec.assoc.state) !== 'ok') {
+        throw new Error(`receipt B not ok: ${JSON.stringify(bRec.assoc)}`);
+      }
+      record('r-assoc-retry-binding', true, {
+        assocReq: assocReqs[0], aState: aRec.assoc.state, bState: bRec.assoc.state,
+      });
+    } catch (e) {
+      record('r-assoc-retry-binding', false,
+        { error: String(e).slice(0, 300), assocReqs });
+    } finally {
+      await context.close();
+    }
+  }
+
   const all = [
     ['a-bf', () => scenarioHappy('bf', bf)],
     ['a-fl', () => scenarioHappy('fl', fl)],
@@ -949,6 +1130,8 @@ async function main() {
     ['n-classic-upload', scenarioClassicUpload],
     ['o-throttled-bytes', scenarioThrottledBytes],
     ['p-direct-ome-upload', scenarioDirectOmeUpload],
+    ['q-two-tabs-direct-upload', scenarioTwoTabsDirectUpload],
+    ['r-assoc-retry-binding', scenarioAssocRetryBinding],
   ];
   for (const [id, fn] of all) {
     if (ONLY && id !== ONLY) continue;

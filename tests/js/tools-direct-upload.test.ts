@@ -92,8 +92,11 @@ function fakeBackend(opts: {
 		assocStatus: opts.assocStatus ?? 200,
 		createProjectStatus: opts.createProjectStatus ?? 200,
 	};
-	// 有状态 ingestion：创建 → uploading（分块计划）→ complete → viewable
+	// 有状态 ingestion：创建 → uploading（分块计划）→ complete → viewable。
+	// completed 集合独立于 jobs：跨标签场景的“进行中”任务（续传）不经过本
+	// 假后端的创建端点，complete 后同样要能查到 viewable。
 	const jobs = new Map<string, { size: number; completed: boolean }>();
+	const completed = new Set<string>();
 	const fetchImpl = vi.fn((url: string, init?: RequestInit) => {
 		const method = String((init && init.method) || "GET");
 		if (url === "/api/tools/slides/upload-capability") {
@@ -112,9 +115,12 @@ function fakeBackend(opts: {
 		if (/^\/api\/ingestions\/[^/]+$/.test(url) && method === "GET") {
 			const id = url.split("/").pop()!;
 			const job = jobs.get(id);
-			if (job && job.completed) {
+			if (completed.has(id) || (job && job.completed)) {
+				// slide id 按 job 派生（inj_1 → sld_rc1）：同账号两条回执的
+				// 场景需要可区分的 slide id（单任务场景期望值不变）
 				return Promise.resolve(resp({
-					stage: "viewable", slide_id: "sld_rc1", slide: "same.ome.tif",
+					stage: "viewable", slide_id: `sld_${id.replace("inj_", "rc")}`,
+					slide: "same.ome.tif",
 				}));
 			}
 			const size = job ? job.size : 16;
@@ -138,7 +144,11 @@ function fakeBackend(opts: {
 			}));
 		}
 		if (url.endsWith("/upload-complete")) {
-			for (const j of jobs.values()) j.completed = true;
+			// 只收口被 complete 的任务（同账号两条回执的场景各自独立）
+			const jid = url.split("/")[3];
+			completed.add(jid);
+			const mine = jobs.get(jid);
+			if (mine) mine.completed = true;
 			return Promise.resolve(resp({ stage: "awaiting_server" }, 202));
 		}
 		if (/^\/api\/project\/create$/.test(url) && method === "POST") {
@@ -335,6 +345,257 @@ describe("direct 控制器：published receipt（review #3/#4）", () => {
 		expect(r.ok).toBe(true);
 		expect(h.publishedId()).toBe("sld_rc1");
 		expect((h.receipts()[0].assoc as { state: string }).state).toBe("ok");
+	});
+});
+
+// --------------------------------------------------------------------------- //
+// 复核 8428f7f0（2026-10-07）：双标签并发直传的跨标签互斥（Web Lock）。
+// 锁实现 = 共享引擎 window.HP_COS_UPLOAD.acquireContentLock；vitest 用假
+// navigator.locks 驱动「被占 → 等待 → 复用/续传」「等待可取消」两条路径；
+// 无 navigator.locks 的退化行为由上方全部既有用例覆盖（Node 无 locks）。
+// --------------------------------------------------------------------------- //
+function fakeLocks() {
+	const busy = new Set<string>();
+	const waiters: Array<{ name: string; wake: () => void }> = [];
+	function pump(name: string) {
+		for (let i = 0; i < waiters.length; i++) {
+			if (waiters[i].name === name && !busy.has(name)) {
+				waiters.splice(i, 1)[0].wake();
+				break;
+			}
+		}
+	}
+	function tryRun(name: string, cb: (lock: unknown) => unknown): Promise<unknown> {
+		busy.add(name);
+		// 请求 promise 在回调 settle 时收口——锁随之释放、唤醒下一个等待者
+		const p = Promise.resolve().then(() => cb({ name, mode: "exclusive" }));
+		void p.then(() => { busy.delete(name); pump(name); },
+			() => { busy.delete(name); pump(name); });
+		return p;
+	}
+	return {
+		busy,
+		request(name: string,
+			opts: { ifAvailable?: boolean; signal?: AbortSignal },
+			cb: (lock: unknown) => unknown): Promise<unknown> {
+			const signal = opts && opts.signal;
+			if (!busy.has(name)) return tryRun(name, cb);
+			if (opts && opts.ifAvailable) {
+				return Promise.resolve().then(() => cb(null));
+			}
+			return new Promise((resolve, reject) => {
+				const onAbort = () =>
+					reject(new DOMException("lock request aborted", "AbortError"));
+				if (signal) {
+					if (signal.aborted) return onAbort();
+					signal.addEventListener("abort", onAbort, { once: true });
+				}
+				waiters.push({
+					name,
+					wake: () => {
+						if (signal) signal.removeEventListener("abort", onAbort);
+						if (signal && signal.aborted) return onAbort();
+						tryRun(name, cb).then(resolve, reject);
+					},
+				});
+			});
+		},
+	};
+}
+
+/// Node crypto.subtle 计算 8 B 分片摘要，落一条内容凭证正确的已发布回执
+/// （模拟「另一标签已完成上传」后的共享 localStorage 状态）。
+async function seedPublishedReceipt(
+	ls: ReturnType<typeof fakeLocalStorage>, file: File, account: string,
+	slideId = "sld_tab1", jobId = "inj_tab1") {
+	const digests: Record<string, string> = {};
+	const plan: Array<{ part_number: number; length: number }> = [];
+	let off = 0;
+	let n = 1;
+	while (off < file.size) {
+		const len = Math.min(8, file.size - off);
+		const buf = await file.slice(off, off + len).arrayBuffer();
+		const d = new Uint8Array(await crypto.subtle.digest("SHA-256", buf));
+		digests[String(n)] = [...d].map((b) => b.toString(16).padStart(2, "0")).join("");
+		plan.push({ part_number: n, length: len });
+		off += len;
+		n += 1;
+	}
+	const receipts = JSON.parse(ls.getItem("pt.tools.direct.published") || "[]") as
+		Array<Record<string, unknown>>;
+	receipts.push({
+		receipt: true, receipt_id: `rc_${jobId}`, account,
+		filename: file.name, size: file.size, digests, plan,
+		job_id: jobId, slide_id: slideId, target: null,
+		assoc: { state: "ok", error: null },
+	});
+	ls.setItem("pt.tools.direct.published", JSON.stringify(receipts));
+}
+
+async function until(cond: () => boolean, label = "cond"): Promise<void> {
+	for (let i = 0; i < 500 && !cond(); i++) {
+		await new Promise((r) => setTimeout(r, 2));
+	}
+	if (!cond()) throw new Error(`timeout: ${label}`);
+}
+
+describe("direct 控制器：跨标签内容锁（复核 8428f7f0）", () => {
+	it("另一标签持锁：显示等待提示、零创建；释放后回执命中 → 复用（零新 ingestion）", async () => {
+		const h = await setup();
+		const locks = fakeLocks();
+		vi.stubGlobal("navigator", { locks: locks as unknown as LockManager });
+		const file = omeTiffFile(new Uint8Array(16).fill(1));
+		const lockName = String((window as Record<string, unknown> as {
+			HP_COS_UPLOAD: { contentLockName: (a: string, f: File) => string };
+		}).HP_COS_UPLOAD.contentLockName("acct-1", file));
+		// 「另一标签」先持有同一把锁（同一账号 + 同一文件身份）
+		let releaseHolder: () => void = () => {};
+		await new Promise<void>((res) => {
+			void locks.request(lockName, {}, (l) => {
+				expect(l).toBeTruthy();
+				res();
+				return new Promise<void>((r) => { releaseHolder = r; });
+			}) as unknown as Promise<unknown>;
+		});
+		const pending = h.ctl.uploadFile(file, {
+			cls: { directClass: "ome-tiff", ext: ".tif" }, target: null,
+		});
+		await until(() => h.statuses.some((s) => s.startsWith("tools.direct.other.tab")),
+			"waiting message");
+		expect(h.be.st.creates).toHaveLength(0);   // 等待期绝不创建
+		// 另一标签完成上传：共享 localStorage 出现内容凭证正确的已发布回执
+		await seedPublishedReceipt(h.ls, file, "acct-1");
+		releaseHolder();
+		const r = await pending;
+		expect(r.ok).toBe(true);
+		expect((r as { deduped?: boolean }).deduped).toBe(true);
+		expect(h.be.st.creates).toHaveLength(0);   // 复用结果：零新 ingestion
+		expect(h.statuses.some((s) => s.startsWith("tools.direct.published.open")))
+			.toBe(true);
+	});
+
+	it("另一标签持锁且只有进行中记录：释放后经既有核验续传（不重建，只补未确认分片）", async () => {
+		const h = await setup();
+		const locks = fakeLocks();
+		vi.stubGlobal("navigator", { locks: locks as unknown as LockManager });
+		const file = omeTiffFile(new Uint8Array(16).fill(1));
+		const lockName = String((window as Record<string, unknown> as {
+			HP_COS_UPLOAD: { contentLockName: (a: string, f: File) => string };
+		}).HP_COS_UPLOAD.contentLockName("acct-1", file));
+		let releaseHolder: () => void = () => {};
+		await new Promise<void>((res) => {
+			void locks.request(lockName, {}, () => {
+				res();
+				return new Promise<void>((r) => { releaseHolder = r; });
+			}) as unknown as Promise<unknown>;
+		});
+		// 另一标签创建了任务、确认了分片 1，还没传完（记录落共享 localStorage）
+		const part1 = await file.slice(0, 8).arrayBuffer();
+		const d1 = new Uint8Array(await crypto.subtle.digest("SHA-256", part1));
+		const hex1 = [...d1].map((b) => b.toString(16).padStart(2, "0")).join("");
+		h.ls.setItem("pt.tools.direct.uploads", JSON.stringify([{
+			job_id: "inj_tab1", filename: file.name, size: file.size,
+			account: "acct-1", confirmed: [1],
+			digests: { 1: hex1 },
+			plan: [{ part_number: 1, length: 8 }, { part_number: 2, length: 8 }],
+			slide_id: null,
+		}]));
+		const pending = h.ctl.uploadFile(file, {
+			cls: { directClass: "ome-tiff", ext: ".tif" }, target: null,
+		});
+		await until(() => h.statuses.some((s) => s.startsWith("tools.direct.other.tab")),
+			"waiting message");
+		releaseHolder();
+		const r = await pending;
+		expect(r.ok).toBe(true);
+		expect(h.be.st.creates).toHaveLength(0);   // 续传：不重建
+		// 只补分片 2（分片 1 经摘要核验后跳过）
+		const signs = h.be.fetchImpl as unknown as vi.Mock;
+		const signCall = signs.mock.calls.find((c: unknown[]) =>
+			String(c[0]).endsWith("/parts/sign"));
+		expect(signCall).toBeTruthy();
+		const body = JSON.parse(String(
+			(signCall![1] as RequestInit).body));
+		expect(body.part_numbers).toEqual([2]);
+	});
+
+	it("等待另一标签期间取消：以 cancelled 收口、零创建、不报错误", async () => {
+		const h = await setup();
+		const locks = fakeLocks();
+		vi.stubGlobal("navigator", { locks: locks as unknown as LockManager });
+		const file = omeTiffFile(new Uint8Array(16).fill(1));
+		const lockName = String((window as Record<string, unknown> as {
+			HP_COS_UPLOAD: { contentLockName: (a: string, f: File) => string };
+		}).HP_COS_UPLOAD.contentLockName("acct-1", file));
+		// 持锁不放
+		void (locks.request(lockName, {}, () => new Promise<void>(() => {})) as
+			unknown as Promise<unknown>);
+		const pending = h.ctl.uploadFile(file, {
+			cls: { directClass: "ome-tiff", ext: ".tif" }, target: null,
+		});
+		await until(() => h.statuses.some((s) => s.startsWith("tools.direct.other.tab")),
+			"waiting message");
+		h.ctl.cancel();
+		const r = await pending;
+		expect(r.ok).toBe(false);
+		expect((r as { reason?: string }).reason).toBe("cancelled");
+		expect(h.be.st.creates).toHaveLength(0);
+	});
+});
+
+// --------------------------------------------------------------------------- //
+// 复核 8428f7f0：关联重试绑定当前回执（绝不取「第一条 pending」）+ 账号核对。
+// --------------------------------------------------------------------------- //
+describe("direct 控制器：关联重试绑定与账号核对（复核 8428f7f0）", () => {
+	it("同账号两条 pending：重试 B 只发 project-B/slide-B；A 原样 pending", async () => {
+		const h = await setup({ assocStatus: 503 });
+		const cls = { directClass: "ome-tiff", ext: ".tif" };
+		const ra = await h.ctl.uploadFile(
+			omeTiffFile(new Uint8Array(16).fill(32), "a.ome.tif"),
+			{ cls, target: { project: "pj_A" } });
+		expect(ra.ok).toBe(false);
+		const rb = await h.ctl.uploadFile(
+			omeTiffFile(new Uint8Array(16).fill(64), "b.ome.tif"),
+			{ cls, target: { project: "pj_B" } });
+		expect(rb.ok).toBe(false);
+		expect(h.be.st.assocAdds).toHaveLength(2);   // 两次发布时的失败关联
+		h.be.st.assocStatus = 200;
+		const recB = h.receipts().find((r) => r.filename === "b.ome.tif") as
+			{ receipt_id?: string; job_id?: string };
+		const rr = await (h.ctl as unknown as {
+			retryAssociation: (id?: string) => Promise<{ ok: boolean }>;
+		}).retryAssociation(String(recB.receipt_id || recB.job_id));
+		expect(rr.ok).toBe(true);
+		expect(h.be.st.assocAdds).toHaveLength(3);   // A 未被重试
+		expect(h.be.st.assocAdds[2]).toEqual({ pid: "pj_B", slideIds: ["sld_rc2"] });
+		const recs = h.receipts();
+		expect(((recs.find((r) => r.filename === "a.ome.tif") as
+			{ assoc: { state: string } }).assoc).state).toBe("pending");
+		expect(((recs.find((r) => r.filename === "b.ome.tif") as
+			{ assoc: { state: string } }).assoc).state).toBe("ok");
+	});
+
+	it("回执属于他号（登录账号已切换）：拒绝、不发任何关联请求、明确提示", async () => {
+		const h = await setup({ assocStatus: 503, account: "acct-1" });
+		const cls = { directClass: "ome-tiff", ext: ".tif" };
+		await h.ctl.uploadFile(omeTiffFile(new Uint8Array(16).fill(1)), {
+			cls, target: { project: "pj_1" },
+		});
+		expect((h.receipts()[0].assoc as { state: string }).state).toBe("pending");
+		// 「退出后以另一账号登录」：全新控制器 + 同一 localStorage
+		const h2 = await setup({ assocStatus: 503, account: "acct-2" }, h.ls);
+		const rid = String(h.receipts()[0].job_id);
+		const rr = await (h2.ctl as unknown as {
+			retryAssociation: (id?: string) => Promise<{ ok: boolean; reason?: string }>;
+		}).retryAssociation(rid);
+		expect(rr.ok).toBe(false);
+		expect(rr.reason).toBe("account");
+		expect(h2.be.st.assocAdds).toHaveLength(0);   // 未发任何关联请求
+		expect(h2.be.st.projectCreates).toHaveLength(0);
+		expect(h2.statuses.some((s) =>
+			s.startsWith("tools.direct.assoc.account.mismatch"))).toBe(true);
+		// 回执未被修改
+		expect((h.receipts()[0].assoc as { state: string }).state).toBe("pending");
 	});
 });
 

@@ -45,10 +45,76 @@
 
 `337b7423` 上复跑：vitest 918 通过、2 跳过；全量 pytest 3027 通过、0 失败、26 跳过。本次复跑没有加载真实样本环境变量，多出的跳过都是真实样本测试。这些测试已在 `8d89b2ea` 的全量门禁中加载样本通过；此后的改动只涉及插件清单、哈希钉和浏览器测试，转换器与嗅探代码没有变化。
 
+## 复核修复（8428f7f0 复核提出，第二轮）
+
+复核文档：`upload-convert-first-recheck-8428f7f0-20261007.md`。
+
+1. **[P2] 双标签并发重复创建**（工具页直传）：共享引擎新增跨标签内容锁
+   `window.HP_COS_UPLOAD.contentLockName / acquireContentLock`（Web Lock，
+   键 = 账号 + name + size + lastModified——同一磁盘文件在两个标签的 File
+   三元组一致；不同文件键碰撞只会互相串行，不误判）。工具页直传把「读回执
+   → 创建 ingestion」整段放进锁内：拿锁后重读回执/上传记录——已发布则复用
+   （零新 ingestion），进行中则经既有分片摘要核验续传。等待期显示「另一个
+   标签页正在上传同一文件」，可取消（AbortSignal；规范禁止 signal 与
+   ifAvailable 同用，立即探测不带 signal、排队等待才带）。`navigator.locks`
+   不可用（旧浏览器/非安全上下文）→ 退化为既有单页 busy 行为（与产物上传
+   的 uploadLockName 同一前提）。工作台 `uploadFileCos` 套同一把锁（同一共享
+   实现）：并发双拖同一文件不再各建一个 ingestion，另一标签进行中经既有
+   「询问后续传」续传；已完成文件不做工作台级去重（工作台重新上传同一文件
+   = 新建切片，没有已发布回执语义）。回归：C4 `q-two-tabs-direct-upload`
+   （同一 context 两个真实 page 并发实际点击，创建屏障按复核语义：第二个
+   创建到达立即放行、否则持守数秒放行；断言合计创建数 == 1、两页均以已发布
+   收口且恰一页显示「未重复上传」复用入口）——修复前 creates=2，修复后
+   creates=1；另有 vitest 三条锁路径用例（等待复用 / 进行中续传 / 等待取消）。
+2. **[P2] 关联重试错拿回执**：`retryAssociation(receiptId)` 绑定当前显示
+   文件的回执（新增 `receipt_id`，旧记录退回 job_id 指认）；动作前重查登录
+   账号与回执账号，不符一律拒绝并发明确提示、不发任何请求；只修改被点选的
+   回执。回归：C4 `r-assoc-retry-binding`（同账号 A、B 两条 pending，页面
+   显示 B → 重试只发 project-B/slide-B，A 原样 pending——修复前请求打到
+   project-A）；vitest 两条（B 绑定 + 他号回执拒发请求）。
+
+### 上传内存实测（1 GiB 合成 OME-TIFF 直传）
+
+方法：C4 假后端（假 COS 为真实 TLS 本地 socket——`page.route` 拦截会在
+Node 驱动侧缓冲 32 MB 请求体，不能用于内存实测；真实 socket 下浏览器真实
+发送字节，本地 COS 只计数不缓存）。文件为稀疏生成的 1 GiB（1073741824 B）
+OME-TIFF，`part_bytes=32,000,000`、`max_concurrent_parts=3`（34 片），
+真实 Chromium（headless shell）走 /tools/slides 直传，250 ms 采样 `/proc`
+进程树 `VmRSS`/`VmHWM`（渲染器进程求和）+ CDP `Performance.getMetrics`。
+整个测量在 `systemd-run --user --scope -p MemoryMax=6G -p MemorySwapMax=0`
+下进行，两轮均完整发布成功。
+
+| 指标（kB，/proc Vm* 单位） | 页面基线（点击前） | 上传峰值 | 上传增量 |
+| --- | --- | --- | --- |
+| 渲染器 RSS（哈希真实计算） | 173 632 | 794 476 | +620 844 |
+| 渲染器 VmHWM（同上） | 184 588 | 1 224 308 | +1 039 720 |
+| 浏览器主进程 RSS（同上） | 111 436 | 686 340 | +574 904 |
+| 渲染器 RSS（假 digest 绕过） | 166 864 | 771 928 | +605 064 |
+| 渲染器 VmHWM（同上） | 177 800 | 1 217 548 | +1 039 748 |
+| 浏览器主进程 RSS（同上） | 110 424 | 761 216 | +650 792 |
+
+读法与边界：
+
+- V8 `JSHeapUsedSize` 峰值仅 ~5.3 MB——分片缓冲是外部（ArrayBuffer）内存，
+  不计入 JS 堆；内存上限约束应以进程 RSS 为准。
+- 设计边界是「单片 × 通道数」≈ 32 MB × 3 ≈ 96 MiB；实测上传增量
+  ~+0.6 GiB（渲染器 RSS）远高于该值，主因是 34 片连续分发时已弃引用的
+  32 MB ArrayBuffer 未被立即 GC（峰值后回落：上传结束 1.5 s 内渲染器 RSS
+  回落至 ~349 MiB），外加浏览器主进程为在途 PUT 保留的请求体副本。属瞬态
+  峰值、可回收；若需压低峰值应改「整片读入」为流式，本轮不顺便改。
+- 真实 SHA-256 对比假 digest：渲染器 RSS 增量 +620 844 vs +605 064 kB、
+  VmHWM 增量几乎相同（+1 039 720 vs +1 039 748 kB）、浏览器 RSS 增量反向
+  （+574 904 vs +650 792 kB）——差异与单轮波动同量级。哈希消费的是同一块
+  已在内存中的分片 ArrayBuffer（`slice` 只读一次，哈希与 PUT 并发），不产生
+  额外整片拷贝；两轮耗时 141 s vs 138 s，无显著差别。
+- 未测：真实 COS、Windows/macOS；假 COS 不代表公网 TLS 吞吐下的窗口行为
+  （在途片数上限 3 不变，内存上界形状一致）。
+
+
 ## 已知限制
 
-- 分片摘要依赖 WebCrypto（安全上下文）。纯 HTTP 访问时无法记录摘要，续传退化为全部重传，不会退回按名称复用。
-- 为同时计算摘要和上传，分片整片读入内存：当前 32 MB × 3 通道，约 100 MB。
-- 两个真实标签页并发的重复发布只做了结构性覆盖（回执存于共享 localStorage），没有双标签实测。
+- 分片摘要依赖 WebCrypto：可用性按 `crypto.subtle` 的实际能力判定（安全上下文才有；`localhost`/`127.0.0.1` 属安全上下文，可用——不能把「纯 HTTP」一概归为不可用）。`crypto.subtle` 不可用时（例如非本机域名的纯 HTTP 访问）无法记录摘要，续传退化为全部重传，不会退回按名称复用（代码在 `sha256Hex` 处判定，取不到 `crypto.subtle` 即返回空摘要）。
+- 为同时计算摘要和上传，分片整片读入内存：当前 32 MB × 3 通道，约 100 MB（上传路径实测见下文「复核修复与上传内存实测」）。
+- 跨标签互斥依赖 Web Lock（`navigator.locks`，安全上下文可用；localhost 同样满足）。不可用时（旧浏览器/非安全上下文）退化为既有单页 busy 行为——与产物上传的 `uploadLockName` 同一前提。
 - 真实 COS、Windows/macOS 未执行。
 - 管理插件 0.4.15 需要单独的插件发布切换才会到生产。

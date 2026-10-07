@@ -152,10 +152,20 @@ async function verifyReceipt(file, receipt) {
 
 export function createDirectUploadController({ t, onStatus, onPublished,
   onEngineEvent }) {
-  const state = { busy: false, handle: null };
+  // busy：单页守卫；lockAbort：跨标签内容锁等待的取消句柄；
+  // currentReceiptId：页面当前显示文件对应的回执（关联重试只作用于它——
+  // 复核 8428f7f0：绝不取「所有本地回执的第一条 pending」）。
+  const state = { busy: false, handle: null, lockAbort: null,
+                  currentReceiptId: null };
 
   function status(key, vars) {
     if (onStatus) onStatus(key ? t(key, vars || {}) : '');
+  }
+
+  /// 回执句柄（优先 receipt_id；旧记录没有则退 job_id——同一磁盘文件只
+  /// 有一条同账号回执，job_id 足以唯一指认）。
+  function receiptIdOf(receipt) {
+    return (receipt && (receipt.receipt_id || receipt.job_id)) || null;
   }
 
   /// 目标 → 项目（「新项目」仅在上传成功后创建）；失败抛错（发布不受影响，
@@ -205,23 +215,53 @@ export function createDirectUploadController({ t, onStatus, onPublished,
   /// 关联重试（receipt assoc=pending 时页面「重试加入项目」入口）：
   /// 只做关联（同 slideId、同幂等键），成功后才回调 onPublished（全量成功
   /// 只发一次——review #4：发布成功 ≠ 关联成功，绝不提前报成功）。
-  async function retryAssociation() {
+  /// 复核 8428f7f0：重试绑定当前显示文件的回执（receiptId 缺省用控制器
+  /// 记住的当前回执），并在动作前重查登录账号与回执账号——不符绝不发任何
+  /// 请求（服务端权限之外的前置拒绝，明确提示）。只修改被点选的回执。
+  async function retryAssociation(receiptId) {
     if (state.busy) return { ok: false, reason: 'busy' };
-    const receipt = readReceipts().find(
-      (r) => r && r.assoc && r.assoc.state === 'pending') || null;
-    if (!receipt) return { ok: false, reason: 'none' };
     state.busy = true;
     try {
-      await associateTarget(receipt.target || null, receipt.slide_id);
-      updateReceiptAssoc(receipt, 'ok', null);
-      status('tools.direct.published', { id: receipt.slide_id });
-      if (onPublished && receipt.slide_id) onPublished(receipt.slide_id);
-      return { ok: true, slideId: receipt.slide_id };
-    } catch (e) {
-      updateReceiptAssoc(receipt, 'pending', (e && e.message) || String(e));
-      status('tools.direct.assoc.pending',
-        { id: receipt.slide_id, e: (e && e.message) || String(e) });
-      return { ok: false, reason: 'association', slideId: receipt.slide_id };
+      const want = (typeof receiptId === 'string' && receiptId)
+        ? receiptId : state.currentReceiptId;
+      const receipt = want ? readReceipts().find(
+        (r) => r && (r.receipt_id === want || r.job_id === want) &&
+               r.assoc && r.assoc.state === 'pending') || null : null;
+      if (!receipt) return { ok: false, reason: 'none' };
+      try {
+        // 账号重查（点按时的登录态为准；能力不可得 = 无法核对，同样不动）
+        let cap;
+        try {
+          cap = await fetchCapability();
+        } catch {
+          status('tools.upload.offline');
+          return { ok: false, reason: 'offline', receiptId: receiptIdOf(receipt) };
+        }
+        if (cap.authRequired) {
+          status('tools.upload.login.required');
+          return { ok: false, reason: 'login', receiptId: receiptIdOf(receipt) };
+        }
+        const account = typeof cap.account === 'string' ? cap.account : '';
+        if (String(receipt.account || '') !== account) {
+          status('tools.direct.assoc.account.mismatch',
+            { owner: String(receipt.account || '') });
+          return { ok: false, reason: 'account', receiptId: receiptIdOf(receipt) };
+        }
+        await associateTarget(receipt.target || null, receipt.slide_id);
+        updateReceiptAssoc(receipt, 'ok', null);
+        state.currentReceiptId = receiptIdOf(receipt);
+        status('tools.direct.published', { id: receipt.slide_id });
+        if (onPublished && receipt.slide_id) onPublished(receipt.slide_id);
+        return { ok: true, slideId: receipt.slide_id,
+                 receiptId: receiptIdOf(receipt) };
+      } catch (e) {
+        // 只回滚被点选的回执（receipt 已按句柄唯一指认）
+        updateReceiptAssoc(receipt, 'pending', (e && e.message) || String(e));
+        status('tools.direct.assoc.pending',
+          { id: receipt.slide_id, e: (e && e.message) || String(e) });
+        return { ok: false, reason: 'association', slideId: receipt.slide_id,
+                 receiptId: receiptIdOf(receipt) };
+      }
     } finally {
       state.busy = false;
     }
@@ -237,14 +277,16 @@ export function createDirectUploadController({ t, onStatus, onPublished,
       writeReceipts(readReceipts().filter((r) => r !== receipt));
       return null;
     }
+    state.currentReceiptId = receiptIdOf(receipt);
     if (receipt.assoc && receipt.assoc.state === 'pending') {
       status('tools.direct.assoc.pending',
         { id: receipt.slide_id, e: receipt.assoc.error || '' });
       return { ok: true, slideId: receipt.slide_id, deduped: true,
-               assocPending: true };
+               assocPending: true, receiptId: receiptIdOf(receipt) };
     }
     status('tools.direct.published.open', { id: receipt.slide_id });
-    return { ok: true, slideId: receipt.slide_id, deduped: true };
+    return { ok: true, slideId: receipt.slide_id, deduped: true,
+             receiptId: receiptIdOf(receipt) };
   }
 
   /// 上传一个直传类别文件（唯一入口）。cls 是嗅探结果（classifyFile）：
@@ -290,10 +332,51 @@ export function createDirectUploadController({ t, onStatus, onPublished,
         return { ok: false, reason: 'format' };
       }
 
+      // ③″ 跨标签互斥（复核 8428f7f0）：busy 只在单页生效——两个标签并发
+      // 首传同一文件会各建一个 ingestion。锁键 = 账号 + 文件身份（name +
+      // size + lastModified，同一磁盘文件在两个标签一致；不同文件键碰撞只
+      // 互相串行）。锁内重读回执/上传记录再决定复用、续传或新建。等待期
+      // 显示「另一标签正在上传」，可取消（AbortSignal，cancel() 触发）。
+      // navigator.locks 不可用（旧浏览器/非安全上下文）→ 退化为既有行为
+      // （与产物上传的 uploadLockName 同一前提；见修复文档已知限制）。
+      const account = typeof cap.account === 'string' ? cap.account : '';
+      state.lockAbort = (typeof AbortController === 'function')
+        ? new AbortController() : null;
+      const lock = await window.HP_COS_UPLOAD.acquireContentLock(
+        window.HP_COS_UPLOAD.contentLockName(account, file), {
+          signal: state.lockAbort ? state.lockAbort.signal : undefined,
+          onWaiting: () => status('tools.direct.other.tab'),
+        });
+      try {
+        return await uploadLocked(file, { directClass, cfg, account, target });
+      } finally {
+        lock.release();
+      }
+    } catch (err) {
+      state.handle = null;
+      if (err && err.name === 'AbortError') {
+        // 等锁被取消：与上传中取消同一语义（不建任务、不报错误）
+        status(null);
+        return { ok: false, reason: 'cancelled' };
+      }
+      const d = describeUploadError(err);
+      status(d.key, d.vars);
+      return { ok: false, reason: 'error' };
+    } finally {
+      state.busy = false;
+      state.lockAbort = null;
+    }
+  }
+
+  /// 锁内临界区（持有 pt:upload:content:…）：读回执（另一标签刚发布的也
+  /// 算）→ 命中即复用；无回执 → 既有上传（引擎在锁内自查续传候选——另一
+  /// 标签进行中的记录经既有核验续传）。回执写入与目标关联都在锁内完成：
+  /// 持锁标签发布完成之前，等待标签拿不到锁、看不到半成品状态。
+  async function uploadLocked(file, { directClass, cfg, account, target }) {
+    try {
       // ③′ published receipt（review #3）：同账号同名同大小且内容凭证
       // 核验通过 → 已发布过，绝不创建第二个 ingestion
-      const seen = receiptFor(file, typeof cap.account === 'string'
-        ? cap.account : '');
+      const seen = receiptFor(file, account);
       if (seen) {
         seen.sourceFile = file;
         const reused = await reuseReceipt(seen);
@@ -301,7 +384,6 @@ export function createDirectUploadController({ t, onStatus, onPublished,
       }
 
       // ④ 共享引擎上传（数据源 = 用户的 File，仅 slice 分块读取）
-      const account = typeof cap.account === 'string' ? cap.account : '';
       const resume = resumableFor(file, account);
       let uploadedJobId = resume ? resume.job_id : null;
       // 发布成功后引擎会清掉上传记录（complete）——digests/plan 在 save 时
@@ -379,8 +461,11 @@ export function createDirectUploadController({ t, onStatus, onPublished,
       // ⑤ published receipt（review #3/#4）：先持久化 published + 关联状态，
       // 再做关联——关联失败不报全成功（onPublished 只在关联成功/无目标时
       // 回调）；pending 可用「重试加入项目」恢复（同 slideId、同幂等键）。
+      // receipt_id：页面重试按钮绑定当前回执的句柄（复核 8428f7f0）。
       const receipt = {
         receipt: true,
+        receipt_id: `rc_${uploadedJobId ||
+          `${file.size}-${Date.now().toString(36)}`}`,
         account,
         filename: file.name,
         size: file.size,
@@ -392,10 +477,11 @@ export function createDirectUploadController({ t, onStatus, onPublished,
         assoc: { state: target ? 'pending' : 'ok', error: null },
       };
       upsertReceipt(receipt);
+      state.currentReceiptId = receiptIdOf(receipt);
       if (!target) {
         status('tools.direct.published', { id: slideId || '—' });
         if (onPublished && slideId) onPublished(slideId);
-        return { ok: true, slideId };
+        return { ok: true, slideId, receiptId: receiptIdOf(receipt) };
       }
       try {
         await associateTarget(receipt.target, slideId);
@@ -404,23 +490,30 @@ export function createDirectUploadController({ t, onStatus, onPublished,
         status('tools.direct.assoc.pending',
           { id: slideId || '—', e: (e && e.message) || String(e) });
         // 切片已发布但未入项目：不是全量成功（不回调 onPublished）
-        return { ok: false, reason: 'association', slideId };
+        return { ok: false, reason: 'association', slideId,
+                 receiptId: receiptIdOf(receipt) };
       }
       updateReceiptAssoc(receipt, 'ok', null);
       status('tools.direct.published', { id: slideId || '—' });
       if (onPublished && slideId) onPublished(slideId);
-      return { ok: true, slideId };
+      return { ok: true, slideId, receiptId: receiptIdOf(receipt) };
     } catch (err) {
       state.handle = null;
+      if (err && err.name === 'AbortError') {
+        status(null);
+        return { ok: false, reason: 'cancelled' };
+      }
       const d = describeUploadError(err);
       status(d.key, d.vars);
       return { ok: false, reason: 'error' };
-    } finally {
-      state.busy = false;
     }
   }
 
   function cancel() {
+    // 等锁中取消（复核 8428f7f0：等待必须可取消）+ 上传中取消（引擎）
+    if (state.lockAbort) {
+      try { state.lockAbort.abort(); } catch { /* */ }
+    }
     if (state.handle) state.handle.cancel();
   }
 

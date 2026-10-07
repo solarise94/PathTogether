@@ -387,13 +387,17 @@ function showDirectReady(file, cls) {
 
 /// 直传发布后的入口 UI（review #3/#4）：已发布同文件 → 「打开切片」；
 /// 关联待完成 → 「重试加入项目」。绝不引导重复上传。
+/// 复核 8428f7f0：记录页面当前显示文件对应的回执句柄——重试按钮只作用于
+/// 它（账号不符被拒时保持入口，便于换回原账号后重试）。
 function updateDirectReceiptUi(r) {
+  if (r && r.receiptId) page.directReceiptId = r.receiptId;
   const slideId = r && r.slideId;
   if (slideId && els.directOpenLink) {
     els.directOpenLink.href = '/?slide=' + encodeURIComponent(slideId);
     els.directOpenLink.hidden = false;
   }
-  const assocPending = !!(r && (r.assocPending || r.reason === 'association'));
+  const assocPending = !!(r && (r.assocPending ||
+    r.reason === 'association' || r.reason === 'account'));
   if (els.directAssocRetryBtn) els.directAssocRetryBtn.hidden = !assocPending;
 }
 
@@ -435,12 +439,15 @@ function setDirectStatusText(text) {
 }
 
 /// 「重试加入项目」（review #4/#5）：只做关联（同 slideId、同幂等键），
-/// 成功后控制器才回调 onPublished（全量成功）。
+/// 成功后控制器才回调 onPublished（全量成功）。复核 8428f7f0：传入页面
+/// 当前显示文件的回执句柄——绝不重试另一条回执；账号不符由控制器拒绝
+/// （不发任何请求，明确提示）。
 async function onDirectAssocRetry() {
   if (!page.directCtl) return;
   if (els.directAssocRetryBtn) els.directAssocRetryBtn.disabled = true;
   try {
-    const r = await page.directCtl.retryAssociation();
+    const r = await page.directCtl.retryAssociation(
+      page.directReceiptId || null);
     updateDirectReceiptUi(r);
   } finally {
     if (els.directAssocRetryBtn) els.directAssocRetryBtn.disabled = false;

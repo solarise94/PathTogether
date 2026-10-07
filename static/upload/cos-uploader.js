@@ -12,6 +12,11 @@
         capability payload → 规范化配置 | null（缺字段/非法一律 null，
         宁可不用 COS 也不拿坏参数拼请求；并发/批量夹上界）。
 
+     window.HP_COS_UPLOAD.contentLockName(account, file) / acquireContentLock
+        跨标签内容锁（review 2026-10-07 复核：双标签并发直传同一文件各建一
+        个 ingestion）。页面在「读回执/候选 → 创建 ingestion」临界区外套锁；
+        拿锁后重读回执/记录再决定复用、续传或新建。
+
      window.HP_COS_UPLOAD.createUpload(opts) -> { cancel(), done }
         opts = {
           source:    { name, size, slice(start, end) }   // File 或 OPFS 产物视图；
@@ -1059,10 +1064,88 @@
     };
   }
 
+  // ---------- 跨标签内容锁（review 2026-10-07 复核：双标签并发直传） ----
+  // 键 = 账号 + 文件身份（name/size/lastModified）：同一磁盘文件在两个标签
+  // 的 File 对象三元组一致 → 同一把锁；不同文件键碰撞只会互相串行（可接受，
+  // 绝不误判为同一文件）。与产物上传的 uploadLockName(jobId) 同一原语
+  // （navigator.locks）。锁不可用（旧浏览器/非安全上下文）时 acquire 返回
+  // held=false，调用方按既有行为继续（无跨标签互斥、绝不阻塞——与产物上传
+  // 对 Web Lock 的同一前提）。
+  function contentLockName(account, file) {
+    return "pt:upload:content:" + String(account || "") + ":" +
+      String(file && file.name) + ":" + String(file && file.size) + ":" +
+      String(file && file.lastModified);
+  }
+
+  // acquireContentLock(name, opts) -> Promise<{ held, release() }>
+  //   held=false：navigator.locks 不可用——照常执行临界区（退化行为）。
+  //   立即可得 → {held:true}，锁已持有，直到 release()（临界区 finally 调）。
+  //   被其他标签占用 → onWaiting() 回调一次（页面提示「另一标签正在上传」）
+  //   后排队等待，拿到锁才 resolve；等待可经 opts.signal 取消（reject
+  //   AbortError，此时锁未被持有）。
+  function acquireContentLock(name, opts) {
+    opts = opts || {};
+    var locks = (typeof navigator !== "undefined" && navigator.locks &&
+                 typeof navigator.locks.request === "function")
+      ? navigator.locks : null;
+    if (!locks) return Promise.resolve({ held: false, release: function () {} });
+    // release 是稳定的包装：holdUntilRelease() 每个持有期重新绑定真正的
+    // resolve——grant 时捕获到的 release 必须能释放之后才建立的持有。
+    var releaseHold = null;
+    var release = function () {
+      if (releaseHold) {
+        var r = releaseHold;
+        releaseHold = null;
+        r();
+      }
+    };
+    function holdUntilRelease() {
+      releaseHold = null;
+      return new Promise(function (r) { releaseHold = r; });
+    }
+    return new Promise(function (resolve, reject) {
+      var settled = false;
+      function grant(got) {
+        if (settled) return;
+        if (got) {
+          settled = true;
+          resolve({ held: true, release: release });
+          return;
+        }
+        // 被其他标签占用：先提示（页面显示「另一标签正在上传」）再排队等待
+        if (opts.onWaiting) {
+          try { opts.onWaiting(); } catch (e) { /* 提示失败不阻塞等待 */ }
+        }
+        var queued = true;
+        locks.request(name, { signal: opts.signal || undefined }, function (lock) {
+          if (!lock) return;
+          queued = false;
+          if (!settled) { settled = true; resolve({ held: true, release: release }); }
+          return holdUntilRelease();   // 持有直到 release()
+        }).catch(function (e) {
+          // 等待期被取消（AbortError）等：锁未被持有，把原因交给调用方
+          if (queued && !settled) { settled = true; reject(e); }
+        });
+      }
+      // 立即探测不带 signal（规范禁止 signal + ifAvailable 组合；探测本就
+      // 不排队等待，无需取消）。等待排队的请求才带 signal（等待可取消）。
+      locks.request(name, { ifAvailable: true },
+        function (lock) {
+          if (!lock) { grant(false); return; }
+          grant(true);
+          return holdUntilRelease();   // 持有直到 release()
+        }).catch(function (e) {
+          if (!settled) { settled = true; reject(e); }
+        });
+    });
+  }
+
   window.HP_COS_UPLOAD = {
     resolveConfig: resolveConfig,
     createUpload: createUpload,
     buildPlan: buildPlan,
     putPart: putPart,
+    contentLockName: contentLockName,
+    acquireContentLock: acquireContentLock,
   };
 })();

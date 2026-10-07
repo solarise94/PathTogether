@@ -83,6 +83,8 @@
     "upload.cos.err.state": { zh: "任务状态冲突，请刷新页面后重试", en: "Job state conflict; please refresh and retry" },
     "upload.cos.err.rate": { zh: "签名请求过于频繁，请稍后重试", en: "Signing rate limited; please retry later" },
     "upload.cos.err.reconcile": { zh: "云端容量对账中，暂不可继续，请稍后重试", en: "Cloud capacity reconciliation in progress; retry later" },
+    // 复核 8428f7f0：跨标签内容锁等待（另一标签正在上传同一文件；i18n.js 为主源，此处兜底）
+    "upload.cos.other.tab": { zh: "另一个标签页正在上传同一文件，等待中…（可取消）", en: "Another tab is uploading this file — waiting… (you can cancel)" },
     // U1 字节级上传进度（i18n.js 为主源，此处兜底）
     "upload.cos.bytes": { zh: "已传输 {done} / {total}", en: "{done} / {total} transferred" },
     "upload.cos.sent_all": { zh: "数据已发送，等待确认", en: "All data sent, awaiting confirmation" },
@@ -7124,91 +7126,119 @@
     }
 
     // —— 取消（§4 cancel 幂等）：停轮询 + abort 在途 PUT + POST cancel ——
+    // 复核 8428f7f0：等锁中取消 = abort 内容锁等待（此刻引擎尚未创建）
+    var lockAbort = (typeof AbortController === "function")
+      ? new AbortController() : null;
     addRowButton(row, tt("upload.cos.cancel"), function () {
+      if (lockAbort) { try { lockAbort.abort(); } catch (e) {} }
       if (!upload) return;
       row.setStage("upload.cos.cancelled");
       row.finish(10000);
       upload.cancel();
     });
 
-    upload = window.HP_COS_UPLOAD.createUpload({
-      source: file,
-      apiFetch: apiFetch,
-      config: COS_UPLOAD_CONFIG,
-      // 阶段 1：创建 ingestion 时携带嗅探出的直传类别声明（服务端词表校验，
-      // worker 在 open_slide 前头级核验；无声明则不带字段——存量语义不变）
-      createBody: opts.directClass ? { direct_class: opts.directClass } : null,
-      storage: {
-        save: cosJobSave,
-        complete: cosJobRemove,   // viewable/终态：本地恢复记录清理（§5）
-        remove: cosJobRemove,
-        findResumable: cosFindResumableJob,
-        readConfirmed: function (id) {
-          var jobs = cosJobsRead().filter(function (j) { return j.job_id === id; });
-          return jobs.length ? jobs[0].confirmed : [];
+    // 复核 8428f7f0（双标签并发直传同一文件）：行/引擎没有跨标签互斥，两
+    // 个工作台标签并发拖入同一文件会各建一个 ingestion。与工具页同一把跨
+    // 标签内容锁（账号 + 文件身份，共享引擎 contentLockName）；锁内引擎自
+    // 查续传候选（另一标签进行中 → 询问后续传，绝不并发双建）。等待期行
+    // 显示「另一标签正在上传」，可取消；Web Lock 不可用（旧浏览器/非安全
+    // 上下文）→ 既有行为。已完成文件不在此去重（工作台重新上传同一文件 =
+    // 新建切片，工作台没有已发布回执语义）。
+    var locked = (window.HP_COS_UPLOAD.acquireContentLock &&
+                  window.HP_COS_UPLOAD.contentLockName)
+      ? window.HP_COS_UPLOAD.acquireContentLock(
+          window.HP_COS_UPLOAD.contentLockName(String(currentUserId || ""), file),
+          { signal: lockAbort ? lockAbort.signal : undefined,
+            onWaiting: function () {
+              row.setStage("upload.cos.other.tab", null, "", true);
+            } })
+      : Promise.resolve({ held: false, release: function () {} });
+    locked.then(function (lk) {
+      upload = window.HP_COS_UPLOAD.createUpload({
+        source: file,
+        apiFetch: apiFetch,
+        config: COS_UPLOAD_CONFIG,
+        // 阶段 1：创建 ingestion 时携带嗅探出的直传类别声明（服务端词表校验，
+        // worker 在 open_slide 前头级核验；无声明则不带字段——存量语义不变）
+        createBody: opts.directClass ? { direct_class: opts.directClass } : null,
+        storage: {
+          save: cosJobSave,
+          complete: cosJobRemove,   // viewable/终态：本地恢复记录清理（§5）
+          remove: cosJobRemove,
+          findResumable: cosFindResumableJob,
+          readConfirmed: function (id) {
+            var jobs = cosJobsRead().filter(function (j) { return j.job_id === id; });
+            return jobs.length ? jobs[0].confirmed : [];
+          },
+          readRecord: cosReadJobRecord,   // review #1：分片摘要 + 账号
         },
-        readRecord: cosReadJobRecord,   // review #1：分片摘要 + 账号
-      },
-      // review #1：记录/候选按登录账号绑定（本页身份 = /api/auth/info 的
-      // user_id；免认证态为空串——绑定语义退化为「同一（唯一）账号」）
-      account: String(currentUserId || ""),
-      resumeJobId: jobId,
-      skipConfirm: !!opts.skipConfirm,
-      confirmResume: function () {
-        return window.confirm(tt("upload.cos.resume_confirm", { name: file.name }));
-      },
-      // 工作台保持抽出前行为：完成请求网络失败不自动重发（行级失败提示
-      // 重选同名文件续传）；工具页才开 retryCompleteOnNetworkError。
-      retryCompleteOnNetworkError: false,
-      useResumeEndpoint: false,
-      onEvent: function (ev) {
-        if (ev.type === "status") {
-          cosShowStage(row, ev.body);
-          if (ev.body && ev.body.stage !== "uploading") retrying = false;
-        } else if (ev.type === "progress") {
-          // phase:'uploading' 字节事件（兼容旧 frac 消费；determinate=false →
-          // 不定态 + 已确认字节后备，不虚构按片百分比）
-          retrying = false;
-          row.setStage("upload.cos.stage.uploading",
-                       ev.determinate === false ? null : ev.frac,
-                       cosProgressNote(ev), ev.determinate === false);
-        } else if (ev.type === "retry") {
-          retrying = true;
-          row.setStage("upload.cos.stage.uploading", null,
-                       cosProgressNote(null), true);
-        } else if (ev.type === "created") jobId = ev.jobId;
-      },
-    });
+        // review #1：记录/候选按登录账号绑定（本页身份 = /api/auth/info 的
+        // user_id；免认证态为空串——绑定语义退化为「同一（唯一）账号」）
+        account: String(currentUserId || ""),
+        resumeJobId: jobId,
+        skipConfirm: !!opts.skipConfirm,
+        confirmResume: function () {
+          return window.confirm(tt("upload.cos.resume_confirm", { name: file.name }));
+        },
+        // 工作台保持抽出前行为：完成请求网络失败不自动重发（行级失败提示
+        // 重选同名文件续传）；工具页才开 retryCompleteOnNetworkError。
+        retryCompleteOnNetworkError: false,
+        useResumeEndpoint: false,
+        onEvent: function (ev) {
+          if (ev.type === "status") {
+            cosShowStage(row, ev.body);
+            if (ev.body && ev.body.stage !== "uploading") retrying = false;
+          } else if (ev.type === "progress") {
+            // phase:'uploading' 字节事件（兼容旧 frac 消费；determinate=false →
+            // 不定态 + 已确认字节后备，不虚构按片百分比）
+            retrying = false;
+            row.setStage("upload.cos.stage.uploading",
+                         ev.determinate === false ? null : ev.frac,
+                         cosProgressNote(ev), ev.determinate === false);
+          } else if (ev.type === "retry") {
+            retrying = true;
+            row.setStage("upload.cos.stage.uploading", null,
+                         cosProgressNote(null), true);
+          } else if (ev.type === "created") jobId = ev.jobId;
+        },
+      });
 
-    upload.done.then(function (r) {
-      if (!r || r.cancelled) return;
-      cosUploadSucceeded(row, r.body, file);
-    }, function (err) {
-      var msg;
-      if (err && err.terminal) {
-        msg = cosErrorMessage(0, { code: (err.data && err.data.fail_code) || "" });
-      } else if (err && err.network) {
-        // 网络层失败：任务与已确认分块保留，重选同名文件可续传（§5）
-        msg = tt("upload.cos.resume_hint");
-      } else {
-        msg = cosErrorMessage(err && err.status, err && err.data);
-      }
-      row.markError();
-      row.setStage("upload.stage.failed");
-      if (err && typeof err.part === "number") {
-        // 分块最终失败：从 confirmed 续传（服务端计划仍在，跳过已确认块）
-        addRowButton(row, tt("upload.cos.retry"), function () {
-          uploadFile(file, { cosRetry: jobId });
-        });
-      } else if (err && err.recheck) {
-        // review #9：状态轮询连续失败放弃 → 只提供「重新检查状态」
-        //（同 job 重入状态机重新查询；绝不重建任务/重传分片）
-        addRowButton(row, tt("upload.cos.recheck"), function () {
-          uploadFile(file, { cosRetry: jobId });
-        });
-      }
-      row.finish(10000);
-      toast(t("upload.fail", { e: msg }), "error");
+      // done 收口（成功/失败/取消）后立刻释放内容锁：等待标签随后重读
+      // 回执/记录（工具页）或续传候选（工作台）。
+      var settled = upload.done.then(function (r) {
+        if (!r || r.cancelled) return;
+        cosUploadSucceeded(row, r.body, file);
+      }, function (err) {
+        var msg;
+        if (err && err.terminal) {
+          msg = cosErrorMessage(0, { code: (err.data && err.data.fail_code) || "" });
+        } else if (err && err.network) {
+          // 网络层失败：任务与已确认分块保留，重选同名文件可续传（§5）
+          msg = tt("upload.cos.resume_hint");
+        } else {
+          msg = cosErrorMessage(err && err.status, err && err.data);
+        }
+        row.markError();
+        row.setStage("upload.stage.failed");
+        if (err && typeof err.part === "number") {
+          // 分块最终失败：从 confirmed 续传（服务端计划仍在，跳过已确认块）
+          addRowButton(row, tt("upload.cos.retry"), function () {
+            uploadFile(file, { cosRetry: jobId });
+          });
+        } else if (err && err.recheck) {
+          // review #9：状态轮询连续失败放弃 → 只提供「重新检查状态」
+          //（同 job 重入状态机重新查询；绝不重建任务/重传分片）
+          addRowButton(row, tt("upload.cos.recheck"), function () {
+            uploadFile(file, { cosRetry: jobId });
+          });
+        }
+        row.finish(10000);
+        toast(t("upload.fail", { e: msg }), "error");
+      });
+      settled.then(function () { lk.release(); },
+                   function () { lk.release(); });
+    }, function () {
+      // 等锁被取消（AbortError）：取消按钮已把行切到「已取消」，无需再动
     });
   }
 

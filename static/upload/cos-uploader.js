@@ -70,8 +70,9 @@
      注册，settle/取消后注销；abortController.abort() 停止全部在途 XHR；
    - 分批签名（sign_batch_max_parts，429/503 退避 ≤3 次同批重试）+ 批内并发
      （max_concurrent_parts）；单片同 URL 重试 ≤3 → 重新签名一次 → 再 ≤3；
-   - upload-complete 幂等：409 ingestion_state_conflict = 已完成过，转轮询；
-     重复回放限速（1.5s）防热循环。
+   - upload-complete 幂等：409 ingestion_state_conflict = 已完成过，转轮询。
+     review #10：完成请求网络失败 → 先查任务状态再决定（已收口→轮询；仍
+     uploading→幂等重发 ≤4 次）——工作台与工具页同一语义。
    ========================================================================= */
 (function () {
   "use strict";
@@ -312,7 +313,6 @@
     var abortCtl = (typeof AbortController === "function") ? new AbortController() : null;
     var stopped = false;           // 用户取消后停一切后续动作
     var waits = new Set();         // 进行中的等待 {h, reject}：取消时立即以 cancelled 结束
-    var completePosts = 0;         // upload-complete 回放计数（限速热循环）
     var settleCancelled = null;
     var cancelledOutcome = new Promise(function (r) { settleCancelled = r; });
 
@@ -583,6 +583,30 @@
       return api("/api/ingestions/" + encodeURIComponent(jobId)).then(jsonBody);
     }
 
+    // review 2026-10-07 #9：状态轮询容忍瞬时失败——429/5xx/网络层失败按
+    // 退避重查（指数退避 1s/2s/4s/8s，封顶 8s；连续失败上限 5 次），超界
+    // 后以 recheck 标记失败（UI 提供「重新检查状态」= 以同 job 重入状态机
+    // 重新查询，绝不重建任务/重传分片）。4xx（404/401/403…）非瞬态：立即
+    // 失败，不退避。
+    var STATUS_FAIL_LIMIT = 5;
+    var statusFails = 0;
+
+    function transientOrThrow(status, data) {
+      var transient = status === 0 || status === 429 || status >= 500;
+      if (!transient) {
+        statusFails = 0;
+        throw { status: status, data: data };
+      }
+      statusFails++;
+      if (statusFails > STATUS_FAIL_LIMIT) {
+        statusFails = 0;
+        throw { status: status, data: data, recheck: true,
+                network: status === 0 };
+      }
+      var backoff = Math.min(1000 * Math.pow(2, statusFails - 1), 8000);
+      return delay(backoff).then(drive);
+    }
+
     // 服务端冻结计划落位：长度索引 + totalBytes 一致性校验 + 续传已确认字节
     // 折算。mismatch=true 时调用方必须拒绝上传（不签名、不 PUT、不发事件）。
     function freezePlan(parts) {
@@ -613,7 +637,8 @@
       // upload-complete → 服务端阶段(2s 轮询) → viewable/terminal
       return fetchStatus().then(function (res) {
         if (stopped) throw { cancelled: true };
-        if (!res.ok) throw { status: res.status, data: res.body };
+        if (!res.ok) return transientOrThrow(res.status, res.body);
+        statusFails = 0;
         var b = res.body || {};
         // status 响应出现 slide_id（随 slide 出现）即回填本地记录
         if (b.slide_id && jobId) quiet(saveRecord({ slide_id: b.slide_id }));
@@ -662,6 +687,10 @@
           throw { terminal: true, data: b };
         }
         return delay(2000).then(drive);   // 未知 stage：以服务端为准再查
+      }, function (err) {
+        if (err && err.cancelled) throw err;
+        // 网络层失败（fetch TypeError / api 拒绝）：与 5xx 同一退避合同
+        return transientOrThrow(0, null);
       });
     }
 
@@ -814,25 +843,40 @@
       //（服务端状态是唯一权威，直接转入阶段轮询）。重复回放（complete 后
       // 状态仍停在 uploading，如 worker 尚未处理完成请求）做限速重放，避免
       // 无延时的热循环打爆控制 API。
-      // retryCompleteOnNetworkError（工具页）：完成请求已到达服务端但响应
-      // 丢失（网络层失败）→ 重发 complete——同任务幂等，409 冲突即已完成过。
-      // 注意 post()/send() 分层：网络重试的递归只回归 {ok,status,body}，
-      // 响应判定与 drive() 只在 send() 里发生一次（递归里再跑响应链会把
-      // drive 的结果当响应再判一遍——双重轮询）。
+      // review 2026-10-07 #10：完成请求**网络层失败 ≠ 失败**（请求可能已达
+      // 服务端、只是响应丢失）——先重查任务状态再决定：
+      //   已离开 uploading（completing/awaiting_server/…/viewable）→ 直接
+      //   进入轮询收口（不重发）；仍在 uploading → 幂等重发 complete（409
+      //   冲突 = 已完成过），有界（≤4 次）。工作台与工具页同一语义（状态查
+      //   不到时按仍 uploading 处理，同样有界）。
+      var attempts = 0;
+      var COMPLETE_LIMIT = 4;
       function post() {
-        completePosts++;
+        attempts++;
         return api("/api/ingestions/" + encodeURIComponent(jobId) +
                    "/upload-complete", { method: "POST" })
           .then(jsonBody, function (netErr) {
             if (netErr && netErr.cancelled) throw netErr;
-            if (opts.retryCompleteOnNetworkError && completePosts < 4) {
-              return delay(1500).then(post);
+            if (attempts >= COMPLETE_LIMIT) {
+              throw { network: true, status: 0, data: null };
             }
-            throw netErr;
+            return delay(1500).then(function () {
+              if (stopped) throw { cancelled: true };
+              return fetchStatus().then(function (res) {
+                var st = res.ok && res.body && res.body.stage;
+                if (st && st !== "uploading") {
+                  return null;   // 已在收口/已完成 → 直接进入轮询
+                }
+                return post();   // 仍 uploading（或状态不可得）→ 幂等重发
+              }, function () {
+                return post();
+              });
+            });
           });
       }
       function send() {
         return post().then(function (res) {
+          if (res === null) return drive();
           if (res.ok || (res.status === 409 && res.body &&
                          res.body.code === "ingestion_state_conflict")) {
             return drive();
@@ -840,7 +884,7 @@
           throw { status: res.status, data: res.body };
         });
       }
-      if (completePosts > 0) return delay(1500).then(send);
+      if (attempts > 0) return delay(1500).then(send);
       return send();
     }
 

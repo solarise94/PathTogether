@@ -206,6 +206,16 @@ function fakeStorage() {
 	};
 }
 
+
+/** 推进假时钟并让出真实事件循环：确认链上的 WebCrypto 摘要是线程池真实
+ *  异步——只冲微任务不会让它落地（高负载下尤其明显），done/记录断言需要
+ *  真实 yield 才确定。 */
+const REAL_TIMEOUT = setTimeout;
+async function advYield(ms: number) {
+	await vi.advanceTimersByTimeAsync(ms);
+	await new Promise((r) => REAL_TIMEOUT(r, 0));
+}
+
 const tick = () => new Promise((r) => setTimeout(r, 0));
 async function flush(n = 12) { for (let i = 0; i < n; i++) await tick(); }
 
@@ -656,16 +666,16 @@ describe("createUpload：记录落盘失败与取消收口（C4 复审 P1/P2）"
 		});
 		const waitingOn = kind === "waiting_space" ? "/api/ingestions/inj_w" : "/parts/sign";
 		for (let i = 0; i < 50 && !calls.some(([u]) => u.endsWith(waitingOn)); i++) {
-			await vi.advanceTimersByTimeAsync(0);
+			await advYield(0);
 		}
 		expect(calls.some(([u]) => u.endsWith(waitingOn))).toBe(true);
 		let settled: unknown = null;
 		up.done.then((r) => { settled = r; });
 		up.cancel();
-		await vi.advanceTimersByTimeAsync(0);
+		await advYield(0);
 		expect(settled).toEqual({ cancelled: true });
 		const before = calls.length;
-		await vi.advanceTimersByTimeAsync(20000);
+		await advYield(20000);
 		const after = calls.slice(before).map(([u]) => u);
 		expect(after).toEqual([]);
 		expect(calls.filter(([u]) => u.endsWith("/cancel"))).toHaveLength(1);
@@ -721,7 +731,7 @@ describe("createUpload：U1 字节级上传进度", () => {
 		});
 		/** 等到第 n 个 PUT 的 XHR 进入 send（签名后） */
 		async function waitForPut(n: number) {
-			for (let i = 0; i < 200 && gates.length < n; i++) await vi.advanceTimersByTimeAsync(0);
+			for (let i = 0; i < 200 && gates.length < n; i++) await advYield(0);
 			expect(gates.length, `waiting for PUT #${n}`).toBeGreaterThanOrEqual(n);
 			return gates[n - 1];
 		}
@@ -740,9 +750,9 @@ describe("createUpload：U1 字节级上传进度", () => {
 		// 先推时钟再触发回调：保证距上一次发射 ≥120ms（初始事件在 PUT 前刚发过）
 		const steps: number[] = [];
 		for (const loaded of [8, 16, 24, 32]) {
-			await vi.advanceTimersByTimeAsync(150);
+			await advYield(150);
 			x1.progress(loaded);
-			await vi.advanceTimersByTimeAsync(0);
+			await advYield(0);
 			const evs = h.byteEvents();
 			const last = evs[evs.length - 1];
 			expect(last.totalBytes).toBe(32);
@@ -759,7 +769,7 @@ describe("createUpload：U1 字节级上传进度", () => {
 		expect(beforeConfirm.every((e) => e.confirmedBytes === 0)).toBe(true);
 		// HTTP 2xx 确认后：confirmedBytes 入账（active→confirmed 同一更新）
 		x1.respond(200, '"e1"');
-		await vi.advanceTimersByTimeAsync(0);
+		await advYield(0);
 		const evs = h.byteEvents();
 		expect(evs[evs.length - 1].loadedBytes).toBe(32);
 		expect(evs[evs.length - 1].confirmedBytes).toBe(32);
@@ -774,33 +784,33 @@ describe("createUpload：U1 字节级上传进度", () => {
 		const h = byteHarness(parts, 32);
 		const x1 = await h.waitForPut(1);
 		const x2 = await h.waitForPut(2);
-		await vi.advanceTimersByTimeAsync(150);
+		await advYield(150);
 		x1.progress(12);                       // 大片传一半：12/32（按片数则 0%）
-		await vi.advanceTimersByTimeAsync(0);
+		await advYield(0);
 		let last = h.byteEvents().slice(-1)[0];
 		expect(last.loadedBytes).toBe(12);
 		expect(last.frac).toBeCloseTo(12 / 32, 5);
-		await vi.advanceTimersByTimeAsync(150);
+		await advYield(150);
 		x2.progress(4);                        // 尾片 4/8
-		await vi.advanceTimersByTimeAsync(0);
+		await advYield(0);
 		last = h.byteEvents().slice(-1)[0];
 		expect(last.loadedBytes).toBe(16);
-		await vi.advanceTimersByTimeAsync(150);
+		await advYield(150);
 		x1.progress(9999);                     // 越界回调：夹到分片长度
-		await vi.advanceTimersByTimeAsync(0);
+		await advYield(0);
 		last = h.byteEvents().slice(-1)[0];
 		expect(last.loadedBytes).toBe(28);
 		expect(last.frac).toBeLessThanOrEqual(1);
-		await vi.advanceTimersByTimeAsync(150);
+		await advYield(150);
 		x2.progress(8);
-		await vi.advanceTimersByTimeAsync(0);
+		await advYield(0);
 		last = h.byteEvents().slice(-1)[0];
 		expect(last.loadedBytes).toBe(32);     // 夹紧后总和恰为 totalBytes
 		expect(last.frac).toBe(1);
 		expect(last.sentAll).toBe(true);
 		expect(h.byteEvents().every((e) => e.frac <= 1)).toBe(true);
 		x1.respond(200); x2.respond(200);
-		await vi.advanceTimersByTimeAsync(0);
+		await advYield(0);
 		expect(h.byteEvents().slice(-1)[0].confirmedBytes).toBe(32);
 		const r = await h.up.done;
 		expect(r && r.ok).toBe(true);
@@ -811,33 +821,33 @@ describe("createUpload：U1 字节级上传进度", () => {
 		const parts = [{ part_number: 1, length: 16 }, { part_number: 2, length: 16 }];
 		const h = byteHarness(parts, 32);
 		const x1 = await h.waitForPut(1);      // part 1 第一次尝试
-		await vi.advanceTimersByTimeAsync(150);
+		await advYield(150);
 		x1.progress(16);
-		await vi.advanceTimersByTimeAsync(0);
+		await advYield(0);
 		expect(h.byteEvents().slice(-1)[0].loadedBytes).toBe(16);
 		x1.failNetwork();                      // 网络错误：同 URL 重试（600ms 退避）
-		await vi.advanceTimersByTimeAsync(700);
+		await advYield(700);
 		// 失败尝试的 loaded 立即丢弃（暂态百分比回退 + retry 事件）
 		expect(h.events.some((e) => e.type === "retry" && e.part === 1)).toBe(true);
 		// 旧尝试的迟到进度回调无效（新 attempt ID 已替换）
 		const xRetry = FakeXHR.instances.find(
 			(x) => x !== x1 && putPartNumber(String(x.url)) === 1);
 		expect(xRetry, "part 1 retry XHR").toBeTruthy();
-		await vi.advanceTimersByTimeAsync(150);
+		await advYield(150);
 		xRetry!.progress(4);
-		await vi.advanceTimersByTimeAsync(0);
+		await advYield(0);
 		const withRetry4 = h.byteEvents().slice(-1)[0].loadedBytes;
 		expect(withRetry4).toBeGreaterThanOrEqual(4);
 		x1.progress(16);                       // 旧尝试迟到回调：不得计入
-		await vi.advanceTimersByTimeAsync(150);
+		await advYield(150);
 		expect(h.byteEvents().slice(-1)[0].loadedBytes).toBe(withRetry4);
 		// 第二次尝试推进 + 双双确认 → 每片只确认一次（重试不重复入账）
-		await vi.advanceTimersByTimeAsync(150);
+		await advYield(150);
 		xRetry!.progress(16);
-		await vi.advanceTimersByTimeAsync(0);
+		await advYield(0);
 		expect(h.byteEvents().slice(-1)[0].loadedBytes).toBeGreaterThanOrEqual(16);
 		FakeXHR.instances.forEach((x) => { if (x !== x1) x.respond(200); });
-		await vi.advanceTimersByTimeAsync(0);
+		await advYield(0);
 		const confirmedFull = h.byteEvents().filter((e) => e.confirmedBytes === 32);
 		expect(confirmedFull).toHaveLength(1);   // 不双计（重试不重复入账）
 		expect(h.st.saves[h.st.saves.length - 1].confirmed.sort()).toEqual([1, 2]);
@@ -882,7 +892,7 @@ describe("createUpload：U1 字节级上传进度", () => {
 		const doneAssertion = expect(up.done).rejects.toMatchObject(
 			{ part: 1, status: 403, network: false });
 		for (let i = 0; i < 40 && FakeXHR.instances.length < 6; i++) {
-			await vi.advanceTimersByTimeAsync(700);
+			await advYield(700);
 		}
 		expect(FakeXHR.instances).toHaveLength(6);
 		const urls = FakeXHR.instances.map((x) => String(x.url));
@@ -921,7 +931,7 @@ describe("createUpload：U1 字节级上传进度", () => {
 		const doneAssertion = expect(up.done).rejects.toMatchObject(
 			{ part: 1, network: true });   // 先订阅（见上一测试注释）
 		for (let i = 0; i < 40 && FakeXHR.instances.length < 6; i++) {
-			await vi.advanceTimersByTimeAsync(700);
+			await advYield(700);
 		}
 		await doneAssertion;
 	});
@@ -945,9 +955,9 @@ describe("createUpload：U1 字节级上传进度", () => {
 		const h = byteHarness(parts, 16);
 		const x1 = await h.waitForPut(1);
 		const evCount0 = h.byteEvents().length;
-		await vi.advanceTimersByTimeAsync(150);
+		await advYield(150);
 		x1.progress(7, false);               // lengthComputable=false
-		await vi.advanceTimersByTimeAsync(0);
+		await advYield(0);
 		let last = h.byteEvents().slice(-1)[0];
 		if (h.byteEvents().length > evCount0) {
 			// 允许发活动事件，但绝不把不可计算长度的 loaded 虚构成确定进度
@@ -960,9 +970,9 @@ describe("createUpload：U1 字节级上传进度", () => {
 		expect(last.frac).toBe(0);
 		x1.respond(200);
 		const x2 = await h.waitForPut(2);
-		await vi.advanceTimersByTimeAsync(150);
+		await advYield(150);
 		x2.progress(5, false);
-		await vi.advanceTimersByTimeAsync(0);
+		await advYield(0);
 		last = h.byteEvents().slice(-1)[0];
 		expect(last.determinate).toBe(false);
 		expect(last.confirmedBytes).toBe(8); // 后备：分片响应驱动已确认字节
@@ -981,16 +991,16 @@ describe("createUpload：U1 字节级上传进度", () => {
 		const x1 = await h.waitForPut(1);
 		const fired = 20;                    // 20 次回调、30ms 间隔（< 120ms 节流窗）
 		for (let k = 1; k <= fired; k++) {
-			await vi.advanceTimersByTimeAsync(30);
+			await advYield(30);
 			x1.progress(k * 5);
-			await vi.advanceTimersByTimeAsync(0);
+			await advYield(0);
 		}
 		const evs = h.byteEvents();
 		// 密集回调被合并（远少于触发次数），但仍有多次可见（≥3 次中间值）
 		expect(evs.length).toBeLessThan(fired);
 		expect(evs.length).toBeGreaterThanOrEqual(3);
 		x1.respond(200);
-		await vi.advanceTimersByTimeAsync(0);
+		await advYield(0);
 		// 确认事件不受节流约束（force 立即发）
 		expect(h.byteEvents().slice(-1)[0].confirmedBytes).toBe(100);
 		const r = await h.up.done;
@@ -1293,7 +1303,7 @@ describe("createUpload：分片失败的 lane 停止与 drain（review #7）", (
 		let settled = false;
 		void up.done.catch(() => {}).then(() => { settled = true; });
 		for (let i = 0; i < budget && !settled; i++) {
-			await vi.advanceTimersByTimeAsync(700);
+			await advYield(700);
 		}
 		return settled;
 	}
@@ -1318,7 +1328,7 @@ describe("createUpload：分片失败的 lane 停止与 drain（review #7）", (
 		});
 		// 推进到 part 2 终局失败（终局重签 [2] 出现）
 		for (let i = 0; i < 100 && h.signCalls.length < 2; i++) {
-			await vi.advanceTimersByTimeAsync(700);
+			await advYield(700);
 		}
 		// 终局失败后：第二批分片（3/4）不再被任何 lane 调度
 		expect(h.signCalls).toEqual([[1, 2, 3, 4], [2]]);
@@ -1385,7 +1395,7 @@ describe("createUpload：XHR 无进度超时与单片上限（review #8）", () 
 		}
 		async function firstGate(): Promise<FakeXHR> {
 			for (let i = 0; i < 200 && !gates.length; i++) {
-				await vi.advanceTimersByTimeAsync(0);
+				await advYield(0);
 			}
 			expect(gates.length).toBeGreaterThan(0);
 			return gates[0];
@@ -1398,11 +1408,11 @@ describe("createUpload：XHR 无进度超时与单片上限（review #8）", () 
 		const h = timeoutHarness();
 		const up = h.makeUpload();
 		const x1 = await h.firstGate();
-		await vi.advanceTimersByTimeAsync(59000);
+		await advYield(59000);
 		expect(x1.aborted).toBe(false);          // 59s 内不动
-		await vi.advanceTimersByTimeAsync(1000);
+		await advYield(1000);
 		expect(x1.aborted).toBe(true);           // 第 60s：无进度超时
-		for (let i = 0; i < 10; i++) await vi.advanceTimersByTimeAsync(700);
+		for (let i = 0; i < 10; i++) await advYield(700);
 		expect(h.events.some((e) => e.type === "retry")).toBe(true);
 		expect(FakeXHR.instances.length).toBeGreaterThan(1);   // 新尝试已发出
 	});
@@ -1413,11 +1423,11 @@ describe("createUpload：XHR 无进度超时与单片上限（review #8）", () 
 		const up = h.makeUpload({ progressTimeoutMs: 30000 });
 		const x1 = await h.firstGate();
 		for (let i = 0; i < 5; i++) {            // 每 25s 有进度：不超时
-			await vi.advanceTimersByTimeAsync(25000);
+			await advYield(25000);
 			x1.progress(2 * (i + 1));
 		}
 		expect(x1.aborted).toBe(false);
-		await vi.advanceTimersByTimeAsync(30000);   // 30s 无进度：按配置超时
+		await advYield(30000);   // 30s 无进度：按配置超时
 		expect(x1.aborted).toBe(true);
 	});
 
@@ -1428,7 +1438,7 @@ describe("createUpload：XHR 无进度超时与单片上限（review #8）", () 
 		const x1 = await h.firstGate();
 		expect(x1.timeout).toBe(120000);
 		x1.ontimeout && x1.ontimeout();          // 浏览器整体超时 → 可重试
-		for (let i = 0; i < 10; i++) await vi.advanceTimersByTimeAsync(700);
+		for (let i = 0; i < 10; i++) await advYield(700);
 		expect(h.events.some((e) => e.type === "retry")).toBe(true);
 	});
 
@@ -1439,7 +1449,212 @@ describe("createUpload：XHR 无进度超时与单片上限（review #8）", () 
 		await h.firstGate();
 		up.cancel();
 		const n = FakeXHR.instances.length;
-		await vi.advanceTimersByTimeAsync(600000);
+		await advYield(600000);
 		expect(FakeXHR.instances.length).toBe(n);
+	});
+});
+
+// --------------------------------------------------------------------------- //
+// review 2026-10-07 #9：状态轮询容忍瞬时失败（退避重查，连续失败有界），
+// 放弃后错误带 recheck 标记（UI 提供「重新检查状态」= 重新查询，绝不重传）；
+// 非瞬态（404/401/403）立即失败不退避。
+// --------------------------------------------------------------------------- //
+describe("createUpload：状态轮询容忍瞬时失败（review #9）", () => {
+	function pollingHarness(failTimes: number, failStatus: number) {
+		const calls: Array<[string, number]> = [];
+		let gets = 0;
+		const parts = [{ part_number: 1, length: 8 }];
+		const fetchImpl = vi.fn((url: string, init?: RequestInit) => {
+			const method = String((init && init.method) || "GET");
+			if (url === "/api/ingestions" && method === "POST") {
+				return Promise.resolve(resp({ job_id: "inj_pl", stage: "uploading" }, 202));
+			}
+			if (url === "/api/ingestions/inj_pl" && method === "GET") {
+				gets++;
+				calls.push(["status", gets]);
+				if (gets <= failTimes) {
+					if (failStatus === 0) return Promise.reject(new TypeError("net"));
+					return Promise.resolve(resp({ error: "busy" }, failStatus));
+				}
+				if (gets <= failTimes + 1) {
+					return Promise.resolve(resp({ stage: "uploading", parts }));
+				}
+				return Promise.resolve(resp({ stage: "viewable", slide_id: "sld_pl" }));
+			}
+			if (url.endsWith("/parts/sign")) {
+				const nums = JSON.parse(String(init!.body)).part_numbers as number[];
+				return Promise.resolve(resp({
+					urls: nums.map((n) => ({ url: `https://cos.example/o?partNumber=${n}`, part_number: n })),
+				}));
+			}
+			if (url.endsWith("/upload-complete")) {
+				return Promise.resolve(resp({ stage: "awaiting_server" }, 202));
+			}
+			return Promise.resolve(resp({}));
+		}) as unknown as typeof fetch;
+		const eng = loadEngine(fetchImpl);
+		happyXhr();   // PUT 一律立即 200
+		return { eng, fetchImpl, statusGets: () => gets };
+	}
+
+	it("瞬时 503 ×2：退避后重查并正常收口（不立即失败）", async () => {
+		vi.useFakeTimers();
+		const h = pollingHarness(2, 503);
+		const up = h.eng.createUpload({
+			source: sliceSource(8),
+			apiFetch: (u, o) => (h.fetchImpl as unknown as (u2: string, o2?: RequestInit) => Promise<Response>)(u, o),
+			config: h.eng.resolveConfig(CFG), storage: fakeStorage().adapter,
+		});
+		let settled: { ok?: boolean } | null = null;
+		void up.done.then((r) => { settled = r as { ok?: boolean }; });
+		for (let i = 0; i < 200 && !settled; i++) await advYield(700);
+		expect(settled && settled.ok).toBe(true);
+		expect(h.statusGets()).toBe(4);   // 2 次失败 + uploading + viewable
+	});
+
+	it("连续失败超界（>5 次）→ reject {recheck:true}；同 job 重新查询可收口", async () => {
+		vi.useFakeTimers();
+		const h = pollingHarness(99, 503);
+		const up = h.eng.createUpload({
+			source: sliceSource(8),
+			apiFetch: (u, o) => (h.fetchImpl as unknown as (u2: string, o2?: RequestInit) => Promise<Response>)(u, o),
+			config: h.eng.resolveConfig(CFG), storage: fakeStorage().adapter,
+		});
+		let err: Record<string, unknown> | null = null;
+		void up.done.catch((e) => { err = e as Record<string, unknown>; });
+		for (let i = 0; i < 400 && !err; i++) await advYield(700);
+		expect(err && err.recheck).toBe(true);   // UI 语义：重新查询，绝不重传
+		const getsAtGiveUp = h.statusGets();
+		expect(getsAtGiveUp).toBeGreaterThanOrEqual(6);
+		// 「重新检查状态」= 以 resumeJobId 重入同一状态机（重查后恢复收口；
+		// 绝不重建任务）。后端恢复：重查直接 viewable。
+		const recovered = vi.fn((url: string, init?: RequestInit) => {
+			const method = String((init && init.method) || "GET");
+			if (url === "/api/ingestions/inj_pl" && method === "GET") {
+				return Promise.resolve(resp({ stage: "viewable", slide_id: "sld_pl" }));
+			}
+			return Promise.resolve(resp({}));
+		}) as unknown as typeof fetch;
+		const eng2 = loadEngine(recovered);
+		const up2 = eng2.createUpload({
+			source: sliceSource(8),
+			apiFetch: (u, o) => (recovered as unknown as (u2: string, o2?: RequestInit) => Promise<Response>)(u, o),
+			config: eng2.resolveConfig(CFG), storage: fakeStorage().adapter,
+			resumeJobId: "inj_pl",
+		});
+		const r = await up2.done;
+		expect(r && r.ok).toBe(true);
+	});
+
+	it("非瞬态（404）：立即失败，不退避重试", async () => {
+		const h = pollingHarness(1, 404);
+		const up = h.eng.createUpload({
+			source: sliceSource(8),
+			apiFetch: (u, o) => (h.fetchImpl as unknown as (u2: string, o2?: RequestInit) => Promise<Response>)(u, o),
+			config: h.eng.resolveConfig(CFG), storage: fakeStorage().adapter,
+		});
+		await expect(up.done).rejects.toMatchObject({ status: 404 });
+		expect(h.statusGets()).toBe(1);
+	});
+});
+
+// --------------------------------------------------------------------------- //
+// review 2026-10-07 #10：完成请求网络失败 → 先查任务状态再决定——已离开
+// uploading（completing/awaiting_server/…/viewable）→ 直接进入轮询；仍在
+// uploading → 幂等重发 complete（409 ingestion_state_conflict = 已完成过）；
+// 有界（≤4 次）。工作台（不设 retryCompleteOnNetworkError）同样生效。
+// --------------------------------------------------------------------------- //
+describe("createUpload：完成请求的状态优先重查（review #10）", () => {
+	function completeHarness() {
+		let completePosts = 0;
+		let completeFails = 0;
+		const stagesAfter: string[] = [];
+		const parts = [{ part_number: 1, length: 8 }];
+		const fetchImpl = vi.fn((url: string, init?: RequestInit) => {
+			const method = String((init && init.method) || "GET");
+			if (url === "/api/ingestions" && method === "POST") {
+				return Promise.resolve(resp({ job_id: "inj_cm", stage: "uploading" }, 202));
+			}
+			if (url === "/api/ingestions/inj_cm" && method === "GET") {
+				if (!completePosts) return Promise.resolve(resp({ stage: "uploading", parts }));
+				const st = stagesAfter.length ? stagesAfter.shift()! : "viewable";
+				return Promise.resolve(resp(st === "viewable"
+					? { stage: st, slide_id: "sld_cm" } : { stage: st }));
+			}
+			if (url.endsWith("/parts/sign")) {
+				const nums = JSON.parse(String(init!.body)).part_numbers as number[];
+				return Promise.resolve(resp({
+					urls: nums.map((n) => ({ url: `https://cos.example/o?partNumber=${n}`, part_number: n })),
+				}));
+			}
+			if (url.endsWith("/upload-complete")) {
+				completePosts++;
+				if (completePosts <= completeFails) {
+					return Promise.reject(new TypeError("complete lost"));
+				}
+				return Promise.resolve(resp({ stage: "awaiting_server" }, 202));
+			}
+			return Promise.resolve(resp({}));
+		}) as unknown as typeof fetch;
+		const eng = loadEngine(fetchImpl);
+		happyXhr();   // PUT 一律立即 200
+		return { eng, fetchImpl,
+			completeCount: () => completePosts,
+			setCompleteFails: (n: number) => { completeFails = n; },
+			setStageAfter: (s: string) => { stagesAfter.push(s); } };
+	}
+	const src8 = { name: "o.tif", size: 8,
+		slice: (s: number, e: number) => ({ _range: [s, e], arrayBuffer: async () => new ArrayBuffer(e - s) }) };
+
+	it("complete 丢失 + 状态已在 awaiting_server → 不重发，直接轮询收口（工作台同享）", async () => {
+		vi.useFakeTimers();
+		const h = completeHarness();
+		h.setCompleteFails(1);
+		h.setStageAfter("awaiting_server");
+		const up = h.eng.createUpload({
+			source: src8,
+			apiFetch: (u, o) => (h.fetchImpl as unknown as (u2: string, o2?: RequestInit) => Promise<Response>)(u, o),
+			config: h.eng.resolveConfig(CFG), storage: fakeStorage().adapter,
+			// 工作台：不设 retryCompleteOnNetworkError
+		});
+		let settled: { ok?: boolean } | null = null;
+		void up.done.then((r) => { settled = r as { ok?: boolean }; });
+		for (let i = 0; i < 200 && !settled; i++) await advYield(1700);
+		expect(settled && settled.ok).toBe(true);
+		expect(h.completeCount()).toBe(1);   // 状态已收口：不重发
+	});
+
+	it("complete 丢失 + 状态仍 uploading → 幂等重发（409 视为已完成）", async () => {
+		vi.useFakeTimers();
+		const h = completeHarness();
+		h.setCompleteFails(1);
+		h.setStageAfter("uploading");
+		const up = h.eng.createUpload({
+			source: src8,
+			apiFetch: (u, o) => (h.fetchImpl as unknown as (u2: string, o2?: RequestInit) => Promise<Response>)(u, o),
+			config: h.eng.resolveConfig(CFG), storage: fakeStorage().adapter,
+		});
+		let settled: { ok?: boolean } | null = null;
+		void up.done.then((r) => { settled = r as { ok?: boolean }; });
+		for (let i = 0; i < 200 && !settled; i++) await advYield(1700);
+		expect(settled && settled.ok).toBe(true);
+		expect(h.completeCount()).toBe(2);   // 重发一次
+	});
+
+	it("重发有界（≤4 次）：持续丢失 → reject {network}（交给行级失败/重查）", async () => {
+		vi.useFakeTimers();
+		const h = completeHarness();
+		h.setCompleteFails(99);
+		for (let i = 0; i < 6; i++) h.setStageAfter("uploading");
+		const up = h.eng.createUpload({
+			source: src8,
+			apiFetch: (u, o) => (h.fetchImpl as unknown as (u2: string, o2?: RequestInit) => Promise<Response>)(u, o),
+			config: h.eng.resolveConfig(CFG), storage: fakeStorage().adapter,
+		});
+		let err: Record<string, unknown> | null = null;
+		void up.done.catch((e) => { err = e as Record<string, unknown>; });
+		for (let i = 0; i < 300 && !err; i++) await advYield(1700);
+		expect(err && err.network).toBe(true);
+		expect(h.completeCount()).toBeLessThanOrEqual(4);
 	});
 });

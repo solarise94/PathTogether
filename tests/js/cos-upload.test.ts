@@ -294,6 +294,9 @@ async function zeroSha256(n: number): Promise<string> {
 		.map((x) => x.toString(16).padStart(2, "0")).join("");
 }
 
+// 假时钟安装前的真实 setTimeout（让出真实事件循环用；确认链上的
+// WebCrypto 摘要是线程池真实异步）
+const REAL_TIMEOUT = setTimeout;
 const tick = () => new Promise((r) => setTimeout(r, 0));
 async function flush(n = 10) {
 	for (let i = 0; i < n; i++) await tick();
@@ -678,16 +681,32 @@ describe("waiting_capacity：排队展示与轮询推进", () => {
 		expect(String(statusEl.textContent)).toContain("等待暂存空间");
 		expect(rowText(row, "upload-item-bytes")).toContain("upload.cos.queue:1");
 		expect(String(statusEl.textContent)).not.toContain("eta");
-		// 5s 轮询推进：第一跳后仍在等待（第二次 GET 仍 waiting），继续放行到 uploading
-		await vi.advanceTimersByTimeAsync(5000);
-		await vi.advanceTimersByTimeAsync(5000);
-		expect(h.fetchCalls().filter((c) => c.url === "/api/ingestions/inj_w" && c.method === "GET").length)
-			.toBeGreaterThanOrEqual(3);
+		// 5s 轮询推进：等待→uploading→签名+PUT→complete→轮询 viewable。
+		// 确认链上的 WebCrypto 摘要是真实线程池异步——推时钟的同时让出真实
+		// 事件循环，高负载下也确定落地（断言不变）。
+		const realYield = () => new Promise((r) => REAL_TIMEOUT(r, 0));
+		let statusGets = 0;
+		for (let i = 0; i < 200; i++) {
+			await vi.advanceTimersByTimeAsync(1000);
+			await realYield();
+			statusGets = h.fetchCalls().filter(
+				(c) => c.url === "/api/ingestions/inj_w" && c.method === "GET").length;
+			if (statusGets >= 3) break;
+		}
+		expect(statusGets).toBeGreaterThanOrEqual(3);
 		// 准入后拿到分块计划 → 签名 + PUT（XHR）→ 完成
 		expect(h.fetchCalls().some((c) => c.url === "/api/ingestions/inj_w/parts/sign")).toBe(true);
 		expect(FakeXHR.instances).toHaveLength(2);
-		await vi.advanceTimersByTimeAsync(0);
-		expect(h.toastMessages.some((m) => m.indexOf("upload.done") >= 0)).toBe(true);
+		// 完成链含真实异步（WebCrypto 摘要）——推时钟直到收口（全量套件
+		// 高负载下单次 advance(0) 可能少冲一个真实微任务；只加固等待，
+		// 断言不变）
+		let toastDone = false;
+		for (let i = 0; i < 100 && !toastDone; i++) {
+			await vi.advanceTimersByTimeAsync(50);
+			await realYield();
+			toastDone = h.toastMessages.some((m) => m.indexOf("upload.done") >= 0);
+		}
+		expect(toastDone).toBe(true);
 	});
 });
 

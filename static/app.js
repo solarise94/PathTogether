@@ -70,6 +70,7 @@
     "upload.cos.cancel": { zh: "取消", en: "Cancel" },
     "upload.cos.cancelled": { zh: "已取消", en: "Cancelled" },
     "upload.cos.retry": { zh: "重试", en: "Retry" },
+    "upload.cos.recheck": { zh: "重新检查状态", en: "Re-check status" },
     "upload.cos.resume_hint": { zh: "上传未完成；重新选择同名文件可续传", en: "Upload unfinished; re-select the same file to resume" },
     "upload.cos.resume_confirm": { zh: "检测到「{name}」有未完成的云端直传任务，续传已上传的分块？", en: "An unfinished cloud upload for \"{name}\" exists. Resume from the uploaded parts?" },
     "upload.cos.err.format_unsupported": { zh: "不支持该文件格式", en: "Unsupported file format" },
@@ -7197,6 +7198,12 @@
       if (err && typeof err.part === "number") {
         // 分块最终失败：从 confirmed 续传（服务端计划仍在，跳过已确认块）
         addRowButton(row, tt("upload.cos.retry"), function () {
+          uploadFile(file, { cosRetry: jobId });
+        });
+      } else if (err && err.recheck) {
+        // review #9：状态轮询连续失败放弃 → 只提供「重新检查状态」
+        //（同 job 重入状态机重新查询；绝不重建任务/重传分片）
+        addRowButton(row, tt("upload.cos.recheck"), function () {
           uploadFile(file, { cosRetry: jobId });
         });
       }

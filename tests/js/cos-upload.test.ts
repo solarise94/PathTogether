@@ -277,19 +277,34 @@ function cosFile(size = 30, name = "big.svs") {
 		size,
 		lastModified: 42,
 		slice(s: number, e: number) {
-			// review #1：引擎对每片读一次 arrayBuffer（SHA-256 与 PUT body
-			// 共用同一 buffer）——假源给零字节内容
+			// PUT body = Blob 切片（流式）；摘要按 4 MiB 子块流式另读
+			//（sha256-chunked-4MiB-v1）——假源切片带 Blob 语义（size + 再
+			// slice），零字节内容
+			const len = Math.max(0, e - s);
 			return {
 				_offset: s,
 				_end: e,
-				arrayBuffer: async () => new ArrayBuffer(Math.max(0, e - s)),
+				size: len,
+				slice(a: number, b: number) {
+					const sub = Math.max(0, Math.min(b, len) - a);
+					return {
+						size: sub,
+						arrayBuffer: async () => new ArrayBuffer(sub),
+					};
+				},
+				arrayBuffer: async () => new ArrayBuffer(len),
 			};
 		},
 	};
 }
 
-async function zeroSha256(n: number): Promise<string> {
-	const d = await crypto.subtle.digest("SHA-256", new ArrayBuffer(n));
+async function zeroSha256(n: number, seedHex?: string): Promise<string> {
+	// seedHex 传入时：对 seed 的十六进制串字节再做一次 SHA-256
+	//（= sha256-chunked-4MiB-v1 单子块分片摘要：SHA-256(子块摘要拼接)）
+	const bytes = seedHex !== undefined
+		? new Uint8Array(seedHex.match(/.{2}/g)!.map((x) => parseInt(x, 16))).buffer
+		: new ArrayBuffer(n);
+	const d = await crypto.subtle.digest("SHA-256", bytes);
 	return Array.from(new Uint8Array(d))
 		.map((x) => x.toString(16).padStart(2, "0")).join("");
 }
@@ -787,11 +802,15 @@ describe("刷新恢复：只读进度行与终态清理", () => {
 		// review #1 后的合同：续传记录必须携带分片内容摘要（零字节假源的
 		// 分片 = 8 字节 0x00 的 SHA-256）与账号绑定。曾只凭 confirmed 跳过
 		//（名称/大小复用——review 2026-10-07 #1 的混合文件漏洞）。
+		// 分片摘要 = sha256-chunked-4MiB-v1 方案（子块摘要拼接再哈希；测试
+		// 分片 ≤ 4 MiB → 单子块，即 SHA-256(SHA-256(子块))），记录带方案标记
 		const d1 = await zeroSha256(8);
+		const d1c = await zeroSha256(32, d1);
 		h.storage.setItem("pt.cos.jobs", JSON.stringify([
 			{
 				job_id: "inj_r", filename: "big.svs", size: 30, confirmed: [1, 2],
-				account: "", digests: { "1": d1, "2": d1 },
+				account: "", digests: { "1": d1c, "2": d1c },
+				digest_scheme: "sha256-chunked-4MiB-v1",
 			},
 		]));
 		h.confirmMock.mockReturnValue(true);   // 用户确认续传

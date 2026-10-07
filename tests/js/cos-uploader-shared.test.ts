@@ -32,7 +32,8 @@ const engineSrc = readFileSync(
 type StorageRec = {
 	job_id: string; filename: string; size: number;
 	confirmed: number[]; slide_id?: string | null;
-	digests?: Record<string, string> | null;   // review #1：分块 SHA-256
+	digests?: Record<string, string> | null;   // review #1：分片摘要（方案见 digest_scheme）
+	digest_scheme?: string;                    // 复核第二轮：摘要方案标记
 	account?: string;                          // review #1：账号绑定
 };
 
@@ -168,10 +169,16 @@ function fakeSource(size = 32, name = "out.tif") {
 				slices.push({ start, end });
 				expect(end - start).toBeLessThanOrEqual(8);
 				const len = end - start;
-				return {
-					_range: [start, end],
+				// Blob 语义：chunked 哈希对分片 Blob 再按 4 MiB 子块 slice
+				const blob = {
+					size: len,
+					slice(a: number, b: number) {
+						const sub = Math.min(b, len) - a;
+						return { size: sub, arrayBuffer: async () => new ArrayBuffer(sub) };
+					},
 					arrayBuffer: async () => new ArrayBuffer(len),
 				};
+				return blob;
 			},
 		},
 	};
@@ -184,7 +191,7 @@ function fakeStorage() {
 	let confirmed: number[] = [];
 	// review #1：续传记录的完整形态（账号绑定 + 分块内容摘要）
 	let record: { confirmed?: number[]; digests?: Record<string, string>;
-		account?: string } | null = null;
+		digest_scheme?: string; account?: string } | null = null;
 	return {
 		saves, completes, removes,
 		setConfirmed: (c: number[]) => { confirmed = c; },
@@ -201,6 +208,7 @@ function fakeStorage() {
 				record ? { job_id: id, filename: "out.tif", size: 0,
 					confirmed: record.confirmed || confirmed,
 					digests: record.digests || null,
+					digest_scheme: record.digest_scheme || "",
 					account: record.account || "" } : null),
 		},
 	};
@@ -307,9 +315,11 @@ describe("createUpload（注入假依赖）", () => {
 			expect(x.withCredentials).toBe(false);
 			expect(x.setRequestHeader).not.toHaveBeenCalled();   // 无 CSRF/Authorization/Content-Length
 		});
-		// 每片恰好 slice 一次，且长度受计划约束
-		expect(src.slices).toHaveLength(4);
-		expect(src.slices.map((s) => s.end - s.start).sort()).toEqual([8, 8, 8, 8]);
+		// 每片 slice 两次（PUT body 的 Blob 切片 + chunked 哈希的流式另读
+		// ——磁盘读两次，内存每通道一个 4 MiB 子块），长度受计划约束
+		expect(src.slices).toHaveLength(8);
+		expect(src.slices.map((s) => s.end - s.start).sort()).toEqual(
+			[8, 8, 8, 8, 8, 8, 8, 8]);
 		// 持久化先于第一个 PUT（断网/刷新后可续传的前提）
 		// storage.save 是同步调用（引擎内联），首个 PUT 前必有 saves 记录
 		expect(st.saves.length).toBeGreaterThanOrEqual(1);
@@ -405,9 +415,10 @@ describe("createUpload（注入假依赖）", () => {
 		st.setRecord({
 			confirmed: [1, 2],
 			digests: {
-				"1": await sha256Hex(new ArrayBuffer(8)),
-				"2": await sha256Hex(new ArrayBuffer(8)),
+				"1": await chunkedPartHex(new Uint8Array(8)),
+				"2": await chunkedPartHex(new Uint8Array(8)),
 			},
+			digest_scheme: eng.digestScheme,
 			account: "",
 		});
 		const up = eng.createUpload({
@@ -420,9 +431,10 @@ describe("createUpload（注入假依赖）", () => {
 		expect(r && r.ok).toBe(true);
 		expect(resumed).toBe(1);
 		expect(signed).toEqual([[3, 4]]);
-		// review #1：4 次 slice = 分片 1/2 的续传摘要核验读 + 分片 3/4 的
-		// 传输读（每片各一次；绝不整体读取）
-		expect(src.slices).toHaveLength(4);
+		// review #1（复核第二轮方案）：6 次 slice = 分片 1/2 的续传摘要核验读
+		// （4 MiB 子块流式）+ 分片 3/4 的传输读与哈希读各一次（PUT body =
+		expect(src.slices).toHaveLength(6);
+		// Blob 切片流式；绝不整体读取）
 	});
 
 	it("401 中途失败：reject {status:401}（引擎无 location —— 绝不自动跳转登录）", async () => {
@@ -1010,17 +1022,28 @@ describe("createUpload：U1 字节级上传进度", () => {
 
 // --------------------------------------------------------------------------- //
 // review 2026-10-07 #1：续传内容身份（有界内存、可证明）。
-//   - 分块确认时记录该分片字节的 SHA-256（WebCrypto；同一 ArrayBuffer 既
-//     做 hash 又做 PUT body——slice 只读一次）；
-//   - 记录绑定账号；他号记录绝不 offered/used；
-//   - 续传前逐个比对「新选中文件」的分片摘要：任何不符 / 无摘要的 legacy
-//     记录 → 不续传（弃旧任务、全新创建），绝不混用；
+//   - 分片确认时记录分片摘要（复核第二轮方案 sha256-chunked-4MiB-v1：
+//     PUT body = Blob 切片流式发送；摘要按 4 MiB 子块流式计算 = 子块摘要
+//     拼接再哈希——磁盘读两次，内存每通道一个子块）；
+//   - 记录绑定账号并携带 digest_scheme：无标记/其他方案 = legacy；
+//   - 他号记录绝不 offered/used；
+//   - 续传前逐个比对「新选中文件」的分片摘要：任何不符 / 无摘要或方案
+//     不符的 legacy 记录 → 不续传（弃旧任务、全新创建），绝不混用；
 //   - 缺单个摘要的可信部分照传（同编号覆盖，安全），不整单放弃。
 // --------------------------------------------------------------------------- //
 
 async function sha256Hex(b: ArrayBuffer): Promise<string> {
 	const d = await crypto.subtle.digest("SHA-256", b);
 	return Array.from(new Uint8Array(d))
+		.map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+/** 引擎方案 sha256-chunked-4MiB-v1 的独立实现（测试分片 ≤ 4 MiB → 单子块）：
+ *  分片摘要 = SHA-256(子块摘要逐字节拼接)。*/
+async function chunkedPartHex(bytes: Uint8Array): Promise<string> {
+	const sub = await crypto.subtle.digest("SHA-256", bytes as unknown as ArrayBuffer);
+	const whole = await crypto.subtle.digest("SHA-256", sub);
+	return Array.from(new Uint8Array(whole))
 		.map((x) => x.toString(16).padStart(2, "0")).join("");
 }
 
@@ -1035,11 +1058,22 @@ function bytesSource(bytes: Uint8Array, name = "same.ome.tif") {
 			slice(start: number, end: number) {
 				slices.push([start, Math.min(end, bytes.length)]);
 				const clamped = Math.min(end, bytes.length);
-				return {
-					_range: [start, clamped],
+				// Blob 语义：size + 再 slice（chunked 哈希按 4 MiB 子块读）
+				const part = {
+					size: clamped - start,
+					slice(a: number, b: number) {
+						const subEnd = Math.min(b, clamped - start);
+						return {
+							size: subEnd - a,
+							arrayBuffer: async () => bytes.buffer.slice(
+								bytes.byteOffset + start + a,
+								bytes.byteOffset + start + subEnd),
+						};
+					},
 					arrayBuffer: async () => bytes.buffer.slice(
 						bytes.byteOffset + start, bytes.byteOffset + clamped),
 				};
+				return part;
 			},
 		},
 	};
@@ -1099,7 +1133,8 @@ describe("createUpload：续传内容身份（review #1）", () => {
 		const st = fakeStorage();
 		st.setRecord({
 			confirmed: [1],
-			digests: { 1: await sha256Hex(fileA.slice(0, 8).buffer as ArrayBuffer) },
+			digests: { 1: await chunkedPartHex(fileA.slice(0, 8)) },
+			digest_scheme: eng.digestScheme,
 			account: "acct-1",
 		});
 		const up = eng.createUpload({
@@ -1117,11 +1152,12 @@ describe("createUpload：续传内容身份（review #1）", () => {
 		// 两片都重传（旧分片 1 绝不跳过——摘要与新文件不符）
 		expect(FakeXHR.instances.map((x) => putPartNumber(String(x.url))).sort())
 			.toEqual([1, 2]);
-		// 新记录只属于新任务且带分片摘要（fileB 内容）
+		// 新记录只属于新任务且带分片摘要（fileB 内容，chunked 方案）
 		const last = st.saves[st.saves.length - 1];
 		expect(last.job_id).toBe("inj_new");
 		expect(last.digests && last.digests["1"])
-			.toBe(await sha256Hex(fileB.slice(0, 8).buffer as ArrayBuffer));
+			.toBe(await chunkedPartHex(fileB.slice(0, 8)));
+		expect(last.digest_scheme).toBe(eng.digestScheme);
 	});
 
 	it("legacy 记录（有确认分块、无摘要）→ 不续传：弃旧任务、全新创建", async () => {
@@ -1159,9 +1195,10 @@ describe("createUpload：续传内容身份（review #1）", () => {
 		st.setRecord({
 			confirmed: [1, 2],
 			digests: {
-				1: await sha256Hex(file.slice(0, 8).buffer as ArrayBuffer),
-				2: await sha256Hex(file.slice(8, 16).buffer as ArrayBuffer),
+				1: await chunkedPartHex(file.slice(0, 8)),
+				2: await chunkedPartHex(file.slice(8, 16)),
 			},
+			digest_scheme: eng.digestScheme,
 			account: "acct-1",
 		});
 		const up = eng.createUpload({
@@ -1192,7 +1229,8 @@ describe("createUpload：续传内容身份（review #1）", () => {
 		const st = fakeStorage();
 		st.setRecord({
 			confirmed: [1],
-			digests: { 1: await sha256Hex(file.slice(0, 8).buffer as ArrayBuffer) },
+			digests: { 1: await chunkedPartHex(file.slice(0, 8)) },
+			digest_scheme: eng.digestScheme,
 			account: "acct-a",
 		});
 		const up = eng.createUpload({
@@ -1218,7 +1256,8 @@ describe("createUpload：续传内容身份（review #1）", () => {
 		const st = fakeStorage();
 		st.setRecord({
 			confirmed: [1, 2],
-			digests: { 2: await sha256Hex(file.slice(8, 16).buffer as ArrayBuffer) },
+			digests: { 2: await chunkedPartHex(file.slice(8, 16)) },
+			digest_scheme: eng.digestScheme,
 			account: "acct-1",
 		});
 		const up = eng.createUpload({
@@ -1256,11 +1295,41 @@ describe("createUpload：续传内容身份（review #1）", () => {
 		const last = st.saves[st.saves.length - 1];
 		expect(last.account).toBe("acct-1");
 		expect(last.digests && last.digests["1"])
-			.toBe(await sha256Hex(file.slice(0, 8).buffer as ArrayBuffer));
+			.toBe(await chunkedPartHex(file.slice(0, 8)));
 		expect(last.digests && last.digests["2"])
-			.toBe(await sha256Hex(file.slice(8, 16).buffer as ArrayBuffer));
-		// 每片只 slice 一次（hash 与 PUT body 复用同一 buffer）
-		expect(src.slices).toHaveLength(2);
+			.toBe(await chunkedPartHex(file.slice(8, 16)));
+		expect(last.digest_scheme).toBe(eng.digestScheme);
+		// PUT body = Blob 切片流式发送；摘要按子块流式另读——每片磁盘读两次
+		// （内存有界：每通道同时只有一个 4 MiB 子块），绝不整片进内存
+		expect(src.slices).toHaveLength(4);
+	});
+
+	it("旧方案记录（有摘要、无 digest_scheme 标记）= legacy：弃旧任务、全新创建", async () => {
+		const file = new Uint8Array(16).fill(21);
+		const h = resumeHarness();
+		const eng = loadEngine(h.fetchImpl);
+		happyXhr();
+		const st = fakeStorage();
+		// 4c38ed7f..改动前的整片哈希记录：有摘要、无方案标记 → 绝不复用
+		st.setRecord({
+			confirmed: [1],
+			digests: { 1: await sha256Hex(file.slice(0, 8).buffer as ArrayBuffer) },
+			account: "acct-1",
+		});
+		const up = eng.createUpload({
+			source: bytesSource(file).view,
+			apiFetch: (u, o) => (h.fetchImpl as unknown as (u2: string, o2?: RequestInit) => Promise<Response>)(u, o),
+			config: eng.resolveConfig(CFG), storage: st.adapter,
+			resumeJobId: "inj_old", skipConfirm: true, account: "acct-1",
+			useResumeEndpoint: true,
+		});
+		const r = await up.done;
+		expect(r && r.ok).toBe(true);
+		const urls = h.urls();
+		expect(urls.some((u) => u.includes("inj_old/cancel"))).toBe(true);
+		expect(urls.some((u) => u === "POST /api/ingestions")).toBe(true);
+		expect(FakeXHR.instances.map((x) => putPartNumber(String(x.url))).sort())
+			.toEqual([1, 2]);
 	});
 });
 // --------------------------------------------------------------------------- //

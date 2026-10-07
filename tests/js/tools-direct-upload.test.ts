@@ -274,8 +274,10 @@ describe("direct 控制器：published receipt（review #3/#4）", () => {
 		});
 		expect(h.publishedId()).toBeNull();
 		h.be.st.assocStatus = 200;
-		const r = await (h.ctl as { retryAssociation: () => Promise<{ ok: boolean; slideId?: string }> })
-			.retryAssociation();
+		const rec = h.receipts()[0] as { receipt_id?: string; job_id?: string; slide_id?: string };
+		const r = await (h.ctl as unknown as {
+			retryAssociation: (id?: string, sid?: string) => Promise<{ ok: boolean; slideId?: string }>;
+		}).retryAssociation(String(rec.receipt_id || rec.job_id), String(rec.slide_id));
 		expect(r.ok).toBe(true);
 		expect(r.slideId).toBe("sld_rc1");
 		expect(h.publishedId()).toBe("sld_rc1");   // 关联成功后才发全量成功
@@ -301,8 +303,10 @@ describe("direct 控制器：published receipt（review #3/#4）", () => {
 		expect((r as { assocPending?: boolean }).assocPending).toBe(true);
 		// 重试关联走 receipt 里的 slideId + target
 		h2.be.st.assocStatus = 200;
-		const rr = await (h2.ctl as { retryAssociation: () => Promise<{ ok: boolean }> })
-			.retryAssociation();
+		const rec2 = h2.receipts()[0] as { receipt_id?: string; job_id?: string; slide_id?: string };
+		const rr = await (h2.ctl as unknown as {
+			retryAssociation: (id?: string, sid?: string) => Promise<{ ok: boolean }>;
+		}).retryAssociation(String(rec2.receipt_id || rec2.job_id), String(rec2.slide_id));
 		expect(rr.ok).toBe(true);
 		expect(h2.be.st.assocAdds[0].slideIds).toEqual(["sld_rc1"]);
 	});
@@ -319,8 +323,10 @@ describe("direct 控制器：published receipt（review #3/#4）", () => {
 		expect(h.be.st.projectCreates[0].key).toBe("idem-key-1");
 		// 服务端恢复后重试：同一幂等键；建成后 pid 写回目标（不再二次建）
 		h.be.st.createProjectStatus = 200;
-		const rr = await (h.ctl as { retryAssociation: () => Promise<{ ok: boolean }> })
-			.retryAssociation();
+		const recA = h.receipts()[0] as { receipt_id?: string; job_id?: string; slide_id?: string };
+		const rr = await (h.ctl as unknown as {
+			retryAssociation: (id?: string, sid?: string) => Promise<{ ok: boolean }>;
+		}).retryAssociation(String(recA.receipt_id || recA.job_id), String(recA.slide_id));
 		expect(rr.ok).toBe(true);
 		expect(h.be.st.projectCreates).toHaveLength(2);
 		expect(h.be.st.projectCreates[1].key).toBe("idem-key-1");
@@ -331,7 +337,10 @@ describe("direct 控制器：published receipt（review #3/#4）", () => {
 			cls: { directClass: "ome-tiff", ext: ".tif" }, target,
 		});
 		h.be.st.assocStatus = 200;
-		await (h.ctl as { retryAssociation: () => Promise<{ ok: boolean }> }).retryAssociation();
+		const recB = h.receipts()[0] as { receipt_id?: string; job_id?: string; slide_id?: string };
+		await (h.ctl as unknown as {
+			retryAssociation: (id?: string, sid?: string) => Promise<{ ok: boolean }>;
+		}).retryAssociation(String(recB.receipt_id || recB.job_id), String(recB.slide_id));
 		expect(h.be.st.projectCreates).toHaveLength(2);   // 幂等：无第三次创建
 		expect(h.be.st.assocAdds[h.be.st.assocAdds.length - 1].pid).toBe("pj_new");
 	});
@@ -408,6 +417,10 @@ function fakeLocks() {
 async function seedPublishedReceipt(
 	ls: ReturnType<typeof fakeLocalStorage>, file: File, account: string,
 	slideId = "sld_tab1", jobId = "inj_tab1") {
+	// 引擎分片摘要方案 sha256-chunked-4MiB-v1 的独立实现（测试分片 ≤ 4 MiB
+	// → 单子块）：分片摘要 = SHA-256(子块摘要逐字节拼接)。
+	const hex = async (b: ArrayBuffer) => [...new Uint8Array(b)]
+		.map((x) => x.toString(16).padStart(2, "0")).join("");
 	const digests: Record<string, string> = {};
 	const plan: Array<{ part_number: number; length: number }> = [];
 	let off = 0;
@@ -415,8 +428,9 @@ async function seedPublishedReceipt(
 	while (off < file.size) {
 		const len = Math.min(8, file.size - off);
 		const buf = await file.slice(off, off + len).arrayBuffer();
-		const d = new Uint8Array(await crypto.subtle.digest("SHA-256", buf));
-		digests[String(n)] = [...d].map((b) => b.toString(16).padStart(2, "0")).join("");
+		const sub = await crypto.subtle.digest("SHA-256", buf);
+		const whole = await crypto.subtle.digest("SHA-256", sub);
+		digests[String(n)] = await hex(whole);
 		plan.push({ part_number: n, length: len });
 		off += len;
 		n += 1;
@@ -425,7 +439,9 @@ async function seedPublishedReceipt(
 		Array<Record<string, unknown>>;
 	receipts.push({
 		receipt: true, receipt_id: `rc_${jobId}`, account,
-		filename: file.name, size: file.size, digests, plan,
+		filename: file.name, size: file.size, digests,
+		digest_scheme: "sha256-chunked-4MiB-v1",
+		plan,
 		job_id: jobId, slide_id: slideId, target: null,
 		assoc: { state: "ok", error: null },
 	});
@@ -489,14 +505,18 @@ describe("direct 控制器：跨标签内容锁（复核 8428f7f0）", () => {
 				return new Promise<void>((r) => { releaseHolder = r; });
 			}) as unknown as Promise<unknown>;
 		});
-		// 另一标签创建了任务、确认了分片 1，还没传完（记录落共享 localStorage）
+		// 另一标签创建了任务、确认了分片 1，还没传完（记录落共享 localStorage；
+		// 摘要 = sha256-chunked-4MiB-v1 方案）
 		const part1 = await file.slice(0, 8).arrayBuffer();
-		const d1 = new Uint8Array(await crypto.subtle.digest("SHA-256", part1));
-		const hex1 = [...d1].map((b) => b.toString(16).padStart(2, "0")).join("");
+		const sub1 = await crypto.subtle.digest("SHA-256", part1);
+		const whole1 = await crypto.subtle.digest("SHA-256", sub1);
+		const hex1 = [...new Uint8Array(whole1)]
+			.map((b) => b.toString(16).padStart(2, "0")).join("");
 		h.ls.setItem("pt.tools.direct.uploads", JSON.stringify([{
 			job_id: "inj_tab1", filename: file.name, size: file.size,
 			account: "acct-1", confirmed: [1],
 			digests: { 1: hex1 },
+			digest_scheme: "sha256-chunked-4MiB-v1",
 			plan: [{ part_number: 1, length: 8 }, { part_number: 2, length: 8 }],
 			slide_id: null,
 		}]));
@@ -561,10 +581,11 @@ describe("direct 控制器：关联重试绑定与账号核对（复核 8428f7f0
 		expect(h.be.st.assocAdds).toHaveLength(2);   // 两次发布时的失败关联
 		h.be.st.assocStatus = 200;
 		const recB = h.receipts().find((r) => r.filename === "b.ome.tif") as
-			{ receipt_id?: string; job_id?: string };
+			{ receipt_id?: string; job_id?: string; slide_id?: string };
 		const rr = await (h.ctl as unknown as {
-			retryAssociation: (id?: string) => Promise<{ ok: boolean }>;
-		}).retryAssociation(String(recB.receipt_id || recB.job_id));
+			retryAssociation: (id?: string, sid?: string) => Promise<{ ok: boolean }>;
+		}).retryAssociation(String(recB.receipt_id || recB.job_id),
+			String(recB.slide_id));
 		expect(rr.ok).toBe(true);
 		expect(h.be.st.assocAdds).toHaveLength(3);   // A 未被重试
 		expect(h.be.st.assocAdds[2]).toEqual({ pid: "pj_B", slideIds: ["sld_rc2"] });
@@ -584,10 +605,11 @@ describe("direct 控制器：关联重试绑定与账号核对（复核 8428f7f0
 		expect((h.receipts()[0].assoc as { state: string }).state).toBe("pending");
 		// 「退出后以另一账号登录」：全新控制器 + 同一 localStorage
 		const h2 = await setup({ assocStatus: 503, account: "acct-2" }, h.ls);
-		const rid = String(h.receipts()[0].job_id);
+		const rec0 = h.receipts()[0] as { job_id?: string; slide_id?: string };
 		const rr = await (h2.ctl as unknown as {
-			retryAssociation: (id?: string) => Promise<{ ok: boolean; reason?: string }>;
-		}).retryAssociation(rid);
+			retryAssociation: (id?: string, sid?: string) =>
+				Promise<{ ok: boolean; reason?: string }>;
+		}).retryAssociation(String(rec0.job_id), String(rec0.slide_id));
 		expect(rr.ok).toBe(false);
 		expect(rr.reason).toBe("account");
 		expect(h2.be.st.assocAdds).toHaveLength(0);   // 未发任何关联请求
@@ -596,6 +618,81 @@ describe("direct 控制器：关联重试绑定与账号核对（复核 8428f7f0
 			s.startsWith("tools.direct.assoc.account.mismatch"))).toBe(true);
 		// 回执未被修改
 		expect((h.receipts()[0].assoc as { state: string }).state).toBe("pending");
+	});
+
+	it("owner repro（同句柄多回执）：两条回执由同一真实回执展开复制——重试 B 只发 project-B/slide-B", async () => {
+		const h = await setup({ assocStatus: 503 });
+		const cls = { directClass: "ome-tiff", ext: ".tif" };
+		// 真实发布一次，得到内容凭证完整的真实回执 r
+		const real = omeTiffFile(new Uint8Array(16).fill(1), "current.ome.tif");
+		const rr0 = await h.ctl.uploadFile(real, {
+			cls, target: { project: "pj_real" },
+		});
+		expect(rr0.ok).toBe(false);   // 注入失败 → 真实回执 assoc=pending
+		const r = h.receipts()[0] as Record<string, unknown>;
+		// owner 构造：a/b 由 {...r} 展开——receipt_id/job_id/digests 全部相同，
+		// 只有 filename/slide_id/target 不同（句柄无法区分，slide_id 才能）
+		const a = { ...r, filename: "older.ome.tif", slide_id: "slide-A",
+			target: { project: "project-A" }, assoc: { state: "pending", error: "x" } };
+		const b = { ...r, slide_id: "slide-B",
+			target: { project: "project-B" }, assoc: { state: "pending", error: "x" } };
+		h.ls.setItem("pt.tools.direct.published", JSON.stringify([a, b]));
+		// 重选当前文件（B 的 filename = 真实文件）→ 回执命中 B → 重试 B
+		h.be.st.assocStatus = 200;
+		const before = h.be.st.assocAdds.length;   // 首次发布时失败的关联
+		const rr = await (h.ctl as unknown as {
+			retryAssociation: (id?: string, sid?: string) => Promise<{ ok: boolean }>;
+		}).retryAssociation(String(r.receipt_id || r.job_id), "slide-B");
+		expect(rr.ok).toBe(true);
+		const adds = h.be.st.assocAdds;
+		expect(adds).toHaveLength(before + 1);   // 只新增 B 的关联
+		expect(adds[before]).toEqual({ pid: "project-B", slideIds: ["slide-B"] });
+		const recs = h.receipts();
+		expect(((recs.find((x) => (x as { slide_id?: string }).slide_id === "slide-A") as
+			{ assoc: { state: string } }).assoc).state).toBe("pending");
+		expect(((recs.find((x) => (x as { slide_id?: string }).slide_id === "slide-B") as
+			{ assoc: { state: string } }).assoc).state).toBe("ok");
+	});
+
+	it("句柄歧义（同句柄同 slide_id 多条 pending）：拒绝、不发任何请求", async () => {
+		const h = await setup({ assocStatus: 503 });
+		const cls = { directClass: "ome-tiff", ext: ".tif" };
+		const real = omeTiffFile(new Uint8Array(16).fill(1), "current.ome.tif");
+		await h.ctl.uploadFile(real, { cls, target: { project: "pj_real" } });
+		const r = h.receipts()[0] as Record<string, unknown>;
+		const a = { ...r, filename: "copy-a.ome.tif",
+			assoc: { state: "pending", error: "x" } };
+		const b = { ...r, filename: "copy-b.ome.tif",
+			assoc: { state: "pending", error: "x" } };
+		h.ls.setItem("pt.tools.direct.published", JSON.stringify([a, b]));
+		const before = h.be.st.assocAdds.length;
+		const rr = await (h.ctl as unknown as {
+			retryAssociation: (id?: string, sid?: string) =>
+				Promise<{ ok: boolean; reason?: string }>;
+		}).retryAssociation(String(r.receipt_id || r.job_id), String(r.slide_id));
+		expect(rr.ok).toBe(false);
+		expect(rr.reason).toBe("ambiguous");
+		expect(h.be.st.assocAdds).toHaveLength(before);   // 未发任何请求
+		expect(h.statuses.some((x) =>
+			x.startsWith("tools.direct.assoc.ambiguous"))).toBe(true);
+	});
+
+	it("无句柄调用（retryAssociation 不带参数）：一律不动、零请求（owner 第二项检查）", async () => {
+		const h = await setup({ assocStatus: 503 });
+		const cls = { directClass: "ome-tiff", ext: ".tif" };
+		await h.ctl.uploadFile(omeTiffFile(new Uint8Array(16).fill(1)), {
+			cls, target: { project: "pj_1" },
+		});
+		expect(h.receipts()).toHaveLength(1);
+		const before = h.be.st.assocAdds.length;
+		const rr = await (h.ctl as unknown as {
+			retryAssociation: (id?: string, sid?: string) =>
+				Promise<{ ok: boolean; reason?: string }>;
+		}).retryAssociation();
+		expect(rr.ok).toBe(false);
+		expect(rr.reason).toBe("none");
+		expect(h.be.st.assocAdds).toHaveLength(before);   // 零请求
+		expect(h.be.st.projectCreates).toHaveLength(0);
 	});
 });
 

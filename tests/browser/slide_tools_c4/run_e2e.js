@@ -1037,8 +1037,9 @@ async function main() {
         const body = await r.json();
         return String((body && body.account) || '');
       });
-      // 两条 pending 回执（同账号、不同文件；digests/plan 与夹具逐片一致，
-      // verifyReceipt 才放行）。A 先写、B 后写——修复前重试取第一条 = A。
+      // 两条 pending 回执（同账号、不同文件；digests/plan 与夹具逐片一致
+      // ——引擎方案 sha256-chunked-4MiB-v1：分片摘要 = 子块摘要拼接再哈希
+      // ——verifyReceipt 才放行）。A 先写、B 后写——修复前重试取第一条 = A。
       const seeded = [];
       for (const [name, slideId, pid] of [
         ['assoc-a.ome.tif', 'sld_assoc_a', 'pj-A'],
@@ -1047,13 +1048,16 @@ async function main() {
         const fixture = directOmeFixture(name);
         const buf = fs.readFileSync(fixture);
         const first = 8 + (2 + 12 + 4);   // head + IFD，第二片为描述堆
+        const partDigest = (bytes) => sha256Hex(
+          nodeCrypto.createHash('sha256').update(bytes).digest());
         seeded.push({
           receipt: true,
           account,
           filename: name,
           size: buf.length,
-          digests: { 1: sha256Hex(buf.subarray(0, first)),
-                     2: sha256Hex(buf.subarray(first)) },
+          digests: { 1: await partDigest(buf.subarray(0, first)),
+                     2: await partDigest(buf.subarray(first)) },
+          digest_scheme: 'sha256-chunked-4MiB-v1',
           plan: [{ part_number: 1, length: first },
                  { part_number: 2, length: buf.length - first }],
           job_id: `inj_assoc_${name}`,
@@ -1110,6 +1114,105 @@ async function main() {
     }
   }
 
+  // ---------------------------------------------------------------- (s) --
+  // 复核第二轮（owner repro two-tabs-timed）：两条回执由同一条真实回执展开
+  // 复制（{...r}——receipt_id/job_id/digests 全部相同，只有 filename/slide_id/
+  // target 不同），句柄无法区分。页面显示 slide-B（重选真实文件命中 B），
+  // 点真实「重试加入项目」按钮必须只发 project-B / slide-B；A 原样 pending。
+  // 只匹配 receipt_id/job_id 会拿错回执（修复前 POST project-A [slide-A]）。
+  // 另保 owner 第二项检查：ctl.retryAssociation() 不带参数 → 零请求。
+  async function scenarioAssocRetryOwnerSpread() {
+    const { context, page } = await L.launch('s-assoc-spread');
+    const fake = await L.fakeUploadRoutes(page, creds.cosOrigin, { partsCount: 2 });
+    const assocReqs = [];
+    await context.route('**/api/project/**/slides', (route) => {
+      const req = route.request();
+      assocReqs.push({
+        pid: (new URL(req.url()).pathname.match(/\/api\/project\/([^/]+)\/slides/) || [])[1],
+        slideIds: (req.postDataJSON() || {}).slide_ids || null,
+      });
+      return route.fulfill({ status: 200, contentType: 'application/json',
+        body: JSON.stringify({ ok: true }) });
+    });
+    try {
+      await L.login(page, PORT, creds, 'user');
+      await L.C3.openTools(page, PORT);
+      // ① 真实发布一次（无目标）：得到内容凭证完整、方案标记齐全的真实回执 r
+      const fixture = directOmeFixture('spread.ome.tif');
+      await loadDirectFixture(page, fixture);
+      await page.click('#direct-upload-btn');
+      await waitFor(async () => /已发布|Published/.test(await textOf(page, '#direct-status')),
+        60000, 'real receipt published');
+      if (fake.st.creates.length !== 1) throw new Error(`creates=${fake.st.creates.length}`);
+      // ② owner 构造：a/b 由 {...r} 展开，句柄相同，仅 filename/slide_id/target 不同
+      const spread = await page.evaluate(() => {
+        const r = JSON.parse(
+          localStorage.getItem('pt.tools.direct.published') || '[]')[0];
+        const a = { ...r, filename: 'older.ome.tif', slide_id: 'slide-A',
+          target: { project: 'project-A' },
+          assoc: { state: 'pending', error: 'seeded' } };
+        const b = { ...r, slide_id: 'slide-B',
+          target: { project: 'project-B' },
+          assoc: { state: 'pending', error: 'seeded' } };
+        localStorage.setItem('pt.tools.direct.published', JSON.stringify([a, b]));
+        return { handle: String(r.receipt_id || r.job_id) };
+      });
+      // ③ 重选真实文件 → 命中 b（a 的 filename 不同）→ 显示 slide-B 待关联
+      await loadDirectFixture(page, fixture);
+      await page.click('#direct-upload-btn');
+      await waitFor(async () =>
+        (await page.$('#direct-assoc-retry-btn:not([hidden])')) !== null,
+        30000, 'retry button visible');
+      const shown = await textOf(page, '#direct-status');
+      if (!shown.includes('slide-B')) {
+        throw new Error(`page shows wrong slide: "${shown.slice(0, 80)}"`);
+      }
+      // ④ 点真实按钮：只发 project-B / slide-B；A 原样 pending
+      await page.click('#direct-assoc-retry-btn');
+      await waitFor(async () =>
+        (await page.$eval('#direct-assoc-retry-btn', (el) => el.hidden)) === true,
+        30000, 'retry done');
+      if (assocReqs.length !== 1) {
+        throw new Error(`assoc requests=${JSON.stringify(assocReqs)} (want 1)`);
+      }
+      if (assocReqs[0].pid !== 'project-B' ||
+          JSON.stringify(assocReqs[0].slideIds) !== '["slide-B"]') {
+        throw new Error(`wrong receipt retried: ${JSON.stringify(assocReqs[0])}`);
+      }
+      const states = await page.evaluate(() => {
+        const list = JSON.parse(
+          localStorage.getItem('pt.tools.direct.published') || '[]');
+        return {
+          a: (list.find((r) => r.slide_id === 'slide-A') || {}).assoc,
+          b: (list.find((r) => r.slide_id === 'slide-B') || {}).assoc,
+        };
+      });
+      if (!states.a || states.a.state !== 'pending') {
+        throw new Error(`receipt A modified: ${JSON.stringify(states.a)}`);
+      }
+      if (!states.b || states.b.state !== 'ok') {
+        throw new Error(`receipt B not ok: ${JSON.stringify(states.b)}`);
+      }
+      // ⑤ owner 第二项检查：retryAssociation() 不带参数 → 零请求
+      const before = assocReqs.length;
+      const noArg = await page.evaluate(() =>
+        window.__stToolsDirect.retryAssociation());
+      if (noArg && noArg.ok !== false) throw new Error(`no-arg acted: ${JSON.stringify(noArg)}`);
+      if (assocReqs.length !== before) {
+        throw new Error(`no-arg sent requests: ${JSON.stringify(assocReqs)}`);
+      }
+      record('s-assoc-retry-owner-spread', true, {
+        assocReq: assocReqs[0], aState: states.a.state, bState: states.b.state,
+        noArgReason: noArg && noArg.reason,
+      });
+    } catch (e) {
+      record('s-assoc-retry-owner-spread', false,
+        { error: String(e).slice(0, 300), assocReqs });
+    } finally {
+      await context.close();
+    }
+  }
+
   const all = [
     ['a-bf', () => scenarioHappy('bf', bf)],
     ['a-fl', () => scenarioHappy('fl', fl)],
@@ -1132,6 +1235,7 @@ async function main() {
     ['p-direct-ome-upload', scenarioDirectOmeUpload],
     ['q-two-tabs-direct-upload', scenarioTwoTabsDirectUpload],
     ['r-assoc-retry-binding', scenarioAssocRetryBinding],
+    ['s-assoc-retry-owner-spread', scenarioAssocRetryOwnerSpread],
   ];
   for (const [id, fn] of all) {
     if (ONLY && id !== ONLY) continue;

@@ -215,6 +215,33 @@
                            function () { return { ok: r.ok, status: r.status, body: null }; });
   }
 
+  // ---------- 续传内容身份（review 2026-10-07 #1） ----------
+  // 分片 SHA-256（WebCrypto，浏览器/Node ≥20 同一全局）；不可用 = 无法
+  // 记录/核验内容身份 → 相关记录按 legacy 处理（绝不凭名称/大小续传）。
+  function sha256Hex(buf) {
+    var subtle = (typeof crypto !== "undefined" && crypto && crypto.subtle)
+      ? crypto.subtle : null;
+    if (!subtle) return Promise.resolve(null);
+    return subtle.digest("SHA-256", buf).then(function (d) {
+      var bytes = new Uint8Array(d);
+      var out = "";
+      for (var i = 0; i < bytes.length; i++) {
+        out += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
+      }
+      return out;
+    }, function () { return null; });
+  }
+
+  // slice 读一次：同一 ArrayBuffer 既做 SHA-256 又做 PUT body（有界内存：
+  // 单片大小 × 并发数）。读失败返回 null（调用方退回直接 PUT blob）。
+  function readSliceBuffer(source, offset, length) {
+    return Promise.resolve()
+      .then(function () {
+        return source.slice(offset, offset + length).arrayBuffer();
+      })
+      .then(function (buf) { return buf || null; }, function () { return null; });
+  }
+
   function createUpload(opts) {
     var cfg = opts.config;
     var apiFetch = opts.apiFetch;
@@ -222,7 +249,11 @@
     var source = opts.source;
     var emit = opts.onEvent || function () {};
     var jobId = opts.resumeJobId || null;
+    var account = typeof opts.account === "string" ? opts.account : "";
     var confirmedMap = {};         // part_number -> ETag|""（ETag 仅提示）
+    var digestMap = {};            // 本次会话确认的分片 -> SHA-256（review #1）
+    var resumeDigests = {};        // 续传记录里已核验的旧分片摘要（review #1）
+    var resumeRejected = false;    // 续传身份核验失败：本轮不再尝试续传
     var plan = null;               // [{part_number, offset, length}]
     var planByNum = {};            // part_number -> {offset, length}（字节折算）
     var totalConfirmed = 0;
@@ -278,9 +309,25 @@
     }
 
     function saveRecord(extra) {
+      // review #1：记录带账号绑定与分片内容摘要（已核验的续传摘要 +
+      // 本次会话确认的摘要）。摘要缺失的分块按未确认语义处理（重传）。
+      var digests = {};
+      var k;
+      for (k in resumeDigests) {
+        if (resumeDigests.hasOwnProperty(k) && confirmedMap.hasOwnProperty(k)) {
+          digests[k] = resumeDigests[k];
+        }
+      }
+      for (k in digestMap) {
+        if (digestMap.hasOwnProperty(k) && confirmedMap.hasOwnProperty(k)) {
+          digests[k] = digestMap[k];
+        }
+      }
       return storage.save(Object.assign({
         job_id: jobId, filename: source.name, size: source.size,
+        account: account,
         confirmed: confirmedList(),
+        digests: confirmedList().length ? digests : {},
       }, extra || {}));
     }
 
@@ -349,13 +396,17 @@
       });
     }
 
-    function confirmPart(n, etag, attemptId) {
+    function confirmPart(n, etag, attemptId, hex) {
       // 取消后才落地的 PUT 不得把已移除的续传记录写回来
       if (stopped || confirmedMap.hasOwnProperty(n)) {
         dropAttempt(n, attemptId);
         return;
       }
       confirmedMap[n] = etag || "";
+      // review #1：分片 SHA-256 与 PUT 并发计算（同一 ArrayBuffer）——
+      // 确认落地时摘要已就绪，记录写入是同步完整的。hash 失败/不可用 →
+      // 该分块无摘要（续传时按未确认处理，安全重传）。
+      if (hex) digestMap[n] = hex;
       totalConfirmed++;
       var len = (planByNum[n] && planByNum[n].length) || 0;
       confirmedBytes += len;
@@ -370,14 +421,109 @@
       // 多传的分块只是同编号覆盖，绑定长度保证不越界——resume 语义）。
       // 适配器可同步（localStorage）或异步（OPFS 任务记录）——统一经
       // Promise.resolve 归一。
-      return Promise.resolve(storage.readConfirmed(jobId) || []).then(function (saved) {
-        (saved || []).forEach(function (n) {
+      return Promise.resolve(storage.readRecord
+        ? storage.readRecord(jobId)
+        : Promise.resolve(null).then(function () {
+            // 适配器未升级：退回 readConfirmed——无摘要即 legacy（调用方
+            // prepareResume 会按“有确认无凭证”放弃续传）
+            return { confirmed: storage.readConfirmed(jobId) || [],
+                     digests: null, account: "" };
+          })
+      ).then(function (rec) {
+        rec = rec || {};
+        (rec.confirmed || []).forEach(function (n) {
           if (!confirmedMap.hasOwnProperty(n)) {
             confirmedMap[n] = "";
             totalConfirmed++;
           }
         });
+        resumeDigests = (rec.digests && typeof rec.digests === "object")
+          ? rec.digests : {};
       });
+    }
+
+    // —— 续传记录的账号/凭证预检（review #1）——
+    // 返回 "resume"（带已确认分块续传）| "discard"（弃旧任务、全新创建，
+    // 与既有“用户拒绝续传”同一路径）| "foreign"（他号记录：绝不 offered/
+    // used，也不动他号的服务端任务——本地视为无候选）。
+    function prepareResumeRecord(rec) {
+      if (rec.account !== undefined && rec.account !== null &&
+          String(rec.account) !== account) {
+        return "foreign";
+      }
+      var confirmed = rec.confirmed || [];
+      // 有确认分块但无任何内容摘要（legacy 记录）：无法证明字节同源 →
+      // 弃旧任务、全新创建（绝不凭名称/大小复用）
+      if (confirmed.length && !(rec.digests && Object.keys(rec.digests).length)) {
+        return "discard";
+      }
+      return "resume";
+    }
+
+    function cancelJob(jobIdToCancel) {
+      // 与既有“用户拒绝续传”同一弃单路径：取消服务端任务 + 清本地记录
+      var cancelPrev = api("/api/ingestions/" +
+        encodeURIComponent(jobIdToCancel) + "/cancel", { method: "POST" });
+      return cancelPrev.then(function () {
+        quiet(storage.remove(jobIdToCancel));
+      }, function () {
+        quiet(storage.remove(jobIdToCancel));
+      });
+    }
+
+    // 计划冻结后、跳过任何分块前：逐片比对「新选中文件」的分片 SHA-256。
+    //  - 不符 → {mismatch: n}（调用方弃旧任务、全新创建，绝不混用）；
+    //  - 缺摘要的已确认分块 → 从跳过表移除（重传，同编号覆盖，安全）；
+    //  - 全部相符 → 保留（且把这些摘要并入后续记录）。
+    function verifyResumeDigests() {
+      var nums = confirmedList().filter(function (n) {
+        return resumeDigests.hasOwnProperty(n);
+      });
+      var verified = {};
+      var bad = null;
+      var seq = Promise.resolve();
+      nums.forEach(function (n) {
+        seq = seq.then(function () {
+          if (bad || stopped) return null;
+          var item = planByNum[n];
+          if (!item) return null;   // 计划外编号：交由服务端状态裁定
+          return readSliceBuffer(source, item.offset, item.length)
+            .then(function (buf) {
+              return buf ? sha256Hex(buf) : Promise.resolve(null);
+            })
+            .then(function (hex) {
+              if (!hex || hex !== resumeDigests[n]) { bad = bad || n; return; }
+              verified[n] = hex;
+            });
+        });
+      });
+      return seq.then(function () {
+        if (bad) return { mismatch: bad };
+        // 只保留已验证分块进跳过表；缺摘要的已确认分块移出（重传，
+        // 同编号覆盖安全；confirmedBytes 折算回退）
+        confirmedList().forEach(function (n) {
+          if (verified.hasOwnProperty(n)) return;
+          delete confirmedMap[n];
+          totalConfirmed--;
+          confirmedBytes -= (planByNum[n] && planByNum[n].length) || 0;
+        });
+        resumeDigests = verified;
+        return null;
+      });
+    }
+
+    // 续传身份核验失败 → 弃旧任务、清状态、以全新任务重启（同引擎实例，
+    // 绝不混用任何旧分块）
+    function resetForFreshCreate() {
+      confirmedMap = {};
+      digestMap = {};
+      resumeDigests = {};
+      totalConfirmed = 0;
+      confirmedBytes = 0;
+      plan = null;
+      planByNum = {};
+      totalBytes = 0;
+      jobId = null;
     }
 
     function fetchStatus() {
@@ -439,7 +585,12 @@
               };
             }
             plan = frozen.plan;
-            return uploadPendingParts();
+            // review #1：跳过任何分块之前，先逐片比对「新选中文件」的
+            // 分片摘要；不符 → 弃旧任务、全新创建（绝不混用）
+            return verifyResumeDigests().then(function (bad) {
+              if (bad) throw { __restartResume: true, mismatchPart: bad.mismatch };
+              return uploadPendingParts();
+            });
           }
           // preparing：worker 尚未初始化 multipart（无分块计划）→ 短间隔再查
           emit({ type: "progress", frac: 0 });
@@ -509,14 +660,23 @@
         // attempt ID 必须绑定在本次 go() 调用内：闭包若读外层可变量，
         // 重试后旧 XHR 的迟到回调会拿到新 ID 而绕过失效判定
         var attemptId = registerAttempt(item.part.part_number, item.part.length);
-        return putPart(url, source.slice(item.part.offset,
-                                         item.part.offset + item.part.length), abortCtl,
-                       function (loaded, computable) {
-                         onPartProgress(item.part.part_number, attemptId,
-                                        loaded, computable);
-                       })
-          .then(function (r) {
-            confirmPart(item.part.part_number, r.etag, attemptId);
+        // review #1：slice 只读一次——同一 ArrayBuffer 既做 SHA-256 又做
+        // PUT body（有界内存：单片大小 × 并发数；读失败退回直接 PUT blob）。
+        // hash 与 PUT 并发，确认时摘要已定（记录同步完整）。
+        return readSliceBuffer(source, item.part.offset, item.part.length)
+          .then(function (buf) {
+            var body = buf !== null ? buf
+              : source.slice(item.part.offset,
+                             item.part.offset + item.part.length);
+            return Promise.all([
+              buf ? sha256Hex(buf) : Promise.resolve(null),
+              putPart(url, body, abortCtl, function (loaded, computable) {
+                onPartProgress(item.part.part_number, attemptId,
+                               loaded, computable);
+              }),
+            ]).then(function (arr) {
+              confirmPart(item.part.part_number, arr[1].etag, attemptId, arr[0]);
+            });
           })
           .catch(function (err) {
             var retried = stopped || (err && err.name === "AbortError");
@@ -646,46 +806,8 @@
       }
     }
 
-    var main = Promise.resolve().then(function () {
-      if (jobId) {
-        // 显式续传（重试/继续按钮）：先读本地已确认分块；useResumeEndpoint
-        //（工具页）时先核对服务端状态——已离开 uploading 而任务未收口（如
-        // 卡在 completing）按 /resume 语义拉回 uploading（服务端拒绝即忽略，
-        // 交由后续轮询判定）
-        return loadConfirmedFromStorage().then(function () {
-          if (opts.useResumeEndpoint) {
-            return fetchStatus().then(function (res) {
-              var st = res.ok && res.body && res.body.stage;
-              if (st && st !== "uploading" && st !== "viewable" && st !== "terminal") {
-                return api("/api/ingestions/" + encodeURIComponent(jobId) + "/resume",
-                  { method: "POST" }).then(jsonBody).catch(function () { return null; });
-              }
-              return null;
-            });
-          }
-          return null;
-        });
-      }
-      // 同名同大小未完任务 → 询问后续传；用户拒绝 = 换新任务语义，
-      // 先取消旧任务再全新创建（不双占、不静默复用）
-      var prev = storage.findResumable ? storage.findResumable(source) : null;
-      if (!prev) return null;
-      var doResume = opts.skipConfirm ||
-        (opts.confirmResume ? opts.confirmResume() : true);
-      if (doResume) {
-        jobId = prev.job_id;
-        return loadConfirmedFromStorage();
-      }
-      var cancelPrev = api(
-        "/api/ingestions/" + encodeURIComponent(prev.job_id) + "/cancel",
-        { method: "POST" });
-      return cancelPrev.then(function () {
-        quiet(storage.remove(prev.job_id));
-      }, function () {
-        quiet(storage.remove(prev.job_id));
-      });
-    }).then(function () {
-      if (jobId) return null;
+    // 创建新任务（持久化先行；落盘失败 = 弃单，见 abandonUnsaved）
+    function createNewJob() {
       // 创建体：基础字段 + 调用方附加（direct_class 声明等；仅新任务——
       // 续传/重试走既有 job id，不重发声明）
       var createBody = Object.assign({
@@ -713,9 +835,99 @@
         }
         throw { status: res.status, data: res.body };   // 422/409 → 稳定码映射
       });
+    }
+
+    // —— 续传准备（review #1：账号绑定 + 内容凭证预检）——
+    // 显式 resumeJobId：读完整记录，账号不符 = 他号任务（绝不 offered/
+    // used，也不动它）；有确认分块但无摘要 = legacy（弃旧任务、全新创建，
+    // 与既有“用户拒绝续传”同一路径）；否则带已确认分块续传（内容比对在
+    // 计划冻结后逐片进行，见 verifyResumeDigests）。
+    function readResumeRecord(id) {
+      return Promise.resolve(storage.readRecord
+        ? storage.readRecord(id)
+        : { confirmed: storage.readConfirmed(id) || [], digests: null,
+            account: "" });
+    }
+
+    function prepareResume() {
+      if (resumeRejected) return Promise.resolve(null);
+      if (jobId) {
+        return readResumeRecord(jobId).then(function (rec) {
+          if (rec) {
+            var verdict = prepareResumeRecord(rec);
+            if (verdict === "foreign") {
+              jobId = null;          // 本地视为无候选；他号服务端任务不动
+              return null;
+            }
+            if (verdict === "discard") {
+              return cancelJob(jobId).then(function () {
+                resetForFreshCreate();
+                resumeRejected = true;
+                return null;
+              });
+            }
+          }
+          return loadConfirmedFromStorage().then(function () {
+            if (!opts.useResumeEndpoint) return null;
+            // 工具页：服务端已离开 uploading 而任务未收口（如卡在
+            // completing）按 /resume 语义拉回 uploading（服务端拒绝即忽略，
+            // 交由后续轮询判定）
+            return fetchStatus().then(function (res) {
+              var st = res.ok && res.body && res.body.stage;
+              if (st && st !== "uploading" && st !== "viewable" && st !== "terminal") {
+                return api("/api/ingestions/" + encodeURIComponent(jobId) + "/resume",
+                  { method: "POST" }).then(jsonBody).catch(function () { return null; });
+              }
+              return null;
+            });
+          });
+        });
+      }
+      // 同名同大小未完任务 → 询问后续传；用户拒绝 = 换新任务语义，
+      // 先取消旧任务再全新创建（不双占、不静默复用）。
+      // review #1：候选记录必须绑定同一账号（他号记录绝不 offered/used）；
+      // legacy 候选（有确认分块、无摘要）按弃单处理，绝不凭名称/大小复用。
+      var prev = storage.findResumable ? storage.findResumable(source) : null;
+      if (!prev) return Promise.resolve(null);
+      if (prev.account !== undefined && prev.account !== null &&
+          String(prev.account) !== account) {
+        return Promise.resolve(null);
+      }
+      var doResume = opts.skipConfirm ||
+        (opts.confirmResume ? opts.confirmResume() : true);
+      if (!doResume) return cancelJob(prev.job_id);
+      var verdict = prepareResumeRecord(prev);
+      if (verdict === "discard") {
+        return cancelJob(prev.job_id).then(function () {
+          resumeRejected = true;
+          return null;
+        });
+      }
+      jobId = prev.job_id;
+      return loadConfirmedFromStorage();
+    }
+
+    var main = Promise.resolve().then(function () {
+      return prepareResume();
+    }).then(function () {
+      if (jobId) return null;
+      return createNewJob();
     }).then(function () {
       return drive();
     }).then(null, function (err) {
+      // review #1：续传内容身份核验失败 → 弃旧任务（同弃单路径）、清状态、
+      // 以全新任务重启（同引擎实例；绝不混用任何旧分块）
+      if (err && err.__restartResume && jobId && !resumeRejected) {
+        var stale = jobId;
+        resumeRejected = true;
+        return cancelJob(stale).then(function () {
+          resetForFreshCreate();
+          return prepareResume().then(function () {
+            if (jobId) throw err;   // 防御：不应发生（resumeRejected 已置位）
+            return createNewJob().then(drive);
+          });
+        });
+      }
       if (stopped || (err && err.cancelled)) return { cancelled: true };
       // 网络层失败统一打标（适配器只看 network 标志，不做跨 realm instanceof）
       if (err instanceof TypeError) throw { network: true, status: 0, data: null };

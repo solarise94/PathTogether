@@ -262,6 +262,9 @@ export function createUploadController({
         return queueWrite(() => runner.setJobUpload(jobId, {
           ingestionId: rec.job_id, filename, size, state: 'uploading',
           confirmedParts: rec.confirmed || [],
+          // review #1：分片内容摘要（SHA-256）随记录持久化——续传逐片核验
+          partDigests: rec.digests && typeof rec.digests === 'object'
+            ? rec.digests : {},
           slideId: rec.slide_id || null, error: null,
           account: acct.account, accountLabel: acct.label,
         }));
@@ -288,6 +291,19 @@ export function createUploadController({
         return runner.getJob(jobId).then((job) => (
           job && job.upload && job.upload.ingestionId === id
             ? (job.upload.confirmedParts || []) : []));
+      },
+      // review #1：续传记录完整形态（已确认分块 + 分片摘要 + 账号）
+      readRecord(id) {
+        return runner.getJob(jobId).then((job) => {
+          const up = job && job.upload;
+          if (!up || up.ingestionId !== id) return null;
+          return {
+            confirmed: up.confirmedParts || [],
+            digests: up.partDigests && typeof up.partDigests === 'object'
+              ? up.partDigests : null,
+            account: typeof up.account === 'string' ? up.account : '',
+          };
+        });
       },
     };
   }
@@ -708,6 +724,9 @@ export function createUploadController({
         apiFetch: pageApiFetch,
         config: cfg,
         storage: opfsStorage(jobId, name, file.size, acct),
+        // review #1：记录/候选按授权账号绑定（capability 端点 account；
+        // 内网免登录态为空串——绑定语义退化为「同一（唯一）账号」）
+        account: String(acct.account || ''),
         resumeJobId,
         skipConfirm: true,
         confirmResume: () => true,

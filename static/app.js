@@ -6946,9 +6946,13 @@
     var jobs = cosJobsRead().filter(function (j) { return j.job_id !== job.job_id; });
     // P2 合同 §5.3：COS jobs 记录补 slide_id 字段位（匹配/续传仍按 job_id；
     // slide_id 随 status 响应出现时由 drive() 回填）
+    // review #1：记录补账号绑定与分片内容摘要（SHA-256）——续传不再凭
+    // 名称/大小复用，逐片核验后只跳过已验证分块
     jobs.push({
       job_id: job.job_id, filename: job.filename, size: job.size,
       slide_id: job.slide_id || null,
+      account: typeof job.account === "string" ? job.account : "",
+      digests: job.digests && typeof job.digests === "object" ? job.digests : {},
       confirmed: (job.confirmed || []).slice().sort(function (a, b) { return a - b; }),
     });
     cosJobsWrite(jobs);
@@ -6960,16 +6964,31 @@
   }
 
   function cosFindResumableJob(file) {
-    // 同名同大小才视为同一候选（§5：文件名/大小只是候选不是证明；真正的
-    // 字节核验在 worker ListParts，浏览器侧 ETag 仅提示）
+    // 同名同大小才视为同一候选；review #1：记录绑定账号——他号记录绝不
+    // offered/used（字节内容核验在共享引擎：逐片比对 SHA-256 后才跳过；
+    // 本地记录只是候选，真正的身份凭证是分片摘要）
     var jobs = cosJobsRead();
     for (var i = 0; i < jobs.length; i++) {
       if (jobs[i].filename === (file && file.name) &&
           jobs[i].size === (file && file.size)) {
+        var recAccount = typeof jobs[i].account === "string" ? jobs[i].account : "";
+        if (recAccount !== String(currentUserId || "")) continue;
         return jobs[i];
       }
     }
     return null;
+  }
+
+  function cosReadJobRecord(jobId) {
+    // review #1：续传记录完整形态（已确认分块 + 分片摘要 + 账号）
+    var jobs = cosJobsRead().filter(function (j) { return j.job_id === jobId; });
+    if (!jobs.length) return Promise.resolve(null);
+    var j = jobs[0];
+    return Promise.resolve({
+      confirmed: j.confirmed || [],
+      digests: j.digests && typeof j.digests === "object" ? j.digests : null,
+      account: typeof j.account === "string" ? j.account : "",
+    });
   }
 
   // ---------- COS PUT 独立传输 ----------
@@ -7127,7 +7146,11 @@
           var jobs = cosJobsRead().filter(function (j) { return j.job_id === id; });
           return jobs.length ? jobs[0].confirmed : [];
         },
+        readRecord: cosReadJobRecord,   // review #1：分片摘要 + 账号
       },
+      // review #1：记录/候选按登录账号绑定（本页身份 = /api/auth/info 的
+      // user_id；免认证态为空串——绑定语义退化为「同一（唯一）账号」）
+      account: String(currentUserId || ""),
       resumeJobId: jobId,
       skipConfirm: !!opts.skipConfirm,
       confirmResume: function () {

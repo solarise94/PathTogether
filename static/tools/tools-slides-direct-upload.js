@@ -34,8 +34,10 @@ function fmtBytes(n) {
 }
 
 /// 直传任务本地记录（localStorage；只存非秘密 job id 与文件提示，§5）。
-/// key 按文件名+大小——同名同大小视为同一候选（真正的字节核验在 worker
-/// ListParts）。隐私模式写入失败静默（只失去续传）。
+/// key 按文件名+大小——同名同大小视为同一候选。review #1：候选只是线索，
+/// 不是身份——记录绑定账号且携带分片 SHA-256（digests），共享引擎在续传前
+/// 逐片核验「新选中文件」的字节后才允许跳过；无摘要的记录按 legacy 处理
+/// （绝不凭名称/大小复用）。隐私模式写入失败静默（只失去续传）。
 const RECORDS_KEY = 'pt.tools.direct.uploads';
 
 function readRecords() {
@@ -53,9 +55,21 @@ function writeRecords(records) {
   } catch { /* localStorage 不可用：仅失去刷新恢复 */ }
 }
 
-function resumableFor(file) {
+function resumableFor(file, account) {
+  const acct = String(account || '');
   return readRecords().find(
-    (r) => r && r.filename === file.name && r.size === file.size) || null;
+    (r) => r && r.filename === file.name && r.size === file.size &&
+            String(r.account || '') === acct) || null;
+}
+
+function readRecordById(jobId) {
+  const r = readRecords().find((x) => x && x.job_id === jobId);
+  if (!r) return Promise.resolve(null);
+  return Promise.resolve({
+    confirmed: r.confirmed || [],
+    digests: r.digests && typeof r.digests === 'object' ? r.digests : null,
+    account: typeof r.account === 'string' ? r.account : '',
+  });
 }
 
 export function createDirectUploadController({ t, onStatus, onPublished }) {
@@ -145,7 +159,8 @@ export function createDirectUploadController({ t, onStatus, onPublished }) {
       }
 
       // ④ 共享引擎上传（数据源 = 用户的 File，仅 slice 分块读取）
-      const resume = resumableFor(file);
+      const account = typeof cap.account === 'string' ? cap.account : '';
+      const resume = resumableFor(file, account);
       const upload = window.HP_COS_UPLOAD.createUpload({
         source: file,
         apiFetch: pageApiFetch,
@@ -156,15 +171,20 @@ export function createDirectUploadController({ t, onStatus, onPublished }) {
         confirmResume: () => true,
         retryCompleteOnNetworkError: true,
         useResumeEndpoint: true,
+        account,
         storage: {
           save(rec) {
             if (!rec || !rec.job_id) return undefined;
             const records = readRecords()
               .filter((r) => r.job_id !== rec.job_id &&
-                             !(r.filename === file.name && r.size === file.size));
+                             !(r.filename === file.name && r.size === file.size &&
+                               String(r.account || '') === account));
             records.push({
               job_id: rec.job_id, filename: file.name, size: file.size,
+              account,
               confirmed: (rec.confirmed || []).slice(),
+              digests: rec.digests && typeof rec.digests === 'object'
+                ? rec.digests : {},
               slide_id: rec.slide_id || null,
             });
             writeRecords(records);
@@ -178,11 +198,12 @@ export function createDirectUploadController({ t, onStatus, onPublished }) {
             writeRecords(readRecords().filter((r) => r.job_id !== id));
             return undefined;
           },
-          findResumable: () => resumableFor(file),
+          findResumable: () => resumableFor(file, account),
           readConfirmed(id) {
             const rec = readRecords().find((r) => r.job_id === id);
             return (rec && rec.confirmed) || [];
           },
+          readRecord: readRecordById,
         },
         onEvent: (ev) => {
           if (ev.type === 'created') {

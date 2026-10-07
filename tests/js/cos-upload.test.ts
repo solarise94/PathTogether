@@ -277,9 +277,21 @@ function cosFile(size = 30, name = "big.svs") {
 		size,
 		lastModified: 42,
 		slice(s: number, e: number) {
-			return { _offset: s, _end: e };
+			// review #1：引擎对每片读一次 arrayBuffer（SHA-256 与 PUT body
+			// 共用同一 buffer）——假源给零字节内容
+			return {
+				_offset: s,
+				_end: e,
+				arrayBuffer: async () => new ArrayBuffer(Math.max(0, e - s)),
+			};
 		},
 	};
+}
+
+async function zeroSha256(n: number): Promise<string> {
+	const d = await crypto.subtle.digest("SHA-256", new ArrayBuffer(n));
+	return Array.from(new Uint8Array(d))
+		.map((x) => x.toString(16).padStart(2, "0")).join("");
 }
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -753,8 +765,15 @@ describe("刷新恢复：只读进度行与终态清理", () => {
 		}) as unknown as typeof fetch;
 		const h = loadApp(fetchImpl, { mode: "official", capabilities: { cos_upload: cosCaps() } });
 		okXhr();   // U1：COS PUT 走 XHR
+		// review #1 后的合同：续传记录必须携带分片内容摘要（零字节假源的
+		// 分片 = 8 字节 0x00 的 SHA-256）与账号绑定。曾只凭 confirmed 跳过
+		//（名称/大小复用——review 2026-10-07 #1 的混合文件漏洞）。
+		const d1 = await zeroSha256(8);
 		h.storage.setItem("pt.cos.jobs", JSON.stringify([
-			{ job_id: "inj_r", filename: "big.svs", size: 30, confirmed: [1, 2] },
+			{
+				job_id: "inj_r", filename: "big.svs", size: 30, confirmed: [1, 2],
+				account: "", digests: { "1": d1, "2": d1 },
+			},
 		]));
 		h.confirmMock.mockReturnValue(true);   // 用户确认续传
 		h.up.uploadFile(cosFile(30, "big.svs"));

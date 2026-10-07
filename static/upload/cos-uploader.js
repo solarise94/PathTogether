@@ -119,7 +119,20 @@
   // 器按 body 推导，手动设置会被 CORS 拒绝）、绝不输出预签名 URL。所有监听
   // 在 send 之前注册；settle（成功/失败/取消/超时）后注销，AbortController
   // 一次 abort 让全部在途 XHR 停止。
-  function putPart(url, blob, abortCtl, onProgress) {
+  //
+  // review 2026-10-07 #8：两层超时（文档化数字，createUpload 可配置）——
+  //   无进度超时 progressTimeoutMs（默认 60 000ms）：连续该时长没有上传
+  //   进度事件 → abort，按**可重试**网络错误处理（err.network + timeout）；
+  //   单片整体上限 partTimeoutMs（默认 600 000ms，写入 xhr.timeout）：单片
+  //   无论如何不得超过该时长。计时器在 settle/取消后清理（不留活性）。
+  var DEFAULT_PROGRESS_TIMEOUT_MS = 60000;
+  var DEFAULT_PART_TIMEOUT_MS = 600000;
+
+  function putPart(url, blob, abortCtl, onProgress, timeouts) {
+    var progressTimeoutMs = (timeouts && timeouts.progressTimeoutMs) ||
+      DEFAULT_PROGRESS_TIMEOUT_MS;
+    var partTimeoutMs = (timeouts && timeouts.partTimeoutMs) ||
+      DEFAULT_PART_TIMEOUT_MS;
     return new Promise(function (resolve, reject) {
       var xhr;
       try {
@@ -130,7 +143,25 @@
       }
       var settled = false;
       var onAbortSignal = null;
+      var noProgressTimer = null;
+      var progressTimedOut = false;
+      function clearNoProgressTimer() {
+        if (noProgressTimer !== null) {
+          clearTimeout(noProgressTimer);
+          noProgressTimer = null;
+        }
+      }
+      function armNoProgressTimer() {
+        clearNoProgressTimer();
+        if (!(progressTimeoutMs > 0)) return;
+        noProgressTimer = setTimeout(function () {
+          // 无进度 = 请求可能悬死：主动 abort，走可重试网络错误合同
+          progressTimedOut = true;
+          try { xhr.abort(); } catch (e) { settle(reject, { network: true, timeout: true }); }
+        }, progressTimeoutMs);
+      }
       function detach() {
+        clearNoProgressTimer();
         try {
           xhr.upload.onprogress = null;
           xhr.onload = null;
@@ -153,10 +184,15 @@
       try {
         xhr.open("PUT", url, true);
         xhr.withCredentials = false;
+        if (partTimeoutMs > 0) {
+          try { xhr.timeout = partTimeoutMs; } catch (e) { /* 老 UA 只读 */ }
+        }
         // 监听先于 send（XHR 规范要求 upload 事件在 send 后才派发，先注册
         // 才不丢早期进度）
         xhr.upload.onprogress = function (ev) {
-          if (settled || !onProgress) return;
+          if (settled) return;
+          armNoProgressTimer();   // 有进度：重置无进度计时器（review #8）
+          if (!onProgress) return;
           var loaded = (ev && typeof ev.loaded === "number") ? ev.loaded : 0;
           onProgress(loaded, !!(ev && ev.lengthComputable));
         };
@@ -175,13 +211,21 @@
           }
         };
         xhr.onerror = function () { settle(reject, { network: true }); };
-        xhr.onabort = function () { settle(reject, { name: "AbortError" }); };
+        xhr.onabort = function () {
+          // 无进度超时触发的 abort = 可重试网络错误（区别于用户取消）
+          if (progressTimedOut) {
+            settle(reject, { network: true, timeout: true });
+            return;
+          }
+          settle(reject, { name: "AbortError" });
+        };
         xhr.ontimeout = function () { settle(reject, { network: true, timeout: true }); };
         if (abortCtl && abortCtl.signal) {
           if (abortCtl.signal.aborted) { settle(reject, { name: "AbortError" }); return; }
           onAbortSignal = function () { try { xhr.abort(); } catch (e) {} };
           abortCtl.signal.addEventListener("abort", onAbortSignal);
         }
+        armNoProgressTimer();
         xhr.send(blob);
       } catch (e) {
         // 同步抛出（坏 URL / 不支持的方案等）按网络层失败进入重试合同
@@ -657,6 +701,10 @@
       // loaded 在进入重试/重新签名前丢弃（暂态百分比可回退，显示「正在重试」）。
       var url = freshUrl || item.url;
       var attempt = 0;
+      var timeouts = {
+        progressTimeoutMs: opts.progressTimeoutMs,
+        partTimeoutMs: opts.partTimeoutMs,
+      };
       function go() {
         if (stopped) return Promise.reject({ cancelled: true });
         attempt++;
@@ -682,7 +730,7 @@
               putPart(url, body, abortCtl, function (loaded, computable) {
                 onPartProgress(item.part.part_number, attemptId,
                                loaded, computable);
-              }),
+              }, timeouts),
             ]).then(function (arr) {
               confirmPart(item.part.part_number, arr[1].etag, attemptId, arr[0]);
             });
@@ -715,12 +763,18 @@
     function uploadPendingParts() {
       // pending = 计划编号 − 已确认（服务端计划是权威；本地 confirmed 只用于
       // 跳过，误判多传的分块会被同编号覆盖且长度受签名约束）
+      // review 2026-10-07 #7：某个分片终局失败 → 所有 lane 停止调度新分片，
+      // 等在途请求收口（drain：在途分片自然完成或失败，confirmed 照常入账）
+      // 之后才 surface 错误——done reject 时不再有任何在途请求，用户重试
+      // 不会与旧请求重叠。
       var pending = plan.filter(function (p) {
         return !confirmedMap.hasOwnProperty(p.part_number);
       });
       var i = 0;
+      var failure = null;   // 首个终局失败（后续失败只留第一个）
       function nextBatch() {
         if (stopped) return Promise.reject({ cancelled: true });
+        if (failure) return Promise.resolve();   // 已有终局失败：不再签新批
         var batch = pending.slice(i, i + cfg.sign_batch_max_parts);
         i += batch.length;
         if (!batch.length) return requestComplete();
@@ -729,13 +783,24 @@
           var conc = cfg.max_concurrent_parts || 3;
           var next = 0;
           function lane() {
-            if (next >= signed.length) return Promise.resolve();
+            if (stopped) return Promise.reject({ cancelled: true });
+            if (failure || next >= signed.length) return Promise.resolve();
             var item = signed[next++];
-            return putPartRobust(item).then(lane);
+            return putPartRobust(item).then(lane, function (e) {
+              if (!failure && !stopped && !(e && (e.cancelled ||
+                  e.name === "AbortError"))) {
+                failure = e;
+              }
+              return lane();   // drain：本 lane 收口后退出
+            });
           }
           var lanes = [];
           for (var k = 0; k < Math.min(conc, signed.length); k++) lanes.push(lane());
-          return Promise.all(lanes).then(nextBatch);
+          return Promise.all(lanes).then(function () {
+            // 全部在途收口后才 surface（绝不带着悬置请求把错误抛给调用方）
+            if (failure) throw failure;
+            return nextBatch();
+          });
         });
       }
       if (!pending.length) return requestComplete();

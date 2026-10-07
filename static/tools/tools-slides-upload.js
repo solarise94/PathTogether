@@ -288,6 +288,9 @@ export function createUploadController({
           // review #1：分片内容摘要（SHA-256）随记录持久化——续传逐片核验
           partDigests: rec.digests && typeof rec.digests === 'object'
             ? rec.digests : {},
+          // 摘要方案标记（复核第二轮）：无标记/其他方案 = legacy，续传弃旧
+          digestScheme: typeof rec.digest_scheme === 'string'
+            ? rec.digest_scheme : '',
           slideId: rec.slide_id || null, error: null,
           account: acct.account, accountLabel: acct.label,
         }));
@@ -324,6 +327,8 @@ export function createUploadController({
             confirmed: up.confirmedParts || [],
             digests: up.partDigests && typeof up.partDigests === 'object'
               ? up.partDigests : null,
+            digest_scheme: typeof up.digestScheme === 'string'
+              ? up.digestScheme : '',
             account: typeof up.account === 'string' ? up.account : '',
           };
         });

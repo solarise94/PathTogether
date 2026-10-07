@@ -68,6 +68,7 @@ function readRecordById(jobId) {
   return Promise.resolve({
     confirmed: r.confirmed || [],
     digests: r.digests && typeof r.digests === 'object' ? r.digests : null,
+    digest_scheme: typeof r.digest_scheme === 'string' ? r.digest_scheme : '',
     account: typeof r.account === 'string' ? r.account : '',
     plan: Array.isArray(r.plan) ? r.plan : null,
   });
@@ -113,37 +114,32 @@ function upsertReceipt(receipt) {
     .concat([receipt]));
 }
 
-function sha256Hex(buf) {
-  const subtle = (typeof crypto !== 'undefined' && crypto && crypto.subtle)
-    ? crypto.subtle : null;
-  if (!subtle) return Promise.resolve(null);
-  return subtle.digest('SHA-256', buf).then((d) => {
-    const bytes = new Uint8Array(d);
-    let out = '';
-    for (let i = 0; i < bytes.length; i++) {
-      out += (bytes[i] < 16 ? '0' : '') + bytes[i].toString(16);
-    }
-    return out;
-  }, () => null);
-}
-
-/// receipt 内容凭证核验（有界内存：逐片读取、一片在内存）：plan 覆盖整个
-/// 文件且每片摘要与新选中文件的对应分片一致 → 同一文件。
+/// receipt 内容凭证核验（复核第二轮：与引擎同一分片摘要方案
+/// sha256-chunked-4MiB-v1，有界内存——逐片、片内 4 MiB 子块流式读取）：
+/// plan 覆盖整个文件、方案标记匹配，且每片分片摘要与新选中文件的对应
+/// 分片一致 → 同一文件。方案缺失/其他方案 = 过期凭证（清掉后按新文件
+/// 全新上传，绝不凭名称/大小复用）。
 async function verifyReceipt(file, receipt) {
+  const engine = (typeof window !== 'undefined' && window.HP_COS_UPLOAD) || {};
+  const chunked = typeof engine.sha256HexChunked === 'function'
+    ? engine.sha256HexChunked : null;
+  const scheme = typeof engine.digestScheme === 'string'
+    ? engine.digestScheme : '';
   const plan = Array.isArray(receipt.plan) ? receipt.plan : null;
   const digests = receipt.digests && typeof receipt.digests === 'object'
     ? receipt.digests : null;
-  if (!plan || !plan.length || !digests) return { ok: false };
+  if (!chunked || !scheme || !plan || !plan.length || !digests ||
+      receipt.digest_scheme !== scheme) {
+    return { ok: false };
+  }
   let offset = 0;
   for (const p of plan) {
     const want = digests[String(p.part_number)];
     if (!(p.length > 0) || !want) return { ok: false };
-    let buf = null;
+    let hex = null;
     try {
-      buf = await file.slice(offset, offset + p.length).arrayBuffer();
-    } catch { buf = null; }
-    if (!buf) return { ok: false };
-    const hex = await sha256Hex(buf);
+      hex = await chunked(file.slice(offset, offset + p.length));
+    } catch { hex = null; }
     if (!hex || hex !== want) return { ok: false };
     offset += p.length;
   }
@@ -152,11 +148,10 @@ async function verifyReceipt(file, receipt) {
 
 export function createDirectUploadController({ t, onStatus, onPublished,
   onEngineEvent }) {
-  // busy：单页守卫；lockAbort：跨标签内容锁等待的取消句柄；
-  // currentReceiptId：页面当前显示文件对应的回执（关联重试只作用于它——
-  // 复核 8428f7f0：绝不取「所有本地回执的第一条 pending」）。
-  const state = { busy: false, handle: null, lockAbort: null,
-                  currentReceiptId: null };
+  // busy：单页守卫；lockAbort：跨标签内容锁等待的取消句柄。关联重试的
+  // 句柄由页面随结果显示并回传（见 retryAssociation）——控制器不保留
+  // 「当前回执」内部状态（owner repro：同句柄多回执时内部状态无法消歧）。
+  const state = { busy: false, handle: null, lockAbort: null };
 
   function status(key, vars) {
     if (onStatus) onStatus(key ? t(key, vars || {}) : '');
@@ -215,18 +210,27 @@ export function createDirectUploadController({ t, onStatus, onPublished,
   /// 关联重试（receipt assoc=pending 时页面「重试加入项目」入口）：
   /// 只做关联（同 slideId、同幂等键），成功后才回调 onPublished（全量成功
   /// 只发一次——review #4：发布成功 ≠ 关联成功，绝不提前报成功）。
-  /// 复核 8428f7f0：重试绑定当前显示文件的回执（receiptId 缺省用控制器
-  /// 记住的当前回执），并在动作前重查登录账号与回执账号——不符绝不发任何
-  /// 请求（服务端权限之外的前置拒绝，明确提示）。只修改被点选的回执。
-  async function retryAssociation(receiptId) {
+  /// 复核 8428f7f0：重试句柄必须完整指认被显示的回执——receipt_id/job_id
+  /// AND slide_id（发布对象的身份；owner repro：两条回执由同一真实回执
+  /// 展开复制、句柄相同，只匹配句柄会拿错回执）。命中多条 = ambiguous，
+  /// 拒绝且不发任何请求；无句柄调用（未绑定页面显示）一律不动。动作前
+  /// 重查登录账号与回执账号，不符拒绝。只修改被点选的回执。
+  async function retryAssociation(receiptId, slideId) {
     if (state.busy) return { ok: false, reason: 'busy' };
     state.busy = true;
     try {
-      const want = (typeof receiptId === 'string' && receiptId)
-        ? receiptId : state.currentReceiptId;
-      const receipt = want ? readReceipts().find(
-        (r) => r && (r.receipt_id === want || r.job_id === want) &&
-               r.assoc && r.assoc.state === 'pending') || null : null;
+      if (typeof receiptId !== 'string' || !receiptId ||
+          typeof slideId !== 'string' || !slideId) {
+        return { ok: false, reason: 'none' };   // 未绑定：绝不发请求
+      }
+      const matches = readReceipts().filter((r) => r &&
+        (r.receipt_id === receiptId || r.job_id === receiptId) &&
+        r.slide_id === slideId && r.assoc && r.assoc.state === 'pending');
+      if (matches.length > 1) {
+        status('tools.direct.assoc.ambiguous', { n: String(matches.length) });
+        return { ok: false, reason: 'ambiguous' };
+      }
+      const receipt = matches[0] || null;
       if (!receipt) return { ok: false, reason: 'none' };
       try {
         // 账号重查（点按时的登录态为准；能力不可得 = 无法核对，同样不动）
@@ -249,7 +253,6 @@ export function createDirectUploadController({ t, onStatus, onPublished,
         }
         await associateTarget(receipt.target || null, receipt.slide_id);
         updateReceiptAssoc(receipt, 'ok', null);
-        state.currentReceiptId = receiptIdOf(receipt);
         status('tools.direct.published', { id: receipt.slide_id });
         if (onPublished && receipt.slide_id) onPublished(receipt.slide_id);
         return { ok: true, slideId: receipt.slide_id,
@@ -277,7 +280,6 @@ export function createDirectUploadController({ t, onStatus, onPublished,
       writeReceipts(readReceipts().filter((r) => r !== receipt));
       return null;
     }
-    state.currentReceiptId = receiptIdOf(receipt);
     if (receipt.assoc && receipt.assoc.state === 'pending') {
       status('tools.direct.assoc.pending',
         { id: receipt.slide_id, e: receipt.assoc.error || '' });
@@ -407,6 +409,8 @@ export function createDirectUploadController({ t, onStatus, onPublished,
               job_id: rec.job_id,
               digests: rec.digests && typeof rec.digests === 'object'
                 ? rec.digests : {},
+              digest_scheme: typeof rec.digest_scheme === 'string'
+                ? rec.digest_scheme : '',
               plan: Array.isArray(rec.plan) ? rec.plan : null,
             };
             const records = readRecords()
@@ -419,6 +423,8 @@ export function createDirectUploadController({ t, onStatus, onPublished,
               confirmed: (rec.confirmed || []).slice(),
               digests: rec.digests && typeof rec.digests === 'object'
                 ? rec.digests : {},
+              digest_scheme: typeof rec.digest_scheme === 'string'
+                ? rec.digest_scheme : '',
               plan: Array.isArray(rec.plan) ? rec.plan : null,
               slide_id: rec.slide_id || null,
             });
@@ -470,6 +476,7 @@ export function createDirectUploadController({ t, onStatus, onPublished,
         filename: file.name,
         size: file.size,
         digests: (lastSaved && lastSaved.digests) || {},
+        digest_scheme: (lastSaved && lastSaved.digest_scheme) || '',
         plan: (lastSaved && lastSaved.plan) || null,
         job_id: uploadedJobId,
         slide_id: slideId,
@@ -477,7 +484,6 @@ export function createDirectUploadController({ t, onStatus, onPublished,
         assoc: { state: target ? 'pending' : 'ok', error: null },
       };
       upsertReceipt(receipt);
-      state.currentReceiptId = receiptIdOf(receipt);
       if (!target) {
         status('tools.direct.published', { id: slideId || '—' });
         if (onPublished && slideId) onPublished(slideId);

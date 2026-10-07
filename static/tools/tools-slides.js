@@ -197,6 +197,8 @@ const page = {
   uploadCtl: null,         // C4 上传控制器（tools-slides-upload.js）
   convertUploadCtl: null,  // R1 一键转换并上传控制器（tools-slides-convert-upload.js）
   directCtl: null,         // 阶段 1 直传类别上传控制器（tools-slides-direct-upload.js）
+  directReceiptId: null,   // 当前显示回执的句柄（receipt_id/job_id；复核 8428f7f0）
+  directSlideId: null,     // 当前显示回执的 slide_id（句柄消歧；复核第二轮）
   file: null,
   directCls: null,         // 阶段 1：当前直传类别文件的嗅探结果（classifyFile）
   bundleFiles: null,       // F3：MRXS 完整包成员行 [{name, relPath, file}] | null
@@ -374,6 +376,8 @@ function showDirectReady(file, cls) {
   page.directCls = cls || null;
   els.directSection.hidden = false;
   // review #3/#4/#6：面板每次准备重置（receipt 入口 / 关联重试 / 进度条）
+  page.directReceiptId = null;
+  page.directSlideId = null;
   if (els.directOpenLink) els.directOpenLink.hidden = true;
   if (els.directAssocRetryBtn) els.directAssocRetryBtn.hidden = true;
   if (els.directCancelBtn) els.directCancelBtn.hidden = true;
@@ -387,10 +391,12 @@ function showDirectReady(file, cls) {
 
 /// 直传发布后的入口 UI（review #3/#4）：已发布同文件 → 「打开切片」；
 /// 关联待完成 → 「重试加入项目」。绝不引导重复上传。
-/// 复核 8428f7f0：记录页面当前显示文件对应的回执句柄——重试按钮只作用于
-/// 它（账号不符被拒时保持入口，便于换回原账号后重试）。
+/// 复核 8428f7f0（第二轮）：重试句柄必须完整指认被显示的回执——
+/// receipt_id/job_id 与 slide_id 一起记录、一起回传（同句柄多回执时只有
+/// slide_id 能消歧；命中多条控制器按 ambiguous 拒绝）。
 function updateDirectReceiptUi(r) {
   if (r && r.receiptId) page.directReceiptId = r.receiptId;
+  if (r && r.slideId) page.directSlideId = r.slideId;
   const slideId = r && r.slideId;
   if (slideId && els.directOpenLink) {
     els.directOpenLink.href = '/?slide=' + encodeURIComponent(slideId);
@@ -439,15 +445,15 @@ function setDirectStatusText(text) {
 }
 
 /// 「重试加入项目」（review #4/#5）：只做关联（同 slideId、同幂等键），
-/// 成功后控制器才回调 onPublished（全量成功）。复核 8428f7f0：传入页面
-/// 当前显示文件的回执句柄——绝不重试另一条回执；账号不符由控制器拒绝
-/// （不发任何请求，明确提示）。
+/// 成功后控制器才回调 onPublished（全量成功）。复核 8428f7f0（第二轮）：
+/// 传入页面当前显示回执的完整句柄（receipt_id/job_id + slide_id）——绝不
+/// 重试另一条回执；句柄缺失/歧义/账号不符由控制器拒绝（不发任何请求）。
 async function onDirectAssocRetry() {
   if (!page.directCtl) return;
   if (els.directAssocRetryBtn) els.directAssocRetryBtn.disabled = true;
   try {
     const r = await page.directCtl.retryAssociation(
-      page.directReceiptId || null);
+      page.directReceiptId || null, page.directSlideId || null);
     updateDirectReceiptUi(r);
   } finally {
     if (els.directAssocRetryBtn) els.directAssocRetryBtn.disabled = false;
@@ -1833,6 +1839,7 @@ async function init() {
   els.uploadCancelBtn.addEventListener('click', () => { page.uploadCtl.cancel(); });
   // 测试/诊断可观测钩子（不承载任何逻辑）
   window.__stToolsReady = true;
+  window.__stToolsDirect = page.directCtl;
 }
 
 const runBytesMsg = { key: null, vars: null };

@@ -75,38 +75,47 @@
 
 ### 上传内存实测（1 GiB 合成 OME-TIFF 直传）
 
+复核第二轮修复了 4c38ed7f 引入的内存回退：该改动为「同一分片既做哈希又做
+PUT body」把整片读入 ArrayBuffer——32 MB × 3 通道的驻留把渲染器 RSS 顶到
+~0.8 GiB（下方中间行）。现恢复 PUT body = Blob 切片（浏览器从盘流式发送，
+与 digest 改动前一致）；摘要按 sha256-chunked-4MiB-v1 单独流式计算（4 MiB
+子块，每通道同时只有一个子块在内存，磁盘读两次）。
+
 方法：C4 假后端（假 COS 为真实 TLS 本地 socket——`page.route` 拦截会在
 Node 驱动侧缓冲 32 MB 请求体，不能用于内存实测；真实 socket 下浏览器真实
 发送字节，本地 COS 只计数不缓存）。文件为稀疏生成的 1 GiB（1073741824 B）
 OME-TIFF，`part_bytes=32,000,000`、`max_concurrent_parts=3`（34 片），
 真实 Chromium（headless shell）走 /tools/slides 直传，250 ms 采样 `/proc`
-进程树 `VmRSS`/`VmHWM`（渲染器进程求和）+ CDP `Performance.getMetrics`。
+进程树 `VmRSS`/`VmHWM`（渲染器进程求和；VmHWM 为进程自启动的高水位，含
+页面加载/WASM 初始化的瞬时峰值）+ CDP `Performance.getMetrics`。
 整个测量在 `systemd-run --user --scope -p MemoryMax=6G -p MemorySwapMax=0`
-下进行，两轮均完整发布成功。
+下进行，各轮均完整发布成功。基线 = 直传面板就绪、点击「上传到工作台」前
+（含工具页自身的转换 runner/WASM 驻留）。
 
-| 指标（kB，/proc Vm* 单位） | 页面基线（点击前） | 上传峰值 | 上传增量 |
+| 轮次 | 渲染器 RSS 基线→峰值（MiB） | 渲染器上传增量 RSS / HWM（MiB） | 浏览器主进程峰值 RSS（MiB） |
 | --- | --- | --- | --- |
-| 渲染器 RSS（哈希真实计算） | 173 632 | 794 476 | +620 844 |
-| 渲染器 VmHWM（同上） | 184 588 | 1 224 308 | +1 039 720 |
-| 浏览器主进程 RSS（同上） | 111 436 | 686 340 | +574 904 |
-| 渲染器 RSS（假 digest 绕过） | 166 864 | 771 928 | +605 064 |
-| 渲染器 VmHWM（同上） | 177 800 | 1 217 548 | +1 039 748 |
-| 浏览器主进程 RSS（同上） | 110 424 | 761 216 | +650 792 |
+| digest 改动前（decd6c8，复核方实测，PUT=Blob 无哈希） | —（未分开采样） | — | 111.3 |
+| 4c38ed7f..改动前（整片读入，PUT=ArrayBuffer） | 169.6 → 775.9 | +606.3 / +1015.4 | 670.3 |
+| **本轮（PUT=Blob 切片 + chunked 摘要）** | **163.2 → 289.4** | **+126.2 / +212.9** | **153.8** |
+
+（复核方对 decd6c8 的实测：渲染器峰值 RSS 184.7 MB（HWM 184.7 MB）、浏览器
+峰值 RSS 111.3 MB——与本轮渲染器峰值 289.4 MiB 同口径可比：差值 ≈ +105 MiB，
+来源是 chunked 摘要的 4 MiB 子块顺序读取在 V8 外部内存里的 GC 滞留
+（1 GiB 共 272 次 4 MiB 分配，峰值后回落：上传结束 1.5 s 内渲染器 RSS
+回落至 ~222 MiB）与在途 XHR 的请求体缓冲；设计边界「每通道一个子块」
+= 4 MiB × 3 ≈ 12 MiB 是稳态占用，峰值含 GC 滞留属瞬态、可回收。）
 
 读法与边界：
 
-- V8 `JSHeapUsedSize` 峰值仅 ~5.3 MB——分片缓冲是外部（ArrayBuffer）内存，
-  不计入 JS 堆；内存上限约束应以进程 RSS 为准。
-- 设计边界是「单片 × 通道数」≈ 32 MB × 3 ≈ 96 MiB；实测上传增量
-  ~+0.6 GiB（渲染器 RSS）远高于该值，主因是 34 片连续分发时已弃引用的
-  32 MB ArrayBuffer 未被立即 GC（峰值后回落：上传结束 1.5 s 内渲染器 RSS
-  回落至 ~349 MiB），外加浏览器主进程为在途 PUT 保留的请求体副本。属瞬态
-  峰值、可回收；若需压低峰值应改「整片读入」为流式，本轮不顺便改。
-- 真实 SHA-256 对比假 digest：渲染器 RSS 增量 +620 844 vs +605 064 kB、
-  VmHWM 增量几乎相同（+1 039 720 vs +1 039 748 kB）、浏览器 RSS 增量反向
-  （+574 904 vs +650 792 kB）——差异与单轮波动同量级。哈希消费的是同一块
-  已在内存中的分片 ArrayBuffer（`slice` 只读一次，哈希与 PUT 并发），不产生
-  额外整片拷贝；两轮耗时 141 s vs 138 s，无显著差别。
+- V8 `JSHeapUsedSize` 全程 ~5 MB——分片/子块缓冲都是外部（ArrayBuffer）
+  内存，不计入 JS 堆；内存约束以进程 RSS 为准。
+- 整片读入轮的对比数字是修复前同方法实测（渲染器 RSS 794 476 kB 峰值、
+  VmHWM 1 224 308 kB、浏览器 686 340 kB）；当时用「假 digest 绕过」对照
+  无法暴露问题——绕过只跳过哈希、仍把整片读进内存当 PUT body，两轮几乎
+  相同（+620 844 vs +605 064 kB）。成本在 ArrayBuffer PUT body，不在哈希。
+- 浏览器主进程 VmHWM（含启动期瞬时峰值，非上传专属）在两轮修复后测量中为
+  ~790 MiB，峰值 RSS 采样仅 154-158 MiB——HWM 口径仅供排障，不作产品上限
+  依据。
 - 未测：真实 COS、Windows/macOS；假 COS 不代表公网 TLS 吞吐下的窗口行为
   （在途片数上限 3 不变，内存上界形状一致）。
 
@@ -114,7 +123,7 @@ OME-TIFF，`part_bytes=32,000,000`、`max_concurrent_parts=3`（34 片），
 ## 已知限制
 
 - 分片摘要依赖 WebCrypto：可用性按 `crypto.subtle` 的实际能力判定（安全上下文才有；`localhost`/`127.0.0.1` 属安全上下文，可用——不能把「纯 HTTP」一概归为不可用）。`crypto.subtle` 不可用时（例如非本机域名的纯 HTTP 访问）无法记录摘要，续传退化为全部重传，不会退回按名称复用（代码在 `sha256Hex` 处判定，取不到 `crypto.subtle` 即返回空摘要）。
-- 为同时计算摘要和上传，分片整片读入内存：当前 32 MB × 3 通道，约 100 MB（上传路径实测见下文「复核修复与上传内存实测」）。
+- 分片摘要按 sha256-chunked-4MiB-v1 方案流式计算（4 MiB 子块，每通道同时只有一个子块在内存）；PUT body 为 Blob 切片，浏览器从盘流式发送。上传内存实测见下文「上传内存实测（1 GiB 合成 OME-TIFF 直传）」。
 - 跨标签互斥依赖 Web Lock（`navigator.locks`，安全上下文可用；localhost 同样满足）。不可用时（旧浏览器/非安全上下文）退化为既有单页 busy 行为——与产物上传的 `uploadLockName` 同一前提。
 - 真实 COS、Windows/macOS 未执行。
 - 管理插件 0.4.15 需要单独的插件发布切换才会到生产。

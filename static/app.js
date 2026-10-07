@@ -6956,6 +6956,8 @@
       slide_id: job.slide_id || null,
       account: typeof job.account === "string" ? job.account : "",
       digests: job.digests && typeof job.digests === "object" ? job.digests : {},
+      // 摘要方案标记（复核第二轮）：无标记/其他方案 = legacy，续传弃旧
+      digest_scheme: typeof job.digest_scheme === "string" ? job.digest_scheme : "",
       confirmed: (job.confirmed || []).slice().sort(function (a, b) { return a - b; }),
     });
     cosJobsWrite(jobs);
@@ -6990,6 +6992,7 @@
     return Promise.resolve({
       confirmed: j.confirmed || [],
       digests: j.digests && typeof j.digests === "object" ? j.digests : null,
+      digest_scheme: typeof j.digest_scheme === "string" ? j.digest_scheme : "",
       account: typeof j.account === "string" ? j.account : "",
     });
   }

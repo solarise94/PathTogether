@@ -268,28 +268,67 @@
   // ---------- 续传内容身份（review 2026-10-07 #1） ----------
   // 分片 SHA-256（WebCrypto，浏览器/Node ≥20 同一全局）；不可用 = 无法
   // 记录/核验内容身份 → 相关记录按 legacy 处理（绝不凭名称/大小续传）。
+  function bytesHex(d) {
+    var bytes = new Uint8Array(d);
+    var out = "";
+    for (var i = 0; i < bytes.length; i++) {
+      out += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
+    }
+    return out;
+  }
+
   function sha256Hex(buf) {
     var subtle = (typeof crypto !== "undefined" && crypto && crypto.subtle)
       ? crypto.subtle : null;
     if (!subtle) return Promise.resolve(null);
-    return subtle.digest("SHA-256", buf).then(function (d) {
-      var bytes = new Uint8Array(d);
-      var out = "";
-      for (var i = 0; i < bytes.length; i++) {
-        out += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
-      }
-      return out;
-    }, function () { return null; });
+    return subtle.digest("SHA-256", buf).then(bytesHex, function () { return null; });
   }
 
-  // slice 读一次：同一 ArrayBuffer 既做 SHA-256 又做 PUT body（有界内存：
-  // 单片大小 × 并发数）。读失败返回 null（调用方退回直接 PUT blob）。
-  function readSliceBuffer(source, offset, length) {
-    return Promise.resolve()
-      .then(function () {
-        return source.slice(offset, offset + length).arrayBuffer();
-      })
-      .then(function (buf) { return buf || null; }, function () { return null; });
+  // 分片摘要方案（有界内存，复核第二轮：4c38ed7f 曾把整个分片读入内存既做
+  // 哈希又做 PUT body——32 MB × 通道数的驻留把渲染器 RSS 顶到 ~0.8 GiB，
+  // 见修复文档内存实测）。PUT body 恢复为 Blob 切片（浏览器从盘流式发送）；
+  // 摘要单独按 DIGEST_CHUNK_BYTES 子块流式读取，分片摘要 =
+  // SHA-256(子块摘要逐字节拼接)。磁盘读两次，同一时刻每通道只有一个子块在
+  // 内存。方案随记录携带 digest_scheme：缺 scheme/其他 scheme 的记录一律按
+  // legacy 处理（弃旧任务、全新上传，绝不凭名称/大小复用）。
+  var DIGEST_SCHEME = "sha256-chunked-4MiB-v1";
+  var DIGEST_CHUNK_BYTES = 4 * 1024 * 1024;
+
+  function sha256HexChunked(blob) {
+    var subtle = (typeof crypto !== "undefined" && crypto && crypto.subtle)
+      ? crypto.subtle : null;
+    if (!subtle || !blob || !(blob.size > 0)) return Promise.resolve(null);
+    var acc = null;          // 子块摘要拼接（每子块 32 B）
+    var offset = 0;
+    function step() {
+      if (offset >= blob.size) {
+        if (!acc) return Promise.resolve(null);
+        return subtle.digest("SHA-256", acc).then(bytesHex,
+          function () { return null; });
+      }
+      var end = Math.min(blob.size, offset + DIGEST_CHUNK_BYTES);
+      var p;
+      try {
+        p = blob.slice(offset, end).arrayBuffer();
+      } catch (e) {
+        p = Promise.reject(e);
+      }
+      return p.then(function (buf) {
+        if (!buf || buf.byteLength !== end - offset) {
+          throw new Error("short read");
+        }
+        return subtle.digest("SHA-256", buf);
+      }).then(function (d) {
+        var nd = new Uint8Array(d);
+        var next = new Uint8Array((acc ? acc.length : 0) + nd.length);
+        if (acc) next.set(acc, 0);
+        next.set(nd, acc ? acc.length : 0);
+        acc = next;
+        offset = end;
+        return step();
+      }, function () { return null; });   // 读失败/哈希失败 → 无摘要（重传）
+    }
+    return step();
   }
 
   function createUpload(opts) {
@@ -385,6 +424,9 @@
         account: account,
         confirmed: confirmedList(),
         digests: confirmedList().length ? digests : {},
+        // 摘要方案标记：无标记/其他方案 = legacy（续传弃旧任务、全新上传）
+        digest_scheme: (confirmedList().length && Object.keys(digests).length)
+          ? DIGEST_SCHEME : "",
         plan: planSnap,
       }, extra || {}));
     }
@@ -461,9 +503,10 @@
         return;
       }
       confirmedMap[n] = etag || "";
-      // review #1：分片 SHA-256 与 PUT 并发计算（同一 ArrayBuffer）——
-      // 确认落地时摘要已就绪，记录写入是同步完整的。hash 失败/不可用 →
-      // 该分块无摘要（续传时按未确认处理，安全重传）。
+      // review #1：分片 SHA-256 与 PUT 并发计算（分片摘要 = 4 MiB 子块摘要
+      // 的 SHA-256 拼接再哈希，见 sha256-chunked-4MiB-v1）——确认落地时摘要
+      // 已就绪，记录写入是同步完整的。hash 失败/不可用 → 该分块无摘要
+      // （续传时按未确认处理，安全重传）。
       if (hex) digestMap[n] = hex;
       totalConfirmed++;
       var len = (planByNum[n] && planByNum[n].length) || 0;
@@ -510,9 +553,11 @@
         return "foreign";
       }
       var confirmed = rec.confirmed || [];
-      // 有确认分块但无任何内容摘要（legacy 记录）：无法证明字节同源 →
+      // 有确认分块但无内容摘要，或摘要方案不符/缺失（legacy 记录——含
+      // 4c38ed7f..改动前无 scheme 标记的整片哈希记录）：无法证明字节同源 →
       // 弃旧任务、全新创建（绝不凭名称/大小复用）
-      if (confirmed.length && !(rec.digests && Object.keys(rec.digests).length)) {
+      if (confirmed.length && !(rec.digests && Object.keys(rec.digests).length &&
+          rec.digest_scheme === DIGEST_SCHEME)) {
         return "discard";
       }
       return "resume";
@@ -545,10 +590,8 @@
           if (bad || stopped) return null;
           var item = planByNum[n];
           if (!item) return null;   // 计划外编号：交由服务端状态裁定
-          return readSliceBuffer(source, item.offset, item.length)
-            .then(function (buf) {
-              return buf ? sha256Hex(buf) : Promise.resolve(null);
-            })
+          // 同一分片摘要方案流式核验（4 MiB 子块；不整片读入内存）
+          return sha256HexChunked(source.slice(item.offset, item.offset + item.length))
             .then(function (hex) {
               if (!hex || hex !== resumeDigests[n]) { bad = bad || n; return; }
               verified[n] = hex;
@@ -749,26 +792,24 @@
           emit({ type: "retry", part: item.part.part_number, attempt: attempt });
         }
         // attempt ID 必须绑定在本次 go() 调用内：闭包若读外层可变量，
-        // 重试后旧 XHR 的迟到回调会拿到新 ID 而绕过失效判定
+        // 重试后旧尝试的迟到回调会拿到新 ID 而绕过失效判定
         var attemptId = registerAttempt(item.part.part_number, item.part.length);
-        // review #1：slice 只读一次——同一 ArrayBuffer 既做 SHA-256 又做
-        // PUT body（有界内存：单片大小 × 并发数；读失败退回直接 PUT blob）。
-        // hash 与 PUT 并发，确认时摘要已定（记录同步完整）。
-        return readSliceBuffer(source, item.part.offset, item.part.length)
-          .then(function (buf) {
-            var body = buf !== null ? buf
-              : source.slice(item.part.offset,
-                             item.part.offset + item.part.length);
-            return Promise.all([
-              buf ? sha256Hex(buf) : Promise.resolve(null),
-              putPart(url, body, abortCtl, function (loaded, computable) {
-                onPartProgress(item.part.part_number, attemptId,
-                               loaded, computable);
-              }, timeouts),
-            ]).then(function (arr) {
-              confirmPart(item.part.part_number, arr[1].etag, attemptId, arr[0]);
-            });
-          })
+        // PUT body = Blob 切片（浏览器从盘流式发送，不整片进内存——复核第
+        // 二轮：整片读入曾把渲染器 RSS 顶到 ~0.8 GiB）。摘要与 PUT 并发：
+        // 磁盘读两次；内存同一时刻每通道只有一个 4 MiB 子块
+        // （sha256-chunked-4MiB-v1）。哈希失败/不可用 → 该分块无摘要
+        // （续传时按未确认处理，安全重传；绝不退回按名称复用）。
+        return Promise.all([
+          sha256HexChunked(
+            source.slice(item.part.offset, item.part.offset + item.part.length)),
+          putPart(url,
+                  source.slice(item.part.offset, item.part.offset + item.part.length),
+                  abortCtl, function (loaded, computable) {
+            onPartProgress(item.part.part_number, attemptId, loaded, computable);
+          }, timeouts),
+        ]).then(function (arr) {
+          confirmPart(item.part.part_number, arr[1].etag, attemptId, arr[0]);
+        })
           .catch(function (err) {
             var retried = stopped || (err && err.name === "AbortError");
             dropAttempt(item.part.part_number, attemptId);
@@ -1147,5 +1188,8 @@
     putPart: putPart,
     contentLockName: contentLockName,
     acquireContentLock: acquireContentLock,
+    // 分片摘要方案（published receipt 的内容凭证核验与引擎同一实现）
+    digestScheme: DIGEST_SCHEME,
+    sha256HexChunked: sha256HexChunked,
   };
 })();

@@ -2868,6 +2868,16 @@ describe("切片页：failed 资产失败原因/来源/时间", () => {
 		// COS 摄取取消：原因 + 来源任务号
 		expect(tbody).toContain("用户已取消上传");
 		expect(tbody).toContain("COS 上传（inj_abc）");
+		// 主状态文字按原因区分，不再一律「处理失败」
+		const stateText = (sid: string) => bus.created
+			.filter((e) => e.tagName === "TD"
+				&& (e as unknown as { getAttribute(n: string): string | null })
+					.getAttribute("data-asset-state") === "failed")
+			.map((e) => e.textContent)
+			.find((t) => t.includes(sid === "sld_bf" ? "源文件缺失" : sid === "sld_cancel" ? "用户已取消上传" : "weird_code"));
+		expect(stateText("sld_bf")!.startsWith("文件缺失")).toBe(true);
+		expect(stateText("sld_cancel")!.startsWith("上传已取消")).toBe(true);
+		expect(stateText("sld_weird")!.startsWith("处理失败")).toBe(true);
 		// 未知码：回显原文；转换来源带任务号；无时间不渲染日期占位
 		expect(tbody).toContain("未知原因（weird_code）");
 		expect(tbody).toContain("KFB 转换（cvj_9）");

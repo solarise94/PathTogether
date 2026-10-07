@@ -3314,8 +3314,15 @@
     }
     if (st === "failed") {
       var detail = slideFailDetailText(item);
+      var fcode = item.failure && item.failure.code;
+      var ftext = "处理失败";
+      if (fcode === "missing_file") ftext = "文件缺失";
+      else if (fcode === "cancelled_by_user"
+               || (item.failure && item.failure.source_state === "cancelled")) {
+        ftext = "上传已取消";
+      }
       return {
-        text: "处理失败", ok: false,
+        text: ftext, ok: false,
         reason: detail
           ? "资产处理失败：" + detail + "；不可读取，不能加入"
           : "资产处理失败，不可读取，不能加入",

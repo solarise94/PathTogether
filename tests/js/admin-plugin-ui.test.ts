@@ -2806,3 +2806,95 @@ describe("切片页：可读名 + 资产状态 + 按 slide_id 操作", () => {
 		expect(req!.env.payload).toEqual({ name: "sld_newA", granted: true });
 	});
 });
+
+// --------------------------------------------------------------------------- //
+// failed 资产的失败证据展示（inventory failure 字段；2026-10-03）：状态列/
+// 加入按钮说明给出「原因（机器码映射中文，未知码回显原文）· 来源任务（族+
+// 任务号）· 时间」；推断证据（回填 missing_file）显式标注；老响应无
+// failure 字段时回退通用文案。加入按钮保持禁用（不可加入语义不变）。
+// --------------------------------------------------------------------------- //
+describe("切片页：failed 资产失败原因/来源/时间", () => {
+	const NONCE = "6f".repeat(32);
+	const TS = 1790000000; // 2026-09-21 22:13:20 GMT+8
+	const items = [
+		// 历史回填：legacy 缺文件（生产 failed 大头）
+		{ name: "gone.svs", slide_id: "sld_bf", original_filename: null, display_name: "",
+			asset_state: "failed", storage_layout: "legacy", file_exists: false, servable: false,
+			owner_user_id: "u1", size_bytes: 0, granted_to_owner: false, grant_recorded: false,
+			failure: { code: "missing_file", inferred: true, source: "backfill",
+				source_state: "failed", source_ref: null, occurred_at: TS } },
+		// COS 摄取被用户取消
+		{ name: "sld_cancel", slide_id: "sld_cancel", original_filename: "c.tif", display_name: "",
+			asset_state: "failed", storage_layout: "id_bundle", file_exists: false, servable: false,
+			owner_user_id: "u1", size_bytes: 0, granted_to_owner: false, grant_recorded: false,
+			failure: { code: "cancelled_by_user", inferred: false, source: "ingestion",
+				source_state: "cancelled", source_ref: "inj_abc", occurred_at: TS } },
+		// 未知码：回显原文不假装翻译；无时间不渲染日期
+		{ name: "sld_weird", slide_id: "sld_weird", original_filename: "w.kfb", display_name: "",
+			asset_state: "failed", storage_layout: "id_bundle", file_exists: false, servable: false,
+			owner_user_id: "u1", size_bytes: 0, granted_to_owner: false, grant_recorded: false,
+			failure: { code: "weird_code", inferred: false, source: "conversion",
+				source_state: "failed", source_ref: "cvj_9", occurred_at: null } },
+		// 老响应无 failure 字段：回退通用文案
+		{ name: "sld_legacyresp", slide_id: "sld_legacyresp", original_filename: "o.tif", display_name: "",
+			asset_state: "failed", storage_layout: "id_bundle", file_exists: false, servable: false,
+			owner_user_id: "u1", size_bytes: 0, granted_to_owner: false, grant_recorded: false },
+	];
+
+	async function bootSlides() {
+		const bus = loadPluginUiWithBus();
+		bus.dispatch(bus.parent, {
+			kind: "init", bridge: "admin", protocolVersion: "1.0.0", nonce: NONCE,
+			adminPermissions: ["admin:overview:read", "admin:slides:read", "admin:slides:write"],
+		});
+		bus.client!.showPage("slides");
+		await ticks(4);
+		replyMethod(bus, NONCE, "admin.slides.inventory", {
+			ok: true, result: { items, next_cursor: null },
+		});
+		await ticks(4);
+		return bus;
+	}
+
+	it("状态列显示处理失败 + 原因/来源/时间明细；未知码回显原文；推断证据标注", async () => {
+		const bus = await bootSlides();
+		const tbody = bus.els["adm-slides-tbody"].textContent;
+		// 回填 missing_file：原因 + 来源 + 推断标注 + 时间
+		expect(tbody).toContain("处理失败");
+		expect(tbody).toContain("源文件缺失");
+		expect(tbody).toContain("回填/迁移盘点");
+		expect(tbody).toContain("依据现状推断");
+		expect(tbody).toContain("2026-09-21 22:13:20 GMT+8");
+		// COS 摄取取消：原因 + 来源任务号
+		expect(tbody).toContain("用户已取消上传");
+		expect(tbody).toContain("COS 上传（inj_abc）");
+		// 主状态文字按原因区分，不再一律「处理失败」
+		const stateText = (sid: string) => bus.created
+			.filter((e) => e.tagName === "TD"
+				&& (e as unknown as { getAttribute(n: string): string | null })
+					.getAttribute("data-asset-state") === "failed")
+			.map((e) => e.textContent)
+			.find((t) => t.includes(sid === "sld_bf" ? "源文件缺失" : sid === "sld_cancel" ? "用户已取消上传" : "weird_code"));
+		expect(stateText("sld_bf")!.startsWith("文件缺失")).toBe(true);
+		expect(stateText("sld_cancel")!.startsWith("上传已取消")).toBe(true);
+		expect(stateText("sld_weird")!.startsWith("处理失败")).toBe(true);
+		// 未知码：回显原文；转换来源带任务号；无时间不渲染日期占位
+		expect(tbody).toContain("未知原因（weird_code）");
+		expect(tbody).toContain("KFB 转换（cvj_9）");
+	});
+
+	it("加入按钮保持禁用；按钮 title 与状态列同源（资产处理失败：原因…）；老响应回退通用文案", async () => {
+		const bus = await bootSlides();
+		const btns = bus.created.filter((e) => e.tagName === "BUTTON");
+		const add = btns.filter((b) => b.textContent === "加入");
+		expect(add).toHaveLength(4);
+		expect(add.every((b) => b.disabled)).toBe(true);
+		const titles = add.map((b) => (b as unknown as { title: string }).title);
+		expect(titles.some((t) => t.startsWith("资产处理失败：源文件缺失"))).toBe(true);
+		expect(titles.some((t) => t.includes("用户已取消上传"))).toBe(true);
+		// 无 failure 字段的老响应：通用文案兜底，不出现「资产处理失败：原因未记录」
+		expect(titles.some((t) => t === "资产处理失败，不可读取，不能加入")).toBe(true);
+		expect(bus.els["adm-slides-tbody"].textContent)
+			.toContain("资产处理失败，不可读取，不能加入");
+	});
+});

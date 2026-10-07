@@ -50,3 +50,4 @@ artifacts/import-project-upgrade-20260914T161016Z/
 .venv-image-review/
 artifacts/**/reference/
 artifacts/**/smoke/
+.gate-tmp/

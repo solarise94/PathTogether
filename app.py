@@ -10492,6 +10492,183 @@ def _admin_v1_resolve_slide(ref):
     return desc
 
 
+# --------------------------------------------------------------------------- #
+# Admin API v1：failed 资产证据溯源（只读，inventory 附带字段）
+#
+# 生产 failed 资产的大头是历史回填（missing_file——legacy 布局、无任务行
+# 绑定，scripts/backfill_slide_asset_state.py / migrate_slide_storage.py 的
+# 证据只留在离线报告里），其余来自任务终态：COS 摄取（ingestion_jobs /
+# ingestion_job_items）、KFB 转换（conversion_jobs）、百度导入
+# （baidu_import_items）、直传任务（upload_tasks / upload_task_items——
+# 现行代码无 failed 写入方，防御性兜底）。本节把「谁、何时、为何把该资产
+# 标记失败」的既有 DB 证据并进 inventory 行：
+#   - 只读查询、零 schema 变更、不新增写路径；
+#   - 只暴露任务侧稳定机器码（fail_code / error_code / 终态）、来源与
+#     时间戳——error_detail_internal、object key、storage_relpath、签名
+#     URL、用户标识一律不出端点（沿用 inventory 既有口径）。
+# 证据优先级（同一 slide_id 只归一个任务族，序仅作确定性兜底）：
+# ingestion 条目 > ingestion 任务 > 转换任务 > 百度条目 > 直传任务；
+# 全部未命中时按布局推断（legacy 且文件缺失 → 回填 missing_file，
+# inferred=True），时间退回 slides.updated_at（mark_failed 的 CAS 即写它）。
+# --------------------------------------------------------------------------- #
+_ADMIN_V1_FAILURE_TASK_TERMINAL = ("failed", "cancelled", "expired")
+
+
+def _admin_v1_slide_failure_provenance(failed_meta):
+    """failed 资产 → {slide_id: failure dict}（只读；查询失败降级为空）。
+
+    ``failed_meta``：inventory 第 1 步的行元数据（需 slide_id /
+    storage_layout / file_exists 键）。failure dict 形如
+    ``{code, inferred, source, source_state, source_ref, occurred_at}``：
+      - code：任务表存储的稳定失败码（无则 None；回填推断时 missing_file
+        且 inferred=True）；
+      - source：ingestion_item / ingestion / conversion / baidu_import /
+        upload_task / upload_task_item / backfill / unknown；
+      - source_state：来源任务终态（failed / cancelled / expired）；
+      - source_ref：来源任务行 id（管理台对账用，同 slide_id 口径的短 id）；
+      - occurred_at：失败时间（epoch 秒；任务终态时间，兜底 slides.updated_at）。
+    """
+    sids = [sid for sid in failed_meta if sid]
+    if not sids:
+        return {}
+    out = {}
+
+    def _put(sid, *, code, source, source_state=None, source_ref=None,
+             occurred_at=None, inferred=False):
+        if sid not in out:
+            out[sid] = {
+                "code": code,
+                "inferred": inferred,
+                "source": source,
+                "source_state": source_state,
+                "source_ref": source_ref,
+                "occurred_at": occurred_at,
+            }
+
+    try:
+        import psycopg.rows
+
+        conn = pg_store.connect()
+        try:
+            conn.row_factory = psycopg.rows.dict_row
+            with conn.cursor() as cur:
+                # 1) ingestion 批量条目（ZIP item：item 级 fail_code 最具体；
+                #    slide_id 全局唯一，一个资产只属一个任务项）
+                cur.execute(
+                    "SELECT slide_id, fail_code, job_id, "
+                    "extract(epoch from updated_at)::float8 AS ts "
+                    "FROM ingestion_job_items "
+                    "WHERE slide_id = ANY(%s) AND state = 'failed'", (sids,))
+                for r in cur.fetchall():
+                    _put(r["slide_id"], code=r["fail_code"],
+                         source="ingestion_item", source_state="failed",
+                         source_ref=r["job_id"], occurred_at=r["ts"])
+                # 2) ingestion 任务（native 单文件：slide_id 直接绑定；
+                #    cancelled/expired 也同事务把 staging 资产收口 failed）
+                cur.execute(
+                    "SELECT slide_id, fail_code, state, job_id, "
+                    "extract(epoch from coalesce(terminal_at, updated_at))"
+                    "::float8 AS ts "
+                    "FROM ingestion_jobs "
+                    "WHERE slide_id = ANY(%s) AND state = ANY(%s)",
+                    (sids, list(_ADMIN_V1_FAILURE_TASK_TERMINAL)))
+                for r in cur.fetchall():
+                    _put(r["slide_id"], code=r["fail_code"],
+                         source="ingestion", source_state=r["state"],
+                         source_ref=r["job_id"], occurred_at=r["ts"])
+                # 3) KFB 转换任务（产物 slide_id 绑定；无 updated_at 列，
+                #    终态时间用 finished_at，兜底心跳）。百度导入发起的转换
+                #    （baidu_import_items.conversion_job_id 关联）来源归并
+                #    baidu_import，避免把百度导入报成独立转换。
+                cur.execute(
+                    "SELECT id, slide_id, error_code, state, "
+                    "extract(epoch from coalesce(finished_at, heartbeat_at))"
+                    "::float8 AS ts "
+                    "FROM conversion_jobs "
+                    "WHERE slide_id = ANY(%s) AND state = ANY(%s)",
+                    (sids, ["failed", "cancelled"]))
+                conv_rows = cur.fetchall()
+                conv_ids = [r["id"] for r in conv_rows]
+                baidu_conv_ids = set()
+                if conv_ids:
+                    cur.execute(
+                        "SELECT DISTINCT conversion_job_id "
+                        "FROM baidu_import_items "
+                        "WHERE conversion_job_id = ANY(%s)", (conv_ids,))
+                    baidu_conv_ids = {r["conversion_job_id"]
+                                      for r in cur.fetchall()}
+                for r in conv_rows:
+                    _put(r["slide_id"], code=r["error_code"],
+                         source=("baidu_import" if r["id"] in baidu_conv_ids
+                                 else "conversion"),
+                         source_state=r["state"], source_ref=r["id"],
+                         occurred_at=r["ts"])
+                # 4) 百度导入条目（native：item 级 slide_id 预分配绑定）
+                cur.execute(
+                    "SELECT slide_id, error_code, stage, id, "
+                    "extract(epoch from updated_at)::float8 AS ts "
+                    "FROM baidu_import_items "
+                    "WHERE slide_id = ANY(%s) AND stage = ANY(%s)",
+                    (sids, ["failed", "cancelled"]))
+                for r in cur.fetchall():
+                    _put(r["slide_id"], code=r["error_code"],
+                         source="baidu_import", source_state=r["stage"],
+                         source_ref=r["id"], occurred_at=r["ts"])
+                # 5/6) 直传任务（单文件 / ZIP 批量条目；无失败码列，仅终态）
+                cur.execute(
+                    "SELECT slide_id, upload_id, state, "
+                    "extract(epoch from updated_at)::float8 AS ts "
+                    "FROM upload_tasks "
+                    "WHERE slide_id = ANY(%s) AND state = ANY(%s)",
+                    (sids, ["failed", "cancelled"]))
+                for r in cur.fetchall():
+                    _put(r["slide_id"], code=None, source="upload_task",
+                         source_state=r["state"], source_ref=r["upload_id"],
+                         occurred_at=r["ts"])
+                cur.execute(
+                    "SELECT i.slide_id, t.upload_id, t.state, "
+                    "extract(epoch from t.updated_at)::float8 AS ts "
+                    "FROM upload_task_items i "
+                    "JOIN upload_tasks t ON t.upload_id = i.task_id "
+                    "WHERE i.slide_id = ANY(%s) AND t.state = ANY(%s)",
+                    (sids, ["failed", "cancelled"]))
+                for r in cur.fetchall():
+                    _put(r["slide_id"], code=None, source="upload_task_item",
+                         source_state=r["state"], source_ref=r["upload_id"],
+                         occurred_at=r["ts"])
+                # 7) 无任务绑定的 failed 行：时间兜底 slides.updated_at；
+                #    legacy 布局 + 文件缺失 → 回填/迁移的 missing_file 推断
+                #    （inferred=True——离线报告才是权威证据，此处只是展示）。
+                rest = [sid for sid in sids if sid not in out]
+                if rest:
+                    cur.execute(
+                        "SELECT slide_id, "
+                        "extract(epoch from updated_at)::float8 AS ts "
+                        "FROM slides WHERE slide_id = ANY(%s)", (rest,))
+                    fallback_ts = {r["slide_id"]: r["ts"]
+                                   for r in cur.fetchall()}
+                    for sid in rest:
+                        meta = failed_meta.get(sid) or {}
+                        if (meta.get("storage_layout") == "legacy"
+                                and not meta.get("file_exists")):
+                            _put(sid, code="missing_file", source="backfill",
+                                 source_state="failed",
+                                 occurred_at=fallback_ts.get(sid),
+                                 inferred=True)
+                        else:
+                            _put(sid, code=None, source="unknown",
+                                 occurred_at=fallback_ts.get(sid))
+        finally:
+            conn.close()
+    except Exception:
+        # 溯源是辅助观测：读失败只降级（UI 回退通用文案），不拖垮清单主体
+        app.logger.warning(
+            "admin v1 slides inventory failed 资产溯源读取失败（降级为不附带"
+            "失败详情）", exc_info=True)
+        return {}
+    return out
+
+
 @app.route("/api/admin/v1/slides/inventory", methods=["GET"])
 def admin_v1_slides_inventory():
     """全量切片清单（管理台唯一「看全部」出口；不含切片图像内容）。
@@ -10503,7 +10680,10 @@ def admin_v1_slides_inventory():
     null）、public、alias、note、archived（归档项目只读保护）、
     granted_to_owner（是否已显式授权给当前 actor-owner）、granted_at，
     另加 slide_id / asset_state / storage_layout / file_exists /
-    original_filename / display_name / format_ext。
+    original_filename / display_name / format_ext；asset_state=failed 的行
+    附 ``failure``（失败证据溯源：code / inferred / source / source_state /
+    source_ref / occurred_at——只读任务表机器码，详见
+    _admin_v1_slide_failure_provenance）。
     按 name 升序 cursor/limit 分页（管理列表禁全量返回的既有口径）。
 
     兼容过渡：盘上无 slides 行的支持格式文件同时以「未注册」形态并入 items
@@ -10585,6 +10765,11 @@ def admin_v1_slides_inventory():
         }
     orphan_files.sort(key=lambda f: f["name"])
 
+    # failed 行的失败证据（任务侧机器码/来源/时间；只读，失败降级为空）
+    failed_meta = {m["slide_id"]: m for m in by_name.values()
+                   if m.get("asset_state") == "failed" and m.get("slide_id")}
+    failures = _admin_v1_slide_failure_provenance(failed_meta)
+
     names = sorted(by_name)
 
     archived = _archived_slide_names()
@@ -10658,6 +10843,12 @@ def admin_v1_slides_inventory():
             "format_ext": meta.get("format_ext"),
             "servable": bool(meta.get("servable")),
         }
+        if meta.get("asset_state") == "failed":
+            # 形态稳定（无证据也落 unknown 档，UI 不必判缺键）
+            item["failure"] = failures.get(meta.get("slide_id")) or {
+                "code": None, "inferred": False, "source": "unknown",
+                "source_state": None, "source_ref": None, "occurred_at": None,
+            }
         if meta.get("unregistered"):
             item["unregistered"] = True
         items.append(item)

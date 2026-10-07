@@ -28,6 +28,7 @@ import { bundleRoute, bundleRows, collectEntryFiles, folderNameFromRelPath }
 import { createUploadController } from './tools-slides-upload.js';
 import { createConvertUploadController } from './tools-slides-convert-upload.js';
 import { createDirectUploadController } from './tools-slides-direct-upload.js';
+import { toolStageText } from './tools-slides-upload.js';
 
 const CHANNEL_JSON_MAX_BYTES = 1 << 20; // 伴随文件读取上限 1 MiB（有界）
 
@@ -90,6 +91,12 @@ const els = {
   directSection: $('direct-section'),
   directUploadBtn: $('direct-upload-btn'),
   directStatus: $('direct-status'),
+  directAssocRetryBtn: $('direct-assoc-retry-btn'),
+  directOpenLink: $('direct-open-link'),
+  directCancelBtn: $('direct-cancel-btn'),
+  directProgress: $('direct-progress'),
+  directBar: $('direct-bar'),
+  directBytes: $('direct-bytes'),
   jobsDetails: $('jobs-details'),
   jobsList: $('jobs-list'),
   pageError: $('page-error'),
@@ -366,7 +373,78 @@ function showDirectReady(file, cls) {
   page.file = file;
   page.directCls = cls || null;
   els.directSection.hidden = false;
+  // review #3/#4/#6：面板每次准备重置（receipt 入口 / 关联重试 / 进度条）
+  if (els.directOpenLink) els.directOpenLink.hidden = true;
+  if (els.directAssocRetryBtn) els.directAssocRetryBtn.hidden = true;
+  if (els.directCancelBtn) els.directCancelBtn.hidden = true;
+  if (els.directProgress) {
+    els.directProgress.hidden = true;
+    setProgress(els.directProgress, els.directBar, els.directBytes, 0, '');
+    els.directBytes.hidden = true;
+  }
   setDirectStatus(null);
+}
+
+/// 直传发布后的入口 UI（review #3/#4）：已发布同文件 → 「打开切片」；
+/// 关联待完成 → 「重试加入项目」。绝不引导重复上传。
+function updateDirectReceiptUi(r) {
+  const slideId = r && r.slideId;
+  if (slideId && els.directOpenLink) {
+    els.directOpenLink.href = '/?slide=' + encodeURIComponent(slideId);
+    els.directOpenLink.hidden = false;
+  }
+  const assocPending = !!(r && (r.assocPending || r.reason === 'association'));
+  if (els.directAssocRetryBtn) els.directAssocRetryBtn.hidden = !assocPending;
+}
+
+/// 直传引擎事件 → 进度条/取消按钮（review #6：复用产物上传的同一套交互，
+/// 不另做只显示成功/失败的面板）
+function onDirectEngineEvent(ev) {
+  if (!els.directProgress) return;
+  if (ev && ev.type === 'progress' && ev.phase === 'uploading') {
+    els.directProgress.hidden = false;
+    if (els.directCancelBtn) els.directCancelBtn.hidden = false;
+    // 与工作台上传行同一词汇（U1 字节级进度：绝不虚构完成）
+    let bytesText = '';
+    if (ev.sentAll) {
+      bytesText = t('upload.cos.sent_all');
+    } else if (ev.determinate !== false && ev.totalBytes > 0) {
+      bytesText = t('upload.cos.bytes', {
+        done: fmtBytes(ev.loadedBytes), total: fmtBytes(ev.totalBytes),
+      });
+    }
+    setProgress(els.directProgress, els.directBar, els.directBytes,
+      ev.determinate === false ? null : ev.frac, bytesText);
+    els.directBytes.hidden = false;
+  } else if (ev && ev.type === 'status' && ev.body) {
+    // 服务端阶段（排队/接收/校验/发布/可查看）——状态文本由 stageText 渲染
+    const txt = toolStageText(t, ev.body);
+    if (txt) setDirectStatusText(txt);
+    if (ev.body.stage !== 'uploading' && els.directCancelBtn) {
+      els.directCancelBtn.hidden = true;
+    }
+  } else if (ev && ev.type === 'retry') {
+    if (els.directBytes) els.directBytes.textContent = t('upload.cos.retrying');
+  }
+}
+
+function setDirectStatusText(text) {
+  directMsg.key = null;
+  directMsg.vars = null;
+  els.directStatus.textContent = text;
+}
+
+/// 「重试加入项目」（review #4/#5）：只做关联（同 slideId、同幂等键），
+/// 成功后控制器才回调 onPublished（全量成功）。
+async function onDirectAssocRetry() {
+  if (!page.directCtl) return;
+  if (els.directAssocRetryBtn) els.directAssocRetryBtn.disabled = true;
+  try {
+    const r = await page.directCtl.retryAssociation();
+    updateDirectReceiptUi(r);
+  } finally {
+    if (els.directAssocRetryBtn) els.directAssocRetryBtn.disabled = false;
+  }
 }
 
 const directMsg = { key: null, vars: null };
@@ -382,12 +460,14 @@ async function onDirectUpload() {
   if (!page.file || !page.directCtl) return;
   els.directUploadBtn.disabled = true;
   try {
-    await page.directCtl.uploadFile(page.file, {
+    const r = await page.directCtl.uploadFile(page.file, {
       cls: page.directCls,
       target: page.convertUploadCtl ? page.convertUploadCtl.handoffTarget() : null,
     });
+    updateDirectReceiptUi(r);
   } finally {
     els.directUploadBtn.disabled = false;
+    if (els.directCancelBtn) els.directCancelBtn.hidden = true;
   }
 }
 
@@ -1691,6 +1771,7 @@ async function init() {
     t,
     onStatus: (text) => { els.directStatus.textContent = text; },
     onPublished: () => { refreshJobs(); },
+    onEngineEvent: onDirectEngineEvent,
   });
   refreshJobs();
 
@@ -1734,6 +1815,13 @@ async function init() {
   // 阶段 1：直传类别文件的「上传到工作台」（点击后才查能力）
   if (els.directUploadBtn) {
     els.directUploadBtn.addEventListener('click', () => { onDirectUpload(); });
+  }
+  // review #4/#5：published receipt 的关联重试；review #6：取消上传
+  if (els.directAssocRetryBtn) {
+    els.directAssocRetryBtn.addEventListener('click', () => { onDirectAssocRetry(); });
+  }
+  if (els.directCancelBtn) {
+    els.directCancelBtn.addEventListener('click', () => { page.directCtl.cancel(); });
   }
   els.uploadCancelBtn.addEventListener('click', () => { page.uploadCtl.cancel(); });
   // 测试/诊断可观测钩子（不承载任何逻辑）

@@ -311,6 +311,8 @@
     function saveRecord(extra) {
       // review #1：记录带账号绑定与分片内容摘要（已核验的续传摘要 +
       // 本次会话确认的摘要）。摘要缺失的分块按未确认语义处理（重传）。
+      // plan 冻结后随记录持久化（分片编号→长度；工具页 published receipt
+      // 靠它对「重新选中的文件」做内容凭证核验）。
       var digests = {};
       var k;
       for (k in resumeDigests) {
@@ -323,11 +325,18 @@
           digests[k] = digestMap[k];
         }
       }
+      var planSnap = null;
+      if (plan) {
+        planSnap = plan.map(function (p) {
+          return { part_number: p.part_number, length: p.length };
+        });
+      }
       return storage.save(Object.assign({
         job_id: jobId, filename: source.name, size: source.size,
         account: account,
         confirmed: confirmedList(),
         digests: confirmedList().length ? digests : {},
+        plan: planSnap,
       }, extra || {}));
     }
 

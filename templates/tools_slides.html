@@ -69,8 +69,18 @@
         <p class="hint" data-i18n="tools.direct.ready.body">该文件是 OME-TIFF / 本机转换工具导出的 BigTIFF——无需转换，可直接上传到工作台。</p>
         <div class="drop-actions">
           <button type="button" id="direct-upload-btn" class="btn btn-primary" data-i18n="tools.upload.btn">上传到工作台</button>
+          <!-- review 2026-10-07 #3/#4：发布后的入口（不重复上传）与关联重试；
+               review #6：上传进度与取消（复用产物上传的同一套交互） -->
+          <button type="button" id="direct-assoc-retry-btn" class="btn btn-secondary" hidden data-i18n="tools.direct.assoc.retry">重试加入项目</button>
+          <a id="direct-open-link" class="btn btn-secondary" hidden data-i18n="tools.direct.open" href="/">打开切片</a>
+          <button type="button" id="direct-cancel-btn" class="btn btn-danger" hidden data-i18n="tools.upload.cancel">取消上传</button>
         </div>
         <p id="direct-status" class="status-panel" role="status" aria-live="polite"></p>
+        <div id="direct-progress" class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100"
+             aria-valuenow="0" data-i18n-aria="tools.upload.progress.aria" aria-label="上传进度" hidden>
+          <div class="progress-bar" id="direct-bar"></div>
+        </div>
+        <p id="direct-bytes" class="progress-bytes" hidden></p>
       </section>
       <p id="input-hint" class="hint" data-i18n="tools.input.file.hint">支持已验证的 KFB（明场）、KFBF（荧光）、Aperio SVS、Leica SCN（明场，JPEG 编码）、Hamamatsu NDPI（明场，带 restart marker 的整层 JPEG）、通用瓦片 JPEG TIFF/BigTIFF（无厂商描述的明场金字塔）与普通图片（未压缩 24/32 位 BMP、基线 JPEG——逐图有界解码后整图重编码，无物理标尺）单文件，以及 Ventana BIF（BigTIFF + iScan 元数据——重叠瓦片按记录位置拼接后重编码，输出尺寸与 OpenSlide 一致），标准 MRXS 完整包（.mrxs 主文件 + 同名数据目录，含 Slidedat.ini、Index.dat、Data*.dat）与 Hamamatsu VMS 完整包（.vms 入口 + 同目录全部 tile JPEG——用「选择文件夹」或拖入整个文件夹）；JPEG 2000 编码的 SVS、荧光/非 JPEG 编码的 SCN、无 restart marker 的 NDPI/VMS tile，VMU（未压缩原始数据），渐进/灰度 JPEG，RLE/位域/调色板位深 BMP，条带存储 / LZW / deflate / 非 8 位 / 多通道的通用 TIFF 变体，以及 JPEG 2000 编码、LEFT/DOWN 拼接走向、多 z 层或无 EncodeInfo 记录的 BIF 变体暂不支持。扩展名只是提示——页面按文件头识别，不支持的其他格式会在复制前被拒绝。</p>
     </section>

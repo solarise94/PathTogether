@@ -64,6 +64,29 @@ function isAuthError(err) {
 
 const TERMINAL_UPLOAD_STATES = ['published', 'failed', 'cancelled'];
 
+/// 服务端阶段 → 工具页文案（直传面板与产物上传共用同一套五段词汇；
+/// review 2026-10-07 #6：直传面板不再只有成功/失败两种文本）。
+export function toolStageText(t, body) {
+  const TOOL_STAGE_KEY = {
+    waiting_space: 'tools.upload.stage.queued',
+    uploading: 'tools.upload.stage.cos',
+    awaiting_server: 'tools.upload.stage.workbench',
+    downloading: 'tools.upload.stage.workbench',
+    validating: 'tools.upload.stage.validate',
+    processing: 'tools.upload.stage.validate',
+    readiness: 'tools.upload.stage.validate',
+    viewable: 'tools.upload.stage.viewable',
+  };
+  if (!body || !body.stage) return '';
+  const key = TOOL_STAGE_KEY[body.stage] || `upload.cos.stage.${body.stage}`;
+  const s = t(key);
+  if (s === key) return String(body.stage || '');
+  if (body.stage === 'waiting_space' && typeof body.queue_position === 'number') {
+    return `${s} · ${t('upload.cos.queue', { n: body.queue_position + 1 })}`;
+  }
+  return s;
+}
+
 /// 服务端结构化错误（{status, data:{error, code, …}}）→ 文案键。只认稳定码
 /// 与 HTTP 状态，绝不把原始对象/响应体拼进文案（[object Object]、内部细节）。
 const STABLE_CODE_RE = /^[a-z][a-z0-9_]{0,63}$/;
@@ -323,14 +346,7 @@ export function createUploadController({
   };
 
   function stageText(body) {
-    if (!body || !body.stage) return '';
-    const key = TOOL_STAGE_KEY[body.stage] || `upload.cos.stage.${body.stage}`;
-    const s = t(key);
-    if (s === key) return String(body.stage || '');
-    if (body.stage === 'waiting_space' && typeof body.queue_position === 'number') {
-      return `${s} · ${t('upload.cos.queue', { n: body.queue_position + 1 })}`;
-    }
-    return s;
+    return toolStageText(t, body);
   }
 
   function handleFailure(err, jobId) {

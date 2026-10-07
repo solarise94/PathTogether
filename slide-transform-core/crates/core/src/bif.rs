@@ -134,14 +134,18 @@ impl BifArea {
         let off = self.y - self.start_row as f64 * advance_y;
         row as f64 * advance_y + off
     }
-    /// Integer paste offset of tile (col,row) (floor of the fractional
-    /// position — the converter's placement; OpenSlide's own rendering
-    /// bilinearly interpolates there, the converter floors deterministically).
+    /// Integer paste offset of tile (col,row) — ROUND to the nearest pixel
+    /// of the fractional position. Deterministic (browser == native), and
+    /// measurably closer to OpenSlide's sub-pixel rendering than floor:
+    /// with the OpenSlide precedence fixed, the zero-reencode ROI error on
+    /// OS-2.bif is 3.77/2.10/4.01 (floor) vs 1.73/1.88/3.69 (round); the
+    /// earlier "round only helps ~15%" claim was measured under the flipped
+    /// precedence and is retracted.
     pub fn tile_x(&self, col: i64, advance_x: f64) -> i64 {
-        self.tile_x_f(col, advance_x).floor() as i64
+        self.tile_x_f(col, advance_x).round() as i64
     }
     pub fn tile_y(&self, row: i64, advance_y: f64) -> i64 {
-        self.tile_y_f(row, advance_y).floor() as i64
+        self.tile_y_f(row, advance_y).round() as i64
     }
 }
 
@@ -424,8 +428,16 @@ fn parse_encode_info(
     let mut tot_wx = 0i64;
     let mut tot_wy = 0i64;
     for ((info, info_body), aoi) in infos.iter().zip(origins.iter()) {
-        if attr_i64(info, "AOIScanned") != Some(1) {
-            continue; // ignored AOI (ventana.c skips them the same way)
+        // ventana.c：AOIScanned 非 0 即扫描（缺属性是其硬错误）；只有
+        // 显式 0 才跳过
+        match attr_i64(info, "AOIScanned") {
+            Some(0) => continue, // ignored AOI (ventana.c skips them the same way)
+            Some(_) => {}
+            None => {
+                return Err(CoreError::metadata(
+                    "ImageInfo 缺少 AOIScanned 属性（OpenSlide 同样要求在场）",
+                ))
+            }
         }
         let start_col = attr_i64(aoi, "OriginX")
             .ok_or_else(|| CoreError::metadata("AoiOrigin 缺少 OriginX"))?;
@@ -454,10 +466,14 @@ fn parse_encode_info(
                 "AOI 瓦片数 {tiles_across}×{tiles_down} 非法"
             )));
         }
+        // Pos 有时写成小数；ventana.c 把 double 存进 int64_t（向零截断）
+        // ——这里在同一位置截断，保证边界盒/落位与其逐位一致
         let x = attr_f64(info, "Pos-X")
-            .ok_or_else(|| CoreError::metadata("ImageInfo 缺少 Pos-X"))?;
+            .ok_or_else(|| CoreError::metadata("ImageInfo 缺少 Pos-X"))?
+            .trunc();
         let y = attr_f64(info, "Pos-Y")
-            .ok_or_else(|| CoreError::metadata("ImageInfo 缺少 Pos-Y"))?;
+            .ok_or_else(|| CoreError::metadata("ImageInfo 缺少 Pos-Y"))?
+            .trunc();
         raw.push(RawArea { start_col: start_col / tile_w, start_row: start_row / tile_h, tiles_across, tiles_down, x, y });
 
         for tj in tag_spans(info_body, "TileJointInfo") {
@@ -834,20 +850,68 @@ pub fn probe_bif_with_budget(src: &dyn ByteSource, budget_bytes: u64) -> CoreRes
     let Some(l0) = levels.first() else {
         return Err(CoreError::variant("BIF 没有任何 level= 层级页"));
     };
-    if levels.len() == 1 {
-        return Err(CoreError::variant(
-            "BIF 只有 level=0 一层（无降采样层）：未知 BIF 变体，拒绝猜测",
-        ));
-    }
+    // 单层（只有 level=0）文件照常接受：输出的全部降采样层由 l0-box2 生
+    // 成，源层从不解码像素（OpenSlide 同样接受单层 BIF）
     let Some(xml) = level0_xml else { unreachable!("level=0 checked above") };
 
     // ---- stitch geometry ------------------------------------------------- //
     let (areas, adv_x, adv_y) =
         parse_encode_info(&xml, l0.tile_w as i64, l0.tile_h as i64)?;
+    let mut seen_charge = 0u64;
+    // 审查（medium）：AOI 网格遍历必须有上限——构造文件（小瓦片 + 大画布
+    // + 大 NumCols/NumRows）可让遍历做 ~1e12 次 HashSet 插入。两条硬界都
+    // 在任何遍历之前：每个 AOI 的网格必须完整落在 canvas 网格内（算术检
+    // 查，不逐格）；AOI 网格总格数 ≤ TileOffsets 实际条目数（每个引用格
+    // 都要有一个真实瓦片，且 (col,row) 不得重复 → 总数严格不超）。
+    {
+        let total_entries = {
+            let l0_ifd0 = &chain[l0.ifd_index as usize];
+            let Some(oe) = l0_ifd0.find(tag::TILE_OFFSETS) else {
+                return Err(CoreError::variant("层级 0 缺少 TileOffsets"));
+            };
+            oe.count
+        };
+        let mut total_cells: u64 = 0;
+        for a in &areas {
+            let end_col = a.start_col.checked_add(a.tiles_across);
+            let end_row = a.start_row.checked_add(a.tiles_down);
+            let (Some(end_col), Some(end_row)) = (end_col, end_row) else {
+                return Err(CoreError::variant("AOI 瓦片数算术溢出：拒绝猜测"));
+            };
+            if a.start_col < 0
+                || a.start_row < 0
+                || end_col as u64 > l0.tiles_across
+                || end_row as u64 > l0.tiles_down
+            {
+                return Err(CoreError::variant(format!(
+                    "AOI 网格 [{},+{})×[{},+{}) 超出 canvas 瓦片网格 {}×{}：损坏的 EncodeInfo",
+                    a.start_col, end_col, a.start_row, end_row, l0.tiles_across, l0.tiles_down
+                )));
+            }
+            total_cells = total_cells
+                .saturating_add((a.tiles_across as u64).saturating_mul(a.tiles_down as u64));
+        }
+        if total_cells > total_entries {
+            return Err(CoreError::variant(format!(
+                "AOI 网格总格数 {total_cells} 超出 TileOffsets 条目数 {total_entries}：\
+                 声明的网格没有对应瓦片，拒绝（遍历前上限）"
+            )));
+        }
+        // HashSet 工作集先计费后分配（review §1；15.3M 格的构造文件是
+        // ~1 GB 的 HashSet——必须在分配前按预算拒绝）
+        seen_charge = total_cells.saturating_mul(16);
+        budget.charge(seen_charge, "AOI 网格去重表")?;
+    }
     // bounding box right/bottom edges over every placed tile
     let mut max_x = f64::NEG_INFINITY;
     let mut max_y = f64::NEG_INFINITY;
     let mut seen: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
+    let seen_cap: u64 = areas
+        .iter()
+        .map(|a| (a.tiles_across.max(0) as u64).saturating_mul(a.tiles_down.max(0) as u64))
+        .fold(0u64, |acc, v| acc.saturating_add(v))
+        .min(1 << 22);
+    seen.reserve(seen_cap as usize);
     let mut tiles_present = 0u64;
     for a in &areas {
         for row in a.start_row..a.start_row + a.tiles_down {
@@ -960,11 +1024,16 @@ pub fn probe_bif_with_budget(src: &dyn ByteSource, budget_bytes: u64) -> CoreRes
 
     let icc = match chain[0].find(tag::ICC) {
         Some(e) if e.value_len().unwrap_or(u64::MAX) <= 4 << 20 => {
+            // ICC 随产物携带（保留在 doc 里直到写出）：先计费后读取
+            let n = e.value_len().unwrap_or(0);
+            budget.charge(n, "ICC profile 读取")?;
             Some(tiff_read::entry_value(src, &hdr, e)?)
         }
         _ => None,
     };
     let generated = crate::gtiff::generated_tail(width as u32, height as u32);
+    drop(seen);
+    budget.release(seen_charge);
     budget.release(iscan_xml.len() as u64);
     budget.release(encode_xml_bytes);
     Ok(BifDoc {

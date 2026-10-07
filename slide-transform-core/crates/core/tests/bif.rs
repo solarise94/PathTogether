@@ -180,14 +180,18 @@ fn reference_compose(p: &BifGenParams) -> Vec<u8> {
             d += 1;
         }
     }
+    // AOI2 的图案偏移与夹具一致（d=100..，与 AOI0 的 1..9 拉开）
+    let mut d2 = 100i64;
     for row in 0..2 {
         for col in 0..2 {
             let (x, y) = fixture_tile_xy(1 + col, 3 + row, (1, 3), (140, a2_y), p);
-            placements.push((3 + row, 1 + col, x, y, d));
-            d += 1;
+            placements.push((3 + row, 1 + col, x, y, d2));
+            d2 += 1;
         }
     }
-    placements.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+    // OpenSlide 的重叠优先级：(row,col) 较大的瓦片最后落笔并胜出
+    // （openslide 4.0.1 实测，OS-2.bif 接缝逐点核对）→ 升序遍历
+    placements.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
     for (_, _, x0, y0, dd) in placements {
         for y in 0..256i64 {
             let ay = y0 + y;
@@ -287,6 +291,25 @@ fn stitched_pixels_match_reference_compose() {
     // q90 source → q96 re-encode on a sawtooth gradient: one generation of
     // high-fidelity loss (measured ≈ 1.4)
     assert!(mean < 4.0, "L0 均值误差 {mean:.3} 超上限");
+    // 重叠带 [140,620)×[632,720)：AOI2（行号更大）按 OpenSlide 优先级胜
+    // 出——夹具把两 AOI 的图案偏移拉开（d 1..9 vs 100..103），优先级翻
+    // 转时该带误差为图案差量级（~14），正确时与整体同量级
+    let mut osum = 0u64;
+    let mut on = 0u64;
+    for y in 632..720usize {
+        for x in 140..620usize {
+            let at = (y * 704 + x) * 3;
+            for c in 0..3 {
+                osum += (got[at + c] as i64 - want[at + c] as i64).unsigned_abs();
+                on += 1;
+            }
+        }
+    }
+    let omean = osum as f64 / on as f64;
+    assert!(
+        omean < 4.0,
+        "重叠带均值误差 {omean:.3} 超上限（优先级与 OpenSlide 相反？）"
+    );
     // uncovered in-bounds zones are BLACK (OpenSlide-transparent gaps)
     // — stitched (0..140, 720..1120) is uncovered
     let at = |x: usize, y: usize| (y * 704 + x) * 3;
@@ -388,6 +411,77 @@ fn strict_lossless_and_fl_refused() {
     )
     .expect_err("fl profile");
     assert!(e.message.contains("荧光"));
+}
+
+// --------------------------------------------------------------------------- //
+// 结构变体：网格炸弹（遍历上限）/ 单层 / AOIScanned 非 0 即扫 / 小数 Pos
+// --------------------------------------------------------------------------- //
+
+#[test]
+fn grid_bomb_rejected_before_traversal() {
+    // ImageInfo 声明 3907×3907 ≈ 15.3M 格（canvas 1e6² 内），但 tile 数组
+    // 只有 15 条——probe 必须在 HashSet 遍历前按「格数 ≤ tile 条目数」上
+    // 限类型化拒绝（修复前：无上限遍历后以稀疏错误收场）
+    let p = BifGenParams { grid_bomb: true, ..Default::default() };
+    let data = gen(&p);
+    let src = MemSource::new(data.clone());
+    let started = std::time::Instant::now();
+    let e = bif::probe_bif(&src).expect_err("grid bomb must be rejected");
+    assert!(
+        started.elapsed().as_secs() < 5,
+        "拒绝必须发生在遍历之前（耗时 {:?}）",
+        started.elapsed()
+    );
+    assert!(e.message.contains("条目"), "message: {}", e.message);
+    // convert 同样拒绝（防御纵深）
+    let e2 = convert(&data, OutputProfile::ClassicJpegBigTiff)
+        .expect_err("grid bomb convert");
+    assert!(e2.message.contains("条目") || e2.message.contains("稀疏"), "msg: {}", e2.message);
+}
+
+#[test]
+fn single_level_file_is_accepted() {
+    // 只有 level=0 一层（OpenSlide 接受；输出降采样层全部由 l0-box2 生成）
+    let p = BifGenParams { single_level: true, ..Default::default() };
+    let data = gen(&p);
+    let src = MemSource::new(data.clone());
+    let doc = bif::probe_bif(&src).expect("probe");
+    assert_eq!(doc.levels.len(), 1);
+    let (r, out) = convert(&data, OutputProfile::ClassicJpegBigTiff).expect("convert");
+    assert_eq!(r.levels.len(), 1 + doc.generated.len());
+    let vsrc = MemSource::new(out.clone());
+    validate_output(&vsrc, out.len() as u64, Some(r.validation.ifd_count)).expect("validate");
+}
+
+#[test]
+fn aoi_scanned_nonzero_means_scanned() {
+    // AOIScanned="2"（非 0 即扫描，与 OpenSlide ventana.c 一致）：几何与
+    // 默认夹具完全相同（修复前 !="1" 会把 AOI2 整个跳掉 → probe 拒绝）
+    let p = BifGenParams { aoi_scanned_alt: true, ..Default::default() };
+    let data = gen(&p);
+    let src = MemSource::new(data.clone());
+    let doc = bif::probe_bif(&src).expect("AOIScanned=2 must be scanned");
+    assert_eq!((doc.width, doc.height), (704, 1120));
+    assert_eq!(doc.areas.len(), 2);
+    assert_eq!(doc.tiles_present, 13);
+}
+
+#[test]
+fn fractional_area_pos_truncates_like_openslide() {
+    // Pos-X="140.9"：OpenSlide 把区域 Pos 读为 double 后存入 int64（截
+    // 断）——尺寸/落位必须与整数 140 完全一致（修复前边界盒用了未截断
+    // 值，宽度会差 1px）
+    let p = BifGenParams { fractional_pos: true, ..Default::default() };
+    let data = gen(&p);
+    let src = MemSource::new(data.clone());
+    let doc = bif::probe_bif(&src).expect("probe");
+    assert_eq!((doc.width, doc.height), (704, 1120), "截断语义：与 Pos=140 相同");
+    // 与整数 Pos 的夹具逐字节等价？图案编码用了截断后的位置 → 是
+    let plain = gen(&BifGenParams::default());
+    let (r1, o1) = convert(&data, OutputProfile::ClassicJpegBigTiff).expect("c1");
+    let (r2, o2) = convert(&plain, OutputProfile::ClassicJpegBigTiff).expect("c2");
+    assert_eq!(r1.width, r2.width);
+    assert_eq!(o1, o2, "截断后应与整数 Pos 的产物逐字节一致");
 }
 
 // --------------------------------------------------------------------------- //

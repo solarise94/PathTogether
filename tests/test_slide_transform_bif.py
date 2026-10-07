@@ -355,24 +355,25 @@ def test_real_sample_l0_mean_error_and_pyramid_geometry(workdir):
     last_w, last_h = dst.level_dimensions[-1]
     assert max(last_w, last_h) <= 256
 
-    # L0 组织 ROI：均值误差上限。误差的主项不是重编码（实测重编码只贡献
-    # ≈0.05），而是整数落位 vs OpenSlide 的亚像素双线性拼接渲染——把源
-    # 瓦片按记录位置原样拼好、不做任何重编码，与 OpenSlide 的差就在
-    # 4.8-9.3（核内核外各半像素的结构错位）；通道均值差仍必须紧贴。
+    # L0 组织 ROI：均值误差上限与 NDPI/VMS 同档（6.0）。重叠优先级与
+    # OpenSlide 一致（(row,col) 较大者胜出），落位取小数位置的最近整数
+    # （round）——实测 2.030/2.109/3.932（修复前优先级翻转时为
+    # 9.378/6.805/5.010）；通道均值差 ≤ 0.26。
     for (x, y, w, h) in REAL_ROIS:
         a = src.read_region((x, y), 0, (w, h)).convert("RGB")
         b = dst.read_region((x, y), 0, (w, h)).convert("RGB")
         d = np.abs(np.asarray(a, dtype=np.int16) - np.asarray(b, dtype=np.int16))
-        assert d.mean() < 12.0, f"ROI ({x},{y}) L0 均值误差 {d.mean():.3f} 超上限"
+        assert d.mean() < 6.0, f"ROI ({x},{y}) L0 均值误差 {d.mean():.3f} 超上限"
         for c in range(3):
             assert abs(np.asarray(a)[..., c].mean() - np.asarray(b)[..., c].mean()) < 4.0
 
-    # 低倍层（l0-box2 生成 vs 扫描仪自己的降采样层）：均值误差上限。
-    # read_region 的坐标是 level-0 坐标、尺寸是目标层坐标（openslide 语
-    # 义）。采样核不同（box 平均 vs 扫描器）+ L0 的落位差向下传播，
-    # 上限取 12（与 VMS 同档；实测 7.5/8.9/10.9）。
+    # 低倍层（l0-box2 生成 vs 扫描仪自己的降采样层）：均值误差上限按
+    # 修复后实测给（余量 13-19%）：层 1 实测 7.100 → 8.0、层 2 实测
+    # 8.581 → 10.0、层 4 实测 10.968 → 13.0。read_region 坐标是 level-0
+    # 坐标、尺寸是目标层坐标（openslide 语义）；深层误差主项是重采样核
+    # 不同（box2 链 vs 扫描仪金字塔），L0 落位的亚像素差向下传播。
     x, y, w, h = 45000, 40000, 8192, 8192
-    for out_level, src_level in ((1, 1), (2, 2), (4, 4)):
+    for out_level, src_level, bound in ((1, 1, 8.0), (2, 2, 10.0), (4, 4, 13.0)):
         scale = 2 ** out_level
         a = src.read_region((x, y), src_level,
                             (w // scale, h // scale)).convert("RGB")
@@ -380,6 +381,6 @@ def test_real_sample_l0_mean_error_and_pyramid_geometry(workdir):
                             (w // scale, h // scale)).convert("RGB")
         assert a.size == b.size
         d = np.abs(np.asarray(a, dtype=np.int16) - np.asarray(b, dtype=np.int16))
-        assert d.mean() < 12.0, (
-            f"输出层 {out_level} vs 源层 {src_level} 均值误差 {d.mean():.3f} 超上限"
+        assert d.mean() < bound, (
+            f"输出层 {out_level} vs 源层 {src_level} 均值误差 {d.mean():.3f} 超上限 {bound}"
         )

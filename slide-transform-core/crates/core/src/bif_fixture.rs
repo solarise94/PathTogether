@@ -49,6 +49,17 @@ pub struct BifGenParams {
     pub classic: bool,
     pub gray: bool,
     pub sparse: bool,
+    /// 变体：ImageInfo 声明远超 tile 数组条目数的网格（canvas 同步拉满
+    /// 以使网格仍在 canvas 内）——probe 必须在遍历前按条目数上限类型化
+    /// 拒绝。
+    pub grid_bomb: bool,
+    /// 变体：只有 level=0 一层（OpenSlide 接受；适配器同样接受）。
+    pub single_level: bool,
+    /// 变体：AOI2 的 AOIScanned 写 "2"（非 0 即扫描，与 OpenSlide 一致；
+    /// 旧代码 !="1" 会把整个区域跳掉）。
+    pub aoi_scanned_alt: bool,
+    /// 变体：AOI2 的 Pos-X 写小数 "140.9"（与 OpenSlide 一致按整数截断）。
+    pub fractional_pos: bool,
     pub quality: u8,
     pub seed: u64,
 }
@@ -66,6 +77,10 @@ impl Default for BifGenParams {
             classic: false,
             gray: false,
             sparse: false,
+            grid_bomb: false,
+            single_level: false,
+            aoi_scanned_alt: false,
+            fractional_pos: false,
             quality: 90,
             seed: 7,
         }
@@ -359,29 +374,52 @@ fn joints_xml(cols: i64, rows: i64, p: &BifGenParams) -> String {
 /// The EncodeInfo stitch XML of the default layout.
 fn encode_info_xml(p: &BifGenParams) -> String {
     let z = if p.z_layers { 3 } else { 1 };
+    // 变体：AOIScanned="2"（非 0 即扫描）；Pos-X 写小数（截断语义）
+    let scanned2 = if p.aoi_scanned_alt { "2" } else { "1" };
+    let a1px: std::borrow::Cow<str> = if p.fractional_pos {
+        format!("{}.9", A2_POS.0).into()
+    } else {
+        A2_POS.0.to_string().into()
+    };
+    // 变体：AOI0 网格炸弹（远超 tile 数组条目数，canvas 同步拉满）；
+    // 炸弹布局不写 TileJointInfo（真实布局只有 3×3 的邻接数据）
+    let (a0_rows, a0_cols) = if p.grid_bomb {
+        (BOMB_GRID, BOMB_GRID)
+    } else {
+        (A0_ROWS, A0_COLS)
+    };
+    let a0_joints = if p.grid_bomb {
+        String::new()
+    } else {
+        joints_xml(A0_COLS, A0_ROWS, p)
+    };
     format!(
         "<?xml version=\"1.0\"?>\n<EncodeInfo Ver='2'>\n\
 <SlideInfo Rack=\"0\" Slot=\"16\" BaseName=\"synthetic-bif\">\n\
 <iScan Magnification='40' ScanRes='0.5000' UnitNumber='FIXTURE' UserName='fixture' BuildVersion='1' Z-layers='{z}' Z-spacing='1'/>\n\
 </SlideInfo>\n\
 <SlideStitchInfo Left=\"-1\" Top=\"-1\" Right=\"-1\" Bottom=\"-1\">\n\
-<ImageInfo AOIScanned=\"1\" Width=\"{T}\" Height=\"{T}\" NumRows=\"{A0_ROWS}\" NumCols=\"{A0_COLS}\" Pos-X=\"{A0PX}\" Pos-Y=\"{A0PY}\">\n{A0J}</ImageInfo>\n\
+<ImageInfo AOIScanned=\"1\" Width=\"{T}\" Height=\"{T}\" NumRows=\"{a0_rows}\" NumCols=\"{a0_cols}\" Pos-X=\"{A0PX}\" Pos-Y=\"{A0PY}\">\n{A0J}</ImageInfo>\n\
 <ImageInfo AOIScanned=\"0\" Width=\"{T}\" Height=\"{T}\" NumRows=\"1\" NumCols=\"1\" Pos-X=\"640\" Pos-Y=\"8\">\n</ImageInfo>\n\
-<ImageInfo AOIScanned=\"1\" Width=\"{T}\" Height=\"{T}\" NumRows=\"{A1_ROWS}\" NumCols=\"{A1_COLS}\" Pos-X=\"{A1PX}\" Pos-Y=\"{A1PY}\">\n{A1J}</ImageInfo>\n\
+<ImageInfo AOIScanned=\"{scanned2}\" Width=\"{T}\" Height=\"{T}\" NumRows=\"{A1_ROWS}\" NumCols=\"{A1_COLS}\" Pos-X=\"{A1PX}\" Pos-Y=\"{A1PY}\">\n{A1J}</ImageInfo>\n\
 </SlideStitchInfo>\n\
 <AoiOrigin>\n<AOI0 OriginX=\"0\" OriginY=\"0\"/>\n<AOI1 OriginX=\"0\" OriginY=\"1024\"/>\n<AOI2 OriginX=\"{A2OX}\" OriginY=\"{A2OY}\"/>\n</AoiOrigin>\n\
 </EncodeInfo>\n",
         T = TILE,
         A0PX = A0_POS.0,
         A0PY = A0_POS.1,
-        A0J = joints_xml(A0_COLS, A0_ROWS, p),
-        A1PX = A2_POS.0,
+        A0J = a0_joints,
+        A1PX = a1px,
         A1PY = A2_POS.1,
         A1J = joints_xml(A1_COLS, A1_ROWS, p),
         A2OX = A2_START.0 * TILE,
         A2OY = A2_START.1 * TILE,
     )
 }
+
+/// 网格炸弹变体的 AOI0 尺寸（3907×3907 ≈ 15.3M 格，canvas 1e6² 时仍在
+/// canvas 网格内；tile 数组只有 15 条——probe 必须在遍历前拒绝）。
+const BOMB_GRID: i64 = 3907;
 
 /// The compact iScan XML of IFD 0 (the vendor sniff input).
 fn iscan_xml(p: &BifGenParams) -> String {
@@ -450,7 +488,11 @@ fn build_image_ifd(
 /// (fixtures are small) and written in one call.
 pub fn build_synthetic_bif(out: &mut dyn RandomAccessSink, p: &BifGenParams) -> CoreResult<u64> {
     let w = W { bigtiff: !p.classic, little: !p.big_endian };
-    let (canvas0_w, canvas0_h) = (3 * TILE, 5 * TILE);
+    let (canvas0_w, canvas0_h) = if p.grid_bomb {
+        (1_000_000i64, 1_000_000)
+    } else {
+        (3 * TILE, 5 * TILE)
+    };
 
     // ---- payloads -------------------------------------------------------- //
     let mut rng = Rng(p.seed);
@@ -508,14 +550,18 @@ pub fn build_synthetic_bif(out: &mut dyn RandomAccessSink, p: &BifGenParams) -> 
             d += 1;
         }
     }
+    // AOI2 的图案偏移与 AOI0 拉开（d=100..）：重叠带（AOI2 行号更大、按
+    // OpenSlide 优先级胜出）内容与 AOI0 明显不同——优先级翻转会在合成
+    // 像素门的重叠带里产生大误差
+    let mut d_a2 = 100i64;
     for row in 0..A1_ROWS {
         for col in 0..A1_COLS {
             let (x, y) = tile_xy(A2_START.0 + col, A2_START.1 + row, A2_START, a2_stitched, p);
-            let j = encode_src_tile(x, y, d, p)?;
+            let j = encode_src_tile(x, y, d_a2, p)?;
             let (_tables, tile) = split_tables(&j)?;
             let at = push(&mut blob, &tile);
             referenced.insert((A2_START.0 + col, A2_START.1 + row), (at, tile.len() as u64));
-            d += 1;
+            d_a2 += 1;
         }
     }
     let tables_bytes = a0_tables.unwrap_or_default();
@@ -548,10 +594,17 @@ pub fn build_synthetic_bif(out: &mut dyn RandomAccessSink, p: &BifGenParams) -> 
         v
     };
     // reduced levels: COMPLETE tile grids (OpenSlide reads them; the
-    // converter itself never decodes them for pixels — l0-box2)
+    // converter itself never decodes them for pixels — l0-box2). The grid
+    // bomb only exercises the probe's pre-traversal bound — its canvas is
+    // huge, so skip the (billion-tile) reduced levels and emit a single
+    // level IFD instead.
+    let skip_reduced = p.single_level || p.grid_bomb;
     let mut red_payloads: Vec<Vec<(u64, u64)>> = Vec::new();
     let mut red_tables: Option<Vec<u8>> = None;
     for (li, &(cw, ch, _mag)) in levels_meta.iter().enumerate() {
+        if skip_reduced {
+            break;
+        }
         let across = (cw + TILE - 1) / TILE;
         let down = (ch + TILE - 1) / TILE;
         let mut tiles = Vec::new();
@@ -632,6 +685,9 @@ pub fn build_synthetic_bif(out: &mut dyn RandomAccessSink, p: &BifGenParams) -> 
             compression,
         ));
         for (li, &(cw, ch, mag)) in levels_meta.iter().enumerate() {
+            if skip_reduced {
+                break;
+            }
             ifd_specs.push((
                 format!("level={} mag={} quality=90", li + 1, mag),
                 cw,

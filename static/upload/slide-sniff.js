@@ -116,16 +116,16 @@
                             ifdBytes.byteLength);
       var entrySize = bigtiff ? 20 : 12;
       // BigTIFF 条目数是 u64：DataView 只有 getBigUint64（BigInt）——曾误
-      // 写 getUint64（不存在），BigTIFF 的 IFD 解析整体落空
-      var count = bigtiff ? Number(dv.getBigUint64(0, true)) : dv.getUint16(0, true);
+      // 写 getUint64（不存在）且硬编码小端，BigTIFF 的 IFD 解析整体落空
+      var count = bigtiff ? Number(dv.getBigUint64(0, little)) : dv.getUint16(0, true);
       if (count > 4096) return null;   // 防御：坏头不猜
       for (var i = 0; i < count; i++) {
         var at = (bigtiff ? 8 : 2) + i * entrySize;
         if (at + entrySize > ifdBytes.byteLength) return null;
-        var t = bigtiff ? dv.getUint16(at, true) : dv.getUint16(at, true);
+        var t = dv.getUint16(at, little);   // tag 按文件字节序（曾硬编码小端）
         if (t !== tag) continue;
         var type = dv.getUint16(at + 2, little);
-        var num = bigtiff ? Number(dv.getBigUint64(at + 4, true))
+        var num = bigtiff ? Number(dv.getBigUint64(at + 4, little))
                           : dv.getUint32(at + 4, little);
         // 值内联在值域字段（≤4/8 字节）或值域字段是偏移
         return { type: type, count: num,
@@ -142,13 +142,25 @@
       if (entry.type === 3) return ifdDv.getUint16(entry.valueAt, little);
       if (entry.type === 4) return ifdDv.getUint32(entry.valueAt, little);
       if (entry.type === 16 || entry.type === 17) {  // LONG8 族（BigTIFF）
-        return ifdDv.getUint32(entry.valueAt, little);
+        // 64 位内联值按文件字节序拼高低 32 位（曾截成低 32 位）
+        var lo = ifdDv.getUint32(entry.valueAt, little);
+        var hi = ifdDv.getUint32(entry.valueAt + 4, little);
+        return little ? lo + hi * 4294967296 : hi + lo * 4294967296;
       }
     } catch (e) { /* */ }
     return 0;
   }
 
-  function descTextAt(ifdBytes, entry, little) {
+  /// 64 位外联偏移（BigTIFF 值域字段 8 字节；经典 TIFF 4 字节）——按文件
+  /// 字节序拼。本工具自己的产物可超 4 GiB，截成 32 位会读到错误位置。
+  function valueOffset64(dv, at, little, bigtiff) {
+    if (!bigtiff) return dv.getUint32(at, little);
+    var lo = dv.getUint32(at, little);
+    var hi = dv.getUint32(at + 4, little);
+    return little ? lo + hi * 4294967296 : hi + lo * 4294967296;
+  }
+
+  function descTextAt(ifdBytes, entry, little, bigtiff) {
     try {
       var dv = new DataView(ifdBytes.buffer, ifdBytes.byteOffset,
                             ifdBytes.byteLength);
@@ -157,7 +169,7 @@
       if (count <= entry.inlineMax) {
         offset = entry.valueAt;
       } else {
-        offset = dv.getUint32(entry.valueAt, little);
+        offset = valueOffset64(dv, entry.valueAt, little, bigtiff);
       }
       return { offset: offset, count: count };
     } catch (e) {
@@ -219,7 +231,7 @@
     var descEntry = findIfdEntry(ifdBytes, little, 270, hdr.bigtiff);
     var text = "";
     if (descEntry) {
-      var loc = descTextAt(ifdBytes, descEntry, little);
+      var loc = descTextAt(ifdBytes, descEntry, little, hdr.bigtiff);
       if (loc && loc.count > 0) {
         var cap = Math.min(loc.count, HEAD_BYTES);
         var raw = readRegion(headBytes, loc.offset, cap, more);
@@ -267,7 +279,7 @@
       var xmpEntry = findIfdEntry(ifdBytes, little, 700, hdr.bigtiff);
       var xmpText = "";
       if (xmpEntry) {
-        var xloc = descTextAt(ifdBytes, xmpEntry, little);
+        var xloc = descTextAt(ifdBytes, xmpEntry, little, hdr.bigtiff);
         if (xloc && xloc.count > 0) {
           var xcap = Math.min(xloc.count, 4096);
           var xraw = readRegion(headBytes, xloc.offset, xcap, more);
@@ -331,7 +343,7 @@
   function ndpiConvertible(headBytes, ifdBytes, idv, little, bigtiff) {
     var make = findIfdEntry(ifdBytes, little, 271, bigtiff);
     if (!make) return false;
-    var makeLoc = descTextAt(ifdBytes, make, little);
+    var makeLoc = descTextAt(ifdBytes, make, little, bigtiff);
     var makeText = "";
     if (makeLoc && makeLoc.count > 0) {
       // Make 值是绝对文件偏移（count > 4 恒为外联），从头缓冲读取
@@ -574,11 +586,11 @@
             // 头窗口——按头字段指向的首 IFD 偏移再补读一段（≤ 96 KiB，
             // 合计仍有界）
             if (routed.bif && head.length >= 16) {
+              // 按文件自身的字节序读首 IFD 偏移（曾硬编码小端）
               var dv0 = new DataView(head.buffer, head.byteOffset, head.byteLength);
-              var isBig = dv0.getUint16(2, true) === 43;
-              var ifdOff0 = isBig
-                ? dv0.getUint32(8, true) + dv0.getUint32(12, true) * 4294967296
-                : dv0.getUint32(4, true);
+              var le0 = head[0] === 0x49 && head[1] === 0x49;
+              var isBig = dv0.getUint16(2, le0) === 43;
+              var ifdOff0 = valueOffset64(dv0, isBig ? 8 : 4, le0, isBig);
               if (ifdOff0 > 0 && ifdOff0 < (file.size || Infinity)) {
                 // 窗口从 IFD 前 64 KiB 起：外联值（描述/XMLPacket）既可能
                 // 排在 IFD 表之后（真实布局），也可能排在前面

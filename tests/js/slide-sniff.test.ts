@@ -257,6 +257,118 @@ describe("slide-sniff：Leica SCN（F4）", () => {
 	});
 });
 
+/** 最小 BigTIFF 构造器（IFD 表 + 外联描述；偏移可指定为 >4 GiB 的稀疏
+ * 位置——用 classifyTiffHead 的 more 注入段直接测 64 位偏移路径）。 */
+function bigTiff(
+	entries: Array<[number, number, number]> = [],
+	description = new Uint8Array(0),
+	opts: { bigEndian?: boolean } = {},
+): Uint8Array {
+	const le = !opts.bigEndian;
+	const u16 = (v: number) => {
+		const b = [(v >> 8) & 0xff, v & 0xff];
+		return le ? [b[1], b[0]] : b;
+	};
+	const u32 = (v: number) => {
+		const b = [(v >>> 24) & 0xff, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff];
+		return le ? [b[3], b[2], b[1], b[0]] : b;
+	};
+	const all = [...entries];
+	if (description.length) all.push([270, 2, 0]);
+	all.sort((a, b) => a[0] - b[0]);
+	const header = new Uint8Array(16);
+	header.set(le ? [0x49, 0x49] : [0x4d, 0x4d], 0);
+	const dvh = new DataView(header.buffer);
+	dvh.setUint16(2, 43, le);
+	dvh.setUint16(4, 8, le);
+	dvh.setUint16(6, 0, le);
+	const ifdSize = 8 + 20 * all.length + 8;
+	const heapOffset = 16 + ifdSize;
+	dvh.setUint32(8, 16, le);                // IFD 表在 16；外联值在其后
+	dvh.setUint32(12, 0, le);
+	const heaps: Uint8Array[] = [];
+	const ifd = new Uint8Array(ifdSize);
+	const dv = new DataView(ifd.buffer);
+	// u64 字段：LE 低字在前、BE 低字在后（值 < 2^32，另一字为 0）
+	const putU64 = (at2: number, v: number) => {
+		dv.setUint32(le ? at2 : at2 + 4, v >>> 0, le);
+		dv.setUint32(le ? at2 + 4 : at2, 0, le);
+	};
+	putU64(0, all.length);
+	let at = 8;
+	for (const [tag, typ] of all) {
+		dv.setUint16(at, tag, le);
+		dv.setUint16(at + 2, typ, le);
+		if (typ === 2 && description.length) {
+			putU64(at + 4, description.length);
+			putU64(at + 12, heapOffset +
+				heaps.reduce((a, b) => a + b.length, 0));
+			heaps.push(description);
+		} else {
+			putU64(at + 4, 1);
+			putU64(at + 12, all.find((e) => e[0] === tag)![2]);
+		}
+		at += 20;
+	}
+	putU64(8 + 20 * all.length, 0); // next IFD = 0
+	const total = 16 + ifdSize + heaps.reduce((a, b) => a + b.length, 0);
+	const out = new Uint8Array(total);
+	out.set(header, 0);
+	out.set(ifd, 16);
+	let pos = 16 + ifdSize;
+	for (const h of heaps) {
+		out.set(h, pos);
+		pos += h.length;
+	}
+	return out;
+}
+
+describe("slide-sniff：BigTIFF 头解析（回归：字节序 + 64 位偏移）", () => {
+	it("BigTIFF + OME-XML 描述 → ome-tiff（小端）", async () => {
+		const r = await S.classifyFile(fakeFile("a.tif", bigTiff([], OME_DESC)));
+		expect(r.cls).toBe("ome-tiff");
+		expect(r.directClass).toBe("ome-tiff");
+	});
+
+	it("大端 BigTIFF + OME-XML 描述 → ome-tiff（偏移按大端拼）", async () => {
+		const r = await S.classifyFile(fakeFile(
+			"a.tif", bigTiff([], OME_DESC, { bigEndian: true })));
+		expect(r.cls).toBe("ome-tiff");
+	});
+
+	it("BigTIFF + 转换器来源标记 → converter-bigtiff", async () => {
+		const r = await S.classifyFile(fakeFile("out.tif", bigTiff([], CONVERTER_DESC)));
+		expect(r.cls).toBe("converter-bigtiff");
+		expect(r.directClass).toBe("converter-bigtiff");
+	});
+
+	it("描述外联偏移 > 4 GiB（本工具产物可超 4 GiB）→ 仍能读到", () => {
+		// 构造小端 BigTIFF：IFD 表在 16，描述值域字段写 64 位偏移
+		// 0x1_0000_0100（> 2^32）；描述本体经 more 段注入该偏移处
+		const descAt = 0x100000100;
+		const entriesIfd = new Uint8Array(8 + 20 + 8);
+		const dv = new DataView(entriesIfd.buffer);
+		dv.setUint32(0, 1, true);
+		dv.setUint16(8, 270, true);
+		dv.setUint16(10, 2, true);
+		dv.setUint32(12, CONVERTER_DESC.length, true);
+		dv.setUint32(20, descAt >>> 0, true);        // 低 32 位
+		dv.setUint32(24, Math.floor(descAt / 2 ** 32), true); // 高 32 位
+		const head = new Uint8Array(16 + entriesIfd.length);
+		const dvh = new DataView(head.buffer);
+		head.set([0x49, 0x49], 0);
+		dvh.setUint16(2, 43, true);
+		dvh.setUint16(4, 8, true);
+		dvh.setUint32(8, 16, true);
+		head.set(entriesIfd, 16);
+		// more 段锚在 descAt 本身（readRegion 只支持按 baseOffset 定位的
+		// 分段注入，不需要垫字节）
+		const more = { bytes: CONVERTER_DESC, baseOffset: descAt };
+		const r = S.classifyTiffHead(head, more, ".tif");
+		expect(r.cls).toBe("converter-bigtiff");
+	});
+});
+
 describe("slide-sniff：TIFF 头解析（手工夹具，≤128KB 预算）", () => {
 	it("ImageDescription 含 OME-XML → ome-tiff + direct_class=ome-tiff", async () => {
 		const bytes = classicTiff([], OME_DESC);

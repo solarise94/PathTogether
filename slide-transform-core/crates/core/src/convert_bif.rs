@@ -15,10 +15,10 @@
 //! `compact-jpeg-v1` composes identically and re-encodes at the locked U3
 //! parameters.
 //!
-//! Overlap precedence mirrors OpenSlide's tilemap paint order exactly: the
-//! grid paints tiles in REVERSE raster order, so the tile with the
-//! smallest (row, col) paints LAST and wins the overlap — this converter
-//! pastes in the same reverse-raster order.
+//! Overlap precedence mirrors OpenSlide's rendering: in the overlap band
+//! the tile with the LARGER (row, col) wins (verified empirically against
+//! openslide 4.0.1 on OS-2.bif seams; see `placements`), so this converter
+//! pastes in ascending raster order — the larger tile lands LAST.
 //!
 //! Reduced output levels are the `l0-box2` chain (the 2×2 area-average of
 //! output level 0, read back from the committed sink): the source's own
@@ -514,21 +514,41 @@ struct Placement {
 }
 
 /// Collect every scanned AOI's tile placement, bounds-checked. Sorted
-/// REVERSE-raster (decreasing (row, col)) — the smallest (row,col) pastes
-/// LAST and wins the overlap, mirroring OpenSlide's tilemap paint order.
+/// ASCENDING (row, col) — the LARGER (row,col) pastes LAST and wins the
+/// overlap. This is OpenSlide's precedence, verified empirically against
+/// openslide 4.0.1 on OS-2.bif seams (whole-ROI zero-reencode error
+/// 9.32/6.70/4.83 under the flipped order vs 3.77/2.10/4.01 under this
+/// one; an earlier revision read grid.c's paint loop the other way round).
 fn placements(
     doc: &BifDoc,
     l0_ifd: &crate::tiff_read::Ifd,
     hdr: &crate::tiff_read::TiffHeader,
     src: &dyn ByteSource,
+    budget: &mut MemBudget,
 ) -> CoreResult<Vec<Placement>> {
     let l0 = &doc.levels[0];
-    let mut out: Vec<Placement> = Vec::new();
+    // 审查（medium）：区间表与位置表先计费后分配（此前在带缓冲计费之
+    // 前分配）；AOI 网格总格数 ≤ TileOffsets 条目数的硬界与 probe 同源
+    // （防御纵深——probe 已拒绝过一遍，这里独立再验）。
     let mut cur = crate::tiff_read::TileCursor::new(src, hdr, l0_ifd)?;
-    let mut pairs: Vec<(u64, u64)> = Vec::with_capacity(cur.total() as usize);
+    let total = cur.total();
+    let cells: u64 = doc
+        .areas
+        .iter()
+        .map(|a| (a.tiles_across.max(0) as u64).saturating_mul(a.tiles_down.max(0) as u64))
+        .fold(0u64, |acc, v| acc.saturating_add(v));
+    if cells > total {
+        return Err(CoreError::variant(format!(
+            "AOI 网格总格数 {cells} 超出 TileOffsets 条目数 {total}：声明的网格没有对应瓦片，拒绝"
+        )));
+    }
+    budget.charge(total.saturating_mul(16), "瓦片区间表（offset/count 对）")?;
+    budget.charge(cells.saturating_mul(64), "拼接位置表（Placement）")?;
+    let mut pairs: Vec<(u64, u64)> = Vec::with_capacity(total.min(1 << 22) as usize);
     while let Some(p) = cur.next_pair_allow_zero()? {
         pairs.push(p);
     }
+    let mut out: Vec<Placement> = Vec::new();
     for a in &doc.areas {
         for row in a.start_row..a.start_row + a.tiles_down {
             for col in a.start_col..a.start_col + a.tiles_across {
@@ -554,7 +574,8 @@ fn placements(
             }
         }
     }
-    out.sort_by(|a, b| (b.row, b.col).cmp(&(a.row, a.col)));
+    // OpenSlide 优先级：(row,col) 较大者最后落笔并胜出（升序遍历）
+    out.sort_by(|a, b| (a.row, a.col).cmp(&(b.row, b.col)));
     Ok(out)
 }
 
@@ -659,10 +680,9 @@ fn convert_inner(
         }
         crate::tiff_read::read_ifd(src, &hdr, ifd)?
     };
-    let mut placements = placements(&doc, &chain_l0, &hdr, src)?;
-    // reverse-raster paste order: DECREASING (row, col) — the smallest
-    // (row,col) pastes LAST and wins the overlap (OpenSlide paint order)
-    placements.sort_by(|a, b| (b.row, b.col).cmp(&(a.row, a.col)));
+    // placements() 返回升序 (row,col) —— (row,col) 较大者最后落笔并胜出
+    // （OpenSlide 优先级；此前这里还有一处逆序重排把它翻回了错误方向）
+    let placements = placements(&doc, &chain_l0, &hdr, src, &mut budget)?;
 
     // ---- working set, charged BEFORE any allocation (review §1) ---------- //
     let band_bytes = (OUT_TILE as u64)
@@ -680,15 +700,6 @@ fn convert_inner(
     // `resource_profile_insufficient` before the allocation).
     budget.charge(band_bytes, "L0 拼接带缓冲（256 行 × 拼接宽 × 3）")?;
     budget.charge(canvas_bytes, "tile 画布与编码缓冲")?;
-    // placements + tile-pair table structural overhead (the per-placement
-    // synthesized header cache is charged per open and released at
-    // exhaustion, like the scanners)
-    budget.charge(
-        (placements.len() as u64)
-            .saturating_mul(72)
-            .saturating_add(1024 * 1024),
-        "拼接位置表与瓦片区间表",
-    )?;
     // the generated-pyramid working set (f² decoded prev tiles + canvases)
     let pyramid_ws = 4u64
         .saturating_mul((OUT_TILE as u64) * (OUT_TILE as u64) * 6)
@@ -992,8 +1003,9 @@ fn paste_rows(
 }
 
 /// L0 composition: for every output tile row, paste every intersecting
-/// placement into the band (reverse-raster precedence — the placements are
-/// pre-sorted), then re-encode the row's 256×256 output tiles. Placement
+/// placement into the band (ascending raster order — the placements are
+/// pre-sorted so the LARGER (row,col) lands last and wins, mirroring
+/// OpenSlide), then re-encode the row's 256×256 output tiles. Placement
 /// scanners stay alive across the bands their tile spans (each tile is
 /// decoded exactly once, top to bottom).
 #[allow(clippy::too_many_arguments)]

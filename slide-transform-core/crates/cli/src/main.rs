@@ -2465,6 +2465,10 @@ fn cmd_gen_bif(args: &[String]) -> Result<String, CoreError> {
             "--classic" => p.classic = true,
             "--gray" => p.gray = true,
             "--sparse" => p.sparse = true,
+            "--grid-bomb" => p.grid_bomb = true,
+            "--single-level" => p.single_level = true,
+            "--aoi-scanned-alt" => p.aoi_scanned_alt = true,
+            "--fractional-pos" => p.fractional_pos = true,
             "--quality" => { i += 1; p.quality = args.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| CoreError::validation("--quality"))?; }
             _ => {
                 if args[i].starts_with('-') && args[i] != "-" {

@@ -47,15 +47,21 @@ class FakeXHR {
 	ontimeout: (() => void) | null = null;
 	setRequestHeader = vi.fn();
 	getResponseHeader = vi.fn((_h: string) => '"etag"');
+	static hold = false;   // true：send 挂起不回（测取消/在途）
 	open(method: string, url: string) { this.method = method; this.url = url; }
 	send(body: unknown) {
 		this.body = body;
 		expect(this.upload.onprogress).toBeTypeOf("function");
 		expect(this.onload).toBeTypeOf("function");
+		if (FakeXHR.hold) return;   // 在途挂起，由测试驱动
 		this.status = 200;
 		if (this.onload) this.onload();
 	}
-	abort() { if (this.onabort) this.onabort(); }
+	abort() {
+		this.aborted = true;
+		if (this.onabort) this.onabort();
+	}
+	aborted = false;
 	progress() { /* 本文件不需要 */ }
 	constructor() { FakeXHR.instances.push(this); }
 }
@@ -165,6 +171,7 @@ function omeTiffFile(bytes: Uint8Array, name = "same.ome.tif") {
 async function setup(opts?: Parameters<typeof fakeBackend>[0], reuseLs?: ReturnType<typeof fakeLocalStorage>) {
 	const ls = reuseLs || fakeLocalStorage();
 	const be = fakeBackend(opts);
+	const engineEvents: Array<Record<string, unknown>> = [];
 	vi.stubGlobal("localStorage", ls);
 	vi.stubGlobal("document", { cookie: "csrf_token=tok" });
 	const w: Record<string, unknown> = {};
@@ -180,8 +187,9 @@ async function setup(opts?: Parameters<typeof fakeBackend>[0], reuseLs?: ReturnT
 			(k + (vars ? JSON.stringify(vars) : "")) as string,
 		onStatus: (s: string) => { statuses.push(s); },
 		onPublished: (id: string) => { published = id; },
+		onEngineEvent: (ev: Record<string, unknown>) => { engineEvents.push(ev); },
 	});
-	return { ctl, be, ls, statuses,
+	return { ctl, be, ls, statuses, engineEvents,
 		publishedId: () => published,
 		receipts: () => JSON.parse(ls.getItem("pt.tools.direct.published") || "[]") as
 			Array<Record<string, unknown>> };
@@ -190,6 +198,7 @@ async function setup(opts?: Parameters<typeof fakeBackend>[0], reuseLs?: ReturnT
 afterEach(() => {
 	vi.unstubAllGlobals();
 	FakeXHR.instances = [];
+	FakeXHR.hold = false;
 });
 
 describe("direct 控制器：published receipt（review #3/#4）", () => {
@@ -326,5 +335,50 @@ describe("direct 控制器：published receipt（review #3/#4）", () => {
 		expect(r.ok).toBe(true);
 		expect(h.publishedId()).toBe("sld_rc1");
 		expect((h.receipts()[0].assoc as { state: string }).state).toBe("ok");
+	});
+});
+
+// --------------------------------------------------------------------------- //
+// review 2026-10-07 #6：直传面板接字节进度与取消（复用产物上传的交互）——
+// 控制器把共享引擎的 progress/status/retry 事件透传给页面（onEngineEvent），
+// cancel() 走引擎取消（abort 在途 XHR + POST /cancel + done cancelled）。
+// --------------------------------------------------------------------------- //
+describe("direct 控制器：进度与取消（review #6）", () => {
+	it("上传过程透传 progress 字节事件（loadedBytes/totalBytes/sentAll）", async () => {
+		const h = await setup();
+		const file = omeTiffFile(new Uint8Array(16).fill(1));
+		const r = await h.ctl.uploadFile(file, {
+			cls: { directClass: "ome-tiff", ext: ".tif" }, target: null,
+		});
+		expect(r.ok).toBe(true);
+		const progress = h.engineEvents.filter((e) => e.type === "progress") as
+			Array<{ phase?: string; loadedBytes?: number; totalBytes?: number;
+				sentAll?: boolean }>;
+		expect(progress.length).toBeGreaterThan(0);
+		expect(progress.some((e) => e.phase === "uploading" &&
+			e.totalBytes === 16)).toBe(true);
+		expect(progress.some((e) => e.loadedBytes === 16)).toBe(true);
+	});
+
+	it("取消：done 以 cancelled 收口、POST /cancel、不再创建第二个 ingestion", async () => {
+		const h = await setup();
+		const file = omeTiffFile(new Uint8Array(16).fill(1));
+		const pending = h.ctl.uploadFile(file, {
+			cls: { directClass: "ome-tiff", ext: ".tif" }, target: null,
+		});
+		FakeXHR.hold = true;   // 两片 PUT 在途挂起
+		for (let i = 0; i < 100 && FakeXHR.instances.length < 2; i++) {
+			await new Promise((r2) => setTimeout(r2, 2));
+		}
+		expect(FakeXHR.instances.length).toBe(2);
+		h.ctl.cancel();
+		const r = await pending;
+		expect((r as { reason?: string }).reason).toBe("cancelled");
+		expect(h.be.st.creates).toHaveLength(1);   // 不新建第二个 ingestion
+		expect(FakeXHR.instances.every((x) => x.aborted)).toBe(true);
+		const urls = h.be.fetchImpl as unknown as vi.Mock;
+		const calls = urls.mock.calls.map((c: unknown[]) => String(c[0]));
+		expect(calls.some((u) => (u as string).endsWith("/cancel"))).toBe(true);
+		FakeXHR.hold = false;
 	});
 });

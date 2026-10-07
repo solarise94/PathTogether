@@ -89,7 +89,10 @@
 
   // ---------- 最小 TIFF 头解析（魔数 + IFD0 + 描述标签） ----------
 
-  // (dv, little) → {ifdOffset}；不合法返回 null
+  // (dv, little) → {ifdOffset}；不合法返回 null。
+  // 64 位偏移一律 DataView.getBigUint64(off, little)（按文件字节序）——曾把
+  // 大端 u64 按“低 32 位在前”拼接（16×2^32 之类），并要求安全整数与上限：
+  // 偏移必须落在文件内才是合法头。
   function readTiffHeader(dv, little) {
     if (dv.byteLength < 8) return null;
     var magic = dv.getUint16(2, little);
@@ -101,7 +104,9 @@
       if (dv.getUint16(4, little) !== 8 || dv.getUint16(6, little) !== 0) {
         return null;
       }
-      ifdOff = dv.getUint32(8, little) + dv.getUint32(12, little) * 4294967296;
+      var big = dv.getBigUint64(8, little);
+      if (big > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+      ifdOff = Number(big);
     } else {
       ifdOff = dv.getUint32(4, little);
     }
@@ -115,9 +120,10 @@
       var dv = new DataView(ifdBytes.buffer, ifdBytes.byteOffset,
                             ifdBytes.byteLength);
       var entrySize = bigtiff ? 20 : 12;
-      // BigTIFF 条目数是 u64：DataView 只有 getBigUint64（BigInt）——曾误
-      // 写 getUint64（不存在）且硬编码小端，BigTIFF 的 IFD 解析整体落空
-      var count = bigtiff ? Number(dv.getBigUint64(0, little)) : dv.getUint16(0, true);
+      // 条目数按文件字节序：BigTIFF 是 u64，经典 TIFF 是 u16（曾对经典
+      // 硬编码 getUint16(0, true)——大端 256 被读成 1，后面的条目全部漏扫）
+      var count = bigtiff ? Number(dv.getBigUint64(0, little))
+                          : dv.getUint16(0, little);
       if (count > 4096) return null;   // 防御：坏头不猜
       for (var i = 0; i < count; i++) {
         var at = (bigtiff ? 8 : 2) + i * entrySize;

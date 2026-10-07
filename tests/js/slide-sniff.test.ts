@@ -284,15 +284,15 @@ function bigTiff(
 	dvh.setUint16(6, 0, le);
 	const ifdSize = 8 + 20 * all.length + 8;
 	const heapOffset = 16 + ifdSize;
-	dvh.setUint32(8, 16, le);                // IFD 表在 16；外联值在其后
-	dvh.setUint32(12, 0, le);
+	// 首 IFD 偏移是 u64：按规范写入（曾按两个 u32 手工拼接，大端夹具写错）
+	dvh.setBigUint64(8, BigInt(16), le);     // IFD 表在 16；外联值在其后
 	const heaps: Uint8Array[] = [];
 	const ifd = new Uint8Array(ifdSize);
 	const dv = new DataView(ifd.buffer);
-	// u64 字段：LE 低字在前、BE 低字在后（值 < 2^32，另一字为 0）
+	// u64 字段：一律按规范写入（setBigUint64 按文件字节序）——曾按“低 32 位
+	// 在前”手工拼接，大端夹具随之写错（回归 review 2026-10-07 #5）
 	const putU64 = (at2: number, v: number) => {
-		dv.setUint32(le ? at2 : at2 + 4, v >>> 0, le);
-		dv.setUint32(le ? at2 + 4 : at2, 0, le);
+		dv.setBigUint64(at2, BigInt(v), le);
 	};
 	putU64(0, all.length);
 	let at = 8;
@@ -323,6 +323,37 @@ function bigTiff(
 	return out;
 }
 
+/** 大端 classic TIFF（n 个条目；ImageDescription 固定在最后一个条目，
+ *  其余用 < 270 的合法 tag 填充——条目按 tag 升序）。 */
+function bigEndianClassicTiff(n: number, description: Uint8Array): Uint8Array {
+	if (n < 1 || n > 4096) throw new Error("entry count out of range");
+	const ifdSize = 2 + 12 * n + 4;
+	const heapOffset = 8 + ifdSize;
+	const out = new Uint8Array(heapOffset + description.length);
+	const dv = new DataView(out.buffer);
+	out.set([0x4d, 0x4d], 0);                       // MM（大端）
+	dv.setUint16(2, 42, false);
+	dv.setUint32(4, 8, false);                      // 首 IFD 在 8
+	dv.setUint16(8, n, false);                      // 条目数按大端写
+	for (let i = 0; i < n; i++) {
+		const at = 10 + i * 12;
+		const isDesc = i === n - 1;
+		const tag = isDesc ? 270 : 10 + i;            // 升序、无重复、均 < 270
+		dv.setUint16(at, tag, false);
+		dv.setUint16(at + 2, isDesc ? 2 : 3, false);  // 2=ASCII / 3=SHORT
+		if (isDesc) {
+			dv.setUint32(at + 4, description.length, false);
+			dv.setUint32(at + 8, heapOffset, false);    // 外联偏移
+		} else {
+			dv.setUint32(at + 4, 1, false);
+			dv.setUint16(at + 8, 1, false);             // SHORT 内联值
+		}
+	}
+	dv.setUint32(10 + n * 12, 0, false);            // next IFD = 0
+	out.set(description, heapOffset);
+	return out;
+}
+
 describe("slide-sniff：BigTIFF 头解析（回归：字节序 + 64 位偏移）", () => {
 	it("BigTIFF + OME-XML 描述 → ome-tiff（小端）", async () => {
 		const r = await S.classifyFile(fakeFile("a.tif", bigTiff([], OME_DESC)));
@@ -334,6 +365,30 @@ describe("slide-sniff：BigTIFF 头解析（回归：字节序 + 64 位偏移）
 		const r = await S.classifyFile(fakeFile(
 			"a.tif", bigTiff([], OME_DESC, { bigEndian: true })));
 		expect(r.cls).toBe("ome-tiff");
+	});
+
+	it("大端 BigTIFF 首 IFD 偏移按规范写 u64（00…10 = 16，非 16×2^32）", async () => {
+		// review 2026-10-07 #5：独立用 DataView.setBigUint64(..., false) 构造
+		// 合法大端头——首 IFD=16 的字节是 00 00 00 00 00 00 00 10；曾被按
+		// “低 32 位在前”拼成 16×2^32 → temporary。
+		const b = bigTiff([], OME_DESC, { bigEndian: true });
+		const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+		expect(dv.getBigUint64(8, false)).toBe(16n);   // 夹具本身必须合法
+		const r = await S.classifyFile(fakeFile("a.tif", b));
+		expect(r.cls).toBe("ome-tiff");
+		expect(r.directClass).toBe("ome-tiff");
+	});
+
+	it("大端 classic TIFF：条目数按文件字节序读取（256 条时不再截成 1）", async () => {
+		// 经典 TIFF 条目数是 u16（`II`=LE / `MM`=BE）。曾硬编码 getUint16(0,
+		// true)：大端 256（字节 01 00）被读成 1 → 只扫第 0 条 → 排在后面的
+		// ImageDescription 丢失 → 误判 temporary。
+		const bytes = bigEndianClassicTiff(256, OME_DESC);
+		const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+		expect(dv.getUint16(8, false)).toBe(256);      // 夹具条目数按 BE 写
+		const r = await S.classifyFile(fakeFile("be-many.tif", bytes));
+		expect(r.cls).toBe("ome-tiff");
+		expect(r.directClass).toBe("ome-tiff");
 	});
 
 	it("BigTIFF + 转换器来源标记 → converter-bigtiff", async () => {

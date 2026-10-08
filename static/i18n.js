@@ -560,6 +560,7 @@
       "register.turnstile.pending": "请先完成下方的安全验证",
       "register.turnstile.unavailable": "安全验证暂时无法加载，请检查网络后重试",
       "register.turnstile.retry": "重试",
+      "register.turnstile.loading": "正在加载安全验证…",
 
       // ---- 注册帮助页（/registration-help；zh 默认值与模板一致） ----
       "reghelp.badge": "注册帮助",
@@ -2080,6 +2081,7 @@
       "register.turnstile.pending": "Please complete the security check below first",
       "register.turnstile.unavailable": "The security check couldn't load. Please check your connection and try again.",
       "register.turnstile.retry": "Retry",
+      "register.turnstile.loading": "Loading security check…",
 
       // ---- Registration help page (/registration-help) ----
       "reghelp.badge": "Registration help",

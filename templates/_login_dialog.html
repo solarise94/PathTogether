@@ -53,33 +53,33 @@
       <div id="register-state" data-state-kind="{{ register_state.kind }}" role="status">
         {% if register_state.kind == 'submitted' %}
         <h2 id="register-dialog-title" data-i18n="register.state.submitted.title">验证邮件请求已提交</h2>
-        <div class="login-dialog-message" data-i18n="register.state.submitted">验证邮件请求已提交。请检查收件箱和垃圾邮件，邮件可能需要几分钟送达。</div>
+        <div class="login-dialog-message login-dialog-message-ok" data-i18n="register.state.submitted">验证邮件请求已提交。请检查收件箱和垃圾邮件，邮件可能需要几分钟送达。</div>
         {% elif register_state.kind == 'cooldown' %}
         <h2 id="register-dialog-title" data-i18n="register.state.cooldown.title">请稍候再试</h2>
-        <div class="login-dialog-message" data-i18n="register.state.cooldown">请求已受理。两次发送请求至少间隔 5 分钟；已发送的验证链接仍然有效，请先检查收件箱和垃圾邮件。</div>
+        <div class="login-dialog-message login-dialog-message-info" data-i18n="register.state.cooldown">请求已受理。两次发送请求至少间隔 5 分钟；已发送的验证链接仍然有效，请先检查收件箱和垃圾邮件。</div>
         {% if register_state.resend_available_at %}<span id="register-resend-countdown" class="login-dialog-countdown" data-resend-at="{{ register_state.resend_available_at }}"></span>{% endif %}
         {% elif register_state.kind == 'resend_submitted' %}
         <h2 id="register-dialog-title" data-i18n="register.state.resend_submitted.title">重发请求已提交</h2>
-        <div class="login-dialog-message" data-i18n="register.state.resend_submitted">重发请求已提交。请使用最新一封邮件中的链接（此前邮件中的链接仍然有效）。</div>
+        <div class="login-dialog-message login-dialog-message-ok" data-i18n="register.state.resend_submitted">重发请求已提交。请使用最新一封邮件中的链接（此前邮件中的链接仍然有效）。</div>
         {% elif register_state.kind == 'new_link' %}
         <h2 id="register-dialog-title" data-i18n="register.state.new_link.title">已重新发送验证邮件</h2>
-        <div class="login-dialog-message" data-i18n="register.state.new_link">原链接即将过期，已签发新的验证邮件。请使用最新邮件中的链接完成注册。</div>
+        <div class="login-dialog-message login-dialog-message-ok" data-i18n="register.state.new_link">原链接即将过期，已签发新的验证邮件。请使用最新邮件中的链接完成注册。</div>
         {% elif register_state.kind == 'processing' %}
         <h2 id="register-dialog-title" data-i18n="register.state.processing.title">邮件正在处理</h2>
-        <div class="login-dialog-message" data-i18n="register.state.processing">验证邮件正在处理，请稍候；稍后仍可联系作者。</div>
+        <div class="login-dialog-message login-dialog-message-info" data-i18n="register.state.processing">验证邮件正在处理，请稍候；稍后仍可联系作者。</div>
         {% elif register_state.kind == 'limit' %}
         <h2 id="register-dialog-title" data-i18n="register.state.limit.title">发送次数已达上限</h2>
-        <div class="login-dialog-message" data-i18n="register.state.limit">为避免重复发送，验证邮件发送次数已达上限；已发送的验证链接在有效期内仍可完成注册。可给作者发邮件协助排查。</div>
+        <div class="login-dialog-message login-dialog-message-warn" data-i18n="register.state.limit">为避免重复发送，验证邮件发送次数已达上限；已发送的验证链接在有效期内仍可完成注册。可给作者发邮件协助排查。</div>
         {% if register_state.resume_at %}<span id="register-resume-countdown" class="login-dialog-countdown" data-resume-at="{{ register_state.resume_at }}"></span>{% endif %}
         {% elif register_state.kind == 'challenge_failed' %}
         <h2 id="register-dialog-title" data-i18n="register.state.challenge_failed.title">安全验证未完成</h2>
-        <div class="login-dialog-message" data-i18n="register.state.challenge_failed">安全验证未完成，本次未发送验证邮件。请重新完成验证后再试。</div>
+        <div class="login-dialog-message login-dialog-message-warn" data-i18n="register.state.challenge_failed">安全验证未完成，本次未发送验证邮件。请重新完成验证后再试。</div>
         {% elif register_state.kind == 'challenge_unavailable' %}
         <h2 id="register-dialog-title" data-i18n="register.state.challenge_unavailable.title">验证服务暂时不可用</h2>
-        <div class="login-dialog-message" data-i18n="register.state.challenge_unavailable">安全验证服务暂时不可用，本次未发送验证邮件。请稍后重试，或给作者发邮件。</div>
+        <div class="login-dialog-message login-dialog-message-warn" data-i18n="register.state.challenge_unavailable">安全验证服务暂时不可用，本次未发送验证邮件。请稍后重试，或给作者发邮件。</div>
         {% else %}
         <h2 id="register-dialog-title" data-i18n="register.state.unavailable.title">暂时无法发送验证邮件</h2>
-        <div class="login-dialog-message" data-i18n="register.state.unavailable">暂时无法发送验证邮件，请稍后重试；给你带来的不便请联系作者协助排查。</div>
+        <div class="login-dialog-message login-dialog-message-warn" data-i18n="register.state.unavailable">暂时无法发送验证邮件，请稍后重试；给你带来的不便请联系作者协助排查。</div>
         {% endif %}
         {% if register_state.kind in ('resend_submitted', 'new_link') %}
         {# §5：重发后仍未解决的主要出路——求助链接在此态强调（见下方链接区） #}
@@ -108,7 +108,7 @@
       {% elif register_done %}
       {# 兼容旧上下文（无 register_state 的 done 渲染）：中性提交态文案 #}
       <h2 id="register-dialog-title" data-i18n="register.state.submitted.title">验证邮件请求已提交</h2>
-      <div class="login-dialog-message" role="status" data-i18n="register.state.submitted">验证邮件请求已提交。请检查收件箱和垃圾邮件，邮件可能需要几分钟送达。</div>
+      <div class="login-dialog-message login-dialog-message-ok" role="status" data-i18n="register.state.submitted">验证邮件请求已提交。请检查收件箱和垃圾邮件，邮件可能需要几分钟送达。</div>
       <div class="login-dialog-links">
         <a href="/register" data-auth-nav data-i18n="register.dialog.again">重新填写邮箱</a>
         <a href="/login" data-auth-switch="login" data-i18n="register.dialog.have_account">已有账号？登录</a>

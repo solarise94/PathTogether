@@ -1007,10 +1007,27 @@ body.login-dialog-open { overflow: hidden; }
   border-radius: 10px;
   font-size: 13px;
 }
+/* 基调=中性（信息框）；成功/提示/警示用语气变体（2026-10-08 设计 §5：
+   绿色只表示「已受理/已发送」类成功态，绝不用于受限/失败态） */
 .login-dialog-message {
+  background: var(--bg-deep);
+  border: 1px solid var(--line-strong);
+  color: var(--text-2);
+}
+.login-dialog-message-ok {
   background: rgba(52, 199, 89, 0.12);
-  border: 1px solid rgba(52, 199, 89, 0.35);
+  border-color: rgba(52, 199, 89, 0.35);
   color: #7ddc9a;
+}
+.login-dialog-message-info {
+  background: rgba(10, 132, 255, 0.10);
+  border-color: rgba(10, 132, 255, 0.32);
+  color: #9ecbff;
+}
+.login-dialog-message-warn {
+  background: rgba(255, 159, 10, 0.12);
+  border-color: rgba(255, 159, 10, 0.38);
+  color: #ffc46b;
 }
 .login-dialog-error {
   background: rgba(255, 69, 58, 0.12);
@@ -1116,13 +1133,20 @@ body.login-dialog-open { overflow: hidden; }
 }
 
 /* ---- 注册防刷状态 UX（2026-10-08 设计 §5/§7）---- */
-/* Cloudflare Turnstile 容器：flexible 尺寸随弹窗宽度自适应（375px 不溢出） */
+/* Cloudflare Turnstile 容器：不预留高度（未渲染时收起——重发倒计时中/加载
+   中只显示占位小字）；flexible 尺寸随弹窗宽度自适应（375px 不溢出） */
 #register-turnstile {
   width: 100%;
-  min-height: 65px;
   margin-top: 14px;
 }
 #register-turnstile iframe { max-width: 100%; }
+/* 渲染前占位（中性小字；渲染成功/失败后移除或让位于提示） */
+.register-turnstile-placeholder {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-3);
+}
 /* 就地提示（token 未就绪 / 挑战加载失败）：中性措辞，绝不说「机器人」 */
 .register-turnstile-notice {
   margin-top: 10px;

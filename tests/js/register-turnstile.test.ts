@@ -14,7 +14,7 @@
  *     widget（token 5 分钟过期），归零恢复按钮并渲染；
  *   - limit 恢复时间显示为本地时间。
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,6 +22,36 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const src = readFileSync(
 	resolve(here, "../../static/register-turnstile.js"), "utf8");
+
+/* ---- 可控时钟：Date.now 可跳进（模拟后台标签页节流后回前台） ---- */
+const REAL_DATE_NOW = Date.now.bind(Date);
+const clock = { now: 1_700_000_000_000 }; // 固定起点（ms）
+beforeEach(() => {
+	clock.now = 1_700_000_000_000;
+	Date.now = () => clock.now;
+});
+afterEach(() => {
+	Date.now = REAL_DATE_NOW;
+});
+const advanceSeconds = (s: number) => {
+	clock.now += s * 1000;
+};
+/** 与被测源码同口径的期望时间格式（zh/en Intl） */
+function expectResumeTime(atSec: number, lang: "zh" | "en"): string {
+	const d = new Date(atSec * 1000);
+	const locale = lang === "en" ? "en" : "zh-CN";
+	const time = new Intl.DateTimeFormat(locale, {
+		hour: "2-digit", minute: "2-digit",
+	}).format(d);
+	const now = new Date();
+	const sameDay = d.getFullYear() === now.getFullYear() &&
+		d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+	if (sameDay) return time;
+	const date = new Intl.DateTimeFormat(locale, {
+		month: "short", day: "numeric",
+	}).format(d);
+	return `${date} ${time}`;
+}
 
 /* ---------------- 最小 fake DOM（够 register-turnstile.js 用） ---------------- */
 
@@ -206,6 +236,7 @@ function makeWindow(lang: string) {
 		"register.turnstile.pending": "请先完成下方的安全验证",
 		"register.turnstile.unavailable": "安全验证暂时无法加载，请检查网络后重试",
 		"register.turnstile.retry": "重试",
+		"register.turnstile.loading": "正在加载安全验证…",
 		"register.help.link": "注册遇到问题？给作者发邮件",
 		"register.state.resend.wait": "{time} 后可重新发送",
 		"register.state.limit.resume": "预计 {time}（本地时间）后可再次自助发送",
@@ -517,14 +548,17 @@ describe("register-turnstile（注册弹窗 Turnstile 按需加载器）", () =>
 		expect(input.value).toBe("zh");
 	});
 
-	it("submitted/cooldown 态（重发表单 + 倒计时中）：不提前渲染重发 widget；按钮禁用并显示倒计时；归零恢复并渲染", async () => {
+	it("submitted/cooldown 倒计时：禁用 + 「X:YY 后可重新发送」；后台节流（tick 少、时钟跳进）仍按真实时钟恢复", async () => {
 		const ts = mockTurnstile();
 		const ctx = setupRegister({
-			turnstile: ts, resendAt: Math.floor(Date.now() / 1000) + 90,
+			turnstile: ts, resendAt: Math.floor(clock.now / 1000) + 90,
 		});
 		await flush();
-		// 倒计时未结束：widget 未渲染（token 5 分钟过期，等按钮可用再渲染）
+		// 倒计时未结束：widget 未渲染（token 5 分钟过期，等按钮可用再渲染），
+		// 容器收起、无占位（不预留高度）
 		expect(ts.calls.some((c) => c[0] === "render")).toBe(false);
+		expect(ctx.d.root.querySelector(".register-turnstile-placeholder"))
+			.toBeNull();
 		const btn = ctx.resendBtn!;
 		expect(btn.disabled).toBe(true);
 		expect(btn.textContent).toContain("1:30");
@@ -532,26 +566,87 @@ describe("register-turnstile（注册弹窗 Turnstile 按需加载器）", () =>
 		// cooldown 态的 span 同步显示
 		const span = ctx.d.byId.get("register-resend-countdown")!;
 		expect(span.textContent).toContain("1:30");
-		// 走 95 个 tick → 归零：恢复按钮文案 + 渲染重发 widget
-		ctx.w.runTimers(95);
-		await flush(); // finish() → onRegisterShown → loadApi.then(render) 微任务
+		// 后台 60s：定时器被节流只跑了 1 个 tick——剩余时间按真实时钟重算
+		advanceSeconds(60);
+		ctx.w.runTimers(1);
+		expect(btn.disabled).toBe(true);
+		expect(btn.textContent).toContain("0:30");
+		// 再过 31s 回前台（visibilitychange）：立即校正 → 恢复按钮 + 渲染重发 widget
+		advanceSeconds(31);
+		ctx.d.emit("visibilitychange", {});
 		expect(btn.disabled).toBe(false);
 		expect(btn.textContent).toBe("重新发送验证邮件");
 		expect(span.textContent).toBe("");
+		await flush();
 		const renderCall = ts.calls.find((c) => c[0] === "render")!;
 		const params = renderCall[3] as Record<string, unknown>;
 		expect(params.action).toBe("registration_resend");
+		// 渲染后占位撤除
+		expect(ctx.d.root.querySelector(".register-turnstile-placeholder"))
+			.toBeNull();
 	});
 
-	it("limit 态：#register-resume-countdown 显示本地恢复时间（中性措辞）", () => {
-		const at = Math.floor(Date.now() / 1000) + 3600;
-		const ctx = setupRegister({ resumeAt: at });
+	it("form 容器：渲染前显示中性占位「正在加载安全验证…」，渲染成功后移除", async () => {
+		const ctx = setupRegister({ turnstile: null });
+		await flush(); // 脚本已注入、尚未 onload → 加载中
+		const ph = ctx.d.root.querySelector(".register-turnstile-placeholder");
+		expect(ph).toBeTruthy();
+		expect(ph!.textContent).toContain("正在加载安全验证");
+		expect(ctx.d.root.textContent).not.toContain("机器人");
+		// 渲染成功 → 占位移除
+		succeedScriptLoad(ctx.d, ctx.w, mockTurnstile());
+		await flush();
+		expect(ctx.d.root.querySelector(".register-turnstile-placeholder"))
+			.toBeNull();
+	});
+
+	it("加载失败：占位让位于不可用提示；重试先恢复占位", async () => {
+		const ctx = setupRegister({ turnstile: null });
+		await flush();
+		expect(ctx.d.root.querySelector(".register-turnstile-placeholder"))
+			.toBeTruthy();
+		ctx.d.head.children[0].onerror!();
+		await flush();
+		expect(ctx.d.root.querySelector(".register-turnstile-placeholder"))
+			.toBeNull(); // 占位撤除
+		expect(ctx.d.root.querySelector(".register-turnstile-notice"))
+			.toBeTruthy(); // 不可用提示在场
+		// 重试：先恢复占位（清除失败态），脚本再失败仍回到提示
+		const retryBtn = ctx.d.root
+			.querySelector("button.register-turnstile-retry")!;
+		retryBtn.emit("click");
+		expect(ctx.d.root.querySelector(".register-turnstile-placeholder"))
+			.toBeTruthy();
+	});
+
+	it("limit 恢复时间：当天只显示 HH:MM；非当天带日期（Intl 跟随 UI 语言）", () => {
+		// 固定本地正午，避免跨日边界
+		const noon = new Date(REAL_DATE_NOW());
+		noon.setHours(12, 0, 0, 0);
+		clock.now = noon.getTime();
+		const baseSec = Math.floor(clock.now / 1000);
+		const ctxSame = setupRegister({ resumeAt: baseSec + 60 });
+		const sameText = ctxSame.d.byId.get("register-resume-countdown")!.textContent;
+		expect(sameText).toContain(expectResumeTime(baseSec + 60, "zh"));
+		const d = new Date((baseSec + 48 * 3600) * 1000);
+		const zhShort = new Intl.DateTimeFormat("zh-CN", {
+			month: "short", day: "numeric",
+		}).format(d);
+		expect(sameText).not.toContain(zhShort); // 当天不带日期
+
+		const ctxFar = setupRegister({ resumeAt: baseSec + 48 * 3600 });
+		const farText = ctxFar.d.byId.get("register-resume-countdown")!.textContent;
+		expect(farText).toContain(zhShort); // 非当天带日期（如 “10月9日”）
+		expect(farText).toContain(expectResumeTime(baseSec + 48 * 3600, "zh"));
+	});
+
+	it("limit 恢复时间在 hp-lang-change 后按新语言重渲染（en 带英文日期）", () => {
+		const baseSec = Math.floor(clock.now / 1000);
+		const ctx = setupRegister({ lang: "zh", resumeAt: baseSec + 48 * 3600 });
 		const span = ctx.d.byId.get("register-resume-countdown")!;
-		const expectTime = new Date(at * 1000);
-		const hh = String(expectTime.getHours()).padStart(2, "0");
-		const mm = String(expectTime.getMinutes()).padStart(2, "0");
-		expect(span.textContent).toContain(`${hh}:${mm}`);
-		expect(span.textContent).toContain("本地时间");
-		expect(span.textContent).not.toContain("机器人");
+		expect(span.textContent).toContain(expectResumeTime(baseSec + 48 * 3600, "zh"));
+		(ctx.w.win.HP_I18N as { getLang: () => string }).getLang = () => "en";
+		ctx.d.emit("hp-lang-change", {});
+		expect(span.textContent).toContain(expectResumeTime(baseSec + 48 * 3600, "en"));
 	});
 });

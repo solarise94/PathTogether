@@ -21,9 +21,15 @@
  *    同步为当前 UI 语言（仅 zh|en；服务端仍按白名单兜底）。
  *  - 倒计时（仅展示；服务端权威）：#register-resend-countdown 与
  *    #register-resend-form[data-resend-at] 的「X:YY 后可重新发送」，归零前
- *    禁用重发按钮；重发 widget 归零可用时才渲染（token 5 分钟过期，早渲染
- *    会在可提交前失效）。#register-resume-countdown[data-resume-at] 显示
- *    恢复自助发送的本地时间。
+ *    禁用重发按钮。剩余时间每 tick 按 Date.now 重算（后台标签页节流定时器
+ *    也不会落后于服务端），visibilitychange / pageshow 回前台立即校正；
+ *    重发 widget 归零可用时才渲染（token 5 分钟过期，早渲染会在可提交前
+ *    失效），倒计时未结束前容器收起、不预留高度。
+ *    #register-resume-countdown[data-resume-at] 显示恢复自助发送的本地时间
+ *    （非当天带日期，跟随 UI 语言，hp-lang-change 重渲染）。
+ *  - 渲染前占位：表单容器在 widget 渲染成功前显示一行中性小字
+ *    「正在加载安全验证…」（不预留 widget 高度）；渲染成功/失败让位于
+ *    widget 本体或不可用提示。
  *
  * 本文件不含任何内联事件/内联样式（CSP style-src/script-src 'self'）。
  */
@@ -40,7 +46,8 @@
     widgetId: null,      // turnstile.render 返回的 widget id
     container: null,     // 当前 widget 渲染进的容器元素
     token: '',           // 最近一次 callback 的 token（提交护栏用）
-    noticeEl: null       // 就地提示元素（.register-turnstile-notice）
+    noticeEl: null,      // 就地提示元素（.register-turnstile-notice）
+    placeholderEl: null  // 渲染前占位元素（.register-turnstile-placeholder）
   };
 
   /* ---------------- i18n 小工具（缺 HP_I18N 时用模板同款中文兜底） -------- */
@@ -117,18 +124,19 @@
     return state.loadPromise;
   }
 
-  /* ---------------- 就地提示（中性措辞；绝不说「机器人」） ---------------- */
+/* ---------------- 就地提示（中性措辞；绝不说「机器人」） ---------------- */
 
-  function removeNotice() {
-    if (state.noticeEl && state.noticeEl.parentNode &&
-        typeof state.noticeEl.parentNode.removeChild === 'function') {
-      state.noticeEl.parentNode.removeChild(state.noticeEl);
-    }
-    state.noticeEl = null;
+function removeNotice() {
+  if (state.noticeEl && state.noticeEl.parentNode &&
+      typeof state.noticeEl.parentNode.removeChild === 'function') {
+    state.noticeEl.parentNode.removeChild(state.noticeEl);
   }
+  state.noticeEl = null;
+}
 
-  function showNotice(box, message, withRetry) {
-    var n = state.noticeEl;
+function showNotice(box, message, withRetry) {
+  removePlaceholder(); // 提示与占位不并存
+  var n = state.noticeEl;
     if (!n || n.parentNode !== box.parentNode) {
       removeNotice();
       n = document.createElement('div');
@@ -174,6 +182,34 @@
       t('register.turnstile.pending', '请先完成下方的安全验证'), false);
   }
 
+  /* ---------------- 渲染前占位（小号中性一行；不预留 widget 高度） ---------- */
+
+  function removePlaceholder() {
+    if (state.placeholderEl && state.placeholderEl.parentNode &&
+        typeof state.placeholderEl.parentNode.removeChild === 'function') {
+      state.placeholderEl.parentNode.removeChild(state.placeholderEl);
+    }
+    state.placeholderEl = null;
+  }
+
+  function showPlaceholder(box) {
+    if (state.placeholderEl &&
+        state.placeholderEl.parentNode === box.parentNode) {
+      return; // 已显示
+    }
+    removePlaceholder();
+    var n = document.createElement('div');
+    n.className = 'register-turnstile-placeholder';
+    n.setAttribute('role', 'status');
+    n.textContent = t('register.turnstile.loading', '正在加载安全验证…');
+    if (box.parentNode && box.parentNode.insertBefore) {
+      box.parentNode.insertBefore(n, box.nextSibling);
+    } else if (box.parentNode) {
+      box.parentNode.appendChild(n);
+    }
+    state.placeholderEl = n;
+  }
+
   /* ---------------- 渲染 / 重置 ---------------- */
 
   function disposeWidget() {
@@ -211,21 +247,24 @@
       callback: function (token) {
         state.token = String(token || '');
         removeNotice();
+        removePlaceholder();
       },
       'expired-callback': function () { resetWidget(); },
       'timeout-callback': function () { resetWidget(); },
       'error-callback': function () {
         resetWidget();
+        removePlaceholder();
         showUnavailable(box);
         return true; // 抑制 turnstile 向 console 抛未处理错误
       }
     });
     state.container = box;
+    removePlaceholder(); // 渲染成功：撤掉占位，widget 取自然尺寸
   }
 
   /* 重发表单倒计时未结束：暂不渲染重发 widget（token 5 分钟过期，等按钮
-     可用再渲染，避免用户还没能提交挑战就已失效）。状态由
-     startResendCountdown 设置/清除（与按钮启用一致，不做时钟二次推断）。 */
+     可用再渲染，避免用户还没能提交挑战就已失效）。容器不占位、无预留高度。
+     状态由 startResendCountdown 设置/清除（与按钮启用一致）。 */
   var resendWaitActive = false;
 
   function resendFormPending() {
@@ -235,18 +274,20 @@
   function onRegisterShown() {
     var box = container();
     if (!box || !registerPaneVisible()) return;
-    if (resendFormPending()) return; // 倒计时归零后由 startResendCountdown 渲染
+    if (resendWaitActive) return; // 倒计时中：容器收起，无占位无渲染
     if (state.loadFailed) { showUnavailable(box); return; }
+    if (state.widgetId != null && state.container === box) {
+      resetWidget(); // 重新显示：token 可能已过期/被消费，重置拿新挑战
+      return;
+    }
+    showPlaceholder(box);
     loadApi(false).then(function () {
       var current = container();
       if (!current || !registerPaneVisible()) return;
-      if (state.widgetId != null && state.container === current) {
-        resetWidget(); // 重新显示：token 可能已过期/被消费，重置拿新挑战
-      } else {
-        render(current); // 容器被替换或首次显示（重新）渲染
-      }
+      render(current);
     }).catch(function () {
       state.loadFailed = true;
+      removePlaceholder();
       var current = container();
       if (current) showUnavailable(current);
     });
@@ -255,8 +296,10 @@
   function retryLoad() {
     var box = container();
     removeNotice();
+    removePlaceholder();
     state.loadFailed = false;
     if (!box) return;
+    showPlaceholder(box);
     loadApi(true).then(function () {
       var current = container();
       if (current && registerPaneVisible()) {
@@ -265,6 +308,7 @@
       }
     }).catch(function () {
       state.loadFailed = true;
+      removePlaceholder();
       var current = container();
       if (current) showUnavailable(current);
     });
@@ -295,6 +339,13 @@
 
   /* ---------------- 倒计时（仅展示；服务端权威） ------------------------- */
 
+  var resendAt = 0;            // 重发可用时间（unix 秒）
+  var resendSpan = null;       // cooldown 态的倒计时 span
+  var resendBtn = null;        // 重发表单提交按钮
+  var resendBox = null;        // 重发表单内的 widget 容器
+  var resendOriginalLabel = '';
+  var resendTickPending = false;
+
   function pad2(n) { return (n < 10 ? '0' : '') + n; }
 
   function formatClock(totalSeconds) {
@@ -305,41 +356,55 @@
   function startResendCountdown() {
     var span = document.getElementById('register-resend-countdown');
     var form = document.getElementById('register-resend-form');
-    var at = parseInt((span && span.getAttribute('data-resend-at')) ||
+    resendAt = parseInt((span && span.getAttribute('data-resend-at')) ||
       (form && form.getAttribute('data-resend-at')) || '0', 10);
-    if (!at) return;
-    var btn = (form && form.querySelector) ?
+    if (!resendAt) return;
+    resendSpan = span;
+    resendBtn = (form && form.querySelector) ?
       form.querySelector('button[type="submit"]') : null;
-    var box = (form && form.querySelector) ?
+    resendBox = (form && form.querySelector) ?
       form.querySelector('#register-turnstile') : null;
-    var originalLabel = btn ? btn.textContent : '';
-    var left = Math.max(0, at - nowSeconds());
-    resendWaitActive = left > 0;
+    resendOriginalLabel = resendBtn ? resendBtn.textContent : '';
+    resendWaitActive = resendAt > nowSeconds();
+    tickResend();
+  }
 
-    function finish() {
-      resendWaitActive = false;
-      if (span) span.textContent = '';
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = originalLabel;
-      }
-      // 按钮可用时才渲染重发 widget（token 5 分钟有效）
-      if (box && registerPaneVisible()) onRegisterShown();
+  /* 每次按真实时钟重算剩余秒数：后台标签页会节流 setTimeout（切去邮件
+     客户端等场景），递减计数会落后于服务端要求；重算保证回到前台/任意
+     延迟的 tick 都显示并恢复到与服务器一致的状态。visibilitychange /
+     pageshow 再补一次立即刷新。 */
+  function tickResend() {
+    if (!resendWaitActive) return;
+    var left = Math.max(0, resendAt - nowSeconds());
+    if (left <= 0) { finishResend(); return; }
+    var label = t('register.state.resend.wait', '{time} 后可重新发送')
+      .replace('{time}', formatClock(left));
+    if (resendSpan) resendSpan.textContent = label;
+    if (resendBtn) {
+      resendBtn.disabled = true;
+      resendBtn.textContent = label;
     }
+    scheduleResendTick();
+  }
 
-    function tick() {
-      if (left <= 0) { finish(); return; }
-      var label = t('register.state.resend.wait', '{time} 后可重新发送')
-        .replace('{time}', formatClock(left));
-      if (span) span.textContent = label;
-      if (btn) {
-        btn.disabled = true;
-        btn.textContent = label;
-      }
-      left -= 1;
-      window.setTimeout(tick, 1000);
+  function scheduleResendTick() {
+    if (resendTickPending || !resendWaitActive) return;
+    resendTickPending = true;
+    window.setTimeout(function () {
+      resendTickPending = false;
+      tickResend();
+    }, 1000);
+  }
+
+  function finishResend() {
+    resendWaitActive = false;
+    if (resendSpan) resendSpan.textContent = '';
+    if (resendBtn) {
+      resendBtn.disabled = false;
+      resendBtn.textContent = resendOriginalLabel;
     }
-    tick();
+    // 按钮可用时才渲染重发 widget（token 5 分钟有效）
+    if (resendBox && registerPaneVisible()) onRegisterShown();
   }
 
   function startResumeNote() {
@@ -347,11 +412,32 @@
     if (!span) return;
     var at = parseInt(span.getAttribute('data-resume-at') || '0', 10);
     if (!at) return;
-    var d = new Date(at * 1000);
-    var time = pad2(d.getHours()) + ':' + pad2(d.getMinutes());
     span.textContent =
       t('register.state.limit.resume', '预计 {time}（本地时间）后可再次自助发送')
-        .replace('{time}', time);
+        .replace('{time}', formatResumeTime(at));
+  }
+
+  /* 恢复时间展示：当天只显示 HH:MM；非当天补充日期（跟随 UI 语言的
+     Intl 格式，如 “10月9日 12:35” / “Oct 9, 12:35”）。 */
+  function formatResumeTime(atSeconds) {
+    var d = new Date(atSeconds * 1000);
+    var locale = uiLang() === 'en' ? 'en' : 'zh-CN';
+    var time = formatIntl(d, locale, { hour: '2-digit', minute: '2-digit' });
+    var now = new Date();
+    var sameDay = d.getFullYear() === now.getFullYear() &&
+      d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+    if (sameDay) return time;
+    var date = formatIntl(d, locale, { month: 'short', day: 'numeric' });
+    return date + ' ' + time;
+  }
+
+  function formatIntl(d, locale, opts) {
+    try {
+      return new Intl.DateTimeFormat(locale, opts).format(d);
+    } catch (e) {
+      // 无 Intl 的环境退回本地时间 HH:MM（日期不补，避免硬编码错格式）
+      return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+    }
   }
 
   /* ---------------- 初始化 ---------------- */
@@ -367,7 +453,23 @@
       // bfcache 恢复：token/挑战可能早已失效
       resetWidget();
     }
+    // bfcache 恢复后计时器状态未知：立即按真实时钟校正倒计时
+    if (resendWaitActive) tickResend();
     if (registerPaneVisible()) onRegisterShown();
+  }
+
+  function onVisibilityChange() {
+    // 后台标签页定时器被节流：回前台立即按真实时钟校正一次
+    if (resendWaitActive) tickResend();
+  }
+
+  function onLangChange() {
+    syncFormLocales();
+    startResumeNote(); // 恢复时间格式跟随 UI 语言
+    if (state.placeholderEl) {
+      state.placeholderEl.textContent =
+        t('register.turnstile.loading', '正在加载安全验证…');
+    }
   }
 
   function init() {
@@ -375,9 +477,8 @@
     document.addEventListener('submit', onDocumentSubmitCapture, true);
     document.addEventListener('hp-auth-view', onViewEvent);
     window.addEventListener('pageshow', onPageShow);
-    document.addEventListener('hp-lang-change', function () {
-      syncFormLocales();
-    });
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    document.addEventListener('hp-lang-change', onLangChange);
     syncFormLocales();
     startResendCountdown();
     startResumeNote();

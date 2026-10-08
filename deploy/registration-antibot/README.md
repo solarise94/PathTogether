@@ -6,6 +6,8 @@
 发布目录：homepc `/home/solarise/releases/suite-20261008-registration`，权限 0700。
 公开配置在 `deploy.py` 的 `EXTRA_ENV` 中；secret 仅从该目录的 `turnstile.secret.env` 读取，权限必须为 0600。目录内 env、数据库快照和容器配置均属于私有发布记录，不进 Git，不打印内容。
 
+`build.py FULL_GIT_REVISION` 先确认运行镜像和基础镜像 ID，再核对 `requirements.txt` 完全一致，以已验证生产镜像为基础执行原 Containerfile 的所有 COPY/ENV/CMD。使用 `--pull=never`，复用同一套生产依赖，避免本次发布重新解析依赖或因 PyPI 下载波动失败。依赖清单变化时拒绝该构建方式。
+
 当前 widget 的控制台配置已由用户确认：托管模式、允许 `.cn` 与 `.com`。控制台额外允许的 localhost/旧域名不加入服务器生产 hostname 白名单。
 
 ## 安全存入密钥

@@ -86,3 +86,10 @@ check ok: CheckViolation                    # account_kind 非法值被拒
 门禁（admin-viewer @ f27794f3，主代理独立执行）：pytest 全量 2928 passed / 113 skipped / 0 failed；vitest 967 passed / 2 skipped；Playwright 全部 80 passed / 0 failed（原先 5 个基线失败已由测试债清理恢复为有效用例）；仓库内不再有预期失败标记。
 
 注意：`add_roi` 的成员判定改走 `share_slides` 后，从未回填 `share_slides` 的旧分享写入会被拒——与读路径现状一致（读路径早已只认 `share_slides`）。
+
+## 8. 第三轮复核（2026-10-09）
+
+- 分页换页时，新页首张切片仍按 28px 条带计价（换页前算的 `cost` 未重算），短侧栏下第二页溢出（200px 可用、实占 272px）。修复：换页后按整卡 104px 重算。审查方回归补丁原样入库。
+- 由此暴露的深链问题：`/app?slide=<id>` 打开的切片不保证在侧栏当前叠（此前靠首页溢出「碰巧」可见，全量 E2E 中前序用例多传切片时失败）。修复：深链在列表加载后调用与搜索相同的 `fbLocateSlide`，补 vitest 回归。两条新回归在修复前均失败。
+- pytest 计数：全量命令带 `--ignore=tests/test_e2e_pg_reap.py --ignore=tests/e2e`，前者正好 3 项（收集 3044 = 3041 + 3）；已单独执行 `tests/test_e2e_pg_reap.py`：3 passed。本轮只改前端，Python 全量结果不变。
+- 门禁：vitest 969 passed / 2 skipped；Playwright 全部 80 passed，连续两次。

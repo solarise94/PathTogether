@@ -134,7 +134,7 @@ interface FbUI {
 
 type Seedable = { routes: Map<string, () => RouteResult>; hang: Set<string>; laggy: Map<string, (out: RouteResult) => void> };
 
-function bootApp(seed?: (s: Seedable) => void) {
+function bootApp(seed?: (s: Seedable) => void, opts: { search?: string } = {}) {
 	const els: Record<string, BootEl> = {};
 	const docListeners: Record<string, Array<(e?: unknown) => void>> = {};
 	const calls: Array<{ url: string; opts?: { method?: string; headers?: Record<string, string>; body?: string } }> = [];
@@ -219,7 +219,7 @@ function bootApp(seed?: (s: Seedable) => void) {
 			addListener() {},
 		}),
 		fetch: fetchImpl,
-		location: { href: "http://local/", pathname: "/" },
+		location: { href: "http://local/" + (opts.search || ""), pathname: "/", search: opts.search || "" },
 		innerWidth: 1920,
 		innerHeight: 900,
 		requestAnimationFrame: (cb: () => void) => {
@@ -653,4 +653,25 @@ describe("临时查看到期（§5.5）", () => {
 		expect(h.closes()).toBe(openSlideCount);
 		expect(h.UI.viewerState.slide).toBeNull(); // 本就没有打开切片
 	});
+});
+
+// Short/landscape sidebar: every page must respect the same visible height.
+it("换页后首张切片按完整卡高计入，第二页不超出 200px", async () => {
+    const h = bootApp(seedNone);
+    await flush();
+    h.els["fb-stack"].clientHeight = 200;
+    h.UI.fb.go(null, 1);
+    const cards = fbHits(h);
+    expect(cards.length).toBeGreaterThan(0);
+    const bottom = Math.max(...cards.map(card =>
+        parseFloat(card.style.top) + parseFloat(card.style.height)));
+    expect(bottom).toBeLessThanOrEqual(200);
+});
+
+// 深链 /app?slide=<id>：侧栏翻到该切片所在的叠（与搜索定位同一函数）
+it("深链打开的切片在侧栏所在叠可见", async () => {
+	const h = bootApp(seedNone, { search: "?slide=sld_l11" });
+	h.els["fb-stack"].clientHeight = 200;
+	await flush(20);
+	expect(fbHits(h).some((c) => c.dataset.slideId === "sld_l11")).toBe(true);
 });

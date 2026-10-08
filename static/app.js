@@ -2824,16 +2824,20 @@
     var cur = [];
     var curH = 0;
     var slides = 0;
-    for (var i = 0; i < items.length; i++) {
-      var it = items[i];
-      var cost = it.kind === "folder"
+    function costOf(it) {
+      return it.kind === "folder"
         ? FB_FOLDER_H + FB_FOLDER_GAP
         : (slides === 0 ? FB_CARD_H : FB_MIN_GAP);
+    }
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      var cost = costOf(it);
       if (cur.length >= FB_MAX_PAGE || (cur.length > 0 && curH + cost > availH)) {
         pages.push(cur);
         cur = [];
         curH = 0;
         slides = 0;
+        cost = costOf(it); // 新页首张切片按整卡高计
       }
       cur.push(it);
       curH += cost;
@@ -10563,20 +10567,29 @@
     // 升级 A：启动时无切片，显示空态入口（openSlide 成功后隐藏）
     updateViewerEmptyState();
     updateCanvasSlideLabel();
-    loadAll();
+    var listLoaded = loadAll();
     // P2 合同 §5.1：?slide=<slide_id> URL 通道——加载时若带此参数打开对应切片
     // （与 /s/<token>、/login?next= 无语义冲突；旧链接无此参数不受影响）。
     // 旧后端（slide_id_api=false）该参数按名回落打开。
-    openSlideFromLocation();
+    openSlideFromLocation(listLoaded);
   }
 
-  function openSlideFromLocation() {
+  function openSlideFromLocation(listLoaded) {
     var m = null;
     try { m = location.search.match(/[?&]slide=([^&]+)/); } catch (e) { return; }
     if (!m) return;
     var ref = decodeURIComponent(m[1]);
     if (!ref) return;
     openSlide(ref);
+    // 侧栏翻到深链切片所在的文件夹与叠（与搜索定位同一函数）
+    if (listLoaded && listLoaded.then) {
+      listLoaded.then(function () {
+        for (var i = 0; i < allSlides.length; i++) {
+          var s = allSlides[i];
+          if (slideRefOf(s) === ref || s.name === ref) { fbLocateSlide(s); return; }
+        }
+      });
+    }
   }
 
   if (document.readyState === "loading") {

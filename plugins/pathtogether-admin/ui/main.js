@@ -66,7 +66,7 @@
        注册模式收敛为 closed/public，只在设置页）；
      - 用户页 = 四列主表（用户/加入时间/最近登录/分类）+ 分类筛选
        （默认正式用户）与排序下拉；切筛选/排序即重置游标重取；行内
-       「标为测试/改为正式」走 admin.users.setAccountKind；启停/AI 权限/
+       「标为 Dogfood/改为正式」走 admin.users.setAccountKind；启停/AI 权限/
        重置密码/预览/总额度等既有操作全部保留在「详情」抽屉；
      - 切片页 = 用户上传清单（切片/上传者、加入时间、管理员临时查看、
        操作）：临时查看五态（未开启/已结束/可查看·剩余 N 分钟/本人切片/
@@ -1275,7 +1275,7 @@
   // ------------------------------------------------------------------
   // 用户主表（2026-10-08 §2）：四列 = 用户（显示名+邮箱）/ 加入时间 /
   // 最近登录 / 分类。额度、启用状态、掩码登录账号等低频字段收进「详情」
-  // 抽屉；行内动作 = 分类切换（标为测试/改为正式）+ 详情。
+  // 抽屉；行内动作 = 分类切换（标为 Dogfood/改为正式）+ 详情。
   // ------------------------------------------------------------------
   function renderUsers(items, append) {
     var tbody = $("adm-users-tbody");
@@ -1309,7 +1309,7 @@
       var kindActions = document.createElement("div");
       kindActions.className = "adm-kind-actions";
       kindActions.appendChild(actionBtn(
-        u.account_kind === "dogfood" ? "改为正式" : "标为测试",
+        u.account_kind === "dogfood" ? "改为正式" : "标为 Dogfood",
         function () { setUserAccountKind(u); }, "secondary"));
       var detailBtn = actionBtn("详情", function () {
         openUserDrawer(u, detailBtn);

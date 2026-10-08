@@ -599,13 +599,19 @@ def test_admin_manifest_v1_1_validates():
     data = json.loads(ADMIN_MANIFEST.read_text(encoding="utf-8"))
     assert M.validate_manifest(data) == []
     assert M.check_manifest_schema_supported(data["manifestSchemaVersion"]) is True
-    # wave 2（2026-09-03，review-2026-09-02-upload-user-limits-admin-ui-cleanup.md
-    # Batch C5-6/D1）：manifest adminPermissions 删除 turn read / billing write /
-    # acquisition read；SDK 词表同步删除（含早已无 manifest 消费者的
-    # turn-budgets:write 死枚举），断言改为「精确等于新 11 项词表」
-    assert set(data["adminPermissions"]) == set(M.MANIFEST_ADMIN_PERMISSIONS)
+    # wave 2（2026-09-03）：manifest adminPermissions 删除 turn read /
+    # billing write / acquisition read。2026-10-08（admin-viewer-simplified
+    # §4/§6）：邀请页退役——admin.invites.* 桥方法整行删除，manifest 同步
+    # 移除 admin:invites:read/write（SDK 词表 plugins/sdk/manifest.py 保留
+    # 这两个枚举值——非本线文件；manifest 是其真子集，校验器允许）。
+    # 期望集合 = SDK 词表 − 邀请两项 = 11 项。
+    expected_perms = (set(M.MANIFEST_ADMIN_PERMISSIONS)
+                      - {"admin:invites:read", "admin:invites:write"})
+    assert set(data["adminPermissions"]) == expected_perms
+    assert len(data["adminPermissions"]) == 11
     for retired in ("admin:turn-budgets:read", "admin:turn-budgets:write",
-                    "admin:billing:write", "admin:acquisition:read"):
+                    "admin:billing:write", "admin:acquisition:read",
+                    "admin:invites:read", "admin:invites:write"):
         assert retired not in data["adminPermissions"]
     # 站点访问 / Demo 周统计复用 admin:overview:read（不新增权限域）
     assert "admin:overview:read" in data["adminPermissions"]

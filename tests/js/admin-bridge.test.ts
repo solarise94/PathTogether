@@ -885,10 +885,11 @@ describe("AdminBridge host — wave 2 只读聚合（Demo 周统计 / 站点访�
 
 describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () => {
 	const ALL_WRITE = [
-		"admin:users:write", "admin:invites:read", "admin:invites:write",
+		"admin:users:write",
 		// 批次 F：turn-budgets:write 已从桥上移除（服务端 410）；runtime 写
 		// 走 admin:settings:write。wave 2：billing:write 已随人工调账/caps
-		// 退役一并删除
+		// 退役一并删除。2026-10-08：invites:read/write 已从 manifest 词表
+		// 移除（邀请页退役），不再作为授权能力出现
 		"admin:settings:write",
 	];
 
@@ -1974,7 +1975,9 @@ describe("AdminBridge host — wave 2：users/invites 总额度字段过桥（Ba
 		// 一并消失）；总额度调整唯一出口 = admin.spend.userTotalLimit.set。
 		const calls: Array<{ url: string; method?: string }> = [];
 		const { handle, posted, contentWindow } = makeHost({
-			permissions: ["admin:invites:write"], // 权限仍在 manifest 词表（no-op）
+			// 合成场景：即使该能力被（错误地）授予，也稳定 unknown_method
+			//（manifest 已不再申请 admin:invites:write）
+			permissions: ["admin:invites:write"],
 			fetchJson: async (url, o) => {
 				calls.push({
 					url, method: (o as { method?: string } | undefined)?.method,

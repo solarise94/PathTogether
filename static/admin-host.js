@@ -77,11 +77,11 @@
      - 新增 admin.viewer.open {slide_id}（admin:slides:read）：只读宿主
        方法——不经任何 HTTP，宿主侧 window.open('/?slide=<id>', '_blank',
        'noopener')（iframe 不能也不应直接导航宿主）。slide_id 由 schema
-       pattern ^sld_[A-Za-z0-9_-]+$ 与宿主侧二次校验双重约束。
-       注：admin:invites:read/write 仍是 manifest adminPermissions 词表
-       （plugins/sdk/manifest.py，本线不改）的合法值——KNOWN_PERMISSIONS
-       继续接受它们（无方法消费、纯 no-op 授权），否则 bootstrap 会对
-       现 manifest 的 permissions 数组抛「未知值」使宿主整体不可用。
+       pattern ^sld_[A-Za-z0-9_-]+$ 与宿主侧二次校验双重约束；
+     - manifest adminPermissions 同步移除 admin:invites:read/write
+       （plugins/sdk/manifest.py 的 SDK 词表保留这两个枚举值——非本线文件；
+       manifest 是它的子集，校验器允许），KNOWN_PERMISSIONS 随之不再
+       含邀请权限：bootstrap 只接受现 manifest 声明的 11 项。
    ========================================================================= */
 (function () {
   "use strict";
@@ -124,9 +124,8 @@
     // 执行（见 METHOD_BACKENDS 与 create() 的 hostActions）。
     "admin.viewer.open": "admin:slides:read",
     // 2026-10-08：admin.invites.list/create/revoke 整行删除（邀请页退役，
-    // 注册只剩 closed/public）——已删方法不在本表 → 稳定 unknown_method。
-    // admin:invites:read/write 权限词本身仍被 KNOWN_PERMISSIONS 接受
-    //（见 2026-10-08 文件头注释：与 SDK 词表同源，纯 no-op 授权）。
+    // 注册只剩 closed/public）——已删方法不在本表 → 稳定 unknown_method；
+    // manifest adminPermissions 已同步移除 admin:invites:read/write。
     // 2026-09-03 wave 2（review-2026-09-02-upload-user-limits-admin-ui-cleanup.md
     // §4/Batch C5-6/D1）：误导性桥方法整行删除——turn 冻结历史（turn-budgets:read）、
     // billing account 读取/caps 写入/人工调账（billing:write）、用户归因
@@ -552,14 +551,6 @@
     var set = {};
     Object.keys(METHOD_PERMISSIONS).forEach(function (m) {
       set[METHOD_PERMISSIONS[m]] = true;
-    });
-    // 2026-10-08：邀请页退役后桥上不再有 admin.invites.* 方法，但
-    // admin:invites:read/write 仍是 manifest adminPermissions 词表
-    //（plugins/sdk/manifest.py MANIFEST_ADMIN_PERMISSIONS，本线不改）的
-    // 合法值——bootstrap 必须继续接受它们（纯 no-op 授权），否则现网
-    // manifest 的 permissions 数组会触发「未知值」错误使宿主 fail-closed。
-    ["admin:invites:read", "admin:invites:write"].forEach(function (p) {
-      set[p] = true;
     });
     return set;
   })();

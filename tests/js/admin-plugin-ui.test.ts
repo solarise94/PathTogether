@@ -819,14 +819,14 @@ describe("pathtogether-admin plugin UI — workbench KPI + drawer (§9, 包 E)",
 		await ticks(4);
 		const tbody = bus.els["adm-users-tbody"].textContent;
 		// 用户列 = 显示名 + 邮箱（sub 行）；加入时间/最近登录（上海时间，GMT+8）；
-		// 分类列 = 标签（正式用户/Dogfood）+ 标为测试/改为正式 + 详情
+		// 分类列 = 标签（正式用户/Dogfood）+ 标为 Dogfood/改为正式 + 详情
 		expect(tbody).toContain("张三");
 		expect(tbody).toContain("zhang@x.com");
 		expect(tbody).toContain("2023-11-15 06:13:20 GMT+8");
 		expect(tbody).toContain("暂无记录"); // u2 从未登录（last_login_at null）
 		expect(tbody).toContain("正式用户");
 		expect(tbody).toContain("Dogfood");
-		expect(tbody).toContain("标为测试");
+		expect(tbody).toContain("标为 Dogfood");
 		expect(tbody).toContain("改为正式");
 		expect(tbody).toContain("详情");
 		// 低频字段不进表格行（额度/启用状态/掩码账号只在抽屉里出现）
@@ -869,7 +869,7 @@ describe("pathtogether-admin plugin UI — workbench KPI + drawer (§9, 包 E)",
 			},
 		});
 		await ticks(4);
-		const toggleBtn = bus.created.find((el) => el.textContent === "标为测试" &&
+		const toggleBtn = bus.created.find((el) => el.textContent === "标为 Dogfood" &&
 			el._listeners && el._listeners.click);
 		expect(toggleBtn).toBeTruthy();
 		toggleBtn!._fire("click", {});

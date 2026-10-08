@@ -11,8 +11,8 @@
       "admin.workspace"
     ],
     "fileHashes": {
-      "ui/index.html": "97fdc95421603f0b01a701cdf63d86e5364b22257fdc56190a2b7c0fdee30ba0",
-      "ui/main.js": "4948e73ca772c278e6a78c1d02d55fbfbeac8994456e1f17f9d6abd931c96ef8",
+      "ui/index.html": "c89987f11a81429e05f4430e619f6218645f6775bbbb16ab048698179b2c724b",
+      "ui/main.js": "22b7febd049ca7de968f19f63cccc9fd5834f745a59b21a9f946aa020292e746",
       "ui/style.css": "c43fab4df219224e6c500bc09d5111f5cce9e231a37b6ad8362a62de514c990f"
     }
   },
@@ -27,8 +27,6 @@
     "admin:users:write",
     "admin:slides:read",
     "admin:slides:write",
-    "admin:invites:read",
-    "admin:invites:write",
     "admin:billing:read",
     "admin:audit:read",
     "admin:plugins:read",

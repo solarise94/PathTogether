@@ -453,11 +453,20 @@ function bootApp(opts: {
 	while (rafCbs.length) (rafCbs.shift() as () => void)();
 
 	const findSlideRow = (name?: string) => {
-		// P2：行操作键 = data-slide-id（slide_id）；name 入参按 data-name 兼容定位
-		const row = created.find((e) =>
-			e.classList.contains("slide-row") &&
+		// P2：操作键 = data-slide-id（slide_id）；name 入参按 data-name 兼容定位。
+		// 改版 2026-10-08：切片行由堆叠卡片（.fb-hit）承载，键同源。切片在
+		// 文件夹内时先点文件夹卡进入（同步渲染），再取卡片。
+		const pick = () => created.find((e) =>
+			e.classList.contains("fb-hit") && e.parentNode &&
 			(!name || e.dataset.slideId === name || e.dataset.name === name));
-		if (!row) throw new Error("harness: 未渲染出 .slide-row（生产路径 loadAll → renderProjects → renderSlideRow）");
+		let row = pick();
+		if (!row) {
+			const folder = created.filter((e) => e.classList.contains("fb-folder") && e.parentNode).pop();
+			if (!folder) throw new Error("harness: 未渲染出 .fb-hit 卡片与 .fb-folder 文件夹");
+			folder.dispatch("click");
+			row = pick();
+		}
+		if (!row) throw new Error("harness: 进入文件夹后仍未渲染出 .fb-hit 卡片");
 		return row;
 	};
 	return {

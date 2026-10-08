@@ -296,8 +296,17 @@ async function settle(times = 20) {
 }
 
 function findSlideRow(created: FakeEl[]): FakeEl {
-  const row = created.find((e) => e.classList.contains("slide-row"));
-  if (!row) throw new Error("harness: 未渲染出 .slide-row");
+  // 改版 2026-10-08：切片行由堆叠卡片（.fb-hit）承载，点击即 openSlide。
+  // 切片在项目（文件夹）内时先点文件夹卡进入（同步渲染）。
+  const pick = () => created.filter((e) => e.classList.contains("fb-hit") && e.parentNode).pop();
+  let row = pick();
+  if (!row) {
+    const folder = created.filter((e) => e.classList.contains("fb-folder") && e.parentNode).pop();
+    if (!folder) throw new Error("harness: 未渲染出 .fb-hit 卡片与 .fb-folder 文件夹");
+    folder.dispatch("click");
+    row = pick();
+  }
+  if (!row) throw new Error("harness: 进入文件夹后仍未渲染出 .fb-hit 卡片");
   return row;
 }
 

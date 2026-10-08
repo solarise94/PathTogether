@@ -273,6 +273,14 @@ function bootEl(id = ""): BootEl {
 	const children: BootEl[] = [];
 	const el: BootEl = {
 		id,
+		// app.js 渲染器用 className="..." 建卡——需与 classList 同源
+		get className() {
+			return Array.from(classes).join(" ");
+		},
+		set className(v: string) {
+			classes.clear();
+			String(v).split(/\s+/).filter(Boolean).forEach((n) => classes.add(n));
+		},
 		hidden: false,
 		disabled: false,
 		title: "",
@@ -728,7 +736,7 @@ describe("U03：提交中防重与幂等键（R4）", () => {
 		expect(String(createCalls(h)[2].opts!.headers!["Idempotency-Key"])).not.toBe(key1);
 	});
 
-	it("成功：关闭清空、重载列表并定位 pid（展开项目行）", async () => {
+	it("成功：关闭清空、重载文件夹浏览器并定位 pid（当前目录内新建→原地可见）", async () => {
 		const h = bootApp();
 		h.routes.set("/api/project/create", () => ({ status: 200, body: { pid: "pnew" } }));
 		h.routes.set("/api/projects", () => ({
@@ -741,11 +749,57 @@ describe("U03：提交中防重与幂等键（R4）", () => {
 		UI.submitProjectDialog();
 		await flush(24);
 		expect(h.els["project-create-mask"].hidden).toBe(true);
-		const rows = h.els["project-list"].children;
-		expect(rows.length).toBe(1);
-		expect(rows[0].dataset.pid).toBe("pnew");
-		expect(rows[0].classList.contains("expanded")).toBe(true);
+		// 改版 2026-10-08：项目=文件夹。当前目录（根）内新建 → 原地重渲，
+		// 新文件夹卡直接可见（不再有 project-list 展开行）
+		const stack = h.els["fb-stack"];
+		const folderCards = stack.children.filter((c) => c.classList.contains("fb-folder"));
+		expect(folderCards.length).toBe(1);
+		expect(folderCards[0].dataset.pid).toBe("pnew");
+		expect(h.els["fb-location"].textContent).toBe("fb.root");
 		expect(UI.projectDialog.idemKey).toBeNull();
+	});
+
+	it("成功（在文件夹内新建）：POST 带 parent_project_id=当前文件夹", async () => {
+		const h = bootApp();
+		const projects: Array<Record<string, unknown>> = [];
+		let createSeq = 0;
+		h.routes.set("/api/project/create", () => {
+			createSeq += 1;
+			return createSeq === 1
+				? { status: 200, body: { pid: "p1" } }
+				: { status: 200, body: { pid: "pchild" } };
+		});
+		h.routes.set("/api/projects", () => ({ status: 200, body: projects }));
+		const UI = h.UI;
+		// 1) 根目录建「外层」（parentPid 为空 → POST 无 parent_project_id）
+		UI.openProjectDialog("empty", null);
+		h.els["pcd-name"].value = "外层";
+		UI.submitProjectDialog();
+		await flush(24);
+		projects.push({ pid: "p1", name: "外层", slides: [], slide_count: 0 });
+		UI.fb.render();
+		// 2) 点文件夹卡进入，再点「＋ 新建文件夹」
+		const outer = h.els["fb-stack"].children.find((c) => c.dataset.pid === "p1");
+		expect(outer).toBeTruthy();
+		outer!.dispatch("click", clickEvt());
+		expect(h.els["fb-location"].textContent).toBe("外层");
+		h.els["new-project-btn"].dispatch("click", clickEvt());
+		expect(UI.projectDialog.parentPid).toBe("p1");
+		expect(h.els["pcd-title"].textContent).toBe("pcd.title.folder");
+		// 3) 建「内层」→ POST 带 parent_project_id=当前文件夹
+		h.els["pcd-name"].value = "内层";
+		UI.submitProjectDialog();
+		await flush(24);
+		const posts = createCalls(h);
+		expect(posts.length).toBe(2);
+		const body = JSON.parse(String(posts[1].opts && posts[1].opts.body));
+		expect(body.parent_project_id).toBe("p1");
+		projects.push({ pid: "pchild", name: "内层", parent_project_id: "p1", slides: [], slide_count: 0 });
+		UI.fb.render();
+		// 子文件夹在当前文件夹内创建 → 原地可见，不跳转
+		const folderCards = h.els["fb-stack"].children.filter((c) => c.classList.contains("fb-folder"));
+		expect(folderCards.map((c) => c.dataset.pid)).toEqual(["pchild"]);
+		expect(h.els["fb-location"].textContent).toBe("外层");
 	});
 });
 

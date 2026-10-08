@@ -304,15 +304,18 @@ function bootApp(opts: BootOpts): BootResult {
 		addEventListener(type: string, cb: () => void) {
 			(docListeners[type] ||= []).push(cb);
 		},
+		removeEventListener() {},
 		querySelector: () => null,
-		// openSlide 高亮走 document.querySelectorAll(".slide-row")：在已创建
-		// 元素里按 class 深度查找（含自身）
+		// openSlide 高亮走 document.querySelectorAll(".slide-row, .fb-hit")：
+		// 在已创建元素里按 class 深度查找（含自身；支持逗号复合选择器）
 		querySelectorAll: (sel: string) => {
-			const cls = sel.replace(/^\./, "");
+			const classes = sel.split(",").map((s) => s.trim().replace(/^\./, ""));
 			const out: FakeEl[] = [];
 			for (const el of created) {
-				if (el.classList.contains(cls)) out.push(el);
-				for (const d of findByClass(el, cls)) out.push(d);
+				if (classes.some((cls) => el.classList.contains(cls))) out.push(el);
+				for (const cls of classes) {
+					for (const d of findByClass(el, cls)) out.push(d);
+				}
 			}
 			return out;
 		},
@@ -361,7 +364,8 @@ function bootApp(opts: BootOpts): BootResult {
 	(docListeners["DOMContentLoaded"] || []).forEach((cb) => cb());
 	while (rafCbs.length) (rafCbs.shift() as () => void)();
 
-	const unfiledRows = () => (els["unfiled-list"] ? els["unfiled-list"].children.filter((c) => c.classList.contains("slide-row")) : []);
+	// 改版 2026-10-08：根目录未归类切片 = #fb-stack 内的堆叠卡片（.fb-hit）
+	const unfiledRows = () => (els["fb-stack"] ? els["fb-stack"].children.filter((c) => c.classList.contains("fb-hit")) : []);
 	const rowBySlideId = (id: string) => {
 		const row = unfiledRows().find((r) => r.dataset.slideId === id);
 		if (!row) throw new Error("harness: 未找到 data-slide-id=" + id + " 的行");
@@ -400,7 +404,10 @@ describe("slide ID 化前端契约（P2 合同 §5）", () => {
 		expect(rows).toHaveLength(2);
 		expect(rows.map((r) => r.dataset.slideId).sort()).toEqual([ID_A, ID_B].sort());
 		// 主显示 display_name 相同（同名条目用 ID 区分，不改 ID）
-		const names = rows.map((r) => (r.querySelector(".slide-name") as FakeEl).innerHTML);
+		const names = rows.map((r) => {
+			const nameEl = r.querySelector(".fb-card-name") as FakeEl;
+			return (nameEl && nameEl.textContent) || "";
+		});
 		expect(names[0]).toContain(DISP);
 		expect(names[1]).toContain(DISP);
 
@@ -433,20 +440,20 @@ describe("slide ID 化前端契约（P2 合同 §5）", () => {
 		await settle();
 		const row = app.rowBySlideId(ID_A);
 		expect(row.dataset.slideId).toBe(ID_A);
-		// 行内编辑：edit 按钮 → 表单（display_name/note）→ 确认
-		const editBtn = row.children.find((c) => c.classList.contains("slide-edit"));
-		expect(editBtn).toBeTruthy();
-		editBtn!.dispatch("click", { stopPropagation() {} });
+		// 卡片「⋯」菜单 → 重命名/备注（prompt 两段）→ PATCH
+		const w = (globalThis as { window?: { prompt?: unknown } }).window!;
+		const prompts: string[] = [];
+		(w as { prompt: unknown }).prompt = vi.fn((label: string) => {
+			prompts.push(String(label));
+			return prompts.length === 1 ? "新名字" : "备注";
+		});
+		const menuBtn = row.children.find((c) => c.classList.contains("fb-card-menu"));
+		expect(menuBtn).toBeTruthy();
+		menuBtn!.dispatch("click", { stopPropagation() {} });
 		await settle();
-		const form = row.children.find((c) => c.classList.contains("slide-edit-form"));
-		expect(form).toBeTruthy();
-		const aInput = form!.children[0] as FakeEl;
-		const nInput = form!.children[1] as FakeEl;
-		const actions = form!.children[2] as FakeEl;
-		const okBtn = actions.children[0] as FakeEl;
-		aInput.value = "新名字";
-		nInput.value = "备注";
-		okBtn.dispatch("click", { stopPropagation() {} });
+		const renameItem = app.created.filter((e) => e.textContent === "fb.menu.rename").pop();
+		expect(renameItem).toBeTruthy();
+		renameItem!.dispatch("click", { stopPropagation() {} });
 		await settle(30);
 		// ID 通道走 PATCH /api/slides/<slide_id>（display_name/note；旧 meta 端点不动）
 		expect(app.fetchUrls().some((u) => u === "/api/slides/" + ID_A)).toBe(true);

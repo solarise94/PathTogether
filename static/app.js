@@ -835,10 +835,7 @@
   var editing = false;
 
   // 临时选择器状态
-  var pickerCtx = { targetPid: null, selected: {} };
-
-  // 未归类勾选
-  var slideChecked = {};   // 切片勾选状态（项目内 + 未归类统一，供分享/新建项目用）
+  var pickerCtx = { targetPid: null, selected: {}, mode: "add" };
 
   // 分享创建用的临时切片集（分享选中 / 项目分享）
   var sharePendingSlides = null; // 若非 null，则用此切片集创建分享
@@ -969,9 +966,36 @@
     menuBtn: $("menu-btn"),
     sidebar: $("sidebar"),
     sidebarMask: $("sidebar-mask"),
-    // 升级 A（2026-09-22 重做）：搜索输入框按需创建——首屏只有按钮 + 空容器
-    slideSearchBtn: $("slide-search-btn"),
-    slideSearchArea: $("slide-search-area"),
+    // 改版 2026-10-08：顶栏搜索/分享浮层（§5.1/§5.4；Demo 壳不渲染，全部可空）
+    tbSearchBtn: $("tb-search-btn"),
+    tbSearchPop: $("tb-search-pop"),
+    tbSearchArea: $("tb-search-area"),
+    tbSearchResults: $("tb-search-results"),
+    tbSearchClose: $("tb-search-close"),
+    tbShareBtn: $("tb-share-btn"),
+    tbSharePop: $("tb-share-pop"),
+    tbShareClose: $("tb-share-close"),
+    sharePickBtn: $("share-pick-btn"),
+    shareTargetLine: $("share-target-line"),
+    // 改版 2026-10-08：文件夹/切片浏览器（§5.1–5.3；Demo 壳不渲染，全部可空）
+    fbUpBtn: $("fb-up-btn"),
+    fbLocation: $("fb-location"),
+    fbCount: $("fb-count"),
+    fbPlusBtn: $("fb-plus-btn"),
+    fbPlusMenu: $("fb-plus-menu"),
+    fbFolderBtn: $("fb-folder-btn"),
+    fbFolderMenu: $("fb-folder-menu"),
+    fbRename: $("fb-rename"),
+    fbMove: $("fb-move"),
+    fbShareFolder: $("fb-share-folder"),
+    fbDelete: $("fb-delete"),
+    fbStack: $("fb-stack"),
+    fbPager: $("fb-pager"),
+    fbPrevBtn: $("fb-prev-btn"),
+    fbNextBtn: $("fb-next-btn"),
+    fbPageInfo: $("fb-page-info"),
+    // 当前切片名画布标签（§5.1）
+    canvasSlideLabel: $("canvas-slide-label"),
     viewerEmpty: $("viewer-empty"),
     viewerEmptyPick: $("viewer-empty-pick"),
     viewerEmptyUpload: $("viewer-empty-upload"),
@@ -990,6 +1014,7 @@
     projectCreateMask: $("project-create-mask"),
     projectCreateDialog: $("project-create-dialog"),
     pcdClose: $("pcd-close"),
+    pcdTitle: $("pcd-title"),
     pcdName: $("pcd-name"),
     pcdNote: $("pcd-note"),
     pcdSlidesSummary: $("pcd-slides-summary"),
@@ -997,19 +1022,12 @@
     pcdError: $("pcd-error"),
     pcdCancel: $("pcd-cancel"),
     pcdConfirm: $("pcd-confirm"),
-    projectList: $("project-list"),
-    unfiledToggle: $("unfiled-toggle"),
-    unfiledCount: $("unfiled-count"),
-    unfiledBody: $("unfiled-body"),
-    unfiledList: $("unfiled-list"),
-    unfiledNewProject: $("unfiled-new-project"),
-    unfiledShare: $("unfiled-share"),
+    // 改版 2026-10-08：project-list/unfiled 分区被文件夹浏览器替代（els.fb*）
     // 身份预览 banner（S4：预览态提示 + 退出按钮；用户管理 UI 已迁 admin 插件）
     previewBanner: $("preview-banner"),
     previewBannerText: $("preview-banner-text"),
     previewStopBtn: $("preview-stop-btn"),
     // 分享
-    shareMgrToggle: $("share-mgr-toggle"),
     shareMgrBody: $("share-mgr-body"),
     shareExpiresSelect: $("share-expires-select"),
     shareExpiresCustom: $("share-expires-custom"),
@@ -1676,12 +1694,32 @@
   // ---------- 打开切片 ----------
   // ref = slide_id（ID 通道，唯一操作键）；slideIdApiOn()=false 的旧后端由
   // 调用方传 legacy 文件名（列表行 data-slide-id 同源）。
+  // 请求序号（§5.2）：A→B 快速点击只保留最后一次——晚到的旧 info 响应整体
+  // 丢弃，不触碰 viewer/state/选中标记。
+  var openSlideSeq = 0;
+
   function openSlide(ref) {
     // 切换切片前移除旧底图
     clearBaseThumb();
+    var seq = ++openSlideSeq;
     apiFetch(slideInfoUrl(ref))
-      .then(function (r) { return r.json(); })
-      .then(function (info) {
+      .then(function (r) {
+        var st = r.status;
+        return r.json().then(
+          function (info) { return { status: st, info: info }; },
+          function () { return { status: st, info: { error: "invalid info body" } }; });
+      })
+      .then(function (res) {
+        if (seq !== openSlideSeq) return; // 晚到的旧响应：丢弃
+        // 临时查看切片被服务端拒绝（403/404=到期或无权读取，§5.5）：清屏提示。
+        // 仅对「当前打开的、带临时标记」的切片生效；其余切片维持原报错路径。
+        if ((res.status === 403 || res.status === 404) && state.slide &&
+            String(state.slide.id || state.slide.name) === String(ref) &&
+            state.slide.temporaryViewExpiresAt) {
+          endTemporaryView();
+          return;
+        }
+        var info = res.info;
         if (info.error) { toast(t("open.fail", { e: info.error }), "error"); return; }
         state.slide = {
           // slide ID 化（P2 合同 §5.1）：id = slide_id 唯一操作键；name 保持
@@ -1699,6 +1737,8 @@
           // info.asset_revision（"mtime_ns:size"）随 info 响应下发；边缘路径
           // （render fields 读取失败等）可能缺键 → 宽容置 null
           revision: info.asset_revision || null,
+          // 临时查看到期时间（§5.5；后端合入前字段缺失 = 普通切片，不定时器）
+          temporaryViewExpiresAt: info.temporary_view_expires_at || null,
         };
         state.mppX = info.mpp_x;
         state.rotation = 0;
@@ -1744,15 +1784,77 @@
         // 高亮列表项（未归类与项目切片行）：按 data-slide-id（= slide_id；
         // 旧后端列表无 slide_id 时 dataset 键回落 name，P6 拆 name 回落）
         var activeRef = String(ref);
-        document.querySelectorAll(".slide-row").forEach(function (it) {
-          it.classList.toggle("active", String(it.dataset.slideId) === activeRef);
+        document.querySelectorAll(".slide-row, .fb-hit").forEach(function (it) {
+          var on = String(it.dataset.slideId) === activeRef;
+          it.classList.toggle("active", on);
+          if (it.setAttribute) it.setAttribute("aria-pressed", on ? "true" : "false");
+          var dot = it.querySelector ? it.querySelector(".fb-card-dot") : null;
+          if (dot) dot.textContent = on ? "●" : "";
         });
+        // 临时查看：按到期时间设定清屏计时器（服务端门禁是唯一权限依据）
+        armTempViewTimer(state.slide);
+        updateCanvasSlideLabel();
         // 手机端：打开切片后自动收起侧栏抽屉，让用户立刻看到查看器；
         // 收起后走统一布局同步（抽屉关闭 + viewer resize 链，§4.2）。
         // 桌面端保持当前收起/展开偏好，不打断读片。
         if (isMobileWidth()) sidebarCtrl.closeDrawer();
       })
-      .catch(function (e) { toast(t("open.info.fail", { e: e }), "error"); });
+      .catch(function (e) {
+        if (seq === openSlideSeq) toast(t("open.info.fail", { e: e }), "error");
+      });
+  }
+
+  // ---------- 临时查看到期（§5.5） ----------
+  // 到期（计时器）或读取被拒（403/404）→ 关闭画面、移除该切片卡片与缩略图、
+  // 提示「临时查看已结束，可在后台重新开启」。服务端门禁是唯一权限依据，
+  // 计时器只负责清屏。
+  var tempViewTimer = null;
+
+  function clearTempViewTimer() {
+    if (tempViewTimer) {
+      clearTimeout(tempViewTimer);
+      tempViewTimer = null;
+    }
+  }
+
+  function armTempViewTimer(slide) {
+    clearTempViewTimer();
+    if (!slide || !slide.temporaryViewExpiresAt) return;
+    var ms = new Date(slide.temporaryViewExpiresAt).getTime() - Date.now();
+    if (!isFinite(ms)) return;
+    if (ms <= 0) { endTemporaryView(); return; }
+    tempViewTimer = setTimeout(function () { endTemporaryView(); }, ms);
+  }
+
+  function endTemporaryView() {
+    clearTempViewTimer();
+    var cur = state.slide;
+    // 关闭画面（与 deleteSlide 清屏同口径）
+    state.slide = null;
+    state.mppX = null;
+    updateDocTitle(null);
+    updateMppSetterVisibility();
+    updateCanvasSlideLabel();
+    if (roiBox) exitRoi();
+    if (viewer) viewer.close();
+    // 本地标记已结束：卡片与缩略图立即移除（下次 /api/slides 拉到权威状态）
+    if (cur && (cur.id || cur.name)) {
+      var s = findSlideInfo(cur.id || cur.name);
+      if (s) s.__tempEnded = true;
+    }
+    renderFolderBrowser();
+    toast(t("tempview.ended"), "info");
+  }
+
+  // ---------- 当前切片名画布标签（§5.1：紧凑标签，不新增第二行） ----------
+  function updateCanvasSlideLabel() {
+    var el = els.canvasSlideLabel;
+    if (!el) return;
+    var name = state.slide
+      ? (slideDisplayName(state.slide) || state.slide.name || "")
+      : "";
+    if (el.textContent !== undefined) el.textContent = name;
+    el.hidden = !name;
   }
 
   // ---------- mpp 设置区显示控制 ----------
@@ -2519,7 +2621,7 @@
   }
 
   // =========================================================================
-  // 项目渲染与管理
+  // 项目渲染与管理（改版 2026-10-08：项目 = 文件夹，见下方文件夹/切片浏览器）
   // =========================================================================
   function loadAll() {
     // 并行加载切片、项目、分享、标注索引（AI 配置由 HistoPilot 插件 bundle 自行加载）
@@ -2531,14 +2633,15 @@
     ]).then(function (results) {
       allSlides = results[0] || [];
       allProjects = results[1] || [];
-      renderProjects(allProjects);
-      renderUnfiled();
+      renderFolderBrowser();
       renderShareList((results[2] && results[2].shares) || []);
     }).catch(function (e) {
       toast(t("load.fail", { e: e }), "error");
     });
   }
 
+  // 重载项目+切片并重渲文件夹浏览器（分享/标注不变）。名字里的 unfiled 是
+  // 历史口径（旧侧栏「未归类」分区），现统一渲染为根目录内容。
   function reloadProjectsAndUnfiled() {
     return Promise.all([
       fetch("/api/projects").then(function (r) { return r.json(); }),
@@ -2547,8 +2650,7 @@
     ]).then(function (results) {
       allProjects = results[0] || [];
       allSlides = results[1] || [];
-      renderProjects(allProjects);
-      renderUnfiled();
+      renderFolderBrowser();
     });
   }
 
@@ -2577,254 +2679,702 @@
     return parts.join(" · ");
   }
 
-  function renderProjects(projects) {
-    els.projectList.innerHTML = "";
-    if (!projects || projects.length === 0) {
-      var empty = document.createElement("div");
-      empty.className = "proj-empty";
-      empty.textContent = t("proj.empty");
-      els.projectList.appendChild(empty);
-      return;
-    }
-    var renderTail = function () {
-      // 升级 A：列表重渲后重放当前搜索条件（搜索条件不因收起/重渲丢失；
-      // 输入框未创建/已移除时 getSlideQuery 返回空 → 显示全部）
-      applySlideFilter(getSlideQuery());
-    };
-    projects.forEach(function (p) {
-      var row = document.createElement("div");
-      row.className = "proj-row";
-      row.dataset.pid = p.pid;
+  // =========================================================================
+  // 文件夹/切片浏览器（改版 2026-10-08，admin-viewer-simplified §5.1–5.3）
+  // -------------------------------------------------------------------------
+  // 项目（project）在 UI 文案中叫「文件夹」；层级由 parent_project_id 承载
+  // （本分支后端尚未合入：字段缺失一律视为根目录）。结构：
+  //   根目录 = 顶层文件夹 + 「临时查看」虚拟文件夹（仅有临时授权切片时）+ 未归类切片
+  //   文件夹 = 子文件夹卡片 + 该文件夹的切片卡片堆叠
+  // 堆叠：每叠最多 FB_MAX_PAGE 张、按可用高度缩减（文件夹卡占用同一预算）；
+  // 纵向重叠、悬停整卡右滑预览（180ms，prefers-reduced-motion 关闭位移）；
+  // 翻页只换列表不动 Viewer；页码按文件夹记在内存（fbState.pages，刷新不保留）。
+  // =========================================================================
+  var FB_TEMP_KEY = "__temp__";   // 「临时查看」虚拟文件夹键（不对应项目）
+  var FB_MAX_PAGE = 8;            // 每叠最多 8 张（§5.2）
+  var FB_GAP = 36;                // 堆叠露出条带高度（名称条 + 一段缩略图）
+  var FB_CARD_H = 104;            // 完整卡片高度
+  var FB_FOLDER_H = 56;           // 文件夹卡高度
+  var FB_FOLDER_GAP = 8;          // 文件夹卡间距
+  var FB_STACK_FALLBACK_H = 396;  // 无布局环境（测试/首帧）时的可用高度兜底
 
-      var slideCount = p.slide_count != null ? p.slide_count : (p.slides || []).length;
-      var roiCount = p.roi_count || 0;
+  var fbState = {
+    folder: null,   // null=根目录；pid=项目 id；FB_TEMP_KEY=临时查看
+    pages: {},      // 文件夹 → 上次页码（仅内存）
+    page: 0,        // 当前文件夹当前页（渲染时钳回有效范围）
+    totalPages: 1,
+  };
 
-      // 头部行：chevron + 图标 + 名称/副行 + 计数 + 操作
-      var head = document.createElement("div");
-      head.className = "proj-head";
-
-      var chevron = document.createElement("span");
-      chevron.className = "chevron";
-      chevron.textContent = "▸";
-      chevron.title = t("proj.chevron");
-      head.appendChild(chevron);
-
-      var icon = document.createElement("span");
-      icon.className = "icon";
-      icon.textContent = "📁";
-      head.appendChild(icon);
-
-      var main = document.createElement("div");
-      main.className = "ph-main";
-      var nameEl = document.createElement("div");
-      nameEl.className = "proj-name";
-      nameEl.textContent = p.name || t("proj.unnamed");
-      var meta = document.createElement("div");
-      meta.className = "proj-meta";
-      meta.textContent = t("proj.meta", { s: slideCount, r: roiCount }) +
-        (p.note ? " · " + p.note : "");
-      main.appendChild(nameEl);
-      main.appendChild(meta);
-      head.appendChild(main);
-
-      var countBadge = document.createElement("span");
-      countBadge.className = "proj-count";
-      countBadge.textContent = String(slideCount);
-      head.appendChild(countBadge);
-
-      // 操作按钮（hover 浮现）
-      var ops = document.createElement("div");
-      ops.className = "proj-ops";
-      function opBtn(cls, glyph, title) {
-        var b = document.createElement("button");
-        b.className = "proj-op " + cls;
-        b.textContent = glyph; b.title = title || "";
-        return b;
-      }
-      var shareBtn = opBtn("po-share", "↗", t("proj.op.share"));
-      var editBtn = opBtn("po-edit", "✎", t("proj.op.edit"));
-      var addBtn = opBtn("po-add", "＋", t("proj.op.add"));
-      var delBtn = opBtn("po-del", "🗑", t("proj.op.del"));
-      ops.appendChild(shareBtn);
-      ops.appendChild(editBtn);
-      ops.appendChild(addBtn);
-      ops.appendChild(delBtn);
-      head.appendChild(ops);
-      row.appendChild(head);
-
-      shareBtn.addEventListener("click", function (e) { e.stopPropagation(); shareProject(p); });
-      editBtn.addEventListener("click", function (e) { e.stopPropagation(); editProject(p); });
-      addBtn.addEventListener("click", function (e) { e.stopPropagation(); openSlidePicker(p.pid, p.name); });
-      delBtn.addEventListener("click", function (e) { e.stopPropagation(); deleteProject(p); });
-
-      // 展开体：切片行
-      var body = document.createElement("div");
-      body.className = "proj-body";
-      // 行身份 = slide_id（slide_refs 与项目行逐行对齐）：id_bundle 资产 name 为
-      // null，原始文件名可重复，不能当身份。无 slide_refs 的旧后端回落按名。
-      projectSlideRefs(p).forEach(function (ref) {
-        var sinfo = ref.slide_id ? findSlideInfoById(ref.slide_id) : findSlideInfo(ref.slide);
-        var label = (sinfo && (sinfo.name || sinfo.original_filename)) || ref.slide || ref.slide_id;
-        body.appendChild(renderSlideRow(label, false, sinfo, ref.slide_id));
-      });
-      row.appendChild(body);
-
-      // 点击头部（chevron 或名称区）展开/收起
-      function toggleExpand(e) {
-        if (e.target.closest(".proj-ops")) return; // 操作按钮不触发展开
-        row.classList.toggle("expanded");
-      }
-      chevron.addEventListener("click", toggleExpand);
-      main.addEventListener("click", toggleExpand);
-      countBadge.addEventListener("click", toggleExpand);
-
-      els.projectList.appendChild(row);
-    });
-    renderTail();
+  // 每叠页数：可用高度 − 文件夹卡占用 − 一张完整卡 → 余量按露出条带折算。
+  // 纯函数（vitest 锁行为）：上限 8、下限 1。
+  function fbPageSize(availH, folderCount) {
+    var used = (folderCount || 0) * (FB_FOLDER_H + FB_FOLDER_GAP);
+    var remaining = (availH || 0) - used - FB_CARD_H;
+    var n = Math.floor(remaining / FB_GAP) + 1;
+    if (!isFinite(n)) n = FB_MAX_PAGE;
+    return Math.max(1, Math.min(FB_MAX_PAGE, n));
   }
 
-  // 切片行（项目展开体内 / 未归类）。unfiled=true 时显示复选框。
-  // sname 是行的显示/列表定位名；操作键 sid = slide_id（P2 合同 §5.1；
-  // 列表外资产/旧后端回落 name——与 data-slide-id 同源）。
-  function renderSlideRow(sname, unfiled, sinfoHint, idHint) {
-    // sinfoHint：调用方已持有列表项（renderUnfiled）时直用，省一次线性查找，
-    // 也覆盖 P3 起 id_bundle 行（name=None，按名查不到）——操作键仍取 slide_id。
-    // idHint：项目行的 slide_id（列表外资产也按 ID 打开/删除，不回落到文件名）
-    var sinfo = sinfoHint || (idHint ? findSlideInfoById(idHint) : findSlideInfo(sname));
-    var sid = (sinfo && sinfo.slide_id) || idHint || sname;
-    var assetId = (sinfo && sinfo.slide_id) || idHint || null;
-    var row = document.createElement("div");
-    row.className = "slide-row";
-    // 操作键：data-slide-id（ID 通道=slide_id；旧后端=name）。
-    // data-name 保留：搜索（applySlideFilter）与显示用（P6 拆 name 回落时评估收窄）
-    row.dataset.slideId = sid;
-    row.dataset.name = sname;
-    if (state.slide && activeSlideRef() === String(sid)) row.classList.add("active");
-
-    // 所有切片行（项目内 + 未归类）都带复选框，可勾选用于分享/新建项目
-    var cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.className = "slide-check";
-    cb.title = t("proj.cb.title");
-    if (slideChecked[sid]) cb.checked = true;
-    cb.addEventListener("click", function (ev) { ev.stopPropagation(); });
-    cb.addEventListener("change", function () { slideChecked[sid] = cb.checked; });
-    row.appendChild(cb);
-
-    var mid = document.createElement("div");
-    mid.className = "slide-mid";
-    var failed = (sinfo && sinfo.error) || (!sinfo);
-    // 主显示名（P2 合同 §5.4）：display_name 优先（alias 已从 display_name
-    // 派生），空则文件名；title 辅助显示 original_filename
-    var dispName = sinfo ? slideDisplayName(sinfo) : "";
-
-    // 第一行：名称独占整行（显示名优先，无显示名则截断文件名）；第二行：标注
-    // pill（标记/作者数）；第三行：meta（工单 B 布局：名称与徽章分行，窄
-    // 侧栏/长英文名互不挤压，截断保留可辨认编号）
-    var top = document.createElement("div");
-    top.className = "slide-top";
-    var nameEl = document.createElement("span");
-    nameEl.className = "slide-name";
-    if (dispName && dispName !== sname) {
-      nameEl.classList.add("alias-first");
-      nameEl.innerHTML = esc(dispName) +
-        '<span class="alias-filename">' + esc(truncateMiddle(sname, 20)) + "</span>";
-    } else {
-      nameEl.textContent = truncateMiddle(sname, 24) + (failed ? t("slide.read.fail.short") : "");
+  function fbStackAvailH() {
+    var el = els.fbStack;
+    if (el && typeof el.clientHeight === "number" && el.clientHeight > 40) {
+      return el.clientHeight;
     }
-    // 完整名称（含读取失败提示）经 tooltip 与可访问名称提供（截断不丢信息）
-    nameEl.title = sname + (failed ? " " + t("slide.read.fail") : "");
-    nameEl.setAttribute("aria-label", sname);
-    top.appendChild(nameEl);
-    mid.appendChild(top);
+    return FB_STACK_FALLBACK_H;
+  }
 
-    // 标注 pill（独立次行，不再与名称同行）
-    var badgeText = annoBadgeText(sid);
+  function fbProject(pid) {
+    if (!pid) return null;
+    for (var i = 0; i < allProjects.length; i++) {
+      if (allProjects[i].pid === pid) return allProjects[i];
+    }
+    return null;
+  }
+
+  // 父项目：字段缺失/空 = 根目录（本分支后端未合入 parent_project_id 时的兼容口径）
+  function fbParentOf(p) {
+    return (p && p.parent_project_id) ? String(p.parent_project_id) : null;
+  }
+
+  function fbChildFolders(folderKey) {
+    var want = folderKey || null;
+    return allProjects.filter(function (p) { return fbParentOf(p) === want; });
+  }
+
+  // pid 是否位于 ancestorPid 的子树内（含自身）
+  function fbInSubtree(pid, ancestorPid) {
+    var p = fbProject(pid);
+    while (p) {
+      if (p.pid === ancestorPid) return true;
+      p = fbProject(fbParentOf(p));
+    }
+    return false;
+  }
+
+  // 项目内切片（项目行 slide_refs 与 /api/slides 逐项对齐；旧后端 slides 名数组）
+  function fbFolderProjectSlides(p) {
+    var out = [];
+    projectSlideRefs(p).forEach(function (ref) {
+      var sinfo = ref.slide_id ? findSlideInfoById(ref.slide_id) : findSlideInfo(ref.slide);
+      if (sinfo) out.push(sinfo);
+      else if (ref.slide_id) out.push({ slide_id: ref.slide_id, name: ref.slide || null, __missing: true });
+    });
+    return out;
+  }
+
+  // 临时查看到期（或本地已结束标记）的切片不再出现在任何列表
+  function fbTempSlides() {
+    return allSlides.filter(function (s) {
+      return s.temporary_view_expires_at && !s.__tempEnded;
+    });
+  }
+
+  // 根目录未归类：不在任何项目中、非临时查看（§5.1）
+  function fbUnfiledSlides() {
+    return allSlides.filter(function (s) {
+      return !isSlideInAnyProject(s) && !s.temporary_view_expires_at;
+    });
+  }
+
+  // 文件夹卡计数：子树内切片总数（含子文件夹，原型口径「N 张切片」）
+  function fbSubtreeCount(pid) {
+    var n = fbFolderProjectSlides(fbProject(pid) || {}).length;
+    fbChildFolders(pid).forEach(function (c) { n += fbSubtreeCount(c.pid); });
+    return n;
+  }
+
+  // 位置路径（面包屑文本）：根 → 「我的切片」；子目录 → 「教学切片 / 复核」
+  function fbPathOf(folderKey) {
+    var names = [];
+    var p = fbProject(folderKey);
+    while (p) {
+      names.unshift(p.name || t("fb.addto.untitled"));
+      p = fbProject(fbParentOf(p));
+    }
+    return names.length ? names.join(" / ") : t("fb.root");
+  }
+
+  // 切片所在位置文本（搜索结果行）：首个所在文件夹路径 +「+N」（多文件夹）；
+  // 无项目：临时查看 → 「临时查看」；否则「未归类」。
+  function fbSlideLocationText(s) {
+    var paths = [];
+    allProjects.forEach(function (p) {
+      var inP = (s.slide_id && (p.slide_ids || []).indexOf(s.slide_id) >= 0) ||
+                (s.name && (p.slides || []).indexOf(s.name) >= 0);
+      if (inP) paths.push(fbPathOf(p.pid));
+    });
+    if (!paths.length) {
+      return s.temporary_view_expires_at ? t("fb.temp.folder") : t("fb.unfiled");
+    }
+    return paths[0] + (paths.length > 1 ? " +" + (paths.length - 1) : "");
+  }
+
+  // 搜索（§5.4）：在 /api/slides 已鉴权全量上本地匹配显示名/别名/原文件名
+  // （含 legacy 名），大小写不敏感，不受当前文件夹限制。
+  function fbSearchSlides(q) {
+    var needle = String(q == null ? "" : q).trim().toLowerCase();
+    if (!needle) return [];
+    return allSlides.filter(function (s) {
+      var hay = [s.display_name, s.alias, s.original_filename, s.name]
+        .map(function (v) { return String(v == null ? "" : v).toLowerCase(); })
+        .join("\n");
+      return hay.indexOf(needle) >= 0;
+    });
+  }
+
+  // 当前文件夹内容：子文件夹卡（真实项目）+ 根目录附加「临时查看」虚拟文件夹
+  // + 切片列表
+  function fbEntries(folderKey) {
+    var folders = fbChildFolders(folderKey).map(function (p) {
+      return {
+        kind: "folder",
+        key: p.pid,
+        name: p.name || t("fb.addto.untitled"),
+        count: fbSubtreeCount(p.pid),
+      };
+    });
+    var slides;
+    if (!folderKey) {
+      if (fbTempSlides().length) {
+        folders.push({
+          kind: "folder", virtual: true, key: FB_TEMP_KEY,
+          name: t("fb.temp.folder"), count: fbTempSlides().length,
+        });
+      }
+      slides = fbUnfiledSlides();
+    } else if (folderKey === FB_TEMP_KEY) {
+      slides = fbTempSlides();
+    } else {
+      var p = fbProject(folderKey);
+      slides = p ? fbFolderProjectSlides(p) : [];
+    }
+    return { folders: folders, slides: slides };
+  }
+
+  // 进入文件夹（翻页记忆：离开时存当前页，回来恢复；§5.3）
+  function fbGo(folderKey, pageHint) {
+    fbState.pages[fbState.folder] = fbState.page;
+    fbState.folder = folderKey || null;
+    fbState.page = (typeof pageHint === "number" && pageHint >= 0)
+      ? pageHint : (fbState.pages[fbState.folder] || 0);
+    renderFolderBrowser();
+    // 焦点管理：进入（非返回）时落在新内容首个可聚焦元素；根目录回落返回钮
+    var first = els.fbStack && els.fbStack.querySelector
+      ? els.fbStack.querySelector(".fb-folder, .fb-hit") : null;
+    var focusTarget = first || (fbState.folder ? null : els.fbUpBtn);
+    if (focusTarget && typeof focusTarget.focus === "function") {
+      try { focusTarget.focus(); } catch (e) { /* 忽略聚焦失败 */ }
+    }
+  }
+
+  // 定位切片所在文件夹并翻到其所在叠（搜索结果点击 / 建后定位共用）。
+  // 首个所在文件夹（或根目录 / 临时查看）+ 页码 = 索引 ÷ 当前叠大小。
+  function fbLocateSlide(sinfo) {
+    if (!sinfo) return;
+    var ref = sinfo.slide_id || sinfo.name;
+    var pid = null;
+    for (var i = 0; i < allProjects.length; i++) {
+      var p = allProjects[i];
+      var inP = (sinfo.slide_id && (p.slide_ids || []).indexOf(sinfo.slide_id) >= 0) ||
+                (sinfo.name && (p.slides || []).indexOf(sinfo.name) >= 0);
+      if (inP) { pid = p.pid; break; }
+    }
+    var key = pid || (sinfo.temporary_view_expires_at ? FB_TEMP_KEY : null);
+    var entries = fbEntries(key);
+    var pageSize = fbPageSize(fbStackAvailH(), entries.folders.length);
+    var idx = -1;
+    entries.slides.forEach(function (sl, j) {
+      if (idx < 0 && (sl.slide_id || sl.name) === ref) idx = j;
+    });
+    fbGo(key, idx >= 0 ? Math.floor(idx / pageSize) : 0);
+  }
+
+  var FB_FOLDER_SVG = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>';
+
+  // 渲染当前文件夹（整格重渲；页码在渲染前钳回有效范围）
+  function renderFolderBrowser() {
+    if (!els.fbStack) return;
+    // 当前文件夹被删除后回到根目录（§5.3）；临时文件夹恒可用
+    if (fbState.folder && fbState.folder !== FB_TEMP_KEY && !fbProject(fbState.folder)) {
+      fbState.folder = null;
+      fbState.page = 0;
+    }
+    var entries = fbEntries(fbState.folder);
+    var totalItems = entries.folders.length + entries.slides.length;
+    var pageSize = fbPageSize(fbStackAvailH(), entries.folders.length);
+    var totalPages = Math.max(1, Math.ceil(totalItems / pageSize));
+    fbState.page = Math.max(0, Math.min(fbState.page, totalPages - 1));
+    fbState.totalPages = totalPages;
+
+    els.fbStack.innerHTML = "";
+    var pageEntries = entries.folders.map(function (f) {
+      return { kind: "folder", key: f.key, name: f.name, count: f.count, virtual: !!f.virtual };
+    }).concat(entries.slides.map(function (s) {
+      return { kind: "slide", s: s, sid: slideRefOf(s), name: s.name || s.original_filename || slideRefOf(s) };
+    })).slice(fbState.page * pageSize, fbState.page * pageSize + pageSize);
+
+    var top = 0;
+    var activeRef = activeSlideRef();
+    var focusIdx = 0;
+    pageEntries.forEach(function (entry, j) {
+      var node;
+      if (entry.kind === "folder") {
+        node = buildFbFolderCard(entry, top, focusIdx);
+        top += FB_FOLDER_H + FB_FOLDER_GAP;
+      } else {
+        var isLast = j === pageEntries.length - 1;
+        node = buildFbSlideCard(entry, top, focusIdx, activeRef, isLast);
+        top += isLast ? FB_CARD_H : FB_GAP;
+      }
+      focusIdx += 1;
+      els.fbStack.appendChild(node);
+    });
+    // 堆叠区固定高度 = 内容高度（翻页只换列表不动布局骨架）
+    els.fbStack.style.height = Math.max(top, 0) + "px";
+
+    // 头部：位置 + 返回 + 文件夹 ⋯ + 计数
+    var isRoot = !fbState.folder;
+    var isTemp = fbState.folder === FB_TEMP_KEY;
+    var curP = fbProject(fbState.folder);
+    if (els.fbLocation) {
+      var locText = isRoot ? t("fb.root") : (isTemp ? t("fb.temp.folder") : (curP ? curP.name || t("fb.addto.untitled") : t("fb.root")));
+      els.fbLocation.textContent = locText;
+      els.fbLocation.title = isRoot || isTemp ? locText : fbPathOf(fbState.folder);
+    }
+    if (els.fbUpBtn) els.fbUpBtn.hidden = isRoot;
+    if (els.fbFolderBtn) els.fbFolderBtn.hidden = isRoot || isTemp;
+    if (els.fbCount) els.fbCount.textContent = String(totalItems);
+    if (els.fbPageInfo) {
+      els.fbPageInfo.textContent = t("fb.page.info", { p: fbState.page + 1, m: totalPages });
+    }
+    if (els.fbPrevBtn) els.fbPrevBtn.disabled = fbState.page === 0;
+    if (els.fbNextBtn) els.fbNextBtn.disabled = fbState.page >= totalPages - 1;
+  }
+
+  function buildFbFolderCard(entry, top, focusIdx) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.className = "fb-folder";
+    b.style.top = top + "px";
+    b.style.zIndex = String(focusIdx + 1);
+    b.dataset.pid = entry.key;
+    b.setAttribute("aria-label", t("fb.open.folder.aria", { name: entry.name }));
+    var icon = document.createElement("span");
+    icon.className = "fb-folder-icon";
+    icon.innerHTML = FB_FOLDER_SVG;
+    b.appendChild(icon);
+    var text = document.createElement("span");
+    text.className = "fb-folder-text";
+    var nameEl = document.createElement("span");
+    nameEl.className = "fb-folder-name";
+    nameEl.textContent = entry.name;
+    if (entry.virtual) {
+      var tempTag = document.createElement("span");
+      tempTag.className = "fb-temp-tag";
+      tempTag.textContent = t("tempview.badge");
+      nameEl.appendChild(tempTag);
+    }
+    var countEl = document.createElement("small");
+    countEl.className = "fb-folder-count";
+    countEl.textContent = t("fb.folder.slides", { n: entry.count });
+    text.appendChild(nameEl);
+    text.appendChild(countEl);
+    b.appendChild(text);
+    b.addEventListener("click", function () { fbGo(entry.key); });
+    b.addEventListener("keydown", function (e) { fbStackKeydown(e, b); });
+    return b;
+  }
+
+  function buildFbSlideCard(entry, top, focusIdx, activeRef, isLast) {
+    var s = entry.s;
+    var sid = entry.sid;
+    var sname = entry.name;
+    var failed = !!s.__missing || (!s.slide_id && !s.name);
+    var dispName = s.__missing ? sname : slideDisplayName(s);
+    var active = !!activeRef && activeRef === String(sid);
+
+    // 命中区：卡片原位置的窄条（含 ⋯ 钮），命中区稳定不随预览位移（§5.2）
+    var hit = document.createElement("button");
+    hit.type = "button";
+    hit.className = "fb-hit" + (isLast ? " fb-hit-last" : "") + (active ? " active" : "");
+    hit.style.top = top + "px";
+    hit.style.zIndex = String(focusIdx + 1);
+    hit.dataset.slideId = sid;
+    hit.dataset.name = sname;
+    hit.setAttribute("aria-pressed", active ? "true" : "false");
+    hit.setAttribute("aria-label", t("fb.open.slide.aria", { name: dispName || sname }));
+
+    // 悬停预览卡（完整缩略图 + 名称）：浮层不改变布局；pointer-events 只在
+    // 滑出态开启，避免遮住下方卡片命中区造成抖动
+    var card = document.createElement("span");
+    card.className = "fb-card";
+    var label = document.createElement("span");
+    label.className = "fb-card-label";
+    var nameEl = document.createElement("span");
+    nameEl.className = "fb-card-name";
+    nameEl.textContent = truncateMiddle(dispName || sname, 16) + (failed ? t("slide.read.fail.short") : "");
+    nameEl.title = (dispName || sname) + (failed ? " " + t("slide.read.fail") : "");
+    label.appendChild(nameEl);
+    // 标注徽章（次行信息在滑出时完整可见；作者口径见 annoBadgeText）
+    var badgeText = failed ? null : annoBadgeText(sid);
     if (badgeText) {
-      var badges = document.createElement("div");
-      badges.className = "slide-badges";
-      var badge = document.createElement("button");
-      badge.className = "anno-pill";
+      var badge = document.createElement("span");
+      badge.className = "fb-card-badge";
       badge.textContent = badgeText;
       badge.title = t("slide.anno.badge.title");
-      badge.addEventListener("click", function (e) {
-        e.stopPropagation();
-        openSlide(sid);
-        // 打开后自动展开标注面板
-        setTimeout(function () { openAnnoPanel(); }, 600);
+      label.appendChild(badge);
+    }
+    if (s.temporary_view_expires_at) {
+      var tempTag = document.createElement("span");
+      tempTag.className = "fb-card-temp";
+      tempTag.textContent = t("tempview.badge");
+      label.appendChild(tempTag);
+    }
+    var dot = document.createElement("i");
+    dot.className = "fb-card-dot";
+    dot.textContent = active ? "●" : "";
+    label.appendChild(dot);
+    card.appendChild(label);
+    // 缩略图：只为当前叠创建（渲染即当前叠）；失败显示占位（CSS 类）
+    if (!failed) {
+      var img = document.createElement("img");
+      img.className = "fb-card-img";
+      img.alt = "";
+      img.setAttribute("loading", "lazy");
+      img.src = slideThumbnailUrl(sid);
+      img.addEventListener("error", function () {
+        card.classList.add("fb-thumb-error");
+        img.removeAttribute("src");
       });
-      badges.appendChild(badge);
-      mid.appendChild(badges);
-    }
-
-    var meta = document.createElement("div");
-    meta.className = "slide-meta";
-    var metaParts = [];
-    if (sinfo) {
-      metaParts.push(slideMetaTags(sinfo));
-      if (unfiled && sinfo.size_bytes) metaParts.push(fmtSize(sinfo.size_bytes));
-      if (sinfo.note) metaParts.push('<span class="sm-note">' + esc(sinfo.note) + "</span>");
+      card.appendChild(img);
     } else {
-      metaParts.push(t("slide.not.found"));
+      card.classList.add("fb-thumb-error");
     }
-    meta.innerHTML = metaParts.join(" · ");
-    mid.appendChild(meta);
-    row.appendChild(mid);
+    hit.appendChild(card);
 
-    // 别名/备注编辑钮（hover 浮现）
-    var editBtn = document.createElement("button");
-    editBtn.className = "slide-edit";
-    editBtn.textContent = "✎";
-    editBtn.title = t("slide.op.alias");
-    editBtn.addEventListener("click", function (ev) {
+    // 卡片「⋯」菜单：保留全部单片操作（重命名/备注、加入文件夹、从此文件夹
+    // 移出、分享、Demo 目录、删除）
+    var menuBtn = document.createElement("button");
+    menuBtn.type = "button";
+    menuBtn.className = "fb-card-menu";
+    menuBtn.textContent = "⋯";
+    menuBtn.setAttribute("aria-haspopup", "menu");
+    menuBtn.setAttribute("aria-label", t("fb.folder.menu.aria"));
+    menuBtn.addEventListener("click", function (ev) {
       ev.stopPropagation();
-      enterSlideMetaEdit(row, sname, sinfo, sid);
+      openFbSlideMenu(menuBtn, s, sid, sname);
     });
-    row.appendChild(editBtn);
+    hit.appendChild(menuBtn);
 
-    // 单独分享按钮（hover 浮现）：直接分享这一张，无需勾选
-    var shareBtn = document.createElement("button");
-    shareBtn.className = "slide-share";
-    shareBtn.textContent = "↗";
-    shareBtn.title = t("slide.op.share");
-    shareBtn.addEventListener("click", function (ev) {
-      ev.stopPropagation();
-      doCreateShare([sid]);
+    // 悬停只预览：不打开切片、不改倍率/AI/标注（点击才 openSlide）
+    hit.addEventListener("pointerenter", function (e) {
+      if (e && e.pointerType === "touch") return;
+      hit.classList.add("extracted");
     });
-    row.appendChild(shareBtn);
+    hit.addEventListener("pointerleave", function () { hit.classList.remove("extracted"); });
+    hit.addEventListener("focus", function () { hit.classList.add("extracted"); });
+    hit.addEventListener("blur", function () { hit.classList.remove("extracted"); });
+    hit.addEventListener("click", function () { openSlide(sid); });
+    hit.addEventListener("keydown", function (e) { fbStackKeydown(e, hit); });
+    return hit;
+  }
 
-    // 删除按钮（hover 浮现）：有 slide_id 走权威 ID 端点（id_bundle 资产按名
-    // 不可寻址，旧名端点对其返回 403/404）；仅旧后端/无 ID 行回落按名
-    var delBtn = document.createElement("button");
-    delBtn.className = "slide-del";
-    delBtn.textContent = "×";
-    delBtn.title = t("slide.op.del");
-    delBtn.addEventListener("click", function (ev) {
-      ev.stopPropagation();
-      deleteSlide(dispName || sname, assetId, sinfo ? sinfo.name : sname);
-    });
-    row.appendChild(delBtn);
+  // 堆叠键盘导航：↑/↓ 在卡片（含文件夹卡）间移动，Enter 原生触发打开
+  function fbStackKeydown(e, node) {
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    e.preventDefault();
+    var kids = els.fbStack ? els.fbStack.querySelectorAll(".fb-folder, .fb-hit") : [];
+    var idx = -1;
+    for (var i = 0; i < kids.length; i++) { if (kids[i] === node) { idx = i; break; } }
+    var next = kids[idx + (e.key === "ArrowDown" ? 1 : -1)];
+    if (next && typeof next.focus === "function") { try { next.focus(); } catch (err) {} }
+  }
 
-    // Demo 目录按钮（仅 owner；加入后无需登录即可从互联网访问，docs §5.1）。
-    // admin demo-catalog 写通道按名：无唯一名的 id_bundle 资产不提供（按原始
-    // 文件名会定位到别的同名切片）
-    if (sinfo ? !sinfo.name : !!idHint) {
-      row.addEventListener("click", function () { openSlide(sid); });
-      return row;
+  // ---------- 通用小菜单（＋ / 文件夹 ⋯ / 卡片 ⋯ / 加入文件夹 / 移动到） ----------
+  function closeFbMenuEl(menu) {
+    if (menu && menu.parentNode) menu.parentNode.removeChild(menu);
+    if (menu && menu.setAttribute) menu.setAttribute("hidden", "");
+  }
+  function openFbMenuEl(menu, anchor) {
+    // 挂 body（避免侧栏收起/overflow 裁剪）；固定定位在锚点下方，越界钳回
+    closeFbMenuEl(menu);
+    if (menu.removeAttribute) menu.removeAttribute("hidden");
+    document.body.appendChild(menu);
+    var r = anchor.getBoundingClientRect ? anchor.getBoundingClientRect()
+      : { left: 8, right: 40, bottom: 40, top: 20 };
+    var vw = window.innerWidth || 1024;
+    var vh = window.innerHeight || 768;
+    var mw = menu.offsetWidth || 160;
+    var mh = menu.offsetHeight || 120;
+    var left = Math.min(r.left, vw - mw - 8);
+    if (left < 8) left = 8;
+    var top2 = r.bottom + 4;
+    if (top2 + mh > vh - 8 && r.top - mh - 4 >= 8) top2 = r.top - mh - 4;
+    menu.style.left = Math.round(left) + "px";
+    menu.style.top = Math.round(top2) + "px";
+    menu.classList.add("open");
+    function onDocClick(ev) {
+      var tgt = ev.target;
+      if (tgt && tgt.closest && (tgt.closest("#" + menu.id) || tgt.closest("#" + anchor.id))) return;
+      closeFbMenu();
     }
-    var demoBtn = document.createElement("button");
-    demoBtn.className = "slide-demo";
-    demoBtn.type = "button";
-    demoBtn.dataset.name = sname;
-    demoBtn.addEventListener("click", function (ev) {
-      ev.stopPropagation();
-      toggleDemoCatalog(sname);
+    function onKey(ev) { if (ev.key === "Escape") closeFbMenu(); }
+    var closeFbMenu = function () {
+      closeFbMenuEl(menu);
+      document.removeEventListener("click", onDocClick, true);
+      document.removeEventListener("keydown", onKey, true);
+      if (anchor.setAttribute) anchor.setAttribute("aria-expanded", "false");
+    };
+    setTimeout(function () {
+      document.addEventListener("click", onDocClick, true);
+      document.addEventListener("keydown", onKey, true);
+    }, 0);
+    menu.__close = closeFbMenu;
+    if (anchor.setAttribute) anchor.setAttribute("aria-expanded", "true");
+    return closeFbMenu;
+  }
+  function menuItemEl(label, onClick, danger) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.className = "fb-menu-item" + (danger ? " danger" : "");
+    b.setAttribute("role", "menuitem");
+    b.textContent = label;
+    b.addEventListener("click", function (e) {
+      e.stopPropagation();
+      var menu = b.parentNode;
+      if (menu && typeof menu.__close === "function") menu.__close();
+      else closeFbMenuEl(menu);
+      onClick();
     });
-    row.appendChild(demoBtn);
-    updateDemoBtn(demoBtn, sname);
+    return b;
+  }
 
-    row.addEventListener("click", function () { openSlide(sid); });
-    return row;
+  // 卡片「⋯」菜单：单片操作一项不少（§5.2）
+  function openFbSlideMenu(anchor, s, sid, sname) {
+    var menu = document.createElement("div");
+    menu.id = "fb-slide-menu";
+    menu.className = "fb-menu fb-slide-menu";
+    menu.setAttribute("role", "menu");
+    menu.setAttribute("aria-label", sname || sid);
+    menu.appendChild(menuItemEl(t("fb.menu.rename"), function () { promptSlideMeta(sname, s, sid); }));
+    menu.appendChild(menuItemEl(t("fb.menu.addto"), function () { openFbAddToFolder(anchor, s, sid); }));
+    if (fbState.folder && fbState.folder !== FB_TEMP_KEY) {
+      menu.appendChild(menuItemEl(t("fb.menu.remove"), function () { removeSlideFromFolder(s, sid, fbState.folder); }));
+    }
+    menu.appendChild(menuItemEl(t("fb.menu.share"), function () { doCreateShare([sid]); }));
+    // Demo 目录按钮（仅 owner；与旧行内 ▣/▢ 同一能力）
+    if (s && s.name) {
+      var inCatalog = !!demoCatalogNames[s.name];
+      menu.appendChild(menuItemEl(t(inCatalog ? "demo.catalog.remove" : "demo.catalog.add"),
+        function () { toggleDemoCatalog(s.name); }));
+    }
+    menu.appendChild(menuItemEl(t("fb.menu.delete"),
+      function () { deleteSlide(slideDisplayName(s) || sname, (s && s.slide_id) || sid, s ? s.name : sname); }, true));
+    openFbMenuEl(menu, anchor);
+  }
+
+  // 「加入文件夹…」：把这张切片 POST 到所选项目（与切片选择器确认同端点）
+  function openFbAddToFolder(anchor, s, sid) {
+    var menu = document.createElement("div");
+    menu.id = "fb-addto-menu";
+    menu.className = "fb-menu fb-slide-menu";
+    menu.setAttribute("role", "menu");
+    menu.setAttribute("aria-label", t("fb.addto.title"));
+    if (!allProjects.length) {
+      var empty = document.createElement("div");
+      empty.className = "fb-menu-note";
+      empty.textContent = t("proj.empty");
+      menu.appendChild(empty);
+    }
+    allProjects.forEach(function (p) {
+      menu.appendChild(menuItemEl(truncateMiddle(p.name || t("fb.addto.untitled"), 18), function () {
+        apiFetch("/api/project/" + encodeURIComponent(p.pid) + "/slides", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(slideRefsPayload([sid])),
+        })
+          .then(function (r) {
+            if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || t("fb.addto.fail", { e: r.status })); });
+            return r.json();
+          })
+          .then(function () { toast(t("fb.addto.done", { name: p.name || "" }), "success"); reloadProjectsAndUnfiled(); })
+          .catch(function (e) { toast(t("fb.addto.fail", { e: e.message }), "error"); });
+      }));
+    });
+    openFbMenuEl(menu, anchor);
+  }
+
+  // 「从此文件夹移出」：只删关联；失去全部关联的切片回到根目录「未归类」（§5.3）
+  function removeSlideFromFolder(s, sid, pid) {
+    var byId = !!(s && s.slide_id) && slideIdApiOn();
+    var url = byId
+      ? "/api/project/" + encodeURIComponent(pid) + "/slides/" + encodeURIComponent(s.slide_id)
+      : "/api/project/" + encodeURIComponent(pid) + "/slide/" + encodeURIComponent((s && s.name) || sid);
+    apiFetch(url, { method: "DELETE" })
+      .then(function (r) {
+        if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || t("fb.remove.fail", { e: r.status })); });
+        return r.json();
+      })
+      .then(function () { toast(t("fb.remove.done"), "success"); reloadProjectsAndUnfiled(); })
+      .catch(function (e) { toast(t("fb.remove.fail", { e: e.message }), "error"); });
+  }
+
+  // 「移动到…」：根目录 + 其余文件夹（排除自身与自身子树；环检测由服务端
+  // 事务内做，前端只做同口径预检与可读报错）。本分支后端未合入
+  // parent_project_id 时 PATCH 会忽略该字段——行为=移动暂不生效（可验证期
+  // 在合并后）。
+  function openFbMoveDialog(anchor) {
+    var cur = fbProject(fbState.folder);
+    if (!cur) return;
+    var menu = document.createElement("div");
+    menu.id = "fb-move-menu";
+    menu.className = "fb-menu fb-slide-menu";
+    menu.setAttribute("role", "menu");
+    menu.setAttribute("aria-label", t("fb.move.title"));
+    function moveTo(targetPid, targetName) {
+      apiFetch("/api/project/" + encodeURIComponent(cur.pid), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ parent_project_id: targetPid }),
+      })
+        .then(function (r) {
+          if (!r.ok) {
+            return r.json().then(function (j) {
+              throw new Error(j.error || t("fb.move.fail", { e: r.status }));
+            });
+          }
+          return r.json();
+        })
+        .then(function () {
+          toast(t("fb.move.done", { name: targetName }), "success");
+          fbState.pages[fbState.folder] = 0;
+          reloadProjectsAndUnfiled();
+        })
+        .catch(function (e) { toast(t("fb.move.fail", { e: e.message }), "error"); });
+    }
+    menu.appendChild(menuItemEl(t("fb.move.root"), function () { moveTo(null, t("fb.root")); }));
+    allProjects.forEach(function (p) {
+      if (p.pid === cur.pid) return;
+      if (fbInSubtree(p.pid, cur.pid)) return; // 不能移到自己或自己的子孙
+      menu.appendChild(menuItemEl(truncateMiddle(fbPathOf(p.pid), 24), function () {
+        moveTo(p.pid, p.name || "");
+      }));
+    });
+    openFbMenuEl(menu, anchor);
+  }
+
+  // ---------- 浏览器头部/翻页绑定（bindEvents 调用；Demo 壳无此 DOM 时全部跳过） ----------
+  var fbResizePending = false;
+  function initFbBrowser() {
+    if (!els.fbStack) return;
+    if (els.fbUpBtn) {
+      els.fbUpBtn.addEventListener("click", function () {
+        // 返回上级：恢复该目录上次所在叠（fbGo 内读 pages 记忆）
+        var key = fbState.folder === FB_TEMP_KEY ? null : fbParentOf(fbProject(fbState.folder) || {});
+        fbGo(key || null);
+      });
+    }
+    if (els.fbPrevBtn) {
+      els.fbPrevBtn.addEventListener("click", function () {
+        if (fbState.page > 0) { fbState.page -= 1; renderFolderBrowser(); }
+      });
+    }
+    if (els.fbNextBtn) {
+      els.fbNextBtn.addEventListener("click", function () {
+        if (fbState.page < fbState.totalPages - 1) { fbState.page += 1; renderFolderBrowser(); }
+      });
+    }
+    // ＋ 菜单（导入切片 / 新建文件夹）
+    if (els.fbPlusBtn && els.fbPlusMenu) {
+      els.fbPlusMenu.addEventListener("click", function (e) {
+        // 菜单项点击后收起（导入抽屉/新建对话框各自打开）
+        if (e.target && e.target.closest && e.target.closest("button")) {
+          if (typeof els.fbPlusMenu.__close === "function") els.fbPlusMenu.__close();
+        }
+      });
+      els.fbPlusBtn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        if (els.fbPlusMenu.parentNode) { if (els.fbPlusMenu.__close) els.fbPlusMenu.__close(); return; }
+        openFbMenuEl(els.fbPlusMenu, els.fbPlusBtn);
+      });
+    }
+    // 当前文件夹 ⋯ 菜单（重命名 / 移动到… / 分享此文件夹 / 删除文件夹）
+    if (els.fbFolderBtn && els.fbFolderMenu) {
+      els.fbFolderMenu.addEventListener("click", function (e) {
+        if (e.target && e.target.closest && e.target.closest("button")) {
+          if (typeof els.fbFolderMenu.__close === "function") els.fbFolderMenu.__close();
+        }
+      });
+      els.fbFolderBtn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        if (els.fbFolderMenu.parentNode) { if (els.fbFolderMenu.__close) els.fbFolderMenu.__close(); return; }
+        openFbMenuEl(els.fbFolderMenu, els.fbFolderBtn);
+      });
+    }
+    if (els.fbRename) els.fbRename.addEventListener("click", function () {
+      var p = fbProject(fbState.folder);
+      if (p) editProject(p);
+    });
+    if (els.fbMove) els.fbMove.addEventListener("click", function () { openFbMoveDialog(els.fbFolderBtn); });
+    if (els.fbShareFolder) els.fbShareFolder.addEventListener("click", function () {
+      var p = fbProject(fbState.folder);
+      if (p) shareProject(p);
+    });
+    if (els.fbDelete) els.fbDelete.addEventListener("click", function () {
+      var p = fbProject(fbState.folder);
+      if (!p) return;
+      // 确认框说明：子文件夹回到根、切片不删（§5.3）
+      if (!confirm(t("fb.del.confirm", { name: p.name || "" }))) return;
+      deleteProject(p);
+    });
+    // 窗口高度变化 → 可用高度变化 → 叠大小重算（rAF 节流，翻页不变）
+    window.addEventListener("resize", function () {
+      if (fbResizePending) return;
+      fbResizePending = true;
+      (window.requestAnimationFrame || function (cb) { setTimeout(cb, 16); })(function () {
+        fbResizePending = false;
+        renderFolderBrowser();
+      });
+    });
+    // 首帧（loadAll 之前）先渲染空态，避免空白侧栏
+    renderFolderBrowser();
+  }
+
+  // 行内别名/备注编辑（卡片「⋯ → 重命名 / 备注」）：两次 prompt 收集
+  // display_name/note，ID 通道 PATCH /api/slides/<slide_id>；旧后端回落
+  // POST /api/slide/<name>/meta（alias 入参服务端映射 display_name）。
+  // 叠卡空间放不下行内表单，改用 prompt（与项目重命名同一交互档）。
+  function promptSlideMeta(sname, sinfo, sid) {
+    var alias0 = (sinfo && (sinfo.display_name || sinfo.alias)) || "";
+    var note0 = (sinfo && sinfo.note) || "";
+    var alias = window.prompt(t("edit.alias.ph"), alias0);
+    if (alias === null) return;
+    var note = window.prompt(t("edit.note.ph"), note0);
+    if (note === null) return;
+    var req;
+    if (slideIdApiOn() && sid && sinfo && sinfo.slide_id) {
+      req = apiFetch("/api/slides/" + encodeURIComponent(sinfo.slide_id), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ display_name: alias, note: note }),
+      });
+    } else {
+      req = apiFetch("/api/slide/" + encodeURIComponent(sname) + "/meta", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ alias: alias, note: note }),
+      });
+    }
+    req
+      .then(function (r) {
+        if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || t("save.fail")); });
+        return r.json();
+      })
+      .then(function () {
+        toast(t("common.updated"), "success");
+        reloadProjectsAndUnfiled();
+      })
+      .catch(function (e) { toast(t("save.fail2", { e: e.message }), "error"); });
   }
 
   // ---------- Demo 目录（owner allowlist，PT-4 docs §5.1） ----------
@@ -2885,77 +3435,6 @@
     });
   }
 
-  // 行内别名/备注编辑态。sid 是该行操作键（slide_id；旧后端=名）
-  function enterSlideMetaEdit(row, sname, sinfo, sid) {
-    if (!row) return;
-    var alias0 = (sinfo && (sinfo.display_name || sinfo.alias)) || "";
-    var note0 = (sinfo && sinfo.note) || "";
-    // 清空行内容，替换为编辑表单
-    row.innerHTML = "";
-    row.classList.add("editing");
-    row.removeEventListener("click", openSlide);
-    var form = document.createElement("div");
-    form.className = "slide-edit-form";
-    var aInput = document.createElement("input");
-    aInput.type = "text"; aInput.maxLength = 60; aInput.placeholder = t("edit.alias.ph");
-    aInput.value = alias0;
-    var nInput = document.createElement("input");
-    nInput.type = "text"; nInput.maxLength = 200; nInput.placeholder = t("edit.note.ph");
-    nInput.value = note0;
-    var actions = document.createElement("div");
-    actions.className = "sef-actions";
-    var okBtn = document.createElement("button");
-    okBtn.className = "btn primary small"; okBtn.textContent = t("edit.confirm");
-    var cancelBtn = document.createElement("button");
-    cancelBtn.className = "btn secondary small"; cancelBtn.textContent = t("edit.cancel");
-    actions.appendChild(okBtn); actions.appendChild(cancelBtn);
-    form.appendChild(aInput); form.appendChild(nInput); form.appendChild(actions);
-    row.appendChild(form);
-    aInput.focus();
-
-    function commit() {
-      var alias = aInput.value;
-      var note = nInput.value;
-      // P2 合同 §7：ID 通道 PATCH /api/slides/<slide_id>（display_name 是唯一
-      // 可编辑展示名，R-02）；旧后端回落 POST /api/slide/<name>/meta（alias
-      // 入参服务端映射 display_name）
-      var req;
-      if (slideIdApiOn() && sid) {
-        req = apiFetch("/api/slides/" + encodeURIComponent(sid), {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ display_name: alias, note: note }),
-        });
-      } else {
-        req = apiFetch("/api/slide/" + encodeURIComponent(sname) + "/meta", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ alias: alias, note: note }),
-        });
-      }
-      req
-        .then(function (r) {
-          if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || t("save.fail")); });
-          return r.json();
-        })
-        .then(function () {
-          toast(t("common.updated"), "success");
-          reloadProjectsAndUnfiled();
-        })
-        .catch(function (e) { toast(t("save.fail2", { e: e.message }), "error"); });
-    }
-    okBtn.addEventListener("click", function (e) { e.stopPropagation(); commit(); });
-    cancelBtn.addEventListener("click", function (e) {
-      e.stopPropagation();
-      reloadProjectsAndUnfiled();
-    });
-    aInput.addEventListener("keydown", function (e) { if (e.key === "Enter") nInput.focus(); });
-    nInput.addEventListener("keydown", function (e) {
-      if (e.key === "Enter") { e.stopPropagation(); commit(); }
-      if (e.key === "Escape") { e.stopPropagation(); reloadProjectsAndUnfiled(); }
-    });
-  }
-
   // 列表查找（P2 合同 §5.1：按 id 定位；旧后端/名称快照按名——两个键空间
   // 不相交：slide_id 是 sld_ 前缀服务端随机串，文件名带扩展名）
   function findSlideInfo(ref) {
@@ -2984,32 +3463,6 @@
     return ((p && p.slides) || []).map(function (n) { return { slide: n, slide_id: null }; });
   }
 
-  // ---------- 未归类切片 ----------
-  function renderUnfiled() {
-    var unfiled = allSlides.filter(function (s) { return !isSlideInAnyProject(s); });
-    els.unfiledCount.textContent = String(unfiled.length);
-    els.unfiledList.innerHTML = "";
-    if (unfiled.length === 0) {
-      var empty = document.createElement("div");
-      empty.className = "unfiled-empty";
-      empty.textContent = t("unfiled.empty");
-      els.unfiledList.appendChild(empty);
-      // 真实空态（没有未归类切片）不是过滤结果：清掉过滤残留并复位计数
-      applySlideFilter(getSlideQuery());
-      return;
-    }
-    // 同显示名（display_name）条目用列表自带的日期/序号辅助信息区分，
-    // 不改 ID（P2 合同 §5.4：同名条目按 data-slide-id 各自定位）。
-    // P3 起 id_bundle 行 name=None：行定位名回落 original_filename，再回落
-    // slide_id（显示键非操作键——操作键恒为 dataset.slideId）
-    unfiled.forEach(function (s) {
-      els.unfiledList.appendChild(renderSlideRow(
-        s.name || s.original_filename || slideRefOf(s), true, s));
-    });
-    // 升级 A：列表重渲后重放当前搜索条件（搜索条件不因收起/重渲丢失）
-    applySlideFilter(getSlideQuery());
-  }
-
   // ---------- 新建项目（W3：独立对话框；修 R3 草稿残留 / R4 重复提交） ----------
   // R3：旧实现把「显式空数组」回退到 pendingNewProjectSlides（未归类勾选的
   // 隐式全局），取消含选中后普通新建仍夹带旧选择。现在 empty / selection
@@ -3025,6 +3478,7 @@
     idemKey: null,         // 当前草稿的 Idempotency-Key（未发送/已失败时保留）
     idemFingerprint: "",   // 生成 idemKey 时的载荷指纹
     lastFocusEl: null,     // 打开者（Esc/关闭后归还焦点）
+    parentPid: null,       // 新建文件夹的父文件夹（当前所在文件夹；null=根）
   };
 
   function uuid() {
@@ -3042,8 +3496,8 @@
     return s;
   }
 
-  function projectDialogFingerprint(name, note, slides) {
-    return JSON.stringify([name, note, slides.slice().sort()]);
+  function projectDialogFingerprint(name, note, slides, parentPid) {
+    return JSON.stringify([name, note, slides.slice().sort(), parentPid || null]);
   }
 
   function pcdShowError(msg) {
@@ -3112,6 +3566,11 @@
     triggerEl = closeSidebarDrawerUnderOverlay(triggerEl);
     projectDialog.open = true;
     projectDialog.mode = mode === "selection" ? "selection" : "empty";
+    // 改版 2026-10-08：对话框文案/提交目标 =「文件夹」；父文件夹 = 浏览器
+    // 当前所在文件夹（根目录为 null）。后端未合入 parent_project_id 时该
+    // 字段被忽略（行为=仍在根创建，合并后生效）。
+    projectDialog.parentPid = (fbState.folder && fbState.folder !== FB_TEMP_KEY)
+      ? fbState.folder : null;
     projectDialog.slides = projectDialog.mode === "selection" && Array.isArray(slidesSnapshot)
       ? slidesSnapshot.slice() : [];
     projectDialog.inFlight = false;
@@ -3123,9 +3582,10 @@
     if (els.pcdNote) els.pcdNote.value = "";
     pcdShowError("");
     renderProjectDialogSlides();
+    if (els.pcdTitle) els.pcdTitle.textContent = t("pcd.title.folder");
     if (els.pcdConfirm) {
       els.pcdConfirm.disabled = false;
-      els.pcdConfirm.textContent = t("pcd.confirm");
+      els.pcdConfirm.textContent = t("pcd.confirm.folder");
     }
     els.projectCreateMask.hidden = false;
     if (els.pcdName && typeof els.pcdName.focus === "function") {
@@ -3143,6 +3603,7 @@
     projectDialog.slides = [];
     projectDialog.idemKey = null;
     projectDialog.idemFingerprint = "";
+    projectDialog.parentPid = null;
     els.projectCreateMask.hidden = true;
     pcdShowError("");
     var back = projectDialog.lastFocusEl;
@@ -3152,20 +3613,19 @@
     }
   }
 
-  // 定位新项目：展开行并滚到可见（成功后的「locate pid」）
+  // 定位新文件夹（成功后的「locate pid」）：在当前文件夹内创建的——原地重渲
+  // （新文件夹卡直接可见）；否则切到该文件夹。
   function locateProject(pid) {
-    if (!pid || !els.projectList) return;
-    var rows = els.projectList.children || [];
-    for (var i = 0; i < rows.length; i++) {
-      var row = rows[i];
-      if (row.dataset && row.dataset.pid === pid) {
-        if (row.classList) row.classList.add("expanded");
-        if (typeof row.scrollIntoView === "function") {
-          try { row.scrollIntoView({ block: "nearest" }); } catch (e) {}
-        }
-        return;
-      }
+    if (!pid || !fbProject(pid)) return;
+    var parent = fbParentOf(fbProject(pid));
+    if ((parent || null) === (fbState.folder || null)) {
+      renderFolderBrowser();
+      return;
     }
+    fbState.pages[fbState.folder] = fbState.page;
+    fbState.folder = pid;
+    fbState.page = 0;
+    renderFolderBrowser();
   }
 
   function ensureProjectIdemKey(payloadFp) {
@@ -3185,20 +3645,22 @@
     var note = (els.pcdNote && els.pcdNote.value) || "";
     // slides 永远显式：空数组=空项目（R3），无任何隐式回退
     var slides = projectDialog.slides.slice();
-    var fp = projectDialogFingerprint(name, note, slides);
+    var fp = projectDialogFingerprint(name, note, slides, projectDialog.parentPid);
     var idemKey = ensureProjectIdemKey(fp);
     projectDialog.inFlight = true;
     pcdShowError("");
     els.pcdConfirm.disabled = true;
-    els.pcdConfirm.textContent = t("pcd.creating");
+    els.pcdConfirm.textContent = t("pcd.creating.folder");
     var headers = { "Content-Type": "application/json", "Idempotency-Key": idemKey };
     // P2 合同 §3.2：ID 通道发 slide_ids（草稿键是行操作键 slide_id；旧后端
-    // 回落 slides 名数组）
+    // 回落 slides 名数组）；改版附加 parent_project_id（当前文件夹）
     apiFetch("/api/project/create", {
       method: "POST",
       headers: headers,
       body: JSON.stringify(Object.assign(
-        { name: name, note: note }, slideRefsPayload(slides))),
+        { name: name, note: note },
+        projectDialog.parentPid ? { parent_project_id: projectDialog.parentPid } : {},
+        slideRefsPayload(slides))),
     })
       .then(function (r) {
         return r.json().then(function (j) {
@@ -3225,10 +3687,8 @@
         if (els.projectCreateMask) els.projectCreateMask.hidden = true;
         if (els.pcdConfirm) {
           els.pcdConfirm.disabled = false;
-          els.pcdConfirm.textContent = t("pcd.confirm");
+          els.pcdConfirm.textContent = t("pcd.confirm.folder");
         }
-        slideChecked = {};
-        renderUnfiled();
         reloadProjectsAndUnfiled().then(function () {
           locateProject(created && (created.pid || created.id));
         }).catch(function () {
@@ -3241,7 +3701,7 @@
         projectDialog.inFlight = false;
         if (els.pcdConfirm) {
           els.pcdConfirm.disabled = false;
-          els.pcdConfirm.textContent = t("pcd.confirm");
+          els.pcdConfirm.textContent = t("pcd.confirm.folder");
         }
         pcdShowError(t("newproj.create.fail2", { e: (e && e.message) ? e.message : e }));
       });
@@ -3316,12 +3776,15 @@
   // =========================================================================
   // 切片选择器（添加切片到项目）
   // =========================================================================
-  function openSlidePicker(pid, pname) {
+  // mode="share"：选择切片…（§5.1）——同一选择器，确认改为回填分享浮层目标
+  function openSlidePicker(pid, pname, opts) {
+    opts = opts || {};
     pickerCtx.targetPid = pid;
     pickerCtx.selected = {};
-    els.pickerTitleText.textContent = pname
-      ? t("picker.title.with", { name: pname })
-      : t("picker.title");
+    pickerCtx.mode = opts.mode === "share" ? "share" : "add";
+    els.pickerTitleText.textContent = pickerCtx.mode === "share"
+      ? t("sb.share.pick")
+      : (pname ? t("picker.title.with", { name: pname }) : t("picker.title"));
     els.pickerList.innerHTML = "";
     allSlides.forEach(function (s) {
       var row = document.createElement("label");
@@ -3361,11 +3824,20 @@
     els.pickerMask.style.display = "none";
     pickerCtx.targetPid = null;
     pickerCtx.selected = {};
+    pickerCtx.mode = "add";
   }
 
   function confirmSlidePicker() {
     var refs = Object.keys(pickerCtx.selected).filter(function (k) { return pickerCtx.selected[k]; });
     if (refs.length === 0) { toast(t("picker.need.slide"), "error"); return; }
+    if (pickerCtx.mode === "share") {
+      // 分享多选：回填浮层目标（保持浮层打开，直接可点「分享选中切片」）
+      sharePendingSlides = refs;
+      updateShareTargetLine();
+      toast(t("sb.share.picked.toast", { n: refs.length }), "info");
+      closeSlidePicker();
+      return;
+    }
     var pid = pickerCtx.targetPid;
     if (!pid) return;
     // P2 合同 §3.2：ID 通道发 slide_ids（picker 键=行操作键）；旧后端 slides(名)
@@ -3457,8 +3929,7 @@
         copyText(data.url);
         toast(t("share.created"), "success");
         sharePendingSlides = null;
-        slideChecked = {};
-        renderUnfiled();
+        updateShareTargetLine();
         reloadShares();
       })
       .catch(function (e) { toast(t("share.create.fail2", { s: e.message }), "error"); })
@@ -3468,8 +3939,9 @@
       });
   }
 
-  // 分享本项目（项目 DTO 的 slides 是名数组；ID 通道逐名解析成 slide_id 作
-  // 操作键，列表外资产保持名——payload 构建时按通道裁决）
+  // 分享文件夹（项目 DTO 的 slides 是名数组；ID 通道逐名解析成 slide_id 作
+  // 操作键，列表外资产保持名——payload 构建时按通道裁决）。改版后入口 =
+  // 文件夹「⋯ → 分享此文件夹」：预填目标并打开顶栏分享浮层（§5.1）。
   function shareProject(p) {
     var slides = p.slides || [];
     if (slides.length === 0) { toast(t("share.project.empty"), "error"); return; }
@@ -3477,30 +3949,38 @@
       var s = findSlideInfo(n);
       return (s && s.slide_id) || n;
     });
-    // 展开分享管理区，预填提示
-    var shareSec = els.shareMgrBody.closest(".section");
-    if (shareSec) shareSec.classList.remove("collapsed");
     els.shareCreateBtn.textContent = t("share.project.btn", { name: (p.name || ""), n: slides.length });
     toast(t("share.project.selected.tip", { n: slides.length }), "info");
     els.shareResult.style.display = "none";
+    updateShareTargetLine();
+    if (sharePopCtl) sharePopCtl.open();
   }
 
-  // 分享管理区按钮：若有 sharePendingSlides 则用它，否则用未归类勾选
+  // 分享浮层「分享选中切片」：优先浮层预填目标（当前切片 / 选择切片… /
+  // 分享此文件夹），否则回落当前打开的切片
   function onShareCreateClick() {
     var slides;
     if (sharePendingSlides) {
       slides = sharePendingSlides;
+    } else if (state.slide) {
+      slides = [activeSlideRef()];
     } else {
-      slides = Object.keys(slideChecked).filter(function (k) { return slideChecked[k]; });
+      slides = [];
     }
     doCreateShare(slides);
   }
 
-  // 未归类"分享选中"
-  function onUnfiledShare() {
-    var slides = Object.keys(slideChecked).filter(function (k) { return slideChecked[k]; });
-    if (slides.length === 0) { toast(t("unfiled.need.check"), "error"); return; }
-    doCreateShare(slides);
+  // 分享浮层目标摘要行（当前切片 / N 张切片 / 未选择）
+  function updateShareTargetLine() {
+    if (!els.shareTargetLine) return;
+    if (sharePendingSlides && sharePendingSlides.length) {
+      els.shareTargetLine.textContent = t("sb.share.target.slides", { n: sharePendingSlides.length });
+    } else if (state.slide) {
+      els.shareTargetLine.textContent = t("sb.share.target.slide",
+        { name: slideDisplayName(state.slide) || state.slide.name });
+    } else {
+      els.shareTargetLine.textContent = t("sb.share.target.none");
+    }
   }
 
   function renderShareList(shares) {
@@ -3815,228 +4295,115 @@
     }
   }
 
-  // ---------- 切片搜索（2026-09-22 重做，slide-search-autofill-bug） ----------
-  // 按需创建：默认 DOM 没有搜索输入框，点「搜索切片」才创建；关闭即清空
-  // 过滤、移除输入框并把焦点还给按钮。首屏无输入框 + 防自动填充属性 +
-  // 原生 autofill 标记检测，避免浏览器/密码管理器把账号邮箱填进侧栏顶部、
-  // 造成「有数量、无列表、无解释」的误填状态。查询保留在输入框里，侧栏
-  // 收起/展开、列表重渲不丢失；重渲后由 renderTail 重放当前条件。
-  var slideSearchState = { open: false, wrap: null, label: null, input: null, closeBtn: null };
+  // ---------- 顶栏搜索浮层（改版 2026-10-08，§5.4） ----------
+  // 替换旧侧栏内联过滤：浮层挂在顶栏「搜索」按钮下（bindToolbarPop 统一开合/
+  // 外点关闭/Esc）。输入框由打开时创建（沿用 slide-search-autofill-bug 的
+  // 防自动填充方案：首屏 DOM 无搜索输入框 + autocomplete off + 各管理器忽略
+  // 标记）。匹配 /api/slides 全量（显示名/别名/原文件名），点击结果 → 左栏
+  // 切到所在文件夹并翻页 → openSlide → 关浮层；Esc 关闭并把焦点还给按钮。
+  var tbSearchState = { input: null, results: [], page: 0, pageSize: 6, totalPages: 1 };
+  var searchPopCtl = null;
+  var searchThumbSeq = 0;
 
-  // 原生 autofill 状态检测：能力检测 + try/catch，不支持的浏览器一律按
-  // 「非自动填充」处理，绝不让检测异常中断列表加载/过滤
-  function isNativeAutofilled(el) {
-    if (!el || typeof el.matches !== "function") return false;
-    try { return el.matches(":-webkit-autofill"); } catch (e) { return false; }
-  }
-
-  // 当前有效查询：输入框不存在（未创建/已移除/脱离 DOM）时为空串。读取时
-  // 发现明确标记为自动填充的值：清掉该值并返回空查询（列表保持全量）。
-  // 不按「含 @ / 像邮箱」拒绝——用户可能合法地按文件名/别名搜索。
-  function getSlideQuery() {
-    var st = slideSearchState;
-    if (!st.open || !st.input || !st.input.isConnected) return "";
-    if (st.input.value && isNativeAutofilled(st.input)) {
-      st.input.value = "";
-      return "";
-    }
-    return st.input.value;
-  }
-
-  // 动态控件文案/aria 随语言刷新（静态节点由 i18n.js applyLang 处理）
-  function refreshSlideSearchTexts() {
-    var st = slideSearchState;
-    if (st.label) st.label.textContent = t("sb.search.label");
-    if (st.input) {
-      st.input.setAttribute("placeholder", t("sb.search.ph"));
-      st.input.setAttribute("aria-label", t("sb.search.aria"));
-    }
-    if (st.closeBtn) {
-      var closeLabel = t("sb.search.close");
-      st.closeBtn.setAttribute("aria-label", closeLabel);
-      st.closeBtn.title = closeLabel;
-    }
-  }
-
-  function openSlideSearch() {
-    var st = slideSearchState;
-    if (!els.slideSearchArea) return;
-    if (st.open) {
-      // 已打开：按钮点击只把焦点送回输入框（关闭走 × / Escape）
-      if (st.input && typeof st.input.focus === "function") {
-        try { st.input.focus(); } catch (e) { /* 忽略聚焦失败 */ }
-      }
-      return;
-    }
-    var wrap = document.createElement("div");
-    wrap.className = "slide-search-wrap";
-
-    // 用途标签（可见 label，不只靠 placeholder 表明用途）
-    var label = document.createElement("label");
-    label.className = "slide-search-label";
-    label.setAttribute("for", "slide-search");
-    wrap.appendChild(label);
-
-    var row = document.createElement("div");
-    row.className = "slide-search-row";
+  function ensureSearchInput() {
+    if (!els.tbSearchArea || tbSearchState.input) return;
     var input = document.createElement("input");
     input.type = "search";
-    input.id = "slide-search";
-    input.className = "slide-search";
+    input.id = "tb-search-input";
+    input.className = "slide-search tb-search-input";
     // 防自动填充（辅助措施）：非账号含义的字段名 + autocomplete off + 各
-    // 密码管理器忽略标记；主要保障是首屏没有输入框与明确的用途展示
-    input.name = "slide-filter";
+    // 密码管理器忽略标记；主要保障是首屏没有输入框
+    input.name = "slide-search-pop";
     input.setAttribute("autocomplete", "off");
     input.setAttribute("data-lpignore", "true");
     input.setAttribute("data-1p-ignore", "");
     input.setAttribute("data-bwignore", "");
     input.setAttribute("data-form-type", "other");
-    row.appendChild(input);
-
-    var closeBtn = document.createElement("button");
-    closeBtn.type = "button";
-    closeBtn.id = "slide-search-close";
-    closeBtn.className = "slide-search-close";
-    closeBtn.textContent = "×";
-    row.appendChild(closeBtn);
-    wrap.appendChild(row);
-
-    els.slideSearchArea.appendChild(wrap);
-    st.open = true;
-    st.wrap = wrap;
-    st.label = label;
-    st.input = input;
-    st.closeBtn = closeBtn;
-
-    function onSearchValue() {
-      // 明确标记为浏览器原生 autofill 的值：清空并恢复列表（正常输入照常过滤）
-      if (input.value && isNativeAutofilled(input)) {
-        input.value = "";
-        applySlideFilter("");
-        return;
-      }
-      applySlideFilter(input.value);
-    }
-    input.addEventListener("input", onSearchValue);
-    input.addEventListener("change", onSearchValue);
-    // Escape 关闭搜索；阻止同一事件继续冒泡去关手机抽屉
+    input.setAttribute("placeholder", t("tb.search.ph"));
+    input.setAttribute("aria-label", t("tb.search.aria"));
+    input.addEventListener("input", function () { renderSearchResults(); });
     input.addEventListener("keydown", function (e) {
-      if (e.key === "Escape") {
+      if (e.key === "ArrowDown") {
         e.preventDefault();
-        e.stopPropagation();
-        closeSlideSearch();
+        var first = els.tbSearchResults && els.tbSearchResults.querySelector(".tb-search-result");
+        if (first && typeof first.focus === "function") { try { first.focus(); } catch (err) {} }
       }
     });
-    closeBtn.addEventListener("click", closeSlideSearch);
-
-    if (els.slideSearchBtn) els.slideSearchBtn.setAttribute("aria-expanded", "true");
-    refreshSlideSearchTexts();
-    try { input.focus(); } catch (e) { /* 忽略聚焦失败 */ }
+    els.tbSearchArea.innerHTML = "";
+    els.tbSearchArea.appendChild(input);
+    tbSearchState.input = input;
   }
 
-  function closeSlideSearch() {
-    var st = slideSearchState;
-    if (!st.open) return;
-    if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap);
-    st.open = false;
-    st.wrap = null;
-    st.label = null;
-    st.input = null;
-    st.closeBtn = null;
-    // 清空过滤、恢复全部可见切片；计数与无匹配提示由 applySlideFilter 复位
-    applySlideFilter("");
-    if (els.slideSearchBtn) {
-      els.slideSearchBtn.setAttribute("aria-expanded", "false");
-      try { els.slideSearchBtn.focus(); } catch (e) { /* 忽略聚焦失败 */ }
+  function refreshSearchTexts() {
+    if (tbSearchState.input) {
+      tbSearchState.input.setAttribute("placeholder", t("tb.search.ph"));
+      tbSearchState.input.setAttribute("aria-label", t("tb.search.aria"));
     }
   }
 
-  // ---------- 切片搜索过滤（升级 A：纯前端；收起不丢搜索条件） ----------
-  // 匹配完整文件名（data-name）与显示别名（.slide-name 文本），大小写不敏感。
-  // 项目行：名称命中 → 项目及其全部切片可见；仅切片命中 → 展开显示命中行；
-  // 无命中隐藏。未归类：过滤时计数显示 匹配数/总数（如 0/4），全部被滤掉时
-  // 显示「没有匹配的切片」提示，不留空白列表、不误写成没有上传切片。
-  function applySlideFilter(raw) {
-    if (!els.sidebar) return;
-    var q = String(raw == null ? "" : raw).trim().toLowerCase();
-    function rowMatches(row) {
-      if (!q) return true;
-      var nameEl = row.querySelector(".slide-name");
-      var hay = String(row.getAttribute("data-name") || "") + " " +
-        String((nameEl && nameEl.textContent) || "");
-      return hay.toLowerCase().indexOf(q) >= 0;
+  function renderSearchResults() {
+    if (!els.tbSearchResults) return;
+    var q = tbSearchState.input ? tbSearchState.input.value : "";
+    tbSearchState.results = fbSearchSlides(q);
+    tbSearchState.page = 0;
+    tbSearchState.totalPages = 1;
+    els.tbSearchResults.innerHTML = "";
+    if (!q || !String(q).trim()) return; // 空查询：不渲染结果区
+    if (!tbSearchState.results.length) {
+      var empty = document.createElement("div");
+      empty.className = "tb-search-empty";
+      empty.textContent = t("tb.search.empty");
+      els.tbSearchResults.appendChild(empty);
+      return;
     }
-    // 未归类行 + 匹配数/总数计数 + 无匹配提示
-    var unfiledRows = els.sidebar.querySelectorAll("#unfiled-list .slide-row");
-    var unfiledVisible = 0;
-    Array.prototype.forEach.call(unfiledRows, function (row) {
-      var hit = rowMatches(row);
-      row.style.display = hit ? "" : "none";
-      if (hit) unfiledVisible += 1;
-    });
-    var filterEmpty = els.unfiledList
-      ? els.unfiledList.querySelector(".unfiled-filter-empty") : null;
-    var needEmpty = !!q && unfiledRows.length > 0 && unfiledVisible === 0;
-    if (needEmpty) {
-      if (!filterEmpty && els.unfiledList) {
-        filterEmpty = document.createElement("div");
-        filterEmpty.className = "unfiled-filter-empty";
-        els.unfiledList.appendChild(filterEmpty);
-      }
-      if (filterEmpty) filterEmpty.textContent = t("sb.search.empty");
-    } else if (filterEmpty && filterEmpty.parentNode) {
-      filterEmpty.parentNode.removeChild(filterEmpty);
-    }
-    if (els.unfiledCount) {
-      els.unfiledCount.textContent = (q && unfiledRows.length > 0)
-        ? unfiledVisible + "/" + unfiledRows.length
-        : String(unfiledRows.length);
-    }
-    // 有查询且存在未归类切片时展开未归类分区：命中行或「没有匹配的切片」
-    // 提示必须可见（用户手动折叠态在查询期间不适用；清空查询不回收展开）
-    if (q && unfiledRows.length > 0 && els.unfiledBody) {
-      var unfiledSec = els.unfiledBody.closest(".section");
-      if (unfiledSec) unfiledSec.classList.remove("collapsed");
-    }
-    // 项目行
-    var projRows = els.sidebar.querySelectorAll(".proj-row");
-    var projVisible = 0;
-    Array.prototype.forEach.call(projRows, function (row) {
-      var nameEl = row.querySelector(".proj-name");
-      var nameHit = !!(q && nameEl &&
-        String(nameEl.textContent || "").toLowerCase().indexOf(q) >= 0);
-      var slideHit = false;
-      Array.prototype.forEach.call(row.querySelectorAll(".slide-row"), function (s) {
-        var hit = nameHit || rowMatches(s);
-        s.style.display = hit ? "" : "none";
-        if (hit) slideHit = true;
+    var thumbSeq = ++searchThumbSeq;
+    tbSearchState.results.forEach(function (s) {
+      var sid = slideRefOf(s);
+      var row = document.createElement("button");
+      row.type = "button";
+      row.className = "tb-search-result";
+      row.dataset.slideId = sid;
+      var img = document.createElement("img");
+      img.alt = "";
+      img.src = slideThumbnailUrl(sid);
+      img.addEventListener("error", function () {
+        img.classList.add("tb-thumb-error");
+        img.removeAttribute("src");
       });
-      var show = !q || nameHit || slideHit;
-      row.style.display = show ? "" : "none";
-      if (show) projVisible += 1;
-      // 过滤时命中即展开：项目名命中要整组可见，切片命中要看到命中行
-      // （折叠体会把切片藏住；清空查询不回收用户手动折叠态）
-      if (q && show && row.classList) row.classList.add("expanded");
-    });
-    // 项目区过滤反馈：有查询且没有可见项目行时显示「没有匹配的项目」，
-    // 不留只有「项目」标题的空白；真实空态（暂无项目）在过滤期间让位
-    var projList = els.projectList;
-    if (projList) {
-      var projEmpty = projList.querySelector(".proj-empty");
-      var projHint = projList.querySelector(".proj-filter-empty");
-      if (q && projVisible === 0) {
-        if (projEmpty) projEmpty.style.display = "none";
-        if (!projHint) {
-          projHint = document.createElement("div");
-          projHint.className = "proj-filter-empty";
-          projList.appendChild(projHint);
+      row.appendChild(img);
+      var info = document.createElement("span");
+      info.className = "tsr-info";
+      var disp = slideDisplayName(s);
+      var nameEl = document.createElement("span");
+      nameEl.className = "tsr-name";
+      nameEl.textContent = disp || s.name || sid;
+      info.appendChild(nameEl);
+      // 同名消歧：位置 + slide_id 末 6 位（§5.4）
+      var locEl = document.createElement("small");
+      locEl.className = "tsr-loc";
+      var locText = fbSlideLocationText(s);
+      var id6 = sid && s.slide_id ? String(s.slide_id).slice(-6) : "";
+      locEl.textContent = locText + (id6 ? " · " + id6 : "");
+      info.appendChild(locEl);
+      row.appendChild(info);
+      row.addEventListener("click", function () {
+        var slideRef = sid;
+        var sinfo = findSlideInfo(slideRef) || s;
+        closeSearchPop();
+        // 左栏切到首个所在文件夹（或根目录）并翻到其所在叠 → 打开切片
+        if (sidebarCtrl && sidebarCtrl.isDesktopCollapsed && sidebarCtrl.isDesktopCollapsed()) {
+          sidebarCtrl.expand();
         }
-        projHint.textContent = t("sb.search.empty.projects");
-      } else {
-        if (projEmpty) projEmpty.style.display = "";
-        if (projHint && projHint.parentNode) projHint.parentNode.removeChild(projHint);
-      }
-    }
+        fbLocateSlide(sinfo);
+        openSlide(slideRef);
+      });
+      els.tbSearchResults.appendChild(row);
+    });
+    void thumbSeq;
+  }
+
+  function closeSearchPop() {
+    if (searchPopCtl) searchPopCtl.close();
   }
 
   // ---------- 移动端上下文动作条显隐 ----------
@@ -4857,8 +5224,7 @@
           selectCreatedAnnotation(j && j.annotation_id);
         });
         loadAnnotationsIndex().then(function () {
-          renderProjects(allProjects);
-          renderUnfiled();
+          renderFolderBrowser();
         });
         // 保存期间用户按过撤销 → 现在执行该次创建的逆操作（仍是权限内 DELETE）
         if (pendingUndoAfterSave && entry) {
@@ -5500,8 +5866,7 @@
   function refreshAfterUndo(entry) {
     refreshCurrentAnnotations();
     loadAnnotationsIndex().then(function () {
-      renderProjects(allProjects);
-      renderUnfiled();
+      renderFolderBrowser();
     });
   }
 
@@ -6209,8 +6574,7 @@
         closeEditCard();
         refreshCurrentAnnotations();
         loadAnnotationsIndex().then(function () {
-          renderProjects(allProjects);
-          renderUnfiled();
+          renderFolderBrowser();
         });
       })
       .catch(function (e) {
@@ -6301,8 +6665,7 @@
       refreshCurrentAnnotations();
       // 全量索引只影响项目/未归类行的计数徽章，后台慢慢同步即可
       loadAnnotationsIndex().then(function () {
-        renderProjects(allProjects);
-        renderUnfiled();
+        renderFolderBrowser();
       });
     }
 
@@ -6375,8 +6738,10 @@
         if (state.slide && (byId ? state.slide.id === slideId
                                  : state.slide.name === legacyName)) {
           state.slide = null; state.mppX = null; state.roiMode = null;
+          clearTempViewTimer();
           updateDocTitle(null);
           updateMppSetterVisibility();
+          updateCanvasSlideLabel();
           if (roiBox) exitRoi();
           if (viewer) viewer.close();
         }
@@ -8779,6 +9144,7 @@
 
   var acctPopCtl = null;
   var annoPopCtl = null;
+  var sharePopCtl = null;
 
   // els.tbbMore 的宿主：正式版在 #toolbar 内；浮层随工具栏横向滚动收起
   els.tbbMoreHost = function () { return els.tbbMore && els.tbbMore.parentNode; };
@@ -8787,6 +9153,51 @@
     acctPopCtl = bindToolbarPop(els.acctBtn, els.acctPop, {
       onOpen: function () { loadAccountBalance(); },
     });
+    // 顶栏搜索浮层（§5.4）：打开时创建输入框并聚焦；Esc/外点关闭后焦点还按钮
+    searchPopCtl = bindToolbarPop(els.tbSearchBtn, els.tbSearchPop, {
+      onOpen: function () {
+        ensureSearchInput();
+        renderSearchResults();
+        if (els.tbSearchBtn.setAttribute) els.tbSearchBtn.setAttribute("aria-expanded", "true");
+        if (tbSearchState.input && typeof tbSearchState.input.focus === "function") {
+          setTimeout(function () { try { tbSearchState.input.focus(); } catch (e) {} }, 30);
+        }
+      },
+      onClose: function () {
+        var doc = document;
+        var inside = doc.activeElement && els.tbSearchPop && els.tbSearchPop.contains
+          ? (els.tbSearchPop.contains(doc.activeElement) ||
+             doc.activeElement === els.tbSearchBtn)
+          : true;
+        if (inside && els.tbSearchBtn && typeof els.tbSearchBtn.focus === "function") {
+          try { els.tbSearchBtn.focus(); } catch (e) { /* 忽略 */ }
+        }
+      },
+    });
+    // 顶栏分享浮层（§5.1）：默认分享对象=当前打开的切片；打开时刷新列表
+    sharePopCtl = bindToolbarPop(els.tbShareBtn, els.tbSharePop, {
+      onOpen: function () {
+        if (!sharePendingSlides && state.slide) sharePendingSlides = [activeSlideRef()];
+        updateShareTargetLine();
+        if (allSharesCache) renderShareList(allSharesCache);
+        els.shareResult.style.display = els.shareResult.style.display || "none";
+      },
+      onClose: function () {
+        if (els.tbShareBtn && typeof els.tbShareBtn.focus === "function") {
+          // 仅当焦点在浮层内（Esc 路径）才归还按钮；外点关闭不抢焦点
+          var doc = document;
+          if (doc.activeElement && els.tbSharePop.contains && els.tbSharePop.contains(doc.activeElement)) {
+            try { els.tbShareBtn.focus(); } catch (e) { /* 忽略 */ }
+          }
+        }
+      },
+    });
+    if (els.tbSearchClose) {
+      els.tbSearchClose.addEventListener("click", function () { closeSearchPop(); });
+    }
+    if (els.tbShareClose) {
+      els.tbShareClose.addEventListener("click", function () { if (sharePopCtl) sharePopCtl.close(); });
+    }
     annoPopCtl = bindToolbarPop(els.annoMoreBtn, els.annoPop, {
       onOpen: function () {
         var input = els.annoLabelInput;
@@ -8903,6 +9314,8 @@
       // 档位切换时收起已开的工具栏浮层（几何已失效）
       if (annoPopCtl) annoPopCtl.close();
       if (acctPopCtl) acctPopCtl.close();
+      if (searchPopCtl) searchPopCtl.close();
+      if (sharePopCtl) sharePopCtl.close();
       if (rectToolActive() && els.roiSettings && !els.roiSettings.hidden) {
         els.roiSettings.hidden = true;
         els.roiRectBtn.setAttribute("aria-expanded", "false");
@@ -9039,12 +9452,6 @@
         openImportDrawer(els.viewerEmptyUpload);
       });
     }
-    // 切片搜索（2026-09-22 重做）：点「搜索切片」才创建输入框；关闭即清空
-    // 过滤并移除输入框。查询保留在输入框里，侧栏收起/展开、列表重渲不丢失
-    if (els.slideSearchBtn) {
-      els.slideSearchBtn.addEventListener("click", openSlideSearch);
-    }
-
     // 移动端 ⋯ 溢出面板（AI 读片 + 缩放徽章）；§3.3 宽度分组的统一折叠目标
     bindTbbMore();
     // 工具栏浮层（账户/标注选项/矩形设置外点关闭）：§3.3/§3.5
@@ -9173,19 +9580,9 @@
       }
     });
 
-    // 未归类
-    els.unfiledToggle.addEventListener("click", function () {
-      var sec = els.unfiledBody.closest(".section");
-      if (sec) sec.classList.toggle("collapsed");
-    });
-    els.unfiledNewProject.addEventListener("click", function () {
-      var slides = Object.keys(slideChecked).filter(function (k) { return slideChecked[k]; });
-      if (slides.length === 0) { toast(t("unfiled.need.check"), "error"); return; }
-      // selection 模式：把当前勾选**快照**传入对话框（可逐项移除；取消/重开
-      // 清空，不再有 pendingNewProjectSlides 隐式全局回退）
-      openProjectDialog("selection", slides, els.unfiledNewProject);
-      toast(t("unfiled.selected.tip", { n: slides.length }), "info");
-    });
+    // 文件夹浏览器（改版 2026-10-08 §5.1–5.3）：返回 / ＋ 菜单 / 文件夹 ⋯ 菜单 / 翻页
+    initFbBrowser();
+
 
     // 分享
     els.shareExpiresSelect.addEventListener("change", function () {
@@ -9193,10 +9590,12 @@
     });
     els.shareCreateBtn.addEventListener("click", onShareCreateClick);
     els.shareResultCopy.addEventListener("click", function () { copyText(els.shareResultUrl.value); });
-    els.shareMgrToggle.addEventListener("click", function () {
-      var sec = els.shareMgrBody.closest(".section");
-      if (sec) sec.classList.toggle("collapsed");
-    });
+    // 「选择切片…」：复用切片选择器多选（§5.1）；确认后回填浮层目标
+    if (els.sharePickBtn) {
+      els.sharePickBtn.addEventListener("click", function () {
+        openSlidePicker(null, null, { mode: "share" });
+      });
+    }
 
     // 修改我的密码（owner/user 通用；docs §8.1）
     initChangePw();
@@ -9515,7 +9914,7 @@
     }).then(function (res) {
       refreshCurrentAnnotations();
       loadAnnotationsIndex().then(function () {
-        if (typeof renderProjects === "function") { renderProjects(allProjects); renderUnfiled(); }
+        if (typeof renderFolderBrowser === "function") renderFolderBrowser();
       }).catch(function () {});
       return { ok: true, id: res && (res.id || res.index) };
     });
@@ -9831,10 +10230,10 @@
       doc: document,
       onLayoutChange: syncViewerLayoutAfterSidebar,
       focusSearch: function () {
-        // 2026-09-22 重做：搜索输入框按需创建，「选择切片」只展开侧栏、
-        // 不创建输入框；焦点落在「搜索切片」按钮（侧栏内首个入口）
-        if (els.slideSearchBtn && typeof els.slideSearchBtn.focus === "function") {
-          try { els.slideSearchBtn.focus(); } catch (e) { /* 忽略聚焦失败 */ }
+        // 改版 2026-10-08：搜索入口移至顶栏「搜索」浮层——「选择切片」展开
+        // 侧栏后焦点落在顶栏搜索按钮
+        if (els.tbSearchBtn && typeof els.tbSearchBtn.focus === "function") {
+          try { els.tbSearchBtn.focus(); } catch (e) { /* 忽略聚焦失败 */ }
         }
       },
     });
@@ -9886,13 +10285,11 @@
     initResearchTelemetry();
     // 注册 HistoPilot HostBridge host 能力（插件未启用时为空操作）
     registerHostBridgeHandlers();
-    // 初始折叠区状态（默认展开）
-    var unfiledSec = els.unfiledBody.closest(".section");
-    var shareSec = els.shareMgrBody.closest(".section");
-    if (unfiledSec) unfiledSec.classList.remove("collapsed");
-    if (shareSec) shareSec.classList.remove("collapsed");
+    // 改版 2026-10-08：旧「未归类/分享管理」折叠区已由文件夹浏览器与顶栏
+    // 分享浮层替代（无初始折叠区）。
     // 升级 A：启动时无切片，显示空态入口（openSlide 成功后隐藏）
     updateViewerEmptyState();
+    updateCanvasSlideLabel();
     loadAll();
     // P2 合同 §5.1：?slide=<slide_id> URL 通道——加载时若带此参数打开对应切片
     // （与 /s/<token>、/login?next= 无语义冲突；旧链接无此参数不受影响）。
@@ -9955,6 +10352,29 @@
       },
       viewerState: state,
       openSlide: openSlide,
+      // 改版 2026-10-08（§5）：文件夹浏览器/搜索/临时查看的测试驱动面
+      // （与 openSlide 同约定：仅当测试预置 __PT_TEST_HOOKS 才挂载）
+      fb: {
+        state: fbState,
+        FB_TEMP_KEY: FB_TEMP_KEY,
+        pageSize: fbPageSize,
+        entries: fbEntries,
+        pathOf: fbPathOf,
+        search: fbSearchSlides,
+        locationText: fbSlideLocationText,
+        render: renderFolderBrowser,
+        go: fbGo,
+        locate: fbLocateSlide,
+        reload: reloadProjectsAndUnfiled,
+        endTemporaryView: endTemporaryView,
+        armTempViewTimer: armTempViewTimer,
+        updateCanvasLabel: updateCanvasSlideLabel,
+      },
+      share: {
+        setPending: function (refs) { sharePendingSlides = refs; },
+        pending: function () { return sharePendingSlides; },
+        updateTargetLine: updateShareTargetLine,
+      },
       slideHasPhysicalScale: slideHasPhysicalScale,
       syncUnitAvailability: syncUnitAvailability,
       setMpp: setMpp,
@@ -9967,9 +10387,8 @@
   // 静态 [data-i18n] 节点由 i18n.js 的 applyLang 直接刷新，这里只处理 JS 渲染的部分。
   document.addEventListener("hp-lang-change", function () {
     try {
-      // 项目 / 未归类 / 分享列表（只要数据已加载就重渲）
-      if (allProjects && allProjects.length >= 0) renderProjects(allProjects);
-      renderUnfiled();
+      // 文件夹浏览器 / 分享列表（只要数据已加载就重渲）
+      renderFolderBrowser();
       if (allSharesCache) renderShareList(allSharesCache);
     } catch (e) {}
     try {
@@ -9980,8 +10399,9 @@
     } catch (e) {}
     // 升级 A：侧栏按钮文案/aria 随状态（展开↔收起）变化，切语言后重写
     try { if (sidebarCtrl) sidebarCtrl.refreshButton(); } catch (e) {}
-    // 切片搜索（按需创建）：动态控件文案/aria 随语言刷新
-    try { refreshSlideSearchTexts(); } catch (e) {}
+    // 顶栏搜索/分享浮层（改版 2026-10-08）：动态文案随语言刷新
+    try { refreshSearchTexts(); } catch (e) {}
+    try { updateShareTargetLine(); } catch (e) {}
     // §3.4：document.title 的产品名后缀随语言刷新（切片名不变；P2：主显示
     // display_name，旧 DTO 回落 name）
     try {

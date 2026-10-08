@@ -276,8 +276,16 @@ function bootApp(info: Record<string, unknown>, opts?: { idMode?: boolean }): Bo
 	while (rafCbs.length) (rafCbs.shift() as () => void)();
 
 	const findSlideRow = () => {
-		const row = created.find((e) => e.classList.contains("slide-row"));
-		if (!row) throw new Error("harness: 未渲染出 .slide-row（生产路径 loadAll → renderProjects → renderSlideRow）");
+		// 改版 2026-10-08：切片行由堆叠卡片（.fb-hit）承载，点击即 openSlide。
+		// 切片在项目（文件夹）内时先点文件夹卡进入，再取卡片（同步渲染）。
+		let row = created.filter((e) => e.classList.contains("fb-hit") && e.parentNode).pop();
+		if (!row) {
+			const folder = created.filter((e) => e.classList.contains("fb-folder") && e.parentNode).pop();
+			if (!folder) throw new Error("harness: 未渲染出 .fb-hit 卡片与 .fb-folder 文件夹");
+			folder.dispatch("click");
+			row = created.filter((e) => e.classList.contains("fb-hit") && e.parentNode).pop();
+		}
+		if (!row) throw new Error("harness: 进入文件夹后仍未渲染出 .fb-hit 卡片");
 		return row;
 	};
 	return { emitted, openUrls, created, handlers, findSlideRow };

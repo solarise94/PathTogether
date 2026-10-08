@@ -1,11 +1,12 @@
 /**
- * 工单 B：主工作台切片行布局 + 标注徽章人数口径。
+ * 工单 B：主工作台切片卡布局 + 标注徽章人数口径（改版 2026-10-08 更新）。
  *
  * 加载真实 static/app.js（bootApp 风格 harness + URL 感知 fetch stub），锁定：
- *   - 切片行（项目内 + 未归类同构）：名称独占第一行（.slide-top 内只有
- *     .slide-name，无徽章）；标注 pill 在独立第二行（.slide-badges）；meta
- *     为第三行；
- *   - 完整文件名经 title tooltip 与 aria-label 提供（截断不丢信息）；
+ *   - 旧侧栏「切片行」（.slide-row）由文件夹浏览器的堆叠卡片（.fb-hit）承载：
+ *     命中区 data-slide-id/data-name 同源；卡内标签（.fb-card-name）+ 标注
+ *     徽章（.fb-card-badge）+ 选中标记（.fb-card-dot）+ 缩略图（.fb-card-img）；
+ *   - 完整文件名经 title tooltip 提供（截断不丢信息）；
+ *   - 打开切片后卡片带 active 类与 aria-pressed=true（选中标记，§5.2）；
  *   - annoBadgeText 人数 = 唯一作者数（不按 label 组数计）：
  *     同一 visitor 跨多个 label 组只算 1 人；source=ai 不算人；缺身份不虚构；
  *     author_key/author_kind 优先（author_kind=unknown 跳过）。
@@ -44,6 +45,7 @@ interface FakeEl {
 	setAttribute(k: string, v: string): void;
 	getAttribute(k: string): string | null;
 	addEventListener(type: string, cb: Listener): void;
+	dispatch(type: string, evt?: unknown): void;
 	appendChild(c: FakeEl): FakeEl;
 	querySelector(sel: string): FakeEl | null;
 	querySelectorAll(sel: string): FakeEl[];
@@ -102,6 +104,10 @@ function fakeEl(id = ""): FakeEl {
 		},
 		addEventListener(type, cb) {
 			(el.listeners[type] ||= []).push(cb);
+		},
+		dispatch(type, evt) {
+			(el.listeners[type] || []).forEach((cb) =>
+				cb(Object.assign({ stopPropagation() {}, preventDefault() {} }, evt)));
 		},
 		appendChild(c) {
 			c.parentNode = el;
@@ -172,12 +178,19 @@ function bootApp(bySlide: Record<string, unknown>): App {
 			void fn;
 		},
 		forceResize: vi.fn(),
+		open() {},
+		setMouseNavEnabled() {},
 	};
 	const fetchImpl = vi.fn((url: string) => {
 		const u = String(url);
 		let body: unknown = [];
 		if (u.includes("/api/annotations")) {
 			body = { by_slide: bySlide };
+		} else if (/\/info$/.test(u) && (u.includes("/api/slides/") || u.includes("/api/slide/"))) {
+			// openSlide 的 info 通道（ID/legacy 两形态）：按末段 ref 回对单项
+			const seg = u.includes("/api/slides/") ? u.split("/api/slides/")[1] : u.split("/api/slide/")[1];
+			const ref = decodeURIComponent(seg.split("/")[0]);
+			body = SLIDES.find((s) => s.slide_id === ref || s.name === ref) || SLIDES[0];
 		} else if (u.includes("/api/projects")) {
 			body = PROJECTS;
 		} else if (u.includes("/api/slides")) {
@@ -195,6 +208,7 @@ function bootApp(bySlide: Record<string, unknown>): App {
 		});
 	}) as unknown as typeof fetch;
 
+	const created: FakeEl[] = [];
 	const doc = {
 		readyState: "loading",
 		cookie: "",
@@ -203,12 +217,21 @@ function bootApp(bySlide: Record<string, unknown>): App {
 			if (!els[id]) els[id] = fakeEl(id);
 			return els[id];
 		},
-		createElement: () => fakeEl(),
+		createElement: () => {
+			const el = fakeEl();
+			created.push(el);
+			return el;
+		},
 		addEventListener(type: string, cb: Listener) {
 			(docListeners[type] ||= []).push(cb);
 		},
 		querySelector: () => null,
-		querySelectorAll: () => [] as FakeEl[],
+		// openSlide 高亮走 document.querySelectorAll(".slide-row, .fb-hit")：
+		// 在已创建元素里按 class 查找（支持逗号复合选择器）
+		querySelectorAll: (sel: string) => {
+			const classes = sel.split(",").map((s) => s.trim().replace(/^\./, ""));
+			return created.filter((e) => classes.some((cls) => e.classList.contains(cls)));
+		},
 		body: fakeEl("body"),
 	};
 	const w: Record<string, unknown> = {
@@ -260,89 +283,121 @@ async function boot(bySlide: Record<string, unknown>): Promise<App> {
 	return app;
 }
 
-function projectSlideRow(app: App): FakeEl {
-	const projRow = app.els["project-list"].children.find((c) =>
-		c.classList.contains("proj-row"));
-	expect(projRow).toBeTruthy();
-	const body = projRow!.children.find((c) => c.classList.contains("proj-body"));
-	expect(body).toBeTruthy();
-	return body!.children[0];
+// 文件夹浏览器（改版 2026-10-08）里的卡片定位：
+// 项目内切片 → 先点文件夹卡进入（fbGo 同步渲染），再按 data-slide-id 找卡；
+// 未归类切片 → 根目录堆叠里直接找。
+function folderCard(app: App, pid: string): FakeEl {
+	const card = app.els["fb-stack"].children.find((c) =>
+		c.classList.contains("fb-folder") && c.dataset.pid === pid);
+	expect(card).toBeTruthy();
+	return card!;
+}
+
+function projectSlideCard(app: App): FakeEl {
+	folderCard(app, "p1").dispatch("click");
+	const stack = app.els["fb-stack"].children.filter((c) => c.classList.contains("fb-hit"));
+	expect(stack.length).toBe(1);
+	return stack[0];
 }
 
 function unfiledRow(app: App, name: string): FakeEl {
-	const rows = app.els["unfiled-list"].children.filter((c) =>
-		c.classList.contains("slide-row"));
-	// P2：行操作键 data-slide-id（= slide_id）；data.name 兼容按名定位
+	const rows = app.els["fb-stack"].children.filter((c) =>
+		c.classList.contains("fb-hit"));
+	// P2：操作键 data-slide-id（= slide_id）；data.name 兼容按名定位
 	const row = rows.find((r) => r.dataset.slideId === name || r.dataset.name === name);
 	expect(row).toBeTruthy();
 	return row!;
 }
 
-function rowKinds(row: FakeEl): string[] {
-	const mid = row.children.find((c) => c.classList.contains("slide-mid"))!;
-	expect(mid).toBeTruthy();
-	return mid.children.map((c) =>
-		c.classList.contains("slide-top") ? "top" :
-		c.classList.contains("slide-badges") ? "badges" :
-		c.classList.contains("slide-meta") ? "meta" : "other");
+function labelParts(card: FakeEl): { label: FakeEl; name: FakeEl; badge: FakeEl | null; dot: FakeEl } {
+	const cardEl = card.children.find((c) => c.classList.contains("fb-card"))!;
+	expect(cardEl).toBeTruthy();
+	const label = cardEl.children.find((c) => c.classList.contains("fb-card-label"))!;
+	const name = label.children.find((c) => c.classList.contains("fb-card-name"))!;
+	const badge = label.children.find((c) => c.classList.contains("fb-card-badge")) || null;
+	const dot = label.children.find((c) => c.classList.contains("fb-card-dot"))!;
+	return { label, name, badge, dot };
 }
 
-function pillOf(row: FakeEl): FakeEl {
-	const pill = row.querySelectorAll(".anno-pill")[0];
-	expect(pill).toBeTruthy();
-	return pill!;
+function badgeOf(card: FakeEl): FakeEl {
+	const badge = labelParts(card).badge;
+	expect(badge).toBeTruthy();
+	return badge!;
 }
 
-describe("切片行布局：名称独占首行 / 徽章次行 / meta 第三行（工单 B）", () => {
-	it("项目内切片行：.slide-top 只含 .slide-name（无徽章）；徽章在 .slide-badges 次行；meta 第三行", async () => {
+function imgOf(card: FakeEl): FakeEl {
+	const cardEl = card.children.find((c) => c.classList.contains("fb-card"))!;
+	const img = cardEl.children.find((c) => c.classList.contains("fb-card-img"));
+	expect(img).toBeTruthy();
+	return img!;
+}
+
+describe("切片卡布局：命中区 / 标签 / 缩略图（改版 2026-10-08）", () => {
+	it("项目内切片卡：.fb-hit 命中区含 .fb-card 预览卡；标签=名称+徽章+选中标记；缩略图当前叠才创建", async () => {
 		const app = await boot({
 			[LONG_NAME]: [
 				{ label: "肿瘤", count: 2, items: [{ visitor: "v1" }, { visitor: "v1" }] },
 			],
 		});
-		const row = projectSlideRow(app);
-		expect(row.classList.contains("slide-row")).toBe(true);
-		// 次序：名称行 → 徽章行 → meta 行
-		expect(rowKinds(row)).toEqual(["top", "badges", "meta"]);
-		const mid = row.children.find((c) => c.classList.contains("slide-mid"))!;
-		const top = mid.children[0];
-		// 名称独占第一行：.slide-top 内没有标注徽章
-		expect(top.querySelectorAll(".anno-pill")).toEqual([]);
-		expect(top.children[0].classList.contains("slide-name")).toBe(true);
-		// 徽章独立次行
-		expect(mid.children[1].querySelectorAll(".anno-pill").length).toBe(1);
+		const card = projectSlideCard(app);
+		expect(card.classList.contains("fb-hit")).toBe(true);
+		const parts = labelParts(card);
+		// 标签内：名称 + 徽章 + 选中标记（初始未打开：空标记）
+		expect(parts.name.textContent).toContain(LONG_NAME.slice(0, 4));
+		expect(parts.badge).toBeTruthy();
+		expect(parts.dot.textContent).toBe("");
+		// 缩略图：当前叠的卡才创建（本 harness 未注入 slide_id_api → legacy
+		// 通道 /api/slide/<ref>/thumbnail；ID 通道为 /api/slides/<id>/thumbnail）
+		expect(imgOf(card).src).toContain("thumbnail");
+		expect(imgOf(card).src).toContain(encodeURIComponent(LONG_ID));
 	});
 
-	it("未归类切片行同构（中英共用结构）", async () => {
+	it("未归类切片卡同构（名称+徽章+标记+缩略图）", async () => {
 		const app = await boot({
 			"b.svs": [
 				{ label: "肿瘤", count: 1, items: [{ visitor: "v1" }] },
 			],
 		});
-		expect(rowKinds(unfiledRow(app, "b.svs"))).toEqual(["top", "badges", "meta"]);
+		const parts = labelParts(unfiledRow(app, "b.svs"));
+		expect(parts.badge).toBeTruthy();
+		expect(parts.dot.textContent).toBe("");
+		const unfiledCard = unfiledRow(app, "b.svs");
+		expect(imgOf(unfiledCard).src).toContain("thumbnail");
+		expect(imgOf(unfiledCard).src).toContain(encodeURIComponent(B_ID));
 	});
 
-	it("完整文件名经 title tooltip 与 aria-label 提供（截断不丢信息）", async () => {
+	it("完整文件名经 title tooltip 提供（截断不丢信息）；aria-label 携带打开语义", async () => {
 		const app = await boot({});
-		const row = projectSlideRow(app);
-		const mid = row.children.find((c) => c.classList.contains("slide-mid"))!;
-		const top = mid.children.find((c) => c.classList.contains("slide-top"))!;
-		const nameEl = top.children.find((c) => c.classList.contains("slide-name"))!;
+		const card = projectSlideCard(app);
+		const nameEl = labelParts(card).name;
 		expect(nameEl.title).toBe(LONG_NAME);
-		expect(nameEl.getAttribute("aria-label")).toBe(LONG_NAME);
-		// 显示文本是截断名（含 …），完整名只经 tooltip/aria 提供
+		// 显示文本是截断名（含 …），完整名只经 tooltip 提供
 		expect(nameEl.textContent).not.toBe(LONG_NAME);
 		expect(nameEl.textContent.includes("…")).toBe(true);
+		// 本 harness 的 t 不查字典：aria-label = 键文本（键名即打开语义断言）
+		expect(card.getAttribute("aria-label")).toContain("fb.open.slide.aria");
 	});
 
-	it("P2：行操作键 = data-slide-id（slide_id）；data-name 保留供搜索/显示", async () => {
+	it("P2：操作键 = data-slide-id（slide_id）；data-name 保留供搜索/显示", async () => {
 		const app = await boot({});
-		const row = projectSlideRow(app);
-		expect(row.dataset.slideId).toBe(LONG_ID);
-		expect(row.dataset.name).toBe(LONG_NAME);
+		// 先取根目录未归类卡（进入文件夹后堆叠只显示该文件夹内容）
 		const unfiled = unfiledRow(app, "b.svs");
 		expect(unfiled.dataset.slideId).toBe(B_ID);
 		expect(unfiled.dataset.name).toBe("b.svs");
+		const card = projectSlideCard(app);
+		expect(card.dataset.slideId).toBe(LONG_ID);
+		expect(card.dataset.name).toBe(LONG_NAME);
+	});
+
+	it("打开切片：卡片 active + aria-pressed=true（选中标记 ●）", async () => {
+		const app = await boot({});
+		const card = unfiledRow(app, "b.svs");
+		card.dispatch("click");
+		await app.flush();
+		const after = unfiledRow(app, "b.svs");
+		expect(after.classList.contains("active")).toBe(true);
+		expect(after.getAttribute("aria-pressed")).toBe("true");
+		expect(labelParts(after).dot.textContent).toBe("●");
 	});
 });
 
@@ -354,7 +409,7 @@ describe("annoBadgeText 人数 = 唯一作者（不按 label 组计）", () => {
 				{ label: "坏死", count: 2, items: [{ visitor: "v1" }, { visitor: "v1" }] },
 			],
 		});
-		expect(pillOf(unfiledRow(app, "b.svs")).textContent)
+		expect(badgeOf(unfiledRow(app, "b.svs")).textContent)
 			.toBe("badge.marks".split("{n}").join("4").split("{m}").join("1"));
 	});
 
@@ -367,7 +422,7 @@ describe("annoBadgeText 人数 = 唯一作者（不按 label 组计）", () => {
 				{ label: "坏死", count: 1, items: [{ visitor: "v1" }] },
 			],
 		});
-		expect(pillOf(unfiledRow(app, "b.svs")).textContent)
+		expect(badgeOf(unfiledRow(app, "b.svs")).textContent)
 			.toBe("badge.marks".split("{n}").join("4").split("{m}").join("2"));
 	});
 
@@ -380,7 +435,7 @@ describe("annoBadgeText 人数 = 唯一作者（不按 label 组计）", () => {
 				{ label: "坏死", count: 1, items: [{ owner_user_id: "usr_2" }] },
 			],
 		});
-		expect(pillOf(unfiledRow(app, "b.svs")).textContent)
+		expect(badgeOf(unfiledRow(app, "b.svs")).textContent)
 			.toBe("badge.marks".split("{n}").join("3").split("{m}").join("2"));
 	});
 
@@ -395,7 +450,7 @@ describe("annoBadgeText 人数 = 唯一作者（不按 label 组计）", () => {
 				] },
 			],
 		});
-		expect(pillOf(unfiledRow(app, "b.svs")).textContent)
+		expect(badgeOf(unfiledRow(app, "b.svs")).textContent)
 			.toBe("badge.marks".split("{n}").join("4").split("{m}").join("2"));
 	});
 
@@ -407,7 +462,7 @@ describe("annoBadgeText 人数 = 唯一作者（不按 label 组计）", () => {
 				] },
 			],
 		});
-		expect(pillOf(unfiledRow(app, "b.svs")).textContent)
+		expect(badgeOf(unfiledRow(app, "b.svs")).textContent)
 			.toBe("badge.marks.only".split("{n}").join("2"));
 	});
 });

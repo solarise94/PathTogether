@@ -1794,6 +1794,11 @@
         // 临时查看：按到期时间设定清屏计时器（服务端门禁是唯一权限依据）
         armTempViewTimer(state.slide);
         updateCanvasSlideLabel();
+        // 画质/RGB/mpp 等上下文控件随切片出现 → 顶栏需重测溢出折放（P0：
+        // 否则 1440 档打开切片后 ⋯/账户被推出视口）。立即 + 迟一拍各一次
+        //（channel 控件挂载可能晚于本回调）。
+        applyToolbarTier();
+        setTimeout(function () { try { applyToolbarTier(); } catch (e) {} }, 150);
         // 手机端：打开切片后自动收起侧栏抽屉，让用户立刻看到查看器；
         // 收起后走统一布局同步（抽屉关闭 + viewer resize 链，§4.2）。
         // 桌面端保持当前收起/展开偏好，不打断读片。
@@ -1844,6 +1849,7 @@
     }
     renderFolderBrowser();
     toast(t("tempview.ended"), "info");
+    setTimeout(function () { try { applyToolbarTier(); } catch (e) {} }, 150);
   }
 
   // ---------- 当前切片名画布标签（§5.1：紧凑标签，不新增第二行） ----------
@@ -2692,7 +2698,9 @@
   // =========================================================================
   var FB_TEMP_KEY = "__temp__";   // 「临时查看」虚拟文件夹键（不对应项目）
   var FB_MAX_PAGE = 8;            // 每叠最多 8 张（§5.2）
-  var FB_GAP = 36;                // 堆叠露出条带高度（名称条 + 一段缩略图）
+  var FB_GAP = 36;                // 堆叠露出条带的偏好高度（名称条+一段缩略图）
+  var FB_MIN_GAP = 28;            // 条带下限（页容量按最紧条带计，保证放得下）
+  var FB_MAX_GAP = 104;           // 条带上限 = 整卡高（短叠铺开时不再过度拉伸）
   var FB_CARD_H = 104;            // 完整卡片高度
   var FB_FOLDER_H = 56;           // 文件夹卡高度
   var FB_FOLDER_GAP = 8;          // 文件夹卡间距
@@ -2705,14 +2713,26 @@
     totalPages: 1,
   };
 
-  // 每叠页数：可用高度 − 文件夹卡占用 − 一张完整卡 → 余量按露出条带折算。
+  // 每叠页数：可用高度 − 文件夹卡占用 − 一张完整卡 → 余量按最紧露出条带
+  // （FB_MIN_GAP）折算——保证整页在最挤时也放得下；铺开是渲染期的自适应。
   // 纯函数（vitest 锁行为）：上限 8、下限 1。
   function fbPageSize(availH, folderCount) {
     var used = (folderCount || 0) * (FB_FOLDER_H + FB_FOLDER_GAP);
     var remaining = (availH || 0) - used - FB_CARD_H;
-    var n = Math.floor(remaining / FB_GAP) + 1;
+    var n = Math.floor(remaining / FB_MIN_GAP) + 1;
     if (!isFinite(n)) n = FB_MAX_PAGE;
     return Math.max(1, Math.min(FB_MAX_PAGE, n));
+  }
+
+  // 露出条带高度：短叠按剩余高度铺开（P1：贴到翻页钮上方为止），上限=整卡
+  // 高（不过度拉伸）、下限=FB_MIN_GAP（名称条保持可读）。纯函数。
+  function fbBandGap(availH, folderCount, slideCount) {
+    var used = (folderCount || 0) * (FB_FOLDER_H + FB_FOLDER_GAP);
+    var remaining = (availH || 0) - used - FB_CARD_H;
+    if (!(slideCount > 1)) return FB_GAP;
+    var gap = Math.floor(remaining / (slideCount - 1));
+    if (!isFinite(gap)) return FB_GAP;
+    return Math.max(FB_MIN_GAP, Math.min(FB_MAX_GAP, gap));
   }
 
   function fbStackAvailH() {
@@ -2916,6 +2936,8 @@
     var top = 0;
     var activeRef = activeSlideRef();
     var focusIdx = 0;
+    // 露出条带按当前叠的卡片数与可用高度自适应（短叠铺满、上限整卡高）
+    var gap = fbBandGap(fbStackAvailH(), entries.folders.length, pageEntries.filter(function (e) { return e.kind === "slide"; }).length);
     pageEntries.forEach(function (entry, j) {
       var node;
       if (entry.kind === "folder") {
@@ -2923,14 +2945,14 @@
         top += FB_FOLDER_H + FB_FOLDER_GAP;
       } else {
         var isLast = j === pageEntries.length - 1;
-        node = buildFbSlideCard(entry, top, focusIdx, activeRef, isLast);
-        top += isLast ? FB_CARD_H : FB_GAP;
+        node = buildFbSlideCard(entry, top, focusIdx, activeRef, isLast, gap);
+        top += isLast ? FB_CARD_H : gap;
       }
       focusIdx += 1;
       els.fbStack.appendChild(node);
     });
-    // 堆叠区固定高度 = 内容高度（翻页只换列表不动布局骨架）
-    els.fbStack.style.height = Math.max(top, 0) + "px";
+    // 高度不写死：.fb-stack 由 flex 撑满头部/翻页之间的剩余空间（页码恒在
+    // 底部），条带高度按上面的自适应值铺开；翻页只换列表不动布局骨架。
 
     // 头部：位置 + 返回 + 文件夹 ⋯ + 计数
     var isRoot = !fbState.folder;
@@ -2985,7 +3007,7 @@
     return b;
   }
 
-  function buildFbSlideCard(entry, top, focusIdx, activeRef, isLast) {
+  function buildFbSlideCard(entry, top, focusIdx, activeRef, isLast, gap) {
     var s = entry.s;
     var sid = entry.sid;
     var sname = entry.name;
@@ -2998,6 +3020,8 @@
     hit.type = "button";
     hit.className = "fb-hit" + (isLast ? " fb-hit-last" : "") + (active ? " active" : "");
     hit.style.top = top + "px";
+    // 命中区：非末张=露出条带；末张=整卡高（无遮挡，可点整卡）
+    hit.style.height = (isLast ? FB_CARD_H : Math.max(gap || FB_GAP, FB_MIN_GAP)) + "px";
     hit.style.zIndex = String(focusIdx + 1);
     hit.dataset.slideId = sid;
     hit.dataset.name = sname;
@@ -6752,6 +6776,7 @@
           updateCanvasSlideLabel();
           if (roiBox) exitRoi();
           if (viewer) viewer.close();
+          setTimeout(function () { try { applyToolbarTier(); } catch (e) {} }, 150);
         }
         toast(t("del.slide.done", { name: name }), "success");
         loadAll();
@@ -9294,6 +9319,56 @@
 
   var tbCurrentTier = null;
 
+  // 改版 2026-10-08：「搜索/分享」两个新按钮的溢出收放——不进静态档位表，
+  // 每次布局后先归位、再按 #toolbar 实测溢出（scrollWidth vs clientWidth）
+  // 逐个折入 ⋯ 菜单。打开切片后画质/RGB/mpp 控件出现、1440 档基线本就贴边
+  // （实测 base@1440 溢出 28px），静态档位盖不住，必须实测。
+  // 候选按档位分级：先收本轮新增的「分享/搜索」，仍溢出再收低频既有控件
+  //（桌面=1:1；手机=原始RGB标识/1:1/视图组）——只在实测溢出时收，全部可经
+  // ⋯ 菜单触达（基线 66cfa29c 在 1440/390 打开切片时本就溢出 28/179px，
+  // 实测见交付说明；此收放使各档位都不再有裁切）。
+  function tbOverflowCandidates(tier) {
+    var mine = ["tb-share-btn", "tb-search-btn"];
+    if (tier === "mobile") {
+      return mine.concat(["rgb-badge", "zoom-native", "view-tools-group"]);
+    }
+    return mine.concat(["zoom-native"]);
+  }
+
+  function tbApplyOverflowFold(more, tier) {
+    var candidates = tbOverflowCandidates(tier);
+    var toolbar = more.parentNode;
+    if (!toolbar || !toolbar.clientWidth || !toolbar.scrollWidth) return;
+    function overflowPx() { return toolbar.scrollWidth - toolbar.clientWidth; }
+    // 仍溢出：按候选次序继续折（折入 ⋯ 菜单 = 仍可触达）
+    var i = 0;
+    var guard = 0;
+    while (overflowPx() > 1 && guard < 8) {
+      guard += 1;
+      var el = document.getElementById(candidates[i]);
+      if (!el) break;
+      if (el.parentNode === more || el.hidden) {
+        i += 1;
+        if (i >= candidates.length) break;
+        continue;
+      }
+      el.__tbOverflowFolded = true;
+      tbMoveIntoMore(el, more);
+    }
+    // 不溢出：从最后一名起逐个放开，每放一个复测（迟滞，防抖动）
+    for (var j = candidates.length - 1; j >= 0; j--) {
+      var el2 = document.getElementById(candidates[j]);
+      if (!el2 || !el2.__tbOverflowFolded) continue;
+      tbRestore(el2);
+      if (overflowPx() > 1) {
+        el2.__tbOverflowFolded = true;
+        tbMoveIntoMore(el2, more);
+        break;
+      }
+      el2.__tbOverflowFolded = false;
+    }
+  }
+
   function applyToolbarTier() {
     var more = els.tbbMore;
     if (!more) return;
@@ -9306,11 +9381,14 @@
       var el = document.getElementById(spec.id);
       if (!el) return;
       var wantFolded = spec.tiers.indexOf(tier) >= 0 && !tbSpecPinned(spec.id);
+      // 溢出收放机制持有的节点不在此归位（它在不溢出时自行放开）
+      if (!wantFolded && el.__tbOverflowFolded) return;
       var isFolded = el.parentNode === more;
       if (wantFolded === isFolded) return;
       if (wantFolded) tbMoveIntoMore(el, more);
       else tbRestore(el);
     });
+    tbApplyOverflowFold(more, tier);
     // 档位类名（幂等）：CSS 据此隐藏悬空分隔线等
     var toolbar = more.parentNode;
     if (toolbar && toolbar.classList) {
@@ -9334,6 +9412,16 @@
   function initToolbarTier() {
     applyToolbarTier();
     window.addEventListener("resize", function () { applyToolbarTier(); });
+    // 上下文控件（画质段/RGB 标识/mpp）随切片异步出现/消失 → 内容尺寸变化
+    // 时重测溢出（ResizeObserver；收放为迟滞式，反复触发稳定不振荡）
+    try {
+      var toolbar = els.tbbMore && els.tbbMore.parentNode;
+      if (toolbar && typeof ResizeObserver === "function") {
+        new ResizeObserver(function () {
+          try { applyToolbarTier(); } catch (e) { /* 忽略 */ }
+        }).observe(toolbar);
+      }
+    } catch (e) { /* 老环境无 ResizeObserver：resize/slice-open 兜底 */ }
   }
 
   function bindEvents() {
@@ -10366,6 +10454,7 @@
         state: fbState,
         FB_TEMP_KEY: FB_TEMP_KEY,
         pageSize: fbPageSize,
+        bandGap: fbBandGap,
         entries: fbEntries,
         pathOf: fbPathOf,
         search: fbSearchSlides,

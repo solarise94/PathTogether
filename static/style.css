@@ -4496,13 +4496,18 @@ button {
   color: var(--accent);
 }
 
-/* ---------- 搜索浮层（§5.4） ---------- */
+/* ---------- 搜索浮层（§5.4） ----------
+   白底不透明（评审 P1：半透明 toolbar-bg 会透出切片颜色），边框/阴影与
+   既有 .toolbar-pop（#acct-pop/#roi-settings）同款。 */
 .tb-search-pop {
   display: flex;
   flex-direction: column;
   gap: 8px;
   width: 300px;
   max-width: calc(100vw - 16px);
+  background: #fff;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 .tb-search-head {
   display: flex;
@@ -4576,7 +4581,7 @@ button {
   white-space: nowrap;
 }
 
-/* ---------- 分享浮层（§5.1：原侧栏「分享管理」整块迁入） ---------- */
+/* ---------- 分享浮层（§5.1：原侧栏「分享管理」整块迁入；白底不透明） ---------- */
 .tb-share-pop {
   display: flex;
   flex-direction: column;
@@ -4585,6 +4590,9 @@ button {
   max-width: calc(100vw - 16px);
   max-height: min(560px, calc(100vh - 88px));
   overflow-y: auto;
+  background: #fff;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 .tb-share-head {
   display: flex;
@@ -4654,9 +4662,7 @@ button {
   max-height: min(420px, calc(100vh - 24px));
   overflow-y: auto;
   padding: 6px;
-  background: var(--toolbar-bg, #fff);
-  backdrop-filter: blur(20px) saturate(180%);
-  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  background: #fff;
   border: 0.5px solid var(--separator);
   border-radius: 10px;
   box-shadow: var(--shadow-float, 0 10px 35px rgba(0, 0, 0, 0.16));
@@ -4683,7 +4689,8 @@ button {
 .fb-menu-item.danger:hover { background: var(--danger-tint, rgba(255, 59, 48, 0.12)); }
 .fb-menu-note { padding: 8px 9px; font-size: 12px; color: var(--text-3); }
 
-/* 堆叠区：固定高度 = 内容高度（翻页只换列表不动布局骨架） */
+/* 堆叠区：flex 撑满头部与翻页之间的剩余高度（页码固定底部）；卡片露出
+   条带按剩余高度自适应铺开（P1：短叠不再挤在上半截），条带 ≤ 整卡高 */
 .fb-stack {
   position: relative;
   flex: 1;
@@ -4801,7 +4808,7 @@ button {
   justify-content: space-between;
   gap: 3px;
   height: 28px;
-  padding: 0 6px;
+  padding: 0 26px 0 6px; /* 右侧留 ⋯ 钮位：选中标记不再与它叠成「··✓」 */
   font-size: 11px;
   white-space: nowrap;
   flex-shrink: 0;
@@ -4878,12 +4885,6 @@ button {
 /* 键盘可达：聚焦即滑出预览（与悬停同态） */
 .fb-hit:focus-visible { outline: 2px solid var(--accent); }
 
-/* prefers-reduced-motion：关闭位移动画，仍显示预览（§5.2） */
-@media (prefers-reduced-motion: reduce) {
-  .fb-card { transition: none !important; }
-  .fb-hit.extracted .fb-card { transform: translateX(32px); }
-}
-
 /* 窄侧栏（手机抽屉 ≤768px）：滑出幅度收窄，避免横向越界 */
 @media (max-width: 768px) {
   .fb-hit.extracted .fb-card { width: 150px; transform: translate(38px, -7px) rotate(-3deg); }
@@ -4894,4 +4895,11 @@ button {
     left: 8px;
     width: auto;
   }
+}
+
+/* prefers-reduced-motion：关闭位移动画与旋转，仍显示预览（§5.2）。
+   置于断点覆盖之后：手机 + 减动效同样不旋转（评审 P2）。 */
+@media (prefers-reduced-motion: reduce) {
+  .fb-card { transition: none !important; }
+  .fb-hit.extracted .fb-card { transform: translateX(32px) !important; }
 }

@@ -507,6 +507,15 @@ test.describe("顶栏搜索浮层（改版 2026-10-08 §5.4，替换旧侧栏内
 		await serveFixture(page);
 		await mockOwnerWithSlides(page, FOUR_SLIDES);
 		await page.goto(FIXTURE_HOST + "/fixture");
+		// 溢出收放（P0 修复）：按钮可能被实测折入 ⋯ 菜单——经菜单点击
+		async function clickFolded(id: string) {
+			if (await page.locator("#" + id).isVisible().catch(() => false)) {
+				await page.locator("#" + id).click();
+				return;
+			}
+			await page.locator("#tbb-more-btn").click();
+			await page.locator("#" + id).click();
+		}
 		const cases = [
 			{ name: "desktop-1440", width: 1440, height: 900 },
 			{ name: "laptop-1024", width: 1024, height: 800 },
@@ -514,21 +523,13 @@ test.describe("顶栏搜索浮层（改版 2026-10-08 §5.4，替换旧侧栏内
 		];
 		for (const vp of cases) {
 			await page.setViewportSize({ width: vp.width, height: vp.height });
-			const box = await page.locator("#tb-search-btn").evaluate((el) => {
-				const r = el.getBoundingClientRect();
-				return { l: r.left, r: r.right, t: r.top, b: r.bottom };
-			});
-			expect(box.l, vp.name + " 搜索按钮在视口内").toBeGreaterThanOrEqual(0);
-			// 单行顶栏：桌面=按钮在顶部 header 内（不换行）；≤768=既有移动端
-			// 底栏接管，按钮贴近视口底部（同一顶栏行内，仍不换行）
-			const isMobileVp = await page.evaluate(() =>
-				!!window.matchMedia("(max-width: 768px)").matches);
-			if (isMobileVp) {
-				expect(box.b, vp.name + " 底栏搜索按钮在视口内").toBeLessThanOrEqual(vp.height);
-			} else {
-				expect(box.b, vp.name + " 顶栏搜索按钮不换行").toBeLessThanOrEqual(64);
+			await page.waitForTimeout(150);
+			// 按钮要么在行内、要么已折入 ⋯ 菜单——两者都必须可触达（P0 契约）
+			const inline = await page.locator("#tb-search-btn").isVisible().catch(() => false);
+			if (!inline) {
+				await expect(page.locator("#tb-search-btn")).toBeAttached();
 			}
-			await page.locator("#tb-search-btn").click();
+			await clickFolded("tb-search-btn");
 			const pop = await page.locator("#tb-search-pop").evaluate((el) => {
 				const r = el.getBoundingClientRect();
 				return { l: r.left, r: r.right, t: r.top, b: r.bottom };
@@ -538,6 +539,8 @@ test.describe("顶栏搜索浮层（改版 2026-10-08 §5.4，替换旧侧栏内
 			await page.screenshot({ path: testInfo.outputPath(`search-${vp.name}.png`) });
 			await page.keyboard.press("Escape");
 			await expect(page.locator("#tb-search-pop")).toBeHidden();
+			// 折入 ⋯ 的路径：关闭上面可能打开的 ⋯ 菜单
+			await page.keyboard.press("Escape");
 		}
 		expect(errors).toEqual([]);
 	});

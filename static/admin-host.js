@@ -62,6 +62,26 @@
    researchDeletionJobs.list（users:read）与 retry（users:write，把终态
    failed 复活为 pending 交 worker 真实清理；completed 只能由清理成功产生，
    不存在也不允许存在「直接置 completed」的桥方法）。
+   2026-10-08（admin-viewer-simplified §6，docs/admin-viewer-simplified-
+   20261008.md）：用户分类与切片临时查看着桥，邀请/可见性方法退役——
+     - admin.users.list 新增 kind/sort 参数（默认 real / joined_desc）；
+     - 新增 admin.users.setAccountKind {user_id, account_kind} →
+       POST /api/admin/v1/users/<id>/account-kind（admin:users:write）；
+     - 新增 admin.slides.startTemporaryView / endTemporaryView {slide_id} →
+       POST / DELETE /api/admin/v1/slides/<id>/temporary-view
+       （admin:slides:write）；
+     - admin.slides.setVisibility 与 admin.invites.list/create/revoke 整行
+       删除（邀请页退役；旧 visibility 授权端点服务端 410）——已删方法按
+       既有语义稳定回 unknown_method；
+     - admin.settings.update 的 registration_mode 枚举收敛为 closed/public；
+     - 新增 admin.viewer.open {slide_id}（admin:slides:read）：只读宿主
+       方法——不经任何 HTTP，宿主侧 window.open('/?slide=<id>', '_blank',
+       'noopener')（iframe 不能也不应直接导航宿主）。slide_id 由 schema
+       pattern ^sld_[A-Za-z0-9_-]+$ 与宿主侧二次校验双重约束。
+       注：admin:invites:read/write 仍是 manifest adminPermissions 词表
+       （plugins/sdk/manifest.py，本线不改）的合法值——KNOWN_PERMISSIONS
+       继续接受它们（无方法消费、纯 no-op 授权），否则 bootstrap 会对
+       现 manifest 的 permissions 数组抛「未知值」使宿主整体不可用。
    ========================================================================= */
 (function () {
   "use strict";
@@ -87,17 +107,26 @@
     "admin.users.setEnabled": "admin:users:write",
     "admin.users.setAiAccess": "admin:users:write",
     "admin.users.resetPassword": "admin:users:write",
+    // 2026-10-08（§2）：用户分类（正式/Dogfood）写——与 enable/ai-access
+    // 同组同权限域（服务端同 owner + CSRF 复核；值未变不写审计）。
+    "admin.users.setAccountKind": "admin:users:write",
     // 2026-09-19（R6）：admin.users.create / identityConflicts /
     // discardPending 整行删除（手动建号与身份冲突页退役）——已删方法不在
     // 本表 → dispatch 门按既有语义稳定回 unknown_method。
-    // 2026-09-05（review P0 owner 读隔离）：切片可见性管理——inventory 是
-    // owner 唯一「看全部」出口；setVisibility 给 owner 建立/收回单切片
-    // view 授权（幂等）。独立 slides 权限域，不与 users/settings 混用。
+    // 2026-10-08（§3.4）：切片清单 + 管理员临时查看。visibility（把切片
+    // 显式加入 owner 工作区的旧授权模型）随临时查看上线整行删除；独立
+    // slides 权限域不与 users/settings 混用。
     "admin.slides.inventory": "admin:slides:read",
-    "admin.slides.setVisibility": "admin:slides:write",
-    "admin.invites.list": "admin:invites:read",
-    "admin.invites.create": "admin:invites:write",
-    "admin.invites.revoke": "admin:invites:write",
+    "admin.slides.startTemporaryView": "admin:slides:write",
+    "admin.slides.endTemporaryView": "admin:slides:write",
+    // 2026-10-08（§6）：「查看」在新标签打开 /?slide=<id>。只读宿主方法
+    //（admin:slides:read）：不经 HTTP，dispatch 后由宿主侧 window.open
+    // 执行（见 METHOD_BACKENDS 与 create() 的 hostActions）。
+    "admin.viewer.open": "admin:slides:read",
+    // 2026-10-08：admin.invites.list/create/revoke 整行删除（邀请页退役，
+    // 注册只剩 closed/public）——已删方法不在本表 → 稳定 unknown_method。
+    // admin:invites:read/write 权限词本身仍被 KNOWN_PERMISSIONS 接受
+    //（见 2026-10-08 文件头注释：与 SDK 词表同源，纯 no-op 授权）。
     // 2026-09-03 wave 2（review-2026-09-02-upload-user-limits-admin-ui-cleanup.md
     // §4/Batch C5-6/D1）：误导性桥方法整行删除——turn 冻结历史（turn-budgets:read）、
     // billing account 读取/caps 写入/人工调账（billing:write）、用户归因
@@ -176,6 +205,12 @@
   var _userIdSpec = { type: "string", minLength: 1, maxLength: 128 };
   // W2：格式申请工单 id（pathId 防路径拼接，与 user_id/invite_id 同规格）
   var _requestIdSpec = { type: "string", minLength: 1, maxLength: 128 };
+  // 2026-10-08（§6）：slide_id 形态 = slide_store 生成器 "sld_" +
+  // token_urlsafe（[A-Za-z0-9_-]）。viewer.open 完全在宿主侧执行、不经
+  // HTTP，start/endTemporaryView 是路径参数——两者都用同一 pattern 门，
+  // 宿主侧再防御一次（见 SLIDE_ID_RE）。
+  var SLIDE_ID_RE = /^sld_[A-Za-z0-9_-]+$/;
+  var _slideIdSpec = { type: "string", pattern: SLIDE_ID_RE.source };
   var _budgetIntSpec = function (min) {
     return { type: "integer", min: min, max: 1000000 };
   };
@@ -189,6 +224,12 @@
         q: { type: "string", maxLength: 128, nullable: true },
         enabled: { type: "boolean" },
         ai_access: { type: "boolean" },
+        // 2026-10-08（§2）：分类筛选与排序。缺键 = 服务端默认
+        //（kind=real、sort=joined_desc）；排序在分页前对全量完成，
+        // last_login_at IS NULL 恒排末尾（服务端权威）。
+        kind: { type: "string", enum: ["real", "dogfood", "all"] },
+        sort: { type: "string",
+                enum: ["joined_desc", "joined_asc", "last_login_desc"] },
       },
       additionalProperties: false,
     },
@@ -251,45 +292,39 @@
       required: ["user_id", "password"],
       additionalProperties: false,
     },
+    // 2026-10-08（§2）：用户分类写。account_kind 枚举 closed 在服务端；
+    // 值未变服务端不写审计（幂等），桥层只挡非法形态。
+    "admin.users.setAccountKind": {
+      properties: {
+        user_id: _userIdSpec,
+        account_kind: { type: "string", enum: ["real", "dogfood"] },
+      },
+      required: ["user_id", "account_kind"],
+      additionalProperties: false,
+    },
     // R6（2026-09-19）：identityConflicts / discardPending 的 schema 已随
     // 身份冲突页退役删除（同回 unknown_method）。
-    // 2026-09-05：切片可见性管理。inventory 只允许游标/页大小；setVisibility
-    // 的 name 是切片文件名（服务端 _sanitize_name 权威校验，桥层只挡空值
-    // 与路径分隔符——pathId）。
+    // 2026-10-08（§3.4）：切片清单 + 管理员临时查看。setVisibility 的
+    // schema 已随旧授权模型删除（方法整体 unknown_method）。
     "admin.slides.inventory": {
       properties: { cursor: _cursorSpec, limit: _limitSpec },
       additionalProperties: false,
     },
-    "admin.slides.setVisibility": {
-      properties: {
-        name: { type: "string", minLength: 1, maxLength: 200 },
-        granted: { type: "boolean" },
-      },
-      required: ["name", "granted"],
+    "admin.slides.startTemporaryView": {
+      properties: { slide_id: _slideIdSpec },
+      required: ["slide_id"],
       additionalProperties: false,
     },
-    "admin.invites.list": {
-      properties: { cursor: _cursorSpec, limit: _limitSpec },
+    "admin.slides.endTemporaryView": {
+      properties: { slide_id: _slideIdSpec },
+      required: ["slide_id"],
       additionalProperties: false,
     },
-    "admin.invites.create": {
-      properties: {
-        login_id: { type: "string", maxLength: 120, nullable: true },
-        // wave 2（§3.4/§4.4）：邀请只负责注册——新契约 {login_id?, ttl_seconds?,
-        // ai_access, total_limit_nano_cny?, note?}；source_code/campaign_id/
-        // cohort/monthly_limit_nano_cny 全部移除（桥层即拒，不发归因字段）。
-        ttl_seconds: { type: "integer", min: 60, max: 2592000 },
-        ai_access: { type: "boolean" },
-        note: { type: "string", maxLength: 200, nullable: true },
-        total_limit_nano_cny: {
-          type: "string", pattern: "^[0-9]{1,19}$", nullable: true,
-        },
-      },
-      additionalProperties: false,
-    },
-    "admin.invites.revoke": {
-      properties: { invite_id: { type: "string", minLength: 1, maxLength: 128 } },
-      required: ["invite_id"],
+    // 只读宿主方法：不经 HTTP，slide_id 在宿主侧再过一次 SLIDE_ID_RE
+    //（dispatch 后由 create() 注入的 hostActions 执行 window.open）。
+    "admin.viewer.open": {
+      properties: { slide_id: _slideIdSpec },
+      required: ["slide_id"],
       additionalProperties: false,
     },
     // 批次 F：运行时安全参数（与 settings.update 的 runtime 步骤同源；
@@ -374,9 +409,12 @@
     "admin.settings.get": { properties: {}, additionalProperties: false },
     "admin.settings.update": {
       properties: {
+        // 2026-10-08（§4）：邀请码退役——注册模式只剩 closed/public（旧值
+        // invite_only / email_verify_invite_activation 由服务端按 closed
+        // fail-closed 处理，桥层不再接受）。
         registration_mode: {
           type: "string",
-          enum: ["closed", "invite_only", "email_verify_invite_activation"],
+          enum: ["closed", "public"],
         },
         demo_enabled: { type: "boolean" },
         demo_weekly_limit: { type: "object" },
@@ -514,6 +552,14 @@
     var set = {};
     Object.keys(METHOD_PERMISSIONS).forEach(function (m) {
       set[METHOD_PERMISSIONS[m]] = true;
+    });
+    // 2026-10-08：邀请页退役后桥上不再有 admin.invites.* 方法，但
+    // admin:invites:read/write 仍是 manifest adminPermissions 词表
+    //（plugins/sdk/manifest.py MANIFEST_ADMIN_PERMISSIONS，本线不改）的
+    // 合法值——bootstrap 必须继续接受它们（纯 no-op 授权），否则现网
+    // manifest 的 permissions 数组会触发「未知值」错误使宿主 fail-closed。
+    ["admin:invites:read", "admin:invites:write"].forEach(function (p) {
+      set[p] = true;
     });
     return set;
   })();
@@ -793,6 +839,8 @@
       var url = "/api/admin/v1/users" + buildQuery({
         cursor: payload.cursor, limit: payload.limit, q: payload.q,
         enabled: payload.enabled, ai_access: payload.ai_access,
+        // 2026-10-08（§2）：kind/sort 缺键即省略（服务端默认 real/joined_desc）
+        kind: payload.kind, sort: payload.sort,
       });
       return ctx.fetchJson(url).then(function (res) {
         if (!res.ok) throw backendError(url, res);
@@ -800,9 +848,9 @@
       });
     },
 
-    // 2026-09-05：切片可见性管理（读隔离的唯一管理出口）。setVisibility 走
-    // POST（makeFetchJson 对非安全方法自动附 CSRF 双提交 header）；name 经
-    // pathId 防路径拼接（拒绝空值与 "/"、"?"）。
+    // 2026-10-08（§3.4）：切片清单（created_at 新→旧 + 每项 temporary_view
+    // + 顶层 server_now）与临时查看开/关。旧 setVisibility 后端映射已删
+    //（授权模型被 1 小时临时查看取代；服务端旧 visibility 端点 410）。
     "admin.slides.inventory": function (ctx, payload) {
       var url = "/api/admin/v1/slides/inventory" + buildQuery({
         cursor: payload.cursor, limit: payload.limit,
@@ -813,10 +861,30 @@
       });
     },
 
-    "admin.slides.setVisibility": function (ctx, payload) {
+    // schema 门已限定 slide_id 形态（^sld_[A-Za-z0-9_-]+$，不含 "/" 或
+    // "?"）；pathId 保留作纵深防御（encodeURIComponent + 拒路径分隔符）。
+    "admin.slides.startTemporaryView": function (ctx, payload) {
       var url = "/api/admin/v1/slides/" +
-        pathId(payload.name, "name") + "/visibility";
-      return jsonWrite(url, "POST", { granted: payload.granted })(ctx);
+        pathId(payload.slide_id, "slide_id") + "/temporary-view";
+      return jsonWrite(url, "POST", {})(ctx);
+    },
+
+    "admin.slides.endTemporaryView": function (ctx, payload) {
+      var url = "/api/admin/v1/slides/" +
+        pathId(payload.slide_id, "slide_id") + "/temporary-view";
+      return jsonWrite(url, "DELETE", {})(ctx);
+    },
+
+    // 2026-10-08（§6）：只读宿主方法——「查看」在新标签打开 /?slide=<id>。
+    // 不经任何 HTTP（iframe 无权直接导航宿主，宿主代为 window.open）；
+    // slide_id 在宿主侧按 SLIDE_ID_RE 二次校验后原样拼接。
+    "admin.viewer.open": function (ctx, payload) {
+      if (!ctx.host || typeof ctx.host.openViewerSlide !== "function") {
+        return Promise.reject({
+          code: "not_implemented", message: "admin.viewer.open 尚未实现",
+        });
+      }
+      return Promise.resolve(ctx.host.openViewerSlide(payload.slide_id));
     },
 
     "admin.billing.usage.list": function (ctx, payload) {
@@ -880,7 +948,7 @@
 
     // ---- PR5 写方法 → Admin API v1 写端点（POST/PUT 走 makeFetchJson 的
     // CSRF 双提交；路径参数必须 encodeURIComponent 且拒绝含 "/" 的值，防止
-    // iframe 借 user_id/invite_id 拼出任意路径）----
+    // iframe 借 user_id/slide_id 拼出任意路径）----
     // R6（2026-09-19）：admin.users.create / identityConflicts /
     // discardPending 的后端映射已随功能退役删除（手动建号与身份冲突页
     // 下线；服务端旧入口 410 endpoint_retired）。
@@ -902,35 +970,20 @@
       return jsonWrite(url, "POST", { password: payload.password })(ctx);
     },
 
+    // 2026-10-08（§2）：用户分类（正式/Dogfood）。与 enable/ai-access 同组：
+    // owner 权限 + CSRF 双提交；值未变服务端不写审计（幂等）。
+    "admin.users.setAccountKind": function (ctx, payload) {
+      var url = "/api/admin/v1/users/" + pathId(payload.user_id, "user_id") +
+          "/account-kind";
+      return jsonWrite(url, "POST", { account_kind: payload.account_kind })(ctx);
+    },
+
     // R6（2026-09-19）：identityConflicts / discardPending 后端映射已删
     // （身份冲突页退役；已删方法稳定 unknown_method）。
 
-    "admin.invites.list": function (ctx, payload) {
-      var url = "/api/admin/v1/invites" + buildQuery({
-        cursor: payload.cursor, limit: payload.limit,
-      });
-      return ctx.fetchJson(url).then(function (res) {
-        if (!res.ok) throw backendError(url, res);
-        return res.body;
-      });
-    },
-
-    "admin.invites.create": function (ctx, payload) {
-      return jsonWrite("/api/admin/v1/invites", "POST", {
-        login_id: payload.login_id,
-        ttl_seconds: payload.ttl_seconds,
-        ai_access: payload.ai_access,
-        note: payload.note,
-        // Batch B/D1：可选初始总额度模板（兑换事务内为新 user 建 allowance）
-        total_limit_nano_cny: payload.total_limit_nano_cny,
-      })(ctx);
-    },
-
-    "admin.invites.revoke": function (ctx, payload) {
-      var url = "/api/admin/v1/invites/" + pathId(payload.invite_id, "invite_id") +
-          "/revoke";
-      return jsonWrite(url, "POST", {})(ctx);
-    },
+    // 2026-10-08：admin.invites.list/create/revoke 后端映射已随邀请页退役
+    // 删除（§4：/api/admin/v1/invites* 服务端 410 endpoint_retired；
+    // registration_invites 表保留为历史）。桥层不出现这些名字。
 
     // 批次 F：运行时安全参数写（settings.update 的 runtime 步骤实际打点；
     // 原 turn-budgets PUT 已 410 turn_budgets_retired）
@@ -1239,6 +1292,25 @@
     var load = null;
     var stats = { denied: 0, handled: 0 };
 
+    // 2026-10-08（§6）：宿主侧动作注入表（不回传给 iframe 的通用能力——
+    // 只有显式登记的 host 方法可触达）。admin.viewer.open 的「查看」需要
+    // 宿主开新标签：iframe 是 opaque sandbox（无 allow-popups/
+    // allow-top-navigation），不能也不应自己 window.open/导航宿主——由宿主
+    // 侧执行，slide_id 过 SLIDE_ID_RE 后拼 /?slide=<id>（Viewer 深链）。
+    var hostActions = {
+      openViewerSlide: function (slideId) {
+        var s = String(slideId == null ? "" : slideId);
+        if (!SLIDE_ID_RE.test(s)) {
+          throw { code: "invalid_params", message: "slide_id 非法" };
+        }
+        if (typeof win.open !== "function") {
+          throw { code: "bridge_error", message: "宿主无法打开新标签页" };
+        }
+        win.open("/?slide=" + encodeURIComponent(s), "_blank", "noopener");
+        return { opened: true, slide_id: s };
+      },
+    };
+
     function postToPlugin(targetWindow, env) {
       if (!targetWindow || typeof targetWindow.postMessage !== "function") return;
       try {
@@ -1354,7 +1426,8 @@
           return;
         }
         Promise.resolve().then(function () {
-          return backend({ fetchJson: observedFetchJson, ensureOwner: ensureOwner },
+          return backend({ fetchJson: observedFetchJson, ensureOwner: ensureOwner,
+                           host: hostActions },
                          env.payload || {});
         }).then(function (result) { finish(true, result == null ? null : result); },
                 function (err) {

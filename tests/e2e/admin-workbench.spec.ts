@@ -147,12 +147,13 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 		await frame.locator('.adm-nav-btn[data-page="users"]').click();
 		await expect(frame.locator("#adm-users-tbody")).toContainText(
 			"e2e-user@pt.test", { timeout: 10_000 });
-		// 关键字段：角色（次要列）、启用状态；掩码登录账号已收进抽屉（§4.3）
-		await expect(frame.locator("#adm-users-tbody")).toContainText("user");
-		await expect(frame.locator("#adm-users-tbody")).toContainText("启用");
-		await expect(frame.locator("#adm-users-table")).toContainText("额度剩余");
-		// r3-wave2 单轨：user 行恒 total 形态——抽屉主视图是总额度字段，
-		// 不出现 window 形态（本月额度）与已删的「切换前」过渡文案
+		// 2026-10-08 §2：主表四列（用户/加入时间/最近登录/分类）——分类默认
+		// 正式用户；掩码登录账号/额度/启停收进抽屉（§4.3 + 2026-10-08）
+		await expect(frame.locator("#adm-users-table")).toContainText("加入时间");
+		await expect(frame.locator("#adm-users-table")).toContainText("最近登录");
+		await expect(frame.locator("#adm-users-table")).toContainText("分类");
+		await expect(frame.locator("#adm-users-tbody")).toContainText("正式用户");
+		// 抽屉主视图仍是总额度字段（r3-wave2 单轨）
 		const userRow = frame.locator("#adm-users-tbody tr", { hasText: "e2e-user@pt.test" });
 		await userRow.locator("button", { hasText: "详情" }).click();
 		await expect(frame.locator("#adm-user-drawer")).toBeVisible();
@@ -166,39 +167,22 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 		await expect(frame.locator("#adm-user-drawer")).toBeHidden();
 	});
 
-	test("7. invites page reaches terminal state with no attribution content (wave 2 §4.4)", async ({ page }) => {
+	test("7. invites page is retired: no nav entry, deep links fall back (2026-10-08 §4)", async ({ page }) => {
 		await login(page, CREDS.ownerLogin, CREDS.ownerPassword);
 		await page.goto("/admin");
 		await expect(hostStatus(page)).toHaveAttribute(
 			"data-admin-host-state", "ready", { timeout: 5000 });
 		const frame = page.frameLocator("#admin-plugin-frame");
-		// wave 2：导航名为「邀请」（slug 保持 invites）
-		await expect(frame.locator('.adm-nav-btn[data-page="invites"]'))
-			.toHaveText("邀请");
-		await frame.locator('.adm-nav-btn[data-page="invites"]').click();
-		// 终态断言：限定时间内离开 loading 进入 ready（注册模式摘要 + 邀请列表）
-		await expect
-			.poll(async () =>
-				frame.locator("#adm-state-invites").getAttribute("data-page-state"))
-			.toBe("ready", { timeout: 10_000 });
-		await expect(frame.locator("#adm-state-invites")).not.toContainText("加载中");
-		// 注册模式只读摘要 + 「去设置修改」跳转（无第二套写控件）
-		await expect(frame.locator("#adm-invite-mode")).toContainText("closed");
-		await expect(frame.locator("#adm-invite-goto-settings-btn")).toBeVisible();
-		// 断言限定在邀请页 section（设置页 section 仍在 DOM 中但 hidden）
-		const invitesHtml = await frame.locator("#adm-page-invites").innerHTML();
-		expect(invitesHtml).not.toContain('id="adm-regmode-select"');
-		expect(invitesHtml).not.toContain("adm-regmode-save-btn");
-		// 来源/归因内容整体退役：漏斗、用户来源明细、campaign/source 输入不存在
-		expect(await frame.locator("#adm-acq-funnel-table").count()).toBe(0);
-		expect(await frame.locator("#adm-acq-users-table").count()).toBe(0);
-		expect(await frame.locator("#adm-invite-cohort").count()).toBe(0);
-		expect(await frame.locator("#adm-invite-source").count()).toBe(0);
-		expect(await frame.locator("#adm-invite-campaign").count()).toBe(0);
-		const pageText = await frame.locator("#adm-page-invites").textContent();
-		expect(pageText).not.toContain("来源漏斗");
-		expect(pageText).not.toContain("first touch");
-		expect(pageText).not.toContain("首次 AI");
+		// 导航无「邀请」按钮；页面 section / 表单 / 列表全部不存在
+		await expect(frame.locator('.adm-nav-btn[data-page="invites"]')).toHaveCount(0);
+		await expect(frame.locator("#adm-page-invites")).toHaveCount(0);
+		await expect(frame.locator("#adm-invite-create-box")).toHaveCount(0);
+		await expect(frame.locator("#adm-invites-table")).toHaveCount(0);
+		// 旧 /admin#invites 深链回概览（不空屏、不报错）
+		await page.goto("/admin#invites");
+		await expect(hostStatus(page)).toHaveAttribute(
+			"data-admin-host-state", "ready", { timeout: 5000 });
+		await expect(frame.locator("#adm-page-overview")).toBeVisible();
 	});
 
 	const bridgePages: Array<[string, RegExp]> = [
@@ -234,10 +218,13 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 			.poll(async () =>
 				frame.locator("#adm-state-settings").getAttribute("data-page-state"))
 			.toBe("ready", { timeout: 10_000 });
-		// 注册模式展示（closed / invite_only；public 灰显不可选）
+		// 2026-10-08 §4：注册模式只剩 closed / public（invite_only 等旧值不在
+		// 选项中，public 不再禁用）
 		await expect(frame.locator("#adm-regmode-info")).toContainText("closed");
 		await expect(frame.locator("#adm-regmode-select option[value=public]"))
-			.toBeDisabled();
+			.toBeEnabled();
+		await expect(frame.locator("#adm-regmode-select").locator("option"))
+			.toHaveCount(2);
 		// 保存 closed：成功态（服务端校验 + 写审计）；保存后页面自动刷新，
 		// 等刷新收敛再操作下拉（renderSettings 会以服务端值回填 select）
 		await frame.locator("#adm-regmode-select").selectOption("closed");
@@ -248,16 +235,23 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 			.poll(async () =>
 				frame.locator("#adm-state-settings").getAttribute("data-page-state"))
 			.toBe("ready", { timeout: 10_000 });
-		// invite_only：本地 HTTP 不满足前置条件 → 可见错误态（fail-closed）。
-		// 该 400 是用例预期的错误态：fetch 的 console 报错按 ignoreApi 豁免，
-		// 错误本身由下方状态文案断言覆盖。
-		ignoreApi.push("/api/admin/v1/settings/registration");
-		await frame.locator("#adm-regmode-select").selectOption("invite_only");
+		// public：开放注册受支持，保存成功并回显
+		await frame.locator("#adm-regmode-select").selectOption("public");
 		await frame.locator("#adm-regmode-save-btn").click();
 		await expect(frame.locator("#adm-regmode-status"))
-			.toContainText("前置条件", { timeout: 10_000 });
-		await expect(frame.locator("#adm-regmode-status"))
-			.toContainText("registration_preconditions_failed");
+			.toContainText("注册模式已提交为 public", { timeout: 10_000 });
+		await expect
+			.poll(async () =>
+				frame.locator("#adm-state-settings").getAttribute("data-page-state"))
+			.toBe("ready", { timeout: 10_000 });
+		await expect(frame.locator("#adm-regmode-select")).toHaveValue("public");
+		// 收回 closed（后续用例假定 closed 种子语义）
+		await frame.locator("#adm-regmode-select").selectOption("closed");
+		await frame.locator("#adm-regmode-save-btn").click();
+		await expect
+			.poll(async () =>
+				frame.locator("#adm-state-settings").getAttribute("data-page-state"))
+			.toBe("ready", { timeout: 10_000 });
 	});
 
 	test("10b. 设置页：消费额度策略保存（三键拆分，CNY 输入 → nano wire）与 enforcement 展示", async ({ page }) => {
@@ -414,10 +408,9 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 		await expect(frame.locator("#adm-drawer-body"))
 			.toContainText("已设置总额度 0.00 CNY", { timeout: 10_000 });
 		await frame.locator("#adm-drawer-close").click();
-		// 用户表「额度剩余」列显示短文案「已用尽」——不再有长拒绝说明
+		// 2026-10-08 §2：额度语义只在抽屉——重开抽屉验证「已用尽」短文案
+		//（不再有长拒绝说明）
 		const row2 = frame.locator("#adm-users-tbody tr", { hasText: "e2e-limited@pt.test" });
-		await expect(row2).toContainText("已用尽", { timeout: 10_000 });
-		// 抽屉金额主视图同样「已用尽」
 		await row2.locator("button", { hasText: "详情" }).click();
 		await expect(frame.locator("#adm-user-drawer")).toBeVisible();
 		await expect(frame.locator("#adm-drawer-body"))
@@ -425,40 +418,6 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 		await expect(frame.locator("#adm-drawer-body"))
 			.not.toContainText("下次预占将被拒绝");
 		await frame.locator("#adm-drawer-close").click();
-	});
-
-	test("10f. 邀请页：初始总额度模板创建 + 明文码仅一次 + 列表展示（新契约字段）", async ({ page }) => {
-		await login(page, CREDS.ownerLogin, CREDS.ownerPassword);
-		await page.goto("/admin");
-		await expect(hostStatus(page)).toHaveAttribute(
-			"data-admin-host-state", "ready", { timeout: 5000 });
-		const frame = page.frameLocator("#admin-plugin-frame");
-		await frame.locator('.adm-nav-btn[data-page="invites"]').click();
-		await expect
-			.poll(async () =>
-				frame.locator("#adm-state-invites").getAttribute("data-page-state"))
-			.not.toBe("loading", { timeout: 10_000 });
-		// §4.4：创建邀请默认折叠——展开入口后填写；初始总额度在高级折叠里
-		const inviteBox = frame.locator("#adm-invite-create-box");
-		await expect(frame.locator("#adm-invite-create-form")).toBeHidden();
-		await inviteBox.locator("summary").first().click();
-		await expect(frame.locator("#adm-invite-create-form")).toBeVisible();
-		await expect(frame.locator("#adm-invite-limit")).toBeHidden();
-		await frame.locator("#adm-invite-limit-box").locator("summary").click();
-		await expect(frame.locator("#adm-invite-limit")).toBeVisible();
-		await frame.locator("#adm-invite-login").fill("e2e-inv@pt.test");
-		await frame.locator("#adm-invite-limit").fill("2.5");
-		await frame.locator("#adm-invite-create-btn").click();
-		// 明文邀请码仅此一次展示（token box 可见且非空）
-		await expect(frame.locator("#adm-invite-create-status"))
-			.toContainText("明文邀请码只显示这一次", { timeout: 10_000 });
-		await expect(frame.locator("#adm-invite-token-box")).toBeVisible();
-		await expect(frame.locator("#adm-invite-token")).not.toBeEmpty();
-		// 列表：初始总额度列 2.50 CNY（两位小数）
-		await expect(frame.locator("#adm-invites-tbody"))
-			.toContainText("2.50 CNY", { timeout: 10_000 });
-		// 注册模式状态展示保持（只读摘要卡）
-		await expect(frame.locator("#adm-invite-mode")).toContainText("closed");
 	});
 
 	test("9. plugin reload re-establishes ready with a fresh nonce", async ({ page }) => {
@@ -622,7 +581,7 @@ test.describe("UI 升级 2026-09-01 — 桌面 1440×900（批次 E）", () => {
 		await shot(page, "after-1440-overview.png");
 	});
 
-	test("13. users: 5 列表头（额度剩余）+ 创建折叠；限额户展示已用尽", async ({ page }) => {
+	test("13. users: 四列表头（用户/加入时间/最近登录/分类）+ 分类筛选；限额户详情抽屉见已用尽", async ({ page }) => {
 		await gotoAdminReady(page);
 		const frame = page.frameLocator("#admin-plugin-frame");
 		await frame.locator('.adm-nav-btn[data-page="users"]').click();
@@ -631,15 +590,19 @@ test.describe("UI 升级 2026-09-01 — 桌面 1440×900（批次 E）", () => {
 			.poll(async () => frame.locator("#adm-state-users").getAttribute("data-page-state"))
 			.toBe("ready", { timeout: 10_000 });
 		const table = frame.locator("#adm-users-table");
-		await expect(table).toContainText("额度剩余");
+		// 2026-10-08 §2：主表四列
+		await expect(table).toContainText("用户");
+		await expect(table).toContainText("加入时间");
+		await expect(table).toContainText("最近登录");
+		await expect(table).toContainText("分类");
+		await expect(table).not.toContainText("额度剩余");
 		await expect(table).not.toContainText("本月用量");
 		await expect(frame.locator("#adm-users-tbody"))
 			.toContainText("e2e-user@pt.test", { timeout: 10_000 });
-		// 剩余列覆盖边界语义之一（10e 已把限额户总额度存 0 → 已用尽）
-		const limited = frame.locator("#adm-users-tbody tr", { hasText: "e2e-limited@pt.test" });
-		await expect(limited).toContainText("已用尽");
-		// §4.3：每行只回答「额度剩余」一个数字语义；5 个单元格、无用量条、
-		// 无已消费/预占双行
+		// 分类筛选：默认正式用户（aria-pressed）
+		await expect(frame.locator('.adm-kind-btn[data-kind="real"]'))
+			.toHaveAttribute("aria-pressed", "true");
+		// 每行 4 个单元格；额度语义在抽屉里（10e 已把限额户总额度存 0 → 已用尽）
 		const rows = await frame.locator("#adm-users-tbody").evaluate((tbody) =>
 			Array.from(tbody.querySelectorAll("tr")).map((tr) => ({
 				text: tr.textContent || "",
@@ -648,14 +611,16 @@ test.describe("UI 升级 2026-09-01 — 桌面 1440×900（批次 E）", () => {
 			})));
 		expect(rows.length).toBeGreaterThan(0);
 		for (const row of rows) {
-			expect(row.text, "user row must answer 额度剩余 semantics")
-				.toMatch(/剩余|已用尽|超支|不可用|契约错误/);
-			expect(row.cells, "desktop users table has exactly 5 columns").toBe(5);
+			expect(row.cells, "desktop users table has exactly 4 columns").toBe(4);
 			expect(row.meters, "no usage meter in simplified table").toBe(0);
 			expect(row.text).not.toContain("已消费");
 			expect(row.text).not.toContain("预占");
-			expect(row.text).not.toContain("下次预占将被拒绝");
 		}
+		const limited = frame.locator("#adm-users-tbody tr", { hasText: "e2e-limited@pt.test" });
+		await limited.locator("button", { hasText: "详情" }).click();
+		await expect(frame.locator("#adm-user-drawer")).toBeVisible();
+		await expect(frame.locator("#adm-drawer-body")).toContainText("已用尽");
+		await frame.locator("#adm-drawer-close").click();
 		// R6：创建用户表单已整体退役（无折叠入口可展开）
 		await expect(frame.locator("#adm-users-create-box")).toHaveCount(0);
 		await assertNoHorizontalOverflow(page, "users-1440");
@@ -826,25 +791,6 @@ test.describe("UI 升级 2026-09-01 — 桌面 1440×900（批次 E）", () => {
     await shot(page, "after-1440-audit.png");
   });
 
-	test("19. invites: 创建折叠、列表前置、无来源漏斗、终态非 loading", async ({ page }) => {
-		await gotoAdminReady(page);
-		const frame = page.frameLocator("#admin-plugin-frame");
-		await frame.locator('.adm-nav-btn[data-page="invites"]').click();
-		await expect
-			.poll(async () => frame.locator("#adm-state-invites").getAttribute("data-page-state"))
-			.toMatch(/ready|empty/, { timeout: 10_000 });
-		const pageHtml = await frame.locator("#adm-page-invites").innerHTML();
-		// 注册模式摘要卡与创建入口在前、邀请列表随后（§4.4）
-		expect(pageHtml.indexOf('id="adm-invite-create-box"'))
-			.toBeLessThan(pageHtml.indexOf('id="adm-invites-table"'));
-		await expect(frame.locator("#adm-invite-create-form")).toBeHidden();
-		// wave 2：来源漏斗/用户来源明细不存在
-		expect(pageHtml).not.toContain("adm-acq-funnel-table");
-		expect(pageHtml).not.toContain("adm-acq-users-table");
-		await assertNoHorizontalOverflow(page, "invites-1440");
-		await shot(page, "after-1440-invites.png");
-	});
-
   // P0-3 回归：抽屉发起的危险操作确认条必须挂抽屉内的 #adm-drawer-confirm
   // （旧实现挂页级 #adm-users-confirm——被遮罩挡住且不在 Tab 圈定内）
   test("23. drawer 危险操作确认：确认条在对话框内、有焦点、可点击、Esc 可关", async ({ page }) => {
@@ -915,9 +861,9 @@ test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
     await expect(frame.locator("#adm-nav.adm-nav--open")).toBeVisible();
     // P0-1：每个导航按钮 innerText 是完整标签（概览/用户/…，wave 2
     // 改名后无首字符重复），且 ::before 内容已按同特异性复位。
-    // R6（2026-09-19）：「身份冲突」页退役移除——导航 10 页（概览/用户/
-    // 切片/格式申请/测试申请/邀请/设置/费用/插件/审计）。
-    const labels = ["概览", "用户", "切片", "格式申请", "测试申请", "邀请", "设置", "费用", "插件", "审计"];
+    // R6（2026-09-19）身份冲突退役 + 2026-10-08 邀请退役——导航 10 页
+    //（概览/用户/切片/格式申请/测试申请/研究删除/设置/费用/插件/审计）。
+    const labels = ["概览", "用户", "切片", "格式申请", "测试申请", "研究删除", "设置", "费用", "插件", "审计"];
     const navBtns = frame.locator(".adm-nav-btn");
     expect(await navBtns.count()).toBe(labels.length);
     for (let i = 0; i < labels.length; i++) {
@@ -934,7 +880,7 @@ test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
     await expect(frame.locator("#adm-page-users")).toBeVisible();
   });
 
-  test("21. 390 users: 4 列布局（名/状态/剩余/详情）、剩余在视口内、无水平溢出", async ({ page }) => {
+  test("21. 390 users: 4 列布局（用户/加入时间/最近登录/分类）、无水平溢出", async ({ page }) => {
     await gotoAdminReady(page);
     const frame = page.frameLocator("#admin-plugin-frame");
     await frame.locator('#adm-nav-toggle').click();
@@ -944,27 +890,14 @@ test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
       .toBe("ready", { timeout: 10_000 });
     const row = frame.locator("#adm-users-tbody tr", { hasText: "e2e-user@pt.test" });
     await expect(row).toBeVisible();
-    // §4.3：关键信息在行内可见——额度剩余语义（含不可用）与详情操作
-    await expect(row).toContainText(/剩余|已用尽|超支|不可用|契约错误/);
+    // 2026-10-08 §2：关键信息在行内可见——分类标签与详情操作
+    await expect(row).toContainText(/正式用户|Dogfood/);
     await expect(row.locator("button", { hasText: "详情" })).toBeVisible();
-    // 列头（额度剩余）在表中
-    await expect(frame.locator("#adm-users-table")).toContainText("额度剩余");
-    // 次要列（角色）在 390px 隐藏；角色已无独立桌面列
-    const hiddenCols = await frame.locator("#adm-users-table").evaluate((t) => {
-      const disp = (sel: string) => {
-        const th = t.querySelector(sel);
-        return th ? getComputedStyle(th).display === "none" : false;
-      };
-      return {
-        secondary: disp("th.adm-col-secondary"),
-        desktop: t.querySelector("th.adm-col-desktop") === null,
-      };
-    });
-    expect(hiddenCols.secondary).toBe(true);
-    expect(hiddenCols.desktop).toBe(true);
+    // 分类筛选在窄屏可见
+    await expect(frame.locator('.adm-kind-btn[data-kind="real"]')).toBeVisible();
     // P0-2：几何断言（iframe 文档视口）——toBeVisible 不足以防截断。
-    // DOM 列序固定：td[0]=显示名 td[1]=角色(隐藏) td[2]=状态(+AI 堆叠)
-    // td[3]=额度剩余 td[4]=操作(详情)；关键单元格 right 边必须落在视口内。
+    // DOM 列序固定：td[0]=用户 td[1]=加入时间 td[2]=最近登录 td[3]=分类；
+    // 关键单元格 right 边必须落在视口内。
     const geo = await row.evaluate((tr) => {
       const vw = document.documentElement.clientWidth;
       const box = (el: Element | null | undefined) => {
@@ -973,36 +906,29 @@ test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
         return { left: r.left, right: r.right, width: r.width };
       };
       const tds = Array.from(tr.querySelectorAll("td"));
-      const stacks = Array.from(tr.querySelectorAll(".adm-stack-mobile")).map((el) => ({
-        text: el.textContent || "",
-        display: getComputedStyle(el).display,
-        box: box(el),
-      }));
       return {
         vw,
         iframeOverflow: document.documentElement.scrollWidth -
           document.documentElement.clientWidth,
         name: box(tds[0]),
-        status: box(tds[2]),
-        remaining: box(tds[3]),
+        joined: box(tds[1]),
+        lastLogin: box(tds[2]),
+        kind: box(tds[3]),
         detail: box(Array.from(tr.querySelectorAll("button"))
           .find((b) => (b.textContent || "").includes("详情"))),
-        stacks,
         visibleCells: tds.filter((td) => td.getBoundingClientRect().width > 0).length,
       };
     });
     expect(geo.iframeOverflow, "users-390 iframe overflow").toBeLessThanOrEqual(1);
-    for (const [key, b] of [["name", geo.name], ["status", geo.status],
-      ["remaining", geo.remaining], ["detail", geo.detail]] as const) {
+    for (const [key, b] of [["name", geo.name], ["joined", geo.joined],
+      ["lastLogin", geo.lastLogin], ["kind", geo.kind],
+      ["detail", geo.detail]] as const) {
       expect(b && b.width, `${key} cell rendered`).toBeGreaterThan(0);
       expect(b && b.right !== undefined && b.right <= geo.vw + 1,
         `${key} cell right edge within iframe viewport`).toBe(true);
     }
-    // 4 列布局：可见单元格恰为 4（显示名/状态/额度剩余/操作）
+    // 4 列布局：可见单元格恰为 4（用户/加入时间/最近登录/分类）
     expect(geo.visibleCells, "390px users table shows exactly 4 columns").toBe(4);
-    // 状态格堆叠了 AI 补行（窄屏堆叠补行唯一保留处）
-    const aiStack = geo.stacks.find((s) => /AI/.test(s.text));
-    expect(aiStack && aiStack.display).toBe("block");
     // R6：创建用户表单已整体退役（无折叠入口可展开）
     await expect(frame.locator("#adm-users-create-box")).toHaveCount(0);
     await assertNoHorizontalOverflow(page, "users-390");

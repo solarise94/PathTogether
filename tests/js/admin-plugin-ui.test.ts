@@ -271,7 +271,8 @@ describe("pathtogether-admin plugin UI bootstrap (PR5)", () => {
 		expect(b.client).toBeTruthy();
 	});
 
-	it("wave 2：邀请/费用页在白名单内（slug 不变，标题收敛）；设置页元素已绑定", () => {
+	it("2026-10-08：邀请页不在白名单（深链回概览）；费用/设置页在白名单且元素已绑定", () => {
+		// invites 深链不再落空屏：showPage 把未知/已退役 slug 归一到 overview
 		expect(loadPluginUi("#invites").client).toBeTruthy();
 		expect(loadPluginUi("#billing").client).toBeTruthy();
 		const a = loadPluginUi("#settings");
@@ -282,9 +283,9 @@ describe("pathtogether-admin plugin UI bootstrap (PR5)", () => {
 		expect(a.els["adm-rt-save-btn"]).toBeTruthy();
 		expect(a.els["adm-win-demo-adjust-btn"]).toBeTruthy();
 		expect(a.els["adm-win-owner-adjust-btn"]).toBeTruthy();
-		// wave 2：注册模式写控件只在设置页；邀请页只有只读摘要 + 跳转
+		// 注册模式写控件只在设置页；邀请页跳转按钮已随页面退役
 		expect(htmlSrc).toContain('id="adm-regmode-select"');
-		expect(htmlSrc).toContain('id="adm-invite-goto-settings-btn"');
+		expect(htmlSrc).not.toContain('id="adm-invite-goto-settings-btn"');
 	});
 });
 
@@ -439,161 +440,69 @@ describe("pathtogether-admin plugin UI — not-ready pages wait instead of error
 });
 
 // --------------------------------------------------------------------------- //
-// wave 2（§4.4）：邀请页 = 注册模式只读摘要 + 邀请列表；不再有任何
-// 来源/归因内容（漏斗/用户来源/first·last touch/首次 AI）。
+// 2026-10-08（admin-viewer-simplified §4）：邀请页整体退役——导航/页面/表单
+// 全部不存在；admin.invites.* 桥方法已删（宿主稳定 unknown_method），深链
+// #invites 归一回概览而不是空屏。
 // --------------------------------------------------------------------------- //
-describe("wave 2 — 邀请页解耦归因（§4.4）", () => {
+describe("2026-10-08 — 邀请页退役（§4）", () => {
 	const NONCE = "c".repeat(64);
 
-	function bootAndWait(bus: ReturnType<typeof loadPluginUiWithBus>) {
+	function boot(bus: ReturnType<typeof loadPluginUiWithBus>) {
 		bus.dispatch(bus.parent, {
 			kind: "init", bridge: "admin", protocolVersion: "1.0.0",
-			nonce: NONCE, adminPermissions: ["admin:settings:read", "admin:invites:read"],
+			nonce: NONCE, adminPermissions: ["admin:settings:read"],
 		});
 	}
 
-	/** 回复邀请页首屏的两路请求（settings.get / invites.list）。 */
-	function replyAll(
-		bus: ReturnType<typeof loadPluginUiWithBus>,
-		reply: (method: string) => { ok: boolean; result?: unknown; error?: unknown } | null,
-	) {
-		for (const posted of bus.parentPosted) {
-			if (posted.env.kind !== "request") continue;
-			const r = reply(String(posted.env.method));
-			if (!r) continue;
-			bus.dispatch(bus.parent, {
-				kind: "response", bridge: "admin", nonce: NONCE,
-				requestId: posted.env.requestId, ok: r.ok,
-				result: r.result, error: r.error,
-			});
-		}
-	}
-
-	it("页面终态：两路都成功即 ready（不再有「加载中…」滞留），零邀请给表内提示", async () => {
-		const bus = loadPluginUiWithBus();
-		bootAndWait(bus);
-		bus.client!.showPage("invites");
-		await ticks(4);
-		replyAll(bus, (method) => {
-			if (method === "admin.settings.get") {
-				return { ok: true, result: { registration: { mode: "closed" } } };
-			}
-			return { ok: true, result: { invites: [], next_cursor: null } };
-		});
-		await ticks(6);
-		const st = bus.els["adm-state-invites"];
-		expect(st.getAttribute("data-page-state")).toBe("ready");
-		expect(st.textContent).toContain("已更新");
-		// 注册模式只读摘要来自 settings.get
-		expect(bus.els["adm-invite-mode"].textContent).toContain("closed");
-		// 归因文案绝不存在（任何元素都不出现旧空态文案）
-		const all = Object.values(bus.els).map((el) => el.textContent).join("\n");
-		expect(all).not.toContain("暂无来源归因数据");
-		expect(all).not.toContain("历史用户尚未回填");
-	});
-
-	it("有邀请数据 → ready 且列表渲染（绑定账号/AI/初始总额度/备注/状态列）", async () => {
-		const bus = loadPluginUiWithBus();
-		bootAndWait(bus);
-		bus.client!.showPage("invites");
-		await ticks(4);
-		replyAll(bus, (method) => {
-			if (method === "admin.settings.get") {
-				return { ok: true, result: { registration: { mode: "invite_only" } } };
-			}
-			return {
-				ok: true,
-				result: {
-					invites: [{
-						invite_id: "iv1", login_id_masked: "a***1@x.com",
-						ai_access: true, total_limit_nano_cny: "2500000000",
-						note: "9 月批次", expires_at: Date.now() / 1000 + 3600,
-					}],
-					next_cursor: null,
-				},
-			};
-		});
-		await ticks(6);
-		const st = bus.els["adm-state-invites"];
-		expect(st.getAttribute("data-page-state")).toBe("ready");
-		const tbody = bus.els["adm-invites-tbody"].textContent;
-		expect(tbody).toContain("iv1");
-		expect(tbody).toContain("2.50 CNY");
-		expect(tbody).toContain("9 月批次");
-		// 旧 cohort / source·campaign 列不再存在（HTML 结构断言见下方源码用例）
-	});
-
-	it("两路全失败 → 终态 error + 重试，绝不渲染成空态", async () => {
-		const bus = loadPluginUiWithBus();
-		bootAndWait(bus);
-		bus.client!.showPage("invites");
-		await ticks(4);
-		replyAll(bus, () => ({
-			ok: false, error: { code: "permission_denied", message: "manifest 未申请" },
-		}));
-		await ticks(6);
-		const st = bus.els["adm-state-invites"];
-		expect(st.getAttribute("data-page-state")).toBe("error");
-		expect(st.textContent).toContain("permission_denied");
-	});
-
-	it("部分失败（settings 挂了）→ ready + partial 提示", async () => {
-		const bus = loadPluginUiWithBus();
-		bootAndWait(bus);
-		bus.client!.showPage("invites");
-		await ticks(4);
-		replyAll(bus, (method) => {
-			if (method === "admin.settings.get") {
-				return { ok: false, error: { code: "bridge_timeout", message: "" } };
-			}
-			return { ok: true, result: { invites: [{ invite_id: "iv1" }], next_cursor: null } };
-		});
-		await ticks(6);
-		const st = bus.els["adm-state-invites"];
-		expect(st.getAttribute("data-page-state")).toBe("ready");
-		expect(st.textContent).toContain("部分数据加载失败");
-	});
-
-	it("创建邀请只发新契约字段（ttl_seconds/total_limit_nano_cny），无归因字段", async () => {
-		const bus = loadPluginUiWithBus();
-		bootAndWait(bus);
-		bus.doc.getElementById("adm-invite-ttl")!.value = "168";
-		bus.doc.getElementById("adm-invite-ai")!.checked = true;
-		bus.doc.getElementById("adm-invite-limit")!.value = "2.5";
-		bus.doc.getElementById("adm-invite-note")!.value = "9 月批次";
-		bus.els["adm-invite-create-btn"]._fire("click", {});
-		await ticks(2);
-		const req = bus.parentPosted
-			.filter((p) => p.env.kind === "request" && p.env.method === "admin.invites.create")
-			.at(-1);
-		expect(req).toBeTruthy();
-		expect(req!.env.payload).toEqual({
-			ttl_seconds: 604800, ai_access: true,
-			total_limit_nano_cny: "2500000000", note: "9 月批次",
-		});
-		replyMethod(bus, NONCE, "admin.invites.create", {
-			ok: true, result: { invite: { invite_id: "iv9", token: "pt-inv-secret" } },
-		});
-		await ticks(4);
-		// 一次性明文码展示
-		expect(bus.els["adm-invite-token-box"].hidden).toBe(false);
-		expect(bus.els["adm-invite-token"].textContent).toBe("pt-inv-secret");
-	});
-
-	it("HTML 源码：邀请页不再包含 source/campaign/cohort/漏斗/用户来源/first·last touch", () => {
-		const invStart = htmlSrc.indexOf('id="adm-page-invites"');
-		const invEnd = htmlSrc.indexOf('id="adm-page-settings"');
-		const invitesPage = htmlSrc.slice(invStart, invEnd);
-		for (const banned of [
-			"adm-invite-cohort", "adm-invite-source", "adm-invite-campaign",
-			"adm-acq-funnel", "adm-acq-users", "adm-acq-more-btn",
-			"来源漏斗", "first touch", "last touch", "首次 AI", "campaign_id",
-			"source_code", "cohort",
+	it("HTML/JS/CSS：无邀请页 section、无导航按钮、无创建表单/一次性 token 区/列表/监听", () => {
+		expect(htmlSrc).not.toContain('id="adm-page-invites"');
+		expect(htmlSrc).not.toContain('data-page="invites"');
+		for (const gone of [
+			"adm-invite-mode", "adm-invite-create-box", "adm-invite-create-form",
+			"adm-invite-create-btn", "adm-invite-token-box", "adm-invite-token",
+			"adm-invites-table", "adm-invites-tbody", "adm-invites-more-btn",
+			"adm-invites-confirm", "adm-invites-status", "adm-invite-login",
+			"adm-invite-ttl", "adm-invite-limit", "adm-invite-note",
+			"adm-invite-ai", "adm-invite-goto-settings-btn",
 		]) {
-			expect(invitesPage, banned).not.toContain(banned);
+			expect(htmlSrc, gone).not.toContain(gone);
 		}
+		expect(src).not.toContain("admin.invites.list");
+		expect(src).not.toContain("admin.invites.create");
+		expect(src).not.toContain("admin.invites.revoke");
+		expect(src).not.toContain("submitCreateInvite");
+		expect(src).not.toContain("loadInvitesPage");
+		expect(cssSrc).not.toContain('data-page="invites"');
+	});
+
+	it("深链 #invites 归一回概览：发概览首屏请求，绝不发 admin.invites.*", async () => {
+		const bus = loadPluginUiWithBus();
+		boot(bus);
+		bus.client!.showPage("invites");
+		await ticks(4);
+		const requested = bus.parentPosted
+			.filter((p) => p.env.kind === "request")
+			.map((p) => String(p.env.method));
+		expect(requested).toContain("admin.overview.get");
+		expect(requested.every((m) => !m.startsWith("admin.invites."))).toBe(true);
+		// 概览 section 可见（不是所有页面都隐藏的空屏）
+		expect(bus.els["adm-page-overview"].hidden).toBe(false);
+		expect(bus.els["adm-page-users"].hidden).toBe(true);
+	});
+
+	it("设置页注册模式只剩 closed/public（旧 invite 模式不在选项中，public 不再禁用）", () => {
+		const selStart = htmlSrc.indexOf('id="adm-regmode-select"');
+		const selEnd = htmlSrc.indexOf("</select>", selStart);
+		const sel = htmlSrc.slice(selStart, selEnd);
+		expect(sel).toContain('value="closed"');
+		expect(sel).toContain('value="public"');
+		expect(sel).not.toContain("invite_only");
+		expect(sel).not.toContain("email_verify_invite_activation");
+		expect(sel).not.toMatch(/value="public"[^>]*disabled/);
+		expect(sel).not.toContain("本阶段不支持");
 	});
 });
+
 
 // --------------------------------------------------------------------------- //
 // wave 2（§4.2）：概览 = 精简 KPI + 供应商余额/调用缓存 + 条件告警 +
@@ -866,7 +775,7 @@ describe("pathtogether-admin plugin UI — workbench KPI + drawer (§9, 包 E)",
 		});
 	}
 
-	it("users table keeps high-frequency columns only; details open the drawer", async () => {
+	it("users table: 四列（用户/加入时间/最近登录/分类）+ 行内分类切换与详情抽屉（2026-10-08 §2）", async () => {
 		const bus = loadPluginUiWithBus();
 		bootWithOverview(bus);
 		bus.client!.showPage("users");
@@ -875,41 +784,151 @@ describe("pathtogether-admin plugin UI — workbench KPI + drawer (§9, 包 E)",
 			.filter((p) => p.env.kind === "request" && p.env.method === "admin.users.list")
 			.at(-1);
 		expect(req).toBeTruthy();
+		// §2：kind/sort 始终显式携带（默认 real / joined_desc）
+		expect(req!.env.payload).toEqual({
+			limit: 50, cursor: null, kind: "real", sort: "joined_desc",
+		});
 		bus.dispatch(bus.parent, {
 			kind: "response", bridge: "admin", nonce: NONCE,
 			requestId: req!.env.requestId, ok: true,
 			result: {
-				items: [{
-					user_id: "u1", display_name: "张三", login_id_masked: "z***@x.com",
-					role: "user", enabled: true, ai_access: true,
-					created_at: 1700000000, registration_method: "invite",
-					spend: {
-						total: {
-							allowance_id: "alw_1", total_limit_nano_cny: "20000000000",
-							spent_nano_cny: "3420000000", reserved_nano_cny: "500000000",
-							remaining_nano: "16080000000", overage_nano: "0",
-							source: "invite", version: 2, cutover_at: 1700000000,
-							opening_spent_nano_cny: "3420000000",
+				items: [
+					{
+						user_id: "u1", display_name: "张三", identity: "zhang@x.com",
+						role: "user", enabled: true, ai_access: true, account_kind: "real",
+						created_at: 1700000000, last_login_at: 1700000100,
+						spend: {
+							total: {
+								allowance_id: "alw_1", total_limit_nano_cny: "20000000000",
+								spent_nano_cny: "3420000000", reserved_nano_cny: "500000000",
+								remaining_nano: "16080000000", overage_nano: "0",
+								source: "invite", version: 2, cutover_at: 1700000000,
+							},
 						},
 					},
-					last_ai_call_at: 1700000100,
-				}],
+					{
+						user_id: "u2", display_name: "李四", identity: "lisi@x.com",
+						role: "user", enabled: true, ai_access: false,
+						account_kind: "dogfood",
+						created_at: 1700000000, last_login_at: null,
+					},
+				],
 				next_cursor: null,
 			},
 		});
 		await ticks(4);
 		const tbody = bus.els["adm-users-tbody"].textContent;
-		// 展示 J：表内主列=完整邮箱用户名（无 identity 字段时回退 login_id）；
-		// display_name 不再冒充身份进表
-		expect(tbody).toContain("u1");
-		expect(tbody).not.toContain("张三");
-		expect(tbody).toContain("user");
-		expect(tbody).toContain("启用");
-		expect(tbody).toContain("剩余 16.08 CNY");
-		// 低频字段不进表格行（掩码登录账号/allowance 详情只在抽屉里出现）
+		// 用户列 = 显示名 + 邮箱（sub 行）；加入时间/最近登录（上海时间，GMT+8）；
+		// 分类列 = 标签（正式用户/Dogfood）+ 标为测试/改为正式 + 详情
+		expect(tbody).toContain("张三");
+		expect(tbody).toContain("zhang@x.com");
+		expect(tbody).toContain("2023-11-15 06:13:20 GMT+8");
+		expect(tbody).toContain("暂无记录"); // u2 从未登录（last_login_at null）
+		expect(tbody).toContain("正式用户");
+		expect(tbody).toContain("Dogfood");
+		expect(tbody).toContain("标为测试");
+		expect(tbody).toContain("改为正式");
+		expect(tbody).toContain("详情");
+		// 低频字段不进表格行（额度/启用状态/掩码账号只在抽屉里出现）
 		expect(tbody).not.toContain("z***@x.com");
-		expect(tbody).not.toContain("alw_1");
-		expect(bus.els["adm-user-drawer"]).toBeTruthy();
+		expect(tbody).not.toContain("剩余 16.08 CNY");
+		const kindTags = bus.created.filter((el) =>
+			String(el.className).includes("adm-kind-tag"));
+		expect(kindTags.length).toBe(2);
+		const detailBtns = bus.created.filter((el) => el.textContent === "详情" &&
+			el._listeners && el._listeners.click);
+		expect(detailBtns.length).toBe(2);
+		// 详情抽屉保留额度主视图 + 分类/最近登录（主表四列不再显示额度）
+		detailBtns[0]!._fire("click", {});
+		expect(bus.els["adm-user-drawer"].hidden).toBe(false);
+		const body = bus.els["adm-drawer-body"].textContent;
+		expect(body).toContain("分类");
+		expect(body).toContain("最近登录");
+		expect(body).toContain("总额度");
+		expect(body).toContain("剩余 16.08 CNY");
+	});
+
+	it("行内分类切换：real→dogfood 走 admin.users.setAccountKind 并刷新列表", async () => {
+		const bus = loadPluginUiWithBus();
+		bootWithOverview(bus);
+		bus.client!.showPage("users");
+		await ticks(4);
+		const req = bus.parentPosted
+			.filter((p) => p.env.kind === "request" && p.env.method === "admin.users.list")
+			.at(-1);
+		bus.dispatch(bus.parent, {
+			kind: "response", bridge: "admin", nonce: NONCE,
+			requestId: req!.env.requestId, ok: true,
+			result: {
+				items: [{
+					user_id: "u1", display_name: "张三", identity: "zhang@x.com",
+					role: "user", enabled: true, ai_access: true, account_kind: "real",
+					created_at: 1700000000, last_login_at: null,
+				}],
+				next_cursor: null,
+			},
+		});
+		await ticks(4);
+		const toggleBtn = bus.created.find((el) => el.textContent === "标为测试" &&
+			el._listeners && el._listeners.click);
+		expect(toggleBtn).toBeTruthy();
+		toggleBtn!._fire("click", {});
+		await ticks(2);
+		const kindReq = bus.parentPosted
+			.filter((p) => p.env.kind === "request" &&
+				p.env.method === "admin.users.setAccountKind")
+			.at(-1);
+		expect(kindReq).toBeTruthy();
+		expect(kindReq!.env.payload).toEqual({ user_id: "u1", account_kind: "dogfood" });
+		replyMethod(bus, NONCE, "admin.users.setAccountKind", { ok: true, result: {} });
+		await ticks(4);
+		// 成功后刷新列表（第二次 users.list），状态行给结果文案
+		const lists = bus.parentPosted
+			.filter((p) => p.env.kind === "request" && p.env.method === "admin.users.list");
+		expect(lists.length).toBeGreaterThanOrEqual(2);
+		expect(bus.els["adm-users-status"].textContent).toContain("Dogfood");
+	});
+
+	it("分类筛选/排序切换：请求携带新值且游标重置（cursor 回 null）", async () => {
+		const bus = loadPluginUiWithBus();
+		bootWithOverview(bus);
+		bus.client!.showPage("users");
+		await ticks(4);
+		// 首屏（kind=real）
+		const r1 = bus.parentPosted
+			.filter((p) => p.env.kind === "request" && p.env.method === "admin.users.list")
+			.at(-1);
+		bus.dispatch(bus.parent, {
+			kind: "response", bridge: "admin", nonce: NONCE,
+			requestId: r1!.env.requestId, ok: true,
+			result: { items: [{ user_id: "u1", account_kind: "real" }], next_cursor: "c2" },
+		});
+		await ticks(4);
+		// 加载更多（带 cursor）
+		bus.els["adm-users-more-btn"]._fire("click", {});
+		await ticks(2);
+		const more = bus.parentPosted
+			.filter((p) => p.env.kind === "request" && p.env.method === "admin.users.list")
+			.at(-1);
+		expect((more!.env.payload as Record<string, unknown>).cursor).toBe("c2");
+		// 切到 Dogfood：cursor 重置为 null、kind=dogfood
+		bus.els["adm-users-kind-seg"]._fire("click", { target: makeKindBtn("dogfood") });
+		await ticks(2);
+		const switched = bus.parentPosted
+			.filter((p) => p.env.kind === "request" && p.env.method === "admin.users.list")
+			.at(-1);
+		expect((switched!.env.payload as Record<string, unknown>).kind).toBe("dogfood");
+		expect((switched!.env.payload as Record<string, unknown>).cursor).toBeNull();
+		// 切排序：cursor 重置、sort=last_login_desc、kind 保持
+		bus.doc.getElementById("adm-users-sort")!.value = "last_login_desc";
+		bus.els["adm-users-sort"]._fire("change", {});
+		await ticks(2);
+		const sorted = bus.parentPosted
+			.filter((p) => p.env.kind === "request" && p.env.method === "admin.users.list")
+			.at(-1);
+		expect((sorted!.env.payload as Record<string, unknown>).sort).toBe("last_login_desc");
+		expect((sorted!.env.payload as Record<string, unknown>).cursor).toBeNull();
+		expect((sorted!.env.payload as Record<string, unknown>).kind).toBe("dogfood");
 	});
 
 	it("empty users page renders an explained empty state with page-state attribute", async () => {
@@ -928,9 +947,19 @@ describe("pathtogether-admin plugin UI — workbench KPI + drawer (§9, 包 E)",
 		await ticks(4);
 		const st = bus.els["adm-state-users"];
 		expect(st.getAttribute("data-page-state")).toBe("empty");
-		expect(st.textContent).toContain("暂无用户");
+		expect(st.textContent).toContain("暂无");
 	});
 });
+
+/** 分类筛选按钮假元素（kindSeg click 的 ev.target 用；closest 返回自身以通过
+ * 处理器里的 closest(".adm-kind-btn") 探测）。 */
+function makeKindBtn(kind: string): FakeEl {
+	const el = fakeEl("button");
+	el.setAttribute("data-kind", kind);
+	el.setAttribute("aria-pressed", kind === "dogfood" ? "true" : "false");
+	(el as unknown as { closest: () => FakeEl }).closest = () => el;
+	return el;
+}
 
 // --------------------------------------------------------------------------- //
 // UI 升级批次 A 锁定（金额主视图 CNY-only、持久 label、抽屉焦点管理、
@@ -988,7 +1017,7 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 
 	// §4.3 wave 2：额度列按形态渲染（total 短文案四态 + 0<remaining<0.005
 	// 显示 0.00 但状态按原始 nano）
-	it("批次A-2: 用户行额度剩余四态正确；0<remaining<0.005 显示 0.00 不判耗尽", async () => {
+	it("批次A-2: 抽屉额度主视图四态正确；0<remaining<0.005 显示 0.00 不判耗尽（主表已无额度列）", async () => {
 		const bus = loadPluginUiWithBus();
 		boot(bus);
 		bus.client!.showPage("users");
@@ -999,7 +1028,8 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 				items: [
 					{
 						user_id: "u1", display_name: "正常户", role: "user", enabled: true,
-						ai_access: true,
+						ai_access: true, account_kind: "real", created_at: 1700000000,
+						last_login_at: null,
 						spend: { total: {
 							allowance_id: "a1", total_limit_nano_cny: "20000000000",
 							spent_nano_cny: "3420000000", reserved_nano_cny: "500000000",
@@ -1009,7 +1039,8 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 					},
 					{
 						user_id: "u2", display_name: "零额度", role: "user", enabled: true,
-						ai_access: true,
+						ai_access: true, account_kind: "real", created_at: 1700000000,
+						last_login_at: null,
 						spend: { total: {
 							allowance_id: "a2", total_limit_nano_cny: "0",
 							spent_nano_cny: "0", reserved_nano_cny: "0",
@@ -1019,7 +1050,8 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 					},
 					{
 						user_id: "u3", display_name: "超支柱", role: "user", enabled: true,
-						ai_access: true,
+						ai_access: true, account_kind: "real", created_at: 1700000000,
+						last_login_at: null,
 						spend: { total: {
 							allowance_id: "a3", total_limit_nano_cny: "20000000000",
 							spent_nano_cny: "22500000000", reserved_nano_cny: "0",
@@ -1030,7 +1062,8 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 					{
 						// 0 < remaining < 0.005 CNY：显示「剩余 0.00 CNY」而非「已用尽」
 						user_id: "u4", display_name: "零头户", role: "user", enabled: true,
-						ai_access: true,
+						ai_access: true, account_kind: "real", created_at: 1700000000,
+						last_login_at: null,
 						spend: { total: {
 							allowance_id: "a4", total_limit_nano_cny: "10000000000",
 							spent_nano_cny: "9996000000", reserved_nano_cny: "0",
@@ -1040,7 +1073,8 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 					},
 					{
 						user_id: "u5", display_name: "owner 月窗", role: "owner", enabled: true,
-						ai_access: true,
+						ai_access: true, account_kind: "real", created_at: 1700000000,
+						last_login_at: null,
 						spend: { window: {
 							window_id: "w5", window_start: 1700000000, window_end: 1702588800,
 							limit_nano_snapshot: "1000000000000", spent_nano_cny: "0",
@@ -1050,7 +1084,8 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 					},
 					{
 						user_id: "u6", display_name: "缺剩余", role: "user", enabled: true,
-						ai_access: true,
+						ai_access: true, account_kind: "real", created_at: 1700000000,
+						last_login_at: null,
 						spend: { total: {
 							allowance_id: "a6", total_limit_nano_cny: "20000000000",
 							spent_nano_cny: "1000000000", reserved_nano_cny: "0",
@@ -1060,34 +1095,44 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 					},
 					{
 						user_id: "u7", display_name: "错误形态", role: "user", enabled: true,
-						ai_access: true, spend: { error: "pg_backend_required" },
+						ai_access: true, account_kind: "real", created_at: 1700000000,
+						last_login_at: null, spend: { error: "pg_backend_required" },
 					},
 				],
 				next_cursor: null,
 			},
 		});
 		await ticks(4);
+		// 主表四列不再显示额度/状态/角色——额度语义整体收进「详情」抽屉
 		const tbody = bus.els["adm-users-tbody"].textContent;
-		expect(tbody).toContain("剩余 16.08 CNY");
-		expect(tbody).toContain("已用尽");
-		expect(tbody).toContain("超支 2.50 CNY");
+		expect(tbody).not.toContain("剩余 16.08 CNY");
+		expect(tbody).not.toContain("已用尽");
+		// 7 行各有 详情（四列主表的行内动作）
+		const detailBtns = bus.created.filter((el) => el.textContent === "详情" &&
+			el._listeners && el._listeners.click);
+		expect(detailBtns.length).toBe(7);
+		// 抽屉额度主视图四态（逐个打开断言：剩余/已用尽/超支/不可用）
+		async function drawerQuota(idx: number) {
+			detailBtns[idx]!._fire("click", {});
+			await ticks(2);
+			const body = bus.els["adm-drawer-body"].textContent;
+			bus.fireDocument("keydown", { key: "Escape" });
+			await ticks(1);
+			return body;
+		}
+		expect(await drawerQuota(0)).toContain("剩余 16.08 CNY");
+		expect(await drawerQuota(1)).toContain("已用尽");
+		expect(await drawerQuota(2)).toContain("超支 2.50 CNY");
 		// 显示 0.00 但不是「已用尽」（原始 nano 判状态）
-		expect(tbody).toContain("剩余 0.00 CNY");
-		expect(tbody).toContain("不可用（remaining 缺失）");
-		expect(tbody).toContain("pg_backend_required");
+		expect(await drawerQuota(3)).toContain("剩余 0.00 CNY");
+		expect(await drawerQuota(5)).toContain("不可用（remaining 缺失）");
+		expect(await drawerQuota(6)).toContain("pg_backend_required");
 		// owner 行用 window 形态的剩余，绝不伪造 total
-		expect(tbody).toContain("剩余 1000.00 CNY");
-		// 每行 5 个单元格（显示名/角色/状态/额度剩余/操作）
-		const rowCount = (tbody.match(/详情/g) || []).length;
-		expect(rowCount).toBe(7);
-		// 状态格内元信息行始终渲染（R1 修复：不再只限移动端）
-		const metas = bus.created.filter((el) =>
-			String(el.className).includes("adm-user-meta"));
-		expect(metas.length).toBeGreaterThanOrEqual(1);
-	});
+		expect(await drawerQuota(4)).toContain("剩余 1000.00 CNY");
+	}, 10000);
 
 	// W1（review 2026-09-14 R1）：合法待激活用户不得显示成额度缺失
-	it("批次A-2c: pending 用户 status=not_provisioned → 待激活文案，激活标签桌面可见", async () => {
+	it("批次A-2c: pending 用户 status=not_provisioned → 抽屉「待激活」文案而非错误（激活标签在抽屉可见）", async () => {
 		const bus = loadPluginUiWithBus();
 		boot(bus);
 		bus.client!.showPage("users");
@@ -1100,12 +1145,14 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 						user_id: "p1", display_name: "待激活用户", role: "user",
 						enabled: true, ai_access: false,
 						activation_state: "pending_activation",
+						account_kind: "real", created_at: 1700000000, last_login_at: null,
 						spend: { spend_target: "total_allowance",
 							status: "not_provisioned" },
 					},
 					{
 						user_id: "p2", display_name: "active 缺行", role: "user",
 						enabled: true, ai_access: true, activation_state: "active",
+						account_kind: "real", created_at: 1700000000, last_login_at: null,
 						spend: { spend_target: "total_allowance", status: "unavailable",
 							error: "spend_total_allowance_missing" },
 					},
@@ -1114,35 +1161,29 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 			},
 		});
 		await ticks(4);
-		const tbody = bus.els["adm-users-tbody"].textContent;
-		// 按行精确断言剩余单元格（两行文案本就不同，不能只看整表 textContent）
-		const remainCells = bus.created.filter((el) =>
-			String(el.className).includes("adm-cell-remaining"));
-		expect(remainCells.length).toBe(2);
-		// 待激活（p1）：正常业务状态文案，不是 missing error，不伪造金额
-		expect(remainCells[0].textContent).toBe("待激活，激活后发放额度");
-		// active 缺行（p2）：仍是稳定错误码（数据损坏语义不变）
-		expect(remainCells[1].textContent)
-			.toBe("不可用（spend_total_allowance_missing）");
-		expect(tbody).toContain("待激活，激活后发放额度");
-		// 激活标签在状态列（元信息行，桌面可见），不依赖移动端媒体查询
-		const chips = bus.created.filter((el) =>
-			String(el.className).includes("adm-chip--pending"));
-		expect(chips.length).toBe(1);
-		expect(chips[0].textContent).toBe("待激活");
-		// 抽屉：待激活无金额动作（不渲染总额度编辑器）
-		const detailBtn = bus.created.find((el) => el.textContent === "详情" &&
+		const detailBtns = bus.created.filter((el) => el.textContent === "详情" &&
 			el._listeners && el._listeners.click);
-		detailBtn!._fire("click", {});
-		const body = bus.els["adm-drawer-body"].textContent;
-		expect(body).toContain("激活状态");
-		expect(body).toContain("待激活，激活后发放额度");
-		const editorInput = bus.created.find((el) => el.id === "adm-total-limit-input");
-		expect(editorInput).toBeUndefined();
-	});
+		expect(detailBtns.length).toBe(2);
+		// 待激活（p1）：正常业务状态文案，不是 missing error，不伪造金额
+		detailBtns[0]!._fire("click", {});
+		await ticks(2);
+		const body1 = bus.els["adm-drawer-body"].textContent;
+		expect(body1).toContain("激活状态");
+		expect(body1).toContain("待激活，激活后发放额度");
+		expect(body1).not.toContain("spend_total_allowance_missing");
+		expect(bus.created.find((el) => el.id === "adm-total-limit-input"))
+			.toBeUndefined(); // 待激活无金额动作
+		bus.fireDocument("keydown", { key: "Escape" });
+		await ticks(1);
+		// active 缺行（p2）：仍是稳定错误码（数据损坏语义不变）
+		detailBtns[1]!._fire("click", {});
+		await ticks(2);
+		expect(bus.els["adm-drawer-body"].textContent)
+			.toContain("不可用（spend_total_allowance_missing）");
+	}, 10000);
 
 	// §4.3 wave 2：互斥形态契约——total 与 window 同时出现必须显式报错
-	it("批次A-2b: spend.total 与 spend.window 同时出现 = 契约错误（不任选其一）", async () => {
+	it("批次A-2b: spend.total 与 spend.window 同时出现 = 契约错误（抽屉显式报错，不任选其一）", async () => {
 		const bus = loadPluginUiWithBus();
 		boot(bus);
 		bus.client!.showPage("users");
@@ -1152,7 +1193,8 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 			result: {
 				items: [{
 					user_id: "u1", display_name: "双形态", role: "user", enabled: true,
-					ai_access: true,
+					ai_access: true, account_kind: "real",
+					created_at: 1700000000, last_login_at: null,
 					spend: {
 						total: {
 							allowance_id: "a1", total_limit_nano_cny: "10000000000",
@@ -1172,9 +1214,6 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 			},
 		});
 		await ticks(4);
-		const tbody = bus.els["adm-users-tbody"].textContent;
-		expect(tbody).toContain("契约错误");
-		// 打开抽屉：同样显式报错，且不提供任何金额动作（无编辑器输入）
 		const detailBtn = bus.created.find((el) => el.textContent === "详情" &&
 			el._listeners && el._listeners.click);
 		detailBtn!._fire("click", {});
@@ -1186,36 +1225,32 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 		expect(body).not.toContain("20.00 CNY");
 		const editorInput = bus.created.find((el) => el.id === "adm-total-limit-input");
 		expect(editorInput).toBeUndefined();
-	});
+	}, 10000);
 
 	// §4.4 折叠创建表单：R6 后「新建用户」表单退役（只剩邀请折叠入口）
-	it("批次A-3: 创建邀请默认折叠为入口，token 区在展开区内；用户创建表单已退役", () => {
+	it("批次A-3: 邀请表单/一次性 token 区已随邀请页退役；用户创建表单保持退役", () => {
 		// R6（service-review-fix-plan-20260919.md §8）：用户创建表单整体移除
 		expect(htmlSrc).not.toContain('id="adm-users-create-box"');
 		expect(htmlSrc).not.toContain('id="adm-users-create-form"');
 		expect(htmlSrc).not.toContain('id="adm-users-create-btn"');
 		expect(htmlSrc).not.toContain(">新建用户</summary>");
-		const invBox = htmlSrc.indexOf('id="adm-invite-create-box"');
-		expect(invBox).toBeGreaterThan(-1);
-		const invTag = htmlSrc.slice(htmlSrc.lastIndexOf("<details", invBox),
-			htmlSrc.indexOf(">", invBox) + 1);
-		expect(invTag).not.toMatch(/\sopen[\s>]/);
-		const invEnd = htmlSrc.indexOf("<section", invBox);
-		const invBlock = htmlSrc.slice(invBox, invEnd);
-		expect(invBlock).toContain("新建邀请");
-		expect(invBlock).toContain('id="adm-invite-create-form"');
-		expect(invBlock).toContain('id="adm-invite-create-btn"');
-		expect(invBlock).toContain('id="adm-invite-token-box"');
-		expect(invBlock).toContain("高级：单独总额度");
+		// 2026-10-08（§4）：邀请创建表单/一次性 token 区/列表整体退役
+		for (const gone of [
+			"adm-invite-create-box", "adm-invite-create-form", "adm-invite-create-btn",
+			"adm-invite-token-box", "adm-invites-table", "adm-invites-tbody",
+		]) {
+			expect(htmlSrc, gone).not.toContain(gone);
+		}
+		expect(htmlSrc).not.toContain("新建邀请");
+		expect(htmlSrc).not.toContain("高级：单独总额度");
 	});
 
 	// §4.1 持久 label
 	it("批次A-4: 每个关键 input/select 都有真实 <label for>（全量扫描）", () => {
 		const ids = [
-			// 用户筛选（R6：创建用户表单已退役，其输入一并移除）
-			"adm-users-q", "adm-users-enabled", "adm-users-ai",
-			// 创建邀请（wave 2：login/ttl/limit/note；cohort/source/campaign 已删）
-			"adm-invite-login", "adm-invite-ttl", "adm-invite-limit", "adm-invite-note",
+			// 用户页（2026-10-08 §2）：分类分段按钮（role=group 有 aria-label）
+			// + 排序下拉；搜索/启用/AI 筛选已随四列主表退役
+			"adm-users-sort",
 			// 设置：注册模式 / 三键额度策略 / enforcement / 运行时 / Demo+Owner 立即调整
 			"adm-regmode-select", "adm-spend-user-total", "adm-spend-demo-week",
 			"adm-spend-owner-month", "adm-spend-mode",
@@ -1471,29 +1506,35 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 		expect(htmlSrc).toMatch(/id="adm-balance-refresh-btn"[^>]*class=["'][^"']*adm-btn-secondary/);
 	});
 
-	// §5.3/§4.8 390px 列适配（CSS 断言）
-	it("批次A-8: 次要列可隐藏、5 列表头（窄屏 4 列）、移动堆叠补行、日期不 break-all", () => {
-		// R6（2026-09-19）：身份冲突页退役——用户页切片直达「切片可见性」；
-		// 本用例仍然只断言用户页
+	// §2/§4.8 390px 列适配（CSS 断言；2026-10-08 四列主表）
+	it("批次A-8: 用户表四列表头（用户/加入时间/最近登录/分类）、分类组件、日期不 break-all", () => {
 		const usersPage = htmlSrc.slice(htmlSrc.indexOf('id="adm-page-users"'),
 			htmlSrc.indexOf('id="adm-page-slides"'));
-		expect(usersPage).toMatch(/<th[^>]*adm-col-secondary[^>]*>角色</);
+		// 四列主表：无次要列/无旧角色·状态·额度列
+		expect(usersPage).toContain("<th>用户</th>");
+		expect(usersPage).toContain("<th>加入时间</th>");
+		expect(usersPage).toContain("<th>最近登录</th>");
+		expect(usersPage).toContain("<th>分类</th>");
+		expect(usersPage).not.toMatch(/<th[^>]*adm-col-secondary[^>]*>角色</);
 		expect(usersPage).not.toMatch(/<th[^>]*>登录账号</);
-		expect(usersPage).not.toMatch(/<th[^>]*>最近 AI 调用</);
+		expect(usersPage).not.toMatch(/<th[^>]*>额度剩余</);
 		expect(usersPage).not.toMatch(/<th[^>]*adm-col-desktop/);
-			// J 批次（2026-09-07）：主列由「显示名」改为「邮箱用户名」（email 即唯一用户名）
-			expect(usersPage).toContain("<th>邮箱用户名</th>");
-		expect(usersPage).toContain("<th>状态</th>");
-		// wave 2：列名从「本月剩余」改为「额度剩余」（user 总额度/owner 月窗共用）
-		expect(usersPage).toContain("<th>额度剩余</th>");
-		expect(usersPage).not.toContain("<th>本月剩余</th>");
-		expect(usersPage).toContain("<th>操作</th>");
+		// 分类筛选分段按钮 + 排序下拉（§2）
+		expect(usersPage).toContain('id="adm-users-kind-seg"');
+		expect(usersPage).toContain('data-kind="real"');
+		expect(usersPage).toContain('data-kind="dogfood"');
+		expect(usersPage).toContain('data-kind="all"');
+		expect(usersPage).toMatch(/<button[^>]*data-kind="real"[^>]*aria-pressed="true"/);
+		expect(usersPage).toContain('id="adm-users-sort"');
+		expect(usersPage).toContain('value="joined_desc"');
+		expect(usersPage).toContain('value="joined_asc"');
+		expect(usersPage).toContain('value="last_login_desc"');
+		// 分类标签/按钮样式存在
+		expect(cssSrc).toMatch(/\.adm-kind-tag\s*{/);
+		expect(cssSrc).toMatch(/\.adm-kind-btn\[aria-pressed="true"\]/);
+		// 次要列机制保留给其它列表（390px 隐藏）
 		expect(cssSrc).toMatch(/@media \(max-width:\s*767px\)[\s\S]*\.adm-col-secondary\s*{[^}]*display:\s*none/);
-		// R1 修复（review 2026-09-14）：状态元信息行（激活标签 + AI）桌面与
-		// 移动端都可见，不再有桌面 display:none 的 adm-stack-mobile
-		expect(cssSrc).toMatch(/\.adm-user-meta\s*{[^}]*font-size/);
-		expect(cssSrc).toMatch(/\.adm-chip--pending\s*{/);
-		expect(cssSrc).not.toContain("adm-stack-mobile");
+		// 日期整词换行 + 抽屉技术细节 + 立即调整折叠样式不变
 		expect(cssSrc).toMatch(/\.adm-cell-time\s*{[^}]*word-break:\s*normal/);
 		expect(cssSrc).toMatch(/\.adm-drawer-tech\s*{/);
 		expect(cssSrc).toMatch(/\.adm-win-adjust\s*{/);
@@ -1503,7 +1544,10 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 	it("批次A-13: 移动端导航 ::before 按同特异性逐页复位", () => {
 		const mobileBlock = cssSrc.slice(cssSrc.indexOf("@media (max-width: 767px)"));
 		expect(mobileBlock).toContain("adm-nav-btn { font-size: 14px");
-		for (const p of ["overview", "users", "invites", "settings",
+		// 2026-10-08：10 页逐一复位（invites 退役；slides/format-requests/
+		// test-applications/research-deletion 图标规则统一覆盖）
+		for (const p of ["overview", "users", "slides", "format-requests",
+			"test-applications", "research-deletion", "settings",
 			"billing", "plugins", "audit"]) {
 			expect(mobileBlock,
 				`mobile ::before reset for ${p}`).toMatch(
@@ -1602,8 +1646,7 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 			result: {
 				registration: { mode: "closed", stored_mode: "closed",
 						precondition_failures: [],
-						supported_modes: ["closed", "invite_only",
-							"email_verify_invite_activation"] },
+						supported_modes: ["closed", "public"] },
 				spend: {
 					available: true, enforcement_mode: "shadow",
 					user_default_total_limit_nano_cny: "20000000000",
@@ -2284,27 +2327,11 @@ describe("copyToClipboard 三级降级 + 复制按钮反馈（2026-09-11 修复�
 		await expect(h.client.copyToClipboard("x")).resolves.toBe(false);
 	});
 
-	it("邀请码复制按钮：成功 → 最近状态行「已复制」", async () => {
-		vi.stubGlobal("navigator", {
-			clipboard: { writeText: () => Promise.resolve() },
-		});
-		const h = loadCopyHarness();
-		h.doc.getElementById("adm-invite-token")!.textContent = "pt-inv-secret";
-		h.els["adm-invite-token-copy"]._fire("click", {});
-		await ticks();
-		expect(h.els["adm-invite-create-status"].textContent).toBe("已复制");
-	});
-
-	it("邀请码复制按钮：降级全失败 → 状态行提示「复制失败，文本已选中，请手动复制」", async () => {
-		vi.stubGlobal("navigator", {
-			clipboard: { writeText: () => Promise.reject(new Error("denied")) },
-		});
-		const h = loadCopyHarness({ execOk: false, noSelection: true });
-		h.doc.getElementById("adm-invite-token")!.textContent = "pt-inv-secret";
-		h.els["adm-invite-token-copy"]._fire("click", {});
-		await ticks();
-		expect(h.els["adm-invite-create-status"].textContent)
-			.toBe("复制失败，文本已选中，请手动复制");
+	it("邀请码复制按钮已随邀请页退役（复制入口只剩插件凭证）", () => {
+		expect(htmlSrc).not.toContain("adm-invite-token-copy");
+		// main.js 不再绑定任何 adm-invite* 监听（退役注释除外）
+		expect(src).not.toContain('onClick("adm-invite');
+		expect(src).not.toContain('setStatus("adm-invite');
 	});
 
 	it("插件密钥复制按钮：成功 → adm-plugins-status「已复制」", async () => {
@@ -2727,174 +2754,278 @@ describe("访问统计刷新", () => {
 });
 
 // --------------------------------------------------------------------------- //
-// R1 跟进（0.4.14）：切片页显示人类可读名 + 资产状态；加入只对可用资产开放，
-// 不可用资产按钮禁用并说明原因；一切操作按 slide_id 寻址。
+// 2026-10-08（admin-viewer-simplified §3.4）：切片页 = 用户上传切片清单 +
+// 管理员临时查看。五态（未开启/已结束/可查看·剩余 N 分钟/本人切片/不可查看）
+// + 开启 1 小时 / 查看宿主开新标签（admin.viewer.open）/ 提前结束；倒计时按
+// expires_at - server_now 向上取整并以本地流逝时间修正，每分钟刷新。
 // --------------------------------------------------------------------------- //
-describe("切片页：可读名 + 资产状态 + 按 slide_id 操作", () => {
-	const NONCE = "5e".repeat(32);
+describe("切片页：临时查看五态 + 行内动作（§3.4）", () => {
+	const NONCE = "7c".repeat(32);
+	const SERVER_NOW = 1_800_000_000; // 清单响应的 server_now（epoch 秒）
+
+	// 五态 fixture：同一清单覆盖 none/ended/active/own/unavailable + 未登记行
 	const items = [
-		{ name: "sld_newA", slide_id: "sld_newA", original_filename: "dup.tif", display_name: "",
-			asset_state: "ready", storage_layout: "id_bundle", file_exists: true, servable: true,
-			owner_user_id: "u1", size_bytes: 10, granted_to_owner: false, grant_recorded: false },
-		{ name: "sld_newB", slide_id: "sld_newB", original_filename: "dup.tif", display_name: "",
-			asset_state: "ready", storage_layout: "id_bundle", file_exists: true, servable: true,
-			owner_user_id: "u1", size_bytes: 10, granted_to_owner: true, grant_recorded: true },
-		{ name: "old.svs", slide_id: "sld_old", original_filename: null, display_name: "",
-			asset_state: "legacy", storage_layout: "legacy", file_exists: true, servable: false,
-			owner_user_id: "u1", size_bytes: 10, granted_to_owner: false, grant_recorded: false },
-		{ name: "sld_del", slide_id: "sld_del", original_filename: "gone.tif", display_name: "",
-			asset_state: "deleted", storage_layout: "id_bundle", file_exists: false, servable: false,
-			owner_user_id: "u1", size_bytes: 0, granted_to_owner: false, grant_recorded: false },
-		{ name: "sld_miss", slide_id: "sld_miss", original_filename: "miss.tif", display_name: "",
-			asset_state: "ready", storage_layout: "id_bundle", file_exists: false, servable: false,
-			owner_user_id: "u1", size_bytes: 0, granted_to_owner: false, grant_recorded: true },
-		{ name: "orphan.svs", slide_id: null, asset_state: null, unregistered: true,
-			file_exists: true, servable: false, size_bytes: 5, granted_to_owner: false, grant_recorded: false },
+		{ slide_id: "sld_none01", name: "sld_none01", display_name: "未开启切片.svs",
+			original_filename: "none.svs", servable: true, file_exists: true,
+			asset_state: "ready", storage_layout: "id_bundle",
+			owner_user_id: "u1", owner_identity: "reader-a@x.com",
+			created_at: SERVER_NOW - 86400,
+			temporary_view: { status: "none", expires_at: null } },
+		{ slide_id: "sld_ended01", name: "sld_ended01", display_name: "已结束切片.svs",
+			servable: true, file_exists: true, asset_state: "ready",
+			storage_layout: "id_bundle", owner_user_id: "u1",
+			owner_identity: "reader-a@x.com",
+			created_at: SERVER_NOW - 172800,
+			temporary_view: { status: "ended", expires_at: SERVER_NOW - 60 } },
+		{ slide_id: "sld_activ01", name: "sld_activ01", display_name: "进行中切片.svs",
+			servable: true, file_exists: true, asset_state: "ready",
+			storage_layout: "id_bundle", owner_user_id: "u2",
+			owner_identity: "reader-b@x.com",
+			created_at: SERVER_NOW - 3600,
+			temporary_view: { status: "active", expires_at: SERVER_NOW + 42 * 60 } },
+		{ slide_id: "sld_own001", name: "sld_own001", display_name: "本人切片.svs",
+			servable: true, file_exists: true, asset_state: "ready",
+			storage_layout: "id_bundle", owner_user_id: "owner-1",
+			owner_identity: "owner@x.com",
+			created_at: SERVER_NOW - 7200,
+			temporary_view: { status: "own", expires_at: null } },
+		{ slide_id: "sld_gone01", name: "sld_gone01", display_name: "坏切片.svs",
+			servable: false, file_exists: false, asset_state: "failed",
+			storage_layout: "id_bundle", owner_user_id: "u2",
+			owner_identity: "reader-b@x.com",
+			created_at: SERVER_NOW - 90000,
+			failure: { code: "missing_file", inferred: true, source: "backfill",
+				source_state: "failed", source_ref: null,
+				occurred_at: SERVER_NOW - 90000 },
+			temporary_view: { status: "unavailable", expires_at: null } },
+		{ name: "orphan.svs", slide_id: null, unregistered: true,
+			file_exists: true, servable: false, asset_state: null,
+			owner_user_id: null, created_at: null,
+			temporary_view: { status: "unavailable", expires_at: null } },
 	];
 
 	async function bootSlides() {
 		const bus = loadPluginUiWithBus();
 		bus.dispatch(bus.parent, {
 			kind: "init", bridge: "admin", protocolVersion: "1.0.0", nonce: NONCE,
-			adminPermissions: ["admin:overview:read", "admin:slides:read", "admin:slides:write"],
+			adminPermissions: ["admin:overview:read", "admin:slides:read",
+				"admin:slides:write"],
 		});
 		bus.client!.showPage("slides");
 		await ticks(4);
 		replyMethod(bus, NONCE, "admin.slides.inventory", {
-			ok: true, result: { items, next_cursor: null },
+			ok: true,
+			result: { items, next_cursor: null, server_now: SERVER_NOW },
 		});
 		await ticks(4);
 		return bus;
 	}
 
-	it("表格显示原始文件名与 slide_id、各类资产状态；不只是裸 sld_ 标识", async () => {
+	it("五态正确渲染：未开启/已结束/可查看·剩余 N 分钟/本人切片/不可查看（原因）", async () => {
 		const bus = await bootSlides();
 		const tbody = bus.els["adm-slides-tbody"].textContent;
-		expect(tbody).toContain("dup.tif");
-		expect(tbody).toContain("ID sld_newA");
-		expect(tbody).toContain("ID sld_newB");
-		expect(tbody).toContain("old.svs");
-		for (const s of ["可用", "旧资产（未迁移）", "已删除", "文件缺失", "未登记文件"]) {
-			expect(tbody).toContain(s);
-		}
-		expect(tbody).toContain("有授权记录（资产当前不可用，未生效）");
-		expect(htmlSrc).toMatch(/<th>切片名<\/th>\s*<th>资产状态<\/th>/);
+		expect(tbody).toContain("未开启");
+		expect(tbody).toContain("已结束");
+		expect(tbody).toContain("可查看 · 剩余 42 分钟"); // ceil((+42*60 - 0)/60)
+		expect(tbody).toContain("本人切片");
+		expect(tbody).toContain("不可查看");
+		expect(tbody).toContain("处理失败：源文件缺失 · 回填/迁移盘点 · 依据现状推断");
+		expect(tbody).toContain("未登记文件");
+		// 列：切片名 + 上传者 sub、加入时间（上海时间；SERVER_NOW-86400=2027-01-14）
+		expect(tbody).toContain("reader-a@x.com");
+		expect(tbody).toContain("无主");
 	});
 
-	it("加入只对可用资产开放；不可用资产按钮禁用并写明原因；加入按 slide_id 发请求", async () => {
+	it("行内动作按状态分流：开启 1 小时 / 查看 / 结束查看（页内确认）", async () => {
 		const bus = await bootSlides();
 		const btns = bus.created.filter((e) => e.tagName === "BUTTON");
-		const add = btns.filter((b) => b.textContent === "加入");
-		const enabled = add.filter((b) => !b.disabled);
-		const disabled = add.filter((b) => b.disabled);
-		expect(enabled).toHaveLength(1);                      // sld_newA
-		expect(disabled).toHaveLength(3);                     // legacy / deleted / unregistered
-		const titles = disabled.map((b) => (b as unknown as { title: string }).title);
-		expect(titles.some((t) => t.includes("尚未迁移"))).toBe(true);
-		expect(titles.some((t) => t.includes("已删除"))).toBe(true);
-		expect(titles.some((t) => t.includes("没有资产记录"))).toBe(true);
-		expect(bus.els["adm-slides-tbody"].textContent).toContain("尚未迁移，迁移后才能加入");
-		// 已加入的可移除；失效授权（文件缺失）可移除授权记录
-		expect(btns.some((b) => b.textContent === "移除")).toBe(true);
-		expect(btns.some((b) => b.textContent === "移除授权记录")).toBe(true);
+		expect(btns.filter((b) => b.textContent === "开启 1 小时")).toHaveLength(2);
+		expect(btns.filter((b) => b.textContent === "查看")).toHaveLength(2);
+		expect(btns.filter((b) => b.textContent === "结束查看")).toHaveLength(1);
 
-		enabled[0]._fire("click");
+		// 开启：POST temporary-view，按 slide_id 寻址
+		btns.filter((b) => b.textContent === "开启 1 小时")[0]._fire("click");
 		await ticks(2);
-		const req = bus.parentPosted
-			.filter((p) => p.env.kind === "request" && p.env.method === "admin.slides.setVisibility")
-			.at(-1);
-		expect(req!.env.payload).toEqual({ name: "sld_newA", granted: true });
+		const startReq = bus.parentPosted
+			.filter((p) => p.env.kind === "request" &&
+				p.env.method === "admin.slides.startTemporaryView").at(-1);
+		expect(startReq!.env.payload).toEqual({ slide_id: "sld_none01" });
+		replyMethod(bus, NONCE, "admin.slides.startTemporaryView", {
+			ok: true,
+			result: { slide_id: "sld_none01",
+				temporary_view: { status: "active", granted_at: SERVER_NOW,
+					expires_at: SERVER_NOW + 3600 },
+				server_now: SERVER_NOW },
+		});
+		await ticks(4);
+		// 成功后重取清单
+		expect(bus.parentPosted.some((p) => p.env.kind === "request" &&
+			p.env.method === "admin.slides.inventory")).toBe(true);
+		expect(bus.els["adm-slides-status"].textContent).toContain("已开启临时查看");
+
+		// 查看：admin.viewer.open（宿主 window.open，不经 HTTP）
+		const viewBtn = btns.filter((b) => b.textContent === "查看")[0];
+		viewBtn._fire("click");
+		await ticks(2);
+		const openReq = bus.parentPosted
+			.filter((p) => p.env.kind === "request" &&
+				p.env.method === "admin.viewer.open").at(-1);
+		expect(openReq!.env.payload).toEqual({ slide_id: "sld_activ01" });
+
+		// 结束查看：先页内确认条，确认后才 DELETE
+		const endBtn = btns.filter((b) => b.textContent === "结束查看")[0];
+		endBtn._fire("click");
+		expect(bus.els["adm-slides-confirm"].hidden).toBe(false);
+		expect(bus.els["adm-slides-confirm"].textContent).toContain("提前结束");
+		expect(bus.parentPosted.some((p) => p.env.kind === "request" &&
+			p.env.method === "admin.slides.endTemporaryView")).toBe(false);
+		const okBtn = bus.created.filter((el) => el.textContent === "确认执行").at(-1);
+		okBtn!._fire("click", {});
+		await ticks(2);
+		const endReq = bus.parentPosted
+			.filter((p) => p.env.kind === "request" &&
+				p.env.method === "admin.slides.endTemporaryView").at(-1);
+		expect(endReq!.env.payload).toEqual({ slide_id: "sld_activ01" });
+	});
+
+	it("倒计时数学：ceil 取整、本地流逝修正、到期转 ended（tempViewStatusOf）", async () => {
+		const { client } = loadPluginUi("");
+		const tv = (status: string, expiresAt: number | null) =>
+			({ status, expires_at: expiresAt });
+		// ceil：42 分钟 + 30 秒 → 43 分钟；整 42 分钟 → 42
+		expect(client!.tempViewStatusOf(tv("active", 1000 + 42 * 60 + 30), 1000, 0))
+			.toEqual({ status: "active", minutes: 43 });
+		expect(client!.tempViewStatusOf(tv("active", 1000 + 42 * 60), 1000, 0))
+			.toEqual({ status: "active", minutes: 42 });
+		// 剩余不足 1 分钟 → 显示 1 分钟（不出现「剩余 0 分钟」）
+		expect(client!.tempViewStatusOf(tv("active", 1030), 1000, 0))
+			.toEqual({ status: "active", minutes: 1 });
+		// 本地流逝修正：响应 5 分钟前到达，剩余按 elapsed 折减
+		expect(client!.tempViewStatusOf(tv("active", 1000 + 42 * 60), 1000, 300))
+			.toEqual({ status: "active", minutes: 37 });
+		// 本地流逝跨过到期时刻 → ended
+		expect(client!.tempViewStatusOf(tv("active", 1300), 1000, 300))
+			.toEqual({ status: "ended", minutes: 0 });
+		// 非 active：原样透传（none/ended/own）；缺失 temporary_view = none
+		expect(client!.tempViewStatusOf(tv("none", null), 1000, 0))
+			.toEqual({ status: "none", minutes: null });
+		expect(client!.tempViewStatusOf(tv("ended", 900), 1000, 0))
+			.toEqual({ status: "ended", minutes: null });
+		expect(client!.tempViewStatusOf(tv("own", null), 1000, 0))
+			.toEqual({ status: "own", minutes: null });
+		expect(client!.tempViewStatusOf(undefined, 1000, 0))
+			.toEqual({ status: "none", minutes: null });
+	});
+
+	it("每分钟刷新：active 跨过到期时刻 → 重取清单；未到期只重画不发请求", async () => {
+		const bus = await bootSlides();
+		const invCount = () => bus.parentPosted
+			.filter((p) => p.env.kind === "request" &&
+				p.env.method === "admin.slides.inventory").length;
+		const timer = bus.intervals.find((x) => x.ms === 60000)!;
+		expect(timer).toBeTruthy();
+		// 未到期：tick 只重画（无新请求）
+		const before = invCount();
+		timer.callback();
+		await ticks(2);
+		expect(invCount()).toBe(before);
+		// 本地时钟前进 50 分钟：active 行（+42 分钟）跨过到期 → tick 触发重取
+		const realNow = Date.now();
+		const spy = vi.spyOn(Date, "now").mockImplementation(
+			() => realNow + 50 * 60 * 1000);
+		try {
+			timer.callback();
+			await ticks(4);
+			expect(invCount()).toBe(before + 1);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it("HTML：列头为 切片/上传者、加入时间、管理员临时查看、操作；旧可见性词汇退役", () => {
+		const slidesPage = htmlSrc.slice(htmlSrc.indexOf('id="adm-page-slides"'),
+			htmlSrc.indexOf('id="adm-page-format-requests"'));
+		expect(slidesPage).toContain("<th>切片 / 上传者</th>");
+		expect(slidesPage).toContain("<th>加入时间</th>");
+		expect(slidesPage).toContain("<th>管理员临时查看</th>");
+		expect(slidesPage).toContain("<th>操作</th>");
+		expect(slidesPage).toContain("临时查看后 1 小时内可在 Viewer 读取");
+		// 旧可见性词汇退役
+		expect(slidesPage).not.toContain("切片可见性");
+		expect(slidesPage).not.toContain("收录状态");
+		expect(slidesPage).not.toContain("资产状态");
 	});
 });
 
 // --------------------------------------------------------------------------- //
-// failed 资产的失败证据展示（inventory failure 字段；2026-10-03）：状态列/
-// 加入按钮说明给出「原因（机器码映射中文，未知码回显原文）· 来源任务（族+
-// 任务号）· 时间」；推断证据（回填 missing_file）显式标注；老响应无
-// failure 字段时回退通用文案。加入按钮保持禁用（不可加入语义不变）。
+// unavailable 的原因词表（failed 资产证据展示沿用 2026-10-03 词表；未知码
+// 回显原文，推断证据显式标注，老响应无 failure 字段回退通用文案）。
 // --------------------------------------------------------------------------- //
-describe("切片页：failed 资产失败原因/来源/时间", () => {
-	const NONCE = "6f".repeat(32);
+describe("切片页：unavailable 原因（failed 资产失败原因/来源/时间）", () => {
+	const NONCE = "8f".repeat(32);
 	const TS = 1790000000; // 2026-09-21 22:13:20 GMT+8
 	const items = [
 		// 历史回填：legacy 缺文件（生产 failed 大头）
-		{ name: "gone.svs", slide_id: "sld_bf", original_filename: null, display_name: "",
-			asset_state: "failed", storage_layout: "legacy", file_exists: false, servable: false,
-			owner_user_id: "u1", size_bytes: 0, granted_to_owner: false, grant_recorded: false,
+		{ slide_id: "sld_bf", name: "sld_bf", display_name: "回填切片.svs",
+			asset_state: "failed", storage_layout: "legacy", file_exists: false,
+			servable: false, owner_user_id: "u1", owner_identity: "a@x.com",
+			created_at: TS,
 			failure: { code: "missing_file", inferred: true, source: "backfill",
-				source_state: "failed", source_ref: null, occurred_at: TS } },
+				source_state: "failed", source_ref: null, occurred_at: TS },
+			temporary_view: { status: "unavailable", expires_at: null } },
 		// COS 摄取被用户取消
-		{ name: "sld_cancel", slide_id: "sld_cancel", original_filename: "c.tif", display_name: "",
-			asset_state: "failed", storage_layout: "id_bundle", file_exists: false, servable: false,
-			owner_user_id: "u1", size_bytes: 0, granted_to_owner: false, grant_recorded: false,
+		{ slide_id: "sld_cancel", name: "sld_cancel", display_name: "取消切片.tif",
+			asset_state: "failed", storage_layout: "id_bundle", file_exists: false,
+			servable: false, owner_user_id: "u1", owner_identity: "a@x.com",
+			created_at: TS,
 			failure: { code: "cancelled_by_user", inferred: false, source: "ingestion",
-				source_state: "cancelled", source_ref: "inj_abc", occurred_at: TS } },
+				source_state: "cancelled", source_ref: "inj_abc", occurred_at: TS },
+			temporary_view: { status: "unavailable", expires_at: null } },
 		// 未知码：回显原文不假装翻译；无时间不渲染日期
-		{ name: "sld_weird", slide_id: "sld_weird", original_filename: "w.kfb", display_name: "",
-			asset_state: "failed", storage_layout: "id_bundle", file_exists: false, servable: false,
-			owner_user_id: "u1", size_bytes: 0, granted_to_owner: false, grant_recorded: false,
+		{ slide_id: "sld_weird", name: "sld_weird", display_name: "怪切片.kfb",
+			asset_state: "failed", storage_layout: "id_bundle", file_exists: false,
+			servable: false, owner_user_id: "u1", owner_identity: "a@x.com",
+			created_at: TS,
 			failure: { code: "weird_code", inferred: false, source: "conversion",
-				source_state: "failed", source_ref: "cvj_9", occurred_at: null } },
+				source_state: "failed", source_ref: "cvj_9", occurred_at: null },
+			temporary_view: { status: "unavailable", expires_at: null } },
 		// 老响应无 failure 字段：回退通用文案
-		{ name: "sld_legacyresp", slide_id: "sld_legacyresp", original_filename: "o.tif", display_name: "",
-			asset_state: "failed", storage_layout: "id_bundle", file_exists: false, servable: false,
-			owner_user_id: "u1", size_bytes: 0, granted_to_owner: false, grant_recorded: false },
+		{ slide_id: "sld_legacyresp", name: "sld_legacyresp", display_name: "旧响应.tif",
+			asset_state: "failed", storage_layout: "id_bundle", file_exists: false,
+			servable: false, owner_user_id: "u1", owner_identity: "a@x.com",
+			created_at: TS,
+			temporary_view: { status: "unavailable", expires_at: null } },
 	];
 
 	async function bootSlides() {
 		const bus = loadPluginUiWithBus();
 		bus.dispatch(bus.parent, {
 			kind: "init", bridge: "admin", protocolVersion: "1.0.0", nonce: NONCE,
-			adminPermissions: ["admin:overview:read", "admin:slides:read", "admin:slides:write"],
+			adminPermissions: ["admin:slides:read", "admin:slides:write"],
 		});
 		bus.client!.showPage("slides");
 		await ticks(4);
 		replyMethod(bus, NONCE, "admin.slides.inventory", {
-			ok: true, result: { items, next_cursor: null },
+			ok: true, result: { items, next_cursor: null, server_now: 1790000000 },
 		});
 		await ticks(4);
 		return bus;
 	}
 
-	it("状态列显示处理失败 + 原因/来源/时间明细；未知码回显原文；推断证据标注", async () => {
+	it("不可查看（原因）明细：词表中文 + 来源任务 + 推断标注 + 时间；未知码回显原文", async () => {
 		const bus = await bootSlides();
 		const tbody = bus.els["adm-slides-tbody"].textContent;
-		// 回填 missing_file：原因 + 来源 + 推断标注 + 时间
-		expect(tbody).toContain("处理失败");
-		expect(tbody).toContain("源文件缺失");
-		expect(tbody).toContain("回填/迁移盘点");
-		expect(tbody).toContain("依据现状推断");
-		expect(tbody).toContain("2026-09-21 22:13:20 GMT+8");
-		// COS 摄取取消：原因 + 来源任务号
-		expect(tbody).toContain("用户已取消上传");
-		expect(tbody).toContain("COS 上传（inj_abc）");
-		// 主状态文字按原因区分，不再一律「处理失败」
-		const stateText = (sid: string) => bus.created
-			.filter((e) => e.tagName === "TD"
-				&& (e as unknown as { getAttribute(n: string): string | null })
-					.getAttribute("data-asset-state") === "failed")
-			.map((e) => e.textContent)
-			.find((t) => t.includes(sid === "sld_bf" ? "源文件缺失" : sid === "sld_cancel" ? "用户已取消上传" : "weird_code"));
-		expect(stateText("sld_bf")!.startsWith("文件缺失")).toBe(true);
-		expect(stateText("sld_cancel")!.startsWith("上传已取消")).toBe(true);
-		expect(stateText("sld_weird")!.startsWith("处理失败")).toBe(true);
-		// 未知码：回显原文；转换来源带任务号；无时间不渲染日期占位
+		expect(tbody).toContain("不可查看");
+		expect(tbody).toContain("处理失败：源文件缺失 · 回填/迁移盘点 · 依据现状推断 · " +
+			"2026-09-21 22:13:20 GMT+8");
+		expect(tbody).toContain("处理失败：用户已取消上传 · COS 上传（inj_abc）");
 		expect(tbody).toContain("未知原因（weird_code）");
 		expect(tbody).toContain("KFB 转换（cvj_9）");
-	});
-
-	it("加入按钮保持禁用；按钮 title 与状态列同源（资产处理失败：原因…）；老响应回退通用文案", async () => {
-		const bus = await bootSlides();
-		const btns = bus.created.filter((e) => e.tagName === "BUTTON");
-		const add = btns.filter((b) => b.textContent === "加入");
-		expect(add).toHaveLength(4);
-		expect(add.every((b) => b.disabled)).toBe(true);
-		const titles = add.map((b) => (b as unknown as { title: string }).title);
-		expect(titles.some((t) => t.startsWith("资产处理失败：源文件缺失"))).toBe(true);
-		expect(titles.some((t) => t.includes("用户已取消上传"))).toBe(true);
-		// 无 failure 字段的老响应：通用文案兜底，不出现「资产处理失败：原因未记录」
-		expect(titles.some((t) => t === "资产处理失败，不可读取，不能加入")).toBe(true);
-		expect(bus.els["adm-slides-tbody"].textContent)
-			.toContain("资产处理失败，不可读取，不能加入");
+		// 老响应无 failure 字段：通用文案兜底
+		expect(tbody).toContain("处理失败");
+		// unavailable 行不提供任何操作按钮
+		expect(bus.created.filter((e) => e.tagName === "BUTTON" &&
+			(e.textContent === "开启 1 小时" || e.textContent === "查看" ||
+			 e.textContent === "结束查看"))).toHaveLength(0);
 	});
 });

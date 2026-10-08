@@ -60,6 +60,22 @@
    真实清理；completed 只能由清理成功产生——本页没有（也不允许有）
    「直接置 completed」的操作。terminal_failed 由服务端判定下发，
    前端只按它显示操作按钮。
+   2026-10-08（admin-viewer-simplified §2/§3.4/§4，docs/
+   admin-viewer-simplified-20261008.md）：
+     - 「邀请」页整体退役（admin.invites.* 桥方法已删、服务端 410；
+       注册模式收敛为 closed/public，只在设置页）；
+     - 用户页 = 四列主表（用户/加入时间/最近登录/分类）+ 分类筛选
+       （默认正式用户）与排序下拉；切筛选/排序即重置游标重取；行内
+       「标为测试/改为正式」走 admin.users.setAccountKind；启停/AI 权限/
+       重置密码/预览/总额度等既有操作全部保留在「详情」抽屉；
+     - 切片页 = 用户上传清单（切片/上传者、加入时间、管理员临时查看、
+       操作）：临时查看五态（未开启/已结束/可查看·剩余 N 分钟/本人切片/
+       不可查看）；开/关走 admin.slides.startTemporaryView /
+       endTemporaryView；「查看」走 admin.viewer.open（宿主在新标签打开
+       /?slide=<id>，iframe 不导航宿主、不经 HTTP）；剩余分钟 = ceil(
+       (expires_at - server_now)/60) 并按响应到达后的本地流逝时间修正，
+       每分钟刷新，归零显示「已结束」并重取清单；
+     - 渲染纪律不变：一律 textContent/createElement，响应未知字段绝不进 DOM。
  ========================================================================= */
 (function () {
   "use strict";
@@ -82,10 +98,14 @@
     listSeq: 0,
     // 分页游标（每列表独立；仅内存）
     cursors: { users: null, usage: null, unpriced: null, ledger: null,
-               audit: null, invites: null, slides: null, formatRequests: null,
+               audit: null, slides: null, formatRequests: null,
                testApplications: null },
-    filters: { users: {}, usage: {}, audit: {}, format: {}, testApp: {},
-               rdel: {} },
+    filters: { users: { kind: "real", sort: "joined_desc" }, usage: {},
+               audit: {}, format: {}, testApp: {}, rdel: {} },
+    // 切片页临时查看倒计时基准（2026-10-08 §3.4）：清单响应的 server_now +
+    // 到达时刻的本地时钟——剩余分钟 = ceil((expires_at - (server_now +
+    // 本地流逝))/60)，修正宿主与响应之间的时钟偏移；仅内存。
+    slidesCache: null,
     // 设置页快照（批次 D §6.1）：admin.settings.get 的响应（含 spend
     // current_windows 的 demo/owner 窗口 CAS version）——仅内存。
     settingsSnapshot: null,
@@ -120,11 +140,13 @@
     });
   }
 
-  // 深链起始页（PR5 /admin#invites 兼容）：宿主把父页 hash 透传到本 iframe
+  // 深链起始页（PR5 /admin#users 兼容）：宿主把父页 hash 透传到本 iframe
   // 自身 URL；只接受已知页面 slug，其余回概览。
+  // 2026-10-08：invites 已从白名单移除（邀请页退役，旧 /admin#invites 深链
+  // 回概览而不是报错）。
   function initialPageFromHash() {
     var pages = ["overview", "users", "slides", "format-requests",
-                 "test-applications", "research-deletion", "invites",
+                 "test-applications", "research-deletion",
                  "settings", "billing", "plugins", "audit"];
     var hash = "";
     try { hash = window.location.hash || ""; } catch (e) { hash = ""; }
@@ -135,12 +157,12 @@
 
   function $(id) { return document.getElementById(id); }
 
-  // wave 2：顶级页名收敛（「邀请与来源」→「邀请」、「额度与账单」→「费用」）；
-  // slug 保持不变，宿主深链 #invites/#billing 兼容。
+  // 2026-10-08：顶级页名收敛——「邀请」页退役移除；「切片可见性」→「切片」
+  //（临时查看取代旧 workspace 收录模型）。
   var PAGE_TITLES = {
-    overview: "概览", users: "用户", slides: "切片可见性",
+    overview: "概览", users: "用户", slides: "切片",
     "format-requests": "格式申请", "test-applications": "测试申请",
-    "research-deletion": "研究删除", invites: "邀请", settings: "设置",
+    "research-deletion": "研究删除", settings: "设置",
     billing: "费用", plugins: "插件", audit: "审计",
   };
 
@@ -160,7 +182,6 @@
       "format-requests": $("adm-page-format-requests"),
       "test-applications": $("adm-page-test-applications"),
       "research-deletion": $("adm-page-research-deletion"),
-      invites: $("adm-page-invites"),
       settings: $("adm-page-settings"),
       billing: $("adm-page-billing"),
       plugins: $("adm-page-plugins"),
@@ -1057,10 +1078,11 @@
   // ------------------------------------------------------------------
   function resetLists() {
     state.cursors = { users: null, usage: null, unpriced: null, ledger: null,
-                      audit: null, invites: null, slides: null,
+                      audit: null, slides: null,
                       formatRequests: null, testApplications: null };
+    state.slidesCache = null;
     ["adm-users-tbody", "adm-usage-tbody", "adm-unpriced-tbody",
-     "adm-ledger-tbody", "adm-audit-tbody", "adm-invites-tbody",
+     "adm-ledger-tbody", "adm-audit-tbody",
      "adm-plugins-tbody", "adm-slides-tbody",
      "adm-format-tbody", "adm-test-tbody", "adm-rdel-tbody"].forEach(
     function (id) {
@@ -1075,16 +1097,32 @@
     if (rdelConfirm) { rdelConfirm.hidden = true; rdelConfirm.textContent = ""; }
   }
 
+  // 用户分类标签（2026-10-08 §2）：服务端权威 account_kind；未知值回显原文。
+  var ACCOUNT_KIND_LABELS = { real: "正式用户", dogfood: "Dogfood" };
+  function accountKindLabel(u) {
+    var kind = u && u.account_kind;
+    if (kind === "real" || kind === "dogfood") return ACCOUNT_KIND_LABELS[kind];
+    return kind ? String(kind) : "正式用户";
+  }
+
+  // 分类筛选/排序切换（§2）：任一变更即重置游标、作废在途响应、重取首页。
+  function resetUsersCursorAndReload() {
+    state.cursors.users = null;
+    state.listSeq++;
+    loadUsers(false);
+  }
+
   function loadUsers(append) {
     var seq = state.listSeq;
     var f = state.filters.users || {};
     var payload = {
       limit: 50,
       cursor: append ? state.cursors.users : null,
+      // §2：kind 默认 real、sort 默认 joined_desc——始终显式携带，UI 与
+      // 服务端默认保持一致（宿主 schema 枚举校验，缺键才走服务端默认）。
+      kind: f.kind || "real",
+      sort: f.sort || "joined_desc",
     };
-    if (f.q) payload.q = f.q;
-    if (f.enabled === "true" || f.enabled === "false") payload.enabled = f.enabled === "true";
-    if (f.ai === "true" || f.ai === "false") payload.ai_access = f.ai === "true";
     var status = $("adm-users-status");
     setPageState("users", "loading");
     request("admin.users.list", payload).then(function (res) {
@@ -1094,11 +1132,12 @@
       rememberIdentities(items);
       renderUsers(items, append);
       if (!append && !items.length) {
-        var f2 = state.filters.users || {};
         setPageState("users", "empty", {
-          message: (f2.q || f2.enabled || f2.ai)
-            ? "没有匹配筛选条件的用户；调整筛选或清空后重试。"
-            : "暂无用户。可通过上方「创建用户」新增（role=user）。",
+          message: f.kind === "dogfood"
+            ? "还没有 Dogfood 测试账号；在「正式用户」或「全部」列表中可把用户标记为 Dogfood。"
+            : f.kind === "all"
+              ? "暂无用户。"
+              : "暂无正式用户；切到「全部」查看所有账号（含 Dogfood）。",
         });
       } else {
       setPageState("users", "ready", {
@@ -1225,15 +1264,7 @@
     return { text: "剩余 " + fmtCny(info.remaining), danger: false };
   }
 
-  function renderRemainCell(u) {
-    var info = remainingInfo(u);
-    var cell = document.createElement("td");
-    cell.className = "adm-cell-remaining" + (info.danger ? " adm-usage-overage" : "");
-    cell.textContent = info.text;
-    return cell;
-  }
-
-  // 激活状态标签（W1/R1 review 2026-09-14）：桌面与移动端都可见——
+  // 激活状态标签（W1/R1 review 2026-09-14）：抽屉内展示——
   // 「启用/禁用」只是账户开关，不代表完成激活或可使用 AI
   function activationLabel(u) {
     if (u && u.activation_state === "pending_activation") return "待激活";
@@ -1241,44 +1272,69 @@
     return "";
   }
 
+  // ------------------------------------------------------------------
+  // 用户主表（2026-10-08 §2）：四列 = 用户（显示名+邮箱）/ 加入时间 /
+  // 最近登录 / 分类。额度、启用状态、掩码登录账号等低频字段收进「详情」
+  // 抽屉；行内动作 = 分类切换（标为测试/改为正式）+ 详情。
+  // ------------------------------------------------------------------
   function renderUsers(items, append) {
     var tbody = $("adm-users-tbody");
     if (!tbody) return;
     if (!append) tbody.textContent = "";
     items.forEach(function (u) {
       var tr = document.createElement("tr");
-      // 展示 J：主列 = 完整邮箱用户名（email 优先，否则 login_id；不再用
-      // display_name 冒充身份）。user_id 为次级技术详情（drawer 内展示）。
-      tr.appendChild(td(identityText(u)));
-      tr.appendChild(td(u.role, "adm-col-secondary"));
-      // 状态列：账户开关（启用/禁用）+ 元信息行（激活标签、AI access）。
-      // R1 修复：此前激活标签只写进 ≤767px 才显示的移动端堆叠行，桌面端
-      // 完全不可见；且显示激活标签时把 AI 信息顶掉。现改为始终可见的
-      // 小字元信息行，激活（如有）+ AI 并列展示。
-      var statusCell = document.createElement("td");
-      statusCell.appendChild(document.createTextNode(u.enabled ? "启用" : "禁用"));
-      var meta = document.createElement("div");
-      meta.className = "adm-user-meta";
-      var act = activationLabel(u);
-      if (act) {
-        var chip = document.createElement("span");
-        chip.className = "adm-chip--pending";
-        chip.textContent = act;
-        meta.appendChild(chip);
+      // 用户列：显示名 + 邮箱（展示 J：identity = email 优先，login_id 兜底）。
+      // 显示名缺失时邮箱即主文案（不重复渲染第二行）。
+      var nameCell = document.createElement("td");
+      var email = identityText(u);
+      var displayName = u && u.display_name ? String(u.display_name) : "";
+      nameCell.appendChild(document.createTextNode(displayName || email));
+      if (displayName && email && email !== displayName) {
+        var sub = document.createElement("div");
+        sub.className = "adm-sub";
+        sub.textContent = email;
+        nameCell.appendChild(sub);
       }
-      meta.appendChild(document.createTextNode(u.ai_access ? "AI" : "无 AI"));
-      statusCell.appendChild(meta);
-      tr.appendChild(statusCell);
-      tr.appendChild(renderRemainCell(u));
-      var cell = document.createElement("td");
-      cell.className = "adm-actions-cell";
+      tr.appendChild(nameCell);
+      tr.appendChild(td(fmtTs(u.created_at), "adm-cell-time"));
+      // §2：从未登录（last_login_at null）→「暂无记录」；时间 Asia/Shanghai。
+      tr.appendChild(td(u.last_login_at === null || u.last_login_at === undefined
+        ? "暂无记录" : fmtTs(u.last_login_at), "adm-cell-time"));
+      var kindCell = document.createElement("td");
+      var tag = document.createElement("span");
+      tag.className = "adm-kind-tag" +
+        (u.account_kind === "dogfood" ? " adm-kind-tag--dogfood" : "");
+      tag.textContent = accountKindLabel(u);
+      kindCell.appendChild(tag);
+      var kindActions = document.createElement("div");
+      kindActions.className = "adm-kind-actions";
+      kindActions.appendChild(actionBtn(
+        u.account_kind === "dogfood" ? "改为正式" : "标为测试",
+        function () { setUserAccountKind(u); }, "secondary"));
       var detailBtn = actionBtn("详情", function () {
         openUserDrawer(u, detailBtn);
       }, "secondary");
-      cell.appendChild(detailBtn);
-      tr.appendChild(cell);
+      kindActions.appendChild(detailBtn);
+      kindCell.appendChild(kindActions);
+      tr.appendChild(kindCell);
       tbody.appendChild(tr);
     });
+  }
+
+  // 分类切换（§2）：real ↔ dogfood 互切（服务端权威；值未变不写审计）。
+  // 非危险操作（不影响数据/额度/登录），与授予/收回 AI 同级——直接执行。
+  function setUserAccountKind(u) {
+    var target = u.account_kind === "dogfood" ? "real" : "dogfood";
+    var who = identityText(u);
+    request("admin.users.setAccountKind",
+            { user_id: u.user_id, account_kind: target })
+      .then(function () {
+        setStatus("adm-users-status", target === "dogfood"
+          ? "已把 " + who + " 标记为 Dogfood 测试账号（数据与额度不变）"
+          : "已把 " + who + " 改回正式用户");
+        loadUsers(false);
+      })
+      .catch(function (err) { userWriteDone(err, null, null, "adm-users-status"); });
   }
 
   // owner 当前月金额窗口（window 形态；可能缺失：owner 策略被禁用 / 后端异常。
@@ -1637,7 +1693,11 @@
     kvRow(dl, "角色", u.role);
     kvRow(dl, "状态", u.enabled ? "启用" : "禁用");
     kvRow(dl, "AI access", u.ai_access ? "是" : "否");
+    kvRow(dl, "分类", accountKindLabel(u));
     kvRow(dl, "创建时间", fmtTs(u.created_at));
+    // §2：从未登录（last_login_at null）→「暂无记录」
+    kvRow(dl, "最近登录", u.last_login_at === null || u.last_login_at === undefined
+      ? "暂无记录" : fmtTs(u.last_login_at));
     kvRow(dl, "注册方式", u.registration_method);
     kvRow(dl, "最近 AI 调用", u.last_ai_call_at === null || u.last_ai_call_at === undefined
           ? "—" : fmtTs(u.last_ai_call_at) + "（Asia/Shanghai）");
@@ -1844,179 +1904,11 @@
   // 语义保持不变。
 
   // ------------------------------------------------------------------
-  // 邀请（§4.4 wave 2）：注册模式只读摘要 + 创建/列表/撤销。
-  // 来源漏斗 / 用户来源明细 / source·campaign·cohort 全部退役；
-  // 注册模式只在设置页可写，本页仅展示 + 跳转。
+  // 邀请页已整体退役（2026-10-08 §4，admin-viewer-simplified）：注册只剩
+  // closed/public（设置页管理），admin.invites.* 桥方法已删（宿主稳定
+  // unknown_method），服务端 /api/admin/v1/invites* 410；
+  // registration_invites 表保留为历史，不再有任何读写入口。
   // ------------------------------------------------------------------
-  function loadInvitesPage() {
-    var seq = state.listSeq;
-    setPageState("invites", "loading");
-    var settled = Promise.allSettled([
-      loadInviteMode(),
-      loadInvites(false),
-    ]);
-    settled.then(function (results) {
-      if (seq !== state.listSeq) return; // 页面已切换：不写终态
-      var ok = [], failed = [];
-      results.forEach(function (r) {
-        (r.status === "fulfilled" ? ok : failed).push(r);
-      });
-      if (!ok.length) {
-        var err = results[0].reason;
-        setPageState("invites", "error", {
-          code: err && err.code, message: err && err.message,
-          retry: function () { loadInvitesPage(); },
-        });
-        return;
-      }
-      setPageState("invites", "ready", {
-        message: "已更新（" + nowText() + "）" +
-          (failed.length ? "（部分数据加载失败，可刷新重试）" : ""),
-      });
-    });
-  }
-
-  // 注册模式只读摘要：来自 admin.settings.get（旧 acquisition summary 已删）
-  function loadInviteMode() {
-    return request("admin.settings.get", {}).then(function (settings) {
-      renderInviteMode(((settings || {}).registration || {}).mode);
-      return true;
-    }).catch(function (err) {
-      var dl = $("adm-invite-mode");
-      if (dl) { dl.textContent = ""; kvRow(dl, "可用性", errText(err)); }
-      throw err; // 交给协调器计数（partial-error 语义）
-    });
-  }
-
-  function renderInviteMode(mode) {
-    var dl = $("adm-invite-mode");
-    if (!dl) return;
-    dl.textContent = "";
-    kvRow(dl, "当前模式", mode || "—");
-  }
-
-  function inviteStatusLabel(inv) {
-    if (inv.revoked_at) return "已撤销";
-    if (inv.consumed_at) return "已消费";
-    if (inv.expires_at !== null && inv.expires_at !== undefined
-        && inv.expires_at <= Date.now() / 1000) return "已过期";
-    return "开放中";
-  }
-
-  function loadInvites(append) {
-    var seq = state.listSeq;
-    var payload = { limit: 50, cursor: append ? state.cursors.invites : null };
-    var status = $("adm-invites-status");
-    return request("admin.invites.list", payload).then(function (res) {
-      if (seq !== state.listSeq) return false;
-      hideError();
-      var tbody = $("adm-invites-tbody");
-      if (!tbody) return false;
-      if (!append) tbody.textContent = "";
-      var invites = res.invites || [];
-      invites.forEach(function (inv) {
-        var tr = document.createElement("tr");
-        tr.appendChild(td(inv.invite_id));
-        tr.appendChild(td(inv.bound_identity || inv.login_id_masked
-                  || "（不绑定）"));
-        tr.appendChild(td(inv.ai_access ? "开" : "关"));
-        // 初始总额度模板（Batch B/D1）：null=兑换继承默认；两位小数 CNY
-        tr.appendChild(td(inv.total_limit_nano_cny === null ||
-                          inv.total_limit_nano_cny === undefined
-          ? "默认" : fmtCny(inv.total_limit_nano_cny)));
-        tr.appendChild(td(inv.note));
-        tr.appendChild(td(inviteStatusLabel(inv)));
-        tr.appendChild(td(fmtTs(inv.expires_at), "adm-cell-time"));
-        var cell = document.createElement("td");
-        cell.className = "adm-actions-cell";
-        if (inviteStatusLabel(inv) === "开放中") {
-          cell.appendChild(actionBtn("撤销", function () {
-            askConfirm($("adm-invites-confirm"),
-              "确认撤销邀请 " + inv.invite_id + "？撤销后立即不可兑换。",
-              function () { revokeInvite(inv.invite_id); });
-          }, true));
-        }
-        tr.appendChild(cell);
-        tbody.appendChild(tr);
-      });
-      if (!append && !invites.length) {
-        setPageHint(status, "暂无邀请；可在上方「新建邀请」创建。");
-      }
-      state.cursors.invites = res.next_cursor || null;
-      var more = $("adm-invites-more-btn");
-      if (more) more.disabled = !res.next_cursor;
-      setPageHint(status, res.next_cursor ? "还有更多" : "已到底");
-      return invites.length > 0;
-    }).catch(function (err) {
-      if (seq === state.listSeq) handleErr(err, status);
-      throw err;
-    });
-  }
-
-  function revokeInvite(inviteId) {
-    request("admin.invites.revoke", { invite_id: inviteId })
-      .then(function () {
-        setStatus("adm-invites-status", "已撤销 " + inviteId);
-        loadInvites(false);
-      })
-      .catch(function (err) { handleErr(err, $("adm-invites-status")); });
-  }
-
-  function showInviteTokenOnce(token) {
-    var box = $("adm-invite-token-box");
-    var code = $("adm-invite-token");
-    if (!box || !code) return;
-    code.textContent = token;
-    box.hidden = false;
-  }
-
-  function submitCreateInvite() {
-    var loginId = ($("adm-invite-login") && $("adm-invite-login").value || "").trim();
-    var ttlRaw = $("adm-invite-ttl") ? $("adm-invite-ttl").value : "";
-    var ai = $("adm-invite-ai") ? !!$("adm-invite-ai").checked : false;
-    var limitText = ($("adm-invite-limit") && $("adm-invite-limit").value || "").trim();
-    var note = ($("adm-invite-note") && $("adm-invite-note").value || "").trim();
-    var ttlHours = parseInt(ttlRaw, 10);
-    if (!ttlHours || ttlHours < 1 || ttlHours > 720) {
-      markInvalid($("adm-invite-ttl"), "有效期需为 1–720 小时",
-        "adm-invite-create-status");
-      return;
-    }
-    // 新契约（§3.4）：{login_id?, ttl_seconds?, ai_access, total_limit_nano_cny?, note?}
-    // ——不再有 source_code/campaign_id/cohort/monthly_limit_nano_cny。
-    var payload = {
-      ttl_seconds: ttlHours * 3600,
-      ai_access: ai,
-    };
-    if (limitText) {
-      var limit = cnyToNano(limitText);
-      if (limit === null) {
-        markInvalid($("adm-invite-limit"),
-          "初始总额度非法（CNY，最多 9 位小数，如 20 或 12.5）",
-          "adm-invite-create-status");
-        return;
-      }
-      payload.total_limit_nano_cny = limit;
-    }
-    if (loginId) payload.login_id = loginId;
-    if (note) payload.note = note;
-    setStatus("adm-invite-create-status", "创建中…");
-    request("admin.invites.create", payload).then(function (res) {
-      setStatus("adm-invite-create-status",
-        "已创建 " + ((res && res.invite && res.invite.invite_id) || "?") +
-        "；明文邀请码只显示这一次：");
-      showInviteTokenOnce((res && res.invite && res.invite.token) || "");
-      ["adm-invite-login", "adm-invite-limit", "adm-invite-note"]
-        .forEach(function (id) {
-          var el = $(id);
-          if (el) el.value = "";
-        });
-      loadInvites(false);
-    }).catch(function (err) {
-      showError(err && err.code, err && err.message);
-      setStatus("adm-invite-create-status", errText(err));
-    });
-  }
 
   // ------------------------------------------------------------------
   // 设置（§6.1 批次 D + wave 2 §4.5）：注册模式 + 消费额度策略（三键拆分）+
@@ -2190,21 +2082,27 @@
   }
 
   function renderSettings(settings) {
-    // 注册模式卡
+    // 注册模式卡（2026-10-08 §4：只剩 closed/public；旧存储值服务端按
+    // closed fail-closed 处理，这里只做回显 + 只允许选择这两种）
     var reg = settings.registration || {};
     var regSelect = $("adm-regmode-select");
-    if (regSelect) regSelect.value = reg.mode || "closed";
+    if (regSelect) {
+      // 旧值（invite_only 等）不在选项集合：回显 closed（与服务端读取
+      // 口径一致），绝不把已废弃值静默写回 select
+      regSelect.value = reg.mode === "public" ? "public" : "closed";
+    }
     var regDl = $("adm-regmode-info");
     if (regDl) {
       regDl.textContent = "";
       kvRow(regDl, "当前生效模式", reg.mode);
       kvRow(regDl, "存储模式", reg.stored_mode);
-      kvRow(regDl, "前置条件",
-        (reg.precondition_failures || []).length
-          ? "不满足：" + (reg.precondition_failures || []).join("；")
-          : "满足（HTTPS / Secure Cookie / PostgreSQL）");
-      kvRow(regDl, "支持的模式", (reg.supported_modes || []).join(" / ") +
-        "（public 本阶段不支持）");
+      if (reg.stored_mode && reg.stored_mode !== reg.mode) {
+        kvRow(regDl, "历史值处理",
+          "存储值 " + reg.stored_mode + " 已退役，按 closed 处理");
+      }
+      kvRow(regDl, "支持的模式",
+        ((reg.supported_modes || []).length
+          ? reg.supported_modes.join(" / ") : "closed / public"));
     }
     // 消费额度策略卡（三键拆分）
     var spend = settings.spend || {};
@@ -3151,12 +3049,21 @@
   }
 
   // ------------------------------------------------------------------
-  // 切片可见性（2026-09-05，review P0 owner 读隔离）：
-  //   - inventory 是 owner 唯一「看全部」出口（切片元数据清点，不含图像
-  //     内容）；
-  //   - 每行「授权/收回」调用 admin.slides.setVisibility（幂等；view 级）；
-  //   - 归属列显示 owner 展示名 + 掩码 login_id（无归属显示「无主」——
-  //     无主切片不因读隔离失联，在此可授权恢复可见）。
+  // 切片页（2026-10-08 §3.4，admin-viewer-simplified）：用户上传切片清单
+  // + 管理员临时查看。旧的「切片可见性 / workspace 收录」模型整体退役
+  //（admin.slides.setVisibility 已删、服务端旧端点 410）。
+  //   - inventory（§3.1）：created_at 新→旧；每项新增 created_at 与
+  //     temporary_view {status: own|none|active|ended|unavailable,
+  //     expires_at}；顶层 server_now（granted_to_owner/grant_recorded 已删）；
+  //   - 剩余分钟 = ceil((expires_at - server_now)/60)，按响应到达后的本地
+  //     流逝时间修正（slidesCache 基准），每分钟刷新；剩余归零按「已结束」
+  //     呈现并重取清单（服务端 read 门是唯一权限依据，倒计时只管呈现）；
+  //   - 开启（1 小时，常量在服务端）走 admin.slides.startTemporaryView；
+  //     提前结束走 admin.slides.endTemporaryView（幂等）；
+  //   - 「查看」走 admin.viewer.open——只读宿主方法，宿主 window.open 在
+  //     新标签打开 /?slide=<slide_id>（iframe 不导航宿主、不经任何 HTTP）；
+  //   - unavailable 行给出现有原因字段（failed 码表），不提供操作；
+  //   - 渲染纪律不变：textContent/createElement，未知字段绝不进 DOM。
   // ------------------------------------------------------------------
   function fmtBytes(n) {
     if (n === null || n === undefined || typeof n !== "number" || !(n >= 0)) {
@@ -3182,17 +3089,6 @@
     return masked || item.owner_user_id;
   }
 
-  function grantStatusText(item) {
-    // 升级 B（2026-09-05）：owner 工作区 = 本人 ∪ 显式添加——public 只对
-    // 普通用户默认可见，不再自动计入 owner 集合；included 以
-    // granted_to_owner 为准（资产生代失效的授权不计入）。
-    if (item.public && item.granted_to_owner) return "公开 + 已加入工作区";
-    if (item.public) return "公开（仅普通用户默认可见）";
-    if (item.granted_to_owner) return "已加入我的工作区";
-    if (item.grant_recorded) return "有授权记录（资产当前不可用，未生效）";
-    return "未加入";
-  }
-
   // 切片行的人类可读名：展示名 → 原始文件名 → 冻结 legacy 名 → slide_id。
   // 名称只用于展示；一切操作都按 slide_id 寻址（无 ID 的未登记文件除外）。
   function slideLabel(item) {
@@ -3202,14 +3098,12 @@
   }
 
   // ------------------------------------------------------------------
-  // 失败资产的证据展示（inventory failure 字段；2026-10-03）：
-  //   - code 是任务表存储的稳定机器码（ingestion fail_code / conversion·
-  //     baidu error_code；回填行推断 missing_file 时 inferred=true）；
-  //   - source 是来源任务族（COS 上传 / KFB 转换 / 百度导入 / 直传 / 回填）；
-  //   - occurred_at 是失败时间（epoch 秒）。
-  // 词表按后端写入口径列举（ingestion_store/cos_ingest_worker/
-  // conversion_worker/kfb/baidu_import_store/baidu_ingest/backfill 脚本）；
-  // 未列举的码回显原文（绝不假装翻译），code 缺失时按终态给通用文案。
+  // 失败资产的证据展示（inventory failure 字段；2026-10-03）：现在服务
+  // 「不可查看（原因）」状态（§3.4）。code 是任务表存储的稳定机器码
+  //（ingestion fail_code / conversion·baidu error_code；回填行推断
+  // missing_file 时 inferred=true）；source 是来源任务族；occurred_at 是
+  // 失败时间（epoch 秒）。词表按后端写入口径列举；未列举的码回显原文
+  //（绝不假装翻译），code 缺失时按终态给通用文案。
   // ------------------------------------------------------------------
   var SLIDE_FAIL_CODE_LABELS = {
     // 回填/迁移（scripts/backfill_slide_asset_state 等）
@@ -3299,48 +3193,77 @@
     return parts.join(" · ");
   }
 
-  // 资产状态 → {text, ok, reason}；reason 是「为什么不能加入」的说明。
-  function slideAssetState(item) {
-    if (item.unregistered) {
-      return { text: "未登记文件", ok: false,
-        reason: "磁盘上的文件没有资产记录，不能直接加入；需先迁移登记" };
-    }
+  // unavailable（不可查看）的原因一行文案（§3.4 表）。
+  function slideUnavailableReason(item) {
+    if (!item || item.unregistered) return "未登记文件";
     var st = item.asset_state;
-    if (st === "deleted") {
-      return { text: "已删除", ok: false, reason: "资产已删除（墓碑保留），不能加入" };
-    }
-    if (st === "deleting") {
-      return { text: "删除中", ok: false, reason: "资产正在删除，不能加入" };
-    }
     if (st === "failed") {
       var detail = slideFailDetailText(item);
-      var fcode = item.failure && item.failure.code;
-      var ftext = "处理失败";
-      if (fcode === "missing_file") ftext = "文件缺失";
-      else if (fcode === "cancelled_by_user"
-               || (item.failure && item.failure.source_state === "cancelled")) {
-        ftext = "上传已取消";
-      }
-      return {
-        text: ftext, ok: false,
-        reason: detail
-          ? "资产处理失败：" + detail + "；不可读取，不能加入"
-          : "资产处理失败，不可读取，不能加入",
-      };
+      return detail ? "处理失败：" + detail : "处理失败";
     }
-    if (st === "staging") {
-      return { text: "上传处理中", ok: false, reason: "资产尚未发布，完成后才能加入" };
-    }
+    if (st === "deleted") return "已删除";
+    if (st === "deleting") return "删除中";
+    if (st === "staging") return "上传处理中";
     if (st === "legacy" || item.storage_layout === "legacy") {
-      return { text: "旧资产（未迁移）", ok: false,
-        reason: "旧布局资产尚未迁移，迁移后才能加入" };
+      return "旧资产（未迁移）";
     }
-    if (st === "ready" && !item.file_exists) {
-      return { text: "文件缺失", ok: false, reason: "资产记录在，但存储中找不到文件，不能加入" };
+    if (st === "ready" && item.file_exists === false) return "文件缺失";
+    if (st && st !== "ready") return "资产状态 " + st;
+    return "资产当前不可读取";
+  }
+
+  // 纯函数（导出供测试锁定倒计时口径）：按 server_now 基准 + 已流逝的本地
+  // 秒数计算临时查看状态。active 且已到期 → ended；剩余分钟向上取整。
+  // 剩余为正但不足 1 分钟时显示 1 分钟（ceil 语义，避免出现「剩余 0 分钟」）。
+  function tempViewStatusOf(tv, serverNow, elapsedSec) {
+    var status = (tv && tv.status) || "none";
+    var expiresAt = tv ? tv.expires_at : null;
+    if (status === "active" && typeof expiresAt === "number") {
+      var now = (typeof serverNow === "number" ? serverNow : 0) +
+        (typeof elapsedSec === "number" ? elapsedSec : 0);
+      if (now >= expiresAt) return { status: "ended", minutes: 0 };
+      return { status: "active",
+               minutes: Math.max(1, Math.ceil((expiresAt - now) / 60)) };
     }
-    if (st === "ready" && item.servable) return { text: "可用", ok: true, reason: "" };
-    return { text: "不可用（" + (st || "未知") + "）", ok: false,
-      reason: "资产当前不可读取，不能加入" };
+    return { status: status, minutes: null };
+  }
+
+  // 当前渲染时刻的 server_now（响应基准 + 本地流逝秒）；无基准时回 null
+  //（tempViewStatusOf 会按 0 处理——只可能出现在清单尚未到达时）。
+  function slidesServerNow() {
+    if (!state.slidesCache ||
+        typeof state.slidesCache.serverNow !== "number") {
+      return null;
+    }
+    return state.slidesCache.serverNow +
+      (Date.now() - state.slidesCache.localAtMs) / 1000;
+  }
+
+  function tempStatusCell(item) {
+    var info = tempViewStatusOf(item.temporary_view, slidesServerNow(), 0);
+    var cell = document.createElement("td");
+    cell.setAttribute("data-temp-status", item.slide_id || "");
+    if (info.status === "unavailable") {
+      cell.appendChild(document.createTextNode("不可查看"));
+      var reason = slideUnavailableReason(item);
+      if (reason) {
+        var why = document.createElement("div");
+        why.className = "adm-sub";
+        why.textContent = reason;
+        cell.appendChild(why);
+      }
+      return cell;
+    }
+    if (info.status === "active") {
+      cell.textContent = "可查看 · 剩余 " + info.minutes + " 分钟";
+    } else if (info.status === "ended") {
+      cell.textContent = "已结束";
+    } else if (info.status === "own") {
+      cell.textContent = "本人切片";
+    } else {
+      cell.textContent = "未开启";
+    }
+    return cell;
   }
 
   function loadSlides(append) {
@@ -3354,12 +3277,19 @@
       if (seq !== state.listSeq) return; // 页面已切换：晚到响应丢弃
       hideError();
       var items = (res && res.items) || [];
-      var tbody = $("adm-slides-tbody");
-      if (!append && tbody) tbody.textContent = "";
-      items.forEach(function (item) { renderSlideRow(item); });
+      // server_now 是剩余分钟与到期判定的基准；本地时钟只追流逝时间
+      //（宿主与服务器时钟偏移不进入倒计时）。
+      state.slidesCache = {
+        serverNow: typeof (res && res.server_now) === "number"
+          ? res.server_now : Math.floor(Date.now() / 1000),
+        localAtMs: Date.now(),
+        items: (append && state.slidesCache && state.slidesCache.items)
+          ? state.slidesCache.items.concat(items) : items,
+      };
+      renderSlidesFromCache();
       if (!append && !items.length) {
         setPageState("slides", "empty", {
-          message: "没有切片文件。上传切片后在此清点与授权。",
+          message: "还没有登记的切片文件。用户上传切片后会出现在此。",
         });
       } else {
         setPageState("slides", "ready", {
@@ -3380,91 +3310,119 @@
     });
   }
 
+  function renderSlidesFromCache() {
+    var tbody = $("adm-slides-tbody");
+    if (!tbody) return;
+    tbody.textContent = "";
+    (state.slidesCache && state.slidesCache.items || []).forEach(
+      function (item) { renderSlideRow(item); });
+  }
+
+  // 每分钟刷新（§3.4）：按缓存重画整表；任一行从 active 跨过到期时刻则
+  // 重取清单（读权限以服务端门为唯一依据，本页倒计时只负责呈现与提醒）。
+  function slidesMinuteTick() {
+    if (!state.slidesCache || !state.slidesCache.items) return;
+    var expired = false;
+    state.slidesCache.items.forEach(function (item) {
+      if (!item.temporary_view || item.temporary_view.status !== "active") return;
+      if (tempViewStatusOf(item.temporary_view, slidesServerNow(), 0)
+            .status === "ended") {
+        expired = true;
+      }
+    });
+    if (expired) {
+      loadSlides(false);
+      return;
+    }
+    renderSlidesFromCache();
+  }
+
   function renderSlideRow(item) {
     var tbody = $("adm-slides-tbody");
     if (!tbody) return;
     var tr = document.createElement("tr");
-    var label = slideLabel(item);
+    // 切片 / 上传者（上传者 = owner_identity；无归属显示「无主」）
     var nameCell = document.createElement("td");
-    nameCell.appendChild(document.createTextNode(label));
-    var sub = [];
-    if (item.original_filename && item.original_filename !== label) {
-      sub.push("原始文件名 " + item.original_filename);
-    }
-    if (item.slide_id) sub.push("ID " + item.slide_id);
-    if (sub.length) {
-      var subEl = document.createElement("div");
-      subEl.className = "adm-sub";
-      subEl.textContent = sub.join(" · ");
-      nameCell.appendChild(subEl);
-    }
+    nameCell.appendChild(document.createTextNode(slideLabel(item)));
+    var uploaderEl = document.createElement("div");
+    uploaderEl.className = "adm-sub";
+    uploaderEl.textContent = ownerCellText(item);
+    nameCell.appendChild(uploaderEl);
     tr.appendChild(nameCell);
-    var asset = slideAssetState(item);
-    var stateCell = td(asset.text);
-    stateCell.setAttribute("data-asset-state", item.unregistered
-      ? "unregistered" : String(item.asset_state || "unknown"));
-    // failed 行在状态列追加紧凑明细（原因 · 来源任务 · 时间；textContent，
-    // 只消费 inventory failure 白名单字段，未知字段不进 DOM）
-    if (!item.unregistered && item.asset_state === "failed") {
-      var failDetail = slideFailDetailText(item);
-      if (failDetail) {
-        var failSub = document.createElement("div");
-        failSub.className = "adm-sub";
-        failSub.textContent = failDetail;
-        stateCell.appendChild(failSub);
-      }
-    }
-    tr.appendChild(stateCell);
-    tr.appendChild(td(ownerCellText(item)));
-    tr.appendChild(td(item.public ? "是" : "—"));
-    tr.appendChild(td(item.archived ? "是" : "—"));
-    tr.appendChild(td(fmtBytes(item.size_bytes)));
-    tr.appendChild(td(grantStatusText(item)));
-    var cell = document.createElement("td");
-    cell.className = "adm-actions-cell";
-    // 移除对任何已记录的授权都可做（含资产已不可用的失效授权）；加入只对
-    // 可用资产开放，不可用时按钮禁用并写明原因。
-    var revocable = !!(item.granted_to_owner || item.grant_recorded);
-    if (revocable) {
-      cell.appendChild(actionBtn(item.granted_to_owner ? "移除" : "移除授权记录", function () {
-        askConfirm($("adm-slides-confirm"),
-          "确认将 " + label + "（" + (item.slide_id || item.name) + "）移出我的工作区？" +
-          "移除后新请求立即拒绝，进行中的 AI 任务会被取消，后续工具访问被拒" +
-          "（归属者与公开状态不受影响）。",
-          function () { setSlideVisibility(item, false); });
-      }, "danger-outline"));
-    } else {
-      var addBtn = actionBtn("加入", function () {
-        setSlideVisibility(item, true);
-      }, "secondary");
-      if (!asset.ok) {
-        addBtn.disabled = true;
-        addBtn.title = asset.reason;
-        var why = document.createElement("div");
-        why.className = "adm-sub";
-        why.textContent = asset.reason;
-        cell.appendChild(addBtn);
-        cell.appendChild(why);
-      } else {
-        cell.appendChild(addBtn);
-      }
-    }
-    tr.appendChild(cell);
+    // 加入时间（§3.1：首次登记时间 = slides.created_at）
+    tr.appendChild(td(fmtTs(item.created_at), "adm-cell-time"));
+    tr.appendChild(tempStatusCell(item));
+    tr.appendChild(slideActionsCell(item));
     tbody.appendChild(tr);
   }
 
-  function setSlideVisibility(item, granted) {
-    var label = slideLabel(item);
-    request("admin.slides.setVisibility",
-            { name: item.slide_id || item.name, granted: granted })
-      .then(function (res) {
-        var already = res && granted && res.already_granted;
-        var cancelled = (res && res.runs_cancelled || []).length;
+  // 操作列（§3.4 表）：active → 查看 + 结束查看；own → 查看；
+  // none/ended → 开启 1 小时；unavailable → 无。
+  function slideActionsCell(item) {
+    var cell = document.createElement("td");
+    cell.className = "adm-actions-cell";
+    var info = tempViewStatusOf(item.temporary_view, slidesServerNow(), 0);
+    if (info.status === "own") {
+      cell.appendChild(actionBtn("查看", function () {
+        openSlideInViewer(item);
+      }, "secondary"));
+      return cell;
+    }
+    if (info.status === "active") {
+      cell.appendChild(actionBtn("查看", function () {
+        openSlideInViewer(item);
+      }, "secondary"));
+      cell.appendChild(actionBtn("结束查看", function () {
+        askConfirm($("adm-slides-confirm"),
+          "确认提前结束 " + slideLabel(item) + " 的临时查看？" +
+          "结束后新请求立即被拒，派生的 AI 运行授权一并取消；" +
+          "用户自己的分享设置不受影响。",
+          function () { endTemporaryView(item); });
+      }, "danger-outline"));
+      return cell;
+    }
+    if (info.status === "none" || info.status === "ended") {
+      cell.appendChild(actionBtn("开启 1 小时", function () {
+        startTemporaryView(item);
+      }, "secondary"));
+    }
+    // unavailable（含未登记/无 ID 行）：不提供任何操作
+    return cell;
+  }
+
+  // 「查看」：不经任何 HTTP——宿主侧 admin.viewer.open 以
+  // window.open('/?slide=<id>', '_blank', 'noopener') 打开 Viewer 深链。
+  function openSlideInViewer(item) {
+    if (!item.slide_id) return;
+    request("admin.viewer.open", { slide_id: item.slide_id })
+      .then(function () {
         setStatus("adm-slides-status",
-          (granted ? "已加入工作区 " : "已移出工作区 ") + label +
-          (already ? "（此前已加入，幂等成功）" : "") +
-          (!granted && cancelled
-            ? "（已请求取消 " + cancelled + " 个运行中任务）" : ""));
+          "已在新标签页打开 Viewer（/?slide=" + item.slide_id + "）");
+      })
+      .catch(function (err) { handleErr(err, $("adm-slides-status")); });
+  }
+
+  function startTemporaryView(item) {
+    setStatus("adm-slides-status", "正在开启临时查看…");
+    request("admin.slides.startTemporaryView", { slide_id: item.slide_id })
+      .then(function (res) {
+        var tv = res && res.temporary_view;
+        var mins = tv && typeof tv.expires_at === "number" &&
+          typeof res.server_now === "number"
+          ? Math.max(1, Math.ceil((tv.expires_at - res.server_now) / 60))
+          : null;
+        setStatus("adm-slides-status", "已开启临时查看：" + slideLabel(item) +
+          (mins ? "（剩余 " + mins + " 分钟，到期自动结束）" : ""));
+        loadSlides(false);
+      })
+      .catch(function (err) { handleErr(err, $("adm-slides-status")); });
+  }
+
+  function endTemporaryView(item) {
+    setStatus("adm-slides-status", "正在结束临时查看…");
+    request("admin.slides.endTemporaryView", { slide_id: item.slide_id })
+      .then(function () {
+        setStatus("adm-slides-status", "已结束临时查看：" + slideLabel(item));
         loadSlides(false);
       })
       .catch(function (err) { handleErr(err, $("adm-slides-status")); });
@@ -4156,6 +4114,9 @@
   // 内存态导航（opaque origin：不用 location.hash，避免任何存储型状态）
   // ------------------------------------------------------------------
   function showPage(name) {
+    // 2026-10-08：未知 slug（含已退役的 invites）归一到概览——直接放行会
+    // 把所有 section 都隐藏成空屏（页面表已无该 key）
+    if (!els.pages[name]) name = "overview";
     state.page = name;
     state.listSeq++; // 作废在途列表响应（§8.2：晚到响应不写回新页面）
     billTabSeq++;    // 作废在途费用明细响应（跨页迟到不写回）
@@ -4196,7 +4157,6 @@
     else if (name === "format-requests") loadFormatRequests(false);
     else if (name === "test-applications") loadTestApplications();
     else if (name === "research-deletion") loadResearchDeletionJobs();
-    else if (name === "invites") loadInvitesPage();
     else if (name === "settings") loadSettingsPage();
     else if (name === "billing") loadBillingPage();
     else if (name === "plugins") loadPlugins();
@@ -4278,35 +4238,45 @@
       var el = $(id);
       if (el) el.addEventListener("click", handler);
     }
-    // 用户页筛选
-    onClick("adm-users-search-btn", function () {
-      state.filters.users = {
-        q: ($("adm-users-q") && $("adm-users-q").value || "").trim(),
-        enabled: $("adm-users-enabled") ? $("adm-users-enabled").value : "",
-        ai: $("adm-users-ai") ? $("adm-users-ai").value : "",
-      };
-      state.cursors.users = null;
-      state.listSeq++;
-      loadUsers(false);
-    });
+    // 用户页分类筛选（§2）：分段按钮 aria-pressed 单选；任一变更重置游标
+    var kindSeg = $("adm-users-kind-seg");
+    if (kindSeg && kindSeg.addEventListener) {
+      kindSeg.addEventListener("click", function (ev) {
+        var btn = ev.target && ev.target.closest
+          ? ev.target.closest(".adm-kind-btn") : null;
+        if (!btn) return;
+        var kind = btn.getAttribute("data-kind");
+        if (["real", "dogfood", "all"].indexOf(kind) === -1) return;
+        if (state.filters.users.kind === kind) return; // 重复点击不重取
+        state.filters.users.kind = kind;
+        var buttons = kindSeg.querySelectorAll(".adm-kind-btn") || [];
+        for (var i = 0; i < buttons.length; i++) {
+          var on = buttons[i].getAttribute("data-kind") === kind;
+          if (buttons[i].setAttribute) {
+            buttons[i].setAttribute("aria-pressed", on ? "true" : "false");
+          }
+        }
+        resetUsersCursorAndReload();
+      });
+    }
+    // 用户页排序（§2）：变更即重置游标重取
+    var usersSort = $("adm-users-sort");
+    if (usersSort && usersSort.addEventListener) {
+      usersSort.addEventListener("change", function () {
+        var v = usersSort.value;
+        if (["joined_desc", "joined_asc", "last_login_desc"].indexOf(v) === -1) return;
+        state.filters.users.sort = v;
+        resetUsersCursorAndReload();
+      });
+    }
     onClick("adm-users-more-btn", function () { loadUsers(true); });
     // R6（2026-09-19）：「新建用户」表单与身份冲突页监听已退役移除
     // （submitCreateUser / adm-identity-refresh-btn 不再存在）
     // R4（2026-09-19）：来源榜「包含疑似爬虫」切换（change 监听 + state
     // 快照分支）已随开关一并退役——来源榜固定排除疑似爬虫
-    // 邀请页（wave 2：注册模式只读 + 跳设置）
-    onClick("adm-invite-goto-settings-btn", function () { showPage("settings"); });
-    onClick("adm-invite-create-btn", submitCreateInvite);
-    onClick("adm-invites-more-btn", function () { loadInvites(true); });
-    onClick("adm-invite-token-copy", function () {
-      var code = $("adm-invite-token");
-      if (!code) return;
-      // 反馈写最近的状态行（token 区上方的创建状态行）
-      copyToClipboard(code.textContent || "").then(function (ok) {
-        setStatus("adm-invite-create-status",
-          ok ? "已复制" : "复制失败，文本已选中，请手动复制");
-      });
-    });
+    // 2026-10-08：邀请页监听（adm-invite-goto-settings-btn /
+    // adm-invite-create-btn / adm-invites-more-btn / adm-invite-token-copy）
+    // 已随邀请页退役整体移除。
     // 设置页（批次 D + wave 2）
     onClick("adm-regmode-save-btn", saveRegistrationMode);
     onClick("adm-model-save-btn", saveDefaultModel); // 0.4.2 平台默认模型
@@ -4365,7 +4335,7 @@
       loadAudit(false);
     });
     onClick("adm-audit-more-btn", function () { loadAudit(true); });
-    // 切片可见性页（2026-09-05 读隔离）
+    // 切片页（2026-10-08 §3.4：清单 + 临时查看；行内动作在行操作列）
     onClick("adm-slides-refresh-btn", function () { loadSlides(false); });
     onClick("adm-slides-more-btn", function () { loadSlides(true); });
     // 格式申请页（W2，2026-09-14）：状态筛选 + 分页（详情/迁移动作在行内）
@@ -4414,15 +4384,21 @@
   bindNav();
   if (typeof window.setInterval === "function") {
     window.setInterval(function () {
-      if (state.nonce && !state.dead && state.page === "overview" && !document.hidden) {
+      if (!(state.nonce && !state.dead) || document.hidden) return;
+      if (state.page === "overview") {
         loadSiteStats();
+      } else if (state.page === "slides") {
+        // 2026-10-08（§3.4）：临时查看剩余分钟每分钟刷新；跨过到期时刻
+        // 即重取清单（读权限以服务端门为唯一依据）
+        slidesMinuteTick();
       }
     }, 60000);
   }
 
   // 导出（仅调试/测试用；不含 nonce 读取器）。金额换算函数一并导出供
   // tests/js/admin-plugin-ui.test.ts 锁定「字符串进、字符串出」契约与
-  // 两位小数口径（formatCny2）；copyToClipboard 导出供锁定三级降级路径。
+  // 两位小数口径（formatCny2）；copyToClipboard 导出供锁定三级降级路径；
+  // tempViewStatusOf 导出供锁定临时查看倒计时口径（ceil + 本地流逝修正）。
   window.PathTogetherAdminClient = {
     request: request,
     showPage: showPage,
@@ -4433,6 +4409,7 @@
     fmtNano: fmtNano,
     fmtCny: fmtCny,
     fmtTs: fmtTs,
+    tempViewStatusOf: tempViewStatusOf,
     handshakeState: function () {
       return {
         ready: !!state.nonce && !state.dead,

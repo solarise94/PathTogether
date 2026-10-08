@@ -957,7 +957,11 @@ def test_admin_manifest_plugin_version_bumped_with_hashes():
     # 2026-09-21 0.4.12：新增「研究删除」页（admin.researchDeletionJobs.
     # list/retry 桥方法，复用 users 权限域不扩域；终态 failed 删除任务的
     # 最小人工处置，completed 只能由 worker 清理成功产生），hashes/pin 同步
-    assert data["pluginVersion"] == "0.4.15"  # hashes/pin 同步
+    # 2026-10-08 0.4.16（admin-viewer-simplified §2/§3.4/§4/§6）：用户页
+    # 四列改版（分类/最近登录/setAccountKind）+ 切片页临时查看改版
+    #（start/endTemporaryView + viewer.open 宿主开新标签）+ 邀请页退役
+    #（admin.invites.* 桥方法删除）+ 注册模式收敛 closed/public，hashes/pin 同步
+    assert data["pluginVersion"] == "0.4.16"  # hashes/pin 同步
     assert "admin:settings:read" in data["adminPermissions"]
     assert "admin:settings:write" in data["adminPermissions"]
     assert "admin:slides:read" in data["adminPermissions"]

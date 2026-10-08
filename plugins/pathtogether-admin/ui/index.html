@@ -49,22 +49,34 @@
     .adm-state 页级状态条（role=status aria-live=polite）承载；错误显示
     类别 + 本地请求序号（非敏感）+ 重试；空态解释为什么为空与下一步。
 
-    页面（11 页 IA）：概览 / 用户 / 切片 / 格式申请 / 邀请 / 测试申请 /
-    研究删除 / 设置 / 费用 / 插件 / 审计。「切片」（2026-09-05，review P0 读隔离 × 升级 B
-    收录语义）= 切片可见性管理：inventory 全量清点（唯一「看全部」出口，
-    仅元数据）+ 把他人切片显式加入/移出 owner 工作区（view 收录，资产生代
-    绑定，撤销联动取消）。
     「格式申请」（2026-09-14 W2）= 格式支持申请工单：清单 + 状态机处置
     （submitted → reviewing → supported|declined，CAS 迁移 + admin_note）；
     样本只呈现元数据，不内嵌文件内容。
+    页面（10 页 IA）：概览 / 用户 / 切片 / 格式申请 / 测试申请 /
+    研究删除 / 设置 / 费用 / 插件 / 审计。
     「研究删除」（2026-09-21）= 研究副本删除任务的最小人工处置入口：
     终态 failed（重试耗尽）任务的清单 + 唯一动作「重新执行删除」（复活为
     pending 交 worker 真实清理；completed 只能由清理成功产生，绝无
     「直接置 completed」入口）。
+    2026-10-08（admin-viewer-simplified §2/§3.4/§4，docs/
+    admin-viewer-simplified-20261008.md）：
+      - 「邀请」页整体退役（注册只剩 closed/public；admin.invites.* 桥方法
+        已删，服务端 /api/admin/v1/invites* 410）；注册模式只在设置页
+        closed/public 两种可选；
+      - 用户页主表四列：用户（显示名+邮箱）/ 加入时间 / 最近登录 / 分类；
+        上方分类筛选（正式用户/Dogfood/全部，默认正式）与排序下拉；行内
+        「标为测试/改为正式」（admin.users.setAccountKind）+「详情」抽屉
+        （启停、AI 权限、密码重置、总额度、预览等现有操作全部收在抽屉）；
+        未登录过显示「暂无记录」；
+      - 切片页改为「用户上传的切片」：列 = 切片/上传者、加入时间、管理员
+        临时查看、操作；临时查看五态（未开启/已结束/可查看·剩余 N 分钟/
+        本人切片/不可查看）；开启 1 小时（admin.slides.startTemporaryView）、
+        提前结束（endTemporaryView）、「查看」经 admin.viewer.open 由宿主
+        在新标签打开 /?slide=<id>；剩余分钟数按 expires_at - server_now
+        向上取整并按本地流逝时间修正，每分钟刷新，归零即「已结束」并重取。
     R6（2026-09-19 service review §8）：「身份冲突」页与「新建用户」表单
     整体退役（含桥方法 admin.users.identityConflicts / discardPending /
-    create 与服务端 REST 入口）——用户获取统一走正常注册/邀请码；用户页
-    只保留列表/筛选/抽屉（启停、AI 权限、密码重置、总额度）。
+    create 与服务端 REST 入口）。
 
     只加载相对路径 style.css / main.js（owner-only 的
     /admin/plugin-assets/pathtogether-admin/ui/*）；不写内联样式/脚本（CSP）。
@@ -89,7 +101,6 @@
         <button type="button" class="adm-nav-btn" data-page="format-requests">格式申请</button>
         <button type="button" class="adm-nav-btn" data-page="test-applications">测试申请</button>
         <button type="button" class="adm-nav-btn" data-page="research-deletion">研究删除</button>
-        <button type="button" class="adm-nav-btn" data-page="invites">邀请</button>
         <button type="button" class="adm-nav-btn" data-page="settings">设置</button>
         <button type="button" class="adm-nav-btn" data-page="billing">费用</button>
         <button type="button" class="adm-nav-btn" data-page="plugins">插件</button>
@@ -183,47 +194,38 @@
           </section>
         </section>
 
-        <!-- 用户（R6：创建表单已退役——用户获取统一走正常注册/邀请码；
-             列表只回答能不能用 AI、额度剩多少） -->
+        <!-- 用户（2026-10-08 §2）：主表四列（显示名+邮箱 / 加入时间 /
+             最近登录 / 分类）+ 分类筛选（默认正式用户）与排序下拉；行内
+             「标为测试 / 改为正式」；启停、AI 权限、密码重置、身份预览、
+             总额度等现有操作全部保留在「详情」抽屉 -->
         <section class="adm-page" id="adm-page-users" hidden>
           <div class="adm-state" id="adm-state-users" data-page-state="idle" role="status" aria-live="polite"></div>
           <section class="adm-card">
             <h2>用户</h2>
-            <p class="adm-note">「额度剩余」按角色显示：注册用户为一次性总额度剩余（不按月刷新），owner 为本月窗口剩余（不可用会写明原因）；登录账号、已消费/预占等技术细节在「详情」抽屉；owner 行不提供禁用/重置（break-glass 不变量，服务端同样拒绝）。</p>
+            <p class="adm-note">分类用于区分正式用户与内部测试（Dogfood）账号：标记不影响账号数据、额度与权限，随时可改回。启停、AI 权限、重置密码、身份预览与额度调整在「详情」抽屉。时间均为北京时间（GMT+8）；从未登录过的账号「最近登录」显示暂无记录。</p>
             <div class="adm-filters" id="adm-users-filters">
-              <div class="adm-field">
-                <label class="adm-field-label" for="adm-users-q">搜索用户</label>
-                <input type="search" id="adm-users-q" placeholder="邮箱用户名" maxlength="128">
+              <div class="adm-kind-seg" id="adm-users-kind-seg" role="group" aria-label="分类筛选">
+                <button type="button" class="adm-kind-btn" data-kind="real" aria-pressed="true">正式用户</button>
+                <button type="button" class="adm-kind-btn" data-kind="dogfood" aria-pressed="false">Dogfood</button>
+                <button type="button" class="adm-kind-btn" data-kind="all" aria-pressed="false">全部</button>
               </div>
               <div class="adm-field">
-                <label class="adm-field-label" for="adm-users-enabled">启用状态</label>
-                <select id="adm-users-enabled">
-                  <option value="">全部</option>
-                  <option value="true">仅启用</option>
-                  <option value="false">仅禁用</option>
+                <label class="adm-field-label" for="adm-users-sort">排序</label>
+                <select id="adm-users-sort">
+                  <option value="joined_desc">加入时间 · 最新优先</option>
+                  <option value="joined_asc">加入时间 · 最早优先</option>
+                  <option value="last_login_desc">最近登录</option>
                 </select>
-              </div>
-              <div class="adm-field">
-                <label class="adm-field-label" for="adm-users-ai">AI access</label>
-                <select id="adm-users-ai">
-                  <option value="">全部</option>
-                  <option value="true">仅有 AI access</option>
-                  <option value="false">仅无 AI access</option>
-                </select>
-              </div>
-              <div class="adm-field adm-field--actions">
-                <button type="button" id="adm-users-search-btn" class="adm-btn-secondary">筛选</button>
               </div>
             </div>
             <div class="adm-table-wrap">
               <table class="adm-table adm-table--users" id="adm-users-table">
                 <thead>
                   <tr>
-                    <th>邮箱用户名</th>
-                    <th class="adm-col-secondary">角色</th>
-                    <th>状态</th>
-                    <th>额度剩余</th>
-                    <th>操作</th>
+                    <th>用户</th>
+                    <th>加入时间</th>
+                    <th>最近登录</th>
+                    <th>分类</th>
                   </tr>
                 </thead>
                 <tbody id="adm-users-tbody"></tbody>
@@ -241,26 +243,23 @@
              方法与服务端入口）；系统不再提供经 Web 物理删除用户行的入口，
              存量冲突收敛回归唯一约束 + 正常注册自身的 fail-closed 语义 -->
 
-        <!-- 切片可见性 / 我的工作区收录（review P0 读隔离 × 升级 B 2026-09-05）：
-             owner 不再默认可见全部切片（public/协作也不自动计入）；本页是唯一
-             「看全部」出口（inventory 元数据清点，不含切片图像内容）+ 把他人
-             切片显式加入/移出 owner 工作区（view 收录，资产生代绑定） -->
+        <!-- 切片（2026-10-08 §3.4）：用户上传切片清单 + 管理员临时查看。
+             旧「切片可见性」（workspace 显式收录）模型已整体退役——owner 的
+             读权限改由 1 小时临时查看授权承载。五态：未开启 / 已结束 /
+             可查看·剩余 N 分钟 / 本人切片 / 不可查看（原因）；「查看」经
+             admin.viewer.open 由宿主在新标签打开 /?slide=<id>。 -->
         <section class="adm-page" id="adm-page-slides" hidden>
           <div class="adm-state" id="adm-state-slides" data-page-state="idle" role="status" aria-live="polite"></div>
           <section class="adm-card">
-            <h2>切片可见性</h2>
-            <p class="adm-note">升级后 owner 的工作区只包含本人上传与在此显式加入的切片——公开、协作受邀都不会自动进入 owner 视图（这些规则只对普通用户生效）。加入是 view 级收录（绑定当前文件版本：同名替换后旧授权失效，需重新加入）；移除后新请求立即拒绝，进行中的 AI 任务会被取消。无主切片也在此清点并可加入恢复可见。本清单只含切片元数据，不含切片图像内容。</p>
+            <h2>用户上传的切片</h2>
+            <p class="adm-note">开启临时查看后 1 小时内可在 Viewer 读取该切片；到期自动结束，也可提前结束。不会修改用户原有的分享设置。</p>
             <div class="adm-table-wrap">
               <table class="adm-table" id="adm-slides-table">
                 <thead>
                   <tr>
-                    <th>切片名</th>
-                    <th>资产状态</th>
-                    <th>归属</th>
-                    <th class="adm-col-secondary">公开</th>
-                    <th class="adm-col-secondary">归档只读</th>
-                    <th class="adm-col-secondary">大小</th>
-                    <th>收录状态</th>
+                    <th>切片 / 上传者</th>
+                    <th>加入时间</th>
+                    <th>管理员临时查看</th>
                     <th>操作</th>
                   </tr>
                 </thead>
@@ -446,97 +445,28 @@
           </section>
         </section>
 
-        <!-- 邀请：注册模式只读摘要 + 折叠的「新建邀请」+ 邀请列表。
-             来源漏斗 / 用户来源明细 / source·campaign·cohort 全部退役（§4.4） -->
-        <section class="adm-page" id="adm-page-invites" hidden>
-          <div class="adm-state" id="adm-state-invites" data-page-state="idle" role="status" aria-live="polite"></div>
-          <section class="adm-card">
-            <h2>注册模式</h2>
-            <p class="adm-note">当前生效的注册模式（closed / invite_only / email_verify_invite_activation）。注册模式只在「设置」页可修改，本页仅展示状态。</p>
-            <dl id="adm-invite-mode" class="adm-kv"></dl>
-            <div class="adm-form-actions">
-              <button type="button" id="adm-invite-goto-settings-btn" class="adm-btn-secondary">去设置修改</button>
-            </div>
-          </section>
-          <details class="adm-card adm-collapsible-form" id="adm-invite-create-box">
-            <summary>新建邀请</summary>
-            <p class="adm-note">绑定登录账号留空 = 不绑定邀请（高风险）；明文邀请码仅创建响应展示一次，库内只存 hash。邀请只负责注册：绑定账号、有效期、AI access、初始总额度与备注，不再携带任何来源/归因信息。</p>
-            <div class="adm-form adm-form--grid" id="adm-invite-create-form">
-              <div class="adm-field">
-                <label class="adm-field-label" for="adm-invite-login">绑定登录账号（可选）</label>
-                <input type="text" id="adm-invite-login" placeholder="如 user01" maxlength="120" autocomplete="off" aria-describedby="adm-invite-login-help">
-                <small class="adm-field-help" id="adm-invite-login-help">留空 = 不绑定（高风险：任何持码人可兑换）</small>
-              </div>
-              <div class="adm-field">
-                <label class="adm-field-label" for="adm-invite-ttl">有效期（小时，必填）</label>
-                <input type="number" id="adm-invite-ttl" placeholder="如 168" min="1" max="720" value="168" aria-describedby="adm-invite-ttl-help">
-                <small class="adm-field-help" id="adm-invite-ttl-help">1–720 小时，默认 168（7 天）</small>
-              </div>
-              <details class="adm-field-span" id="adm-invite-limit-box">
-                <summary>高级：单独总额度</summary>
-                <div class="adm-field">
-                  <label class="adm-field-label" for="adm-invite-limit">兑换用户初始总额度（CNY，可选）</label>
-                  <input type="text" id="adm-invite-limit" placeholder="如 20 或 12.5" autocomplete="off" aria-describedby="adm-invite-limit-help">
-                  <small class="adm-field-help" id="adm-invite-limit-help">留空 = 兑换后继承全局默认；最多 9 位小数；一次性总额度不按月刷新</small>
-                </div>
-              </details>
-              <div class="adm-field">
-                <label class="adm-field-label" for="adm-invite-note">备注（可选）</label>
-                <input type="text" id="adm-invite-note" placeholder="如 9 月批次" maxlength="200" autocomplete="off">
-                <small class="adm-field-help">≤200 字符</small>
-              </div>
-              <label class="adm-check adm-field-span"><input type="checkbox" id="adm-invite-ai"> 兑换用户默认开通 AI access</label>
-              <div class="adm-form-actions">
-                <button type="button" id="adm-invite-create-btn" class="adm-btn-primary">创建邀请</button>
-              </div>
-            </div>
-            <p class="adm-status" id="adm-invite-create-status"></p>
-            <!-- 一次性明文邀请码：创建成功后展示，由用户主动关闭（绝不自动折叠） -->
-            <div class="adm-token-once" id="adm-invite-token-box" hidden>
-              <code id="adm-invite-token"></code>
-              <button type="button" id="adm-invite-token-copy" class="adm-btn-secondary">复制</button>
-            </div>
-          </details>
-          <section class="adm-card">
-            <h2>邀请列表</h2>
-            <p class="adm-note">登录账号仅显示掩码；token/hash 永不返回。已消费邀请不可撤销。</p>
-            <div class="adm-table-wrap">
-              <table class="adm-table" id="adm-invites-table">
-                <thead>
-                  <tr>
-                    <th>invite</th><th>绑定账号</th><th>AI</th><th>初始总额度</th>
-                    <th>备注</th><th>状态</th><th>过期时间</th><th>操作</th>
-                  </tr>
-                </thead>
-                <tbody id="adm-invites-tbody"></tbody>
-              </table>
-            </div>
-            <div class="adm-confirm" id="adm-invites-confirm" hidden></div>
-            <div class="adm-pager">
-              <button type="button" id="adm-invites-more-btn" class="adm-btn-secondary">加载更多</button>
-              <span id="adm-invites-status" class="adm-status"></span>
-            </div>
-          </section>
-        </section>
+        <!-- 邀请页已整体退役（2026-10-08 §4）：注册只剩 closed/public，
+             admin.invites.* 桥方法已删（稳定 unknown_method），服务端
+             /api/admin/v1/invites* 410；registration_invites 表保留为历史。
+             注册模式只在「设置」页管理。 -->
 
-        <!-- 设置：注册模式 / 平台默认模型（0.4.2：查看与切换）/ 金额策略
-             （三键拆分 + Demo/Owner 立即调整折叠 + enforcement 折叠危险开关）/
-             当前窗口摘要卡（Demo/Owner）/ 运行时参数 -->
+        <!-- 设置：注册模式（closed/public 两种）/ 平台默认模型
+             （0.4.2：查看与切换）/ 金额策略（三键拆分 + Demo/Owner 立即调整
+             折叠 + enforcement 折叠危险开关）/ 当前窗口摘要卡（Demo/Owner）/
+             运行时参数 -->
         <section class="adm-page" id="adm-page-settings" hidden>
           <div class="adm-state" id="adm-state-settings" data-page-state="idle" role="status" aria-live="polite"></div>
           <section class="adm-card">
             <h2>注册模式</h2>
-            <p class="adm-note">保存经服务端校验并写审计。public 本阶段不支持（单独安全评审前不可选）。</p>
+            <p class="adm-note">保存经服务端校验并写审计。只有 closed / public 两种：邀请码注册已退役，历史存储值（invite_only 等）一律按 closed 处理。</p>
             <div class="adm-form" id="adm-regmode-form">
               <div class="adm-field">
                 <label class="adm-field-label" for="adm-regmode-select">注册模式</label>
                 <select id="adm-regmode-select" aria-describedby="adm-regmode-help">
                   <option value="closed">closed（关闭注册）</option>
-                  <option value="invite_only">invite_only（邀请码注册）</option>
-                  <option value="email_verify_invite_activation">email_verify_invite_activation（邮箱验证 + 邀请码激活）</option>
-                  <option value="public" disabled>public（本阶段不支持）</option>
+                  <option value="public">public（开放注册）</option>
                 </select>
-                <small class="adm-field-help" id="adm-regmode-help">closed=关闭注册；invite_only=邀请码直接建号；email_verify_invite_activation=先验证邮箱再邀请码激活（需 HTTPS、Secure Cookie、PostgreSQL、邮件通道）；public 本阶段不支持</small>
+                <small class="adm-field-help" id="adm-regmode-help">closed=关闭注册（仅既有账号可登录）；public=开放注册（填写邮箱 → 验证邮箱 → 设置密码后直接进入工作台）</small>
               </div>
               <div class="adm-form-actions">
                 <button type="button" id="adm-regmode-save-btn" class="adm-btn-primary">保存注册模式</button>

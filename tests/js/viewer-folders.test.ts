@@ -329,7 +329,7 @@ describe("叠页大小与露出条带（§5.2 纯函数）", () => {
 		expect(ps(0, 5)).toBe(1);
 	});
 
-	it.fails("KNOWN: 多文件夹时应利用可用空间，而非每页只显示一张卡", async () => {
+	it("多文件夹时应利用可用空间，而非每页只显示一张卡", async () => {
 		const h = bootApp(s => {
 			seedNone(s);
 			s.routes.set("/api/projects", () => ({ status: 200, body:
@@ -512,7 +512,7 @@ describe("搜索（§5.4）", () => {
 		expect(fb.locationText(fb.search("normal")[0])).toContain("fb.unfiled");
 	});
 
-	it.fails("KNOWN: 混合文件夹与切片时，搜索定位后目标卡可见并能打开", async () => {
+	it("混合文件夹与切片时，搜索定位后目标卡可见并能打开", async () => {
 		let slides: Array<Record<string, unknown>> = [];
 		const h = bootApp((s) => {
 			slides = seedNone(s);
@@ -558,7 +558,7 @@ describe("临时查看到期（§5.5）", () => {
 		return slides;
 	}
 
-	it.fails("KNOWN: 列表 epoch 秒到期、info 无标记：有效期内可看，到期后无人操作也清屏", async () => {
+	it("列表 epoch 秒到期、info 无标记：有效期内可看，到期后无人操作也清屏", async () => {
 		vi.useFakeTimers();
 		vi.setSystemTime(new Date("2026-10-08T00:00:00Z"));
 		const h = bootApp((s) => { seedTemp(s, Date.now() / 1000 + 5); });

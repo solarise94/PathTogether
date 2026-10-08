@@ -338,9 +338,10 @@ test.describe("BMP 普通图片兼容（主站 + 分享页真实浏览器走查�
 	});
 });
 
-// Business defect found while reviving this previously blocked E2E. This assertion
-// runs on every suite execution; once fixed it XPASSes until test.fail is removed.
-test("分享选择器确认后保持分享浮层打开（待 Opus 修复）", async ({ page }) => {
+// Regression (was a review-confirmed defect): confirming the slide picker
+// reopens the share popover; the outside-click closer must not close it on
+// the same bubbling click (bindToolbarPop skip-once guard in static/app.js).
+test("分享选择器确认后保持分享浮层打开", async ({ page }) => {
 	await page.addInitScript(() => localStorage.setItem("hp_lang", "zh"));
 	await page.setViewportSize({ width: 1440, height: 900 });
 	await login(page, CREDS.userLogin, CREDS.userPassword);
@@ -351,6 +352,5 @@ test("分享选择器确认后保持分享浮层打开（待 Opus 修复）", as
 	await page.locator(`#picker-list input[value="${sid}"]`).check();
 	await page.locator("#picker-confirm").click();
 	await expect(page.locator("#slide-picker-mask")).toBeHidden();
-	test.fail(true, "confirmSlidePicker opens the popover; bindToolbarPop closes it on the same bubbling click (static/app.js)");
 	await expect(page.locator("#tb-share-pop")).toBeVisible({ timeout: 1000 });
 });

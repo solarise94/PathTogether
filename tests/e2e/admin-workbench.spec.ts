@@ -235,23 +235,22 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 			.poll(async () =>
 				frame.locator("#adm-state-settings").getAttribute("data-page-state"))
 			.toBe("ready", { timeout: 10_000 });
-		// public：开放注册受支持，保存成功并回显
+		// public：E2E 环境无 https 入口/邮件通道，服务端按前置条件拒绝，
+		// 页面显示错误态且存储值仍为 closed
+		ignoreApi.push("/api/admin/v1/settings/registration");
 		await frame.locator("#adm-regmode-select").selectOption("public");
 		await frame.locator("#adm-regmode-save-btn").click();
 		await expect(frame.locator("#adm-regmode-status"))
-			.toContainText("注册模式已提交为 public", { timeout: 10_000 });
+			.toContainText("registration_preconditions_failed", { timeout: 10_000 });
+		await page.reload();
+		await expect(hostStatus(page)).toHaveAttribute(
+			"data-admin-host-state", "ready", { timeout: 5000 });
+		await frame.locator('.adm-nav-btn[data-page="settings"]').click();
 		await expect
 			.poll(async () =>
 				frame.locator("#adm-state-settings").getAttribute("data-page-state"))
 			.toBe("ready", { timeout: 10_000 });
-		await expect(frame.locator("#adm-regmode-select")).toHaveValue("public");
-		// 收回 closed（后续用例假定 closed 种子语义）
-		await frame.locator("#adm-regmode-select").selectOption("closed");
-		await frame.locator("#adm-regmode-save-btn").click();
-		await expect
-			.poll(async () =>
-				frame.locator("#adm-state-settings").getAttribute("data-page-state"))
-			.toBe("ready", { timeout: 10_000 });
+		await expect(frame.locator("#adm-regmode-select")).toHaveValue("closed");
 	});
 
 	test("10b. 设置页：消费额度策略保存（三键拆分，CNY 输入 → nano wire）与 enforcement 展示", async ({ page }) => {

@@ -434,25 +434,49 @@ def test_create_user_total_allowance_atomic_and_no_override():
     assert not hasattr(user_store_pg, "create_user_with_spend_override")
 
 
-def test_redeem_invite_creates_allowance_atomically():
+def _insert_pending_row(email, password="pass123456789012"):
+    """直插 pending_activation 用户（存量 email_verify 形态；§4 后建号入口
+    只剩 user_store 原语与登录惰性激活）。"""
+    import secrets
+    from werkzeug.security import generate_password_hash
+    uid = "usr_" + secrets.token_urlsafe(8)
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (user_id, login_id, display_name, "
+                "password_hash, role, created_at, disabled, ai_config, "
+                "ai_access, activation_state, activation_source, "
+                "activation_updated_at, email, email_normalized, "
+                "email_verified_at) VALUES (%s,%s,%s,%s,'user', now(), FALSE, "
+                "'{}'::jsonb, FALSE, 'pending_activation', "
+                "'invite_activation', now(), %s, %s, now()) RETURNING user_id",
+                (uid, email, email, generate_password_hash(password),
+                 email, email))
+            return {"user_id": cur.fetchone()["user_id"]}
+
+
+def test_lazy_activation_creates_allowance_atomically():
+    """登录惰性激活（§4）：公开注册同口径幂等建额度；注入失败整体回滚
+    （用户状态不推进、无 allowance 残留）；重复激活不重复建行。"""
     _seed_all()
     owner = _mk_owner()
-    inv = registration_store.create_invite(
-        owner["user_id"], login_id="redeem@x.com", ai_access=True,
-        total_limit_nano_cny=15 * 10 ** 9)
-    out = registration_store.redeem_invite(inv["token"], "redeem@x.com",
-                                           "pass123456789012")
-    uid = out["user"]["user_id"]
-    assert out["total_allowance"]["limit_nano_cny"] == 15 * 10 ** 9
-    assert out["total_allowance"]["source"] == "invite"
-    assert _allowance_row(uid) is not None
+    pending = _insert_pending_row("lazy@x.com")
+    uid = pending["user_id"]
+    out = registration_store.lazy_activate_pending_user(uid)
+    assert out is not None and out["activation_state"] == "active"
+    row = _allowance_row(uid)
+    assert row is not None
+    assert row["source"] == "public_registration"
+    # 幂等：已 active 的重复调用不重复建行（连续登录两次只初始化一次）
+    out2 = registration_store.lazy_activate_pending_user(uid)
+    assert out2 is not None and out2["activation_state"] == "active"
+    assert _count("ai_spend_total_allowances",
+                  "subject_id='%s'" % uid) == 1
     # 退役写路径：user_acquisition 零新增、不建 override
     assert _count("user_acquisition") == 0
     assert _count("ai_spend_policies", "scope_type='user_override'") == 0
-    # 注入失败 → 邀请不消费、用户不创建、无 allowance 残留
-    inv2 = registration_store.create_invite(
-        owner["user_id"], login_id="rb@x.com",
-        total_limit_nano_cny=10 ** 9)
+    # 注入失败 → 状态不推进、无 allowance 残留（整体回滚）
+    pending2 = _insert_pending_row("lrb@x.com")
     orig = spend_store.create_user_total_allowance_tx
 
     def boom(*_a, **_k):
@@ -460,48 +484,32 @@ def test_redeem_invite_creates_allowance_atomically():
     spend_store.create_user_total_allowance_tx = boom
     try:
         with pytest.raises(RuntimeError):
-            registration_store.redeem_invite(inv2["token"], "rb@x.com",
-                                             "pass123456789012")
+            registration_store.lazy_activate_pending_user(
+                pending2["user_id"])
     finally:
         spend_store.create_user_total_allowance_tx = orig
-    assert user_store.get_user_by_login_id("rb@x.com") is None
-    row = registration_store.get_invite(inv2["invite_id"])
-    assert row["consumed_at"] is None and row["use_count"] == 0
-    assert _count("ai_spend_total_allowances") == 1
+    assert user_store.get_user(pending2["user_id"])[
+        "activation_state"] == "pending_activation"
+    assert _allowance_row(pending2["user_id"]) is None
+    assert _count("ai_spend_total_allowances",
+                  "subject_id='%s'" % pending2["user_id"]) == 0
 
 
-def test_invite_retired_fields_ignored_and_legacy_monthly_becomes_total():
+def test_lazy_activation_missing_default_fails_closed():
+    """缺全局默认（ai_spend_total_defaults 缺行）→ 整体回滚：状态不推进、
+    绝不建出无额度行的 active 账号。"""
     _seed_all()
-    owner = _mk_owner()
-    # 退役参数：兼容接受但不校验不写库（app.py wave 2 才改调用方）
-    inv = registration_store.create_invite(
-        owner["user_id"], login_id="retired@x.com", cohort="c1",
-        source_code="Not A Slug!", campaign_id="no-such-campaign")
-    assert inv["source_code"] in ("", None)
-    assert inv["campaign_id"] in ("", None)
-    assert inv["cohort"] in ("", None)
-    row = _sql_one("SELECT * FROM registration_invites WHERE invite_id=%s",
-                   (inv["invite_id"],))[0]
-    assert not row["source_code"] and row["campaign_id"] is None \
-        and not row["cohort"]
-    # create audit 不再携带 source/campaign/cohort/acq 字段
-    audits = _sql_one("SELECT detail FROM audit_events WHERE action="
-                      "'registration.invite_create' AND target_id=%s",
-                      (inv["invite_id"],))
-    assert audits
-    assert not ({"source_code", "campaign_id", "cohort", "acq",
-                 "campaign_bound"} & set(audits[0]["detail"]))
-    # R3 Wave2-Compat：旧 monthly 形参已物理删除（传入即 TypeError；
-    # 0033 亦 DROP 列，total_limit_nano_cny 为唯一金额模板面）
-    with pytest.raises(TypeError):
-        registration_store.create_invite(
-            owner["user_id"], login_id="legacy@x.com",
-            monthly_limit_nano_cny=7 * 10 ** 9)
-    with pytest.raises(TypeError):
-        registration_store.create_invite(
-            owner["user_id"], login_id="amb@x.com",
-            monthly_limit_nano_cny=10 ** 9, total_limit_nano_cny=10 ** 9)
-
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM ai_spend_total_defaults")
+    pending = _insert_pending_row("nodef@x.com")
+    with pytest.raises(registration_store.PublicRegistrationError) as ei:
+        registration_store.lazy_activate_pending_user(pending["user_id"])
+    assert ei.value.code == "total_default_missing"
+    after = user_store.get_user(pending["user_id"])
+    assert after["activation_state"] == "pending_activation"
+    assert after["ai_access"] is False
+    assert _allowance_row(pending["user_id"]) is None
 
 # =========================================================================== #
 # 3. 原子授权与结算（§Batch B 原子授权与结算 1-2）

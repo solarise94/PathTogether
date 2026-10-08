@@ -204,20 +204,21 @@ def test_registration_v1_put_validates():
     # 非法值 400
     assert c.put("/api/admin/v1/settings/registration",
                  json={"mode": "oops"}).status_code == 400
-    # json 后端 invite_only 前置条件不满足 → 400（PG 模式同理：PUBLIC_BASE_URL
-    # 非 https）
-    r2 = c.put("/api/admin/v1/settings/registration",
-               json={"mode": "invite_only"})
-    assert r2.status_code == 400
-    assert "前置条件" in r2.get_json()["error"]["message"]
+    # 2026-10-08 §4：旧模式值已从词表移除 → invalid_request（不是前置条件失败）
+    for retired in ("invite_only", "email_verify_invite_activation"):
+        r2 = c.put("/api/admin/v1/settings/registration",
+                   json={"mode": retired})
+        assert r2.status_code == 400, retired
+        assert r2.get_json()["error"]["code"] == "invalid_request"
 
 def test_registration_v1_put_closed_writes_and_audits():
     owner, _u = _setup_users()
     c = _login(_client(), owner)
-    settings_store.set_registration_mode("invite_only")
+    # 存量旧值（直写模拟）读取按 closed 处理；closed 无前置，永远可保存
+    settings_store.set_setting(settings_store.REGISTRATION_MODE_KEY,
+                                "invite_only")
+    assert settings_store.get_registration_mode() == "closed"
     r = c.put("/api/admin/v1/settings/registration", json={"mode": "closed"})
-    # invite_only 前置条件（https）不满足时存储值允许被改回 closed：
-    # closed 无前置条件，永远可保存
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.get_json()["mode"] == "closed"
     assert settings_store.get_registration_mode() == "closed"
@@ -758,141 +759,6 @@ def test_users_create_endpoint_retired_r6():
 # --------------------------------------------------------------------------- #
 # 8. 邀请码总额度模板 + 兑换事务内一次性总额度（Batch B wave 2）
 # --------------------------------------------------------------------------- #
-def test_invite_create_with_total_limit_template():
-    """Batch B wave 2 + R3 Wave2-Compat：邀请初始金额字段为
-    total_limit_nano_cny（wire 十进制字符串）；旧 monthly 字段退役——body 带
-    该键一律 400 retired_spend_field（绝不静默忽略）；来源字段接受即 400
-    retired_invite_field。"""
-    bh.seed_spend_policies()
-    owner, _u = _setup_users()
-    c = _login(_client(), owner)
-    r = c.post("/api/admin/v1/invites", json={
-        "login_id": "inv1@x.com", "ttl_hours": 24, "ai_access": True,
-        "total_limit_nano_cny": "25000000000"})
-    assert r.status_code == 200, r.get_data(as_text=True)
-    invite = r.get_json()["invite"]
-    # wire 十进制字符串；明文 token 仅此一次 + no-store
-    assert invite["total_limit_nano_cny"] == "25000000000"
-    assert "monthly_limit_nano_cny" not in invite
-    assert invite["token"]
-    assert r.headers.get("Cache-Control") == "no-store"
-    # 列表：token 永不回显；金额保持十进制字符串；无来源字段回显
-    lst = c.get("/api/admin/v1/invites").get_json()["invites"]
-    mine = [i for i in lst if i["invite_id"] == invite["invite_id"]][0]
-    assert "token" not in mine
-    assert mine["total_limit_nano_cny"] == "25000000000"
-    for retired in ("source_code", "campaign_id", "cohort"):
-        assert retired not in mine
-    # 金额 JSON number 拒绝
-    assert c.post("/api/admin/v1/invites", json={
-        "total_limit_nano_cny": 100}).status_code == 400
-    # R3 Wave2-Compat：旧 monthly 字段退役——单独传 / 与 total 同传 /
-    # 坏值，一律 400 retired_spend_field（不再有「兼容落总额度」路径）
-    for payload in (
-            {"login_id": "invlegacy@x.com",
-             "monthly_limit_nano_cny": "18000000000"},
-            {"total_limit_nano_cny": "1000000000",
-             "monthly_limit_nano_cny": "1000000000"},
-            {"monthly_limit_nano_cny": 5}):
-        r_ret = c.post("/api/admin/v1/invites", json=payload)
-        assert r_ret.status_code == 400, payload
-        assert r_ret.get_json()["error"]["code"] == "retired_spend_field", \
-            payload
-    # 来源字段退役：接受即 400 retired_invite_field（不静默忽略）
-    for field in ("source_code", "campaign_id", "cohort"):
-        r_ret = c.post("/api/admin/v1/invites", json={field: "whatever"})
-        assert r_ret.status_code == 400, field
-        assert r_ret.get_json()["error"]["code"] == "retired_invite_field"
-    # 创建 audit 无来源字段（store 层保证，wave 2 锁定 API 行为）
-    events = _audit_actions("registration.invite_create")
-    blob = json.dumps([e["detail"] for e in events], ensure_ascii=False)
-    for retired in ("source_code", "campaign_id", "cohort"):
-        assert retired not in blob
-
-def test_invite_redeem_creates_total_allowance_same_transaction():
-    """兑换带模板面值：同一事务内建一次性总额度（source=invite，
-    default_version=None），不建 user_override（写面已删）；恒 None 兼容键
-    acquisition/spend_override_policy 已随 R3 Wave2-Compat 物理删除（不在
-    返回 dict 中）。"""
-    bh.seed_spend_policies()
-    owner, _u = _setup_users()
-    c = _login(_client(), owner)
-    r = c.post("/api/admin/v1/invites", json={
-        "login_id": "redeem@x.com", "total_limit_nano_cny": "15000000000"})
-    token = r.get_json()["invite"]["token"]
-    invite_id = r.get_json()["invite"]["invite_id"]
-    result = registration_store.redeem_invite(
-        token, "redeem@x.com", "password-123456")
-    uid = result["user"]["user_id"]
-    assert result["total_allowance"]["limit_nano_cny"] == 15 * 10 ** 9
-    assert result["total_allowance"]["source"] == "invite"
-    assert result["total_allowance"]["default_version"] is None
-    # 兼容键已物理删除（不是恒 None，是整键不在）
-    assert "acquisition" not in result
-    assert "spend_override_policy" not in result
-    allowance = spend_store.get_total_allowance(uid)
-    assert allowance is not None
-    assert allowance["limit_nano_cny"] == 15 * 10 ** 9
-    # user_override 月策略不再创建
-    conn = bh.connect()
-    try:
-        with conn.cursor() as qcur:
-            qcur.execute("SELECT count(*)::int AS n FROM ai_spend_policies "
-                         "WHERE scope_type='user_override'")
-            assert qcur.fetchone()["n"] == 0
-    finally:
-        conn.close()
-    # 邀请已消费
-    row = registration_store.get_invite(invite_id)
-    assert row["consumed_at"] is not None
-    # 总额度审计在（同事务）spend.total_allowance_create 流里
-    events = _audit_actions("spend.total_allowance_create")
-    assert any(e["detail"].get("user_id") == uid and
-               e["detail"].get("op") == "create_user_total_allowance"
-               for e in events)
-
-def test_invite_without_limit_redeem_uses_default():
-    """R3 单轨：兑换无模板面值 → 同事务按 ai_spend_total_defaults 权威行
-    （20 CNY）建 allowance（source=invite，default_version 锚定）；兼容键
-    spend_override_policy 已随 R3 Wave2-Compat 物理删除。"""
-    bh.seed_spend_policies()
-    owner, _u = _setup_users()
-    r = registration_store.create_invite(owner["user_id"],
-                                         login_id="plain@x.com")
-    result = registration_store.redeem_invite(
-        r["token"], "plain@x.com", "password-123456")
-    uid = result["user"]["user_id"]
-    assert "spend_override_policy" not in result
-    assert result["total_allowance"]["limit_nano_cny"] == 20 * 10 ** 9
-    allowance = spend_store.get_total_allowance(uid)
-    assert allowance is not None
-    assert allowance["source"] == "invite"
-    assert allowance["default_version"] is not None  # 锚定默认行版本
-
-def test_invite_redeem_override_failure_rolls_back_everything():
-    """单事务证据：总额度写入失败 → 邀请不消费、用户不创建（allowance 注入
-    目标；§5.2，单轨恒触达 allowance 原语）。"""
-    bh.seed_spend_policies()
-    owner, _u = _setup_users()
-    invite = registration_store.create_invite(
-        owner["user_id"], login_id="rb@x.com",
-        total_limit_nano_cny=10 ** 9)
-    orig = spend_store.create_user_total_allowance_tx
-
-    def boom(*_a, **_k):
-        raise RuntimeError("allowance down")
-    spend_store.create_user_total_allowance_tx = boom
-    try:
-        with pytest.raises(Exception):
-            registration_store.redeem_invite(
-                invite["token"], "rb@x.com", "password-123456")
-    finally:
-        spend_store.create_user_total_allowance_tx = orig
-    # 整体回滚：用户不存在、邀请未消费、无半创建 allowance 行
-    assert user_store.get_user_by_login_id("rb@x.com") is None
-    row = registration_store.get_invite(invite["invite_id"])
-    assert row["consumed_at"] is None and row["use_count"] == 0
-
 # --------------------------------------------------------------------------- #
 # 9. settings 聚合（§6.1/§6.5 admin.settings.get 数据源）
 # --------------------------------------------------------------------------- #
@@ -904,8 +770,8 @@ def test_settings_aggregate_sections_and_decimal_strings():
     assert r.status_code == 200
     body = r.get_json()
     # 注册模式段（任何后端真实）
-    assert body["registration"]["supported_modes"] == [
-        "closed", "invite_only", "email_verify_invite_activation", "public"]
+    # 2026-10-08 §4：词表只剩 closed/public
+    assert body["registration"]["supported_modes"] == ["closed", "public"]
     # spend 段：三条策略 + enforcement + 窗口边界（epoch）+ 当前 demo 窗口
     spend = body["spend"]
     assert spend["available"] is True

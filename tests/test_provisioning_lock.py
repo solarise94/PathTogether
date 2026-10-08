@@ -151,36 +151,67 @@ def test_lock_helper_maps_timeout_to_provisioning_maintenance(pg_uri):
 
 
 # --------------------------------------------------------------------------- #
-# 2. 维护闸：开闸暂停建号/兑换（零副作用），关闸恢复；缺键按开闸
+# 2. 维护闸：开闸暂停建号（零副作用），关闸恢复；缺键按开闸
 # --------------------------------------------------------------------------- #
-def test_maintenance_gate_blocks_create_and_redeem_then_recovers():
-    """开闸（CAS false→true，生产同款路径）：建号与兑换各抛
-    ProvisioningMaintenanceError；用户未建、invite 未消费（关闸后仍可用）。
-    关闸恢复：建号/兑换照常成功。"""
+def test_maintenance_gate_blocks_create_then_recovers():
+    """开闸（CAS false→true，生产同款路径）：建号组合原语与登录惰性激活
+    各抛 ProvisioningMaintenanceError；用户未建/状态未推进（零副作用）。
+    关闸恢复：建号/惰性激活照常成功。（2026-10-08 §4：兑换入口退役，
+    激活面由登录惰性激活承担同款闸语义。）"""
     owner = _mk_owner()
-    inv = registration_store.create_invite(
-        owner["user_id"], login_id="gated@x.com")
     assert _set_gate(False, True) is True
     with pytest.raises(spend_store.ProvisioningMaintenanceError):
         user_store_pg.create_user_with_total_allowance(
             "gated@x.com", _PW)
+    # 惰性激活（激活事务的闸三段式）同样被拦
+    pending, _ = _make_pending_row("lazy-gated@x.com")
     with pytest.raises(spend_store.ProvisioningMaintenanceError):
-        registration_store.redeem_invite(inv["token"], "gated@x.com", _PW)
-    # 零副作用：用户行不存在、邀请未消费
+        registration_store.lazy_activate_pending_user(pending["user_id"])
+    # 零副作用：用户行不存在 / pending 状态未推进
     assert user_store.get_user_by_login_id("gated@x.com") is None
-    row = registration_store.get_invite(inv["invite_id"])
-    assert row["consumed_at"] is None and row["use_count"] == 0
-    # 关闸恢复：invite 仍可兑换（成功路径单轨恒建 allowance 行）。
+    assert user_store.get_user(pending["user_id"])[
+        "activation_state"] == "pending_activation"
+    # 关闸恢复：建号 + 惰性激活照常成功
     # compare_and_set_setting 返回**写入后的值**——关闸写入 False，未抛
     # SettingsVersionConflictError 即 CAS 命中
     _set_gate(True, False)
     user, allowance = user_store_pg.create_user_with_total_allowance(
         "aftergate@x.com", _PW)
     assert user["login_id"] == "aftergate@x.com" and allowance is not None
-    out = registration_store.redeem_invite(inv["token"], "gated@x.com", _PW)
-    assert out["user"]["login_id"] == "gated@x.com"
-    assert out["total_allowance"] is not None
-    assert registration_store.get_invite(inv["invite_id"])["use_count"] == 1
+    activated = registration_store.lazy_activate_pending_user(
+        pending["user_id"])
+    assert activated is not None
+    assert activated["activation_state"] == "active"
+
+
+def _make_pending_row(email, password=_PW):
+    """直插一行 pending_activation 用户（email_verified_at 非空，模拟存量
+    email_verify 形态；verify 建号已退役）。"""
+    import secrets
+    import pg_store
+    from werkzeug.security import generate_password_hash
+    uid = "usr_" + secrets.token_urlsafe(8)
+    conn = pg_store.connect()
+    conn.row_factory = psycopg.rows.dict_row
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO users (user_id, login_id, display_name, "
+                    "password_hash, role, created_at, disabled, ai_config, "
+                    "ai_access, activation_state, activation_source, "
+                    "activation_updated_at, email, email_normalized, "
+                    "email_verified_at) VALUES (%s,%s,%s,%s,'user', now(), "
+                    "FALSE, '{}'::jsonb, FALSE, 'pending_activation', "
+                    "'invite_activation', now(), %s, %s, now()) RETURNING "
+                    "user_id, auth_version",
+                    (uid, email, email,
+                     generate_password_hash(password), email, email))
+                row = cur.fetchone()
+        return {"user_id": row["user_id"],
+                "auth_version": row["auth_version"]}, password
+    finally:
+        conn.close()
 
 
 def test_missing_maintenance_setting_treated_open():

@@ -292,84 +292,36 @@ def test_admin_users_api_login_id_only(monkeypatch):
     check("启用响应 email=None",
           r7.get_json().get("user", {}).get("email") is None)
 
-def test_invite_admin_api_login_id_only(monkeypatch):
-    """邀请管理 API：只接受 login_id 入参（email 兼容入参已删除）；响应只带
-    login_id_masked（email_masked 已删除）；redeem_invite 返回 login_id 键；
-    绑定语义为「允许兑换的登录账号」（大小写不敏感匹配）。"""
-    import registration_store
+def test_invite_admin_api_retired(monkeypatch):
+    """邀请管理 API 退役（2026-10-08 §4）：列表/创建/撤销 410 endpoint_retired，
+    不再有任何邀请码入口；建号走 user_store 组合原语（login_id 单键语义由
+    test_admin_users_endpoints 与 user_store 套件覆盖）。"""
     make_owner()
     client = make_client()
     check("owner 登录 302", login(client, "admin", OWNER_PW).status_code == 302)
 
-    # 创建：login_id 入参（v1；旧 /api/admin/registration-invites 已删除）
     r = client.post("/api/admin/v1/invites",
                     json={"login_id": "NewUser@X.com"})
-    check("login_id 入参创建邀请 200", r.status_code == 200,
+    check("创建邀请 410 退役", r.status_code == 410,
           "got %s %s" % (r.status_code, r.get_data(as_text=True)))
-    body = r.get_json().get("invite") or {}
-    check("创建响应 login_id_masked",
-          body.get("login_id_masked") == "n***@x.com")
-    check("创建响应无 email_masked 键（批次 C）",
-          "email_masked" not in body)
-    check("响应不含 token_hash；J 后 owner 控制台带完整绑定值 bound_identity",
-          "token_hash" not in body
-          and body.get("bound_identity") == "newuser@x.com")
-
-    # 批次 C：email 兼容入参已删除——body 仍带 email 键说明是旧客户端，
-    # 显式 400（绝不静默降级为不绑定邀请这一高风险形态）。
-    r2 = client.post("/api/admin/v1/invites",
-                     json={"email": "LegacyInv@x.com"})
-    check("email 入参显式 400", r2.status_code == 400,
-          "got %s" % r2.status_code)
-    check("400 文案指引 login_id",
-          "login_id" in json.dumps((r2.get_json() or {}).get("error"),
-                                   ensure_ascii=False))
-    # 显式不绑定（不带 email/login_id）仍可创建（owner 高风险选项语义保持）
-    r2u = client.post("/api/admin/v1/invites", json={})
-    check("显式不绑定创建 200", r2u.status_code == 200)
-    b2 = r2u.get_json().get("invite") or {}
-    check("不绑定邀请 login_id_masked 为空串",
-          b2.get("login_id_masked") == "", "got %r" % b2.get("login_id_masked"))
-
-    # 列表：只带 login_id_masked
-    r3 = client.get("/api/admin/v1/invites")
-    items = r3.get_json().get("invites") or []
-    check("列表两条", len(items) == 2)
-    check("列表每条无 email_masked 键",
-          all("email_masked" not in i for i in items))
-
-    # 兑换：绑定语义为允许兑换的登录账号（大小写不敏感）
-    result = registration_store.redeem_invite(
-        body["token"], "NEWUSER@x.com", PW)
-    created = result["user"]
-    check("大小写不敏感兑换成功",
-          created.get("login_id") == "newuser@x.com")
-    check("redeem_invite 返回 login_id 键（批次 C）",
-          result.get("login_id") == "newuser@x.com")
-    check("redeem_invite 返回无 email 键", "email" not in result)
-    check("兑换创建的用户 dict 单键",
-          created.get("login_id") == "newuser@x.com"
-          and "email" not in created)
-    # 新用户可用该登录账号登录（display_name 缺省同 login_id）
-    v = user_store.verify_user("newuser@x.com", PW)
-    check("兑换后可登录", v is not None
-          and v["user_id"] == created["user_id"])
-    # 绑定邀请 + 错误绑定值兑换失败（统一错误；不消费语义由既有套件覆盖）
-    r_bound = client.post("/api/admin/v1/invites",
-                          json={"login_id": "BoundUser@X.com"})
-    check("绑定邀请创建 200", r_bound.status_code == 200)
+    check("退役 code", (r.get_json() or {}).get("error", {}).get("code")
+          == "endpoint_retired")
+    check("email 入参同样 410（不再有字段级校验）",
+          client.post("/api/admin/v1/invites",
+                      json={"email": "LegacyInv@x.com"}).status_code == 410)
+    check("列表 410", client.get("/api/admin/v1/invites").status_code == 410)
+    check("撤销 410",
+          client.post("/api/admin/v1/invites/inv_x/revoke").status_code == 410)
+    # 零副作用：无邀请行
+    import psycopg
+    conn = psycopg.connect(os.environ["DATABASE_URL"])
     try:
-        registration_store.redeem_invite(
-            r_bound.get_json()["invite"]["token"], "someone-else@x.com", PW)
-        redeemed_wrong = True
-    except registration_store.InviteRedeemError:
-        redeemed_wrong = False
-    check("绑定不匹配兑换失败", redeemed_wrong is False)
-    # 不绑定邀请（r2u）任意登录账号可兑换（高风险选项语义保持）
-    out_unbound = registration_store.redeem_invite(
-        b2["token"], "FreePick@x.com", PW)
-    check("不绑定邀请任意登录账号兑换成功",
-          out_unbound.get("login_id") == "freepick@x.com")
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM registration_invites")
+            check("无邀请行", cur.fetchone()[0] == 0)
+    finally:
+        conn.close()
+
 
 # =========================================================================== #
 # 收尾

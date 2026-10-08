@@ -103,16 +103,6 @@ def _client(auth=True):
     return csrf_client(app_mod.app.test_client())
 
 
-def _open_email_mode(monkeypatch):
-    """打开 email_verify_invite_activation 生效态（verify 流程全部前置）。"""
-    monkeypatch.setenv("PUBLIC_BASE_URL", BASE)
-    monkeypatch.setenv("ADMIN_SESSION_COOKIE_SECURE", "1")
-    monkeypatch.setenv("SECRET_KEY", "test-secret-for-hash-salt")
-    monkeypatch.setenv("REGISTRATION_MAIL_PAYLOAD_KEY", "test-payload-key")
-    monkeypatch.setenv("REGISTRATION_MAIL_SENDER", "agent_mail_cli")
-    monkeypatch.setenv("REGISTRATION_AGENT_MAIL_CLI", "/usr/bin/true")
-    settings_store.set_registration_mode(
-        "email_verify_invite_activation", updated_by="t")
 
 
 def _admin_email(monkeypatch, value="admin-notifications@x.com"):
@@ -120,35 +110,42 @@ def _admin_email(monkeypatch, value="admin-notifications@x.com"):
     monkeypatch.setenv("TEST_APPLICATION_ADMIN_EMAIL", value)
 
 
-def _enqueue_and_verify(client, email, application=None):
-    """真实 verify 流程建 pending_activation 用户；application 为随 verify
-    提交的申请字段 dict（None = 不带，兼容老前端分支）。返回建号响应。"""
-    out = registration_store.enqueue_email_verification(email, base_url=BASE)
-    body = {"token": out["token"], "password": PASSWORD,
-            "password_confirm": PASSWORD}
-    if application is not None:
-        body.update(application)
-    r = client.post("/api/registration/verify", json=body)
-    assert r.status_code == 200, r.get_data(as_text=True)
-    return r
-
-
 def _pending_user(email, application=None, monkeypatch=None):
-    """建 pending 用户并返回（user, verify 响应）。"""
-    client = _client()
-    r = _enqueue_and_verify(client, email, application)
-    user = user_store.get_user_by_login_id(email.lower())
-    assert user is not None
+    """直插 pending_activation 用户（存量 email_verify 形态；2026-10-08 §4：
+    verify 建号与 enrollment 会话退役，模块服务历史 pending 行）。
+
+    application 给出时经 store 提交申请（与历史真实链路同库层语义）。
+    返回 (user dict, None)。"""
+    import secrets
+    from werkzeug.security import generate_password_hash
+    email = email.lower()
+    uid = "usr_" + secrets.token_urlsafe(8)
+    conn = _pg()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (user_id, login_id, display_name, "
+                "password_hash, role, created_at, disabled, ai_config, "
+                "ai_access, activation_state, activation_source, "
+                "activation_updated_at, email, email_normalized, "
+                "email_verified_at) VALUES (%s,%s,%s,%s,'user', now(), FALSE, "
+                "'{}'::jsonb, FALSE, 'pending_activation', "
+                "'invite_activation', now(), %s, %s, now()) "
+                "RETURNING user_id, auth_version",
+                (uid, email, email, generate_password_hash(PASSWORD),
+                 email, email))
+            row = cur.fetchone()
+        conn.commit()
+    finally:
+        conn.close()
+    user = user_store.get_user(row["user_id"])
     assert user["activation_state"] == "pending_activation"
-    return user, r
-
-
-def _enrollment_login(client, email, password=PASSWORD):
-    """pending 用户登录 → enrollment 受限会话（走真实 login 白名单路径）。"""
-    r = client.post("/login", data={"username": email, "password": password})
-    assert r.status_code == 302
-    assert r.headers["Location"].endswith("/activate")
-    return r
+    if application is not None:
+        submitted = test_application_store.submit(
+            uid, application["research_direction"],
+            application["share_research_data"])
+        assert submitted is True
+    return user, None
 
 
 def _owner():
@@ -191,47 +188,55 @@ def test_submit_anonymous_unauthorized():
     assert "重新登录" in body["error"]
 
 
-def test_enrollment_submit_success_idempotent_and_get_pending(monkeypatch):
-    """enrollment 会话提交成功 + 幂等（重复提交不再重复发管理员邮件）+
-    GET 回读 pending 与申请字段。"""
+def test_pending_submit_unreachable_and_active_get_reads_history(monkeypatch):
+    """2026-10-08 §4：enrollment 会话不再签发——pending 用户即使拿到普通
+    session 形态也被 I-R4 拒（403 account_pending）；store 层提交/幂等由
+    _pending_user 的直接 submit 承担；激活后 GET 回读历史申请。"""
     _admin_email(monkeypatch)
-    user, _ = _pending_user("apply@x.com")
+    user, _ = _pending_user("apply@x.com",
+                            application={"research_direction": "model_plant",
+                                         "share_research_data": True})
     client = _client()
-    _enrollment_login(client, "apply@x.com")
-    # 提交前 GET：无记录 → none
+    _session_as(client, user, "user")
     r0 = client.get("/api/account/test-application")
-    assert r0.status_code == 200
-    assert r0.get_json() == {"state": "none"}
+    assert r0.status_code == 403
+    assert r0.get_json()["error"] == "account_pending"
+    # 首次挑战清 session；重伪造（并刷新 CSRF cookie）后 POST 同样被 I-R4 拒
+    _session_as(client, user, "user")
+    client._base.get("/login")  # 重新下发 csrf_token cookie
     r1 = client.post("/api/account/test-application",
                      json={"research_direction": "model_plant",
                            "share_research_data": True})
-    assert r1.status_code == 200, r1.get_data(as_text=True)
-    assert r1.get_json() == {"ok": True, "state": "pending"}
-    # 幂等：重复点击 → duplicate=true，管理员通知邮件仍只有一封
-    r2 = client.post("/api/account/test-application",
-                     json={"research_direction": "model_plant",
-                           "share_research_data": True})
-    assert r2.status_code == 200
-    body = r2.get_json()
-    assert body["ok"] is True and body["state"] == "pending"
-    assert body["duplicate"] is True
+    assert r1.status_code == 403
+    assert r1.get_json()["error"] == "account_pending"
+    # store 层幂等（历史链路同库层语义）：重复提交 duplicate、邮件唯一
+    assert test_application_store.submit(
+        user["user_id"], "model_plant", True) is False  # duplicate
     assert _mail_job_count("test_application") == 1
-    # GET 回读：机器值原样（中文映射在前端做）
+    # 管理员审批激活后：GET（正式 session）回读历史申请
+    owner = _owner()
+    _session_as(client, owner, "owner")
+    client._base.get("/login")  # 换 owner 身份后刷新 csrf_token cookie
+    r = client.post("/api/admin/v1/test-applications/%s/review"
+                    % user["user_id"], json={"decision": "approved"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    _session_as(client, user_store.get_user(user["user_id"]), "user")
     r3 = client.get("/api/account/test-application")
     assert r3.status_code == 200
     got = r3.get_json()
-    assert got["state"] == "pending"
+    assert got["state"] == "approved"
     assert got["research_direction"] == "model_plant"
     assert got["share_research_data"] is True
     assert got["consent_version"] == test_application_store.CONSENT_VERSION
 
 
 def test_submit_invalid_shape_400(monkeypatch):
-    """方向非法 / share 非 bool / 缺字段 → 400 invalid_request（本地形状错误）。"""
+    """方向非法 / share 非 bool / 缺字段 → 400 invalid_request（本地形状错误，
+    先于任何状态/通知检查；以 active 用户正式 session 触达）。"""
     _admin_email(monkeypatch)
-    _pending_user("shape@x.com")
+    active = user_store.create_user("shape@x.com", PASSWORD, role="user")
     client = _client()
-    _enrollment_login(client, "shape@x.com")
+    _session_as(client, active, "user")
     for payload in ({"research_direction": "bogus", "share_research_data": True},
                     {"research_direction": "model_plant",
                      "share_research_data": "yes"},
@@ -242,8 +247,7 @@ def test_submit_invalid_shape_400(monkeypatch):
         assert r.get_json()["code"] == "invalid_request"
     # 非法请求不产生申请记录、不发邮件
     assert _mail_job_count("test_application") == 0
-    assert test_application_store.get(
-        user_store.get_user_by_login_id("shape@x.com")["user_id"]) is None
+    assert test_application_store.get(active["user_id"]) is None
 
 
 def test_submit_admin_email_unconfigured_503(monkeypatch):
@@ -253,9 +257,9 @@ def test_submit_admin_email_unconfigured_503(monkeypatch):
     本分支被并行改动为带硬编码兜底收件人，env 已无法模拟「未配置」——
     先替换 store.admin_email 返回 None 锁定路由 503 契约，再还原原函数
     验证同一请求成功（全程不动 fixture 其它替身）。"""
-    _pending_user("nomail@x.com")
+    active = user_store.create_user("nomail@x.com", PASSWORD, role="user")
     client = _client()
-    _enrollment_login(client, "nomail@x.com")
+    _session_as(client, active, "user")
     original_admin_email = test_application_store.admin_email
     monkeypatch.setattr(test_application_store, "admin_email",
                         lambda: None)
@@ -268,14 +272,15 @@ def test_submit_admin_email_unconfigured_503(monkeypatch):
     assert "暂不可用" in body["error"]
     # 失败请求未产生申请记录、未发邮件
     assert _mail_job_count("test_application") == 0
-    # 还原真实 admin_email（并行改动后的带兜底实现）→ 同一请求成功
+    # 还原真实 admin_email（带兜底实现）→ 请求通过邮箱检查进入 store
+    # 状态校验：active 用户提交 → 409 invalid_state（不再 503）
     monkeypatch.setattr(test_application_store, "admin_email",
                         original_admin_email)
     r2 = client.post("/api/account/test-application",
                      json={"research_direction": "other",
                            "share_research_data": False})
-    assert r2.status_code == 200
-    assert r2.get_json()["ok"] is True
+    assert r2.status_code == 409
+    assert r2.get_json()["code"] == "invalid_state"
 
 
 def test_active_user_submit_conflict_409(monkeypatch):
@@ -306,44 +311,6 @@ def test_active_user_submit_conflict_409(monkeypatch):
 # --------------------------------------------------------------------------- #
 # verify 接线（建号 + best-effort 申请提交）
 # --------------------------------------------------------------------------- #
-def test_verify_submits_application_and_rejects_bad_shape_before_token(
-        monkeypatch):
-    """verify 带申请字段：建号成功后 application_submitted=true；形状非法
-    400 且 token **未被消费**（先校验形状再消费）；缺字段兼容老前端。"""
-    _open_email_mode(monkeypatch)
-    _admin_email(monkeypatch)
-    client = _client()
-    # 形状非法：400，token 仍 valid（未被废）
-    out = registration_store.enqueue_email_verification("bad@x.com",
-                                                        base_url=BASE)
-    r_bad = client.post("/api/registration/verify", json={
-        "token": out["token"], "password": PASSWORD,
-        "research_direction": "bogus", "share_research_data": True})
-    assert r_bad.status_code == 400
-    assert r_bad.get_json()["code"] == "invalid_request"
-    assert registration_store.check_verify_token(out["token"])["state"] == \
-        "valid"
-    # 合法提交：建号 + 申请同响应（申请走独立事务，best-effort）
-    r = _enqueue_and_verify(client, "wired@x.com",
-                            application={"research_direction":
-                                         "clinical_pathology",
-                                         "share_research_data": False})
-    body = r.get_json()
-    assert body["ok"] is True
-    assert body["application_submitted"] is True
-    user = user_store.get_user_by_login_id("wired@x.com")
-    record = test_application_store.get(user["user_id"])
-    assert record is not None
-    assert record["research_direction"] == "clinical_pathology"
-    assert record["share_research_data"] is False
-    assert record["status"] == "pending"
-    # 缺字段（老前端兼容）：建号成功、不提交申请
-    r_old = _enqueue_and_verify(client, "oldfront@x.com")
-    assert r_old.get_json()["application_submitted"] is False
-    old_user = user_store.get_user_by_login_id("oldfront@x.com")
-    assert test_application_store.get(old_user["user_id"]) is None
-
-
 # --------------------------------------------------------------------------- #
 # 管理侧：GET /api/admin/v1/test-applications + review
 # --------------------------------------------------------------------------- #
@@ -381,11 +348,6 @@ def test_admin_list_owner_gate_and_filters(monkeypatch):
     _session_as(client, user, "user")
     r_user = client.get("/api/admin/v1/test-applications")
     assert r_user.status_code == 403
-    # enrollment 会话不是管理身份 → 仍 401
-    anon_client = _client()
-    _enrollment_login(anon_client, "list@x.com")
-    assert anon_client.get(
-        "/api/admin/v1/test-applications").status_code == 401
     # owner：命中 + 过滤 + 白名单字段
     _session_as(client, _owner(), "owner")
     r = client.get("/api/admin/v1/test-applications")
@@ -591,162 +553,9 @@ def test_submit_and_review_real_public_base_url_urls(monkeypatch):
 # --------------------------------------------------------------------------- #
 # R7：申请 → 邀请码激活收口（activated_by_invite 显式终态）
 # --------------------------------------------------------------------------- #
-def test_invite_activation_closes_pending_application(monkeypatch):
-    """邀请码激活同事务收口 pending 申请：status=activated_by_invite、
-    reviewed_by/reviewed_at 保持 NULL（不伪造人工审批）；管理列表按状态
-    过滤正确、附 activation_source=invite；重复激活不重复发额度。"""
-    _admin_email(monkeypatch)
-    user, _ = _pending_user(
-        "close@x.com",
-        application={"research_direction": "model_plant",
-                     "share_research_data": True})
-    owner = _owner()
-    inv = registration_store.create_invite(
-        owner["user_id"], total_limit_nano_cny=7 * 10 ** 9)
-    result = registration_store.activate_registered_user(
-        user["user_id"], inv["token"])
-    assert result["application_closed"] is True
-    record = test_application_store.get(user["user_id"])
-    assert record["status"] == "activated_by_invite"
-    assert record["reviewed_by"] is None and record["reviewed_at"] is None
-    after = user_store.get_user(user["user_id"])
-    assert after["activation_state"] == "active"
-    assert after["activation_source"] == "invite"
-    # 管理列表：待审过滤不含已收口行；activated_by_invite 过滤命中且带来源
-    client = _client()
-    _session_as(client, owner, "owner")
-    r_pending = client.get("/api/admin/v1/test-applications?status=pending")
-    assert r_pending.status_code == 200
-    assert all(it["user_id"] != user["user_id"]
-               for it in r_pending.get_json()["items"])
-    r_inv = client.get(
-        "/api/admin/v1/test-applications?status=activated_by_invite")
-    items = [it for it in r_inv.get_json()["items"]
-             if it["user_id"] == user["user_id"]]
-    assert len(items) == 1
-    assert items[0]["activation_source"] == "invite"
-    assert items[0]["reviewed_by"] is None
-    assert items[0]["activation_state"] == "active"
-    # 状态词表外的过滤值 → 400
-    assert client.get("/api/admin/v1/test-applications?status=bogus"
-                      ).status_code == 400
-    # 重复激活（第二个邀请码）→ 明确 already_active；不重复发额度、不消费
-    inv2 = registration_store.create_invite(
-        owner["user_id"], total_limit_nano_cny=7 * 10 ** 9)
-    with pytest.raises(registration_store.ActivationError) as ei:
-        registration_store.activate_registered_user(user["user_id"],
-                                                    inv2["token"])
-    assert ei.value.code == "already_active"
-    rows = _allowances(user["user_id"])
-    assert len(rows) == 1
-    assert rows[0]["limit_nano_cny"] == 7 * 10 ** 9
-    assert rows[0]["source"] == "invite"
-    assert registration_store.get_invite(inv2["invite_id"])["use_count"] == 0
-
-
-def test_review_after_invite_activation_conflict_409(monkeypatch):
-    """已收口（activated_by_invite）申请再审批 → 409 already_reviewed 明确
-    冲突；状态不被改写为 approved、不发结果邮件、不叠加 admin 额度。"""
-    _admin_email(monkeypatch)
-    user, _ = _pending_user(
-        "late@x.com",
-        application={"research_direction": "other",
-                     "share_research_data": False})
-    owner = _owner()
-    inv = registration_store.create_invite(owner["user_id"])
-    registration_store.activate_registered_user(user["user_id"], inv["token"])
-    client = _client()
-    _session_as(client, owner, "owner")
-    r = client.post("/api/admin/v1/test-applications/%s/review"
-                    % user["user_id"], json={"decision": "approved"})
-    assert r.status_code == 409
-    assert r.get_json()["error"]["code"] == "already_reviewed"
-    assert test_application_store.get(user["user_id"])[
-        "status"] == "activated_by_invite"
-    assert _mail_job_count("test_decision") == 0
-    rows = _allowances(user["user_id"])
-    assert len(rows) == 1 and rows[0]["source"] == "invite"
-
-
-def test_invite_activation_preserves_rejected_decision(monkeypatch):
-    """拒绝是终态：管理员拒绝后用户凭邀请码激活，rejected 记录（含
-    reviewed_by）绝不被改写为 activated_by_invite/approved。"""
-    _admin_email(monkeypatch)
-    user, _ = _pending_user(
-        "rejhist@x.com",
-        application={"research_direction": "other",
-                     "share_research_data": False})
-    owner = _owner()
-    client = _client()
-    _session_as(client, owner, "owner")
-    r = client.post("/api/admin/v1/test-applications/%s/review"
-                    % user["user_id"], json={"decision": "rejected"})
-    assert r.status_code == 200
-    before = test_application_store.get(user["user_id"])
-    assert before["status"] == "rejected"
-    assert before["reviewed_by"] == owner["user_id"]
-    inv = registration_store.create_invite(owner["user_id"])
-    result = registration_store.activate_registered_user(
-        user["user_id"], inv["token"])
-    # 用户激活成功，但历史拒绝决定原样保留
-    assert result["application_closed"] is False
-    after = test_application_store.get(user["user_id"])
-    assert after["status"] == "rejected"
-    assert after["reviewed_by"] == owner["user_id"]
-    assert after["reviewed_at"] == before["reviewed_at"]
-    assert user_store.get_user(user["user_id"])[
-        "activation_state"] == "active"
-
-
 # --------------------------------------------------------------------------- #
 # R7：失败回滚（缺默认额度 / 禁用用户 / 邮件入队失败）
 # --------------------------------------------------------------------------- #
-def test_invite_activation_rolls_back_on_missing_default_allowance(monkeypatch):
-    """无面值邀请码 + 全局默认行缺失 → fail-closed 整体回滚：邀请码不消费、
-    用户仍 pending、申请仍 pending（不收口）。"""
-    _admin_email(monkeypatch)
-    user, _ = _pending_user(
-        "nodefault@x.com",
-        application={"research_direction": "other",
-                     "share_research_data": False})
-    owner = _owner()
-    inv = registration_store.create_invite(owner["user_id"])  # 无面值
-    conn = _pg()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM ai_spend_total_defaults")
-        conn.commit()
-    finally:
-        conn.close()
-    with pytest.raises(ValueError, match="total_default_missing"):
-        registration_store.activate_registered_user(user["user_id"],
-                                                    inv["token"])
-    assert registration_store.get_invite(inv["invite_id"])["use_count"] == 0
-    assert user_store.get_user(user["user_id"])[
-        "activation_state"] == "pending_activation"
-    assert test_application_store.get(user["user_id"])["status"] == "pending"
-    assert _allowances(user["user_id"]) == []
-
-
-def test_invite_activation_rolls_back_on_disabled_user(monkeypatch):
-    """禁用用户激活 → ActivationError(user_disabled) 整体回滚：邀请码不
-    消费、申请不收口。"""
-    _admin_email(monkeypatch)
-    user, _ = _pending_user(
-        "disactivate@x.com",
-        application={"research_direction": "other",
-                     "share_research_data": False})
-    owner = _owner()
-    inv = registration_store.create_invite(owner["user_id"])
-    user_store.set_user_disabled(user["user_id"], True)
-    with pytest.raises(registration_store.ActivationError) as ei:
-        registration_store.activate_registered_user(user["user_id"],
-                                                    inv["token"])
-    assert ei.value.code == "user_disabled"
-    assert registration_store.get_invite(inv["invite_id"])["use_count"] == 0
-    assert test_application_store.get(user["user_id"])["status"] == "pending"
-
-
 def test_review_rolls_back_on_mail_enqueue_failure(monkeypatch):
     """审批通过但结果邮件入队失败 → 现有事务语义整体回滚：用户仍 pending、
     申请仍 pending、不建额度（UI 侧不得显示「已通过」）。"""
@@ -773,50 +582,6 @@ def test_review_rolls_back_on_mail_enqueue_failure(monkeypatch):
     assert _mail_job_count("test_decision") == 0
 
 
-def test_admin_approval_invalidates_waiting_enrollment_session(monkeypatch):
-    """两个独立上下文（必须通过 #1 的服务端半边）：用户停留在等待页持有
-    enrollment 会话；管理员在另一上下文审批成功后，用户刷新状态得到 401
-    auth_required（不得解释为审批通过，前端据此显示重新登录指引）；真实
-    重新登录后以正式会话读到 approved，申请与额度一致。"""
-    _admin_email(monkeypatch)
-    user, _ = _pending_user(
-        "twosc@x.com",
-        application={"research_direction": "other",
-                     "share_research_data": False})
-    owner = _owner()
-    user_client = _client()
-    _enrollment_login(user_client, "twosc@x.com")
-    r0 = user_client.get("/api/account/test-application")
-    assert r0.status_code == 200
-    assert r0.get_json()["state"] == "pending"
-    # 管理员上下文：审批成功
-    admin_client = _client()
-    _session_as(admin_client, owner, "owner")
-    r = admin_client.post("/api/admin/v1/test-applications/%s/review"
-                          % user["user_id"], json={"decision": "approved"})
-    assert r.status_code == 200, r.get_data(as_text=True)
-    # 用户回到等待页刷新：enrollment 会话已随激活失效 → 401 auth_required
-    r2 = user_client.get("/api/account/test-application")
-    assert r2.status_code == 401
-    body = r2.get_json()
-    assert body["code"] == "auth_required"
-    assert "重新登录" in body["error"]
-    # 真实重新登录（密码已设置）→ 正式会话读到 approved，额度恰一次。
-    # 先 GET /login（与真实浏览器一致：登录页刷新 CSRF token——原 token 随
-    # enrollment session 清除而失效）
-    assert user_client.get("/login").status_code == 200
-    r3 = user_client.post("/login", data={"username": "twosc@x.com",
-                                          "password": PASSWORD})
-    assert r3.status_code == 302
-    with user_client.session_transaction() as s:
-        assert s.get("auth_user")
-    r4 = user_client.get("/api/account/test-application")
-    assert r4.status_code == 200
-    assert r4.get_json()["state"] == "approved"
-    rows = _allowances(user["user_id"])
-    assert len(rows) == 1 and rows[0]["source"] == "admin_create"
-
-
 # --------------------------------------------------------------------------- #
 # R7：pending 不能访问工作台与 AI；enrollment 会话不能审核
 # --------------------------------------------------------------------------- #
@@ -828,20 +593,20 @@ def test_pending_cannot_reach_workspace_or_ai_or_review(monkeypatch):
                      "share_research_data": False})
     _owner()
     client = _client()
-    _enrollment_login(client, "gate@x.com")
-    # 工作台：enrollment 白名单之外 → 权威拒绝（302 /login?next=/app）
+    # pending 账号即使伪造普通 session 形态（I-R4）也全拒
+    _session_as(client, user, "user")
     r = client.get("/app")
     assert r.status_code == 302
-    assert r.headers["Location"].endswith("/login?next=/app")
-    # AI 面：/api/* 统一 401 auth_required（不清 enrollment cookie）
+    assert r.headers["Location"].endswith("/login")
+    _session_as(client, user, "user")
     r_ai = client.get("/api/ai/config")
-    assert r_ai.status_code == 401
-    assert r_ai.get_json()["code"] == "auth_required"
-    # enrollment 会话不是管理身份：审核 API 401（普通用户 403 已由
-    # test_review_non_owner_forbidden_and_bad_params 覆盖）
+    assert r_ai.status_code == 403
+    assert r_ai.get_json()["error"] == "account_pending"
+    _session_as(client, user, "user")
     r_rev = client.post("/api/admin/v1/test-applications/%s/review"
                         % user["user_id"], json={"decision": "approved"})
-    assert r_rev.status_code == 401
+    assert r_rev.status_code == 403
+    assert r_rev.get_json()["error"] == "account_pending"
 
 
 # --------------------------------------------------------------------------- #
@@ -854,74 +619,6 @@ def _run_threads(targets, timeout=60):
     for t in threads:
         t.join(timeout)
     assert not any(t.is_alive() for t in threads), "并发线程超时（疑似死锁）"
-
-
-def test_concurrent_invite_and_review_single_provisioning(monkeypatch):
-    """管理员通过与邀请码激活真并发：advisory 锁串行化，无论交错顺序——
-    只允许一次激活、一次额度 provisioning；申请收口为唯一终态
-    （approved 或 activated_by_invite）；失败方拿到明确幂等/冲突结果；
-    被拒绝历史之外的 pending 决定不被双方同时改写。"""
-    _admin_email(monkeypatch)
-    user, _ = _pending_user(
-        "race@x.com",
-        application={"research_direction": "other",
-                     "share_research_data": False})
-    owner = _owner()
-    inv = registration_store.create_invite(
-        owner["user_id"], total_limit_nano_cny=5 * 10 ** 9)
-    barrier = threading.Barrier(2, timeout=30)
-    results = {}
-
-    def _invite():
-        try:
-            barrier.wait()
-            results["invite"] = ("ok", registration_store
-                                 .activate_registered_user(
-                                     user["user_id"], inv["token"]))
-        except registration_store.ActivationError as exc:
-            results["invite"] = ("conflict", exc)
-        except Exception as exc:  # noqa: BLE001  测试收集，原样失败
-            results["invite"] = ("error", exc)
-
-    def _review():
-        try:
-            barrier.wait()
-            results["review"] = ("ok", test_application_store.review(
-                user["user_id"], owner["user_id"], "approved"))
-        except Exception as exc:  # noqa: BLE001
-            results["review"] = ("error", exc)
-
-    _run_threads([_invite, _review])
-    invite_kind, invite_val = results["invite"]
-    review_kind, review_val = results["review"]
-    if invite_kind == "ok":
-        # 邀请先赢：review 返回 False（→ 路由 409 already_reviewed）
-        assert review_kind == "ok" and review_val is False
-        winner = "invite"
-    else:
-        # 审批先赢：邀请侧明确 already_active 冲突（邀请码不消费）
-        assert invite_kind == "conflict"
-        assert invite_val.code == "already_active"
-        assert review_kind == "ok" and review_val is True
-        winner = "review"
-    after = user_store.get_user(user["user_id"])
-    assert after["activation_state"] == "active"
-    rows = _allowances(user["user_id"])
-    assert len(rows) == 1  # 只发一次额度
-    if winner == "invite":
-        assert after["activation_source"] == "invite"
-        assert rows[0]["source"] == "invite"
-        assert test_application_store.get(user["user_id"])[
-            "status"] == "activated_by_invite"
-        assert registration_store.get_invite(inv["invite_id"])["use_count"] == 1
-        assert _mail_job_count("test_decision") == 0
-    else:
-        assert after["activation_source"] == "admin"
-        assert rows[0]["source"] == "admin_create"
-        assert test_application_store.get(user["user_id"])[
-            "status"] == "approved"
-        assert registration_store.get_invite(inv["invite_id"])["use_count"] == 0
-        assert _mail_job_count("test_decision") == 1
 
 
 def test_concurrent_double_review_single_provisioning(monkeypatch):
@@ -954,47 +651,3 @@ def test_concurrent_double_review_single_provisioning(monkeypatch):
     assert test_application_store.get(user["user_id"])["status"] == "approved"
 
 
-def test_concurrent_two_invites_same_user_single_activation(monkeypatch):
-    """同用户双邀请码并发：只成功一次激活（另一路 already_active 且不消费）、
-    一次额度 provisioning、申请唯一收口 activated_by_invite。"""
-    _admin_email(monkeypatch)
-    user, _ = _pending_user(
-        "twoinv@x.com",
-        application={"research_direction": "other",
-                     "share_research_data": False})
-    owner = _owner()
-    inv1 = registration_store.create_invite(
-        owner["user_id"], total_limit_nano_cny=3 * 10 ** 9)
-    inv2 = registration_store.create_invite(
-        owner["user_id"], total_limit_nano_cny=9 * 10 ** 9)
-    barrier = threading.Barrier(2, timeout=30)
-    results = {}
-
-    def _activate(token, key):
-        try:
-            barrier.wait()
-            results[key] = ("ok", registration_store.activate_registered_user(
-                user["user_id"], token))
-        except registration_store.ActivationError as exc:
-            results[key] = ("conflict", exc)
-        except Exception as exc:  # noqa: BLE001
-            results[key] = ("error", exc)
-
-    _run_threads([lambda: _activate(inv1["token"], "a"),
-                  lambda: _activate(inv2["token"], "b")])
-    kinds = sorted(k for k, _ in results.values())
-    assert kinds == ["conflict", "ok"]
-    ok_rows = [v for k, v in results.values() if k == "ok"]
-    assert ok_rows[0]["total_allowance"]["limit_nano_cny"] in \
-        (3 * 10 ** 9, 9 * 10 ** 9)
-    consumed = [inv for inv in (inv1, inv2)
-                if registration_store.get_invite(inv["invite_id"])["use_count"]
-                == 1]
-    assert len(consumed) == 1
-    assert user_store.get_user(user["user_id"])["activation_state"] == "active"
-    assert user_store.get_user(user["user_id"])[
-        "activation_source"] == "invite"
-    rows = _allowances(user["user_id"])
-    assert len(rows) == 1 and rows[0]["source"] == "invite"
-    assert test_application_store.get(user["user_id"])[
-        "status"] == "activated_by_invite"

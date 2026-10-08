@@ -1,23 +1,19 @@
 # -*- coding: utf-8 -*-
-"""I+J 线测试：邮箱验证 + 邀请码激活 + 邮箱唯一用户名（设计文档第 8 节 +
-review J / P2-4 / I-R4 守卫）。
+"""注册遗留线测试（2026-10-08 §4 邀请码激活退役后保留的部分）。
 
-覆盖：
-  - 模式：email_verify_invite_activation 前置检查（邮件通道/载荷密钥/哈希盐）
-    与 fail-closed 降级；PUT/GET 词表；public 经自身前置闸（P1 起正式支持，
-    缺前置 400 registration_preconditions_failed）；
-  - 注册流程 1-3：邮箱优先（不填邀请码、不发额度）、统一文案、GET
-    /verify-email 只展示不消费、POST /api/registration/verify 原子创建
-    pending_activation 用户（密码在邮箱确认之后设置；J：login_id=规范化
-    邮箱，冲突进待补绑）；
-  - 流程 4-5：pending 登录只发 enrollment 受限 session；activate 单事务
-    （CAS 消费邀请码 → active → 按面值建总额度 → 审计）；
-    already_active 不消费不充值；同码两人只有一人成功；
-  - I-R4：require_active_account 统一守卫（pending 全拒）；
+覆盖（保留面）：
+  - 模式：public 前置检查（邮件通道/载荷密钥/哈希盐/管理员邮箱/双文稿）
+    与 fail-closed 降级；PUT/GET 词表只剩 closed/public（旧
+    invite_only / email_verify_invite_activation 存量值读取按非法值
+    fail-closed 为 closed，PUT 一律 400 invalid_request）；
+  - 旧 email_verify 链接退役：GET /verify-email 只展示不消费（渲染
+    「注册流程已更新」）；legacy token 不再建 pending 账号；
+  - I-R4：require_active_account 统一守卫（pending 全拒，直插 SQL 行验证）；
   - 展示 J：owner 管理台主列=完整邮箱用户名、精确/模糊邮箱搜索、审计
     actor 身份、公开分享页评论掩码；
-  - 邮件：token 只存 hash、载荷加密、一次性/30 分钟/配额、fake 发送器与
-    Agent Mail CLI 适配器（两步 confirmation_token）。
+  - 邮件（共享代码不动）：token 只存 hash、载荷加密、一次性/30 分钟/
+    配额、fake 发送器与 Agent Mail CLI/SMTP 适配器、closed 停机只停
+    email_verify 作业。
 """
 import json
 import os
@@ -103,16 +99,28 @@ def _owner_session(client, owner):
                   "role": "owner", "auth_version": owner.get("auth_version", 1)})
 
 
+def _publish_docs_for_public():
+    """发布双协议文稿（public 生效前置；幂等）。"""
+    import agreement_store
+    agreement_store.ensure_builtin_documents()
+    for dt in ("user_agreement", "research_sharing"):
+        doc = [d for d in agreement_store.builtin_documents()
+               if d["document_type"] == dt][0]
+        agreement_store.publish_document(dt, doc["version"])
+
+
 def _open_email_mode(monkeypatch):
-    """打开 email_verify_invite_activation 生效态（含 I 线全部前置 env）。"""
+    """打开 public 生效态（2026-10-08 §4 后唯一开放模式；含全部前置 env +
+    双协议文稿 published + 管理员通知邮箱）。"""
     monkeypatch.setenv("PUBLIC_BASE_URL", BASE)
     monkeypatch.setenv("ADMIN_SESSION_COOKIE_SECURE", "1")
     monkeypatch.setenv("SECRET_KEY", "test-secret-for-hash-salt")
     monkeypatch.setenv("REGISTRATION_MAIL_PAYLOAD_KEY", "test-payload-key")
     monkeypatch.setenv("REGISTRATION_MAIL_SENDER", "agent_mail_cli")
     monkeypatch.setenv("REGISTRATION_AGENT_MAIL_CLI", "/usr/bin/true")
-    settings_store.set_registration_mode(
-        "email_verify_invite_activation", updated_by="t")
+    monkeypatch.setenv("REGISTRATION_ADMIN_EMAIL", "admin@x.com")
+    _publish_docs_for_public()
+    settings_store.set_registration_mode("public", updated_by="t")
 
 
 def _enqueue(email, **kw):
@@ -142,242 +150,83 @@ def _mail_job_row(token_or_hash, by_token=True):
 # =========================================================================== #
 # 1. 模式与前置检查
 # =========================================================================== #
-def test_new_mode_fails_closed_without_mail_channel(monkeypatch):
+def test_public_mode_fails_closed_without_preconditions(monkeypatch):
+    """public 前置阶梯（2026-10-08 §4：唯一开放模式；前置缺失降级 closed）。"""
     monkeypatch.setenv("PUBLIC_BASE_URL", BASE)
     monkeypatch.setenv("ADMIN_SESSION_COOKIE_SECURE", "1")
-    settings_store.set_registration_mode(
-        "email_verify_invite_activation", updated_by="t")
+    settings_store.set_registration_mode("public", updated_by="t")
     # 邮件通道未配置（fake 不计入生产）→ 降级 closed
     assert app_mod._effective_registration_mode() == "closed"
     monkeypatch.setenv("REGISTRATION_MAIL_SENDER", "fake")
     assert app_mod._effective_registration_mode() == "closed"
-    # 配齐真实通道口径 + 载荷密钥 + 哈希盐 → 生效
     monkeypatch.setenv("REGISTRATION_MAIL_SENDER", "agent_mail_cli")
     monkeypatch.setenv("REGISTRATION_AGENT_MAIL_CLI", "/usr/bin/true")
     assert app_mod._effective_registration_mode() == "closed"  # 缺载荷密钥/盐
     monkeypatch.setenv("REGISTRATION_MAIL_PAYLOAD_KEY", "k")
     monkeypatch.setenv("SECRET_KEY", "s")
-    assert app_mod._effective_registration_mode() == \
-        "email_verify_invite_activation"
+    assert app_mod._effective_registration_mode() == "closed"  # 缺管理员邮箱
+    monkeypatch.setenv("REGISTRATION_ADMIN_EMAIL", "admin@x.com")
+    # 缺双协议文稿 → 仍降级 closed
+    assert app_mod._effective_registration_mode() == "closed"
+    _publish_docs_for_public()
+    assert app_mod._effective_registration_mode() == "public"
 
 
-def test_put_registration_mode_new_mode(monkeypatch):
+def test_retired_modes_are_invalid_values(monkeypatch):
+    """旧模式值退役（§4）：存量行读取按非法值 fail-closed 为 closed。"""
+    settings_store.set_setting(settings_store.REGISTRATION_MODE_KEY,
+                                "email_verify_invite_activation")
+    assert app_mod._effective_registration_mode() == "closed"
+    settings_store.set_setting(settings_store.REGISTRATION_MODE_KEY,
+                               "invite_only")
+    assert app_mod._effective_registration_mode() == "closed"
+
+
+def test_put_registration_mode_word_table(monkeypatch):
     owner = _mk_owner()
     app_mod.AUTH_ENABLED = True
     client = _client()
     _owner_session(client, owner)
-    r = client.put("/api/admin/v1/settings/registration",
-                   json={"mode": "email_verify_invite_activation"})
-    assert r.status_code == 400  # 前置不满足
-    assert r.get_json()["error"]["code"] == "registration_preconditions_failed"
+    # 旧模式值一律 invalid_request（不再接受邀请码形态）
+    for retired in ("invite_only", "email_verify_invite_activation"):
+        r = client.put("/api/admin/v1/settings/registration",
+                       json={"mode": retired})
+        assert r.status_code == 400
+        assert r.get_json()["error"]["code"] == "invalid_request"
+    # closed 无前置要求，直接可写
+    r0 = client.put("/api/admin/v1/settings/registration",
+                    json={"mode": "closed"})
+    assert r0.status_code == 200
+    # public：缺前置 → 400 registration_preconditions_failed；配齐 → 200
+    r1 = client.put("/api/admin/v1/settings/registration",
+                    json={"mode": "public"})
+    assert r1.status_code == 400
+    assert r1.get_json()["error"]["code"] == "registration_preconditions_failed"
     _open_email_mode(monkeypatch)
     r2 = client.put("/api/admin/v1/settings/registration",
-                    json={"mode": "email_verify_invite_activation"})
+                    json={"mode": "public"})
     assert r2.status_code == 200, r2.get_data(as_text=True)
     body = client.get("/api/admin/v1/settings").get_json()["registration"]
-    assert body["supported_modes"] == ["closed", "invite_only",
-                                       "email_verify_invite_activation",
-                                       "public"]
-    assert body["mode"] == "email_verify_invite_activation"
-    # public（P1 起正式接受，但走自己的前置闸）：缺管理员通知邮箱/双协议
-    # 文稿 → 400 registration_preconditions_failed
-    r3 = client.put("/api/admin/v1/settings/registration",
-                    json={"mode": "public"})
-    assert r3.status_code == 400
-    assert r3.get_json()["error"]["code"] == \
-        "registration_preconditions_failed"
-
-
-def test_register_email_mode_page_copy(monkeypatch):
-    """R2：GET /register 渲染介绍主页并直开注册弹窗（邮箱表单 + 简明文案）。"""
-    _open_email_mode(monkeypatch)
-    app_mod.AUTH_ENABLED = True
-    client = _client()
-    r = client.get("/register")
-    assert r.status_code == 200
-    body = r.get_data(as_text=True)
-    assert 'name="email"' in body
-    assert 'name="invite_token"' not in body   # 不填邀请码
-    assert 'name="login_id"' not in body       # J：不要求独立登录账号
-    assert 'name="display_name"' not in body   # J：不要求显示名
-    # R2 首屏核心文案（不再承诺/解释激活细节，无实现型说明）
-    assert "验证邮箱并提交申请，管理员审核通过后即可使用。" in body
-    assert "验证邮箱本身不授予" not in body
-    # 弹窗直开且注册视图激活（登录视图收起）
-    assert re.search(r'\bopen\b', re.search(
-        r'<dialog\b[^>]*id="login-dialog"[^>]*>', body).group(0))
-    assert 'id="register-view" data-auth-pane="register">' in body
-    assert 'id="login-view" data-auth-pane="login" hidden>' in body
-    # 注册表单复用既有 POST /register API + CSRF
-    assert 'action="/register"' in body and 'name="csrf_token"' in body
-
-
-def test_register_email_mode_post_unified_copy(monkeypatch):
-    _open_email_mode(monkeypatch)
-    app_mod.AUTH_ENABLED = True
-    client = _client()
-
-    def _post(email):
-        return client.post("/register", data={"email": email})
-
-    def _normalize(body):
-        # 每次渲染签发新的 submission_id（幂等键），比较前归一
-        return re.sub(r"rsb_[A-Za-z0-9_.\-]+", "rsb_X", body)
-
-    r1 = _post("New.User@Example.COM ")
-    assert r1.status_code == 200
-    done1 = _normalize(r1.get_data(as_text=True))
-    # 未知邮箱：同一状态/文案（无枚举信号）
-    r2 = _post("ghost@nowhere.test")
-    assert _normalize(r2.get_data(as_text=True)) == done1
-    assert 'data-state-kind="submitted"' in done1
-    # 2026-10-08 设计 §3：5 分钟冷却内重复提交 → cooldown 状态（同一结构；
-    # 不作废已有 token，不再统一声称「邮件已发送」）
-    r3 = _post("new.user@example.com")
-    body3 = _normalize(r3.get_data(as_text=True))
-    assert 'data-state-kind="cooldown"' in body3
-    assert "验证邮件请求已提交" in done1
-    # 入队规范化：job email = 规范化值；同邮箱冷却只 1 个 job（不作废重发）
-    conn = pg_store_connect()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT count(*)::int AS n FROM registration_mail_jobs "
-                "WHERE email_normalized=%s", ("new.user@example.com",))
-            assert cur.fetchone()["n"] == 1
-            cur.execute("SELECT payload_enc, token_hash FROM "
-                        "registration_mail_jobs")
-            row = cur.fetchone()
-    finally:
-        conn.close()
-    # token 明文/链接绝不落库（载荷加密）
-    assert "verify-email?token=" not in row["payload_enc"]
-
-
-def test_register_email_mode_done_view_copy(monkeypatch):
-    """R2→2026-10-08 设计 §5：提交后注册弹窗内展示 submitted 状态
-    （「验证邮件请求已提交」；不跳独立页，不声称「邮件已发送」）。"""
-    _open_email_mode(monkeypatch)
-    app_mod.AUTH_ENABLED = True
-    client = _client()
-    r = client.post("/register", data={"email": "done.view@x.com"})
-    assert r.status_code == 200
-    body = r.get_data(as_text=True)
-    assert "验证邮件请求已提交" in body
-    assert "邮件已发送" not in body
-    # 完成视图不再提供邮箱表单（防重复提交歧义）；保留重新填写与登录入口
-    assert 'name="email"' not in body
-    assert "重新填写邮箱" in body
-    assert "已有账号？登录" in body
-    # 帮助入口（§5：低强调「给作者发邮件」链接始终存在）
-    assert "/registration-help" in body
-    # 弹窗仍直开（register_open），登录视图收起
-    assert 'id="register-view" data-auth-pane="register">' in body
-    assert 'id="login-view" data-auth-pane="login" hidden>' in body
-    assert "no-store" in r.headers.get("Cache-Control", "")
-
-
-def test_register_done_view_again_link_navigates_to_clean_form(monkeypatch):
-    """提交成功态「重新填写邮箱」真实导航 /register 深链接（2026-09-19 修复；
-    2026-10-08 设计 §5 状态化后语义不变：链接带 data-auth-nav 显式 opt-out，
-    entry-auth.js 不拦截原地切换）。深链接由服务端重新渲染介绍主页 + 干净
-    注册表单（register_state=form、无状态视图），可重新填写/重发。"""
-    _open_email_mode(monkeypatch)
-    app_mod.AUTH_ENABLED = True
-    client = _client()
-    r = client.post("/register", data={"email": "again.nav@x.com"})
-    assert r.status_code == 200
-    done = r.get_data(as_text=True)
-    assert "验证邮件请求已提交" in done
-    # i18n 键不变 + 显式 opt-out 属性存在（允许真实导航）
-    assert 'data-i18n="register.dialog.again">重新填写邮箱</a>' in done
-    assert "data-auth-nav" in done
-    # 深链接 GET /register：干净注册表单（form 态、无提交后状态视图）
-    r2 = client.get("/register")
-    assert r2.status_code == 200
-    clean = r2.get_data(as_text=True)
-    assert "验证邮件请求已提交" not in clean
-    assert "请查收验证邮件" not in clean
-    assert 'id="register-dialog-form"' in clean
-    assert 'name="email"' in clean
-    assert 'id="register-state"' not in clean
-    assert "data-auth-nav" not in clean  # 干净表单不再渲染该链接
-    assert "no-store" in r2.headers.get("Cache-Control", "")
-
-
-def test_register_dialog_full_real_chain(monkeypatch):
-    """R2 完整真实链：注册弹窗表单 → 入队 → fake 发送（真实链接）→
-    GET /verify-email 只展示 → POST /api/registration/verify 建号 + 申请。
-
-    验证 token/建号/申请链全部真实（不全 mock）；仅邮件发送用 fake。
-    """
-    _open_email_mode(monkeypatch)
-    app_mod.AUTH_ENABLED = True
-    client = _client()
-    # 1. 深链接：渲染介绍主页 + 注册弹窗（邮箱表单）
-    page = client.get("/register")
-    assert page.status_code == 200
-    # 2. 弹窗表单提交（同真实 form POST：email + CSRF）
-    r = client.post("/register", data={"email": "dialog.chain@x.com"})
-    assert r.status_code == 200
-    assert "验证邮件请求已提交" in r.get_data(as_text=True)
-    # 3. 真实排水（fake 发送器）：正文带真实 PUBLIC_BASE_URL 链接与 token
-    assert registration_mail_worker.drain_once(sender=_fake()) == 1
-    to, subject, body = _fake().sent[0]
-    assert to == "dialog.chain@x.com"
-    link = "%s/verify-email?token=" % BASE
-    assert link in body
-    token = body.split(link, 1)[1].split()[0]
-    # 4. GET 验证落地页只展示不消费
-    vpage = client.get("/verify-email?token=" + token)
-    assert vpage.status_code == 200
-    assert "管理员审核通过后即可使用" in vpage.get_data(as_text=True)
-    assert _mail_job_row(token)["status"] == "sent"  # GET 只展示，未消费
-    # 5. 消费 token + 设置密码 + 提交申请（原子建 pending 用户）
-    r2 = client.post("/api/registration/verify", json={
-        "token": token, "password": "longpassword123",
-        "password_confirm": "longpassword123",
-        "research_direction": "clinical_pathology",
-        "share_research_data": False})
-    assert r2.status_code == 200, r2.get_data(as_text=True)
-    assert r2.get_json()["ok"] is True
-    assert r2.get_json()["application_submitted"] is True
-    user = user_store.get_user_by_login_id("dialog.chain@x.com")
-    assert user is not None
-    assert user["activation_state"] == "pending_activation"
-    row = _mail_job_row(token)
-    assert row["status"] == "consumed"
-
-
-def test_verify_email_mail_body_copy_simplified(monkeypatch):
-    """R2：验证邮件文案与弹窗同口径——无「不授予任何权限」实现型说明；
-    保留一次性、30 分钟与邀请码直接激活提示。"""
-    _open_email_mode(monkeypatch)
-    subject, body = registration_mail_worker.build_verify_email_body(
-        "copy@x.com", "tok-value", BASE)
-    assert "30 分钟" in subject
-    assert BASE + "/verify-email?token=tok-value" in body
-    assert "只能使用一次" in body
-    assert "邀请码" in body
-    assert "不会授予任何工作区" not in body
-    assert "验证邮箱本身" not in body
+    assert body["supported_modes"] == ["closed", "public"]
+    assert body["mode"] == "public"
 
 
 # =========================================================================== #
 # 2. 验证页（GET 只展示）与 verify 建号（密码后置）
 # =========================================================================== #
 def test_verify_email_get_does_not_consume(monkeypatch):
+    """GET /verify-email 仍只展示不消费；legacy（无 intent）token 渲染退役
+    文案（2026-10-08 §4：不再建 pending 账号）。"""
     _open_email_mode(monkeypatch)
     app_mod.AUTH_ENABLED = True
     client = _client()
-    out = _enqueue("alice@x.com")
+    out = _enqueue("alice@x.com")  # legacy flow 签发（无 intent 行）
     r = client.get("/verify-email?token=" + out["token"])
     assert r.status_code == 200
     body = r.get_data(as_text=True)
-    assert "设置密码" in body
-    # SER-8：验证流程从「邀请码激活」改为「申请测试」——研究方向单选组
-    assert "research_direction" in body
-    assert "申请测试" in body
+    assert "注册流程已更新" in body
+    assert "设置密码" not in body
+    assert "research_direction" not in body
     row = _mail_job_row(out["token"])
     assert row["consumed_at"] is None and row["status"] == "queued"
     # 无效 token：状态页（不 500）
@@ -389,6 +238,13 @@ def test_verify_email_get_does_not_consume(monkeypatch):
         "state"] == "valid"
     assert registration_store.check_verify_token("garbage")["state"] == \
         "unknown"
+    # POST legacy token → 403 registration_closed（token 不消费，引导重走公开注册）
+    r3 = client.post("/api/registration/verify",
+                     json={"token": out["token"],
+                           "password": "longpassword123"})
+    assert r3.status_code == 403
+    assert r3.get_json()["code"] == "registration_closed"
+    assert _mail_job_row(out["token"])["consumed_at"] is None
 
 
 def test_verify_email_expired_state(monkeypatch):
@@ -398,219 +254,58 @@ def test_verify_email_expired_state(monkeypatch):
         "state"] == "expired"
 
 
-def test_verify_creates_pending_user_email_as_login_id(monkeypatch):
-    _open_email_mode(monkeypatch)
-    app_mod.AUTH_ENABLED = True
-    client = _client()
-    out = _enqueue("  Alice@X.COM  ")
-    r = client.post("/api/registration/verify",
-                    json={"token": out["token"],
-                          "password": "longpassword123",
-                          "password_confirm": "longpassword123"})
-    assert r.status_code == 200, r.get_data(as_text=True)
-    assert r.get_json()["ok"] is True
-    user = user_store.get_user_by_login_id("alice@x.com")
-    assert user is not None
-    # J：login_id = 规范化邮箱；email 身份列可信（已验证）
-    assert user["login_id"] == "alice@x.com"
-    assert user["email_normalized"] == "alice@x.com"
-    assert user["email_verified_at"] is not None
-    assert user["activation_state"] == "pending_activation"
-    assert user["activation_source"] == "invite_activation"
-    # 验证邮箱不授予 AI / 额度
-    assert user["ai_access"] is False
+# =========================================================================== #
+# 3. I-R4 守卫（pending 账号即使拿到普通 session 形态也全拒）
+# =========================================================================== #
+def _insert_pending_row(email="blocked@x.com",
+                        password="pendingpass12345678"):
+    """直插一行 pending_activation 用户（verify 建号已退役；email_verified_at
+    非空模拟存量 email_verify 形态）。"""
+    import secrets as _secrets
+    from werkzeug.security import generate_password_hash
+    uid = "usr_" + _secrets.token_urlsafe(8)
     conn = pg_store_connect()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT count(*)::int AS n FROM ai_spend_total_allowances "
-                "WHERE subject_id=%s", (user["user_id"],))
-            assert cur.fetchone()["n"] == 0
+                "INSERT INTO users (user_id, login_id, display_name, "
+                "password_hash, role, created_at, disabled, ai_config, "
+                "ai_access, activation_state, activation_source, "
+                "activation_updated_at, email, email_normalized, "
+                "email_verified_at) VALUES (%s,%s,%s,%s,'user', now(), FALSE, "
+                "'{}'::jsonb, FALSE, 'pending_activation', "
+                "'invite_activation', now(), %s, %s, now()) RETURNING "
+                "user_id, auth_version",
+                (uid, email, email, generate_password_hash(password),
+                 email, email))
+            row = cur.fetchone()
+        conn.commit()
+        return {"user_id": row["user_id"],
+                "auth_version": row["auth_version"]}, password
     finally:
         conn.close()
-    # token 一次性：已消费
-    row = _mail_job_row(out["token"])
-    assert row["status"] == "consumed" and row["consumed_at"] is not None
-    # 二次提交同 token → 统一 400
-    r2 = client.post("/api/registration/verify",
-                     json={"token": out["token"],
-                           "password": "longpassword123"})
-    assert r2.status_code == 400
-    assert r2.get_json()["code"] == "invalid_or_expired"
-    # 新 token 同邮箱 → email_taken（部分唯一索引；不建第二个账号）。
-    # （先把已消费 job 移出 5 分钟冷却窗口——2026-10-08 设计 §3 的 store
-    # 层配额对直接调用方生效）
-    conn = pg_store_connect()
-    try:
-        with pg_store.transaction(conn) as c:
-            with c.cursor() as cur:
-                cur.execute(
-                    "UPDATE registration_mail_jobs SET created_at = now() - "
-                    "interval '10 minutes' WHERE "
-                    "email_normalized='alice@x.com'")
-    finally:
-        conn.close()
-    out2 = _enqueue("alice@x.com")
-    r3 = client.post("/api/registration/verify",
-                     json={"token": out2["token"],
-                           "password": "longpassword123"})
-    assert r3.status_code == 409
-    assert r3.get_json()["code"] == "email_taken"
-    assert user_store.get_user_by_login_id("alice@x.com")["user_id"] == \
-        user["user_id"]
 
 
-def test_verify_login_id_conflict_goes_to_rebind(monkeypatch):
-    """J 红线：与存量 login_id 冲突 → 待补绑合成账号；绝不静默合并、绝不
-    给存量账号伪造 email_verified_at。"""
-    legacy = user_store.create_user("taken@x.com", "existingpass12345678",
-                                    role="user")
-    assert legacy["email_verified_at"] is None  # 存量 @ login_id 不标已验证
-    out = _enqueue("taken@x.com")
-    result = registration_store.verify_email_create_user(
-        out["token"], "longpassword123")
-    new_user = result["user"]
-    assert new_user["user_id"] != legacy["user_id"]
-    assert result["pending_bind"] is True
-    assert new_user["login_id"].startswith("pending-") \
-        and new_user["login_id"].endswith("@bind.invalid")
-    assert new_user["email_normalized"] == "taken@x.com"
-    assert new_user["email_verified_at"] is not None
-    # 存量账号分毫未动
-    after = user_store.get_user(legacy["user_id"])
-    assert after["email_verified_at"] is None
-    assert after["email_normalized"] is None
-
-
-def test_verify_password_policy(monkeypatch):
-    out = _enqueue("pw@x.com")
-    r = _client().post("/api/registration/verify",
-                       json={"token": out["token"], "password": "short"})
-    assert r.status_code == 400
-    assert r.get_json()["code"] == "invalid_request"
-    assert _mail_job_row(out["token"])["consumed_at"] is None
-
-
-# =========================================================================== #
-# 3. pending 登录 → enrollment 受限 session（I-R4 白名单）
-# =========================================================================== #
-def _make_pending(email="pending@x.com", password="pendingpass12345678"):
-    out = _enqueue(email)
-    return registration_store.verify_email_create_user(
-        out["token"], password)["user"], password
-
-
-def test_pending_login_enrollment_scope_only(monkeypatch):
-    _open_email_mode(monkeypatch)
+def test_pending_account_blocked_from_business_api(monkeypatch):
+    """I-R4：pending_activation 账号即使拿到普通 session 形态也全拒
+    （2026-10-08 §4 后新用户不再进入 pending，守卫对存量行仍成立）。"""
     app_mod.AUTH_ENABLED = True
-    user, password = _make_pending()
+    user, _ = _insert_pending_row()
     client = _client()
-    r = client.post("/login", data={"username": "pending@x.com",
-                                    "password": password})
-    assert r.status_code == 302
-    assert r.headers["Location"].endswith("/activate")
     with client.session_transaction() as s:
-        # 独立 scope：不写普通 auth_user/role/user_id
-        assert s.get(app_mod.ENROLLMENT_SESSION_KEY)["user_id"] == \
-            user["user_id"]
-        assert not s.get("auth_user")
-        assert not s.get("role")
-        assert not s.get("user_id")
-    # enrollment 白名单内
-    r2 = client.get("/activate")
-    assert r2.status_code == 200
-    assert "p***@x.com" in r2.get_data(as_text=True)   # 掩码邮箱
-    assert "pending@x.com" not in r2.get_data(as_text=True)
-    r3 = client.get("/api/account/enrollment")
-    assert r3.status_code == 200
-    assert r3.get_json()["state"] == "pending_activation"
-    assert r3.get_json()["email_masked"] == "p***@x.com"
-    # 业务面全拒（enrollment 不是登录态）
-    assert client.get("/api/admin/v1/users").status_code == 401
-    assert client.get("/api/admin/v1/slides/inventory").status_code == 401
-    # 白名单外 /api 一律 401（D2：code=auth_required + 中文 error）
-    r_inv = client.get("/api/admin/v1/invites")
-    assert r_inv.status_code == 401
-    body = r_inv.get_json()
-    assert body["code"] == "auth_required"
-    assert body["error"] != "auth_required"
-    assert "重新登录" in body["error"]
-    # 登出可用（白名单）
-    assert client.post("/logout").status_code == 302
-    with client.session_transaction() as s:
-        assert not s.get(app_mod.ENROLLMENT_SESSION_KEY)
+        s.update({"auth_user": "blocked@x.com", "user_id": user["user_id"],
+                  "role": "user", "auth_version": user["auth_version"]})
+    r = client.get("/api/admin/v1/users")
+    assert r.status_code == 403
+    assert r.get_json()["error"] == "account_pending"
+    # 页面 → 302（无 enrollment 时回 /login）
+    r2 = client.get("/admin")
+    assert r2.status_code == 302
 
 
 # =========================================================================== #
-# 3.5 D1/D2 回归（2026-09-10）：enrollment 会话不被非白名单请求清掉、
-#     favicon 放行、401 错误契约（中文 error + code=auth_required）
+# 3.5 D1 回归：favicon 放行（公开路径）
 # =========================================================================== #
-def test_activation_survives_favicon_request(monkeypatch):
-    """D1 锁定：GET /activate 后浏览器自动 GET /favicon.ico（公开路径，204），
-    再 POST 正确邀请码仍 200 ok=true。旧代码 favicon 会话被清 → 必 401。"""
-    _open_email_mode(monkeypatch)
-    owner = _mk_owner()
-    app_mod.AUTH_ENABLED = True
-    user, password = _make_pending("fav@x.com")
-    inv = registration_store.create_invite(
-        owner["user_id"], total_limit_nano_cny=10 ** 9)
-    client = _client()
-    assert client.post("/login", data={"username": "fav@x.com",
-                                       "password": password}).status_code == 302
-    assert client.get("/activate").status_code == 200
-    # 浏览器自动请求 favicon：公开路径放行（204），不得影响 enrollment 会话
-    r_fav = client.get("/favicon.ico")
-    assert r_fav.status_code == 204
-    # 激活仍成功（旧代码此处必 401 auth_required）
-    r = _activate_via_api(client, inv["token"])
-    assert r.status_code == 200, r.get_data(as_text=True)
-    assert r.get_json()["ok"] is True
-    assert user_store.get_user(user["user_id"])["activation_state"] == "active"
-
-
-def test_enrollment_session_survives_nonwhitelist_challenge(monkeypatch):
-    """D1 锁定：非白名单路径只拒绝、不清会话——401 后 enrollment 状态接口
-    仍 200（激活页刷新/再提交不丢会话）；401 body 符合 D2 契约。"""
-    _open_email_mode(monkeypatch)
-    app_mod.AUTH_ENABLED = True
-    user, password = _make_pending("keep@x.com")
-    client = _client()
-    assert client.post("/login", data={"username": "keep@x.com",
-                                       "password": password}).status_code == 302
-    # 任意非白名单路径（页面 302 /login、/api 401），cookie 保留
-    r_api = client.get("/api/admin/v1/users")
-    assert r_api.status_code == 401
-    body = r_api.get_json()
-    assert body["code"] == "auth_required"
-    assert body["error"] != "auth_required"      # 不是裸机器码
-    assert "重新登录" in body["error"]            # 中文引导文案
-    assert client.get("/some/random/page").status_code == 404
-    assert client.get("/app").status_code == 302
-    # 会话没有被清：enrollment 状态接口仍可用
-    r_enr = client.get("/api/account/enrollment")
-    assert r_enr.status_code == 200
-    assert r_enr.get_json()["state"] == "pending_activation"
-    assert user_store.get_user(user["user_id"]) \
-        ["activation_state"] == "pending_activation"
-
-
-def test_enrollment_whitelist_invalid_session_still_cleared(monkeypatch):
-    """D1 边界：白名单路径上会话/用户本身已无效（禁用）仍清会话（既有
-    fail-closed 语义不放宽；激活成功/already_active 清会话由既有用例锁定）。"""
-    _open_email_mode(monkeypatch)
-    app_mod.AUTH_ENABLED = True
-    user, password = _make_pending("ban@x.com")
-    client = _client()
-    assert client.post("/login", data={"username": "ban@x.com",
-                                       "password": password}).status_code == 302
-    # 管理员禁用 pending 用户 → enrollment 会话立即失效
-    user_store.set_user_disabled(user["user_id"], True)
-    assert client.get("/activate").status_code == 302   # 会话已清 → 去登录
-    with client.session_transaction() as s:
-        assert not s.get(app_mod.ENROLLMENT_SESSION_KEY)
-    assert client.get("/api/account/enrollment").status_code == 401
-
-
 def test_favicon_public_without_session():
     """favicon 对匿名也公开（与 /healthz 同类）：204 且不 302 /login。"""
     app_mod.AUTH_ENABLED = True
@@ -621,286 +316,65 @@ def test_favicon_public_without_session():
 
 
 # =========================================================================== #
-# 4. 激活（P2-4：单事务、CAS 消费、面值额度、already_active 不消费）
+# 4. 退役端点：/activate、/api/account/activate、/api/account/enrollment
 # =========================================================================== #
-def _activate_via_api(client, code):
-    return client.post("/api/account/activate", json={"invite_code": code})
-
-
-def test_activate_happy_path(monkeypatch):
-    _open_email_mode(monkeypatch)
-    owner = _mk_owner()
+def test_activation_endpoints_retired(monkeypatch):
+    """激活面退役（2026-10-08 §4）：GET /activate 302 /login；activate/
+    enrollment API 对已登录调用方稳定 410 endpoint_retired。"""
     app_mod.AUTH_ENABLED = True
-    user, password = _make_pending("happy@x.com")
-    inv = registration_store.create_invite(
-        owner["user_id"], ai_access=True, total_limit_nano_cny=3 * 10 ** 9)
+    owner = _mk_owner()
     client = _client()
-    assert client.post("/login", data={"username": "happy@x.com",
-                                       "password": password}).status_code == 302
-    # 错误邀请码 → 统一 403（不消费）
-    r_bad = _activate_via_api(client, "totally-wrong-code")
-    assert r_bad.status_code == 403
-    assert r_bad.get_json()["code"] == "invite_invalid_or_unavailable"
-    assert registration_store.get_invite(inv["invite_id"])["use_count"] == 0
-    # 正确邀请码 → 激活成功
-    r = _activate_via_api(client, inv["token"])
-    assert r.status_code == 200, r.get_data(as_text=True)
-    # session 清空（enrollment 使命完成）
-    assert client.get("/api/account/enrollment").status_code == 401
-    updated = user_store.get_user(user["user_id"])
-    assert updated["activation_state"] == "active"
-    assert updated["activation_source"] == "invite"
-    assert updated["ai_access"] is True
-    invite_row = registration_store.get_invite(inv["invite_id"])
-    assert invite_row["use_count"] == 1
-    assert invite_row["consumed_by_user_id"] == user["user_id"]
-    # 按面值建一次性总额度（source=invite）
+    _owner_session(client, owner)
+    # GET /activate：不再有激活页（匿名与登录一致 302 /login）
+    assert client.get("/activate").status_code == 302
+    anon = _client()
+    assert anon.get("/activate").status_code == 302
+    # enrollment 状态端点：410（不读 session、不回显 token）
+    r = client.get("/api/account/enrollment")
+    assert r.status_code == 410
+    assert r.get_json()["code"] == "endpoint_retired"
+    # 激活 POST：410，不消费任何东西
+    r = client.post("/api/account/activate", json={"invite_code": "whatever"})
+    assert r.status_code == 410
+    assert r.get_json()["code"] == "endpoint_retired"
     conn = pg_store_connect()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT limit_nano_cny, source FROM ai_spend_total_allowances "
-                "WHERE subject_id=%s", (user["user_id"],))
-            row = cur.fetchone()
+            cur.execute("SELECT count(*)::int AS n FROM registration_invites")
+            assert cur.fetchone()["n"] == 0  # 不消费/不建任何邀请行
     finally:
         conn.close()
-    assert row["limit_nano_cny"] == 3 * 10 ** 9
-    assert row["source"] == "invite"
-    # 正常登录可用（active → 普通 session）
-    assert client.post("/login", data={"username": "happy@x.com",
-                                       "password": password}).status_code == 302
-    with client.session_transaction() as s:
-        assert s.get("auth_user")
-
-
-def test_already_active_second_code_not_consumed(monkeypatch):
-    _open_email_mode(monkeypatch)
-    owner = _mk_owner()
-    user, _pw = _make_pending("once@x.com")
-    inv1 = registration_store.create_invite(owner["user_id"],
-                                            total_limit_nano_cny=10 ** 9)
-    registration_store.activate_registered_user(user["user_id"], inv1["token"])
-    inv2 = registration_store.create_invite(owner["user_id"],
-                                            total_limit_nano_cny=10 ** 9)
-    with pytest.raises(registration_store.ActivationError) as ei:
-        registration_store.activate_registered_user(user["user_id"],
-                                                    inv2["token"])
-    assert ei.value.code == "already_active"
-    # 不消费、不充值（仍只有 1 条 allowance 行）
-    row = registration_store.get_invite(inv2["invite_id"])
-    assert row["use_count"] == 0 and row["consumed_at"] is None
-    conn = pg_store_connect()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT count(*)::int AS n FROM ai_spend_total_allowances "
-                "WHERE subject_id=%s", (user["user_id"],))
-            assert cur.fetchone()["n"] == 1
-    finally:
-        conn.close()
-
-
-def test_same_invite_two_pending_users_single_winner(monkeypatch):
-    owner = _mk_owner()
-    ua, _ = _make_pending("racer-a@x.com")
-    ub, _ = _make_pending("racer-b@x.com")
-    inv = registration_store.create_invite(owner["user_id"])
-    registration_store.activate_registered_user(ua["user_id"], inv["token"])
-    with pytest.raises(registration_store.InviteRedeemError):
-        registration_store.activate_registered_user(ub["user_id"], inv["token"])
-    row = registration_store.get_invite(inv["invite_id"])
-    assert row["use_count"] == 1
-    assert row["consumed_by_user_id"] == ua["user_id"]
-    assert user_store.get_user(ub["user_id"])["activation_state"] == \
-        "pending_activation"
-
-
-def test_activation_maintenance_gate(monkeypatch):
-    owner = _mk_owner()
-    user, _ = _make_pending("maint@x.com")
-    inv = registration_store.create_invite(owner["user_id"])
-    settings_store.set_setting(settings_store.AI_DISPATCH_MAINTENANCE_KEY,
-                               True, updated_by="t")
-    with pytest.raises(spend_store.ProvisioningMaintenanceError):
-        registration_store.activate_registered_user(user["user_id"],
-                                                    inv["token"])
-    assert registration_store.get_invite(inv["invite_id"])["use_count"] == 0
-    assert user_store.get_user(user["user_id"])[
-        "activation_state"] == "pending_activation"
-
-
-def test_activate_api_requires_enrollment_session():
-    app_mod.AUTH_ENABLED = True
-    client = _client()
-    # 匿名 → 401；普通业务身份推导绝不来自请求体
-    assert _activate_via_api(client, "some-code").status_code == 401
 
 
 # --------------------------------------------------------------------------- #
-# 4.5 P0-1：邀请码绑定邮箱校验（激活面）
+# 4.5 邀请管理端点退役（审计口径）
 # --------------------------------------------------------------------------- #
-def _allowance_count(user_id):
-    conn = pg_store_connect()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT count(*)::int AS n FROM ai_spend_total_allowances "
-                "WHERE subject_id=%s", (user_id,))
-            return int(cur.fetchone()["n"])
-    finally:
-        conn.close()
-
-
-def _redeem_attempt_audit_status(invite_id):
-    """取该邀请码最近一条 redeem_attempt 审计的 status（真实原因核验用）。"""
-    conn = pg_store_connect()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT detail FROM audit_events "
-                "WHERE action='registration.redeem_attempt' "
-                "AND target_id=%s ORDER BY ts DESC LIMIT 1", (invite_id,))
-            row = cur.fetchone()
-            return (row["detail"] or {}).get("status") if row else None
-    finally:
-        conn.close()
-
-
-def test_activate_invite_bound_match_succeeds_normalized(monkeypatch):
-    """P0-1：绑定匹配（大小写/空白归一后相等）→ 激活成功。"""
-    _open_email_mode(monkeypatch)
+def test_admin_invite_endpoints_retired(monkeypatch):
+    """邀请管理退役（2026-10-08 §4）：列表/创建/撤销 410，零副作用。"""
     owner = _mk_owner()
-    # pending 用户邮箱带大小写/空白；规范化后与绑定值一致
-    user, _pw = _make_pending("  Bound-A@X.COM ")
-    inv = registration_store.create_invite(
-        owner["user_id"], login_id=" bound-a@X.com ",
-        total_limit_nano_cny=2 * 10 ** 9)
-    # 绑定值落库即规范化
-    assert registration_store.get_invite(inv["invite_id"])[
-        "login_id_normalized"] == "bound-a@x.com"
-    result = registration_store.activate_registered_user(
-        user["user_id"], inv["token"])
-    assert result["user"]["activation_state"] == "active"
-    updated = user_store.get_user(user["user_id"])
-    assert updated["activation_state"] == "active"
-    assert updated["activation_source"] == "invite"
-    # 面值额度照常建立
-    assert _allowance_count(user["user_id"]) == 1
-
-
-def test_activate_invite_bound_mismatch_rejected_and_not_consumed(monkeypatch):
-    """P0-1 红线：绑定给 Alice 的邀请码不能激活 Bob——整体回滚（邀请码不
-    消费、状态不变、不建额度），对外统一 403 文案，真实原因只进审计。"""
-    _open_email_mode(monkeypatch)
-    owner = _mk_owner()
-    _alice, _ = _make_pending("alice@x.com")
-    bob, _ = _make_pending("bob@x.com")
-    inv = registration_store.create_invite(owner["user_id"],
-                                           login_id="alice@x.com")
-    # store 层：InviteRedeemError（对外统一 code）
-    with pytest.raises(registration_store.InviteRedeemError) as ei:
-        registration_store.activate_registered_user(bob["user_id"],
-                                                    inv["token"])
-    assert ei.value.code == "invite_invalid_or_unavailable"
-    # 整体回滚三件套
-    row = registration_store.get_invite(inv["invite_id"])
-    assert row["use_count"] == 0 and row["consumed_at"] is None
-    assert user_store.get_user(bob["user_id"])[
-        "activation_state"] == "pending_activation"
-    assert _allowance_count(bob["user_id"]) == 0
-    # 审计行记录真实原因 bound_mismatch（对外不泄露）
-    assert _redeem_attempt_audit_status(inv["invite_id"]) == \
-        "activate:bound_mismatch"
-    # 绑定者本人随后仍可成功（码未被抢用）
-    registration_store.activate_registered_user(_alice["user_id"],
-                                                inv["token"])
-    assert registration_store.get_invite(inv["invite_id"])["use_count"] == 1
-    assert user_store.get_user(_alice["user_id"])["activation_state"] == \
-        "active"
-
-
-def test_activate_api_bound_mismatch_unified_403(monkeypatch):
-    """P0-1 API 面：绑定不匹配 → 403 统一 invite_invalid_or_unavailable
-    （反枚举：与无效码同文案同 code），且不消费。"""
-    _open_email_mode(monkeypatch)
-    owner = _mk_owner()
-    _alice, _ = _make_pending("alice@x.com")
-    bob, bob_pw = _make_pending("bob@x.com")
-    inv = registration_store.create_invite(owner["user_id"],
-                                           login_id="alice@x.com")
+    app_mod.AUTH_ENABLED = True
     client = _client()
-    assert client.post("/login", data={"username": "bob@x.com",
-                                       "password": bob_pw}).status_code == 302
-    r = _activate_via_api(client, inv["token"])
-    assert r.status_code == 403
-    assert r.get_json()["code"] == "invite_invalid_or_unavailable"
-    assert registration_store.get_invite(inv["invite_id"])["use_count"] == 0
-    assert user_store.get_user(bob["user_id"])[
-        "activation_state"] == "pending_activation"
-
-
-def test_activate_bound_invite_only_bound_user_wins(monkeypatch):
-    """P0-1：两个 pending 用户抢同一绑定码——非绑定者先到被拒且不消费，
-    绑定者（大小写/空白归一匹配）随后成功；反向顺序只有绑定者成功。"""
-    _open_email_mode(monkeypatch)
-    owner = _mk_owner()
-    bound_user, _ = _make_pending("  Racer-A@X.COM ")
-    other, _ = _make_pending("racer-b@x.com")
-    inv = registration_store.create_invite(owner["user_id"],
-                                           login_id=" racer-a@x.com ")
-    # 顺序 A：非绑定者先到 → 拒绝、码不消费
-    with pytest.raises(registration_store.InviteRedeemError):
-        registration_store.activate_registered_user(other["user_id"],
-                                                    inv["token"])
-    assert registration_store.get_invite(inv["invite_id"])["use_count"] == 0
-    assert user_store.get_user(other["user_id"])[
-        "activation_state"] == "pending_activation"
-    # 顺序 B：绑定者（归一化匹配）后到 → 成功消费
-    registration_store.activate_registered_user(bound_user["user_id"],
-                                                inv["token"])
-    row = registration_store.get_invite(inv["invite_id"])
-    assert row["use_count"] == 1
-    assert row["consumed_by_user_id"] == bound_user["user_id"]
-    # 非绑定者仍未被波及
-    assert user_store.get_user(other["user_id"])[
-        "activation_state"] == "pending_activation"
+    _owner_session(client, owner)
+    before = len(app_mod.share_store.list_audit(limit=1000))
+    assert client.get("/api/admin/v1/invites").status_code == 410
+    r = client.post("/api/admin/v1/invites",
+                    json={"login_id": "x@x.com", "ttl_hours": 24})
+    assert r.status_code == 410
+    assert client.post("/api/admin/v1/invites/inv_x/revoke").status_code == 410
+    conn = pg_store_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*)::int AS n FROM registration_invites")
+            assert cur.fetchone()["n"] == 0
+    finally:
+        conn.close()
+    after = app_mod.share_store.list_audit(limit=1000)
+    assert len(after) == before
 
 
 # =========================================================================== #
 # 5. I-R4：require_active_account 统一守卫
 # =========================================================================== #
-def test_pending_account_blocked_from_business_api(monkeypatch):
-    app_mod.AUTH_ENABLED = True
-    user, _ = _make_pending("blocked@x.com")
-    client = _client()
-    # 伪造普通 session 形态（pending 账号绝不该有，但守卫必须独立成立）
-    with client.session_transaction() as s:
-        s.update({"auth_user": "blocked@x.com", "user_id": user["user_id"],
-                  "role": "user", "auth_version": user["auth_version"]})
-    r = client.get("/api/admin/v1/users")
-    assert r.status_code == 403
-    assert r.get_json()["error"] == "account_pending"
-    # 页面 → 302（无 enrollment 时回 /login）
-    r2 = client.get("/admin")
-    assert r2.status_code == 302
-    # 激活后放行（普通用户身份可触达的业务出口恢复；admin 端点仍受 owner
-    # 门控——那是另一层权限，与本守卫无关）
-    owner = _mk_owner()
-    inv = registration_store.create_invite(owner["user_id"])
-    registration_store.activate_registered_user(user["user_id"], inv["token"])
-    fresh = user_store.get_user(user["user_id"])
-    client2 = _client()
-    with client2.session_transaction() as s:
-        s.update({"auth_user": "blocked@x.com", "user_id": user["user_id"],
-                  "role": "user", "auth_version": fresh["auth_version"]})
-    info = client2.get("/api/auth/info")
-    assert info.status_code == 200
-    assert info.get_json()["user_id"] == user["user_id"]
-    admin = client2.get("/api/admin/v1/users")
-    assert admin.status_code == 403
-    assert admin.get_json()["error"] != "account_pending"
-
-
 def test_legacy_backfill_state_defaults_active():
     """存量/owner 建号：activation_state=active（迁移 backfill 与新写入同口径）。"""
     u = user_store.create_user("legacy@x.com", "legacy1234567890",
@@ -1020,70 +494,16 @@ def test_resend_quota_cooldown_daily_and_global_budget(monkeypatch):
         conn.close()
 
 
-def test_resend_api_unified_response(monkeypatch):
-    _open_email_mode(monkeypatch)  # P1-2：resend 写前查生效模式
-    monkeypatch.setenv("PUBLIC_BASE_URL", BASE)
+def test_resend_api_endpoint_retired(monkeypatch):
+    """旧 JSON 重发接口退役（2026-10-08 §4）：410，不写队列（public 重发
+    走 POST /register/resend，见 test_public_registration）。"""
+    _open_email_mode(monkeypatch)
     app_mod.AUTH_ENABLED = True
     client = _client()
     r = client.post("/api/registration/resend", json={"email": "rs@x.com"})
-    assert r.status_code == 200 and r.get_json()["ok"] is True
-    # 冷却超限：同一响应（无枚举/无 429 信号）
-    r2 = client.post("/api/registration/resend", json={"email": "rs@x.com"})
-    assert r2.status_code == 200 and r2.get_json()["ok"] is True
-    conn = pg_store_connect()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT count(*)::int AS n FROM registration_mail_jobs"
-                        " WHERE email_normalized='rs@x.com'")
-            assert cur.fetchone()["n"] == 1
-    finally:
-        conn.close()
-
-
-def test_resend_ip_prefix_rate_limit(monkeypatch):
-    """IP 前缀限流（review 2026-09-14 附带观察加固）：单一来源对**不同**
-    邮箱刷 resend（绕开同邮箱冷却/日限）不能耗尽应用级日预算——与
-    POST /register 共用 reg_ip_daily 桶；达限后响应仍是统一 ok（无枚举/
-    无 429 信号），但不再产生新的 registration_mail_jobs 行。"""
-    import auth_limit_store
-    _open_email_mode(monkeypatch)
-    monkeypatch.setenv("PUBLIC_BASE_URL", BASE)
-    app_mod.AUTH_ENABLED = True
-    client = _client()
-    limit = auth_limit_store.REG_IP_DAILY_ATTEMPT_LIMIT
-    for i in range(limit + 3):
-        r = client.post("/api/registration/resend",
-                        json={"email": "iplimit%03d@x.com" % i})
-        assert r.status_code == 200, i
-        assert r.get_json()["ok"] is True, i  # 锁定前后同一响应
-    conn = pg_store_connect()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT count(*)::int AS n FROM registration_mail_jobs "
-                "WHERE email_normalized LIKE 'iplimit%'")
-            n = cur.fetchone()["n"]
-            # 第 limit 次尝试即触发锁定（窗口内 count>=limit 置锁），
-            # 此前 limit-1 次真实入队；远低于应用日预算 40
-            assert n == limit - 1
-            # 锁定期间再发新邮箱：行数不再增长
-            cur.execute(
-                "SELECT count(*)::int AS n FROM registration_mail_jobs "
-                "WHERE email_normalized LIKE 'iplimit%'")
-            assert cur.fetchone()["n"] == n
-    finally:
-        conn.close()
-    r = client.post("/api/registration/resend",
-                    json={"email": "after-lock@x.com"})
-    assert r.status_code == 200 and r.get_json()["ok"] is True
-    conn = pg_store_connect()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT count(*)::int AS n FROM registration_mail_jobs"
-                        " WHERE email_normalized='after-lock@x.com'")
-            assert cur.fetchone()["n"] == 0
-    finally:
-        conn.close()
+    assert r.status_code == 410
+    assert r.get_json()["code"] == "endpoint_retired"
+    assert _mail_job_count("rs@x.com") == 0
 
 
 def _make_cli_script(tmpdir, marker):
@@ -1422,18 +842,17 @@ def test_worker_uncertain_no_resend_and_link_still_verifiable(monkeypatch):
     assert registration_mail_worker.drain_once(sender=snd) == 0
     assert registration_mail_worker.drain_once(sender=_fake()) == 0
     assert snd.calls == 1 and _fake().sent == []
-    # 用户手里「已收到」的链接仍可验证建号（有效期内 uncertain 一律放行）
+    # 用户手里「已收到」的链接仍处于 valid 态（有效期内 uncertain 一律放行）
     assert registration_store.check_verify_token(out["token"])[
         "state"] == "valid"
+    # 2026-10-08 §4：legacy 链接不再建号（POST 403，token 不消费）
     r = _client().post("/api/registration/verify",
                        json={"token": out["token"],
                              "password": "longpassword123"})
-    assert r.status_code == 200, r.get_data(as_text=True)
-    user = user_store.get_user_by_login_id("uncertain@x.com")
-    assert user is not None
-    assert user["activation_state"] == "pending_activation"
+    assert r.status_code == 403
+    assert user_store.get_user_by_login_id("uncertain@x.com") is None
     row = _mail_job_row(out["token"])
-    assert row["status"] == "consumed" and row["consumed_at"] is not None
+    assert row["status"] == "uncertain" and row["consumed_at"] is None
 
 
 def test_uncertain_token_superseded_by_new_request(monkeypatch):
@@ -1530,43 +949,14 @@ def _mail_job_count(email_norm):
         conn.close()
 
 
-def test_activate_blocked_when_registration_closed(monkeypatch):
-    """P1-2：closed 下 activate 403 registration_closed，且邀请码不消费、
-    用户状态不变（只暂停）。"""
-    # 先配齐全部前置 env（token 哈希盐/载荷密钥全程稳定），再模拟停机：
-    # 存储模式 closed ≠ 前置缺失，二者语义分离
-    _open_email_mode(monkeypatch)
-    settings_store.set_registration_mode("closed", updated_by="t")
-    owner = _mk_owner()
-    user, password = _make_pending("closedact@x.com")
-    inv = registration_store.create_invite(owner["user_id"])
-    client = _client()
-    assert client.post("/login", data={"username": "closedact@x.com",
-                                       "password": password}).status_code == 302
-    r = _activate_via_api(client, inv["token"])
-    assert r.status_code == 403
-    assert r.get_json()["code"] == "registration_closed"
-    # 只暂停：邀请码不消费、状态不变、无额度
-    assert registration_store.get_invite(inv["invite_id"])["use_count"] == 0
-    assert user_store.get_user(user["user_id"])[
-        "activation_state"] == "pending_activation"
-    assert _allowance_count(user["user_id"]) == 0
-    # 恢复开放后同一请求成功（停机只暂停，不销毁）
-    settings_store.set_registration_mode("email_verify_invite_activation",
-                                         updated_by="t")
-    r2 = _activate_via_api(client, inv["token"])
-    assert r2.status_code == 200, r2.get_data(as_text=True)
-    assert user_store.get_user(user["user_id"])["activation_state"] == "active"
-
-
 def test_resend_blocked_when_registration_closed(monkeypatch):
-    """P1-2：closed 下 resend 403 registration_closed，且不写队列。"""
+    """closed 下旧 JSON resend 退役 410（模式无关稳定响应），且不写队列。"""
     app_mod.AUTH_ENABLED = True
     client = _client()
     r = client.post("/api/registration/resend",
                     json={"email": "closedrs@x.com"})
-    assert r.status_code == 403
-    assert r.get_json()["code"] == "registration_closed"
+    assert r.status_code == 410
+    assert r.get_json()["code"] == "endpoint_retired"
     assert _mail_job_count("closedrs@x.com") == 0
 
 
@@ -1578,9 +968,18 @@ def test_register_email_start_blocked_when_closed(monkeypatch):
     assert r.status_code == 403
     assert r.get_json()["code"] == "registration_closed"
     assert _mail_job_count("closedstart@x.com") == 0
-    # 恢复开放后可正常入队
+    # 恢复开放后 public 流程可正常入队（双协议勾选 + 版本标识）
     _open_email_mode(monkeypatch)
-    r2 = client.post("/register", data={"email": "closedstart@x.com"})
+    import agreement_store
+    terms = agreement_store.current_published("user_agreement")
+    research = agreement_store.current_published("research_sharing")
+    r2 = client.post("/register", data={
+        "email": "closedstart@x.com",
+        "terms_accepted": "1",
+        "terms_version": terms["version"],
+        "terms_sha256": terms["content_sha256"],
+        "research_version": research["version"],
+        "research_sha256": research["content_sha256"]})
     assert r2.status_code == 200
     assert _mail_job_count("closedstart@x.com") == 1
 
@@ -1607,8 +1006,7 @@ def test_worker_after_reopen_skips_expired_sends_unexpired(monkeypatch):
     assert registration_mail_worker.drain_once(sender=_fake()) == 0
     assert _fake().sent == []
     # 切回 open：只发未过期作业
-    settings_store.set_registration_mode("email_verify_invite_activation",
-                                         updated_by="t")
+    settings_store.set_registration_mode("public", updated_by="t")
     assert registration_mail_worker.drain_once(sender=_fake()) == 1
     sent = _fake().sent
     assert len(sent) == 1 and sent[0][0] == "fresh-open@x.com"
@@ -1637,10 +1035,8 @@ def test_admin_users_identity_email_first_and_search(monkeypatch):
     app_mod.AUTH_ENABLED = True
     client = _client()
     _owner_session(client, owner)
-    # 待激活用户：identity=邮箱
-    out = _enqueue("Iden@X.com")
-    pending = registration_store.verify_email_create_user(
-        out["token"], "longpassword123")["user"]
+    # 待激活用户（存量 pending 行）：identity=邮箱
+    pending, _ = _insert_pending_row("iden@x.com")
     # admin 建号：无 email → identity=login_id
     manual = user_store.create_user("manual-user", "manualpass12345678",
                                     role="user")

@@ -10,7 +10,7 @@
   - 分享三档：无 annotate 权限的 token POST 标注 403；旧 share（无 permissions）行为不变；
   - claim 流程：user 认领后可见受邀切片；share 撤销后 user 失去访问；
   - owner 读隔离（review P0 2026-09-05）：owner 与 user 同一可见模型——
-    自己的 ∪ public ∪ 认领 ∪ 显式授权（管理台 visibility 端点）；写路径
+    自己的 ∪ public ∪ 认领 ∪ 显式授权（管理台 temporary-view 端点）；写路径
     （删除切片/标注、项目管理、分享撤销）owner 语义不变；
   - AUTH_ENABLED=False 内网模式：写语义不变；读按「无稳定 owner user_id →
     可见集为空」形态，不崩溃；
@@ -93,6 +93,18 @@ def _own(name, user_id):
     """设置切片归属（slide_meta.owner_user_id）。"""
     share_store.set_slide_meta(name, owner_user_id=user_id)
 
+def _sid(name):
+    """legacy 名 → slide_id（temporary-view 端点按 ID 寻址）。"""
+    return share_store.get_slide_id(name)
+
+def _temp_start(client, name):
+    """开启管理员临时查看（2026-10-08 §3.1 新契约的收录入口）。"""
+    return client.post("/api/admin/v1/slides/%s/temporary-view" % _sid(name))
+
+def _temp_end(client, name):
+    """结束管理员临时查看。"""
+    return client.delete("/api/admin/v1/slides/%s/temporary-view" % _sid(name))
+
 def _setup_users():
     """创建 owner + userA + userB，注入 owner 归属，返回三元组 user dict。"""
     owner = user_store.create_user("owner@x.com", "ownerpass123456", role="owner")
@@ -174,7 +186,7 @@ def test_cross_user_not_in_slides_list():
 def test_owner_read_isolation_default_denied_grant_then_revoke():
     """owner 读隔离（review P0 2026-09-05）：默认不可见 user 切片。
 
-    列表 + info + region 直访均拒；显式授权（管理台 visibility 端点）后
+    列表 + info + region 直访均拒；管理员临时查看（temporary-view）后
     可见；收回后再次不可见；重复授权幂等。写路径不受影响（见
     test_owner_can_delete_any_annotation）。
     """
@@ -194,33 +206,31 @@ def test_owner_read_isolation_default_denied_grant_then_revoke():
     assert co.get(
         "/api/slide/%s/region?x=0&y=0&w=10&h=10" % sa).status_code == 403
 
-    # 管理台显式授权 a.svs → 可见（列表 + info）
-    r = co.post("/api/admin/v1/slides/%s/visibility" % sa,
-                json={"granted": True})
+    # 管理员临时查看开启 a.svs → 可见（列表 + info；1 小时窗口）
+    r = _temp_start(co, sa)
     assert r.status_code == 200, r.get_data(as_text=True)
-    assert r.get_json()["granted"] is True
-    names = {i["name"] for i in co.get("/api/slides").get_json()}
-    assert sa in names and sb not in names
+    tv = r.get_json()["temporary_view"]
+    assert tv["status"] == "active"
+    assert tv["expires_at"] > r.get_json()["server_now"]
+    items = {i["name"]: i for i in co.get("/api/slides").get_json()}
+    assert sa in items and sb not in items
+    # §3.2：临时查看切片带 temporary_view_expires_at（与开启响应同值）
+    assert items[sa]["temporary_view_expires_at"] == tv["expires_at"]
     # info 不再 403（占位 stub 打不开真切片，info 出口自捕异常返回元数据）
     assert co.get("/api/slide/%s/info" % sa).status_code != 403
 
-    # 幂等：重复授权仍成功且状态不变
-    r = co.post("/api/admin/v1/slides/%s/visibility" % sa,
-                json={"granted": True})
-    assert r.status_code == 200
-    assert r.get_json()["already_granted"] is True
-    names = {i["name"] for i in co.get("/api/slides").get_json()}
-    assert sa in names
+    # 幂等：重复开启不续期（返回原到期时间）
+    r2 = _temp_start(co, sa)
+    assert r2.status_code == 200
+    assert r2.get_json()["temporary_view"]["expires_at"] == tv["expires_at"]
 
-    # 收回 → 再次不可见；幂等收回（无授权）亦成功
-    r = co.post("/api/admin/v1/slides/%s/visibility" % sa,
-                json={"granted": False})
+    # 结束 → 立即不可见；再次结束幂等（status none）
+    r = _temp_end(co, sa)
     assert r.status_code == 200
-    assert r.get_json()["granted"] is False
-    r = co.post("/api/admin/v1/slides/%s/visibility" % sa,
-                json={"granted": False})
+    assert r.get_json()["temporary_view"]["status"] == "ended"
+    r = _temp_end(co, sa)
     assert r.status_code == 200
-    assert r.get_json()["existed"] is False
+    assert r.get_json()["temporary_view"]["status"] == "none"
     names = {i["name"] for i in co.get("/api/slides").get_json()}
     assert sa not in names
     assert co.get("/api/slide/%s/info" % sa).status_code == 403
@@ -248,9 +258,8 @@ def test_owner_content_channels_all_denied_without_grant():
                                       r.get_data(as_text=True)[:120])
     # 聚合列表通道：share/rois 按可见集过滤（200 但不含他人切片标注）
     assert co.get("/api/share/rois").get_json() == []
-    # 加入后内容通道放行（info 不再 403；stub 打不开真切片走元数据出口）
-    assert co.post("/api/admin/v1/slides/%s/visibility" % sa,
-                   json={"granted": True}).status_code == 200
+    # 临时查看开启后内容通道放行（info 不再 403；stub 走元数据出口）
+    assert _temp_start(co, sa).status_code == 200
     assert co.get("/api/slide/%s/info" % sa).status_code != 403
 
 
@@ -287,9 +296,8 @@ def test_owner_public_slide_not_auto_visible_user_still_sees():
     names_b = {i["name"] for i in cb.get("/api/slides").get_json()}
     assert sa in names_b
 
-    # owner 显式加入后可见（管理台收录入口）
-    assert co.post("/api/admin/v1/slides/%s/visibility" % sa,
-                   json={"granted": True}).status_code == 200
+    # owner 开启临时查看后可见（管理台收录入口）
+    assert _temp_start(co, sa).status_code == 200
     names = {i["name"] for i in co.get("/api/slides").get_json()}
     assert sa in names
 
@@ -332,8 +340,7 @@ def test_owner_grant_scoped_per_account_o1_not_affect_o2():
 
     co1 = _client()
     _login(co1, "owner@x.com", "ownerpass123456")
-    assert co1.post("/api/admin/v1/slides/%s/visibility" % sa,
-                    json={"granted": True}).status_code == 200
+    assert _temp_start(co1, sa).status_code == 200
     # O1 收录生效
     names1 = {i["name"] for i in co1.get("/api/slides").get_json()}
     assert sa in names1
@@ -345,19 +352,23 @@ def test_owner_grant_scoped_per_account_o1_not_affect_o2():
         user_store.create_user("owner2@x.com", "owner2pass123456", role="owner")
 
 
-def test_admin_visibility_endpoint_forbidden_and_csrf():
-    """越权与 CSRF 负例：user 打授权端点 403；未登录 401；CSRF 缺失 400。"""
+def test_admin_visibility_endpoint_forbidden_csrf_and_retired():
+    """越权与 CSRF 负例 + 旧 visibility 端点退役（2026-10-08 §3.1）。
+
+    - user 打 temporary-view 端点 403；未登录 401；CSRF 缺失 400；
+    - 旧 /visibility 对 owner 稳定 410 endpoint_retired，不再建任何授权。
+    """
     owner, userA, _b = _setup_users()
     sa = _touch("a.svs")
     _own(sa, userA["user_id"])
+    sid = _sid(sa)
 
     app_mod.app.config["TESTING"] = True
     app_mod.AUTH_ENABLED = True
     # user → 403
     ca = _client()
     _login(ca, "a@x.com", "userApass123456")
-    r = ca.post("/api/admin/v1/slides/%s/visibility" % sa,
-                json={"granted": True})
+    r = ca.post("/api/admin/v1/slides/%s/temporary-view" % sid)
     assert r.status_code == 403, r.get_data(as_text=True)
     # user → inventory 403
     r = ca.get("/api/admin/v1/slides/inventory")
@@ -367,21 +378,29 @@ def test_admin_visibility_endpoint_forbidden_and_csrf():
     anon = csrf_client(app_mod.app.test_client())
     r = anon.get("/api/admin/v1/slides/inventory")
     assert r.status_code == 401
-    r = anon.post("/api/admin/v1/slides/%s/visibility" % sa,
-                  json={"granted": True})
+    r = anon.post("/api/admin/v1/slides/%s/temporary-view" % sid)
     assert r.status_code == 401
 
     # CSRF 负例：登录 owner 后，绕过包装（不带 X-CSRF-Token）的 /api 写 → 400
     co_bare_login = _client()
     _login(co_bare_login, "owner@x.com", "ownerpass123456")
-    r = co_bare_login._base.post("/api/admin/v1/slides/%s/visibility" % sa,
-                                 json={"granted": True})
+    r = co_bare_login._base.post("/api/admin/v1/slides/%s/temporary-view" % sid)
     assert r.status_code == 400, r.get_data(as_text=True)
     assert r.get_json()["error"] == "csrf_required"
 
+    # 旧 visibility 端点退役：owner 调用 → 410 endpoint_retired，不建授权
+    co = _client()
+    _login(co, "owner@x.com", "ownerpass123456")
+    r = co.post("/api/admin/v1/slides/%s/visibility" % sa,
+                json={"granted": True})
+    assert r.status_code == 410, r.get_data(as_text=True)
+    assert r.get_json()["error"]["code"] == "endpoint_retired"
+    names = {i["name"] for i in co.get("/api/slides").get_json()}
+    assert sa not in names
+
 
 def test_admin_inventory_lists_all_and_marks_grants():
-    """inventory：全量切片清单 + 授权/归属/公开/归档标注正确（含无主切片）。"""
+    """inventory：全量切片清单 + 归属/公开/归档/临时查看状态标注（含无主）。"""
     owner, userA, _b = _setup_users()
     sa = _touch("a.svs")
     _own(sa, userA["user_id"])
@@ -398,53 +417,64 @@ def test_admin_inventory_lists_all_and_marks_grants():
     assert set(by_name) == {sa, so, orphan}
     # owner 可见集默认不含 a.svs / orphan.svs（读隔离），但 inventory 全量
     assert by_name[sa]["owner_user_id"] == userA["user_id"]
-    assert by_name[sa]["granted_to_owner"] is False
+    assert by_name[sa]["temporary_view"]["status"] == "none"
     assert by_name[sa]["public"] is False
     assert by_name[sa]["archived"] is False
+    assert "created_at" in by_name[sa]
+    assert isinstance(body["server_now"], float)
+    # 本人切片 → own；无主 → none
+    assert by_name[so]["temporary_view"]["status"] == "own"
     assert by_name[orphan]["owner_user_id"] is None
+    assert by_name[orphan]["temporary_view"]["status"] == "none"
     assert by_name[so]["owner_user_id"] == owner["user_id"]
-    # 授权标注翻转
-    assert co.post("/api/admin/v1/slides/%s/visibility" % orphan,
-                   json={"granted": True}).status_code == 200
+    # 旧授权字段已删除（§3.1）
+    assert "granted_to_owner" not in by_name[sa]
+    assert "grant_recorded" not in by_name[sa]
+    # 临时查看开启 → active（expires_at 给出）
+    assert _temp_start(co, orphan).status_code == 200
     body = co.get("/api/admin/v1/slides/inventory").get_json()
     by_name = {i["name"]: i for i in body["items"]}
-    assert by_name[orphan]["granted_to_owner"] is True
-    # 无主切片经授权恢复可见（孤儿切片可管理）
+    assert by_name[orphan]["temporary_view"]["status"] == "active"
+    assert by_name[orphan]["temporary_view"]["expires_at"] > \
+        body["server_now"]
+    # 无主切片经临时查看恢复可见（孤儿切片可管理）
     names = {i["name"] for i in co.get("/api/slides").get_json()}
     assert orphan in names
 
 
-def test_admin_visibility_requires_body_and_existing_slide():
-    """参数校验：granted 非布尔 400；不存在的切片 404。"""
+def test_admin_temporary_view_not_found_and_own_slide():
+    """temporary-view 参数与状态负例：未知 ID/旧名 404；本人切片 409 own_slide。"""
     owner, _a, _b = _setup_users()
     co = _client()
     _login(co, "owner@x.com", "ownerpass123456")
-    r = co.post("/api/admin/v1/slides/nope.svs/visibility",
-                json={"granted": True})
+    # 未知 slide_id → 404；legacy 名（非 sld_ 前缀）→ 404（只接受 slide_id）
+    r = co.post("/api/admin/v1/slides/sld_nope/temporary-view")
     assert r.status_code == 404
     assert r.get_json()["error"]["code"] == "slide_not_found"
-    sa = _touch("a.svs")
-    r = co.post("/api/admin/v1/slides/%s/visibility" % sa, json={})
-    assert r.status_code == 400
-    assert r.get_json()["error"]["code"] == "invalid_request"
+    r = co.post("/api/admin/v1/slides/nope.svs/temporary-view")
+    assert r.status_code == 404
+    # 本人切片 → 409 own_slide
+    so = _touch("mine.svs")
+    _own(so, owner["user_id"])
+    r = co.post("/api/admin/v1/slides/%s/temporary-view" % _sid(so))
+    assert r.status_code == 409
+    assert r.get_json()["error"]["code"] == "own_slide"
 
 
-def test_admin_visibility_audited():
-    """授权/收回写审计：admin.slide_visibility.grant / revoke。"""
+def test_admin_temporary_view_audited():
+    """开启/结束写审计：admin.slide_temporary_view.start / end。"""
     owner, userA, _b = _setup_users()
     sa = _touch("a.svs")
     _own(sa, userA["user_id"])
     co = _client()
     _login(co, "owner@x.com", "ownerpass123456")
-    assert co.post("/api/admin/v1/slides/%s/visibility" % sa,
-                   json={"granted": True}).status_code == 200
-    assert co.post("/api/admin/v1/slides/%s/visibility" % sa,
-                   json={"granted": False}).status_code == 200
+    assert _temp_start(co, sa).status_code == 200
+    assert _temp_end(co, sa).status_code == 200
     actions = [e["action"] for e in share_store.list_audit(limit=50)]
-    assert "admin.slide_visibility.grant" in actions
-    assert "admin.slide_visibility.revoke" in actions
+    assert "admin.slide_temporary_view.start" in actions
+    assert "admin.slide_temporary_view.end" in actions
     ev = next(e for e in share_store.list_audit(limit=50)
-              if e["action"] == "admin.slide_visibility.grant")
+              if e["action"] == "admin.slide_temporary_view.start")
     assert ev["actor_user_id"] == owner["user_id"]
     assert ev["slide"] == sa
 
@@ -518,15 +548,13 @@ def test_owner_annotation_write_scoped_to_workspace():
     assert _post_anno(co, sa).status_code == 403
     assert _post_anno(co, so).status_code == 200
 
-    # 加入 → 标注生效（矩阵：添加后 owner 既有标注/AI 权限在该切片上生效）
-    assert co.post("/api/admin/v1/slides/%s/visibility" % sa,
-                   json={"granted": True}).status_code == 200
+    # 临时查看开启 → 标注生效（矩阵：加入后 owner 既有标注/AI 权限在该切片上生效）
+    assert _temp_start(co, sa).status_code == 200
     r = _post_anno(co, sa)
     assert r.status_code == 200, r.get_data(as_text=True)
 
-    # 移除 → 再次 403（新请求立即拒绝）
-    assert co.post("/api/admin/v1/slides/%s/visibility" % sa,
-                   json={"granted": False}).status_code == 200
+    # 结束 → 再次 403（新请求立即拒绝）
+    assert _temp_end(co, sa).status_code == 200
     assert _post_anno(co, sa).status_code == 403
 
 
@@ -555,9 +583,8 @@ def test_owner_ai_run_start_requires_workspace():
                    json={"public": True}).status_code == 200
     assert co.post("/api/ai/run", json={"slide": sa}).status_code == 403
 
-    # 加入后进入后续流程（无凭据 → 400 配置指导，说明已通过权限闸）
-    assert co.post("/api/admin/v1/slides/%s/visibility" % sa,
-                   json={"granted": True}).status_code == 200
+    # 临时查看开启后进入后续流程（无凭据 → 400 配置指导，说明已通过权限闸）
+    assert _temp_start(co, sa).status_code == 200
     r = co.post("/api/ai/run", json={"slide": sa})
     assert r.status_code in (400, 503), r.get_data(as_text=True)
 

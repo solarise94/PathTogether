@@ -272,25 +272,26 @@ def _mk_owner():
     return owner
 
 
-def _redeem_new_user(login_id, ai_access=False):
-    """走真实邀请兑换创建一个 ai_access 模板可控的注册用户。"""
+def _provision_new_user(login_id, ai_access=False):
+    """建号组合原语创建 ai_access 可控的注册用户（2026-10-08 §4：邀请兑换
+    退役，建号统一走 user_store 单轨原语）。"""
+    import user_store_pg
     owner = _mk_owner()
-    inv = registration_store.create_invite(
-        owner["user_id"], login_id=login_id, ai_access=ai_access)
-    out = registration_store.redeem_invite(inv["token"], login_id,
-                                           "userpass1234567")
-    return out["user"], inv
+    user, allowance = user_store_pg.create_user_with_total_allowance(
+        login_id, "userpass1234567", ai_access=ai_access,
+        actor_user_id=owner["user_id"])
+    return user, allowance
 
 
-def test_invited_user_default_ai_access_false():
-    u, _inv = _redeem_new_user("noai@x.com", ai_access=False)
+def test_provisioned_user_ai_access_false():
+    u, _allowance = _provision_new_user("noai@x.com", ai_access=False)
     assert u["ai_access"] is False
     row = user_store.get_user(u["user_id"])
     assert row["ai_access"] is False
 
 
-def test_invited_user_ai_access_template_true():
-    u, _inv = _redeem_new_user("withai@x.com", ai_access=True)
+def test_provisioned_user_ai_access_true():
+    u, _allowance = _provision_new_user("withai@x.com", ai_access=True)
     assert u["ai_access"] is True
 
 
@@ -304,8 +305,8 @@ def test_ai_access_gate_blocks_and_grants(monkeypatch):
     """_ai_reserve_run_budget：ai_access=false → 403 ai_access_required；
     owner 授予（user_store_pg.set_user_ai_access）后恢复预占。"""
     import user_store_pg
-    denied_user, _inv = _redeem_new_user("gate@x.com", ai_access=False)
-    ok_user, _inv2 = _redeem_new_user("gate-ok@x.com", ai_access=True)
+    denied_user, _inv = _provision_new_user("gate@x.com", ai_access=False)
+    ok_user, _inv2 = _provision_new_user("gate-ok@x.com", ai_access=True)
     # 平台凭据可用（绕过真实平台配置读取）
     monkeypatch.setattr(
         app_mod, "_resolve_ai_credentials",
@@ -341,7 +342,7 @@ def test_ai_access_gate_blocks_and_grants(monkeypatch):
 def test_ai_access_gate_read_error_fails_closed(monkeypatch):
     """P0-B review 修复：ai_access 用户行读取异常 → fail-closed 503
     （ai_access=false 的用户不能因一次读库抖动获得平台 AI 访问）。"""
-    u, _inv = _redeem_new_user("gate-err@x.com", ai_access=True)
+    u, _inv = _provision_new_user("gate-err@x.com", ai_access=True)
     monkeypatch.setattr(
         app_mod, "_resolve_ai_credentials",
         lambda ctx: ("platform", {"base_url": "http://127.0.0.1:9/v1",
@@ -363,7 +364,7 @@ def test_ai_access_admin_api(monkeypatch):
     """POST /api/admin/v1/users/<id>/ai-access：owner-only + CSRF + 持久化。"""
     from _pt_helpers import csrf_client
     owner = _mk_owner()
-    u, _inv = _redeem_new_user("api-ai@x.com", ai_access=False)
+    u, _inv = _provision_new_user("api-ai@x.com", ai_access=False)
     app_mod.app.config["TESTING"] = True
     app_mod.AUTH_ENABLED = True
     client = csrf_client(app_mod.app.test_client())

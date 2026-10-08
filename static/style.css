@@ -4487,9 +4487,13 @@ button {
 }
 .canvas-slide-label[hidden] { display: none; }
 
-/* ---------- 顶栏搜索/分享按钮：图标+文字，窄屏由 .tb-txt 规则收成图标 ---------- */
+/* ---------- 顶栏搜索/分享按钮：图标+文字，窄屏由 .tb-txt 规则收成图标 ----------
+   溢出收放的「收图标」步骤（改版二评）：折入 ⋯ 之前的过渡档——只留图标，
+   语义由 aria-label/title 保留。 */
 .tb-search-btn,
 .tb-share-btn { flex-shrink: 0; }
+#toolbar .tool-btn.tb-icon-only { padding-left: 9px; padding-right: 9px; }
+#toolbar .tool-btn.tb-icon-only .tb-txt { display: none; }
 .tb-search-btn[aria-expanded="true"],
 .tb-share-btn[aria-expanded="true"] {
   background: var(--accent-fill);

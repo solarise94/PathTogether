@@ -9320,52 +9320,92 @@
   var tbCurrentTier = null;
 
   // 改版 2026-10-08：「搜索/分享」两个新按钮的溢出收放——不进静态档位表，
-  // 每次布局后先归位、再按 #toolbar 实测溢出（scrollWidth vs clientWidth）
-  // 逐个折入 ⋯ 菜单。打开切片后画质/RGB/mpp 控件出现、1440 档基线本就贴边
-  // （实测 base@1440 溢出 28px），静态档位盖不住，必须实测。
-  // 候选按档位分级：先收本轮新增的「分享/搜索」，仍溢出再收低频既有控件
-  //（桌面=1:1；手机=原始RGB标识/1:1/视图组）——只在实测溢出时收，全部可经
-  // ⋯ 菜单触达（基线 66cfa29c 在 1440/390 打开切片时本就溢出 28/179px，
-  // 实测见交付说明；此收放使各档位都不再有裁切）。
-  function tbOverflowCandidates(tier) {
-    var mine = ["tb-share-btn", "tb-search-btn"];
-    if (tier === "mobile") {
-      return mine.concat(["rgb-badge", "zoom-native", "view-tools-group"]);
+  // 每次布局后按 #toolbar 实测溢出（scrollWidth vs clientWidth）套用收放步骤。
+  // 二评修订：步骤按产品优先级——低频控件先让位（原始 RGB 标识 → mpp → 1:1 →
+  // 保存标记 → 标准/精细 → 镜像/视图组），然后 搜索/分享 收成图标（aria-label
+  // /title 保留语义），最后万不得已才折 分享、搜索。AI 与账户 chip 永不折叠。
+  // 迟滞式回退（不溢出才从最后一步起逐步复原，每步复测；applied 恒为步骤
+  // 前缀）防抖动；openSlide 成功/清理路径延时重测 + #toolbar ResizeObserver
+  // 捕捉画质/RGB/mpp 控件异步出现。
+  var tbFoldSteps = null;
+
+  function tbBuildFoldSteps() {
+    var more = els.tbbMore;
+    function foldStep(id) {
+      return {
+        applied: false,
+        apply: function () {
+          var el = document.getElementById(id);
+          if (!el || more.contains(el)) return; // 已在 ⋯（档位表折过/无内容）
+          el.__tbOverflowFolded = true;
+          tbMoveIntoMore(el, more);
+        },
+        revert: function () {
+          var el = document.getElementById(id);
+          if (!el || !el.__tbOverflowFolded) return;
+          tbRestore(el);
+          el.__tbOverflowFolded = false;
+        },
+      };
     }
-    return mine.concat(["zoom-native"]);
+    // 搜索/分享收成图标（一对一步；title/aria-label 不变）
+    var iconStep = {
+      applied: false,
+      apply: function () {
+        ["tb-search-btn", "tb-share-btn"].forEach(function (id) {
+          var el = document.getElementById(id);
+          if (el) el.classList.add("tb-icon-only");
+        });
+      },
+      revert: function () {
+        ["tb-search-btn", "tb-share-btn"].forEach(function (id) {
+          var el = document.getElementById(id);
+          if (el) el.classList.remove("tb-icon-only");
+        });
+      },
+    };
+    return (tbFoldSteps = [
+      foldStep("rgb-badge"),
+      foldStep("mpp-setter"),
+      foldStep("zoom-native"),
+      foldStep("save-anno-btn"),
+      foldStep("quality-control"),
+      foldStep("flip-btn"),
+      foldStep("view-tools-group"),
+      iconStep,
+      foldStep("tb-share-btn"),
+      foldStep("tb-search-btn"),
+    ]);
   }
 
-  function tbApplyOverflowFold(more, tier) {
-    var candidates = tbOverflowCandidates(tier);
+  function tbApplyOverflowFold() {
+    var more = els.tbbMore;
+    if (!more) return;
+    var steps = tbBuildFoldSteps();
     var toolbar = more.parentNode;
     if (!toolbar || !toolbar.clientWidth || !toolbar.scrollWidth) return;
     function overflowPx() { return toolbar.scrollWidth - toolbar.clientWidth; }
-    // 仍溢出：按候选次序继续折（折入 ⋯ 菜单 = 仍可触达）
-    var i = 0;
     var guard = 0;
-    while (overflowPx() > 1 && guard < 8) {
+    // 仍溢出：按优先级套用下一步
+    while (overflowPx() > 1 && guard < 12) {
       guard += 1;
-      var el = document.getElementById(candidates[i]);
-      if (!el) break;
-      if (el.parentNode === more || el.hidden) {
-        i += 1;
-        if (i >= candidates.length) break;
-        continue;
+      var next = null;
+      for (var s = 0; s < steps.length; s++) {
+        if (!steps[s].applied) { next = steps[s]; break; }
       }
-      el.__tbOverflowFolded = true;
-      tbMoveIntoMore(el, more);
+      if (!next) break;
+      next.apply();
+      next.applied = true;
     }
-    // 不溢出：从最后一名起逐个放开，每放一个复测（迟滞，防抖动）
-    for (var j = candidates.length - 1; j >= 0; j--) {
-      var el2 = document.getElementById(candidates[j]);
-      if (!el2 || !el2.__tbOverflowFolded) continue;
-      tbRestore(el2);
+    // 不溢出：从最后一步起回退，每退一步复测（迟滞；applied 恒为前缀）
+    for (var j = steps.length - 1; j >= 0; j--) {
+      if (!steps[j].applied) continue;
+      steps[j].revert();
       if (overflowPx() > 1) {
-        el2.__tbOverflowFolded = true;
-        tbMoveIntoMore(el2, more);
+        steps[j].apply();
         break;
       }
-      el2.__tbOverflowFolded = false;
+      steps[j].applied = false;
     }
   }
 
@@ -9388,7 +9428,7 @@
       if (wantFolded) tbMoveIntoMore(el, more);
       else tbRestore(el);
     });
-    tbApplyOverflowFold(more, tier);
+    tbApplyOverflowFold();
     // 档位类名（幂等）：CSS 据此隐藏悬空分隔线等
     var toolbar = more.parentNode;
     if (toolbar && toolbar.classList) {

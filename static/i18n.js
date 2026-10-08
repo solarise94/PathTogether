@@ -476,11 +476,8 @@
       "entry.account.aria": "账户菜单",
       "entry.workbench.login": "登录工作台",
       "entry.register": "没有账号？注册账号",
-      "entry.register.invite": "有邀请码？注册账号",
       "entry.register.closed.note": "已有账号可登录；暂未开放注册",
       "entry.register.public.note": "验证邮箱并设置密码即可使用",
-      "entry.register.verify.note": "验证邮箱并提交申请，审核通过后即可使用",
-      "entry.register.invite.note": "注册需管理员发放的邀请码",
       "entry.demo.hint": "Demo 无需登录；上传自己的切片请先登录工作台。",
       "entry.footer": "从区域定位到计量分析，协助研究者更快开展病理研究。",
 
@@ -507,9 +504,7 @@
       "entry.start.kicker": "开始",
       "entry.start.title": "如何开始",
       "entry.start.s1.title": "注册账号",
-      "entry.start.s1.body": "验证邮箱并提交申请，管理员审核通过后即可使用。",
       "entry.start.s1.body.public": "验证邮箱并设置密码，即可创建账号。",
-      "entry.start.s1.body.invite": "使用管理员发放的邀请码创建账号。",
       "entry.start.s1.body.closed": "暂未开放注册。已有账号可直接登录；没有账号也可以先体验 Demo。",
       "entry.start.s2.title": "登录工作台",
       "entry.start.s2.body": "使用你的账号登录，进入个人工作台。",
@@ -550,16 +545,13 @@
       "entry.suite.github": "GitHub →",
       "entry.footer.copy": "© 2026 HistoPilot",
 
-      // ---- 注册弹窗（R2 2026-09-19：统一登录/注册弹窗；独立 register 页已删） ----
+      // ---- 注册弹窗（R2 2026-09-19：统一登录/注册弹窗；独立 register 页已删；
+      //      2026-10-08 §4：邀请码注册退役——只剩 public 表单 + closed 关闭态） ----
       // 关闭态（含 fail-closed 降级）：无可提交表单，仅说明
-      "register.badge": "邀请注册",
-      "register.title": "当前采用邀请注册",
-      "register.desc": "测试账号由管理员创建。如果你已收到账号，请直接登录。",
-      "register.back": "返回登录",
-      "register.demo": "先体验 Demo",
-      // 弹窗注册视图通用
+      "register.title.closed": "当前未开放注册",
+      "register.desc.closed": "注册暂未开放。如果你已有账号，请直接登录。",
+      // 弹窗注册视图（public）
       "register.dialog.title": "注册 HistoPilot",
-      "register.dialog.subtitle": "验证邮箱并提交申请，管理员审核通过后即可使用。",
       "register.dialog.subtitle.public": "验证邮箱并设置密码，即可开始使用。",
       "register.agreement.accept": "我已阅读并接受",
       "register.agreement.terms": "《用户协议与数据处理说明》",
@@ -584,22 +576,6 @@
       "register.dialog.sent.hint": "请在 30 分钟内点击邮件中的链接完成验证；未收到可稍后重试或检查垃圾邮件。",
       "register.dialog.again": "重新填写邮箱",
       "register.dialog.have_account": "已有账号？登录",
-      // 邀请码注册表单（密码口径：账户系统批次 A 统一 15..200，docs §3.3；
-      // 登录账号 login_id 为邀请绑定的登录账号，批次 C docs §8.2；显示名仅
-      // 展示不用于登录；key 名 register.invite.email 为不透明标识符，保持不动）
-      "register.invite.code": "邀请码",
-      "register.invite.code.ph": "粘贴管理员发送的邀请码",
-      "register.invite.email": "登录账号（邮箱）",
-      "register.invite.email.ph": "邀请码绑定的登录账号",
-      "register.invite.display": "显示名（可选，仅展示）",
-      "register.invite.display.ph": "其他人看到的名字（不用于登录，也不作为身份）",
-      "register.invite.password": "设置密码",
-      "register.invite.password.ph": "至少 15 位，推荐使用密码管理器生成的长口令",
-      "register.invite.password.hint": "至少 15 位，可直接使用密码管理器生成并粘贴；不要求大小写或符号组合。",
-      "register.invite.confirm": "确认密码",
-      "register.invite.submit": "创建账号",
-      "register.invite.submitting": "创建中…",
-
       // ---- 注册防刷状态机与求助（2026-10-08 设计 §5/§7；zh 默认值与
       //      _login_dialog.html / registration_help.html 模板默认一致） ----
       "register.state.submitted.title": "验证邮件请求已提交",
@@ -1262,51 +1238,6 @@
       "verify.err.generic": "验证失败，请稍后重试",
       "verify.err.network": "网络异常，请稍后重试",
       "verify.footer": "仅用于研究、教学和软件演示，不用于临床诊断。",
-      // 申请表单（verify / activate 两页共用）
-      "verify.apply.direction.legend": "研究方向",
-      "verify.apply.direction.model_plant": "模式植物",
-      "verify.apply.direction.model_animal": "模式动物",
-      "verify.apply.direction.clinical_pathology": "临床病理",
-      "verify.apply.direction.other": "其他",
-      "verify.apply.direction.required": "请选择研究方向",
-      "verify.apply.share.label": "我愿意向研究团队分享我的切片、分析结果及使用行为数据，用于软件改进和科学研究。",
-      "verify.apply.share.hint": "此项为自愿选择，不影响测试申请审批，之后可在账号设置中更改。",
-      "verify.apply.submit": "申请测试",
-      "verify.apply.submitting": "提交中…",
-      "verify.apply.err.generic": "提交失败，请稍后重试",
-      "verify.apply.err.network": "网络异常，请稍后重试",
-
-      // ---- 激活页：申请测试（默认）/ 邀请码激活 两种方式 ----
-      "activate.badge": "激活账号",
-      "activate.title": "选择激活方式",
-      "activate.desc": "你的邮箱已完成验证。两种方式可用：申请测试——提交后由管理员审核，通过即可使用；或使用管理员发放的邀请码直接激活。",
-      "activate.tab.apply": "申请测试",
-      "activate.tab.invite": "邀请码激活",
-      "activate.state.checking": "正在获取申请状态…",
-      "activate.state.load.fail": "暂时无法获取申请状态，请刷新重试",
-      "activate.state.none.desc": "请选择研究方向并提交测试申请，管理员审核通过后即可开始使用。",
-      "activate.state.pending.desc": "申请已提交，请等待管理员审核。",
-      "activate.state.rejected.desc": "你之前的测试申请未通过。如需了解详情，请联系管理员；也可以调整选择后重新申请。",
-      "activate.state.approved.desc": "申请已通过，账号已激活。请用你的邮箱密码重新登录。",
-      "activate.state.approved.login": "前往登录",
-      "activate.state.invite_activated.desc": "你的账号已通过邀请码激活，无需再等待审核。请用你的邮箱密码重新登录。",
-      "activate.state.auth.desc": "登录状态已更新或失效，请重新登录查看。",
-      "activate.state.auth.login": "重新登录",
-      "activate.state.refresh": "刷新状态",
-      "activate.reapply": "重新申请",
-      "activate.invite.hint": "已有邀请码？直接激活。",
-      "activate.invite.code": "邀请码",
-      "activate.invite.code.ph": "粘贴管理员发送的邀请码",
-      "activate.invite.identity.hint": "身份由当前登录会话推导，无需填写邮箱。",
-      "activate.invite.submit": "激活账号",
-      "activate.invite.activating": "激活中…",
-      "activate.invite.need_code": "请填写邀请码",
-      "activate.invite.err.auth": "登录状态已失效，请重新登录后再试（重新登录后即可重试激活）",
-      "activate.invite.err.generic": "激活失败，请稍后重试",
-      "activate.err.network": "网络异常，请稍后重试",
-      "activate.logout": "退出当前会话",
-      "activate.footer": "仅用于研究、教学和软件演示，不用于临床诊断。",
-
       // ---- C3 切片格式转换工具页（/tools/slides） ----
       "entry.nav.slides": "切片格式转换工具",
       "entry.converter.title": "切片格式转换工具 →",
@@ -2064,11 +1995,8 @@
       "entry.account.aria": "Account",
       "entry.workbench.login": "Sign in to workspace",
       "entry.register": "No account? Sign up",
-      "entry.register.invite": "Have an invite code? Sign up",
       "entry.register.closed.note": "Sign in if you have an account; sign-up is currently closed",
       "entry.register.public.note": "Verify your email and set a password to get started",
-      "entry.register.verify.note": "Verify your email and submit a request; access is granted after review",
-      "entry.register.invite.note": "Sign-up requires an invite code from the administrator",
       "entry.demo.hint": "The Demo needs no login; to upload your own slides, sign in to the workspace.",
       "entry.footer": "From region discovery to quantitative analysis, helping researchers move pathology studies forward.",
 
@@ -2095,9 +2023,7 @@
       "entry.start.kicker": "Start",
       "entry.start.title": "How to get started",
       "entry.start.s1.title": "Create an account",
-      "entry.start.s1.body": "Verify your email and submit a request; access is granted after review.",
       "entry.start.s1.body.public": "Verify your email and set a password to create your account.",
-      "entry.start.s1.body.invite": "Create an account with an invite code from the administrator.",
       "entry.start.s1.body.closed": "Registration is not open yet. Sign in if you already have an account, or try the Demo first.",
       "entry.start.s2.title": "Sign in to the workspace",
       "entry.start.s2.body": "Sign in with your account and open your workspace.",
@@ -2139,16 +2065,13 @@
       "entry.footer.copy": "© 2026 HistoPilot",
 
       // ---- Register dialog (R2 2026-09-19: unified login/register dialog;
-      //      the standalone register page has been removed) ----
+      //      the standalone register page has been removed; 2026-10-08 §4:
+      //      invite-code sign-up retired — public form + closed notice only) ----
       // Closed state (incl. fail-closed downgrade): no submittable form, notice only
-      "register.badge": "Invite-only",
-      "register.title": "Registration is currently invite-only",
-      "register.desc": "Test accounts are created by the administrator. If you already received an account, just log in.",
-      "register.back": "Back to login",
-      "register.demo": "Try the Demo first",
-      // Dialog register view (shared)
+      "register.title.closed": "Registration is not open yet",
+      "register.desc.closed": "Sign-up is not open at the moment. If you already have an account, just log in.",
+      // Dialog register view (public)
       "register.dialog.title": "Sign up for HistoPilot",
-      "register.dialog.subtitle": "Verify your email and submit an application — you can start once an administrator approves it.",
       "register.dialog.subtitle.public": "Verify your email and set a password to start right away — no admin approval needed.",
       "register.agreement.accept": "I have read and accept the",
       "register.agreement.terms": "User Agreement and Data Processing Notice",
@@ -2173,23 +2096,6 @@
       "register.dialog.sent.hint": "Open the link in the email within 30 minutes to finish verification. Didn't get it? Try again later or check your spam folder.",
       "register.dialog.again": "Re-enter email",
       "register.dialog.have_account": "Already have an account? Log in",
-      // Invite-code registration form (password policy: account batch A unified
-      // 15..200, docs §3.3; login_id form field means the invite-bound login ID,
-      // batch C docs §8.2; display name is display-only and never used for login;
-      // key name register.invite.email stays as an opaque identifier)
-      "register.invite.code": "Invite code",
-      "register.invite.code.ph": "Paste the invite code from the administrator",
-      "register.invite.email": "Login ID (email)",
-      "register.invite.email.ph": "Login ID bound to the invite",
-      "register.invite.display": "Display name (optional, display only)",
-      "register.invite.display.ph": "Name shown to others (not used for login, not an identity)",
-      "register.invite.password": "Set password",
-      "register.invite.password.ph": "At least 15 characters; a long passphrase from a password manager is recommended",
-      "register.invite.password.hint": "At least 15 characters. Paste from a password manager is fine; no character-class requirements.",
-      "register.invite.confirm": "Confirm password",
-      "register.invite.submit": "Create account",
-      "register.invite.submitting": "Creating…",
-
       // ---- Registration anti-abuse state machine & author help (design
       //      2026-10-08 §5/§7; zh defaults mirror the template text) ----
       "register.state.submitted.title": "Verification email requested",
@@ -2854,51 +2760,6 @@
       "verify.err.generic": "Verification failed, please try again later",
       "verify.err.network": "Network error, please try again later",
       "verify.footer": "For research, teaching and software demonstration only; not for clinical diagnosis.",
-      // Application form (shared by the verify / activate pages)
-      "verify.apply.direction.legend": "Research direction",
-      "verify.apply.direction.model_plant": "Model plant",
-      "verify.apply.direction.model_animal": "Model animal",
-      "verify.apply.direction.clinical_pathology": "Clinical pathology",
-      "verify.apply.direction.other": "Other",
-      "verify.apply.direction.required": "Please choose a research direction",
-      "verify.apply.share.label": "I agree to share my slide images, analysis results, and usage behavior data with the research team for software improvement and scientific research.",
-      "verify.apply.share.hint": "Optional. Does not affect application review. You can change this later in account settings.",
-      "verify.apply.submit": "Apply for testing",
-      "verify.apply.submitting": "Submitting…",
-      "verify.apply.err.generic": "Submission failed, please try again later",
-      "verify.apply.err.network": "Network error, please try again later",
-
-      // ---- Activate page: test application (default) / invite code ----
-      "activate.badge": "Activate account",
-      "activate.title": "Choose how to activate",
-      "activate.desc": "Your email is verified. Two options: apply for testing — an administrator reviews it and you can start once approved; or activate directly with an invite code from the administrator.",
-      "activate.tab.apply": "Test application",
-      "activate.tab.invite": "Invite code",
-      "activate.state.checking": "Loading application status…",
-      "activate.state.load.fail": "Could not load application status; please refresh and retry",
-      "activate.state.none.desc": "Choose a research direction and submit your test application; you can start once an administrator approves it.",
-      "activate.state.pending.desc": "Application submitted. Please wait for an administrator to review it.",
-      "activate.state.rejected.desc": "Your previous application was not approved. Contact the administrator for details, or adjust your choices and apply again.",
-      "activate.state.approved.desc": "Application approved — your account is active. Sign in again with your email and password.",
-      "activate.state.approved.login": "Go to login",
-      "activate.state.invite_activated.desc": "Your account was activated with an invite code — no review needed. Sign in again with your email and password.",
-      "activate.state.auth.desc": "Your login state has changed or expired. Please sign in again to check.",
-      "activate.state.auth.login": "Sign in again",
-      "activate.state.refresh": "Refresh status",
-      "activate.reapply": "Apply again",
-      "activate.invite.hint": "Already have an invite code? Activate directly.",
-      "activate.invite.code": "Invite code",
-      "activate.invite.code.ph": "Paste the invite code from the administrator",
-      "activate.invite.identity.hint": "Identity comes from your current session; no email needed.",
-      "activate.invite.submit": "Activate account",
-      "activate.invite.activating": "Activating…",
-      "activate.invite.need_code": "Please enter the invite code",
-      "activate.invite.err.auth": "Your session has expired. Please sign in again and retry activation.",
-      "activate.invite.err.generic": "Activation failed, please try again later",
-      "activate.err.network": "Network error, please try again later",
-      "activate.logout": "Sign out of this session",
-      "activate.footer": "For research, teaching and software demonstration only; not for clinical diagnosis.",
-
       // ---- C3 slide format converters page (/tools/slides) ----
       "entry.nav.slides": "Slide format converter",
       "entry.converter.title": "Slide format converter →",

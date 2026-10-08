@@ -30,36 +30,15 @@ from _pt_helpers import isolate_app  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-DIRECTION_VALUES = ("model_plant", "model_animal",
-                    "clinical_pathology", "other")
-DIRECTION_KEYS = tuple("verify.apply.direction.%s" % v for v in DIRECTION_VALUES)
-
 VERIFY_KEYS = (
     "verify.badge", "verify.valid.title", "verify.valid.desc",
     "verify.password", "verify.password.ph", "verify.password_confirm",
     "verify.err.pw.mismatch", "verify.err.pw.length",
     "verify.err.generic", "verify.err.network", "verify.footer",
-) + DIRECTION_KEYS + (
-    "verify.apply.direction.legend", "verify.apply.direction.required",
-    "verify.apply.share.label", "verify.apply.share.hint",
-    "verify.apply.submit", "verify.apply.submitting",
-    "verify.apply.err.generic", "verify.apply.err.network",
 )
-ACTIVATE_KEYS = (
-    "activate.badge", "activate.title", "activate.desc",
-    "activate.tab.apply", "activate.tab.invite",
-    "activate.state.checking", "activate.state.load.fail",
-    "activate.state.none.desc", "activate.state.pending.desc",
-    "activate.state.rejected.desc", "activate.state.approved.desc",
-    "activate.state.approved.login", "activate.state.refresh",
-    "activate.state.invite_activated.desc", "activate.state.auth.desc",
-    "activate.state.auth.login", "activate.reapply",
-    "activate.invite.hint", "activate.invite.code", "activate.invite.code.ph",
-    "activate.invite.identity.hint", "activate.invite.submit",
-    "activate.invite.activating", "activate.invite.need_code",
-    "activate.invite.err.auth", "activate.invite.err.generic",
-    "activate.err.network", "activate.logout", "activate.footer",
-)
+# 2026-10-08 §4：activate.* 与 verify.apply.*（申请测试表单/激活页）键
+# 已随模板删除从 i18n.js 移除（zh/en 同删；见 static/i18n.js）
+RETIRED_KEY_FAMILIES = ("activate.", "verify.apply.")
 
 
 @pytest.fixture(autouse=True)
@@ -169,14 +148,18 @@ def test_i18n_verify_activate_keys_bilingual():
     i18n = (REPO_ROOT / "static" / "i18n.js").read_text(encoding="utf-8")
     zh_block = i18n[i18n.index("zh: {"):i18n.index("en: {")]
     en_block = i18n[i18n.index("en: {"):]
-    for key in VERIFY_KEYS + ACTIVATE_KEYS:
+    for key in VERIFY_KEYS:
         assert '"%s"' % key in zh_block, "i18n.js zh 缺键：%r" % key
         assert '"%s"' % key in en_block, "i18n.js en 缺键：%r" % key
-    # 数据分享中英文案（产品指定原文）
-    assert "我愿意向研究团队分享我的切片、分析结果及使用行为数据" in zh_block
-    assert ("I agree to share my slide images, analysis results, and usage "
-            "behavior data with the research team") in en_block
-    assert "Optional. Does not affect application review." in en_block
+    # 退役键族不得残留（zh/en 都删）
+    import re as _re
+    for prefix in RETIRED_KEY_FAMILIES:
+        assert not _re.search(r'"%s[A-Za-z0-9_.]*"' % _re.escape(prefix),
+                              zh_block), "zh 残留退役键族 %r" % prefix
+        assert not _re.search(r'"%s[A-Za-z0-9_.]*"' % _re.escape(prefix),
+                              en_block), "en 残留退役键族 %r" % prefix
+        assert "我愿意向研究团队分享" not in zh_block
+        assert "Does not affect application review" not in en_block
 
 
 if __name__ == "__main__":

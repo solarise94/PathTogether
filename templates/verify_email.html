@@ -217,7 +217,7 @@
          不再建 pending 账号，引导重新走公开注册（链接本身不消费）。 -->
     <h1 class="title"><span>注册流程已更新</span> <span class="state-bad">✕</span></h1>
     <p class="desc">此验证链接属于旧版注册流程，已不再使用。请返回注册页重新开始公开注册；已完成注册的账号可直接登录。</p>
-    <a class="btn secondary" href="/register" data-i18n="verify.error.retry">重新注册</a>
+    <a class="btn secondary" href="/register" data-i18n="verify.error.retry">重新请求验证邮件</a>
     <a class="btn secondary" href="/login" data-i18n="verify.error.consumed.login">前往登录</a>
     {% endif %}
     {% elif state == "expired" %}
@@ -247,7 +247,6 @@
       if (!form) { return; }
       var btn = document.getElementById("verify-submit");
       var errBox = document.getElementById("verify-error");
-      var isPublic = !!document.getElementById("pub-terms-version");
       function t(key, fallback) {
         try {
           var s = window.HP_I18N && HP_I18N.t(key);
@@ -258,8 +257,7 @@
         errBox.textContent = msg;
         errBox.style.display = "";
         btn.disabled = false;
-        btn.textContent = isPublic ? "完成注册"
-                                   : t("verify.apply.submit", "申请测试");
+        btn.textContent = "完成注册";
       }
       form.addEventListener("submit", function (ev) {
         ev.preventDefault();
@@ -274,33 +272,23 @@
           password: pw,
           password_confirm: form.password_confirm.value
         };
-        if (isPublic) {
-          // P1 public：必选协议实质变化时，重新勾选是提交前置（§3.3.4）
-          var termsRe = document.getElementById("terms_re");
-          if (termsRe && !termsRe.checked) {
-            fail("请先重新阅读并勾选《用户协议与数据处理说明》（必选）"); return;
-          }
-          var researchOpt = document.getElementById("research_opt");
-          payload.research_opt_in = !!(researchOpt && researchOpt.checked);
-          if (termsRe) {
-            payload.terms_version = document.getElementById("pub-terms-version").value;
-            payload.terms_sha256 = document.getElementById("pub-terms-sha256").value;
-          }
-          if (payload.research_opt_in) {
-            payload.research_version = document.getElementById("pub-research-version").value;
-            payload.research_sha256 = document.getElementById("pub-research-sha256").value;
-          }
-        } else {
-          // 前端先校验拦截：研究方向必选（后端 submit_tx 亦权威校验）
-          var direction = form.querySelector('input[name="research_direction"]:checked');
-          if (!direction) {
-            fail(t("verify.apply.direction.required", "请选择研究方向")); return;
-          }
-          payload.research_direction = direction.value;
-          payload.share_research_data = form.share_research_data.checked;
+        // P1 public：必选协议实质变化时，重新勾选是提交前置（§3.3.4）
+        var termsRe = document.getElementById("terms_re");
+        if (termsRe && !termsRe.checked) {
+          fail("请先重新阅读并勾选《用户协议与数据处理说明》（必选）"); return;
+        }
+        var researchOpt = document.getElementById("research_opt");
+        payload.research_opt_in = !!(researchOpt && researchOpt.checked);
+        if (termsRe) {
+          payload.terms_version = document.getElementById("pub-terms-version").value;
+          payload.terms_sha256 = document.getElementById("pub-terms-sha256").value;
+        }
+        if (payload.research_opt_in) {
+          payload.research_version = document.getElementById("pub-research-version").value;
+          payload.research_sha256 = document.getElementById("pub-research-sha256").value;
         }
         btn.disabled = true;
-        btn.textContent = t("verify.apply.submitting", "提交中…");
+        btn.textContent = "提交中…";
         fetch("/api/registration/verify", {
           method: "POST",
           credentials: "same-origin",

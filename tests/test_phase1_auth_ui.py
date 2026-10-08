@@ -576,10 +576,10 @@ def test_entry_landing_source_guards():
         "entry.signed.hint", "entry.demo", "entry.demo.hint",
         "entry.badge",
         "entry.hero.title", "entry.hero.lead",
-        # Hero 双入口 + 注册文字入口（按注册模式区分）
-        "entry.workbench.login", "entry.register", "entry.register.invite",
+        # Hero 双入口 + 注册文字入口（closed/public 两态；2026-10-08 §4：
+        # 邀请码分支与文案已删）
+        "entry.workbench.login", "entry.register",
         "entry.register.closed.note", "entry.register.public.note",
-        "entry.register.verify.note", "entry.register.invite.note",
         # 账户头像 disclosure
         "entry.account.aria",
         # 工作台预览图与 HTML 图外标注
@@ -589,9 +589,8 @@ def test_entry_landing_source_guards():
         "entry.workbench.cap.ai",
         # 如何开始四步
         "entry.start.kicker", "entry.start.title", "entry.start.note",
-        "entry.start.s1.title", "entry.start.s1.body",
-        "entry.start.s1.body.public", "entry.start.s1.body.invite",
-        "entry.start.s1.body.closed",
+        "entry.start.s1.title",
+        "entry.start.s1.body.public", "entry.start.s1.body.closed",
         "entry.start.s2.title", "entry.start.s2.body",
         "entry.start.s3.title", "entry.start.s3.body",
         "entry.start.s4.title", "entry.start.s4.body",
@@ -928,26 +927,28 @@ def test_i18n_register_dialog_keys_bilingual():
     en_block = i18n[i18n.index("en: {"):]
     keys = (
         "login.register",
-        "register.title", "register.desc",
-        "register.dialog.title", "register.dialog.subtitle",
+        # 2026-10-08 §4：邀请码注册退役——closed 态说明 + public 表单键；
+        # register.invite.* / register.title / register.desc /
+        # register.dialog.subtitle（旧审核文案）已删除
+        "register.title.closed", "register.desc.closed",
+        "register.dialog.title",
         "register.dialog.subtitle.public",
         "register.dialog.email", "register.dialog.email.ph",
         "register.dialog.email.hint", "register.dialog.submit",
         "register.dialog.submitting", "register.dialog.sent.title",
         "register.dialog.sent", "register.dialog.sent.hint",
         "register.dialog.again", "register.dialog.have_account",
-        "register.invite.code", "register.invite.code.ph",
-        "register.invite.email", "register.invite.email.ph",
-        "register.invite.display", "register.invite.display.ph",
-        "register.invite.password", "register.invite.password.ph",
-        "register.invite.password.hint", "register.invite.confirm",
-        "register.invite.submit", "register.invite.submitting",
     )
     for key in keys:
         assert '"%s"' % key in zh_block, "i18n.js zh 缺键：%r" % key
         assert '"%s"' % key in en_block, "i18n.js en 缺键：%r" % key
+    # 退役键不得残留（zh/en 都删）
+    for key in ("register.invite.code", "register.title", "register.desc",
+                "register.dialog.subtitle", "register.badge"):
+        assert '"%s"' % key not in zh_block, "i18n.js zh 残留退役键：%r" % key
+        assert '"%s"' % key not in en_block, "i18n.js en 残留退役键：%r" % key
     # R2 核心文案（zh 默认 + en 对应）
-    assert "验证邮箱并提交申请，管理员审核通过后即可使用。" in zh_block
+    assert "验证邮箱并设置密码，即可开始使用。" in zh_block
     assert "验证邮件已发送，请查收。" in zh_block
     assert "Verification email sent. Please check your inbox." in en_block
 
@@ -1101,23 +1102,16 @@ def test_entry_register_entry_state_matrix(monkeypatch):
     assert "验证邮箱并设置密码，即可创建账号。" in public  # 如何开始第一步
     assert public.count('href="/register"') == 3  # Hero + 账户面板 + 弹窗切换
 
-    verify = _body("email_verify")
-    assert "没有账号？注册账号" in verify
-    assert "验证邮箱并提交申请，审核通过后即可使用" in verify
-    assert "验证邮箱并提交申请，管理员审核通过后即可使用。" in verify
-
-    invite = _body("invite_only")
-    assert "有邀请码？注册账号" in invite
-    assert "注册需管理员发放的邀请码" in invite
-    assert "使用管理员发放的邀请码创建账号。" in invite
-    assert "没有账号？注册账号" not in invite          # 不宣传开放注册
-
+    # 2026-10-08 §4：只剩 closed/public——email_verify/invite_only 模式与
+    # 邀请码文案已从模板删除（unreachable 分支）
     closed = _body("closed")
     assert "已有账号可登录；暂未开放注册" in closed
     assert closed.count('data-i18n="entry.register.closed.note"') == 2  # Hero + 面板
     assert 'href="/register"' not in closed.split('login-dialog')[0]     # Hero/面板无注册链接
-    # 四模式共同：Hero 主入口始终为登录工作台（/login?next=/app）
-    for mode_body in (public, verify, invite, closed):
+    # 渲染产物（含 HTML 注释）不残留邀请码语义
+    assert "邀请码" not in closed
+    # 两模式共同：Hero 主入口始终为登录工作台（/login?next=/app）
+    for mode_body in (public, closed):
         assert mode_body.count('href="/login?next=/app"') == 2
         assert 'data-i18n="entry.workbench.login"' in mode_body
         assert 'href="/demo"' in mode_body

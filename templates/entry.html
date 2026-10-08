@@ -67,9 +67,7 @@
           </form>
           {% else %}
           <a class="account-link" href="/login?next=/app" data-i18n="entry.workbench.login">登录工作台</a>
-          {% if registration_mode == "invite_only" %}
-          <a class="account-link" href="/register" data-i18n="entry.register.invite">有邀请码？注册账号</a>
-          {% elif registration_mode == "closed" %}
+          {% if registration_mode == "closed" %}
           <p class="account-note" data-i18n="entry.register.closed.note">已有账号可登录；暂未开放注册</p>
           {% else %}
           <a class="account-link" href="/register" data-i18n="entry.register">没有账号？注册账号</a>
@@ -98,18 +96,11 @@
           <a class="btn btn-secondary" href="/demo" data-i18n="entry.demo">直接体验 Demo</a>
           <p class="hero-hint" data-i18n="entry.demo.hint">Demo 无需登录；上传自己的切片请先登录工作台。</p>
           <p class="hero-register">
-            {% if registration_mode == "invite_only" %}
-            <a href="/register" data-i18n="entry.register.invite">有邀请码？注册账号</a>
-            <span class="hero-register-note" data-i18n="entry.register.invite.note">注册需管理员发放的邀请码</span>
-            {% elif registration_mode == "closed" %}
+            {% if registration_mode == "closed" %}
             <span data-i18n="entry.register.closed.note">已有账号可登录；暂未开放注册</span>
             {% else %}
             <a href="/register" data-i18n="entry.register">没有账号？注册账号</a>
-            {% if registration_mode == "public" %}
             <span class="hero-register-note" data-i18n="entry.register.public.note">验证邮箱并设置密码即可使用</span>
-            {% else %}
-            <span class="hero-register-note" data-i18n="entry.register.verify.note">验证邮箱并提交申请，审核通过后即可使用</span>
-            {% endif %}
             {% endif %}
           </p>
           {% endif %}
@@ -158,12 +149,8 @@
           <h3 data-i18n="entry.start.s1.title">注册账号</h3>
           {% if registration_mode == "closed" %}
           <p data-i18n="entry.start.s1.body.closed">暂未开放注册。已有账号可直接登录；没有账号也可以先体验 Demo。</p>
-          {% elif registration_mode == "invite_only" %}
-          <p data-i18n="entry.start.s1.body.invite">使用管理员发放的邀请码创建账号。</p>
-          {% elif registration_mode == "public" %}
-          <p data-i18n="entry.start.s1.body.public">验证邮箱并设置密码，即可创建账号。</p>
           {% else %}
-          <p data-i18n="entry.start.s1.body">验证邮箱并提交申请，管理员审核通过后即可使用。</p>
+          <p data-i18n="entry.start.s1.body.public">验证邮箱并设置密码，即可创建账号。</p>
           {% endif %}
         </li>
         <li class="step">

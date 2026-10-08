@@ -6241,75 +6241,15 @@ def api_research_viewer_events():
 
 @app.route("/api/registration/resend", methods=["POST"])
 def api_registration_resend():
-    """验证邮件重发（受限）：与 start 同事务入队 + 同配额 + 同一文案。
+    """退役（2026-10-08 §4）：旧 email_verify 形态的 JSON 重发接口下线。
 
-    匿名可调（enrollment 白名单同样放行——pending 用户换邮箱重新走验证属
-    新请求）。body: {email}；对未知/已存在/超限邮箱一律同一响应（反枚举）。
-    P1-2：入队写前重查生效模式——注册暂停时统一 403 registration_closed
-    （只暂停：不写队列、不发邮件、不动已有 token）。
-    IP 前缀限流（review 2026-09-14 附带观察加固）：本端点对任意邮箱统一
-    ok，若无 IP 维度闸，单一来源即可用数十个不同邮箱把应用级日预算
-    （VERIFY_APP_DAILY_BUDGET）耗尽，当天所有真实注册静默收不到验证邮件。
-    与 POST /register 共用同一 reg_ip_daily 桶（24 小时 30 次尝试，成功也
-    计——两入口都是「触发一封验证邮件」的同一动作面）；锁定时同样统一
-    ok 响应（IP 维度信息不构成邮箱枚举信号），仅不再入队。
+    该端点只服务于 email_verify_invite_activation 模式（已从词表移除，
+    永远 403）；public 流程的主动重发是 POST /register/resend（表单 +
+    Turnstile + submission_id 幂等，见 register_resend）。对任何已登录/
+    匿名调用方稳定 410 endpoint_retired，不写队列、不动任何 token。
     """
-    # P1-2：写前重查生效模式（与 activate/verify-start 共用同一权威判定）
-    if _effective_registration_mode() != \
-            registration_store.MODE_EMAIL_VERIFY_INVITE_ACTIVATION:
-        return jsonify(error="注册当前未开放，请稍后再试",
-                       code="registration_closed"), 403
-    # IP 前缀限流（与 register POST 同款原语；存储不可用 fail-closed 503）
-    import auth_limit_store
-    ip_hash = _ip_prefix_hash(request.remote_addr or "")
-    try:
-        retry = auth_limit_store.check_registration_locked(ip_hash)
-        if retry <= 0:
-            retry = auth_limit_store.record_registration_attempt(ip_hash)
-    except Exception:
-        app.logger.exception("重发限流存储不可用，fail-closed 503")
-        return _registration_unavailable_response()
-    if retry > 0:
-        app.logger.warning(
-            "验证邮件重发被 IP 限流吸收（锁定剩余 %d 秒，不入队）", retry)
-        return jsonify(ok=True)
-    # 2026-10-08 设计 §7/§11：本端点可触发新验证邮件投递——
-    # REGISTRATION_TURNSTILE_REQUIRED 时必须通过校验（JSON body 的
-    # cf-turnstile-response 同样接受）；失败/不可用 fail-closed 不入队，
-    # 响应仍统一 ok（无枚举信号）
-    if _turnstile_guard(registration_antibot.ACTION_REGISTRATION_RESEND) \
-            is not None:
-        app.logger.warning("验证邮件重发被 Turnstile 拦截（不入队）")
-        return jsonify(ok=True)
-    if request.is_json:
-        body = request.get_json(silent=True) or {}
-    else:
-        body = request.form
-    email = (body.get("email") or "").strip()
-    # §6：生产部署未知 Host 不发验证邮件（中性 ok，无枚举信号）
-    if _registration_entry_site().get("refused"):
-        app.logger.warning(
-            "验证邮件重发被入口映射拒绝（host=%s，不入队）",
-            registration_antibot.request_hostname(request.host) or "-")
-        return jsonify(ok=True)
-    try:
-        registration_store.enqueue_email_verification(
-            email, base_url=_registration_email_base_url(),
-            form_locale=(body.get("form_locale") or "zh"))
-    except registration_store.EmailVerifyError as exc:
-        if exc.code == "bad_input":
-            return jsonify(error="请输入有效的邮箱地址",
-                           code="invalid_request"), 400
-        app.logger.warning("验证邮件重发被统一文案吸收（code=%s）", exc.code)
-    except Exception:
-        app.logger.exception("验证邮件重发入队异常（统一文案）")
-    else:
-        try:
-            registration_mail_worker.drain_async()
-        except Exception:
-            app.logger.warning("重发邮件即时排水启动失败（留待 worker）",
-                               exc_info=True)
-    return jsonify(ok=True)
+    return jsonify(error="该注册重发入口已退役：请返回注册页重新开始",
+                   code="endpoint_retired"), 410
 
 
 # =========================================================================== #
@@ -11352,7 +11292,10 @@ def admin_v1_slide_temporary_view_end(slide_id):
             "无法结束临时查看授权")
     grant_key = (desc.legacy_filename or desc.slide_id) if desc else ref
     try:
-        status = share_store.end_slide_view_grant(owner_uid, grant_key)
+        status = share_store.end_slide_view_grant(
+            owner_uid, grant_key,
+            slide_id=(desc.slide_id if desc else
+                      (ref if ref.startswith("sld_") else None)))
     except Exception:
         app.logger.exception("admin temporary-view 结束失败：%s", ref)
         return _admin_v1_error(500, "internal", "临时查看结束失败")

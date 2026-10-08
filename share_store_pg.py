@@ -734,8 +734,12 @@ def start_slide_view_grant_timed(user_id, slide_name, granted_by=None,
 
     - 已有 ``expires_at > now()`` 的授权 → 原样返回（``started=False``，
       **不续期**——重复开启返回原到期，天然幂等）；
-    - 否则 upsert：``granted_at=now(), expires_at=now()+ttl, granted_by,
-      slide_id``（过期行被重新开启 = 新窗口，granted_at 一并刷新）。
+    - 否则刷新授权窗口：``granted_at=now(), expires_at=now()+ttl,
+      granted_by, slide_id``（过期行被重新开启 = 新窗口）。
+
+    行寻址以 (slide_id, user_id) 唯一索引（0067）为权威：同一主体对同一
+    slide_id 至多一行（历史行可能以 legacy 名或 slide_id 为 slide_name 键，
+    混合键形态在锁内归一刷新，绝不插第二行）。
 
     返回 ``{"started", "granted_at", "expires_at"}``（epoch 秒）。
     """
@@ -753,17 +757,40 @@ def start_slide_view_grant_timed(user_id, slide_name, granted_by=None,
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                cur.execute(
-                    "SELECT extract(epoch from granted_at)::float8 AS "
-                    "granted_at, extract(epoch from expires_at)::float8 AS "
-                    "expires_at FROM slide_view_grants "
-                    "WHERE slide_name=%s AND user_id=%s AND expires_at > now()",
-                    (slide_name, user_id))
-                row = cur.fetchone()
-                if row is not None:
-                    return {"started": False,
-                            "granted_at": row["granted_at"],
-                            "expires_at": row["expires_at"]}
+                # 权威行：该主体对该 slide_id 的行（任意键形态）
+                if slide_id:
+                    cur.execute(
+                        "SELECT slide_name, extract(epoch from granted_at)::"
+                        "float8 AS granted_at, extract(epoch from expires_at)"
+                        "::float8 AS expires_at FROM slide_view_grants "
+                        "WHERE user_id=%s AND slide_id=%s FOR UPDATE",
+                        (user_id, slide_id))
+                    row = cur.fetchone()
+                    if row is not None:
+                        if row["expires_at"] > time.time():
+                            return {"started": False,
+                                    "granted_at": row["granted_at"],
+                                    "expires_at": row["expires_at"]}
+                        # 过期：原地刷新窗口（新 granted_at/expires_at；
+                        # slide_name 归一为当前键——历史行可能以 slide_id
+                        # 字符串为名键，按名读路径依赖与 legacy 名一致）
+                        cur.execute(
+                            "UPDATE slide_view_grants SET slide_name=%s, "
+                            "granted_by=%s, slide_id=%s, granted_at=now(), "
+                            "expires_at=now() + (%s * interval '1 second') "
+                            "WHERE user_id=%s AND slide_id=%s RETURNING "
+                            "extract(epoch from granted_at)::float8 AS "
+                            "granted_at, extract(epoch from expires_at)::"
+                            "float8 AS expires_at",
+                            (slide_name, granted_by or None, slide_id, ttl,
+                             user_id, slide_id))
+                        r2 = cur.fetchone()
+                        return {"started": True,
+                                "granted_at": r2["granted_at"],
+                                "expires_at": r2["expires_at"]}
+                # 无 (slide_id, user) 行：按 (slide_name, user) upsert
+                # （孤儿/历史 NULL-ID 形态；命中唯一索引冲突不可达——上面
+                # 已按 slide_id 归一）
                 cur.execute(
                     "INSERT INTO slide_view_grants "
                     "(slide_name, user_id, granted_by, slide_id, granted_at, "
@@ -779,19 +806,21 @@ def start_slide_view_grant_timed(user_id, slide_name, granted_by=None,
                     "expires_at",
                     (slide_name, user_id, granted_by or None,
                      slide_id or None, ttl))
-                row = cur.fetchone()
+                r3 = cur.fetchone()
+                # 本分支必然开新窗口（新行或同键过期行刷新）
                 return {"started": True,
-                        "granted_at": row["granted_at"],
-                        "expires_at": row["expires_at"]}
+                        "granted_at": r3["granted_at"],
+                        "expires_at": r3["expires_at"]}
     finally:
         conn.close()
 
 
-def end_slide_view_grant(user_id, slide_name):
+def end_slide_view_grant(user_id, slide_name, slide_id=None):
     """管理员临时查看「结束」（2026-10-08 §3.1；幂等）。
 
     把该主体对该切片**未到期**的授权 ``expires_at`` 置为 now()（已到期/无行
-    不动）。返回 "ended"（确有未到期授权被结束）或 "none"（幂等重放）。
+    不动）。按 slide_id（权威，0067 唯一索引）命中，缺省回退 slide_name。
+    返回 "ended"（确有未到期授权被结束）或 "none"（幂等重放）。
     """
     if not isinstance(user_id, str) or not user_id:
         raise ValueError("user_id 不能为空")
@@ -801,10 +830,17 @@ def end_slide_view_grant(user_id, slide_name):
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                cur.execute(
-                    "UPDATE slide_view_grants SET expires_at=now() "
-                    "WHERE slide_name=%s AND user_id=%s AND expires_at > now()",
-                    (slide_name, user_id))
+                if slide_id:
+                    cur.execute(
+                        "UPDATE slide_view_grants SET expires_at=now() "
+                        "WHERE user_id=%s AND (slide_id=%s OR slide_name=%s) "
+                        "AND expires_at > now()",
+                        (user_id, slide_id, slide_name))
+                else:
+                    cur.execute(
+                        "UPDATE slide_view_grants SET expires_at=now() "
+                        "WHERE slide_name=%s AND user_id=%s "
+                        "AND expires_at > now()", (slide_name, user_id))
                 return "ended" if cur.rowcount > 0 else "none"
     finally:
         conn.close()

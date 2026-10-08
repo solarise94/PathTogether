@@ -1877,17 +1877,40 @@
     armTempViewTimer(state.slide);
   }
 
+  // ---------- 无切片基线状态（初始 / 删除 / 临时到期共用） ----------
+  // 关闭画面并把 UI 回落到「从未打开切片」的初始口径：空态卡回归、画布标签
+  // 清空、缩放徽章复位「—」、画质档与通道 chrome（通道钮/RGB 徽章/面板）
+  // 隐藏——任何切片上下文控件都不得残留。
+  function enterNoSlideUiState() {
+    state.slide = null;
+    state.mppX = null;
+    state.roiMode = null;
+    clearTempViewTimer();
+    updateDocTitle(null);
+    updateMppSetterVisibility();
+    if (roiBox) exitRoi();
+    if (viewer) viewer.close();
+    clearBaseThumb();
+    updateCanvasSlideLabel();
+    updateViewerEmptyState();
+    // 缩放徽章直接复位到初始模板口径（不依赖 OSD close 后的内部状态）
+    if (els.zoomBadge) els.zoomBadge.textContent = "—";
+    if (els.headerZoomBadge) els.headerZoomBadge.textContent = "—";
+    // 通道钮/RGB 徽章/通道面板回初始隐藏（destroy 同时作废在途响应；
+    // 下一次 handleInfo 开头会再次 destroy，复用安全）
+    if (channelCtrl && channelCtrl.destroy) channelCtrl.destroy();
+    // 画质档（标准/精细）隐藏并清当前 display 状态
+    if (window.HP_ViewerEncoding && HP_ViewerEncoding.resetForClose) {
+      HP_ViewerEncoding.resetForClose();
+    }
+    // 上下文控件消失/出现 → 顶栏重测溢出折放
+    setTimeout(function () { try { applyToolbarTier(); } catch (e) {} }, 150);
+  }
+
   function endTemporaryView() {
     clearTempViewTimer();
     var cur = state.slide;
-    // 关闭画面（与 deleteSlide 清屏同口径）
-    state.slide = null;
-    state.mppX = null;
-    updateDocTitle(null);
-    updateMppSetterVisibility();
-    updateCanvasSlideLabel();
-    if (roiBox) exitRoi();
-    if (viewer) viewer.close();
+    enterNoSlideUiState();
     // 本地标记已结束：卡片与缩略图立即移除，再从 /api/slides 拉权威状态
     //（到期后服务端不再下发该切片；DEF-3 验收要求「刷新列表」）
     if (cur && (cur.id || cur.name)) {
@@ -1897,7 +1920,6 @@
     renderFolderBrowser();
     toast(t("tempview.ended"), "info");
     reloadProjectsAndUnfiled().catch(function () {});
-    setTimeout(function () { try { applyToolbarTier(); } catch (e) {} }, 150);
   }
 
   // ---------- 当前切片名画布标签（§5.1：紧凑标签，不新增第二行） ----------
@@ -6879,14 +6901,8 @@
         if (!r.ok) return r.json().then(function (j) { throw new Error(j.error); });
         if (state.slide && (byId ? state.slide.id === slideId
                                  : state.slide.name === legacyName)) {
-          state.slide = null; state.mppX = null; state.roiMode = null;
-          clearTempViewTimer();
-          updateDocTitle(null);
-          updateMppSetterVisibility();
-          updateCanvasSlideLabel();
-          if (roiBox) exitRoi();
-          if (viewer) viewer.close();
-          setTimeout(function () { try { applyToolbarTier(); } catch (e) {} }, 150);
+          // 与临时到期共用同一无切片基线（空态卡回归 + 顶栏上下文复位）
+          enterNoSlideUiState();
         }
         toast(t("del.slide.done", { name: name }), "success");
         loadAll();

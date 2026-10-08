@@ -585,6 +585,10 @@ describe("临时查看到期（§5.5）", () => {
 		expect(toastTexts).toContain("tempview.ended");
 		// 画布标签清空
 		expect(h.els["canvas-slide-label"].hidden).toBe(true);
+		// 回到「未打开切片」基线：空态卡回归、缩放徽章复位（顶栏无残留切片上下文）
+		expect(h.els["viewer-empty"].hidden).toBe(false);
+		expect(h.els["zoom-badge"].textContent).toBe("—");
+		expect(h.els["header-zoom-badge"].textContent).toBe("—");
 	});
 
 	it("DEF-3：info 不带标记时回读列表标记 → 到期 403 仍清屏 + 临时提示 + 列表刷新", async () => {
@@ -619,6 +623,10 @@ describe("临时查看到期（§5.5）", () => {
 		expect(refetched.length).toBeGreaterThan(0);
 		// 临时文件夹已被列表移除
 		expect(fbFolders(h).some((c) => c.dataset.pid === "__temp__")).toBe(false);
+		// 403 清屏路径同一基线：空态卡回归、缩放徽章复位
+		expect(h.els["viewer-empty"].hidden).toBe(false);
+		expect(h.els["zoom-badge"].textContent).toBe("—");
+		expect(h.els["header-zoom-badge"].textContent).toBe("—");
 	});
 
 	it("403/404（服务端拒绝）→ 同口径清屏；普通切片 404 维持报错不清屏", async () => {

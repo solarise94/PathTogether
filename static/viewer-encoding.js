@@ -292,6 +292,14 @@
     } catch (e) { /* 测试环境无 document */ }
   }
 
+  /* 无切片基线（删除/临时到期等清屏路径共用）：隐藏画质档并清当前 display
+     状态——与「从未打开切片」初始口径一致；下一次 info.display 到达时由
+     handleDisplay 重建。 */
+  function resetForClose() {
+    resetState();
+    renderControl();
+  }
+
   root.HP_ViewerEncoding = {
     PROFILE_RGB_STANDARD: PROFILE_RGB_STANDARD,
     PROFILE_RGB_DETAIL: PROFILE_RGB_DETAIL,
@@ -306,6 +314,7 @@
     setPreference: setPreference,
     installConflictRecovery: installConflictRecovery,
     mount: mount,
+    resetForClose: resetForClose,
     // 测试辅助
     _state: state,
   };

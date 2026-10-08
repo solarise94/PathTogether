@@ -375,6 +375,9 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 			.toContainText("2.50 CNY（2500000000 nano）");
 		await expect(frame.locator("#adm-drawer-confirm"))
 			.toContainText("不清零、不重置");
+		await expect(frame.locator("#adm-drawer-confirm button", { hasText: "确认执行" })).toBeVisible();
+		await expect(frame.locator("#adm-drawer-confirm"))
+			.toContainText("不清零、不重置");
 		await frame.locator("#adm-drawer-confirm button", { hasText: "确认执行" }).click();
 		await expect(frame.locator("#adm-drawer-body"))
 			.toContainText("已设置总额度 2.50 CNY", { timeout: 10_000 });
@@ -382,9 +385,17 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 			.toContainText("不重置已用金额", { timeout: 10_000 });
 		await frame.locator("#adm-drawer-close").click();
 		await expect(frame.locator("#adm-user-drawer")).toBeHidden();
-		// 表内剩余列同步刷新为 2.50 CNY（绝对总上限已更新）
+		// 2026-10-08 §2：额度语义只在「详情」抽屉（主表四列不含额度）——
+		// 重开抽屉验证 CAS 结果：剩余 2.50 CNY、已用金额保留不被重置
 		const row2 = frame.locator("#adm-users-tbody tr", { hasText: "e2e-limited@pt.test" });
-		await expect(row2).toContainText("剩余 2.50 CNY", { timeout: 10_000 });
+		await row2.locator("button", { hasText: "详情" }).click();
+		await expect(frame.locator("#adm-user-drawer")).toBeVisible();
+		await expect(frame.locator("#adm-drawer-body"))
+			.toContainText("剩余 2.50 CNY", { timeout: 10_000 });
+		await expect(frame.locator("#adm-drawer-body"))
+			.toContainText("累计已用");
+		await frame.locator("#adm-drawer-close").click();
+		await expect(frame.locator("#adm-user-drawer")).toBeHidden();
 	});
 
 	test("10e. 金额用尽后的可见状态：抽屉把总额度存为 0 → 剩余显示已用尽", async ({ page }) => {
@@ -417,6 +428,49 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 		await expect(frame.locator("#adm-drawer-body"))
 			.not.toContainText("下次预占将被拒绝");
 		await frame.locator("#adm-drawer-close").click();
+	});
+
+	test("10g. 切片页：管理员临时查看（开启 1 小时 → 剩余 60 分钟 → 行内结束确认 → 已结束）", async ({ page }) => {
+		await login(page, CREDS.ownerLogin, CREDS.ownerPassword);
+		await page.goto("/admin");
+		await expect(hostStatus(page)).toHaveAttribute(
+			"data-admin-host-state", "ready", { timeout: 5000 });
+		const frame = page.frameLocator("#admin-plugin-frame");
+		await frame.locator('.adm-nav-btn[data-page="slides"]').click();
+		await expect
+			.poll(async () =>
+				frame.locator("#adm-state-slides").getAttribute("data-page-state"))
+			.toBe("ready", { timeout: 10_000 });
+		// e2e_server 预置普通用户（e2e-user@pt.test）名下的 servable 切片
+		const row = frame.locator("#adm-slides-tbody tr", { hasText: "e2e-temp-view.tif" });
+		await expect(row).toBeVisible({ timeout: 10_000 });
+		// 初始未开启；开启 1 小时后行内出现「查看 / 结束查看」与剩余分钟数
+		await expect(row).toContainText("未开启");
+		const slideRequests: string[] = [];
+		page.on("request", (r) => {
+			const u = r.url();
+			if (u.includes("/api/admin/v1/slides")) {
+				slideRequests.push(r.method() + " " + new URL(u).pathname);
+			}
+		});
+		await row.locator("button", { hasText: "开启 1 小时" }).click();
+		await expect(row).toContainText("可查看 · 剩余 60 分钟", { timeout: 10_000 });
+		expect(slideRequests.some((r) => r.startsWith("POST /api/admin/v1/slides/")))
+			.toBe(true);
+		// 「结束查看」：确认控件行内渲染在操作单元格内（DEF-4），确认前
+		// 桥上零请求（无任何 DELETE 发出）
+		await row.locator("button", { hasText: "结束查看" }).click();
+		const cell = row.locator("td.adm-actions-cell");
+		await expect(cell).toContainText("确认结束");
+		await expect(cell).toContainText("取消");
+		const deleteCount = () =>
+			slideRequests.filter((r) => r.startsWith("DELETE ")).length;
+		expect(deleteCount()).toBe(0);
+		// 确认结束 → DELETE temporary-view 发出 → 行转「已结束」可重新开启
+		await cell.locator("button", { hasText: "确认结束" }).click();
+		await expect(row).toContainText("已结束", { timeout: 10_000 });
+		await expect(row).toContainText("开启 1 小时");
+		expect(deleteCount()).toBe(1);
 	});
 
 	test("9. plugin reload re-establishes ready with a fresh nonce", async ({ page }) => {
@@ -834,10 +888,11 @@ test.describe("UI 升级 2026-09-01 — 桌面 1440×900（批次 E）", () => {
       expect(inside, `tab cycle ${i}`).toBe(true);
     }
     // 取消（比真实禁用更安全的回归路径）→ 确认条清空、用户未被禁用
+    //（2026-10-08 §2：启用状态在「详情」抽屉内，不在主表四列）
     await confirmBox.locator("button", { hasText: "取消" }).click();
     await expect(confirmBox).toBeHidden();
-    await expect(frame.locator("#adm-users-tbody tr", { hasText: "e2e-user@pt.test" }))
-      .toContainText("启用", { timeout: 10_000 });
+    await expect(frame.locator("#adm-drawer-body")).toContainText("启用",
+      { timeout: 10_000 });
     // Esc 仍可关闭抽屉
     await page.keyboard.press("Escape");
     await expect(drawer).toBeHidden();

@@ -102,11 +102,65 @@ def main():
     spend_store.set_total_default(50_000_000_000, 1, updated_by="e2e-seed")
 
     import user_store_pg
-    user_store_pg.create_user_with_total_allowance(
+    # 返回 (public_user_dict, allowance)——取 dict（含 user_id）供切片种子
+    e2e_user, _ = user_store_pg.create_user_with_total_allowance(
         "e2e-user@pt.test", user_pw, display_name="E2E 普通用户")
     user_store_pg.create_user_with_total_allowance(
         "e2e-limited@pt.test", secrets.token_urlsafe(24),
         display_name="E2E 限额用户", total_limit_nano_cny=3_500_000_000)
+
+    # 2026-10-08 admin 切片页 E2E（admin-workbench 临时查看用例）：给普通
+    # 用户名下一张 servable（id_bundle ready）切片——owner 侧「管理员临时
+    # 查看」开启/结束流程需要非本人切片。离线受管理发布通道（pytest
+    # _pt_helpers.publish_test_slide 同款：allocate + staging 落盘 +
+    # publish_standalone，不走上传任务状态机、不结算配额）。**刻意内联**
+    # 而不 import _pt_helpers：其 import 链（pg_compat → conftest）会另起
+    # 一个 conftest 内嵌 PG 并覆写 DATABASE_URL，污染本进程的 e2e 实例。
+    import hashlib
+    import psycopg.rows
+    import pg_store
+    import slide_publish
+    import slide_storage
+    import slide_store
+
+    def _seed_slide_for_e2e_user():
+        try:
+            import tifffile  # requirements-dev 锁定；缺失时退化占位字节
+        except ImportError:
+            tifffile = None
+        if tifffile is not None:
+            import io
+            import numpy as np
+            img = (np.indices((64, 96)).sum(axis=0) % 256).astype(np.uint8)
+            rgb = np.stack([img, img[::-1], img[:, ::-1]], axis=-1)
+            buf = io.BytesIO()
+            tifffile.imwrite(buf, rgb, photometric="rgb", tile=(32, 32))
+            data = buf.getvalue()
+        else:  # openslide stub 不读内容：发布链只校验 manifest/哈希
+            data = b"e2e-seed-slide-bytes"
+        conn = pg_store.connect()
+        conn.row_factory = psycopg.rows.dict_row
+        try:
+            with pg_store.transaction(conn):
+                desc = slide_store.allocate_slide(
+                    owner_user_id=e2e_user["user_id"],
+                    original_filename="e2e-temp-view.tif",
+                    format_ext="tif", conn=conn)
+        finally:
+            conn.close()
+        staging = slide_storage.staging_dir(
+            "tst-" + secrets.token_hex(8), "1")
+        staging.mkdir(parents=True, exist_ok=True)
+        (staging / "data.tif").write_bytes(data)
+        sha = hashlib.sha256(data).hexdigest()
+        manifest_ = slide_publish.build_manifest("data.tif", len(data), sha)
+        slide_publish.publish_standalone(
+            desc.slide_id, manifest_, staging, sha256=sha,
+            accounted_bytes=len(data))
+        print("e2e seed slide: %s (owner %s)" % (desc.slide_id,
+                                                 e2e_user["login_id"]))
+
+    _seed_slide_for_e2e_user()
 
     creds_path = os.environ.get("E2E_CREDS_FILE") or os.path.join(
         tempfile.gettempdir(), "pt-e2e-creds-%d.json" % args.port)

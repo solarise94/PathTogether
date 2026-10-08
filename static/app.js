@@ -1712,11 +1712,18 @@
       .then(function (res) {
         if (seq !== openSlideSeq) return; // 晚到的旧响应：丢弃
         // 临时查看切片被服务端拒绝（403/404=到期或无权读取，§5.5）：清屏提示。
-        // 仅对「当前打开的、带临时标记」的切片生效；其余切片维持原报错路径。
-        if ((res.status === 403 || res.status === 404) && state.slide &&
+        // 临时标记来源（DEF-3，集成验收）：info 不带 temporary_view_expires_at
+        // 时回读最近一次 /api/slides 列表项——两条路任一命中即按到期处理；
+        // 其余切片维持原报错路径。
+        var listedInfo = findSlideInfo(ref);
+        var tempMarked = (state.slide &&
             String(state.slide.id || state.slide.name) === String(ref) &&
-            state.slide.temporaryViewExpiresAt) {
+            state.slide.temporaryViewExpiresAt) ||
+          (listedInfo && listedInfo.temporary_view_expires_at);
+        if ((res.status === 403 || res.status === 404) && tempMarked) {
           endTemporaryView();
+          // 列表权威刷新（到期后服务端不再下发该切片）
+          reloadProjectsAndUnfiled().catch(function () {});
           return;
         }
         var info = res.info;
@@ -1842,13 +1849,15 @@
     updateCanvasSlideLabel();
     if (roiBox) exitRoi();
     if (viewer) viewer.close();
-    // 本地标记已结束：卡片与缩略图立即移除（下次 /api/slides 拉到权威状态）
+    // 本地标记已结束：卡片与缩略图立即移除，再从 /api/slides 拉权威状态
+    //（到期后服务端不再下发该切片；DEF-3 验收要求「刷新列表」）
     if (cur && (cur.id || cur.name)) {
       var s = findSlideInfo(cur.id || cur.name);
       if (s) s.__tempEnded = true;
     }
     renderFolderBrowser();
     toast(t("tempview.ended"), "info");
+    reloadProjectsAndUnfiled().catch(function () {});
     setTimeout(function () { try { applyToolbarTier(); } catch (e) {} }, 150);
   }
 
@@ -2640,7 +2649,7 @@
       allSlides = results[0] || [];
       allProjects = results[1] || [];
       renderFolderBrowser();
-      renderShareList((results[2] && results[2].shares) || []);
+      renderShareList(shareListFrom(results[2]));
     }).catch(function (e) {
       toast(t("load.fail", { e: e }), "error");
     });
@@ -2660,10 +2669,17 @@
     });
   }
 
+  // DEF-5（2026-10-08 集成验收）：/api/share/list 现返回裸数组，旧后端/契约
+  // 返回 {shares:[...]}——两种形状都接受，避免列表恒为「暂无分享」。
+  function shareListFrom(data) {
+    if (Array.isArray(data)) return data;
+    return (data && data.shares) || [];
+  }
+
   function reloadShares() {
     return apiFetch("/api/share/list")
       .then(function (r) { return r.json(); })
-      .then(function (data) { renderShareList((data && data.shares) || []); });
+      .then(function (data) { renderShareList(shareListFrom(data)); });
   }
 
   // 渲染单个切片信息块（用于项目行、未归类项、选择器项）
@@ -3353,9 +3369,10 @@
     if (els.fbDelete) els.fbDelete.addEventListener("click", function () {
       var p = fbProject(fbState.folder);
       if (!p) return;
-      // 确认框说明：子文件夹回到根、切片不删（§5.3）
+      // 确认框说明：子文件夹回到根、切片不删（§5.3）——仅此一层确认
+      //（DEF-1：不再叠加 deleteProject 的旧版「删除项目」确认）
       if (!confirm(t("fb.del.confirm", { name: p.name || "" }))) return;
-      deleteProject(p);
+      deleteProject(p, { skipConfirm: true });
     });
     // 窗口高度变化 → 可用高度变化 → 叠大小重算（rAF 节流，翻页不变）
     window.addEventListener("resize", function () {
@@ -3792,8 +3809,11 @@
   }
 
   // ---------- 删除项目 ----------
-  function deleteProject(p) {
-    if (!confirm(t("delproj.confirm", { name: (p.name || "") }))) return;
+  // 改版后唯一入口是文件夹 ⋯ 删除（已弹「子文件夹回根、切片不删」的专用
+  // 确认）——skipConfirm 跳过旧版「删除项目」二次确认（DEF-1：双层 confirm）。
+  function deleteProject(p, opts) {
+    opts = opts || {};
+    if (!opts.skipConfirm && !confirm(t("delproj.confirm", { name: (p.name || "") }))) return;
     apiFetch("/api/project/" + encodeURIComponent(p.pid), { method: "DELETE" })
       .then(function (r) {
         if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || t("delproj.fail")); });

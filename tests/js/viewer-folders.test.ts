@@ -515,6 +515,16 @@ describe("搜索（§5.4）", () => {
 	});
 });
 
+	/** 到期后让 /api/slides 不再下发某张切片（模拟服务端门禁的列表口径）。 */
+	function hideSlideFromList(h: { routes: Map<string, () => RouteResult> }, sid: string) {
+		const prev = h.routes.get("/api/slides")!;
+		h.routes.set("/api/slides", () => {
+			const out = prev();
+			const body = (out.body as Array<Record<string, unknown>>).filter((s) => s.slide_id !== sid);
+			return { status: 200, body };
+		});
+	}
+
 describe("临时查看到期（§5.5）", () => {
 	function seedTemp(s: Seedable, expiresAt: string) {
 		const slides = [
@@ -551,6 +561,40 @@ describe("临时查看到期（§5.5）", () => {
 		expect(toastTexts).toContain("tempview.ended");
 		// 画布标签清空
 		expect(h.els["canvas-slide-label"].hidden).toBe(true);
+	});
+
+	it("DEF-3：info 不带标记时回读列表标记 → 到期 403 仍清屏 + 临时提示 + 列表刷新", async () => {
+		const h = bootApp((s) => {
+			seedTemp(s, "2036-01-01T00:00:00Z");
+			// 复刻真实后端：/info 不携带 temporary_view_expires_at（标记只在列表上）
+			s.routes.set("/api/slides/sld_temp/info", () => ({
+				status: 200,
+				body: { name: "temp.svs", slide_id: "sld_temp", display_name: "", width: 10, height: 10, mpp_x: 0.5 },
+			}));
+		});
+		await flush();
+		h.UI.fb.go(h.UI.fb.FB_TEMP_KEY);
+		const card = fbHits(h).find((c) => c.dataset.slideId === "sld_temp");
+		card!.dispatch("click", clickEvt());
+		await flush(20);
+		expect(h.UI.viewerState.slide && h.UI.viewerState.slide.id).toBe("sld_temp");
+		// 服务端把授权改到过去 + /api/slides 不再下发该切片（门禁权威）
+		h.routes.set("/api/slides/sld_temp/info", () => ({ status: 403, body: { error: "forbidden" } }));
+		hideSlideFromList(h, "sld_temp");
+		const callsBefore = h.calls.length;
+		// 列表标记仍在（最近一次 /api/slides 下发过 temporary_view_expires_at）——
+		// info 不带标记时回读列表标记 → 按到期清屏（DEF-3 修复路径）
+		h.UI.fb.render();
+		fbHits(h).find((c) => c.dataset.slideId === "sld_temp")!.dispatch("click", clickEvt());
+		await flush(30);
+		expect(h.UI.viewerState.slide).toBeNull();
+		expect(h.closes()).toBeGreaterThan(0);
+		expect(h.els["toast-container"].children.map((c) => c.textContent).join("|")).toContain("tempview.ended");
+		// 列表权威刷新（/api/slides、/api/projects 重拉）
+		const refetched = h.calls.slice(callsBefore).filter((c) => /\/api\/slides$|\/api\/projects$/.test(c.url));
+		expect(refetched.length).toBeGreaterThan(0);
+		// 临时文件夹已被列表移除
+		expect(fbFolders(h).some((c) => c.dataset.pid === "__temp__")).toBe(false);
 	});
 
 	it("403/404（服务端拒绝）→ 同口径清屏；普通切片 404 维持报错不清屏", async () => {

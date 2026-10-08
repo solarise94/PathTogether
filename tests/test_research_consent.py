@@ -51,7 +51,10 @@ import app as app_mod  # noqa: E402
 import pg_store  # noqa: E402
 import research_consent_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app  # noqa: E402
+from _pt_helpers import (
+    isolate_app,
+    make_client as _client,
+)  # noqa: E402
 
 PASSWORD = "longpassword123"
 MIGRATION_0062 = "0062_research_data_deletion_jobs.sql"
@@ -78,11 +81,6 @@ def _isolate(monkeypatch, tmp_path):
 
 def _create_user(login_id):
     return user_store.create_user(login_id, PASSWORD)
-
-
-def _client():
-    app_mod.app.config["TESTING"] = True
-    return csrf_client(app_mod.app.test_client())
 
 
 def _login(client, user):

@@ -33,7 +33,6 @@ import share_store  # noqa: E402
 
 import pytest  # noqa: E402
 
-from pg_compat import BACKEND  # noqa: E402
 import _billing_helpers as bh  # noqa: E402
 import billing_store  # noqa: E402
 

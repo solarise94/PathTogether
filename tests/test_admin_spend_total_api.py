@@ -18,7 +18,7 @@
   1_000_000）；demo 步数独立默认 20，不继承 user 值。
 
 运行：cd 项目根 && python3 -m pytest tests/test_admin_spend_total_api.py -q
-（PG 双跑：RUN_PG_TESTS=1 python3 -m pytest tests/test_admin_spend_total_api.py -q）
+（运行：python3 -m pytest tests/test_admin_spend_total_api.py -q）
 """
 import json
 import os
@@ -36,24 +36,22 @@ import budget_store  # noqa: E402
 import share_store  # noqa: E402
 import settings_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import FakeRequests, FakeResponse, csrf_client, isolate_app  # noqa: E402
-from pg_compat import BACKEND  # noqa: E402
+from _pt_helpers import (
+    FakeRequests,
+    FakeResponse,
+    isolate_app,
+    make_client as _client,
+)  # noqa: E402
 
-if BACKEND == "postgres":
-    import _billing_helpers as bh  # noqa: E402
+import _billing_helpers as bh  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
     """每用例独立存储 + AUTH_ENABLED=True + fake sidecar 常备。"""
-    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True)
+    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR)
     monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
     yield
-
-
-def _client():
-    app_mod.app.config["TESTING"] = True
-    return csrf_client(app_mod.app.test_client())
 
 
 def _login(client, user):

@@ -14,7 +14,7 @@
      - 主动撤销路径：run 被拒、run 结束（上游 SSE 正常关流）、cancel、session
        归档、协作 share 撤销、项目归档；用户禁用由写前复查兜底拒绝。
 
-json / pg 双后端通用（RUN_PG_TESTS=1 时 conftest 已切 postgres 并逐用例
+默认内嵌 PostgreSQL（conftest 逐用例
 TRUNCATE）。运行：cd 项目根 && python3 -m pytest tests/test_ai_integrity.py -q
 """
 import json
@@ -34,14 +34,19 @@ import pytest  # noqa: E402
 import app as app_mod  # noqa: E402
 import share_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import csrf_client, install_json_login_limits, isolate_app, FakeRequests, FakeResponse, register_slide_row  # noqa: E402, register_slide_row
+from _pt_helpers import (
+    csrf_client,
+    isolate_app,
+    FakeRequests,
+    FakeResponse,
+    register_slide_row,
+)  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
     """每用例独立存储目录 + 假 sidecar requests + AI 配置复位。"""
-    _, up_dir = isolate_app(monkeypatch, tmp_path, UPLOAD_DIR,
-                            login_limits=True)
+    _, up_dir = isolate_app(monkeypatch, tmp_path, UPLOAD_DIR)
     monkeypatch.setattr(app_mod, "AUTH_ENABLED", False)
     for child in up_dir.iterdir():
         if child.is_file():

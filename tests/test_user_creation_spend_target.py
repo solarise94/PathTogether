@@ -24,7 +24,7 @@ role=user 的授权面**恒**为一次性总额度（ai_spend_total_allowances�
 - 兑换（redeem_invite）已随邀请码注册退役删除；「默认解析/缺默认回滚」
   由惰性激活承担（test_spend_total_allowances.py）。
 
-运行：RUN_PG_TESTS=1 python3 -m pytest tests/test_user_creation_spend_target.py -q
+运行：python3 -m pytest tests/test_user_creation_spend_target.py -q
 """
 import os
 import sys
@@ -37,10 +37,8 @@ import pytest  # noqa: E402
 import spend_store  # noqa: E402
 import user_store  # noqa: E402
 import user_store_pg  # noqa: E402
-from pg_compat import BACKEND  # noqa: E402
 
-if BACKEND == "postgres":
-    import _billing_helpers as bh  # noqa: E402
+import _billing_helpers as bh  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #

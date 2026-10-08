@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """ai_budget 数据层原子原语测试（docs §4.2/§5.3/§9.4）。
 
-仅 RUN_PG_TESTS=1 时真跑（conftest 已起 pgserver、设 DATABASE_URL +
+默认运行（conftest 已起 pgserver、设 DATABASE_URL +
 STORAGE_BACKEND=postgres，并每用例 TRUNCATE 0006 新表 + RESTART IDENTITY，
 period id 每用例从 1 起）。缺 pgserver/psycopg 时整模块 skip。
 
@@ -31,7 +31,6 @@ pytest.importorskip("psycopg")
 
 import budget_store  # noqa: E402
 import pg_store  # noqa: E402
-from pg_compat import BACKEND  # noqa: E402
 
 
 def _req():

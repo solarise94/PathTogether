@@ -2,7 +2,7 @@
 """批次 D：后台设置、用户覆盖与邀请码模板测试（docs
 ai-money-budget-bugfix-and-simplification-plan.md §5/§6/§8 批次 D/§9.6/§9.7）。
 
-pg 模式（RUN_PG_TESTS=1）：
+pg 模式（默认内嵌 PostgreSQL）：
   - 新端点 owner 门控：匿名 401 / user 403 / owner 预览态 403（§14.1 同口径）；
   - 注册模式 v1 PUT 校验（public 缺前置 400 / 非法值 400 / invite_only
     前置条件 400；旧路由已随 R3 wave1 删除，service 语义由 v1 独守）；
@@ -31,7 +31,7 @@ pg 模式（RUN_PG_TESTS=1）：
   - settings 聚合：注册模式 + spend 分段 + runtime 分段，金额十进制字符串。
 
 运行：cd 项目根 && python3 -m pytest tests/test_admin_batch_d.py -q
-（PG 双跑：RUN_PG_TESTS=1 python3 -m pytest tests/test_admin_batch_d.py -q）
+（运行：python3 -m pytest tests/test_admin_batch_d.py -q）
 """
 import json
 import os
@@ -50,11 +50,12 @@ import registration_store  # noqa: E402
 import settings_store  # noqa: E402
 import spend_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app  # noqa: E402
-from pg_compat import BACKEND  # noqa: E402
+from _pt_helpers import (
+    isolate_app,
+    make_client as _client,
+)  # noqa: E402
 
-if BACKEND == "postgres":
-    import _billing_helpers as bh  # noqa: E402
+import _billing_helpers as bh  # noqa: E402
 
 app_mod.UPLOAD_DIR = Path(UPLOAD_DIR)
 app_mod.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -65,19 +66,15 @@ OVER_2E53_NANO = "9007199254740993"
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
     """每用例独立存储 + AUTH_ENABLED=True（owner 门控有真实意义）。"""
-    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True)
+    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR)
     monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
-    if BACKEND == "postgres":
-        # review R2-F2：PG 上建号/兑换统一走「维护闸 + 开通锁」组合原语，
-        # 闸 fail-closed。conftest TRUNCATE 清掉迁移种子，每用例幂等重放
-        # （0023+0029+0032：闸=false + defaults 物化基线 20 CNY）。R3 单轨后
-        # 无 user_spend_target 可切——user 授权恒 allowance。
-        bh.seed_spend_settings()
+    # review R2-F2：PG 上建号/兑换统一走「维护闸 + 开通锁」组合原语，
+    # 闸 fail-closed。conftest TRUNCATE 清掉迁移种子，每用例幂等重放
+    # （0023+0029+0032：闸=false + defaults 物化基线 20 CNY）。R3 单轨后
+    # 无 user_spend_target 可切——user 授权恒 allowance。
+    bh.seed_spend_settings()
     yield
 
-def _client():
-    app_mod.app.config["TESTING"] = True
-    return csrf_client(app_mod.app.test_client())
 
 def _raw_client():
     """不带 CSRF 包装的裸 client（缺 CSRF 用例）。"""
@@ -102,13 +99,9 @@ def _setup_users(n_extra=1):
             display_name="User %d" % i))
     return tuple([owner] + users)
 
-if BACKEND == "postgres":
-    def _audit_actions(action):
-        import share_store
-        return share_store.list_audit(limit=100, action=action)
-else:
-    def _audit_actions(action):
-        return []
+def _audit_actions(action):
+    import share_store
+    return share_store.list_audit(limit=100, action=action)
 
 # --------------------------------------------------------------------------- #
 # 1. owner 门控 + CSRF + json 后端 fail-closed（两后端都跑）
@@ -160,8 +153,7 @@ def test_preview_owner_403_on_new_endpoints():
 
 def test_new_write_endpoints_require_csrf():
     """写方法缺 X-CSRF-Token 一律 400（before_request 全局闸；§9.6）。"""
-    if BACKEND == "postgres":
-        bh.seed_spend_policies()
+    bh.seed_spend_policies()
     owner, _u = _setup_users()
     raw = _raw_client()
     with raw.session_transaction() as s:

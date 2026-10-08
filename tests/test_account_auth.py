@@ -2,7 +2,7 @@
 """账户系统批次 A「app 线」测试（docs/account-system-simplification-fix-plan.md
 §5 启动状态机 / §6.2 session 版本 / §7 密码 API / §11 批次 A 测试矩阵）。
 
-覆盖（json 默认 + RUN_PG_TESTS=1 双跑）：
+覆盖（默认内嵌 PostgreSQL）：
   - 启动状态机纯函数（_resolve_bootstrap_config / _resolve_owner_at_startup）：
     空库首建、已有 owner 不对账、引导配置被忽略告警、无 owner 拒启、
     多 owner 拒启（json-only 直插构造）、空 hash 拒启、owner 归属注入、
@@ -53,7 +53,7 @@ def _share_owner_uid():
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
     """每用例：隔离目录 / 清空用户库 / 归属注入清空 / json 登录限流 mock。"""
-    isolate_app(monkeypatch, DATA_DIR, login_limits=True, clear_stores=True)
+    isolate_app(monkeypatch, DATA_DIR, clear_stores=True)
     # review R2-F2：PG 上 role=user 建号/兑换统一走「维护闸 + 开通锁」
     # 组合原语，闸 fail-closed（platform_settings 缺 ai_dispatch_maintenance
     # 即拒绝）。conftest TRUNCATE 清掉 0029 种子，这里每用例幂等重放
@@ -62,11 +62,6 @@ def _isolate(monkeypatch):
     bh.seed_spend_settings()
     yield
     # AUTH_ENABLED 的还原已由 isolate_app 的还原护栏接管（防泄漏登记）
-
-def _fake_pg_backend(monkeypatch):
-    """json 模式下把 share_store.STORAGE_BACKEND 伪造成 postgres，使
-    REQUIRE_ADMIN_AUTH=1 的后端前置检查放行（PG 模式本身即是 postgres）。"""
-    monkeypatch.setattr(share_store, "STORAGE_BACKEND", "postgres")
 
 def make_client():
     app_mod.app.config["TESTING"] = True
@@ -117,7 +112,6 @@ def test_startup_bootstrap_legacy_alias_ignored(monkeypatch):
     """R3 Wave2-Compat：一版兼容别名 ADMIN_USERNAME/ADMIN_PASSWORD 读取路径
     已删除——空库 + 仅提供别名 + REQUIRE_ADMIN_AUTH=1 → fail-closed 拒启
     （别名绝不参与引导）。"""
-    _fake_pg_backend(monkeypatch)
     with pytest.raises(SystemExit):
         app_mod._resolve_owner_at_startup({
             "REQUIRE_ADMIN_AUTH": "1",
@@ -178,7 +172,6 @@ def test_startup_bootstrap_login_id_change_only_warns(monkeypatch, caplog,
 
 def test_startup_no_owner_but_users_refuses(monkeypatch):
     """无 owner 但已有普通 user → REQUIRE_ADMIN_AUTH=1 拒绝启动（指明逃生路径）。"""
-    _fake_pg_backend(monkeypatch)
     user_store.create_user("u@x.com", USER_PW, role="user")
     with pytest.raises(SystemExit) as ei:
         app_mod._resolve_owner_at_startup({"REQUIRE_ADMIN_AUTH": "1"})
@@ -191,7 +184,6 @@ def test_startup_no_owner_but_users_refuses(monkeypatch):
 
 def test_startup_empty_db_require_auth_no_secret_refuses(monkeypatch):
     """空库 + REQUIRE_ADMIN_AUTH=1 + 无秘密 → 拒绝启动（fail-closed）。"""
-    _fake_pg_backend(monkeypatch)
     with pytest.raises(SystemExit) as ei:
         app_mod._resolve_owner_at_startup({"REQUIRE_ADMIN_AUTH": "1"})
     check("文案指明 bootstrap 秘密缺失", "bootstrap" in str(ei.value).lower())
@@ -200,7 +192,6 @@ def test_startup_placeholder_secret_treated_as_unconfigured(monkeypatch,
                                                             tmp_path):
     """占位符 secret 文件内容（sentinel / <...>）视为未配置：
     REQUIRE_ADMIN_AUTH=1 → 拒启。"""
-    _fake_pg_backend(monkeypatch)
     with pytest.raises(SystemExit):
         app_mod._resolve_owner_at_startup({
             "REQUIRE_ADMIN_AUTH": "1",

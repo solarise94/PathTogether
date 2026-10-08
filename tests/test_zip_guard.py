@@ -38,8 +38,10 @@ import user_store  # noqa: E402
 import upload_guard  # noqa: E402
 import slide_io  # noqa: E402
 import upload_content  # noqa: E402  # U5：zip 服务直驱（app 壳已随检查点 B 删除）
-from pg_compat import BACKEND  # noqa: E402
-from _pt_helpers import isolate_app, clear_upload_dir  # noqa: E402
+from _pt_helpers import (
+    isolate_app,
+    clear_upload_dir,
+)  # noqa: E402
 
 
 SVS = b"fake-svs-content-0123456789"
@@ -273,7 +275,8 @@ def test_duplicate_normalized_path_rejected():
 
 
 def test_exact_duplicate_path_rejected():
-    z = _make_zip([("a.svs", SVS), ("a.svs", SVS)])
+    with pytest.warns(UserWarning, match="Duplicate name"):
+        z = _make_zip([("a.svs", SVS), ("a.svs", SVS)])
     msg, status = _extract_and_promote(z)
     assert status == 400 and "重复路径" in msg
     _no_slide_residue("a.svs")
@@ -411,20 +414,16 @@ def test_same_name_flat_file_no_longer_conflicts():
 # =========================================================================== #
 # 4. PG：展开总量超过预占 → 原子 topup；quota 不足 → 413 且清理
 # =========================================================================== #
-if BACKEND == "postgres":
-    import psycopg
+import psycopg
 
-    def _set_quota(user_id, quota_bytes):
-        with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO upload_user_quotas (user_id, quota_bytes) "
-                    "VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE "
-                    "SET quota_bytes = EXCLUDED.quota_bytes",
-                    (user_id, quota_bytes))
-else:
-    def _set_quota(user_id, quota_bytes):  # pragma: no cover
-        raise RuntimeError("PG only")
+def _set_quota(user_id, quota_bytes):
+    with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO upload_user_quotas (user_id, quota_bytes) "
+                "VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE "
+                "SET quota_bytes = EXCLUDED.quota_bytes",
+                (user_id, quota_bytes))
 
 
 def test_zip_expansion_topup_success():

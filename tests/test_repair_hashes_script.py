@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """scripts/repair_pg_user_password_hashes.py 测试（账户系统批次 C，docs §9.2）。
 
-仅 RUN_PG_TESTS=1 下跑（需真实 PG）：验证启动修复 shim 迁出后的主机侧一次性
+默认运行（需真实 PG）：验证启动修复 shim 迁出后的主机侧一次性
 命令语义：
   - 默认 dry-run：只输出待修复 user_id 计数，不写库，输出绝不含 hash；
   - --apply：仅填充 PG 空 hash，不覆盖非空 hash；幂等（重跑回填 0 行）；

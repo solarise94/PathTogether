@@ -39,7 +39,7 @@ from _pt_helpers import csrf_client, isolate_app, register_slide_row  # noqa: E4
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
     _, up_dir = isolate_app(monkeypatch, DATA_DIR, UPLOAD_DIR,
-                            login_limits=True, clear_stores=True)
+                            clear_stores=True)
     for child in up_dir.iterdir():
         if child.is_file():
             child.unlink()

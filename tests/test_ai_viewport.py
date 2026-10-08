@@ -25,7 +25,12 @@ UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 import pytest  # noqa: E402
 
 import app as app_mod  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app, FakeRequests, FakeResponse  # noqa: E402
+from _pt_helpers import (
+    isolate_app,
+    FakeRequests,
+    FakeResponse,
+    make_client as shared_client,
+)  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -50,9 +55,7 @@ def install_fake_requests():
 
 
 def make_client():
-    app_mod.app.config["TESTING"] = True
-    app_mod.AUTH_ENABLED = False
-    return csrf_client(app_mod.app.test_client())
+    return shared_client(auth=False)
 
 
 def setup_ai_config(plain_key="sk-vp-secret-123456"):

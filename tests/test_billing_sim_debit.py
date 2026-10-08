@@ -5,7 +5,7 @@ PostgreSQL 唯一后端：
   - ``BILLING_SIMULATED_DEBIT`` 开关解析：缺省启用；``0/false/off``（大小写
     不敏感、允许首尾空白）关闭。
 
-PG 行为（RUN_PG_TESTS=1；conftest 每用例 TRUNCATE billing 表）：
+PG 行为（默认内嵌 PostgreSQL；conftest 每用例 TRUNCATE billing 表）：
   - priced user 事件 → 同事务自动开户 + 一条 usage_debit（负的 customer_charge、
     幂等键 ``usage:<event_id>``、metadata.simulated=true、actor NULL）+ 余额
     为负；
@@ -34,11 +34,9 @@ import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest
 import pytest  # noqa: E402
 import billing_store  # noqa: E402
 
-from pg_compat import BACKEND  # noqa: E402
 
-if BACKEND == "postgres":
-    import _billing_helpers as bh  # noqa: E402
-    import user_store  # noqa: E402
+import _billing_helpers as bh  # noqa: E402
+import user_store  # noqa: E402
 
 
 # =========================================================================== #

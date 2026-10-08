@@ -17,7 +17,7 @@
   - 红线：AUTH_ENABLED=False 内网模式 + legacy /internal/ai/region 通道零影响
     （即便插件像素预算耗尽，legacy 通道仍正常出 base64）。
 
-json / pg 双后端通用（RUN_PG_TESTS=1 时 conftest 已切 postgres）。
+默认运行于 conftest 启动的内嵌 PostgreSQL。
 运行：cd 项目根 && python3 -m pytest tests/test_plugin_v1_transport.py -q
 """
 import base64

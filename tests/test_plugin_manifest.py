@@ -14,7 +14,7 @@
     字段齐全、supportedContractMajors/supportedBridgeMajors 含 1、capabilities
     覆盖 v1 实际能力。
 
-json 后端（RUN_PG_TESTS 未设）。运行：cd 项目根 && python3 -m pytest tests/test_plugin_manifest.py -q
+默认内嵌 PostgreSQL。运行：cd 项目根 && python3 -m pytest tests/test_plugin_manifest.py -q
 """
 import json
 import os
@@ -28,8 +28,10 @@ import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest
 UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 from plugins.sdk import manifest as M  # noqa: E402
 import app as app_mod  # noqa: E402
-from _pt_helpers import isolate_app  # noqa: E402
-from _pt_helpers import csrf_client  # noqa: E402
+from _pt_helpers import (
+    isolate_app,
+    make_client as _client,
+)  # noqa: E402
 import share_store  # noqa: E402
 
 app_mod.UPLOAD_DIR = Path(os.environ["UPLOAD_DIR"])
@@ -448,11 +450,6 @@ def _file_secret():
     except (ValueError, TypeError):
         pass
     return raw
-
-
-def _client():
-    app_mod.app.config["TESTING"] = True
-    return csrf_client(app_mod.app.test_client())
 
 
 def _token_for(inst):

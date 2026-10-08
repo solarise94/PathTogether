@@ -36,8 +36,7 @@ from _pt_helpers import publish_test_slide  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
-    _, up_dir = isolate_app(monkeypatch, tmp_path, UPLOAD_DIR,
-                            login_limits=True)
+    _, up_dir = isolate_app(monkeypatch, tmp_path, UPLOAD_DIR)
     monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
     for child in up_dir.iterdir():
         if child.is_file():

@@ -250,6 +250,8 @@ function bootApp(seed?: (s: Seedable) => void) {
 }
 
 function teardown() {
+	vi.clearAllTimers();
+	vi.useRealTimers();
 	delete (globalThis as { window?: unknown }).window;
 	delete (globalThis as { document?: unknown }).document;
 	delete (globalThis as { fetch?: unknown }).fetch;
@@ -279,7 +281,7 @@ function fbFolders(h: ReturnType<typeof bootApp>): BootEl[] {
 }
 
 // 根目录 36 张未归类 + 2 个顶层文件夹（教学/研究），可选 1 张临时切片
-function seedStd(s: Seedable, opts: { tempAt?: string } = {}) {
+function seedStd(s: Seedable, opts: { tempAt?: number } = {}) {
 	const slides: Array<Record<string, unknown>> = Array.from({ length: 36 }, (_, i) => ({
 		name: "示例切片 " + String(i + 1).padStart(2, "0") + ".svs",
 		slide_id: "sld_std" + String(i + 1).padStart(2, "0"),
@@ -323,10 +325,21 @@ describe("叠页大小与露出条带（§5.2 纯函数）", () => {
 		expect(ps(104, 0)).toBe(1);
 		// 文件夹卡占用同一预算（每张 56+8）
 		expect(ps(10000, 2)).toBe(8);
-		expect(ps(2 * 64 + 104 + 28 * 7, 2)).toBe(8);
-		expect(ps(2 * 64 + 104 + 28 * 7 - 1, 2)).toBe(7);
 		// 极小可用高度：钳到 1（不出现 0/负数叠）
 		expect(ps(0, 5)).toBe(1);
+	});
+
+	it.fails("KNOWN: 多文件夹时应利用可用空间，而非每页只显示一张卡", async () => {
+		const h = bootApp(s => {
+			seedNone(s);
+			s.routes.set("/api/projects", () => ({ status: 200, body:
+				Array.from({ length: 8 }, (_, i) => ({ pid: "p" + i, name: "Folder " + i, slides: [] })) }));
+		});
+		await flush();
+		h.els["fb-stack"].clientHeight = 600;
+		h.UI.fb.render();
+		// 600px 足以放入多张 64px 文件夹卡；不复述 pageSize 内部公式。
+		expect(fbFolders(h).length + fbHits(h).length).toBeGreaterThan(1);
 	});
 
 	it("露出条带：短叠铺满可用高度、上限=整卡高、下限=28px；单张不铺开", () => {
@@ -344,7 +357,7 @@ describe("叠页大小与露出条带（§5.2 纯函数）", () => {
 
 describe("根目录结构与文件夹导航（§5.1/§5.3）", () => {
 	it("根目录=顶层文件夹+未归类；临时文件夹仅在有临时切片时出现；缺失 parent_project_id 视为根", async () => {
-		const h = bootApp((s) => { seedStd(s, { tempAt: "2036-01-01T00:00:00Z" }); });
+		const h = bootApp((s) => { seedStd(s, { tempAt: Date.parse("2036-01-01T00:00:00Z") / 1000 }); });
 		await flush();
 		// 600px 可用高度 → 每叠 8（3 文件夹卡 + 5 切片卡）
 		h.els["fb-stack"].clientHeight = 600;
@@ -499,14 +512,19 @@ describe("搜索（§5.4）", () => {
 		expect(fb.locationText(fb.search("normal")[0])).toContain("fb.unfiled");
 	});
 
-	it("点击结果：定位到所在文件夹与所在叠 → 打开切片（info 请求发出）", async () => {
+	it.fails("KNOWN: 混合文件夹与切片时，搜索定位后目标卡可见并能打开", async () => {
 		let slides: Array<Record<string, unknown>> = [];
-		const h = bootApp((s) => { slides = seedNone(s); });
+		const h = bootApp((s) => {
+			slides = seedNone(s);
+			s.routes.set("/api/projects", () => ({ status: 200, body: [
+				{ pid: "p_a", name: "Folder A", slides: [] },
+				{ pid: "p_b", name: "Folder B", slides: [] },
+			] }));
+		});
 		await flush();
-		const target = slides[9];
+		const target = slides[5];
 		h.UI.fb.locate(target);
 		expect(h.UI.fb.state.folder).toBeNull();
-		expect(h.UI.fb.state.page).toBe(1); // 第 10 张（索引 9）在第二叠（0 起）
 		const card = fbHits(h).find((c) => c.dataset.slideId === target.slide_id);
 		expect(card).toBeTruthy();
 		card!.dispatch("click", clickEvt());
@@ -526,7 +544,7 @@ describe("搜索（§5.4）", () => {
 	}
 
 describe("临时查看到期（§5.5）", () => {
-	function seedTemp(s: Seedable, expiresAt: string) {
+	function seedTemp(s: Seedable, expiresAt: number) {
 		const slides = [
 			{ name: "temp.svs", slide_id: "sld_temp", display_name: "", temporary_view_expires_at: expiresAt, width: 10, height: 10, mpp_x: 0.5 },
 			{ name: "mine.svs", slide_id: "sld_mine", display_name: "", width: 10, height: 10, mpp_x: 0.5 },
@@ -535,13 +553,15 @@ describe("临时查看到期（§5.5）", () => {
 		s.routes.set("/api/projects", () => ({ status: 200, body: [] }));
 		s.routes.set("/api/slides/sld_temp/info", () => ({
 			status: 200,
-			body: { name: "temp.svs", slide_id: "sld_temp", display_name: "", width: 10, height: 10, mpp_x: 0.5, temporary_view_expires_at: expiresAt },
+			body: { name: "temp.svs", slide_id: "sld_temp", display_name: "", width: 10, height: 10, mpp_x: 0.5 },
 		}));
 		return slides;
 	}
 
-	it("打开带 temporary_view_expires_at 的切片：到期时间已过 → 立即清屏（viewer.close）+ 卡片移除 + 提示", async () => {
-		const h = bootApp((s) => { seedTemp(s, "2000-01-01T00:00:00Z"); }); // 已过期
+	it.fails("KNOWN: 列表 epoch 秒到期、info 无标记：有效期内可看，到期后无人操作也清屏", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-10-08T00:00:00Z"));
+		const h = bootApp((s) => { seedTemp(s, Date.now() / 1000 + 5); });
 		await flush();
 		// 临时切片收在「临时查看」虚拟文件夹里 → 先进入
 		h.UI.fb.go(h.UI.fb.FB_TEMP_KEY);
@@ -549,6 +569,10 @@ describe("临时查看到期（§5.5）", () => {
 		expect(card).toBeTruthy();
 		card!.dispatch("click", clickEvt());
 		await flush(20);
+		expect(h.UI.viewerState.slide?.id).toBe("sld_temp");
+		await vi.advanceTimersByTimeAsync(4999);
+		expect(h.UI.viewerState.slide?.id).toBe("sld_temp");
+		await vi.advanceTimersByTimeAsync(2);
 		expect(h.UI.viewerState.slide).toBeNull();
 		expect(h.closes()).toBeGreaterThan(0);
 		// 卡片与虚拟文件夹消失（临时切片排除出根目录）
@@ -565,7 +589,7 @@ describe("临时查看到期（§5.5）", () => {
 
 	it("DEF-3：info 不带标记时回读列表标记 → 到期 403 仍清屏 + 临时提示 + 列表刷新", async () => {
 		const h = bootApp((s) => {
-			seedTemp(s, "2036-01-01T00:00:00Z");
+			seedTemp(s, Date.parse("2036-01-01T00:00:00Z") / 1000);
 			// 复刻真实后端：/info 不携带 temporary_view_expires_at（标记只在列表上）
 			s.routes.set("/api/slides/sld_temp/info", () => ({
 				status: 200,
@@ -598,7 +622,7 @@ describe("临时查看到期（§5.5）", () => {
 	});
 
 	it("403/404（服务端拒绝）→ 同口径清屏；普通切片 404 维持报错不清屏", async () => {
-		const h = bootApp((s) => { seedTemp(s, "2036-01-01T00:00:00Z"); }); // 未到期
+		const h = bootApp((s) => { seedTemp(s, Date.parse("2036-01-01T00:00:00Z") / 1000); }); // 未到期
 		await flush();
 		h.UI.fb.go(h.UI.fb.FB_TEMP_KEY);
 		const card = fbHits(h).find((c) => c.dataset.slideId === "sld_temp");

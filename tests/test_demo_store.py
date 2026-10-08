@@ -3,7 +3,7 @@
 
 批次 E（docs ai-money-budget-bugfix-and-simplification-plan.md §4/§9.5）。
 
-仅 RUN_PG_TESTS=1 时真跑（conftest 起真实 PG + 每用例 TRUNCATE）。
+默认运行（conftest 起真实 PG + 每用例 TRUNCATE）。
 
 覆盖：
   - capability 生命周期：创建 / token_hash 查询 / 过期即 None / 重复冲突；
@@ -33,7 +33,6 @@ pytest.importorskip("pgserver")
 pytest.importorskip("psycopg")
 
 import demo_store  # noqa: E402
-from pg_compat import BACKEND  # noqa: E402
 
 
 @pytest.fixture

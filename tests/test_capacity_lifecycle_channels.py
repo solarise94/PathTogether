@@ -34,7 +34,7 @@ PG_URI = os.environ["DATABASE_URL"]
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
     """同 test_upload_v2：独立存储 + 登录限制 mock + 水印 0 + owner 配置。"""
-    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True)
+    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR)
     share_store.set_owner_user_id(
         user_store.create_user("life-ch-owner@x.com", "localownerpass12345",
                                role="user")["user_id"])

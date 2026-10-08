@@ -16,8 +16,7 @@ API 与 store 级用例在 tests/test_demo_access.py 与 tests/test_demo_store.p
   - 迁移（§9.7）：fresh 全量 0001→0026 后 0026 表/索引/约束在位，且
     ensure_schema 与 0026 SQL 重放幂等。
 
-全部真实 PostgreSQL（RUN_PG_TESTS=1）；本文件用例 PG 缺失时按仓库惯例整模块
-skip（CI 必须 RUN_PG_TESTS=1 才算覆盖）。
+全部使用 conftest 启动的真实内嵌 PostgreSQL；缺少依赖直接失败。
 """
 import os
 import sys
@@ -29,7 +28,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
 import app as app_mod  # noqa: E402
-from _pt_helpers import isolate_app  # noqa: E402
+from _pt_helpers import (
+    isolate_app,
+)  # noqa: E402
 
 import pytest  # noqa: E402
 
@@ -37,12 +38,10 @@ import billing_pricing  # noqa: E402
 import billing_store  # noqa: E402
 import spend_store  # noqa: E402
 import pg_store  # noqa: E402
-from pg_compat import BACKEND  # noqa: E402
 
-if BACKEND == "postgres":
-    import psycopg  # noqa: E402
-    import _billing_helpers as bh  # noqa: E402
-    import user_store  # noqa: E402
+import psycopg  # noqa: E402
+import _billing_helpers as bh  # noqa: E402
+import user_store  # noqa: E402
 
 app_mod.UPLOAD_DIR = Path(os.environ["UPLOAD_DIR"])
 app_mod.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -239,8 +238,7 @@ def _demo_batch_e_env(tmp_path, monkeypatch):
     app_mod._ADAPTER_MODE_CACHE.update(ts=0.0, mode=None)
     yield
     try:
-        if BACKEND == "postgres":
-            _set_mode("shadow")
+        _set_mode("shadow")
     except Exception:
         pass
 

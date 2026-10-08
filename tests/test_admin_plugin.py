@@ -15,7 +15,7 @@ docs/admin-billing-plugin-implementation-plan.md §8 / §14.1（权限/插件行
     非法类型拒绝；v1.1.0 admin manifest 通过。
 
 运行：cd 项目根 && python3 -m pytest tests/test_admin_plugin.py -q
-（PG 双跑：RUN_PG_TESTS=1 python3 -m pytest tests/test_admin_plugin.py -q）
+（运行：python3 -m pytest tests/test_admin_plugin.py -q）
 """
 import hashlib
 import html.parser
@@ -34,8 +34,10 @@ import app as app_mod  # noqa: E402
 import share_store  # noqa: E402
 import user_store  # noqa: E402
 from plugins.sdk import manifest as M  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app  # noqa: E402
-from pg_compat import BACKEND  # noqa: E402
+from _pt_helpers import (
+    isolate_app,
+    make_client as _client,
+)  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ADMIN_PLUGIN_DIR = REPO_ROOT / "plugins" / "pathtogether-admin"
@@ -55,7 +57,7 @@ def _sha256(path):
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
     """每用例独立存储 + AUTH_ENABLED=True + source-policy 缓存复位。"""
-    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True)
+    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR)
     monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
     monkeypatch.delenv("PLUGINS_SOURCE_POLICY_FILE", raising=False)
     monkeypatch.delenv("SAMPLE_PLUGIN_ENABLED", raising=False)
@@ -67,11 +69,6 @@ def _isolate(tmp_path, monkeypatch):
     app_mod._plugin_source_policy.cache_clear()
     yield
     app_mod._plugin_source_policy.cache_clear()
-
-
-def _client():
-    app_mod.app.config["TESTING"] = True
-    return csrf_client(app_mod.app.test_client())
 
 
 def _login(client, user):

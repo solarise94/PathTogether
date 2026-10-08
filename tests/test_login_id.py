@@ -2,7 +2,7 @@
 """账户系统批次 B「登录标识收口」+ 批次 C「物理收口」测试（docs
 account-system-simplification-fix-plan.md §4.2 / §6.1 / §11.2 矩阵）。
 
-覆盖（json 默认 + RUN_PG_TESTS=1 双跑）：
+覆盖（默认内嵌 PostgreSQL）：
   - 用户 dict 单键输出（批次 C）：create_user / get_user /
     get_user_by_login_id / verify_user / list_users / list_enabled_owners /
     create_bootstrap_owner / set_user_password 等读写路径只带 login_id，
@@ -54,7 +54,7 @@ OWNER_PW = "owner-pass-123456"
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
     """每用例前把常量 / env 指回本模块临时目录，并清空 users.json。"""
-    isolate_app(monkeypatch, DATA_DIR, login_limits=True, clear_stores=True)
+    isolate_app(monkeypatch, DATA_DIR, clear_stores=True)
     # review R2-F2：PG 上 role=user 建号/兑换统一走「维护闸 + 开通锁」
     # 组合原语（闸 fail-closed），conftest TRUNCATE 清掉 0029 种子——
     # 每用例幂等重放（target=window + 闸=false）

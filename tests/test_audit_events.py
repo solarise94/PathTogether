@@ -12,7 +12,7 @@
      解档恢复；旧数据无字段默认 false 兼容。
   5. 分享访问日志：/s/<token> 记 share.access，5 分钟窗口去重。
 
-json/pg 双跑（pg 由 RUN_PG_TESTS=1 conftest 起库 + autouse TRUNCATE 隔离）。
+conftest 默认启动内嵌 PostgreSQL，autouse TRUNCATE 隔离用例。
 """
 import json
 import logging
@@ -33,7 +33,12 @@ import share_store  # noqa: E402
 import share_store_pg  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
-from _pt_helpers import csrf_client, install_json_login_limits, isolate_app, register_slide_row  # noqa: E402, register_slide_row
+from _pt_helpers import (
+    csrf_client,
+    isolate_app,
+    register_slide_row,
+    make_client,
+)  # noqa: E402
 import share_server as share_srv  # noqa: E402
 
 
@@ -41,7 +46,7 @@ import share_server as share_srv  # noqa: E402
 def _isolate(monkeypatch):
     """每用例前把常量 / env 指回本模块临时目录，清空 users.json / shares.json。"""
     _, up_dir = isolate_app(monkeypatch, DATA_DIR, UPLOAD_DIR,
-                            login_limits=True, clear_stores=True)
+                            clear_stores=True)
     monkeypatch.setenv("AI_INTERNAL_TOKEN", "test-internal-token")
     monkeypatch.setattr(app_mod, "AI_INTERNAL_TOKEN", "test-internal-token")
     # 重置分享访问日志去重窗口
@@ -62,9 +67,7 @@ def _client():
 
 
 def _client_noauth():
-    app_mod.app.config["TESTING"] = True
-    app_mod.AUTH_ENABLED = False
-    return csrf_client(app_mod.app.test_client())
+    return make_client(auth=False)
 
 
 def _login(client, login_id, password):

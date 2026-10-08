@@ -42,7 +42,11 @@ import slide_store  # noqa: E402
 import upload_guard  # noqa: E402
 import upload_task_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import clear_upload_dir, csrf_client, isolate_app  # noqa: E402
+from _pt_helpers import (
+    clear_upload_dir,
+    isolate_app,
+    make_client,
+)  # noqa: E402
 from kfb.fixture import build_synthetic_kfb  # noqa: E402
 
 PG_URI = os.environ["DATABASE_URL"]
@@ -50,7 +54,7 @@ PG_URI = os.environ["DATABASE_URL"]
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
-    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True)
+    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR)
     monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)
     monkeypatch.setattr(kfb_converter, "DEFAULT_MIN_FREE_BYTES", 0)
     clear_upload_dir(UPLOAD_DIR)
@@ -58,9 +62,7 @@ def _isolate(tmp_path, monkeypatch):
 
 
 def _client(auth=True):
-    app_mod.app.config["TESTING"] = True
-    app_mod.AUTH_ENABLED = auth
-    return csrf_client(app_mod.app.test_client())
+    return make_client(auth=auth)
 
 
 def _user_session(client, login="c@x.com", role="user"):

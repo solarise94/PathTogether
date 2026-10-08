@@ -13,12 +13,16 @@ import pytest  # noqa: E402
 import app as app_mod  # noqa: E402
 import pg_store  # noqa: E402
 import upload_guard  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app, clear_upload_dir  # noqa: E402
+from _pt_helpers import (
+    isolate_app,
+    clear_upload_dir,
+    make_client as _client,
+)  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
-    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True)
+    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR)
     monkeypatch.setattr(app_mod, "AUTH_ENABLED", False)
     monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)
     monkeypatch.setenv("FORMAT_REQUEST_DIR", str(tmp_path / "format_requests"))
@@ -31,11 +35,6 @@ def _isolate(tmp_path, monkeypatch):
         conn.close()
     clear_upload_dir(UPLOAD_DIR)
     yield
-
-
-def _client():
-    app_mod.app.config["TESTING"] = True
-    return csrf_client(app_mod.app.test_client())
 
 
 def test_format_request_post_list_get_wired():

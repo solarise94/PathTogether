@@ -48,7 +48,7 @@ INTERNAL_TOKEN = "test-internal-token-p2"
 def _isolate(monkeypatch):
     """每用例存储隔离 + 清空上传目录 + 清进程内缓存（键已 ID 化仍防串扰）。"""
     _, up_dir = isolate_app(monkeypatch, DATA_DIR, UPLOAD_DIR,
-                            login_limits=True, clear_stores=True)
+                            clear_stores=True)
     for child in up_dir.iterdir():
         if child.is_file():
             child.unlink()

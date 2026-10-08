@@ -56,7 +56,10 @@ import registration_mail_worker  # noqa: E402
 import settings_store  # noqa: E402
 import test_application_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app  # noqa: E402
+from _pt_helpers import (
+    isolate_app,
+    make_client,
+)  # noqa: E402
 
 BASE = "https://path.example.com"
 PASSWORD = "longpassword123"
@@ -98,11 +101,7 @@ def _isolate(monkeypatch):
 
 
 def _client(auth=True):
-    app_mod.app.config["TESTING"] = True
-    app_mod.AUTH_ENABLED = auth
-    return csrf_client(app_mod.app.test_client())
-
-
+    return make_client(auth=auth)
 
 
 def _admin_email(monkeypatch, value="admin-notifications@x.com"):

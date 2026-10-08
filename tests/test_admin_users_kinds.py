@@ -19,7 +19,10 @@ import psycopg  # noqa: E402
 import pytest  # noqa: E402
 
 import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
-from _pt_helpers import csrf_client, isolate_app  # noqa: E402
+from _pt_helpers import (
+    isolate_app,
+    make_client as _client,
+)  # noqa: E402
 
 import app as app_mod  # noqa: E402
 import share_store  # noqa: E402
@@ -31,11 +34,6 @@ def _isolate(monkeypatch):
     isolate_app(monkeypatch, _bootstrap.SHARE_DATA_DIR, clear_stores=True)
     monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
     yield
-
-
-def _client():
-    app_mod.app.config["TESTING"] = True
-    return csrf_client(app_mod.app.test_client())
 
 
 def _login(client, user):

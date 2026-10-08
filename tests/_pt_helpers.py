@@ -1,22 +1,18 @@
 # -*- coding: utf-8 -*-
 """Phase 1 认证加固（CSRF / 跨 worker 登录锁定）测试公共基建。
 
-提供两个工具：
+公共工具：
 
 1. ``csrf_client(base)``：包装 Flask test client，对非安全方法自动附加
    ``X-CSRF-Token``（先 GET /login 惰性取得 token，与真实前端行为一致）。
    生产 CSRF 校验对测试不放宽——旧行为的测试统一走这个包装。
 
-2. ``install_json_login_limits(monkeypatch, ...)``：json 双跑已退役，本函数恒
-   no-op（BACKEND 恒为 postgres，走真实 auth_rate_limits；conftest 每用例
-   TRUNCATE 保证隔离）。保留调用点兼容。
-
-3. ``isolate_app(monkeypatch, ...)``：通用 per-test 存储隔离（test-review P3-16
+2. ``isolate_app(monkeypatch, ...)``：通用 per-test 存储隔离（test-review P3-16
    收敛点）——替代各测试文件自带的高度重复的 ``_isolate`` 主体。文件特有的
    额外 monkeypatch（upload_guard 常量复位等）留在各文件的薄 fixture 里，
    先调本函数再加自己的。
 
-4. ``FakeResponse`` / ``FakeRequests``：fake HistoPilot sidecar 的统一实现
+3. ``FakeResponse`` / ``FakeRequests``：fake HistoPilot sidecar 的统一实现
    （test-review P3-17 合一）。此前 test_ai_proxy / test_ai_integrity /
    test_ai_credentials / test_ai_budget_wiring / test_admin_preview /
    test_ai_session_owner / test_demo_access 各持一份逐渐分叉的副本；现在
@@ -30,7 +26,6 @@ import sys
 import time
 from pathlib import Path
 
-from pg_compat import BACKEND
 
 # --------------------------------------------------------------------------- #
 # 计数式断言（统一收敛实现，替代各脚本式测试文件自带的 check()）
@@ -120,11 +115,29 @@ def csrf_client(base):
     return CsrfClient(base)
 
 
+def make_client(*, auth=None, raw=False):
+    """Flask client for an already isolated app; auth=None preserves its setting."""
+    import app as app_mod
+    app_mod.app.config["TESTING"] = True
+    if auth is not None:
+        app_mod.AUTH_ENABLED = auth
+    client = app_mod.app.test_client()
+    return client if raw else csrf_client(client)
+
+
+def pg_connection():
+    """Connection to the current isolated database, with dictionary rows."""
+    import pg_store
+    import psycopg.rows
+    conn = pg_store.connect()
+    conn.row_factory = psycopg.rows.dict_row
+    return conn
+
+
 # --------------------------------------------------------------------------- #
 # 通用 per-test 存储隔离（test-review P3-16 收敛点）
 # --------------------------------------------------------------------------- #
-def isolate_app(monkeypatch, data_dir, upload_dir=None, login_limits=False,
-                clear_stores=False):
+def isolate_app(monkeypatch, data_dir, upload_dir=None, clear_stores=False):
     """把存储相关 env/常量指到本用例私有目录，并登记防泄漏还原护栏。
 
     做的事（PG 后端下这些 json 常量不被读，等价 no-op）：
@@ -133,8 +146,6 @@ def isolate_app(monkeypatch, data_dir, upload_dir=None, login_limits=False,
       - ``app.UPLOAD_DIR`` 与 ``share_server.UPLOAD_DIR`` → ``upload_dir``
         （缺省 ``data_dir/uploads``，自动创建）；
       - ``share_store.set_owner_user_id("")`` 清归属注入；
-      - ``login_limits=True``：json 后端装登录防爆破内存 mock（默认不装——
-        部分用例专门断言 json 生产行为的 503 fail-closed，装了会掩盖）；
       - ``clear_stores=True``：删 ``data_dir`` 下 users/shares json（含 .bak）；
       - 防泄漏护栏：登记 ``app.AUTH_ENABLED`` / ``app.requests`` 的当前值，
         用例内（``_client()`` 辅助函数等）对它们的**裸赋值**在 teardown 一律
@@ -162,8 +173,6 @@ def isolate_app(monkeypatch, data_dir, upload_dir=None, login_limits=False,
     monkeypatch.setattr(app_mod, "UPLOAD_DIR", upload_dir)
     monkeypatch.setattr(share_srv, "UPLOAD_DIR", upload_dir)
     share_store.set_owner_user_id("")
-    if login_limits:
-        install_json_login_limits(monkeypatch)
     if clear_stores:
         for name in ("users.json", "shares.json",
                      "users.json.bak", "shares.json.bak"):
@@ -261,12 +270,6 @@ def clear_upload_dir(upload_dir):
             child.unlink()
         else:
             shutil.rmtree(child, ignore_errors=True)
-
-
-def install_json_login_limits(monkeypatch, account_limit=10, ip_limit=5,
-                             lock_seconds=60):
-    """postgres 后端恒 no-op：json 双跑已退役，登录防爆破走真实 auth_rate_limits。"""
-    return
 
 
 # --------------------------------------------------------------------------- #

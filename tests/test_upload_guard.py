@@ -7,13 +7,13 @@
   - 端点：流式超限 413 无残留、成功走 .uploading-* 临时文件原子提升、
     目标冲突统一「名称不可用」（不回显真实文件名）、无效切片清理、
     磁盘保留水位 507；
-  - PG 权威配额（RUN_PG_TESTS=1）：并发预占不越过 quota、失败释放
+  - PG 权威配额（默认内嵌 PostgreSQL）：并发预占不越过 quota、失败释放
     reservation、成功转实占、在途/每小时限流、端点级配额与释放；
   - 后端差异：json 后端 role=user 上传 fail-closed 503；owner / 本地免登录
     不走配额（本地开发语义不变，两种后端一致）。
 
 运行：cd 项目根 && python3 -m pytest tests/test_upload_guard.py -q
-（PG 双跑：RUN_PG_TESTS=1 python3 -m pytest tests/test_upload_guard.py -q）
+（运行：python3 -m pytest tests/test_upload_guard.py -q）
 """
 import io
 import os
@@ -34,12 +34,16 @@ import slide_io  # noqa: E402
 import user_store  # noqa: E402
 import upload_guard  # noqa: E402
 import app as app_mod  # noqa: E402
-from pg_compat import BACKEND  # noqa: E402
-from _pt_helpers import csrf_client, install_json_login_limits, isolate_app, clear_upload_dir # noqa: E402
+from _pt_helpers import (
+    isolate_app,
+    clear_upload_dir,
+    make_client,
+)  # noqa: E402
 from _tiff_fixtures import make_ome_tiff_bytes, make_tiff_bytes  # noqa: E402
 
 # A0 异常契约后的验证 stub：成功返回 None / 失败抛 SlideValidationError，
 # 签名兼容 format_hint 关键字（替代旧 lambda p: True/False 布尔契约）
+
 def _validate_ok(path, **_):
     return None
 
@@ -49,8 +53,7 @@ def _validate_bad(path, **_):
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
     """每用例：独立存储 + 无登录限制 mock + 防护参数复位 + 清空 uploads。"""
-    _, up_dir = isolate_app(monkeypatch, tmp_path, UPLOAD_DIR,
-                            login_limits=True)
+    _, up_dir = isolate_app(monkeypatch, tmp_path, UPLOAD_DIR)
     # P3（合同 §3.1.1）：本地免认证态的上传资产 owner 解析——先配置 owner
     #（无 UID 不自动认领；owner-NULL 资产行不再产生）
     import user_store as _us
@@ -65,10 +68,8 @@ def _isolate(tmp_path, monkeypatch):
     clear_upload_dir(up_dir)
     yield
 
-def _client(auth=False):
-    app_mod.app.config["TESTING"] = True
-    app_mod.AUTH_ENABLED = auth
-    return csrf_client(app_mod.app.test_client())
+def _client(auth=True):
+    return make_client(auth=auth)
 
 def _user_session(client, role="user", user_id="usr_test"):
     """直接注入登录 session（_require_auth 认 auth_user + 回查用户）。"""
@@ -132,20 +133,17 @@ def test_disk_watermark_check():
     upload_guard.check_disk_watermark(Path(UPLOAD_DIR), need_bytes=0, reserved=0)
 
 
-if (os.environ.get("STORAGE_BACKEND") or "") == "postgres":
-    import psycopg
+import psycopg
 
-    def _set_quota(user_id, quota_bytes):
-        with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO upload_user_quotas (user_id, quota_bytes) "
-                    "VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE "
-                    "SET quota_bytes = EXCLUDED.quota_bytes",
-                    (user_id, quota_bytes))
-else:
-    def _set_quota(user_id, quota_bytes):  # pragma: no cover
-        raise RuntimeError("PG only")
+def _set_quota(user_id, quota_bytes):
+    with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO upload_user_quotas (user_id, quota_bytes) "
+                "VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE "
+                "SET quota_bytes = EXCLUDED.quota_bytes",
+                (user_id, quota_bytes))
+
 
 def test_quota_row_created_with_env_default(monkeypatch):
     uid = user_store.create_user("q1@x.com", "pass1234pass1234", role="user")["user_id"]

@@ -39,8 +39,10 @@ UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 import share_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
-from pg_compat import BACKEND  # noqa: E402
-from _pt_helpers import csrf_client, install_json_login_limits, isolate_app # noqa: E402
+from _pt_helpers import (
+    csrf_client,
+    isolate_app,
+)  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -111,7 +113,6 @@ def test_csrf_missing_token_post_login_rejected():
         assert not s.get("auth_user")
 
 def test_csrf_login_with_token_passes(monkeypatch):
-    install_json_login_limits(monkeypatch)
     app_mod.AUTH_ENABLED = True
     owner, _u = _setup_owner_and_user()
     client = _client()
@@ -212,7 +213,6 @@ def test_csrf_get_methods_safe():
 # 2. logout 改 POST + 登录清 session
 # =========================================================================== #
 def test_logout_post_with_csrf_clears_session(monkeypatch):
-    install_json_login_limits(monkeypatch)
     app_mod.AUTH_ENABLED = True
     _setup_owner_and_user()
     client = _client()
@@ -255,7 +255,6 @@ def test_logout_get_rejected_405(caplog):
 
 def test_login_success_clears_old_session(monkeypatch):
     """登录成功前 session.clear()：预置的旧键不残留（防 fixation）。"""
-    install_json_login_limits(monkeypatch)
     app_mod.AUTH_ENABLED = True
     _setup_owner_and_user()
     client = _client()
@@ -281,7 +280,6 @@ def test_login_success_clears_old_session(monkeypatch):
 ])
 def test_login_next_rejects_external(monkeypatch, bad_next):
     """恶意/非法 next 不外跳：统一回落 /app（R3：普通登录默认进工作台）。"""
-    install_json_login_limits(monkeypatch)
     app_mod.AUTH_ENABLED = True
     _setup_owner_and_user()
     client = _client()
@@ -290,7 +288,6 @@ def test_login_next_rejects_external(monkeypatch, bad_next):
     assert r.headers["Location"] == "/app"
 
 def test_login_next_allows_site_absolute(monkeypatch):
-    install_json_login_limits(monkeypatch)
     app_mod.AUTH_ENABLED = True
     _setup_owner_and_user()
     client = _client()
@@ -300,7 +297,6 @@ def test_login_next_allows_site_absolute(monkeypatch):
 
 def test_login_default_next_is_app(monkeypatch):
     """R3：无 next 的普通用户/owner 登录成功默认到 /app（不再回介绍主页）。"""
-    install_json_login_limits(monkeypatch)
     app_mod.AUTH_ENABLED = True
     _setup_owner_and_user()
     for username, password in (("owner@x.com", "ownerpass123456"),
@@ -313,7 +309,6 @@ def test_login_default_next_is_app(monkeypatch):
 
 def test_login_safe_next_preserved(monkeypatch):
     """R3：有效安全站内 next（如 /admin）登录后正确保留。"""
-    install_json_login_limits(monkeypatch)
     app_mod.AUTH_ENABLED = True
     _setup_owner_and_user()
     client = _client()
@@ -337,7 +332,6 @@ def test_safe_next_path_unit():
 # =========================================================================== #
 
 def test_login_lock_two_buckets_mock_429_with_retry_after(monkeypatch):
-    install_json_login_limits(monkeypatch)
     app_mod.AUTH_ENABLED = True
     _setup_owner_and_user()
     client = _client()
@@ -360,7 +354,6 @@ def test_login_lock_two_buckets_mock_429_with_retry_after(monkeypatch):
     assert tag and re.search(r"\bopen\b", tag)
 
 def test_login_success_clears_failure_buckets(monkeypatch):
-    install_json_login_limits(monkeypatch)
     app_mod.AUTH_ENABLED = True
     _setup_owner_and_user()
     client = _client()
@@ -373,7 +366,6 @@ def test_login_success_clears_failure_buckets(monkeypatch):
 
 def test_login_error_message_no_account_enumeration(monkeypatch):
     """不存在账号与错误密码文案一致（不泄露账号是否存在）；错误页弹窗直开。"""
-    install_json_login_limits(monkeypatch)
     app_mod.AUTH_ENABLED = True
     _setup_owner_and_user()
     client = _client()
@@ -417,7 +409,6 @@ def test_account_hash_normalized():
 # =========================================================================== #
 def test_index_unauthenticated_renders_entry_page(monkeypatch):
     """AUTH_ENABLED=True 未登录：渲染入口页，不 302 /login（docs §3.1）。"""
-    install_json_login_limits(monkeypatch)
     app_mod.AUTH_ENABLED = True
     _setup_owner_and_user()
     client = _client()
@@ -434,7 +425,6 @@ def test_index_unauthenticated_renders_entry_page(monkeypatch):
 
 def test_index_entry_landing_page_content(monkeypatch):
     """未登录 / 的产品介绍页内容（histopilot-com-landing-page.md §5/§6）。"""
-    install_json_login_limits(monkeypatch)
     app_mod.AUTH_ENABLED = True
     _setup_owner_and_user()
     client = _client()
@@ -626,7 +616,6 @@ def test_index_authenticated_stays_on_landing(monkeypatch):
     disclosure 面板（身份摘要 / 工作台 / 退出）；Hero 主入口亦为「进入工作台」，
     已登录不再出现注册/登录引导。
     """
-    install_json_login_limits(monkeypatch)
     app_mod.AUTH_ENABLED = True
     _setup_owner_and_user()
     client = _client()
@@ -679,7 +668,6 @@ def test_entry_avatar_letter_removed_everywhere():
 
 def test_workbench_requires_login_and_renders_app(monkeypatch):
     """/app 未登录 302 /login?next=/app；已登录渲染完整工作台。"""
-    install_json_login_limits(monkeypatch)
     app_mod.AUTH_ENABLED = True
     _setup_owner_and_user()
     anon = _client()
@@ -706,7 +694,6 @@ def test_index_auth_disabled_keeps_current_behavior():
 
 def test_login_get_redirects_when_authenticated(monkeypatch):
     """已登录访问 /login：302 到安全 next 或 /app（docs §3.1 + R3 默认工作台）。"""
-    install_json_login_limits(monkeypatch)
     app_mod.AUTH_ENABLED = True
     _setup_owner_and_user()
     client = _client()
@@ -724,7 +711,6 @@ def test_login_get_renders_entry_with_open_dialog(monkeypatch):
     login.html 已删除（登录页并入主页弹窗）：返回 200、含 id="login-dialog"
     且弹窗带 open 属性（login_open=True，无 JS 时也可见）。
     """
-    install_json_login_limits(monkeypatch)
     app_mod.AUTH_ENABLED = True
     _setup_owner_and_user()
     client = _client()
@@ -988,25 +974,6 @@ def test_index_template_share_permissions_and_logout():
     assert 'href="/logout"' not in text and 'href="/logout"' not in shell
     assert 'id="logout-btn"' in shell
 
-def test_appjs_csrf_header_and_post_logout():
-    """源码子串断言（脆弱，test-review P3-17 收敛说明）：
-
-    「X-CSRF-Token 出现在 app.js 全文」已删——那是虚假信心断言：上传 CSRF 的
-    **行为**测试在 tests/js/upload-csrf.test.ts（stub fetch 断言头真实附带）与
-    tests/test_upload_csrf.py（后端 header-only 契约）。此处仅保留无行为测试
-    覆盖的零散锚点，改动 app.js 时允许同步更新。
-    """
-    text = (REPO_ROOT / "static" / "app.js").read_text(encoding="utf-8")
-    assert '"/logout"' in text and '"POST"' in text, "app.js 未改 POST /logout"
-    assert "resp.ok" in text
-    assert "toast.logout.fail" in text
-    assert "window.HP_AUTH" in text
-    # 分享创建携带显式 permissions
-    assert "getSharePermissions" in text
-    assert "permissions: permissions" in text
-    # 角色注入 AI 配置标题
-    assert "setRole" in text
-
 def test_share_create_with_view_only_permissions(monkeypatch):
     """端到端：显式仅查看权限的分享不默认带 annotate（UI 语义后端已支持）。"""
     app_mod.AUTH_ENABLED = True
@@ -1084,7 +1051,6 @@ def test_entry_register_entry_state_matrix(monkeypatch):
     """主页升级（H2，计划 §4.1 状态矩阵）：未登录 Hero 注册入口与「如何开始」
     第一步按注册模式渲染；入口与文案随服务端权威模式（_registration_dialog_mode）
     一致，closed 不伪装开放注册。"""
-    install_json_login_limits(monkeypatch)
     app_mod.AUTH_ENABLED = True
     _setup_owner_and_user()
     client = _client()

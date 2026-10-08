@@ -28,14 +28,17 @@ import pytest  # noqa: E402
 import app as app_mod  # noqa: E402
 import share_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import (csrf_client, install_json_login_limits,  # noqa: E402
-                         isolate_app, register_slide_row, FakeRequests)
+from _pt_helpers import (
+    isolate_app,
+    register_slide_row,
+    FakeRequests,
+    make_client as _client,
+)  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
-    _, up_dir = isolate_app(monkeypatch, tmp_path, UPLOAD_DIR,
-                            login_limits=True)
+    _, up_dir = isolate_app(monkeypatch, tmp_path, UPLOAD_DIR)
     monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
     for child in up_dir.iterdir():
         if child.is_file():
@@ -53,11 +56,6 @@ def fake_sidecar(monkeypatch):
     fake = FakeRequests()
     monkeypatch.setattr(app_mod, "requests", fake)
     return fake
-
-
-def _client():
-    app_mod.app.config["TESTING"] = True
-    return csrf_client(app_mod.app.test_client())
 
 
 def _login(client, user):

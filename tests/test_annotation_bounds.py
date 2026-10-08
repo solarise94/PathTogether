@@ -13,7 +13,7 @@ app._validate_annotation_rect 同一套几何规则：
     成功审计事件；
   - 切片尺寸读不到（桩文件、无元数据 mock）时保持旧降级语义：不做包含校验。
 
-json / pg 双后端通用（RUN_PG_TESTS=1 时 conftest 已切 postgres 并逐用例
+默认内嵌 PostgreSQL（conftest 逐用例
 TRUNCATE）。运行：cd 项目根 && python3 -m pytest tests/test_annotation_bounds.py -q
 """
 import json
@@ -32,7 +32,11 @@ os.environ["AI_INTERNAL_TOKEN"] = "test-internal-token"
 # 尺寸，不需要真 OpenSlide）
 import app as app_mod  # noqa: E402
 import share_store  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app, register_slide_row  # noqa: E402, register_slide_row
+from _pt_helpers import (
+    isolate_app,
+    register_slide_row,
+    make_client as _client,
+)  # noqa: E402
 
 app_mod.UPLOAD_DIR = Path(os.environ["UPLOAD_DIR"])
 app_mod.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -56,11 +60,6 @@ def _isolated(tmp_path, monkeypatch):
     with app_mod.slide_cache._info_cache_lock:
         app_mod.slide_cache._info_cache.clear()
     yield
-
-
-def _client():
-    app_mod.app.config["TESTING"] = True
-    return csrf_client(app_mod.app.test_client())
 
 
 def _touch_slide(name="bounds.svs"):

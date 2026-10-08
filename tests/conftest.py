@@ -272,5 +272,3 @@ def _truncate_pg_before_each():
     finally:
         conn.close()
     yield
-
-BACKEND = "postgres"

@@ -28,8 +28,7 @@ PW = "longpassword123"
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch, tmp_path):
-    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True,
-                clear_stores=True)
+    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, clear_stores=True)
     app_mod.app.config["TESTING"] = True
     app_mod.AUTH_ENABLED = True
 

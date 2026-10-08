@@ -217,7 +217,8 @@ def test_raster_rendered_view_passthrough_native(tmp_path):
                                               fingerprint="native")
         direct = s.read_region((0, 0), 0, (8, 6))
         via_view = view.read_region((0, 0), 0, (8, 6))
-        assert list(direct.getdata()) == list(via_view.getdata())
+        assert (direct.mode, direct.size, direct.tobytes()) == (
+            via_view.mode, via_view.size, via_view.tobytes())
         thumb = view.get_thumbnail((32, 32))
         assert thumb.mode == "RGBA"
         assert max(thumb.size) <= 32
@@ -398,7 +399,7 @@ def test_share_raster_with_multichannel_flag_on(view_env, monkeypatch):
     p1 = Image.open(io.BytesIO(plain.data)).convert("RGB")
     p2 = Image.open(io.BytesIO(tok_tile.data)).convert("RGB")
     assert p1.size == p2.size
-    assert list(p1.getdata()) == list(p2.getdata())
+    assert p1.tobytes() == p2.tobytes()
 
 
 # --------------------------------------------------------------------------- #

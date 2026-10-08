@@ -29,7 +29,10 @@ import crop_guard  # noqa: E402
 import share_store  # noqa: E402
 import share_server as share_srv  # noqa: E402
 import app as app_mod  # noqa: E402
-from _pt_helpers import install_json_login_limits, isolate_app, register_slide_row  # noqa: E402, register_slide_row
+from _pt_helpers import (
+    isolate_app,
+    register_slide_row,
+)  # noqa: E402
 
 
 DEFAULT_MAX_PIXELS = 4096 ** 2
@@ -38,8 +41,7 @@ DEFAULT_MAX_PIXELS = 4096 ** 2
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
     """每用例：独立存储 + 三道闸复位为全新实例 + 上限钉默认值。"""
-    _, up_dir = isolate_app(monkeypatch, tmp_path, UPLOAD_DIR,
-                            login_limits=True)
+    _, up_dir = isolate_app(monkeypatch, tmp_path, UPLOAD_DIR)
     monkeypatch.setattr(crop_guard, "CROP_MAX_PIXELS", DEFAULT_MAX_PIXELS)
     monkeypatch.setattr(crop_guard, "_PIXEL_WINDOW",
                         crop_guard.SlidingPixelWindow(

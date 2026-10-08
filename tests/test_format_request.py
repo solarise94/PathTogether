@@ -33,12 +33,16 @@ import format_request_store as frs  # noqa: E402
 import pg_store  # noqa: E402
 import registration_mail_worker as rmw  # noqa: E402
 import upload_guard  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app, clear_upload_dir  # noqa: E402
+from _pt_helpers import (
+    isolate_app,
+    clear_upload_dir,
+    make_client as _client,
+)  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
-    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True)
+    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR)
     monkeypatch.setattr(app_mod, "AUTH_ENABLED", False)
     monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)
     # 样本目录隔离到 tmp_path
@@ -57,11 +61,6 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setenv("REGISTRATION_MAIL_SENDER", "fake")
     clear_upload_dir(UPLOAD_DIR)
     yield
-
-
-def _client():
-    app_mod.app.config["TESTING"] = True
-    return csrf_client(app_mod.app.test_client())
 
 
 class _FakeFile:

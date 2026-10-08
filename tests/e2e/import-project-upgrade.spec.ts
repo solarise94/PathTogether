@@ -50,6 +50,10 @@ const CREDS = JSON.parse(readFileSync(
 /** 每次运行唯一前缀（e2e_server 每次 fresh PG，防的是同 run 内重名）。 */
 const RUN = "e2e" + Date.now().toString(36);
 
+test.beforeEach(async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("hp_lang", "zh"));
+});
+
 async function login(page: Page, loginId: string, password: string) {
   await page.goto("/login");
   await page.fill('form[action="/login"] input[name="username"]', loginId);
@@ -190,10 +194,12 @@ test.describe("API 契约：格式目录与兼容申请（U05/F 系）", () => {
     const mrxs = byId.get("mrxs");
     expect(mrxs, "catalog row mrxs").toBeTruthy();
     expect(mrxs!.bundle_required).toBe(true);
-    expect(mrxs!.import_mode).toBe("bundle");
+    expect(mrxs!.import_mode).toBe("convert");
+    expect(mrxs!.direct_import).toBe("closed");
+    expect(mrxs!.browser_convert).toBe("available");
   });
 
-  test("U05-API: 提交兼容申请 202 回执 + 列表/详情可查 + 他人 404", async ({ page }) => {
+  test("U05-API: 提交兼容申请 202 回执 + 列表/详情可查 + 他人 404", async ({ page, browser }) => {
     await loginAsUser(page);
     const ext = `.z${RUN}`;
     const submit = await api(page, "POST", "/api/format-requests", {
@@ -217,9 +223,15 @@ test.describe("API 契约：格式目录与兼容申请（U05/F 系）", () => {
     expect(detail.status()).toBe(200);
 
     // 越权：owner 登录后查同 id → 404（不回 403 泄露存在性）
-    await login(page, CREDS.ownerLogin, CREDS.ownerPassword);
-    const foreign = await api(page, "GET", `/api/format-requests/${receipt.request_id}`);
-    expect(foreign.status()).toBe(404);
+    const ownerContext = await browser.newContext({ baseURL: CREDS.baseUrl });
+    try {
+      const ownerPage = await ownerContext.newPage();
+      await login(ownerPage, CREDS.ownerLogin, CREDS.ownerPassword);
+      const foreign = await api(ownerPage, "GET", `/api/format-requests/${receipt.request_id}`);
+      expect(foreign.status()).toBe(404);
+    } finally {
+      await ownerContext.close();
+    }
   });
 });
 
@@ -235,9 +247,19 @@ test.describe("API 契约：百度能力与转换任务（U07/U08）", () => {
     expect(typeof caps.reason_code).toBe("string");
     expect(caps.reason_code.length).toBeGreaterThan(0);
     // 响应不含认证详情/秘密字段
-    const raw = await resp.text();
-    expect(raw).not.toMatch(/extraction|token|secret|cookie/i);
-    expect(caps.limits).toBeTruthy();
+    expect(Object.keys(caps).sort()).toEqual([
+      "connector_version", "enumeration_available", "import_available",
+      "limits", "reason_code", "worker_enabled",
+    ]);
+    // 公开原因码 secret_unconfigured 不是秘密；限制响应字段而非匹配整段文字。
+    expect(caps.reason_code).toBe("secret_unconfigured");
+    expect(Object.keys(caps.limits).sort()).toEqual([
+      "enumeration_timeout_seconds", "max_depth", "max_entries", "page_size", "share_ttl_hours",
+    ]);
+    for (const limit of Object.values(caps.limits)) {
+      expect(Number.isInteger(limit)).toBe(true);
+      expect(limit).toBeGreaterThan(0);
+    }
   });
 
   test("U07-API: GET /api/conversions 本人列表可用、非法 group 400", async ({ page }) => {

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """break-glass CLI（python3 -m useradmin）测试（账户系统批次 A，docs §7.3）。
 
-仅当 ``RUN_PG_TESTS=1`` 时真跑（CLI 直连 PostgreSQL；conftest 已起 pgserver、
+默认运行（CLI 直连 PostgreSQL；conftest 已起 pgserver、
 设 DATABASE_URL 并按用例 TRUNCATE）。json 默认模式整模块 skip。
 
 覆盖：

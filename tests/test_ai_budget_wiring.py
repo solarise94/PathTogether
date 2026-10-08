@@ -11,7 +11,7 @@ PostgreSQL 唯一后端：
     注入规则（平台=周期 20 / own=已保存值）、请求体临时塞 tuning 不生效；
   - owner 预算 API + CSRF 回归。
 
-追加（RUN_PG_TESTS=1）：
+追加（默认内嵌 PostgreSQL）：
   - 批次 F：mode=all 下官方 run 跳过 reserve_turn（零 reservations）+
     ai_run_bindings 绑定/跨主体 409；429 消费断言显式 seed shadow（软闸
     回退语义）；owner 预算 API 写端点 410 turn_budgets_retired；
@@ -48,13 +48,18 @@ import app as app_mod  # noqa: E402
 import budget_store  # noqa: E402
 import demo_store  # noqa: E402
 import platform_features  # noqa: E402
-from pg_compat import BACKEND  # noqa: E402
-from _pt_helpers import (csrf_client, isolate_app,  # noqa: E402
-                         register_slide_row, FakeRequests, FakeResponse)
+from _pt_helpers import (
+    isolate_app,
+    register_slide_row,
+    FakeRequests,
+    FakeResponse,
+    make_client,
+)  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # 公共基建
 # --------------------------------------------------------------------------- #
+
 @pytest.fixture(autouse=True)
 def _ssrf_dns(monkeypatch):
     """测试用 DNS：IP 字面量按字面；localhost/元数据指向私网；其余给公网 IP。"""
@@ -93,9 +98,7 @@ def _sse_ok(session_id="sess-fake-1"):
                         headers={"X-AI-Session-ID": session_id})
 
 def _client(auth=True):
-    app_mod.app.config["TESTING"] = True
-    app_mod.AUTH_ENABLED = auth
-    return csrf_client(app_mod.app.test_client())
+    return make_client(auth=auth)
 
 def _login(client, role, user_id):
     with client.session_transaction() as sess:

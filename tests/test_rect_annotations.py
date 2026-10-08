@@ -46,7 +46,7 @@ from _pt_helpers import csrf_client, isolate_app, register_slide_row  # noqa: E4
 def _isolate(monkeypatch, tmp_path):
     """每用例隔离 + 统一注入可信切片元数据（1000×800 @ mpp 分轴）。"""
     _, up_dir = isolate_app(monkeypatch, tmp_path, UPLOAD_DIR,
-                            login_limits=True, clear_stores=True)
+                            clear_stores=True)
     for child in up_dir.iterdir():
         if child.is_file():
             child.unlink()

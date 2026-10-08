@@ -1,16 +1,11 @@
 import os
-import json
 import psycopg
-import pytest
-
 
 
 import slide_storage
 import upload_guard as guard
 import upload_task_store
 from test_reconcile_upload_capacity import recon, _uid, _task, _q
-import app as app_mod
-import task_storage_lock
 
 
 def cli(pg_uri, root, *extra):
@@ -81,21 +76,3 @@ def test_replay_after_cleanup_is_successful_noop(pg_uri, tmp_path):
     upload_task_store.confirm_cleanup_and_release(tid)
     assert cli(pg_uri, tmp_path, '--apply', '--plan', plan, '--repair-residuals') == 0
     assert _q(uid) == (0, 0)
-
-
-@pytest.mark.skip(reason=
-    "U5（检查点 B）：被测面（V1 _api_upload_native_single 早退分支）已按 "
-    "docs/cos-only-upload-agent-plan-20260928.md §6 删除；断言原样保留作历史"
-    "证据，仅退役本例（R16：其余核账反例继续运行）。")
-def test_native_upload_owner_failure_does_not_relock_itself(monkeypatch, tmp_path):
-    original = task_storage_lock.task_storage_lock
-    def bounded_lock(kind, tid, **kwargs):
-        kwargs['timeout'] = 0.05  # bound the real self-wait, don't hang pytest
-        kwargs['root'] = tmp_path
-        return original(kind, tid, **kwargs)
-    monkeypatch.setattr(task_storage_lock, 'task_storage_lock', bounded_lock)
-    monkeypatch.setattr(app_mod, '_upload_asset_owner', lambda ident: None)
-    with app_mod.app.test_request_context('/api/upload', method='POST'):
-        _, status = app_mod._api_upload_native_single(
-            None, 'a.svs', 'a.svs', 'svs', {}, None, None)
-    assert status == 500

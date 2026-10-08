@@ -45,7 +45,9 @@ import registration_mail_worker  # noqa: E402
 import registration_store  # noqa: E402
 import settings_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import csrf_client  # noqa: E402
+from _pt_helpers import (
+    make_client,
+)  # noqa: E402
 
 BASE = "https://path.example.com"
 PW = "longpassword123456"
@@ -82,9 +84,7 @@ def _isolate(monkeypatch):
 
 
 def _client(auth=True):
-    app_mod.app.config["TESTING"] = True
-    app_mod.AUTH_ENABLED = auth
-    return csrf_client(app_mod.app.test_client())
+    return make_client(auth=auth)
 
 
 def _raw_client(auth=True):

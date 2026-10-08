@@ -8,7 +8,7 @@ json 模式（无 PG 也跑，纯函数）：
   - mode_is_hard 矩阵（shadow 恒 False；registered= user/owner；all=全部）；
   - 新稳定错误码（pricing_unavailable / settle_payload_required）。
 
-PG 部分（RUN_PG_TESTS=1，全部真实 PostgreSQL、多连接 + threading.Barrier，
+PG 部分（默认内嵌 PostgreSQL，全部真实 PostgreSQL、多连接 + threading.Barrier，
 禁 mock 充数；注入用例只 monkeypatch 本仓库自身的模块级钩子/函数）：
   - 迁移（§9.7）：fresh PG 全量 0001→0024 + ensure_schema 重跑幂等；0024
     SQL 文件重放幂等；0024 之前的 legacy hold 行（新列 NULL）存活且语义为
@@ -33,7 +33,7 @@ PG 部分（RUN_PG_TESTS=1，全部真实 PostgreSQL、多连接 + threading.Bar
     capabilities（settle_with_usage_event / spend_enforcement）。
 
 运行：cd 项目根 && python3 -m pytest tests/test_billing_hold_settle_chain.py -q
-（PG 双跑：RUN_PG_TESTS=1 python3 -m pytest tests/test_billing_hold_settle_chain.py -q）
+（运行：python3 -m pytest tests/test_billing_hold_settle_chain.py -q）
 """
 import json
 import os
@@ -49,7 +49,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
 import app as app_mod  # noqa: E402
-from _pt_helpers import isolate_app  # noqa: E402
+from _pt_helpers import (
+    isolate_app,
+)  # noqa: E402
 
 import pytest  # noqa: E402
 
@@ -57,12 +59,10 @@ import billing_pricing  # noqa: E402
 import billing_store  # noqa: E402
 import spend_store  # noqa: E402
 
-from pg_compat import BACKEND  # noqa: E402
 
-if BACKEND == "postgres":
-    import psycopg  # noqa: E402
-    import _billing_helpers as bh  # noqa: E402
-    import user_store  # noqa: E402
+import psycopg  # noqa: E402
+import _billing_helpers as bh  # noqa: E402
+import user_store  # noqa: E402
 
 app_mod.UPLOAD_DIR = Path(os.environ["UPLOAD_DIR"])
 app_mod.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)

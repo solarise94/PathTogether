@@ -3,13 +3,24 @@ import { test, expect } from '@playwright/test';
 test.use({ viewport: { width: 1440, height: 1000 }, locale: 'zh-CN' });
 
 test('homepage hero ships one preview raster and runs the full SVG flow without changing tissue', async ({ page }) => {
-  // 100 轮 clock.runFor + getAttribute 往返，慢环境下会顶到默认 60s 超时
-  test.slow();
   const images: string[] = [];
   const errors: string[] = [];
   page.on('request', request => { if (/\.(webp|jpe?g|png)(\?|$)/.test(request.url())) images.push(request.url()); });
   page.on('pageerror', error => errors.push(error.message));
-  await page.clock.install();
+  // Drive real requestAnimationFrame callbacks with a frame clock. Advancing
+  // 400 frames exercises every automatic transition without 40s of wall time.
+  await page.addInitScript(() => {
+    const callbacks = new Map<number, FrameRequestCallback>();
+    let id = 0;
+    window.requestAnimationFrame = callback => { callbacks.set(++id, callback); return id; };
+    window.cancelAnimationFrame = key => { callbacks.delete(key); };
+    (window as any).__pendingFrames = () => callbacks.size;
+    (window as any).__advanceFrame = (now: number) => {
+      const pending = Array.from(callbacks.values());
+      callbacks.clear();
+      pending.forEach(callback => callback(now));
+    };
+  });
   await page.goto('/');
   await expect(page.locator('h1')).toHaveText('与 AI 一起，观察病理切片。');
   await expect(page.locator('body')).not.toContainText('不用于临床诊断');
@@ -23,12 +34,22 @@ test('homepage hero ships one preview raster and runs the full SVG flow without 
   await page.locator('.tissue-demo').scrollIntoViewIfNeeded();
   await expect(page.locator('#tissue')).toHaveAttribute('data-scene', '0');
   const geometry = await page.locator('#tissue [data-glands]').innerHTML();
-  const seen = new Set<string>();
-  for (let i = 0; i < 100; i++) {
-    await page.clock.runFor(400);
-    seen.add((await page.locator('#tissue').getAttribute('data-scene'))!);
-  }
-  expect(seen.size).toBe(8);
+  await page.evaluate(() => {
+    const tissue = document.querySelector('#tissue')!;
+    const seen = new Set([tissue.getAttribute('data-scene')]);
+    (window as any).__sceneCoverage = seen;
+    new MutationObserver(() => seen.add(tissue.getAttribute('data-scene')))
+      .observe(tissue, { attributes: true, attributeFilter: ['data-scene'] });
+  });
+  await expect.poll(() => page.evaluate(() => (window as any).__pendingFrames())).toBeGreaterThan(0);
+  await page.evaluate(async () => {
+    for (let frame = 1; frame <= 400; frame++) {
+      (window as any).__advanceFrame(frame * 100);
+      await Promise.resolve(); // Let the scene observer see each transition.
+    }
+  });
+  expect(await page.evaluate(() => Array.from((window as any).__sceneCoverage).sort()))
+    .toEqual(['0', '1', '2', '3', '4', '5', '6', '7']);
   expect(await page.locator('#tissue [data-glands]').innerHTML()).toBe(geometry);
   // 首页栅格预算：仅 Hero 工作台预览一张（WebP；桌面 1440 视口不选 720 档）
   expect(images.filter(u => !u.includes('/static/entry-media/workbench-preview'))).toEqual([]);

@@ -6,20 +6,20 @@ R3 wave1 起 billing caps/adjustments、turn-budgets 与 /admin/registration
 兼容重定向端点已物理删除（bridge 侧无调用方；billing_store 写原语由
 tests/test_billing_store.py 在 store 级锁定），本文件只覆盖仍在线的写面：
 
-pg 模式（RUN_PG_TESTS=1）：
+pg 模式（默认内嵌 PostgreSQL）：
   - 全部写端点 owner 门控：匿名 401 / user 403 / owner 预览态 403；
   - users 写端点（create/enable/disable/password-reset）与 break-glass
     不变量（owner 不可禁用/启用/重置密码 → 409；disable 推进 auth_version）；
   - ai-access/invites 写端点 PG 语义（PostgreSQL 唯一后端；旧 json/dual
     pg_backend_required 门已随 R3 Wave3 退役）。
 
-PG 模式（RUN_PG_TESTS=1）：
+PG 模式（默认内嵌 PostgreSQL）：
   - invites：创建（含 source_code/campaign slug 校验）token 仅一次 + 列表
     永不回 token / 撤销 / 已消费拒绝撤销 / 不存在 404；
   - ai-access：设置/收回 + 不存在 404。
 
 运行：cd 项目根 && python3 -m pytest tests/test_admin_billing_writes.py -q
-（PG 双跑：RUN_PG_TESTS=1 python3 -m pytest tests/test_admin_billing_writes.py -q）
+（运行：python3 -m pytest tests/test_admin_billing_writes.py -q）
 """
 import os
 import sys
@@ -35,12 +35,13 @@ import app as app_mod  # noqa: E402
 import billing_store  # noqa: E402
 import share_store_pg  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app  # noqa: E402
-from pg_compat import BACKEND  # noqa: E402
+from _pt_helpers import (
+    isolate_app,
+    make_client as _client,
+)  # noqa: E402
 
-if BACKEND == "postgres":
-    import psycopg  # noqa: E402
-    import budget_store  # noqa: E402
+import psycopg  # noqa: E402
+import budget_store  # noqa: E402
 
 app_mod.UPLOAD_DIR = Path(UPLOAD_DIR)
 app_mod.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -48,13 +49,10 @@ app_mod.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
     """每用例独立存储 + AUTH_ENABLED=True（owner 门控有真实意义）。"""
-    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True)
+    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR)
     monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
     yield
 
-def _client():
-    app_mod.app.config["TESTING"] = True
-    return csrf_client(app_mod.app.test_client())
 
 def _login(client, user):
     with client.session_transaction() as s:

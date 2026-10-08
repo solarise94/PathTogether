@@ -24,7 +24,7 @@
 原语，不经 app 层硬闸分流）下闸仍生效。金额硬闸主体的调用点分流见
 test_ai_budget_wiring.test_hard_mode_run_skips_reservations_and_writes_binding。
 
-仅 RUN_PG_TESTS=1 时真跑（conftest 已起 pgserver；每用例 TRUNCATE 重置周期）。
+默认运行（conftest 已起 pgserver；每用例 TRUNCATE 重置周期）。
 """
 import os
 import sys
@@ -50,7 +50,6 @@ import registration_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
 import platform_features  # noqa: E402
-from pg_compat import BACKEND  # noqa: E402
 
 
 def _req():

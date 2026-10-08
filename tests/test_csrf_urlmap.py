@@ -27,13 +27,16 @@ import pytest  # noqa: E402
 import app as app_mod  # noqa: E402
 import share_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import csrf_client, install_json_login_limits, isolate_app # noqa: E402
-from _pt_helpers import register_slide_row  # noqa: E402  # P6：夹具建仓
+from _pt_helpers import (
+    csrf_client,
+    isolate_app,
+    register_slide_row,
+)  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
-    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True)
+    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR)
     monkeypatch.setattr(app_mod, "AUTH_ENABLED", False)
     yield
 
@@ -158,7 +161,6 @@ def test_api_routes_do_not_accept_form_token_fallback():
         "filename": "a.svs", "declared_size": "10"})
     assert r.status_code == 400
     assert r.get_json()["error"] == "csrf_required"
-
 
 
 # --------------------------------------------------------------------------- #

@@ -3,6 +3,7 @@
  * 预览 banner 展示并可用 stop。
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { fakeEl } from "./helpers/basic-element";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,22 +11,10 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const appSrc = readFileSync(resolve(here, "../../static/app.js"), "utf8");
 
-function fakeEl() {
-	return {
-		hidden: true,
-		textContent: "",
-		innerHTML: "",
-		value: "",
-		disabled: false,
-		style: {},
-		classList: { add() {}, remove() {}, contains() { return false; } },
-		appendChild() {},
-		addEventListener() {},
-	};
-}
 
 function loadApp() {
 	const els: Record<string, ReturnType<typeof fakeEl>> = {};
+	const setRole = vi.fn();
 	const loc = { href: "http://local/", pathname: "/" };
 	const w: Record<string, unknown> = {
 		HP_I18N: {
@@ -34,7 +23,7 @@ function loadApp() {
 				return k + ":" + JSON.stringify(vars);
 			},
 			getLang: () => "zh",
-			setRole() {},
+			setRole,
 		},
 		fetch: vi.fn(() => Promise.resolve({
 			ok: true,
@@ -58,11 +47,12 @@ function loadApp() {
 		querySelectorAll() { return []; },
 	};
 	(w as { document: typeof doc }).document = doc;
-	(globalThis as { document: typeof doc }).document = doc;
-	(globalThis as { window: typeof w }).window = w;
+	vi.stubGlobal("document", doc);
+	vi.stubGlobal("window", w);
 	new Function("window", "document", "fetch", "location", appSrc)(w, doc, w.fetch, loc);
 	return {
 		els,
+		setRole,
 		applyAuthInfo: (w.HP_AUTH as { applyAuthInfo: (info: unknown) => void }).applyAuthInfo,
 	};
 }
@@ -90,6 +80,7 @@ describe("admin identity preview UI", () => {
 		});
 		expect(h.els["preview-banner"].hidden).toBe(false);
 		expect(h.els["preview-banner-text"].textContent).toContain("user@x.com");
+		expect(h.setRole).toHaveBeenLastCalledWith("user");
 		expect(h.els["logout-btn"].hidden).toBe(true);
 		expect(h.els["admin-entry-link"].hidden).toBe(true); // 预览态隐藏（与改密/登出同级）
 	});
@@ -105,6 +96,7 @@ describe("admin identity preview UI", () => {
 			preview: null,
 		});
 		expect(h.els["admin-entry-link"].hidden).toBe(false);
+		expect(h.setRole).toHaveBeenLastCalledWith("owner");
 	});
 
 	it("普通 user 不见管理台入口（入口按真实 actor 判定）", () => {

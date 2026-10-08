@@ -38,8 +38,12 @@ import slide_store  # noqa: E402
 import upload_guard  # noqa: E402
 import upload_task_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import (clear_upload_dir, csrf_client, isolate_app,  # noqa: E402
-                         publish_test_slide)
+from _pt_helpers import (
+    clear_upload_dir,
+    isolate_app,
+    publish_test_slide,
+    make_client,
+)  # noqa: E402
 from _tiff_fixtures import make_tiff_bytes  # noqa: E402
 
 PG_URI = os.environ["DATABASE_URL"]
@@ -63,9 +67,7 @@ def _isolate(tmp_path, monkeypatch):
 
 
 def _client():
-    app_mod.app.config["TESTING"] = True
-    app_mod.AUTH_ENABLED = False
-    return csrf_client(app_mod.app.test_client())
+    return make_client(auth=False)
 
 
 def _share_client():

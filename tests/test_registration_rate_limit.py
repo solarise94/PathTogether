@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """P0-B 注册限流测试（docs §4.5 / §6.1 限流条目）。
 
-覆盖（仅 RUN_PG_TESTS=1 真跑，PG 权威）：
+覆盖（默认运行，PG 权威）：
   - 每 IP 前缀 15 分钟 10 次失败 → 锁定（429 + Retry-After）；
   - 每 IP 前缀 24 小时 30 次**尝试**（成功也计）→ 锁定；
   - 每 invite token_hash 15 分钟 5 次失败 → 短时锁定（换 IP 也锁）；
@@ -30,7 +30,6 @@ import registration_store  # noqa: E402
 import settings_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
-from pg_compat import BACKEND  # noqa: E402
 from _pt_helpers import isolate_app  # noqa: E402
 from _pt_helpers import csrf_client  # noqa: E402
 

@@ -24,7 +24,7 @@ UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 
 @pytest.fixture(autouse=True)
 def _iso(tmp_path, monkeypatch):
-    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True)
+    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR)
     # P3：本地免认证态上传资产 owner 解析（合同 §3.1.1）——先配置 owner
     import share_store as _ss
     import user_store as _us

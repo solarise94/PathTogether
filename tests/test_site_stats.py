@@ -3,7 +3,7 @@
 review-2026-09-02-upload-user-limits-admin-ui-cleanup.md §3.4 / §4.4 /
 §Batch D2 / §7.2 / §7.3 / §8.1-9）。
 
-store 级（默认全跑；PG-only 用例 RUN_PG_TESTS=1）：
+store 级（默认全跑；内嵌 PostgreSQL）：
   - allowlist：/、/demo、/register、/login 精确命中；/api/*、/static/*、
     /admin、/healthz、工作区/深路径（含分享 token、切片名、项目 ID）不落；
   - 口径门：非 2xx-3xx 不落；非 HTML 不落；query 含 token/资源 ID 键整条
@@ -50,7 +50,7 @@ app.py 接线由并行代理实施，接线落地前这些用例红属预期）�
 
 运行：
   cd PathTogether && python3 -m pytest tests/test_site_stats.py -q
-  RUN_PG_TESTS=1 python3 -m pytest tests/test_site_stats.py -q
+  python3 -m pytest tests/test_site_stats.py -q
 """
 import json
 import logging
@@ -69,15 +69,17 @@ import pytest  # noqa: E402
 import app as app_mod  # noqa: E402
 import site_stats_store as sss  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app  # noqa: E402
-from pg_compat import BACKEND  # noqa: E402
+from _pt_helpers import (
+    isolate_app,
+    pg_connection as _conn,
+    make_client as _client,
+)  # noqa: E402
 
 # app.py 接线由并行代理实施；依赖它的用例打此标记但**默认启用**（不 skip），
 # 接线未就绪时红属预期，不得删除。
 site_stats_app_wiring = pytest.mark.site_stats_app_wiring
 
-if BACKEND == "postgres":
-    import psycopg  # noqa: E402
+import psycopg  # noqa: E402
 
 UTC = timezone.utc
 BASE_TIME = datetime(2026, 9, 3, 2, 0, 0, tzinfo=UTC)
@@ -120,21 +122,20 @@ def _isolate(tmp_path, monkeypatch):
         monkeypatch.delenv(name, raising=False)
     sss._reset_warn_state()
     sss.stop_worker()          # 先停 worker（app import 可能已自起；见 app.py）
-    if BACKEND == "postgres":
-        # conftest truncate 与 in-flight flush 之间可能落下前用例残余——
-        # 本文件大量精确计数断言，显式清一次 site_visit_events 兜底
-        conn = _conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM site_visit_events")
-            conn.commit()
-        finally:
-            conn.close()
-        # review R2-F2：app 接线用例会经 HTTP 建 owner/user（PG 上 role=user
-        # 建号走「维护闸 + 开通锁」组合原语，闸 fail-closed）——conftest
-        # TRUNCATE 清掉 0029 种子，每用例幂等重放（target=window + 闸=false）
-        import _billing_helpers as bh
-        bh.seed_spend_settings()
+    # conftest truncate 与 in-flight flush 之间可能落下前用例残余——
+    # 本文件大量精确计数断言，显式清一次 site_visit_events 兜底
+    conn = _conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM site_visit_events")
+        conn.commit()
+    finally:
+        conn.close()
+    # review R2-F2：app 接线用例会经 HTTP 建 owner/user（PG 上 role=user
+    # 建号走「维护闸 + 开通锁」组合原语，闸 fail-closed）——conftest
+    # TRUNCATE 清掉 0029 种子，每用例幂等重放（target=window + 闸=false）
+    import _billing_helpers as bh
+    bh.seed_spend_settings()
     yield
     sss.stop_worker()
 
@@ -184,13 +185,6 @@ def _fake_event(**over):
     }
     ev.update(over)
     return ev
-
-
-def _conn():
-    import pg_store
-    c = pg_store.connect()
-    c.row_factory = psycopg.rows.dict_row
-    return c
 
 
 def _sql_all(sql, params=()):
@@ -1189,9 +1183,6 @@ def test_db_failure_drops_batch_without_raise(monkeypatch, caplog):
 # --------------------------------------------------------------------------- #
 # 10. app.py 接线契约（并行代理实施中；默认启用，未接线时红属预期）
 # --------------------------------------------------------------------------- #
-def _client():
-    app_mod.app.config["TESTING"] = True
-    return csrf_client(app_mod.app.test_client())
 
 
 def _login(client, user):
@@ -1233,12 +1224,11 @@ def test_app_admin_site_stats_owner_only(monkeypatch):
     for row in payload["daily"]:
         assert set(row.keys()) == DAILY_KEYS
     assert payload["geo_configured"] is False
-    if BACKEND == "postgres":
-        # 无写副作用：调用前后 site 表行数不变（不创建事件、不清理）
-        n_before = _site_count()
-        resp = client.get("/api/admin/v1/site-stats")
-        assert resp.status_code == 200
-        assert _site_count() == n_before
+    # 无写副作用：调用前后 site 表行数不变（不创建事件、不清理）
+    n_before = _site_count()
+    resp = client.get("/api/admin/v1/site-stats")
+    assert resp.status_code == 200
+    assert _site_count() == n_before
 
 
 @site_stats_app_wiring

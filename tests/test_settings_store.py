@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """platform_settings 存取测试（docs §7.3）。
 
-PostgreSQL 唯一后端（仅 RUN_PG_TESTS=1）：UPSERT 读写、CAS、registration_mode
+PostgreSQL 唯一后端（默认内嵌 PostgreSQL）：UPSERT 读写、CAS、registration_mode
 解析（mode 键缺行 → fail-closed bootstrap closed）。
 
 PG 侧表由 conftest 每用例 TRUNCATE（platform_settings 在清单内）。
 """
 import pytest
 import settings_store
-from pg_compat import BACKEND
 
 
 # --------------------------------------------------------------------------- #

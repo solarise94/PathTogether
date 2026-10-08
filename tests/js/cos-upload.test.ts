@@ -37,6 +37,9 @@ const slideSniffSrc = readFileSync(
 	resolve(here, "../../static/upload/slide-sniff.js"), "utf8");
 const i18nSrc = readFileSync(resolve(here, "../../static/i18n.js"), "utf8");
 
+// Track real engine controllers so failures cannot leak uploads into the next test.
+const uploads: Array<{ cancel: () => void; done: Promise<unknown> }> = [];
+
 const THRESHOLD = 16 * 1024 * 1024;
 
 /** 可记录 children / 事件监听 / insertBefore 的元素 stub */
@@ -231,6 +234,13 @@ function loadApp(fetchImpl?: typeof fetch, bootstrap?: unknown) {
 	vi.stubGlobal("XMLHttpRequest", FakeXHR);
 	vi.stubGlobal("localStorage", storage);
 	new Function("window", "document", "fetch", "location", cosEngineSrc)(w, doc, theFetch, loc);
+	const engine = w.HP_COS_UPLOAD as { createUpload: (...args: unknown[]) => typeof uploads[number] };
+	const createUpload = engine.createUpload;
+	engine.createUpload = (...args) => {
+		const upload = createUpload(...args);
+		uploads.push(upload);
+		return upload;
+	};
 	new Function("window", slideSniffSrc)(w);
 	new Function("window", "document", "fetch", "location", appSrc)(w, doc, theFetch, loc);
 	const up = w.HP_UPLOAD as Record<string, unknown>;
@@ -309,15 +319,16 @@ async function zeroSha256(n: number, seedHex?: string): Promise<string> {
 		.map((x) => x.toString(16).padStart(2, "0")).join("");
 }
 
-// 假时钟安装前的真实 setTimeout（让出真实事件循环用；确认链上的
-// WebCrypto 摘要是线程池真实异步）
-const REAL_TIMEOUT = setTimeout;
 const tick = () => new Promise((r) => setTimeout(r, 0));
 async function flush(n = 10) {
 	for (let i = 0; i < n; i++) await tick();
 }
 
-afterEach(() => {
+afterEach(async () => {
+	for (const upload of uploads) upload.cancel();
+	await Promise.allSettled(uploads.map(upload => upload.done));
+	uploads.length = 0;
+	vi.clearAllTimers();
 	vi.useRealTimers();
 	vi.unstubAllGlobals();
 	FakeXHR.instances = [];
@@ -472,7 +483,7 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 		FakeXHR.onSend = (x) => { seq.push("PUT"); gated.push(x); };
 		const file = cosFile(30);
 		h.up.uploadFile(file);
-		for (let i = 0; i < 50 && gated.length < 2; i++) await vi.advanceTimersByTimeAsync(0);
+		await vi.waitFor(() => expect(gated).toHaveLength(2), { timeout: 5000, interval: 10 });
 		expect(gated.length, "批 1 两片并发在途").toBe(2);
 
 		const calls = h.fetchCalls;
@@ -502,7 +513,7 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 		expect(rowText(row, "upload-item-bytes")).toContain("upload.cos.bytes:16 B,30 B");
 		gated[0].respond(200, '"etag-x"');
 		gated[1].respond(200, '"etag-x"');
-		for (let i = 0; i < 50 && gated.length < 4; i++) await vi.advanceTimersByTimeAsync(0);
+		await vi.waitFor(() => expect(gated).toHaveLength(4), { timeout: 5000, interval: 10 });
 		expect(gated.length, "批 2 两片并发在途").toBe(4);
 
 		// ① 独立传输：COS PUT 是 XHR——PUT/签名 URL/零自定义头/不带凭据
@@ -574,6 +585,7 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 	});
 
 	it("单片失败：同 URL 重试后成功（不触发重新签名分支、不影响其余分块；重试显示「正在重试」）", async () => {
+		vi.useFakeTimers();
 		const parts = [
 			{ part_number: 1, length: 8 }, { part_number: 2, length: 8 },
 			{ part_number: 3, length: 8 }, { part_number: 4, length: 6 },
@@ -607,10 +619,9 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 			else x.respond(200, '"etag-x"');
 		};
 		h.up.uploadFile(cosFile(30));
-		await flush(12);
-		// 重试延迟 600ms（真实定时器）后 part 2 成功 → 全部 confirmed → complete → viewable
-		await new Promise((r) => setTimeout(r, 800));
-		await flush(12);
+		// Native WebCrypto is asynchronous and is not controlled by fake timers.
+		await vi.waitFor(() => expect(h.toastMessages.some(m => m.includes("upload.done"))).toBe(true),
+			{ timeout: 5000, interval: 50 });
 		expect(FakeXHR.instances).toHaveLength(5);   // 4 片 + part2 重试一次
 		expect(h.fetchCalls().some((c) => c.url === "/api/ingestions/inj_f/upload-complete")).toBe(true);
 		expect(h.toastMessages.some((m) => m.indexOf("upload.done") >= 0)).toBe(true);
@@ -696,32 +707,14 @@ describe("waiting_capacity：排队展示与轮询推进", () => {
 		expect(String(statusEl.textContent)).toContain("等待暂存空间");
 		expect(rowText(row, "upload-item-bytes")).toContain("upload.cos.queue:1");
 		expect(String(statusEl.textContent)).not.toContain("eta");
-		// 5s 轮询推进：等待→uploading→签名+PUT→complete→轮询 viewable。
-		// 确认链上的 WebCrypto 摘要是真实线程池异步——推时钟的同时让出真实
-		// 事件循环，高负载下也确定落地（断言不变）。
-		const realYield = () => new Promise((r) => REAL_TIMEOUT(r, 0));
-		let statusGets = 0;
-		for (let i = 0; i < 200; i++) {
-			await vi.advanceTimersByTimeAsync(1000);
-			await realYield();
-			statusGets = h.fetchCalls().filter(
-				(c) => c.url === "/api/ingestions/inj_w" && c.method === "GET").length;
-			if (statusGets >= 3) break;
-		}
-		expect(statusGets).toBeGreaterThanOrEqual(3);
-		// 准入后拿到分块计划 → 签名 + PUT（XHR）→ 完成
-		expect(h.fetchCalls().some((c) => c.url === "/api/ingestions/inj_w/parts/sign")).toBe(true);
+		await vi.advanceTimersByTimeAsync(4999);
+		expect(getStatus).toBe(1);
+		await vi.advanceTimersByTimeAsync(1);
+		await vi.waitFor(() => expect(h.toastMessages.some(m => m.includes("upload.done"))).toBe(true),
+			{ timeout: 5000, interval: 10 });
+		expect(h.fetchCalls().filter(c => c.url === "/api/ingestions/inj_w" && c.method === "GET")).toHaveLength(3);
+		expect(h.fetchCalls().some(c => c.url === "/api/ingestions/inj_w/parts/sign")).toBe(true);
 		expect(FakeXHR.instances).toHaveLength(2);
-		// 完成链含真实异步（WebCrypto 摘要）——推时钟直到收口（全量套件
-		// 高负载下单次 advance(0) 可能少冲一个真实微任务；只加固等待，
-		// 断言不变）
-		let toastDone = false;
-		for (let i = 0; i < 100 && !toastDone; i++) {
-			await vi.advanceTimersByTimeAsync(50);
-			await realYield();
-			toastDone = h.toastMessages.some((m) => m.indexOf("upload.done") >= 0);
-		}
-		expect(toastDone).toBe(true);
 	});
 });
 

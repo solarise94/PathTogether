@@ -31,15 +31,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest  # noqa: E402
 
 import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
-from _pt_helpers import register_slide_row  # noqa: E402  # P6：夹具建仓（id_bundle）
+from _pt_helpers import (
+    register_slide_row,
+    csrf_client,
+    isolate_app,
+    make_client,
+)  # noqa: E402
 DATA_DIR = _bootstrap.SHARE_DATA_DIR
 UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 import share_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
 import share_server as share_srv  # noqa: E402
-from pg_compat import BACKEND  # noqa: E402
-from _pt_helpers import csrf_client, install_json_login_limits, isolate_app # noqa: E402
+
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
@@ -50,7 +54,7 @@ def _isolate(monkeypatch):
     的 UPLOAD_DIR 与本模块写入的不是同一个目录（见 test_ai_config_validation 注释）。
     """
     _, up_dir = isolate_app(monkeypatch, DATA_DIR, UPLOAD_DIR,
-                            login_limits=True, clear_stores=True)
+                            clear_stores=True)
     # 清空 uploads 目录中的测试切片文件（沿用模块级 UPLOAD_DIR 的文件内额外清理）
     for child in up_dir.iterdir():
         if child.is_file():
@@ -73,10 +77,7 @@ def _client():
     return csrf_client(app_mod.app.test_client())
 
 def _client_noauth():
-    """AUTH_ENABLED=False 内网模式客户端。"""
-    app_mod.app.config["TESTING"] = True
-    app_mod.AUTH_ENABLED = False
-    return csrf_client(app_mod.app.test_client())
+    return make_client(auth=False)
 
 def _login(client, login_id, password):
     return client.post("/login", data={"username": login_id, "password": password})
@@ -880,25 +881,19 @@ def _cookie_val(client, name):
     return None if c is None else c.value
 
 def _expire_share(token):
-    """把 share 的 expires_at 拨到过去（JSON 写文件 / PG 更新行）。"""
-    if BACKEND == "postgres":
-        import psycopg
-        conn = psycopg.connect(os.environ["DATABASE_URL"])
-        try:
-            conn.autocommit = True
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE shares SET expires_at = to_timestamp(1) WHERE token=%s",
-                    (token,),
-                )
-                assert cur.rowcount == 1
-        finally:
-            conn.close()
-    else:
-        path = Path(share_store.SHARE_FILE)
-        data = json.loads(path.read_text(encoding="utf-8"))
-        data["shares"][token]["expires_at"] = 1.0
-        path.write_text(json.dumps(data), encoding="utf-8")
+    """把 share 的 expires_at 拨到过去（PG 更新行）。"""
+    import psycopg
+    conn = psycopg.connect(os.environ["DATABASE_URL"])
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE shares SET expires_at = to_timestamp(1) WHERE token=%s",
+                (token,),
+            )
+            assert cur.rowcount == 1
+    finally:
+        conn.close()
 
 def _two_shares_same_visitor():
     _setup_users()

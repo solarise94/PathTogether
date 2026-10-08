@@ -14,7 +14,7 @@
   - 余额 Decimal 解析（≤9 位小数，禁 float）；
   （旧 json/dual fail-closed pg_backend_required 门已随 R3 Wave3 退役。）
 
-PG 部分（RUN_PG_TESTS=1；conftest 每用例 TRUNCATE billing 表）：
+PG 部分（默认内嵌 PostgreSQL；conftest 每用例 TRUNCATE billing 表）：
   - 0018+0022+0045 种子三代书：legacy（错误 CNY×1000 量级，收口保留）、
     corrected v2（CNY×1e9，0045 收口）与 v3 flash_repricing（2026-09-11
     官方 flash 降价，当前生效）逐项核对 + 幂等（§7.1 批次 A + 0045）；

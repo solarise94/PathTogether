@@ -14,7 +14,7 @@ import os
 
 def test_backend_is_postgres():
     """实际生效的后端必须是 postgres（证明 conftest 的 PG 路径真实启用）。"""
-    from pg_compat import BACKEND
+    from platform_features import STORAGE_BACKEND as BACKEND
     assert BACKEND == "postgres", (
         "BACKEND=%r：应为 postgres（conftest 未生效？）" % BACKEND)
 

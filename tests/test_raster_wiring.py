@@ -50,13 +50,18 @@ import upload_content  # noqa: E402
 import upload_guard  # noqa: E402
 import upload_task_store  # noqa: E402
 import app as app_mod  # noqa: E402
-from _pt_helpers import (csrf_client, isolate_app, clear_upload_dir,  # noqa: E402
-                         publish_test_slide)
+from _pt_helpers import (
+    isolate_app,
+    clear_upload_dir,
+    publish_test_slide,
+    make_client,
+)  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
 # 合成数据（PIL；无患者数据）
 # --------------------------------------------------------------------------- #
+
 def _raster_bytes(fmt, w=64, h=48, **save_kwargs):
     """合成确定性 RGB 渐变图（BMP/JPEG 通用）。"""
     from PIL import Image as PILImage
@@ -97,7 +102,7 @@ def _jpeg_bytes(w=120, h=40, orientation=1, dpi=None):
 @pytest.fixture(autouse=True)
 def _iso(tmp_path, monkeypatch):
     """存储隔离 + 上限复位 + 缓存清空（普通图片句柄/瓦片不跨用例泄漏）。"""
-    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True)
+    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR)
     # P3（合同 §3.1.1）：本地免认证态的上传资产 owner 解析——先配置 owner
     #（无 UID 不自动认领；owner-NULL 资产行不再产生）
     import share_store as _ss
@@ -131,9 +136,7 @@ def _reset_caches():
 
 
 def _client():
-    app_mod.app.config["TESTING"] = True
-    app_mod.AUTH_ENABLED = False
-    return csrf_client(app_mod.app.test_client())
+    return make_client(auth=False)
 
 
 def _residue():

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """PT-4：匿名 Demo 完整链路测试（docs §5/§9.1/§9.3/§12.1）。
 
-PostgreSQL 唯一后端（RUN_PG_TESTS=1）：
+PostgreSQL 唯一后端（默认内嵌 PostgreSQL）：
   - /demo 公开 200（服务端渲染 demo 模式，按 PUBLIC_DEMO_ENABLED 降级）；
   - Demo POST 不要求登录 CSRF（capability 通道独立，docs §10.13）；
   - Demo cookie 调 /api/ai/* 等登录态端点 → 401（capability 只放行 /api/demo/*）；
@@ -46,12 +46,17 @@ import user_store  # noqa: E402
 import budget_store  # noqa: E402
 import demo_store  # noqa: E402
 import app as app_mod  # noqa: E402
-from pg_compat import BACKEND  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app, FakeResponse, register_slide_row  # noqa: E402
+from _pt_helpers import (
+    isolate_app,
+    FakeResponse,
+    register_slide_row,
+    make_client,
+)  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # 公共基建
 # --------------------------------------------------------------------------- #
+
 @pytest.fixture(autouse=True)
 def _reset_stores(monkeypatch, tmp_path):
     """每用例：独立存储目录（ai_config/用户库全落本用例私有目录）+ adapter 缓存复位。
@@ -139,9 +144,7 @@ def _json_err(status, code):
     return FakeResponse(status, {"error": code, "code": code})
 
 def _client(auth=True):
-    app_mod.app.config["TESTING"] = True
-    app_mod.AUTH_ENABLED = auth
-    return csrf_client(app_mod.app.test_client())
+    return make_client(auth=auth)
 
 def _login(client, role, user_id):
     with client.session_transaction() as sess:

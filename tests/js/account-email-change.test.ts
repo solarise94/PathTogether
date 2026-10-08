@@ -13,6 +13,7 @@
  *   - 预览态隐藏入口（与改密/登出同级约定）；正常登录态显示；认证关闭不出现
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { fakeEl as basicElement } from "./helpers/basic-element";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,18 +48,7 @@ function makeI18N() {
 }
 
 function fakeEl() {
-	return {
-		hidden: true,
-		textContent: "",
-		innerHTML: "",
-		value: "",
-		disabled: false,
-		style: {} as Record<string, string>,
-		focus() {},
-		classList: { add() {}, remove() {}, contains() { return false; } },
-		appendChild() {},
-		addEventListener() {},
-	};
+	return { ...basicElement(), focus() {} };
 }
 
 /** 可记录 toast 文案的容器（toast() 向 els.toastContainer append 文本节点） */

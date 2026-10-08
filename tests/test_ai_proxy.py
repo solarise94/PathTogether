@@ -31,8 +31,13 @@ UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 import pytest  # noqa: E402
 
 import app as app_mod  # noqa: E402
-from _pt_helpers import (csrf_client, isolate_app,  # noqa: E402
-                         register_slide_row, FakeRequests, FakeResponse)
+from _pt_helpers import (
+    isolate_app,
+    register_slide_row,
+    FakeRequests,
+    FakeResponse,
+    make_client as shared_client,
+)  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -67,11 +72,7 @@ def install_fake_requests():
 
 
 def make_client():
-    app_mod.app.config["TESTING"] = True
-    # 认证默认关闭（多数测试需要放行 /api/）。
-    # AUTH_ENABLED / app.requests 的还原由 _isolate 的还原护栏接管（P3-16）。
-    app_mod.AUTH_ENABLED = False
-    return csrf_client(app_mod.app.test_client())
+    return shared_client(auth=False)
 
 
 @pytest.fixture(autouse=True)
@@ -165,7 +166,6 @@ def test_run_proxies_with_decrypted_config_and_sse():
     check("run 空 session_id 不透传",
           "session_id" not in fake.calls[-1]["body"],
           "got %r" % fake.calls[-1]["body"].get("session_id"))
-
 
 
 def _grant_proxy_slide(client, uid="usr_proxy_owner", slide="s.svs"):

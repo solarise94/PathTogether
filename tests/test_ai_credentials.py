@@ -32,11 +32,17 @@ DATA_DIR = _bootstrap.SHARE_DATA_DIR
 import user_store  # noqa: E402
 import share_store  # noqa: E402
 import app as app_mod  # noqa: E402
-from _pt_helpers import (csrf_client, isolate_app,  # noqa: E402
-                         register_slide_row, FakeRequests, FakeResponse)
+from _pt_helpers import (
+    isolate_app,
+    register_slide_row,
+    FakeRequests,
+    FakeResponse,
+    make_client,
+)  # noqa: E402
 
 import ipaddress  # noqa: E402
 import pytest  # noqa: E402
+
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch, tmp_path):
@@ -65,9 +71,7 @@ def _ssrf_dns(monkeypatch):
     monkeypatch.setattr(app_mod, "_host_ips", fake_ips)
 
 def _client(auth=True):
-    app_mod.app.config["TESTING"] = True
-    app_mod.AUTH_ENABLED = auth
-    return csrf_client(app_mod.app.test_client())
+    return make_client(auth=auth)
 
 def _login(client, role, user_id):
     """用 session_transaction 直接注入身份（等价登录成功后的 session 状态）。

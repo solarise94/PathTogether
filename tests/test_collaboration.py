@@ -11,7 +11,7 @@
   4. AI 标注审核：accept/reject 流转；人工标注 review → 400。
   5. 修改历史：累积 + 20 条封顶。
 
-json/pg 双跑（pg 由 RUN_PG_TESTS=1 conftest 起库 + autouse TRUNCATE 隔离）。
+conftest 默认启动内嵌 PostgreSQL，autouse TRUNCATE 隔离用例。
 """
 import json
 import os
@@ -30,7 +30,11 @@ UPLOAD_DIR = _bootstrap.UPLOAD_DIR
 import share_store  # noqa: E402
 import user_store  # noqa: E402
 import app as app_mod  # noqa: E402
-from _pt_helpers import csrf_client, install_json_login_limits, isolate_app # noqa: E402
+from _pt_helpers import (
+    csrf_client,
+    isolate_app,
+    make_client,
+)  # noqa: E402
 import share_server as share_srv  # noqa: E402
 
 
@@ -38,7 +42,7 @@ import share_server as share_srv  # noqa: E402
 def _isolate(monkeypatch):
     """每用例前把常量 / env 指回本模块临时目录，清空 users.json / shares.json。"""
     _, up_dir = isolate_app(monkeypatch, DATA_DIR, UPLOAD_DIR,
-                            login_limits=True, clear_stores=True)
+                            clear_stores=True)
     for child in up_dir.iterdir():
         if child.is_file():
             child.unlink()
@@ -55,9 +59,7 @@ def _client():
 
 
 def _client_noauth():
-    app_mod.app.config["TESTING"] = True
-    app_mod.AUTH_ENABLED = False
-    return csrf_client(app_mod.app.test_client())
+    return make_client(auth=False)
 
 
 def _login(client, login_id, password):

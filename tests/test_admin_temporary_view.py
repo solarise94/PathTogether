@@ -35,8 +35,7 @@ import user_store  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
-    _, up_dir = isolate_app(monkeypatch, tmp_path, UPLOAD_DIR,
-                            login_limits=True)
+    _, up_dir = isolate_app(monkeypatch, tmp_path, UPLOAD_DIR)
     monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
     for child in up_dir.iterdir():
         if child.is_file():
@@ -348,7 +347,13 @@ def test_expired_temporary_view_blocks_ai_run_at_gate():
     assert r2.status_code in (400, 503), r2.get_data(as_text=True)
 
 
-def test_end_temporary_view_revokes_run_grants():
+@pytest.mark.parametrize("preserve_uploader", [
+    False,
+    pytest.param(True, marks=pytest.mark.xfail(
+        strict=True, raises=AssertionError,
+        reason="KNOWN: ending admin view revokes uploader AI grant too; Opus owns fix")),
+])
+def test_end_temporary_view_revokes_run_grants(preserve_uploader):
     inst = _bootstrap_plugin()
     owner, usera = _setup()
     sid = publish_test_slide("revoke.tif", make_tiff_bytes(),
@@ -361,7 +366,16 @@ def test_end_temporary_view_revokes_run_grants():
     assert app_mod._issue_run_grant("revoke.tif", ctx, config, slide_id=sid)
     grant_id = config["run_grant"]["grant_id"]
     assert share_store.get_run_grant(grant_id)["revoked"] is False
+    if preserve_uploader:
+        uploader_config = {"sidecar": True}
+        uploader_ctx = {"user_id": usera["user_id"], "role": user_store.ROLE_USER}
+        assert app_mod._issue_run_grant(
+            "revoke.tif", uploader_ctx, uploader_config, slide_id=sid)
+        uploader_grant = uploader_config["run_grant"]["grant_id"]
+        assert share_store.get_run_grant(uploader_grant)["revoked"] is False
     # 主动结束 → 运行授权撤销
     assert oc.delete("/api/admin/v1/slides/%s/temporary-view" % sid) \
         .status_code == 200
     assert share_store.get_run_grant(grant_id)["revoked"] is True
+    if preserve_uploader:
+        assert share_store.get_run_grant(uploader_grant)["revoked"] is False

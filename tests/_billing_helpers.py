@@ -16,7 +16,7 @@
   ai_run_bindings ①主源（批次 F）/ demo_runs+demo_sessions ②），构造 §7.2
   解析矩阵的前置态。
 
-仅 PG 后端可用（RUN_PG_TESTS=1；json 模式下调用方自行 skip）。
+默认使用 conftest 启动的内嵌 PostgreSQL。
 """
 import json
 import uuid

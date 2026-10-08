@@ -23,6 +23,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import _bootstrap  # noqa: E402,F401
 
 import psycopg  # noqa: E402
+from _pt_helpers import (
+    make_client,
+    isolate_app,
+)  # noqa: E402
+
 import pytest  # noqa: E402
 
 import app as app_mod  # noqa: E402
@@ -34,7 +39,6 @@ import upload_guard  # noqa: E402
 import user_store  # noqa: E402
 from _producer_import_helpers import (PluginClient, ProducerEnv,  # noqa: E402
                                        build_deliverable, sql_one)
-from _pt_helpers import csrf_client, isolate_app  # noqa: E402
 from plugins.sdk import manifest as sdk_manifest  # noqa: E402
 
 PG_URI = os.environ["DATABASE_URL"]
@@ -57,8 +61,7 @@ def _env(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def client():
-    app_mod.app.config["TESTING"] = True
-    return csrf_client(app_mod.app.test_client())
+    return make_client()
 
 
 @pytest.fixture()

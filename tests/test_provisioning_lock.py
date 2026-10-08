@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """review R2-F2 锁有效性证明测试：用户开通（建号/兑换）与 cutover 串行化
-+ 维护闸暂停注册/建号（仅 RUN_PG_TESTS=1）。
++ 维护闸暂停注册/建号（默认内嵌 PostgreSQL）。
 
 钉死的契约（spend_store shim 区段）：
 
@@ -15,7 +15,7 @@
 - app.py v1 建号端点：维护中稳定 503 ai_dispatch_maintenance（与 AI
   dispatch 同款）。
 
-运行：RUN_PG_TESTS=1 python3 -m pytest tests/test_provisioning_lock.py -q
+运行：python3 -m pytest tests/test_provisioning_lock.py -q
 """
 import os
 import sys
@@ -34,11 +34,12 @@ import settings_store  # noqa: E402
 import spend_store  # noqa: E402
 import user_store  # noqa: E402
 import user_store_pg  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app  # noqa: E402
-from pg_compat import BACKEND  # noqa: E402
+from _pt_helpers import (
+    csrf_client,
+    isolate_app,
+)  # noqa: E402
 
-if BACKEND == "postgres":
-    import _billing_helpers as bh  # noqa: E402
+import _billing_helpers as bh  # noqa: E402
 
 _PW = "password-123456"
 _OWNER_PW = "ownerpass123456"
@@ -53,9 +54,8 @@ def _isolate(monkeypatch, tmp_path):
     本 fixture 重播种；conftest 亦会恢复一条 20 CNY defaults 基线行）。"""
     isolate_app(monkeypatch, tmp_path, clear_stores=True)
     app_mod.app.config["TESTING"] = True
-    if BACKEND == "postgres":
-        bh.seed_spend_policies()
-        bh.seed_spend_settings()
+    bh.seed_spend_policies()
+    bh.seed_spend_settings()
     yield
 
 

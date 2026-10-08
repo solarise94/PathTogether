@@ -2,6 +2,7 @@
  * doLogout：POST 失败不得跳转登录页（服务端 session 可能仍有效）。
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { fakeEl } from "./helpers/basic-element";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,19 +10,6 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const appSrc = readFileSync(resolve(here, "../../static/app.js"), "utf8");
 
-function fakeEl() {
-	return {
-		hidden: true,
-		textContent: "",
-		innerHTML: "",
-		value: "",
-		disabled: false,
-		style: {},
-		classList: { add() {}, remove() {}, contains() { return false; } },
-		appendChild() {},
-		addEventListener() {},
-	};
-}
 
 function loadApp(fetchImpl: typeof fetch) {
 	const els: Record<string, ReturnType<typeof fakeEl>> = {};
@@ -45,10 +33,10 @@ function loadApp(fetchImpl: typeof fetch) {
 		querySelectorAll() { return []; },
 	};
 	(w as { document: typeof doc }).document = doc;
-	(globalThis as { document: typeof doc }).document = doc;
-	(globalThis as { window: typeof w }).window = w;
-	(globalThis as { fetch: typeof fetch }).fetch = fetchImpl;
-	(globalThis as { location: typeof loc }).location = loc;
+	vi.stubGlobal("document", doc);
+	vi.stubGlobal("window", w);
+	vi.stubGlobal("fetch", fetchImpl);
+	vi.stubGlobal("location", loc);
 	new Function("window", "document", "fetch", "location", appSrc)(w, doc, fetchImpl, loc);
 	return {
 		doLogout: (w.HP_AUTH as { doLogout: () => void }).doLogout,
@@ -98,5 +86,9 @@ describe("app.js doLogout 失败不得跳登录页", () => {
 		await Promise.resolve();
 		await Promise.resolve();
 		expect(h.location.href).toBe("/login");
+		expect(fetchImpl).toHaveBeenCalledWith("/logout", expect.objectContaining({
+			method: "POST",
+			headers: expect.objectContaining({ "X-CSRF-Token": "tok" }),
+		}));
 	});
 });

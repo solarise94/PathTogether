@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """auth_rate_limits 跨 worker 登录锁定原语测试（docs §6.3 末段/§9.5）。
 
-仅 RUN_PG_TESTS=1 时真跑（conftest 起真实 PG + 每用例 TRUNCATE）。
+默认运行（conftest 起真实 PG + 每用例 TRUNCATE）。
 
 覆盖：
   - 单账号多 IP 撞库：IP 桶每条 fresh，账号桶累计到阈值（10）被锁——
@@ -19,7 +19,6 @@ pytest.importorskip("pgserver")
 pytest.importorskip("psycopg")
 
 import auth_limit_store  # noqa: E402
-from pg_compat import BACKEND  # noqa: E402
 
 
 @pytest.fixture

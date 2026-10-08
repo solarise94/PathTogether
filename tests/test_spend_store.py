@@ -16,7 +16,7 @@ ai-money-budget-bugfix-and-simplification-plan.md §9.2 全量 + §9.3 窗口投
     三种输入等价；period_kind=none 显式拒绝；
   （旧 json/dual fail-closed pg_backend_required 门已随 R3 Wave3 退役。）
 
-PG 部分（RUN_PG_TESTS=1；conftest 每用例 TRUNCATE 后由
+PG 部分（默认内嵌 PostgreSQL；conftest 每用例 TRUNCATE 后由
 _billing_helpers.seed_spend_policies 幂等重放 0023 种子）：
   - 种子与 shadow 开关：三条默认策略（额度经 parse_balance_to_nano 独立
     换算断言，不从迁移复制常量自证）、部分唯一索引硬性拒绝同 scope 第二条
@@ -38,7 +38,7 @@ _billing_helpers.seed_spend_policies 幂等重放 0023 种子）：
     cutover 前旧影子数据；不自动修。
 
 运行：cd 项目根 && python3 -m pytest tests/test_spend_store.py -q
-（PG 双跑：RUN_PG_TESTS=1 python3 -m pytest tests/test_spend_store.py -q）
+（运行：python3 -m pytest tests/test_spend_store.py -q）
 """
 import os
 import sys
@@ -55,7 +55,6 @@ import billing_pricing  # noqa: E402
 import platform_features  # noqa: E402
 import spend_store  # noqa: E402
 
-from pg_compat import BACKEND  # noqa: E402
 
 CNY = billing_pricing.parse_balance_to_nano  # 独立 CNY→nano 换算入口
 SH = ZoneInfo("Asia/Shanghai")

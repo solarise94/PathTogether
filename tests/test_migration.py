@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """JSON → PostgreSQL 迁移工具测试（Stage 3b-3）。
 
-仅当 ``RUN_PG_TESTS=1`` 时真跑（与 test_pg_infra / test_dual_backend 同惯例）：
+默认运行（conftest 自动启动内嵌 PostgreSQL）：
 conftest 已起 pgserver、设 DATABASE_URL + STORAGE_BACKEND=postgres，并提供
 ``pg_uri`` fixture 与 autouse TRUNCATE。缺 pgserver/psycopg 时整模块 skip。
 

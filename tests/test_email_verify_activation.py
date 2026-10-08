@@ -40,8 +40,10 @@ import registration_mail_worker  # noqa: E402
 import settings_store  # noqa: E402
 import spend_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import csrf_client  # noqa: E402
-from pg_compat import BACKEND  # noqa: E402
+from _pt_helpers import (
+    make_client,
+    pg_connection as pg_store_connect,
+)  # noqa: E402
 
 BASE = "https://path.example.com"
 
@@ -49,13 +51,6 @@ BASE = "https://path.example.com"
 def _pg():
     conn = pg_store_connect()
     return conn
-
-
-def pg_store_connect():
-    import pg_store
-    c = pg_store.connect()
-    c.row_factory = psycopg.rows.dict_row
-    return c
 
 
 @pytest.fixture(autouse=True)
@@ -83,9 +78,7 @@ def _isolate(monkeypatch):
 
 
 def _client(auth=True):
-    app_mod.app.config["TESTING"] = True
-    app_mod.AUTH_ENABLED = auth
-    return csrf_client(app_mod.app.test_client())
+    return make_client(auth=auth)
 
 
 def _mk_owner():

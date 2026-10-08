@@ -46,7 +46,11 @@ import upload_guard  # noqa: E402
 import upload_task_store  # noqa: E402
 import app as app_mod  # noqa: E402
 import upload_content  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app, clear_upload_dir  # noqa: E402
+from _pt_helpers import (
+    isolate_app,
+    clear_upload_dir,
+    make_client,
+)  # noqa: E402
 from _tiff_fixtures import (  # noqa: E402
     make_ome_multifile_bytes,
     make_ome_multiseries_bytes,
@@ -62,6 +66,7 @@ TIFF_NAME = "0702-L2-2 鼠奥球.tiff"  # 中文 + 空格 + 连字符（spec 必
 # --------------------------------------------------------------------------- #
 # 1. logical_format_ext：逻辑格式识别（不接受目录/URL/NUL/MIME）
 # --------------------------------------------------------------------------- #
+
 @pytest.mark.parametrize("name,ext", [
     ("a.tiff", ".tiff"),
     ("a.tif", ".tif"),
@@ -390,7 +395,7 @@ def test_validate_slide_file_unknown_exception_becomes_slide_open_failed(
 @pytest.fixture(autouse=True)
 def _iso(tmp_path, monkeypatch):
     """存储隔离（真验证用例不得 monkeypatch _validate_slide_file）。"""
-    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True)
+    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR)
     # P3（合同 §3.1.1）：本地免认证态的上传资产 owner 解析——先配置 owner
     #（无 UID 不自动认领；owner-NULL 资产行不再产生）
     import share_store as _ss
@@ -408,9 +413,7 @@ def _iso(tmp_path, monkeypatch):
 
 
 def _client():
-    app_mod.app.config["TESTING"] = True
-    app_mod.AUTH_ENABLED = False
-    return csrf_client(app_mod.app.test_client())
+    return make_client(auth=False)
 
 
 def _residue():

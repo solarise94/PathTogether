@@ -40,7 +40,11 @@ import share_store  # noqa: E402
 
 import app as app_mod  # noqa: E402
 # check()：_pt_helpers 统一带守卫实现；PASS/FAIL 计数仍落在本模块
-from _pt_helpers import check, csrf_client, isolate_app  # noqa: E402
+from _pt_helpers import (
+    check,
+    isolate_app,
+    make_client as shared_client,
+)  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -71,10 +75,7 @@ def _isolate_data_dir(monkeypatch, tmp_path):
 
 
 def make_client():
-    """Flask 测试客户端（认证关闭）。"""
-    app_mod.app.config["TESTING"] = True
-    app_mod.AUTH_ENABLED = False
-    return csrf_client(app_mod.app.test_client())
+    return shared_client(auth=False)
 
 
 def reset_config():

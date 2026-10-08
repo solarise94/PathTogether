@@ -9,7 +9,7 @@ json 模式（无 PG）：已随 R3 Wave3 退役——PostgreSQL 为唯一后端
   audit 分页 + detail 出口脱敏（敏感键丢弃、idempotency_key 后缀）；
   users 分页/搜索/筛选 + login ID 只出掩码（原始账号不回显）。
 
-PG 模式（RUN_PG_TESTS=1）：
+PG 模式（默认内嵌 PostgreSQL）：
   - overview「双额度」语义：turn_budget（对话额度）与 billing（金额余额）
     两段同时可用且字段互不混淆；
   - usage-events / ledger / users / audit 的 cursor 分页正确性（无重无漏、
@@ -21,7 +21,7 @@ PG 模式（RUN_PG_TESTS=1）：
     （fix 2026-09-11：失败不盖成功章）/ 失败日志可诊断且 key 不进日志与响应。
 
 运行：cd 项目根 && python3 -m pytest tests/test_admin_api_v1.py -q
-（PG 双跑：RUN_PG_TESTS=1 python3 -m pytest tests/test_admin_api_v1.py -q）
+（运行：python3 -m pytest tests/test_admin_api_v1.py -q）
 """
 import json
 import logging
@@ -41,14 +41,16 @@ import pytest  # noqa: E402
 import app as app_mod  # noqa: E402
 import share_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import (FakeRequests, FakeResponse, csrf_client,  # noqa: E402
-                         isolate_app)
-from pg_compat import BACKEND  # noqa: E402
+from _pt_helpers import (
+    FakeRequests,
+    FakeResponse,
+    isolate_app,
+    make_client as _client,
+)  # noqa: E402
 
-if BACKEND == "postgres":
-    import _billing_helpers as bh  # noqa: E402
-    import billing_store  # noqa: E402
-    import budget_store  # noqa: E402
+import _billing_helpers as bh  # noqa: E402
+import billing_store  # noqa: E402
+import budget_store  # noqa: E402
 
 app_mod.UPLOAD_DIR = Path(UPLOAD_DIR)
 app_mod.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -56,16 +58,13 @@ app_mod.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
     """每用例独立存储 + AUTH_ENABLED=True（owner 门控有真实意义）+ 节流复位。"""
-    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR, login_limits=True)
+    isolate_app(monkeypatch, tmp_path, UPLOAD_DIR)
     monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
     # provider balance refresh 的进程内节流状态跨用例必须复位
     monkeypatch.setattr(app_mod, "_provider_balance_refresh_state",
                         {"last_ok_attempt": 0.0, "last_fail_attempt": 0.0})
     yield
 
-def _client():
-    app_mod.app.config["TESTING"] = True
-    return csrf_client(app_mod.app.test_client())
 
 def _login(client, user):
     with client.session_transaction() as s:

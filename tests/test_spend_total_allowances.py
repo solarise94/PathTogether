@@ -3,7 +3,7 @@
 review-2026-09-02-upload-user-limits-admin-ui-cleanup.md §Batch B / §3.1 /
 §7.3；R3 Wave1-Money 起单轨）。
 
-覆盖（全部需真实 PG；json 模式整文件 skip——额度语义无 json 后端）：
+覆盖（默认使用真实内嵌 PostgreSQL）：
   - 0029/0032 迁移：fresh 全量含 0029+0032、幂等；0032 删除
     user_spend_target/registration_open 旧行并物化 defaults；billing_holds
     CHECK 接受 legacy 双 NULL、拒绝双目标；ai_spend_total_allowances
@@ -31,7 +31,7 @@ review-2026-09-02-upload-user-limits-admin-ui-cleanup.md §Batch B / §3.1 /
     中止保持维护态、无当前窗口 user 的零消费窗物化+审计、remaining 逐
     user 守恒、提交后自动关闸）。
 
-运行：RUN_PG_TESTS=1 python3 -m pytest tests/test_spend_total_allowances.py -q
+运行：python3 -m pytest tests/test_spend_total_allowances.py -q
 """
 import json
 import os
@@ -54,11 +54,9 @@ import spend_store  # noqa: E402
 import user_store  # noqa: E402
 import user_store_pg  # noqa: E402
 
-from pg_compat import BACKEND  # noqa: E402
 
-if BACKEND == "postgres":
-    import psycopg  # noqa: E402
-    import _billing_helpers as bh  # noqa: E402
+import psycopg  # noqa: E402
+import _billing_helpers as bh  # noqa: E402
 
 UTC = timezone.utc
 INSTALLATION = "pin_total_allowance_test"
@@ -67,11 +65,9 @@ INSTALLATION = "pin_total_allowance_test"
 # --------------------------------------------------------------------------- #
 # 公共基建（镜像 test_billing_hold_settle_chain 的种子口径）
 # --------------------------------------------------------------------------- #
-def _conn():
-    import pg_store
-    c = pg_store.connect()
-    c.row_factory = psycopg.rows.dict_row
-    return c
+from _pt_helpers import (
+    pg_connection as _conn,
+)  # noqa: E402
 
 
 def _seed_all(monkeypatch_ttl=None):
@@ -1151,8 +1147,6 @@ def test_cutover_preflight_and_apply():
                   (u1["user_id"],)) == 1
 
 
-
-
 def test_preflight_flags_maintenance_active(capsys):
     """R2-F3：维护闸已开（ai_dispatch_maintenance=true）→ apply 的闸 CAS
     false→true 必然失败，preflight 报 maintenance_active 硬失败。"""
@@ -1328,7 +1322,6 @@ def test_cutover_preflight_flags_window_materialize_no_policy(capsys):
     assert report["windows_to_materialize"] == 1
     assert {"problem": "window_materialize_no_policy",
             "user_id": user["user_id"]} in report["problems"]
-
 
 
 if __name__ == "__main__":

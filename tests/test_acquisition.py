@@ -12,7 +12,7 @@ PostgreSQL 唯一后端：
   - admin v1 acquisition：owner 门控（匿名 401 / user 403）。
   （旧 json/dual 503 pg_backend_required 门已随 R3 Wave3 退役。）
 
-PG 模式（RUN_PG_TESTS=1）：
+PG 模式（默认内嵌 PostgreSQL）：
   - 触点行：不可变行粒度、未知 campaign 落 NULL 不报错、active campaign 关联、
     paused 不关联；referrer/UTM/landing/IP hash 落库形态；
   - 归因四路径全覆盖（invite campaign > pt_acq 触点 > referrer/UTM > direct）；
@@ -26,7 +26,7 @@ PG 模式（RUN_PG_TESTS=1）：
   - 漏斗汇总（访问/注册/首次 AI 计数，首次 AI 直接 SQL 造 ai_usage_events）。
 
 运行：cd 项目根 && python3 -m pytest tests/test_acquisition.py -q
-（PG 双跑：RUN_PG_TESTS=1 python3 -m pytest tests/test_acquisition.py -q）
+（运行：python3 -m pytest tests/test_acquisition.py -q）
 """
 import json
 import os
@@ -46,8 +46,10 @@ import app as app_mod  # noqa: E402
 import acquisition_store as acq_store  # noqa: E402
 import registration_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app  # noqa: E402
-from pg_compat import BACKEND  # noqa: E402
+from _pt_helpers import (
+    csrf_client,
+    isolate_app,
+)  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
@@ -57,13 +59,12 @@ def _isolate(monkeypatch):
     for name in ("PUBLIC_BASE_URL", "ADMIN_SESSION_COOKIE_SECURE",
                  "ACQ_IP_SALT"):
         monkeypatch.delenv(name, raising=False)
-    if BACKEND == "postgres":
-        # review R2-F2：PG 上注册兑换/建号统一走「维护闸 + 开通锁」组合
-        # 原语，闸 fail-closed（platform_settings 缺 ai_dispatch_maintenance
-        # 即拒绝）。conftest TRUNCATE 清掉 0029 种子，每用例幂等重放
-        # （target=window + 闸=false）。
-        import _billing_helpers as bh
-        bh.seed_spend_settings()
+    # review R2-F2：PG 上注册兑换/建号统一走「维护闸 + 开通锁」组合
+    # 原语，闸 fail-closed（platform_settings 缺 ai_dispatch_maintenance
+    # 即拒绝）。conftest TRUNCATE 清掉 0029 种子，每用例幂等重放
+    # （target=window + 闸=false）。
+    import _billing_helpers as bh
+    bh.seed_spend_settings()
     yield
 
 def _raw_client(auth=True):
@@ -258,135 +259,134 @@ def test_r_json_backend_never_500s():
 # =========================================================================== #
 # 4. PG：触点写入与归因数据层
 # =========================================================================== #
-if BACKEND == "postgres":
-    import psycopg  # noqa: E402
-    import pg_store  # noqa: E402
+import psycopg  # noqa: E402
+import pg_store  # noqa: E402
 
-    def _pg_conn():
-        c = pg_store.connect()
-        c.row_factory = psycopg.rows.dict_row
-        return c
+def _pg_conn():
+    c = pg_store.connect()
+    c.row_factory = psycopg.rows.dict_row
+    return c
 
-    def _seed_campaign(cid, source, status="active"):
-        conn = _pg_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO acquisition_campaigns "
-                    "(campaign_id, source_code, name, status, created_by) "
-                    "VALUES (%s,%s,%s,%s,'test') "
-                    "ON CONFLICT (campaign_id) DO UPDATE SET status=%s",
-                    (cid, source, "camp-" + cid, status, status))
-            conn.commit()
-        finally:
-            conn.close()
-        return acq_store.get_campaign(cid)
+def _seed_campaign(cid, source, status="active"):
+    conn = _pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO acquisition_campaigns "
+                "(campaign_id, source_code, name, status, created_by) "
+                "VALUES (%s,%s,%s,%s,'test') "
+                "ON CONFLICT (campaign_id) DO UPDATE SET status=%s",
+                (cid, source, "camp-" + cid, status, status))
+        conn.commit()
+    finally:
+        conn.close()
+    return acq_store.get_campaign(cid)
 
-    def _visits(visitor_id):
-        conn = _pg_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT * FROM acquisition_visits WHERE visitor_id_hash="
-                    "%s ORDER BY touched_at, acquisition_id",
-                    (acq_store.visitor_id_hash(visitor_id),))
-                return [dict(r) for r in cur.fetchall()]
-        finally:
-            conn.close()
+def _visits(visitor_id):
+    conn = _pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM acquisition_visits WHERE visitor_id_hash="
+                "%s ORDER BY touched_at, acquisition_id",
+                (acq_store.visitor_id_hash(visitor_id),))
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
 
-    def _ua(user_id):
-        conn = _pg_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT * FROM user_acquisition WHERE user_id=%s",
-                            (user_id,))
-                row = cur.fetchone()
-            return dict(row) if row else None
-        finally:
-            conn.close()
+def _ua(user_id):
+    conn = _pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM user_acquisition WHERE user_id=%s",
+                        (user_id,))
+            row = cur.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
 
-    def _acq_total():
-        conn = _pg_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT count(*)::int AS n FROM user_acquisition")
-                return int(cur.fetchone()["n"])
-        finally:
-            conn.close()
+def _acq_total():
+    conn = _pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*)::int AS n FROM user_acquisition")
+            return int(cur.fetchone()["n"])
+    finally:
+        conn.close()
 
-    def _visits_total():
-        """acquisition_visits 全表行数（Batch D1 16：/r/ 不再新增触点行）。"""
-        conn = _pg_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT count(*)::int AS n FROM acquisition_visits")
-                return int(cur.fetchone()["n"])
-        finally:
-            conn.close()
+def _visits_total():
+    """acquisition_visits 全表行数（Batch D1 16：/r/ 不再新增触点行）。"""
+    conn = _pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*)::int AS n FROM acquisition_visits")
+            return int(cur.fetchone()["n"])
+    finally:
+        conn.close()
 
-    def _count_override_rows():
-        """user_override 月额度策略行数（cutover 契约：window 过渡期显式
-        额度会建过渡 override；total 模式不建）。"""
-        conn = _pg_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT count(*)::int AS n FROM ai_spend_policies "
-                            "WHERE scope_type='user_override'")
-                return int(cur.fetchone()["n"])
-        finally:
-            conn.close()
+def _count_override_rows():
+    """user_override 月额度策略行数（cutover 契约：window 过渡期显式
+    额度会建过渡 override；total 模式不建）。"""
+    conn = _pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*)::int AS n FROM ai_spend_policies "
+                        "WHERE scope_type='user_override'")
+            return int(cur.fetchone()["n"])
+    finally:
+        conn.close()
 
-    def _insert_historical_attribution(user_id, visit_id, campaign=None):
-        """直接 SQL 造一条 user_acquisition（模拟冻结前的**历史**归因行——
-        Batch B 起写路径已冻结，仅历史数据读取/清理语义仍需覆盖）。"""
-        conn = _pg_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO user_acquisition (user_id, "
-                    "first_acquisition_id, last_acquisition_id, invite_id, "
-                    "source_code, campaign_id, attributed_at, "
-                    "attribution_method) VALUES (%s,%s,%s,NULL,%s,%s,now(),"
-                    "'visit')",
-                    (user_id, visit_id["acquisition_id"],
-                     visit_id["acquisition_id"], visit_id["source_code"],
-                     campaign))
-            conn.commit()
-        finally:
-            conn.close()
+def _insert_historical_attribution(user_id, visit_id, campaign=None):
+    """直接 SQL 造一条 user_acquisition（模拟冻结前的**历史**归因行——
+    Batch B 起写路径已冻结，仅历史数据读取/清理语义仍需覆盖）。"""
+    conn = _pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO user_acquisition (user_id, "
+                "first_acquisition_id, last_acquisition_id, invite_id, "
+                "source_code, campaign_id, attributed_at, "
+                "attribution_method) VALUES (%s,%s,%s,NULL,%s,%s,now(),"
+                "'visit')",
+                (user_id, visit_id["acquisition_id"],
+                 visit_id["acquisition_id"], visit_id["source_code"],
+                 campaign))
+        conn.commit()
+    finally:
+        conn.close()
 
-    def _expire_all_visits():
-        conn = _pg_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE acquisition_visits "
-                            "SET expires_at = now() - interval '1 second'")
-            conn.commit()
-        finally:
-            conn.close()
+def _expire_all_visits():
+    conn = _pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE acquisition_visits "
+                        "SET expires_at = now() - interval '1 second'")
+        conn.commit()
+    finally:
+        conn.close()
 
-    def _insert_usage_event(user_id, hours_back=1):
-        """直接 SQL 造一条 ai_usage_events（unpriced，满足表 CHECK）。"""
-        conn = _pg_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO ai_usage_events "
-                    "(event_id, call_id, payload_hash, schema_version, "
-                    " session_id, subject_type, subject_id, user_id, provider,"
-                    " model, occurred_at, enqueued_at, received_at, status, "
-                    " unpriced_reason) "
-                    "VALUES (%s,%s,%s,1,%s,'user',%s,%s,'deepseek',"
-                    "'deepseek-v4-flash', now() - (%s * interval '1 hour'), "
-                    " now(), now(), 'unpriced', 'test')",
-                    ("use_" + secrets.token_hex(16),
-                     "call_" + secrets.token_hex(16), secrets.token_hex(32),
-                     "sess_" + secrets.token_hex(10), user_id, user_id,
-                     int(hours_back)))
-            conn.commit()
-        finally:
-            conn.close()
+def _insert_usage_event(user_id, hours_back=1):
+    """直接 SQL 造一条 ai_usage_events（unpriced，满足表 CHECK）。"""
+    conn = _pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO ai_usage_events "
+                "(event_id, call_id, payload_hash, schema_version, "
+                " session_id, subject_type, subject_id, user_id, provider,"
+                " model, occurred_at, enqueued_at, received_at, status, "
+                " unpriced_reason) "
+                "VALUES (%s,%s,%s,1,%s,'user',%s,%s,'deepseek',"
+                "'deepseek-v4-flash', now() - (%s * interval '1 hour'), "
+                " now(), now(), 'unpriced', 'test')",
+                ("use_" + secrets.token_hex(16),
+                 "call_" + secrets.token_hex(16), secrets.token_hex(32),
+                 "sess_" + secrets.token_hex(10), user_id, user_id,
+                 int(hours_back)))
+        conn.commit()
+    finally:
+        conn.close()
 
 def test_record_visit_row_shape_and_sanitization(monkeypatch):
     monkeypatch.setenv("ACQ_IP_SALT", "test-salt")

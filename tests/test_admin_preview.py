@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """S4 管理员只读身份预览测试（HistoPilot/docs/session-isolation-fix-plan.md §3）。
 
-覆盖（json 默认 + RUN_PG_TESTS=1 双跑）：
+覆盖（默认内嵌 PostgreSQL）：
   - actor/subject 非破坏分离：current_identity() 返回 effective subject，
     actor_identity() 永远是真实管理员；_require_owner() 查 actor（预览骗不过）；
   - 预览态 subject 权限生效：切片列表按 subject 过滤（user 只见自己的），
@@ -16,7 +16,7 @@
     current_identity 仍归一 owner。
 
 运行：cd 项目根 && python3 -m pytest tests/test_admin_preview.py -q
-（PG 双跑：RUN_PG_TESTS=1 python3 -m pytest tests/test_admin_preview.py -q）
+（运行：python3 -m pytest tests/test_admin_preview.py -q）
 """
 import json
 import os
@@ -35,27 +35,28 @@ import pytest  # noqa: E402
 import app as app_mod  # noqa: E402
 import share_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import (csrf_client, install_json_login_limits, isolate_app,  # noqa: E402
-                         FakeRequests, register_slide_row)
-from pg_compat import BACKEND  # noqa: E402
+from _pt_helpers import (
+    isolate_app,
+    FakeRequests,
+    register_slide_row,
+    make_client as _client,
+)  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
     """每用例独立存储 + 归一环境（AUTH_ENABLED=True + 无预览）。"""
-    _, up_dir = isolate_app(monkeypatch, tmp_path, UPLOAD_DIR,
-                            login_limits=True)
+    _, up_dir = isolate_app(monkeypatch, tmp_path, UPLOAD_DIR)
     monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
     monkeypatch.setattr(app_mod, "PREVIEW_TTL_SECONDS", 15 * 60)
     for child in up_dir.iterdir():
         if child.is_file():
             child.unlink()
-    if BACKEND == "postgres":
-        # review R2-F2：PG 上 role=user 建号统一走「维护闸 + 开通锁」组合
-        # 原语（闸 fail-closed），conftest TRUNCATE 清掉 0029 种子——每用例
-        # 幂等重放（target=window + 闸=false）
-        import _billing_helpers as bh
-        bh.seed_spend_settings()
+    # review R2-F2：PG 上 role=user 建号统一走「维护闸 + 开通锁」组合
+    # 原语（闸 fail-closed），conftest TRUNCATE 清掉 0029 种子——每用例
+    # 幂等重放（target=window + 闸=false）
+    import _billing_helpers as bh
+    bh.seed_spend_settings()
     yield
 
 
@@ -69,11 +70,6 @@ def fake_sidecar(monkeypatch):
     fake = FakeRequests()
     monkeypatch.setattr(app_mod, "requests", fake)
     return fake
-
-
-def _client():
-    app_mod.app.config["TESTING"] = True
-    return csrf_client(app_mod.app.test_client())
 
 
 def _login(client, user):

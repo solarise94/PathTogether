@@ -8,19 +8,14 @@
   - SQL 级验证：更新 legacy_filename（重命名）不影响 slide_id 主键；
   - record_slide_asset 记录内容资产 revision（slide_assets 行）。
 
-本模块只在 RUN_PG_TESTS=1（BACKEND=='postgres'）时真正断言；json 后端下跳过。
-psycopg 延迟 import（缺依赖的裸解释器在 json 模式也能收集本模块，整模块 skip）。
+conftest 默认启动内嵌 PostgreSQL；缺少必需依赖直接失败。
 """
 import pytest
 
-from conftest import BACKEND  # noqa: E402
 
 import share_store  # noqa: E402
 
-if BACKEND == "postgres":
-    import psycopg  # noqa: E402
-else:
-    psycopg = None  # type: ignore
+import psycopg  # noqa: E402
 
 
 @pytest.fixture

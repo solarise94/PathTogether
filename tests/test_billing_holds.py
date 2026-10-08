@@ -7,7 +7,7 @@ PostgreSQL 唯一后端：
   - 纯函数：TTL env 解析（缺省 300，非法/非正回退）、authorize/settle
     request 校验词表（必填/额外字段/call_id 格式/2^53-1 上限）。
 
-PG 行为（RUN_PG_TESTS=1）：
+PG 行为（默认内嵌 PostgreSQL）：
   - 正常 authorize：有账户主体 → estimated（customer_charge 最坏价：输入全按
     cache-miss + max_output）/balance/would_deny 确定性断言（注入 now，期望值用
     同一 price book 查询复算）；余额充足 False、不足 True（行照写、永不拒绝）；
@@ -50,13 +50,11 @@ import pytest  # noqa: E402
 import billing_pricing  # noqa: E402
 import billing_store  # noqa: E402
 
-from pg_compat import BACKEND  # noqa: E402
 
-if BACKEND == "postgres":
-    import _billing_helpers as bh  # noqa: E402
-    import budget_store  # noqa: E402
-    import spend_store  # noqa: E402
-    import user_store  # noqa: E402
+import _billing_helpers as bh  # noqa: E402
+import budget_store  # noqa: E402
+import spend_store  # noqa: E402
+import user_store  # noqa: E402
 
 app_mod.UPLOAD_DIR = Path(os.environ["UPLOAD_DIR"])
 app_mod.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)

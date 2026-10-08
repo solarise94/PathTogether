@@ -45,7 +45,7 @@ OWNER_PW = "owner-pass-123456"
 def _isolate(monkeypatch):
     """每用例前把常量 / env 指回本模块临时目录，并清空 users.json。"""
     # 存储隔离 + 归属注入清空 + json 登录限流 mock + 清空 users/shares json
-    isolate_app(monkeypatch, DATA_DIR, login_limits=True, clear_stores=True)
+    isolate_app(monkeypatch, DATA_DIR, clear_stores=True)
     yield
 
 def make_client():

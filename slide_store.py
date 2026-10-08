@@ -477,12 +477,16 @@ def authorize_read(desc, *, actor_user_id=None, actor_role=None,
 
 
 def _has_slide_view_grant(user_id, slide_id, *, conn=None) -> bool:
-    """slide_id 级显式授权（R-06：只认 slide_id 列，不回退 slide_name 匹配）。"""
+    """slide_id 级显式授权（R-06：只认 slide_id 列，不回退 slide_name 匹配）。
+
+    2026-10-08 §3.2：授权带 ``expires_at``（0080）——只认未到期行
+    （``expires_at > now()``）；到期立即对新请求生效，不依赖清理任务。"""
     with _session(conn) as c:
         with c.cursor() as cur:
             cur.execute(
                 "SELECT 1 FROM slide_view_grants "
-                "WHERE slide_id=%s AND user_id=%s LIMIT 1",
+                "WHERE slide_id=%s AND user_id=%s "
+                "AND expires_at > now() LIMIT 1",
                 (slide_id, user_id),
             )
             return cur.fetchone() is not None
@@ -567,7 +571,8 @@ def visible_ready_slide_ids(actor_user_id=None, actor_role=None, *,
                 granted = set()
                 with c.cursor() as cur2:
                     cur2.execute("SELECT slide_id FROM slide_view_grants "
-                                 "WHERE user_id=%s", (uid,))
+                                 "WHERE user_id=%s AND expires_at > now()",
+                                 (uid,))
                     granted.update(r["slide_id"] for r in cur2.fetchall())
                 if allow_share:
                     with c.cursor() as cur3:

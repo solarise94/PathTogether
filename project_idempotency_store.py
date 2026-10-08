@@ -32,6 +32,7 @@ import psycopg
 
 import pg_store
 import share_store
+import share_store_pg
 from share_shared import _reject_guest_write
 from share_store_pg import _PROJ_SEL, _dedupe
 
@@ -57,15 +58,18 @@ class PayloadInvalid(Exception):
 # --------------------------------------------------------------------------- #
 # canonical 负载摘要
 # --------------------------------------------------------------------------- #
-def canonical_payload_digest(name, note, slides):
-    """返回 {name, note, slides} canonical JSON 的 sha256 hex。
+def canonical_payload_digest(name, note, slides, parent_project_id=None):
+    """返回 {name, note, slides, parent_project_id} canonical JSON 的 sha256。
 
-    - 键序固定 name/note/slides，``separators=(',', ':')``，
+    - 键序固定 name/note/slides/parent_project_id，``separators=(',', ':')``，
       ``ensure_ascii=False``；
     - slides **不排序**——顺序影响 project_slides.position，属负载语义；
-      摘要针对清洗后的精确列表顺序。
+      摘要针对清洗后的精确列表顺序；
+    - 2026-10-08 §5.3：parent_project_id（None=根）属负载语义——同键换父
+      级是不同负载（409，不静默改语义）。
     """
-    payload = {"name": name, "note": note, "slides": list(slides or [])}
+    payload = {"name": name, "note": note, "slides": list(slides or []),
+               "parent_project_id": parent_project_id or None}
     canonical = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -189,11 +193,14 @@ def _insert_idempotency_row(cur, owner_user_id, idempotency_key,
 
 
 def create_project_idempotent(*, name, note="", slides=None, owner_user_id=None,
-                              requester_role=None, idempotency_key=None):
+                              requester_role=None, idempotency_key=None,
+                              parent_project_id=None):
     """创建项目（可选按 (owner, key) 幂等）。返回项目 dict（含 pid）。
 
     - ``idempotency_key`` 缺省/空白 → 直接走既有 ``share_store.create_project``
       （随机 pid，不写幂等行；同名同负载两次调用即两个项目）；
+    - 2026-10-08 §5.3：``parent_project_id`` 透传建子文件夹；层级校验在
+      share_store_pg 的事务内（ProjectParentError 原样上抛）。
     - 键存在 → 单事务内：advisory lock → 查幂等行 →
         - 命中且摘要一致：读回原项目返回（形状与首次创建相同，另附
           ``duplicate=True`` 便于调用方区分；HTTP 层可忽略该字段）；
@@ -210,13 +217,15 @@ def create_project_idempotent(*, name, note="", slides=None, owner_user_id=None,
         # 旧客户端路径：行为与现状完全一致（含默认名/去重逻辑）。
         return share_store.create_project(
             name=name, note=note, slides=slides,
-            owner_user_id=owner_user_id, requester_role=requester_role)
+            owner_user_id=owner_user_id, requester_role=requester_role,
+            parent_project_id=parent_project_id)
 
     # 与 create_project 相同的形状规整（幂等负载以规整后为准）
     proj_name = str(name or "").strip() or "未命名项目"
     proj_note = str(note or "")
     uniq = _dedupe(slides)
-    digest = canonical_payload_digest(proj_name, proj_note, uniq)
+    digest = canonical_payload_digest(proj_name, proj_note, uniq,
+                                       parent_project_id)
 
     conn = pg_store.connect()
     try:
@@ -245,13 +254,19 @@ def create_project_idempotent(*, name, note="", slides=None, owner_user_id=None,
                     out["duplicate"] = True
                     return out
 
+                # §5.3：父级校验（锁 owner 行 + 层级/同 owner/归档），
+                # ProjectParentError 原样上抛（HTTP 层映射 400/403/409）
+                if parent_project_id:
+                    share_store_pg._validate_parent_tx(
+                        cur, owner_user_id or None, parent_project_id)
                 pid = "prj_" + secrets.token_urlsafe(10)
                 now = time.time()
                 cur.execute(
                     "INSERT INTO projects (project_id, name, note, "
-                    "owner_user_id, created_at) "
-                    "VALUES (%s,%s,%s,%s, to_timestamp(%s))",
-                    (pid, proj_name, proj_note, owner_user_id or None, now))
+                    "owner_user_id, created_at, parent_project_id) "
+                    "VALUES (%s,%s,%s,%s, to_timestamp(%s), %s)",
+                    (pid, proj_name, proj_note, owner_user_id or None, now,
+                     parent_project_id or None))
                 for i, s in enumerate(uniq):
                     cur.execute(
                         "INSERT INTO project_slides (project_id, slide, "
@@ -266,6 +281,7 @@ def create_project_idempotent(*, name, note="", slides=None, owner_user_id=None,
                     "created_at": now,
                     "owner_user_id": owner_user_id or None,
                     "archived": False,
+                    "parent_project_id": parent_project_id or None,
                 }
     finally:
         conn.close()

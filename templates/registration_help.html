@@ -6,72 +6,18 @@
   <meta name="referrer" content="no-referrer" />
   <title>HistoPilot · 注册帮助</title>
   <link rel="icon" href="data:," />
-  <style>
-    /* 最小功能样式（前端后续打磨）：与 verify_email.html 同款卡片 */
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body {
-      height: 100%;
-      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
-                   "PingFang SC", "Helvetica Neue", Arial, sans-serif;
-      -webkit-font-smoothing: antialiased;
-    }
-    body {
-      background: #f5f5f7;
-      color: #1d1d1f;
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 24px;
-    }
-    .card {
-      width: 100%;
-      max-width: 460px;
-      background: #fff;
-      border-radius: 16px;
-      box-shadow: 0 1px 3px rgba(0,0,0,.04), 0 12px 32px rgba(0,0,0,.10);
-      padding: 36px 30px 28px;
-      text-align: center;
-    }
-    .badge {
-      display: inline-block; font-size: 12px; font-weight: 600;
-      color: #007AFF; background: rgba(0,122,255,.08);
-      border-radius: 999px; padding: 4px 12px; margin-bottom: 14px;
-    }
-    .title { font-size: 19px; font-weight: 600; margin-bottom: 10px; }
-    .desc { font-size: 13px; color: #86868b; line-height: 1.7; margin-bottom: 20px; text-align: left; }
-    .btn {
-      display: inline-block; height: 42px; line-height: 42px;
-      border-radius: 10px; font-size: 14px; font-weight: 600;
-      font-family: inherit; text-decoration: none; cursor: pointer;
-      border: none; width: 100%;
-    }
-    .btn.primary { background: #007AFF; color: #fff; }
-    .btn.primary:hover { background: #0062CC; }
-    .btn.secondary { background: #fff; color: #007AFF; border: 1px solid rgba(0,0,0,.08); }
-    .btn + .btn { margin-top: 10px; }
-    .author-email {
-      font-size: 13px; color: #1d1d1f; margin: 14px 0 4px;
-      user-select: all; -webkit-user-select: all;
-    }
-    .footer { margin-top: 20px; font-size: 11px; color: #86868b; line-height: 1.5; }
-    .tpl {
-      margin-top: 18px; border-top: 1px solid rgba(0,0,0,.08);
-      padding-top: 14px; text-align: left;
-    }
-    .tpl-title { font-size: 12px; color: #86868b; font-weight: 600; margin-bottom: 6px; }
-    .tpl pre {
-      white-space: pre-wrap; word-break: break-all; font-size: 12px;
-      color: #1d1d1f; background: #f5f5f7; border-radius: 8px;
-      padding: 10px 12px; line-height: 1.6;
-      font-family: inherit;
-    }
-  </style>
+  {# 页面 CSP（_apply_landing_security_headers）：style-src 'self' —— 样式必须
+     走外链 CSS，不得内联 <style> / style 属性（2026-10-08 §7） #}
+  <link rel="stylesheet" href="/static/registration-help.css?v=20261008a" />
+  <script src="/static/i18n.js?v=20261008a"></script>
+  <script defer src="/static/registration-help.js?v=20261008a"></script>
 </head>
 <body>
   <main class="card">
     <span class="badge" data-i18n="reghelp.badge">注册帮助</span>
-    <h1 class="title">{{ title_zh }}<span data-i18n="reghelp.{{ reason }}.title"> · {{ title_en }}</span></h1>
+    {# 原因标题：模板默认=中文（zh 词典同值）；i18n.js 按 reghelp.<reason>.title
+       切换中/英文。reason 只来自服务端固定词表（app.REGISTRATION_HELP_REASONS） #}
+    <h1 class="title" data-i18n="reghelp.{{ reason }}.title">{{ title_zh }}</h1>
     <p class="desc" data-i18n="reghelp.desc">如果你没有收到验证邮件、链接打不开或无法完成注册，可以给作者发邮件说明情况，作者会协助你排查。点击下方按钮将打开你的邮件客户端并预填内容，你可以先检查再发送。</p>
     {# 主操作：给作者发邮件（mailto；主题/正文已按语言标准 URL 编码）。
        href=入口默认语言版本（无 JS 可用）；data-mailto-zh / data-mailto-en
@@ -84,6 +30,8 @@
     <a class="btn secondary" href="/register" data-i18n="reghelp.back">返回注册</a>
     <div class="tpl">
       <p class="tpl-title" data-i18n="reghelp.template.title">邮件内容预览（发送前可修改）</p>
+      {# 无 JS 默认：入口默认语言版本（与服务端 mailto href 一致）；
+         registration-help.js 按当前语言从 data-mailto-zh/en 的 body 参数解码刷新 #}
       <pre id="reghelp-template">{% if locale == 'en' %}Hello, I ran into a problem while registering for HistoPilot.
 
 Registration email: (fill in yourself)
@@ -104,6 +52,5 @@ Please help me look into this. Thank you.{% else %}你好，我在注册 HistoPi
     </div>
     <p class="footer" data-i18n="reghelp.footer">仅用于研究、教学和软件演示，不用于临床诊断。</p>
   </main>
-  <script src="/static/i18n.js?v=20260916a"></script>
 </body>
 </html>

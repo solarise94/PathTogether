@@ -1,0 +1,74 @@
+/* 注册帮助页（/registration-help）样式（2026-10-08 设计 §5）。
+ *
+ * 本页面 CSP（_apply_landing_security_headers）：style-src 'self' —— 2026-10-08
+ * 起：原内联 <style> 整体迁出为本文件（原内联样式会被 CSP 静默丢弃）。
+ * 与 verify_email.html 同款卡片视觉；无 JS 时布局完整可用。
+ */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+  height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+               "PingFang SC", "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+body {
+  background: #f5f5f7;
+  color: #1d1d1f;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.card {
+  width: 100%;
+  max-width: 460px;
+  background: #fff;
+  border-radius: 16px;
+  box-shadow: 0 1px 3px rgba(0,0,0,.04), 0 12px 32px rgba(0,0,0,.10);
+  padding: 36px 30px 28px;
+  text-align: center;
+}
+.badge {
+  display: inline-block; font-size: 12px; font-weight: 600;
+  color: #007AFF; background: rgba(0,122,255,.08);
+  border-radius: 999px; padding: 4px 12px; margin-bottom: 14px;
+}
+.title { font-size: 19px; font-weight: 600; margin-bottom: 10px; }
+.desc { font-size: 13px; color: #86868b; line-height: 1.7; margin-bottom: 20px; text-align: left; }
+.btn {
+  display: inline-block; height: 42px; line-height: 42px;
+  border-radius: 10px; font-size: 14px; font-weight: 600;
+  font-family: inherit; text-decoration: none; cursor: pointer;
+  border: none; width: 100%;
+}
+.btn.primary { background: #007AFF; color: #fff; }
+.btn.primary:hover { background: #0062CC; }
+.btn.secondary { background: #fff; color: #007AFF; border: 1px solid rgba(0,0,0,.08); }
+.btn + .btn { margin-top: 10px; }
+.author-email {
+  font-size: 13px; color: #1d1d1f; margin: 14px 0 4px;
+  user-select: all; -webkit-user-select: all;
+}
+.footer { margin-top: 20px; font-size: 11px; color: #86868b; line-height: 1.5; }
+.tpl {
+  margin-top: 18px; border-top: 1px solid rgba(0,0,0,.08);
+  padding-top: 14px; text-align: left;
+}
+.tpl-title { font-size: 12px; color: #86868b; font-weight: 600; margin-bottom: 6px; }
+.tpl pre {
+  white-space: pre-wrap; word-break: break-all; font-size: 12px;
+  color: #1d1d1f; background: #f5f5f7; border-radius: 8px;
+  padding: 10px 12px; line-height: 1.6;
+  font-family: inherit;
+}
+/* 复制成功反馈（文案由 registration-help.js 按语言切换） */
+.btn.secondary.btn-copied { border-color: rgba(52,199,89,.6); color: #248a3d; }
+
+/* 375px 级手机：卡片贴边、留白收紧，主按钮/预览不溢出 */
+@media (max-width: 420px) {
+  body { padding: 14px; }
+  .card { padding: 28px 18px 22px; border-radius: 14px; }
+  .title { font-size: 18px; }
+  .btn { height: 46px; line-height: 46px; }
+}

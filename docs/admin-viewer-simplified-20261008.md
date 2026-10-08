@@ -80,7 +80,7 @@ CREATE INDEX IF NOT EXISTS projects_parent_idx ON projects(parent_project_id);
 | own | 本人切片 | 查看 |
 | unavailable | 不可查看（原因） | 无 |
 
-「查看」在新标签页打开 `/?slide=<slide_id>`（Viewer 已支持该深链）。页脚说明：临时查看 1 小时后自动结束，可提前结束，不改变用户自己的分享设置。
+「查看」在新标签页打开 `/app?slide=<slide_id>`（工作台路由是 `/app`，`/` 是首页）。页脚说明：临时查看 1 小时后自动结束，可提前结束，不改变用户自己的分享设置。
 
 ## 4. 注册：邀请码退役
 
@@ -144,7 +144,7 @@ Viewer 打开的切片若带 `temporary_view_expires_at`，按其到期时间设
 | `admin.slides.setVisibility`、`admin.invites.*` | 删除（调用返回 `unknown_method`） |
 | `admin.settings.update` 的 `registration_mode` | 枚举改为 `closed/public` |
 
-iframe 内不得直接 fetch；「查看」若需宿主打开新标签，在 admin-host 增加只读宿主方法（如 `admin.viewer.open {slide_id}` → `window.open('/?slide=' + encodeURIComponent(id), '_blank', 'noopener')`），不经 HTTP。
+iframe 内不得直接 fetch；「查看」若需宿主打开新标签，在 admin-host 增加只读宿主方法（如 `admin.viewer.open {slide_id}` → `window.open('/app?slide=' + encodeURIComponent(id), '_blank', 'noopener')`），不经 HTTP。
 
 ## 7. 分工与顺序
 

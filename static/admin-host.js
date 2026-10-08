@@ -75,8 +75,9 @@
        既有语义稳定回 unknown_method；
      - admin.settings.update 的 registration_mode 枚举收敛为 closed/public；
      - 新增 admin.viewer.open {slide_id}（admin:slides:read）：只读宿主
-       方法——不经任何 HTTP，宿主侧 window.open('/?slide=<id>', '_blank',
-       'noopener')（iframe 不能也不应直接导航宿主）。slide_id 由 schema
+       方法——不经任何 HTTP，宿主侧 window.open('/app?slide=<id>', '_blank',
+       'noopener')（iframe 不能也不应直接导航宿主；工作台在 /app——DEF-2，
+       / 是营销首页）。slide_id 由 schema
        pattern ^sld_[A-Za-z0-9_-]+$ 与宿主侧二次校验双重约束；
      - manifest adminPermissions 同步移除 admin:invites:read/write
        （plugins/sdk/manifest.py 的 SDK 词表保留这两个枚举值——非本线文件；
@@ -119,7 +120,7 @@
     "admin.slides.inventory": "admin:slides:read",
     "admin.slides.startTemporaryView": "admin:slides:write",
     "admin.slides.endTemporaryView": "admin:slides:write",
-    // 2026-10-08（§6）：「查看」在新标签打开 /?slide=<id>。只读宿主方法
+    // 2026-10-08（§6）：「查看」在新标签打开 /app?slide=<id>。只读宿主方法
     //（admin:slides:read）：不经 HTTP，dispatch 后由宿主侧 window.open
     // 执行（见 METHOD_BACKENDS 与 create() 的 hostActions）。
     "admin.viewer.open": "admin:slides:read",
@@ -866,7 +867,7 @@
       return jsonWrite(url, "DELETE", {})(ctx);
     },
 
-    // 2026-10-08（§6）：只读宿主方法——「查看」在新标签打开 /?slide=<id>。
+    // 2026-10-08（§6）：只读宿主方法——「查看」在新标签打开 /app?slide=<id>。
     // 不经任何 HTTP（iframe 无权直接导航宿主，宿主代为 window.open）；
     // slide_id 在宿主侧按 SLIDE_ID_RE 二次校验后原样拼接。
     "admin.viewer.open": function (ctx, payload) {
@@ -1287,7 +1288,8 @@
     // 只有显式登记的 host 方法可触达）。admin.viewer.open 的「查看」需要
     // 宿主开新标签：iframe 是 opaque sandbox（无 allow-popups/
     // allow-top-navigation），不能也不应自己 window.open/导航宿主——由宿主
-    // 侧执行，slide_id 过 SLIDE_ID_RE 后拼 /?slide=<id>（Viewer 深链）。
+    // 侧执行，slide_id 过 SLIDE_ID_RE 后拼 /app?slide=<id>（工作台深链；
+    // DEF-2：/ 是营销首页）。
     var hostActions = {
       openViewerSlide: function (slideId) {
         var s = String(slideId == null ? "" : slideId);
@@ -1297,7 +1299,7 @@
         if (typeof win.open !== "function") {
           throw { code: "bridge_error", message: "宿主无法打开新标签页" };
         }
-        win.open("/?slide=" + encodeURIComponent(s), "_blank", "noopener");
+        win.open("/app?slide=" + encodeURIComponent(s), "_blank", "noopener");
         return { opened: true, slide_id: s };
       },
     };

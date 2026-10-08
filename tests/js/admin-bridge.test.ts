@@ -1147,9 +1147,10 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 		expect(calls).toHaveLength(2);
 	});
 
-	it("admin.viewer.open opens /?slide=<id> in a new tab host-side; zero HTTP", async () => {
-		// §6：iframe 不能也不应直接导航宿主——「查看」由宿主 window.open 执行
-		//（_blank + noopener），不经任何 fetch。
+	it("admin.viewer.open opens /app?slide=<id> in a new tab host-side; zero HTTP", async () => {
+		// §6 + DEF-2：iframe 不能也不应直接导航宿主——「查看」由宿主
+		// window.open 执行（_blank + noopener），不经任何 fetch；工作台在
+		// /app（/ 是营销首页）。
 		const opened: Array<{ href: string; target: string; features: string }> = [];
 		const { AdminBridgeHost, crypto } = loadModule();
 		const posted2: Posted[] = [];
@@ -1195,7 +1196,7 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 		expect(rs[0].env.ok).toBe(true);
 		expect(rs[0].env.result).toEqual({ opened: true, slide_id: "sld_abcDEF-1" });
 		expect(opened).toEqual([{
-			href: "/?slide=sld_abcDEF-1", target: "_blank", features: "noopener",
+			href: "/app?slide=sld_abcDEF-1", target: "_blank", features: "noopener",
 		}]);
 		// 非法 slide_id：宿主侧二次校验 → invalid_params，不开窗
 		handle2._handleWindowMessage({

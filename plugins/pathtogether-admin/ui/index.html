@@ -247,7 +247,9 @@
              旧「切片可见性」（workspace 显式收录）模型已整体退役——owner 的
              读权限改由 1 小时临时查看授权承载。五态：未开启 / 已结束 /
              可查看·剩余 N 分钟 / 本人切片 / 不可查看（原因）；「查看」经
-             admin.viewer.open 由宿主在新标签打开 /?slide=<id>。 -->
+             admin.viewer.open 由宿主在新标签打开 /app?slide=<id>；
+             提前结束为行内确认（DEF-4：确认控件渲染在操作单元格内，
+             不再挂表格下方的页级确认条）。 -->
         <section class="adm-page" id="adm-page-slides" hidden>
           <div class="adm-state" id="adm-state-slides" data-page-state="idle" role="status" aria-live="polite"></div>
           <section class="adm-card">
@@ -266,7 +268,6 @@
                 <tbody id="adm-slides-tbody"></tbody>
               </table>
             </div>
-            <div class="adm-confirm" id="adm-slides-confirm" hidden></div>
             <div class="adm-pager">
               <button type="button" id="adm-slides-refresh-btn" class="adm-btn-secondary">刷新列表</button>
               <button type="button" id="adm-slides-more-btn" class="adm-btn-secondary">加载更多</button>

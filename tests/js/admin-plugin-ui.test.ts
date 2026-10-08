@@ -2836,7 +2836,7 @@ describe("切片页：临时查看五态 + 行内动作（§3.4）", () => {
 		expect(tbody).toContain("无主");
 	});
 
-	it("行内动作按状态分流：开启 1 小时 / 查看 / 结束查看（页内确认）", async () => {
+	it("行内动作按状态分流：开启 1 小时 / 查看 / 结束查看（行内确认，DEF-4 回归）", async () => {
 		const bus = await bootSlides();
 		const btns = bus.created.filter((e) => e.tagName === "BUTTON");
 		expect(btns.filter((b) => b.textContent === "开启 1 小时")).toHaveLength(2);
@@ -2872,20 +2872,97 @@ describe("切片页：临时查看五态 + 行内动作（§3.4）", () => {
 				p.env.method === "admin.viewer.open").at(-1);
 		expect(openReq!.env.payload).toEqual({ slide_id: "sld_activ01" });
 
-		// 结束查看：先页内确认条，确认后才 DELETE
+		// —— DEF-4 回归：结束确认必须行内渲染在操作单元格内（真实点击路径）
+		// 旧实现把确认条挂页级 #adm-slides-confirm（表格下方）——长表格时
+		// 离点击位置过远甚至折叠在视口外，owner 点「结束查看」后看不到确认
+		// 条，流程止步于确认前：桥上零请求、行不变、DB 授权仍 active。
+		// 本用例锁定：①点击后确认控件出现在**同一操作单元格**（textContent
+		// 结构断言）；②确认前桥上零请求；③点「确认结束」即发
+		// admin.slides.endTemporaryView（真实 click → confirm → bridge 调用链）；
+		// ④页级 #adm-slides-confirm 容器不再存在。
+		expect(htmlSrc).not.toContain('id="adm-slides-confirm"');
 		const endBtn = btns.filter((b) => b.textContent === "结束查看")[0];
+		// 该按钮所在的操作单元格（结束确认必须渲染在这里）
+		const actionsCell = bus.created.find((el) =>
+			el.tagName === "TD" && el.className === "adm-actions-cell" &&
+			String(el.textContent).includes("结束查看"));
+		expect(actionsCell).toBeTruthy();
 		endBtn._fire("click");
-		expect(bus.els["adm-slides-confirm"].hidden).toBe(false);
-		expect(bus.els["adm-slides-confirm"].textContent).toContain("提前结束");
+		// ①确认控件在操作单元格内（紧邻点击位置；不再是页级远端容器）
+		const cellText = String(actionsCell!.textContent);
+		expect(cellText).toContain("结束查看？");
+		expect(cellText).toContain("确认结束");
+		expect(cellText).toContain("取消");
+		// 焦点落「确认结束」（新交互内容可达）
+		const confirmOk = bus.created.find((el) => el.textContent === "确认结束" &&
+			el._listeners && el._listeners.click);
+		expect(confirmOk).toBeTruthy();
+		expect(confirmOk!._focusCalls).toBeGreaterThanOrEqual(1);
+		// ②确认前桥上零请求（旧缺陷在确认前就「无任何请求」地卡死）
 		expect(bus.parentPosted.some((p) => p.env.kind === "request" &&
 			p.env.method === "admin.slides.endTemporaryView")).toBe(false);
-		const okBtn = bus.created.filter((el) => el.textContent === "确认执行").at(-1);
-		okBtn!._fire("click", {});
+		// ③真实确认路径：点「确认结束」→ 发 DELETE 桥调用
+		confirmOk!._fire("click", {});
 		await ticks(2);
 		const endReq = bus.parentPosted
 			.filter((p) => p.env.kind === "request" &&
 				p.env.method === "admin.slides.endTemporaryView").at(-1);
 		expect(endReq!.env.payload).toEqual({ slide_id: "sld_activ01" });
+		replyMethod(bus, NONCE, "admin.slides.endTemporaryView", {
+			ok: true,
+			result: { slide_id: "sld_activ01",
+				temporary_view: { status: "ended", expires_at: SERVER_NOW },
+				server_now: SERVER_NOW },
+		});
+		await ticks(4);
+		// 成功后重取清单，行会重绘为 已结束
+		expect(bus.els["adm-slides-status"].textContent).toContain("已结束临时查看");
+
+		// 取消路径：恢复行内操作按钮、不发请求
+		const endBtn2 = bus.created.filter((el) => el.textContent === "结束查看" &&
+			el._listeners && el._listeners.click)[0];
+		endBtn2!._fire("click");
+		const cancelBtn = bus.created.filter((el) => el.textContent === "取消" &&
+			el._listeners && el._listeners.click).at(-1);
+		cancelBtn!._fire("click", {});
+		await ticks(2);
+		expect(bus.parentPosted.filter((p) => p.env.kind === "request" &&
+			p.env.method === "admin.slides.endTemporaryView")).toHaveLength(1);
+		expect(String(actionsCell!.textContent)).toContain("结束查看");
+	});
+
+	it("DEF-4：结束确认打开期间 60s 刷新不重绘（不吞确认控件）；失败恢复行内按钮", async () => {
+		const bus = await bootSlides();
+		const invCount = () => bus.parentPosted
+			.filter((p) => p.env.kind === "request" &&
+				p.env.method === "admin.slides.inventory").length;
+		// 打开行内确认
+		const endBtn = bus.created.filter((el) => el.textContent === "结束查看" &&
+			el._listeners && el._listeners.click)[0];
+		endBtn!._fire("click");
+		const cellText = () => String(bus.created.find((el) =>
+			el.tagName === "TD" && el.className === "adm-actions-cell" &&
+			String(el.textContent).includes("确认结束"))?.textContent ?? "");
+		expect(cellText()).toContain("确认结束");
+		// 60s tick：确认打开期间不重绘（确认控件仍在）
+		const timer = bus.intervals.find((x) => x.ms === 60000)!;
+		const before = invCount();
+		timer.callback();
+		await ticks(2);
+		expect(invCount()).toBe(before);
+		// 失败：恢复行内操作按钮（可重试），错误进状态行
+		const confirmOk = bus.created.find((el) => el.textContent === "确认结束" &&
+			el._listeners && el._listeners.click);
+		confirmOk!._fire("click", {});
+		await ticks(2);
+		replyMethod(bus, NONCE, "admin.slides.endTemporaryView", {
+			ok: false, error: { code: "backend_error", message: "500" },
+		});
+		await ticks(4);
+		expect(bus.els["adm-slides-status"].textContent).toContain("backend_error");
+		// 行内按钮已恢复（结束后重绘）
+		expect(bus.created.filter((el) => el.textContent === "结束查看" &&
+			el._listeners && el._listeners.click).length).toBeGreaterThanOrEqual(1);
 	});
 
 	it("倒计时数学：ceil 取整、本地流逝修正、到期转 ended（tempViewStatusOf）", async () => {

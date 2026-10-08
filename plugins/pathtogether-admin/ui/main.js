@@ -3059,9 +3059,13 @@
   //     流逝时间修正（slidesCache 基准），每分钟刷新；剩余归零按「已结束」
   //     呈现并重取清单（服务端 read 门是唯一权限依据，倒计时只管呈现）；
   //   - 开启（1 小时，常量在服务端）走 admin.slides.startTemporaryView；
-  //     提前结束走 admin.slides.endTemporaryView（幂等）；
+  //     提前结束走 admin.slides.endTemporaryView（幂等）；结束确认**行内
+  //     渲染在操作单元格内**（DEF-4：页级确认条挂表格下方，长表格时离
+  //     点击位置过远甚至折叠在视口外——owner 点「结束查看」后看不到确认
+  //     条，流程止步于确认前，桥上零请求）；
   //   - 「查看」走 admin.viewer.open——只读宿主方法，宿主 window.open 在
-  //     新标签打开 /?slide=<slide_id>（iframe 不导航宿主、不经任何 HTTP）；
+  //     新标签打开 /app?slide=<slide_id>（iframe 不导航宿主、不经任何
+  //     HTTP；工作台在 /app，DEF-2）；
   //   - unavailable 行给出现有原因字段（failed 码表），不提供操作；
   //   - 渲染纪律不变：textContent/createElement，未知字段绝不进 DOM。
   // ------------------------------------------------------------------
@@ -3321,6 +3325,7 @@
   // 每分钟刷新（§3.4）：按缓存重画整表；任一行从 active 跨过到期时刻则
   // 重取清单（读权限以服务端门为唯一依据，本页倒计时只负责呈现与提醒）。
   function slidesMinuteTick() {
+    if (slidesInlineConfirm) return; // 行内确认打开期间不重绘（DEF-4）
     if (!state.slidesCache || !state.slidesCache.items) return;
     var expired = false;
     state.slidesCache.items.forEach(function (item) {
@@ -3373,11 +3378,7 @@
         openSlideInViewer(item);
       }, "secondary"));
       cell.appendChild(actionBtn("结束查看", function () {
-        askConfirm($("adm-slides-confirm"),
-          "确认提前结束 " + slideLabel(item) + " 的临时查看？" +
-          "结束后新请求立即被拒，派生的 AI 运行授权一并取消；" +
-          "用户自己的分享设置不受影响。",
-          function () { endTemporaryView(item); });
+        openInlineEndConfirm(cell, item);
       }, "danger-outline"));
       return cell;
     }
@@ -3397,7 +3398,7 @@
     request("admin.viewer.open", { slide_id: item.slide_id })
       .then(function () {
         setStatus("adm-slides-status",
-          "已在新标签页打开 Viewer（/?slide=" + item.slide_id + "）");
+          "已在新标签页打开工作台（/app?slide=" + item.slide_id + "）");
       })
       .catch(function (err) { handleErr(err, $("adm-slides-status")); });
   }
@@ -3418,6 +3419,32 @@
       .catch(function (err) { handleErr(err, $("adm-slides-status")); });
   }
 
+  // 行内结束确认（DEF-4）：确认控件直接渲染在该行操作单元格内——紧邻
+  // 点击位置，不可能被错过；焦点落「确认结束」。打开期间 60s 刷新暂停
+  //（slidesMinuteTick），避免重绘吞掉确认控件；取消/结束/失败都恢复行内
+  // 操作按钮。同一时刻至多一个行内确认（再次点击其它行会重绘恢复）。
+  var slidesInlineConfirm = false;
+
+  function openInlineEndConfirm(cell, item) {
+    cell.textContent = "";
+    slidesInlineConfirm = true;
+    var msg = document.createElement("span");
+    msg.className = "adm-confirm-text";
+    msg.textContent = "结束查看？派生 AI 运行授权一并取消";
+    var ok = actionBtn("确认结束", function () {
+      slidesInlineConfirm = false;
+      endTemporaryView(item);
+    }, "danger");
+    var cancel = actionBtn("取消", function () {
+      slidesInlineConfirm = false;
+      renderSlidesFromCache(); // 恢复该行 查看/结束查看 按钮
+    }, "secondary");
+    cell.appendChild(msg);
+    cell.appendChild(ok);
+    cell.appendChild(cancel);
+    if (ok.focus) ok.focus();
+  }
+
   function endTemporaryView(item) {
     setStatus("adm-slides-status", "正在结束临时查看…");
     request("admin.slides.endTemporaryView", { slide_id: item.slide_id })
@@ -3425,7 +3452,12 @@
         setStatus("adm-slides-status", "已结束临时查看：" + slideLabel(item));
         loadSlides(false);
       })
-      .catch(function (err) { handleErr(err, $("adm-slides-status")); });
+      .catch(function (err) {
+        // 失败恢复行内按钮（可重试）；错误进页级状态行 + 全局错误卡
+        slidesInlineConfirm = false;
+        if (state.slidesCache) renderSlidesFromCache();
+        handleErr(err, $("adm-slides-status"));
+      });
   }
 
   // ------------------------------------------------------------------

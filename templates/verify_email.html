@@ -213,60 +213,12 @@
       <p class="hint" style="margin-top:12px;"><a href="/registration-help?reason=submit_error">提交遇到问题？给作者发邮件</a></p>
     </form>
     {% else %}
-    <h1 class="title"><span data-i18n="verify.valid.title">验证你的邮箱</span> <span class="state-ok">✓</span></h1>
-    <p class="desc" data-i18n="verify.valid.desc" data-i18n-vars="email:{{ email_masked }}">链接有效（收件人：{email}）。请为你的账号设置密码完成验证——提交后将创建账号并提交测试申请，管理员审核通过后即可使用。密码至少 15 位，可直接使用密码管理器生成。</p>
-    <div id="verify-error" class="error-box" role="alert" style="display:none;"></div>
-    <!-- token 经 POST body 提交（一次性、绝不进 URL 以外存储；CSRF 双提交） -->
-    <form id="verify-form" autocomplete="on">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-      <input type="hidden" name="token" value="{{ token }}" />
-      <div class="field">
-        <label for="password" data-i18n="verify.password">设置密码</label>
-        <input id="password" name="password" type="password" required minlength="15"
-               maxlength="200" autocomplete="new-password"
-               placeholder="至少 15 位" data-i18n-ph="verify.password.ph" />
-      </div>
-      <div class="field">
-        <label for="password_confirm" data-i18n="verify.password_confirm">确认密码</label>
-        <input id="password_confirm" name="password_confirm" type="password" required
-               minlength="15" maxlength="200" autocomplete="new-password" />
-      </div>
-      <!-- 申请测试：与设置密码同流程提交；后端 verify 在同事务写 test_applications -->
-      <fieldset>
-        <legend data-i18n="verify.apply.direction.legend">研究方向</legend>
-        <label class="radio-row" for="vd-model_plant">
-          <input id="vd-model_plant" name="research_direction" type="radio"
-                 value="model_plant" required />
-          <span data-i18n="verify.apply.direction.model_plant">模式植物</span>
-        </label>
-        <label class="radio-row" for="vd-model_animal">
-          <input id="vd-model_animal" name="research_direction" type="radio"
-                 value="model_animal" required />
-          <span data-i18n="verify.apply.direction.model_animal">模式动物</span>
-        </label>
-        <label class="radio-row" for="vd-clinical_pathology">
-          <input id="vd-clinical_pathology" name="research_direction" type="radio"
-                 value="clinical_pathology" required />
-          <span data-i18n="verify.apply.direction.clinical_pathology">临床病理</span>
-        </label>
-        <label class="radio-row" for="vd-other">
-          <input id="vd-other" name="research_direction" type="radio"
-                 value="other" required />
-          <span data-i18n="verify.apply.direction.other">其他</span>
-        </label>
-      </fieldset>
-      <div class="field">
-        <label class="check-row" for="share_research_data">
-          <input id="share_research_data" name="share_research_data" type="checkbox"
-                 value="1" />
-          <span data-i18n="verify.apply.share.label">我愿意向研究团队分享我的切片、分析结果及使用行为数据，用于软件改进和科学研究。</span>
-        </label>
-        <p class="hint" data-i18n="verify.apply.share.hint">此项为自愿选择，不影响测试申请审批，之后可在账号设置中更改。</p>
-      </div>
-      <button class="btn primary" type="submit" id="verify-submit"
-              data-i18n="verify.apply.submit">申请测试</button>
-      <p class="hint" style="margin-top:12px;"><a href="/registration-help?reason=submit_error">提交遇到问题？给作者发邮件</a></p>
-    </form>
+    <!-- 2026-10-08 §4：旧 email_verify（邮箱验证 + 邀请码激活）链接退役——
+         不再建 pending 账号，引导重新走公开注册（链接本身不消费）。 -->
+    <h1 class="title"><span>注册流程已更新</span> <span class="state-bad">✕</span></h1>
+    <p class="desc">此验证链接属于旧版注册流程，已不再使用。请返回注册页重新开始公开注册；已完成注册的账号可直接登录。</p>
+    <a class="btn secondary" href="/register" data-i18n="verify.error.retry">重新注册</a>
+    <a class="btn secondary" href="/login" data-i18n="verify.error.consumed.login">前往登录</a>
     {% endif %}
     {% elif state == "expired" %}
     <h1 class="title"><span data-i18n="verify.error.expired.title">链接已过期</span> <span class="state-bad">✕</span></h1>
@@ -287,14 +239,15 @@
     <p class="footer" data-i18n="verify.footer">仅用于研究、教学和软件演示，不用于临床诊断。</p>
   </main>
 
-  {% if state == "valid" %}
+  {% if state == "valid" and flow == "public" %}
   <script>
     (function () {
       "use strict";
       var form = document.getElementById("verify-form");
+      if (!form) { return; }
       var btn = document.getElementById("verify-submit");
       var errBox = document.getElementById("verify-error");
-      var isPublic = form && !!document.getElementById("pub-terms-version");
+      var isPublic = !!document.getElementById("pub-terms-version");
       function t(key, fallback) {
         try {
           var s = window.HP_I18N && HP_I18N.t(key);

@@ -412,8 +412,8 @@ def test_owner_workbench_not_a_dump_of_private_notes():
     aid = r.get_json()["annotation_id"]
 
     # owner 显式收录 X（切片可见）后：切片可见，但标注仍不可见
-    assert co.post("/api/admin/v1/slides/%s/visibility" % x,
-                   json={"granted": True}).status_code == 200
+    assert co.post("/api/admin/v1/slides/%s/temporary-view"
+                   % share_store.get_slide_id(x)).status_code == 200
     assert co.get("/api/slide/%s/info" % x).status_code != 403
     assert all(i["annotation_id"] != aid
                for i in co.get("/api/share/rois").get_json())

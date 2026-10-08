@@ -331,36 +331,22 @@ def user_store_pg_create(login_id, password, **kwargs):
         login_id, password, **kwargs)
 
 
-def test_invite_only_register_requires_email_login_id(monkeypatch):
-    """invite_only 表单：login_id 必须邮箱形态；display_name 保留可填。"""
-    owner = _mk_owner()
+def test_register_closed_mode_has_no_invite_form(monkeypatch):
+    """2026-10-08 §4：closed 模式注册视图无邀请码输入（只读关闭态说明）；
+    POST 一律 403 registration_closed，零用户行。"""
     monkeypatch.setenv("ADMIN_SESSION_COOKIE_SECURE", "1")
-    settings_store.set_registration_mode("invite_only", updated_by="t")
-    inv = registration_store.create_invite(
-        owner["user_id"], login_id="dave@x.com")
+    settings_store.set_registration_mode("closed", updated_by="t")
     client = _client()
-
-    def _post(login_id, display_name=""):
-        return client.post("/register", data={
-            "invite_token": inv["token"], "login_id": login_id,
-            "display_name": display_name, "password": PW,
-            "password_confirm": PW})
-
-    # 非邮箱形态：本地形状错误（200 页面回显），无用户行
-    r_bad = _post("dave")
-    assert r_bad.status_code == 200
-    assert "邮箱" in r_bad.get_data(as_text=True)
-    assert user_store.get_user_by_login_id("dave") is None
-    # 邮箱形态（大小写/空白规范化）+ 可选显示名：302 /login，兑换成功
-    r_ok = _post("  DAVE@X.com ", display_name="Dave 展示名")
-    assert r_ok.status_code == 302, r_ok.get_data(as_text=True)
-    u = user_store.get_user_by_login_id("dave@x.com")
-    assert u is not None
-    assert u["display_name"] == "Dave 展示名"
-    # GET 页面：登录账号输入框为邮箱形态（type=email + 邮箱占位符）
     page = client.get("/register").get_data(as_text=True)
-    assert 'type="email"' in page
-    assert "you@example.com" in page
+    assert 'name="invite_token"' not in page
+    assert 'name="login_id"' not in page
+    assert "当前未开放注册" in page
+    r = client.post("/register", data={
+        "invite_token": "whatever", "login_id": "dave@x.com",
+        "password": PW, "password_confirm": PW})
+    assert r.status_code == 403
+    assert r.get_json()["code"] == "registration_closed"
+    assert user_store.get_user_by_login_id("dave@x.com") is None
 
 
 # =========================================================================== #

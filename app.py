@@ -4151,6 +4151,31 @@ def login():
     user = user_store.verify_user(username, password)
     if user is not None:
         _clear_login_failures(account_hash, ip_prefix_hash)
+        # 2026-10-08 §4：pending_activation 惰性激活——已验证邮箱且未禁用的
+        # pending 用户在登录成功时转 active 并按公开注册同口径幂等初始化
+        # 额度/AI，然后走正常登录；**不再签发受限 enrollment session**。
+        # 未验证邮箱的账号无法登录（重新走公开注册）；禁用账号在
+        # verify_user 已按统一失败拒绝。
+        if (user.get("activation_state") or "active") == "pending_activation":
+            try:
+                activated = registration_store.lazy_activate_pending_user(
+                    user.get("user_id"))
+            except spend_store.ProvisioningMaintenanceError:
+                return _login_page(
+                    error="系统维护中（cutover），登录暂不可用，请稍后再试",
+                    error_code="unavailable", next_url=post_next, status=503)
+            except Exception:
+                app.logger.exception(
+                    "登录惰性激活异常（user_id=%s）", user.get("user_id"))
+                return _login_page(
+                    error="登录暂不可用，请稍后再试",
+                    error_code="unavailable", next_url=post_next, status=503)
+            if activated is None:
+                return _login_page(
+                    error="账号尚未完成邮箱验证，暂不能登录；请通过公开注册"
+                          "重新注册",
+                    error_code="account_pending", next_url=post_next, status=403)
+            user = activated
         # 防 session fixation：先清旧 session 再写新身份，并轮换 CSRF token。
         # auth_version（docs §6.2）：登录成功把当次凭据版本写进 session；
         # 改密/重置/禁用/启用都会递增版本，旧 Cookie 随即失效。
@@ -4158,20 +4183,6 @@ def login():
         # → email → login_id；display_name 是纯展示字段，绝不冒充身份）。
         # 存量无邮箱账号回退 login_id（语义即「当前唯一用户名」）。
         session.clear()
-        # I 线状态机（设计文档第 8 节）：pending_activation 凭据正确只发
-        # **enrollment 受限 session**（独立 scope，不写 auth_user/role/
-        # user_id 顶层键），跳激活页——普通登录态与业务面完全不可达。
-        if (user.get("activation_state") or "active") == "pending_activation":
-            session[ENROLLMENT_SESSION_KEY] = {
-                "user_id": user.get("user_id"),
-                "email": user.get("email_normalized")
-                or user.get("email") or "",
-                "purpose": "activation",
-                "issued_at": time.time(),
-                "auth_version": user.get("auth_version"),
-            }
-            rotate_csrf_token()
-            return redirect("/activate")
         session.permanent = True
         session["auth_user"] = (user.get("email_normalized")
                                 or user.get("email")
@@ -4180,6 +4191,13 @@ def login():
         session["role"] = user.get("role")
         session["auth_version"] = user.get("auth_version")
         rotate_csrf_token()
+        # 2026-10-08 §2：last_login_at 只在正常成功路径记录（GREATEST 单调
+        # 不回退；登录失败/刷新/AI 请求/注册完成都不更新）；写失败不影响登录
+        try:
+            user_store.record_login_success(user.get("user_id"))
+        except Exception:
+            app.logger.warning("last_login_at 写入失败（不影响登录）",
+                               exc_info=True)
         return redirect(post_next)
 
     # 失败：统一文案（不泄露账号是否存在）；记录两桶计数，触发锁定则 429 + 倒计时
@@ -4638,23 +4656,11 @@ def acquisition_redirect(source_code):
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
-    """注册弹窗页（registration_mode = closed | invite_only |
-    email_verify_invite_activation | public，P0-B §4.1 + I 线设计文档第 8 节；
-    R2 2026-09-19：并入介绍主页弹窗，register.html 独立页已删除）。
+    """注册弹窗页（registration_mode = closed | public；2026-10-08 §4 起邀请
+    码形态（invite_only / email_verify_invite_activation）退役，只剩两种模式。
 
     - GET（任意模式）：渲染介绍主页并直开注册视图（深链接可用）；
       closed：注册视图为关闭态说明（无可提交表单），POST 一律 403；
-    - invite_only：注册视图渲染邀请码/登录账号/显示名/密码表单（统一密码策略
-      15..200 位、允许密码管理器 paste），POST 走 registration_store 原子
-      兑换（表单 login_id 字段为登录账号，批次 C docs §8.2）；成功**不自动
-      登录**——清理匿名 session、轮换 CSRF 后 302 /login；
-    - email_verify_invite_activation（I 线）：注册视图**先填邮箱**请求验证
-      邮件（不填邀请码、不发额度；首屏文案「验证邮箱并提交申请，管理员审核
-      通过后即可使用」）。POST 同事务入队 registration_mail_jobs（配额：同
-      邮箱 60s 冷却、时 3、日 5，应用日预算 40）；对已存在/未知邮箱/超限一律
-      **同一文案**（无枚举信号）。验证邮件含一次性链接 → GET /verify-email
-      只展示 → POST /api/registration/verify 消费 token 并原子建
-      pending_activation 用户（密码在邮箱确认之后设置）；
     - public（P1，docs/agent-plan-20260921 §3.3/§4）：注册视图填邮箱 +
       **两个独立复选框**（必选《用户协议与数据处理说明》+ 自愿《数据共享
       与软件改进协议》，均不预勾选）+ 服务端发布的协议版本标识。POST 入队
@@ -4665,12 +4671,10 @@ def register():
       registration_created 管理员通知。成功跳 /login?registered=1；
     - 模式权威值还受 fail-closed 前置闸（_effective_registration_mode：非
       HTTPS / 非 Secure Cookie / 邮件通道未配置等一律按 closed 处理，docs
-      §3.2 末段 + I 线模式前置）。
+      §3.2 末段）。
 
     限流（§4.5，PostgreSQL 权威，不可用 503 不退化）：每 IP 前缀 15 分钟 10 次
-    失败 + 24 小时 30 次尝试；每 invite hash 15 分钟 5 次失败短时锁定；IP 桶
-    为辅闸（FRP 可信链未定）。兑换失败文案统一（无枚举信号）；邀请码只放
-    POST body，绝不进 URL query/path。
+    失败 + 24 小时 30 次尝试；IP 桶为辅闸（FRP 可信链未定）。
     """
     mode = _effective_registration_mode()
 
@@ -4678,28 +4682,20 @@ def register():
         # R2（2026-09-19）：/register 深链接 = 渲染介绍主页 + 直开注册弹窗；
         # 邮箱验证链接（/verify-email）、token 校验与过期/重复使用错误仍由
         # 独立页面承担，不为弹窗破坏验证链。
-        if mode == "invite_only":
-            return _register_landing_page(mode="invite_only")
-        if mode == "email_verify_invite_activation":
-            return _register_landing_page(mode="email_verify")
         if mode == "public":
             return _register_landing_page(mode="public")
         return _register_landing_page(mode="closed")
 
     # ---- POST ----
     if mode == "closed":
-        return jsonify(error="当前采用邀请注册，暂未开放自助注册",
+        return jsonify(error="当前未开放自助注册",
                        code="registration_closed"), 403
 
-    # IP 前缀限流（invite_only 与 email_verify 两形态共用 IP 桶；存储不可用
-    # 503 fail-closed，绝不退化进程内计数）
+    # IP 前缀限流（存储不可用 503 fail-closed，绝不退化进程内计数）
     import auth_limit_store
     ip_hash = _ip_prefix_hash(request.remote_addr or "")
-    invite_token = (request.form.get("invite_token") or "").strip()
-    invite_hash = registration_store.invite_token_hash(invite_token) \
-        if invite_token else ""
     try:
-        retry = auth_limit_store.check_registration_locked(ip_hash, invite_hash)
+        retry = auth_limit_store.check_registration_locked(ip_hash, "")
         if retry <= 0:
             # 24 小时尝试桶：成功也计（先记尝试，处理结果不再重复计）
             retry = auth_limit_store.record_registration_attempt(ip_hash)
@@ -4707,144 +4703,18 @@ def register():
         app.logger.exception("注册限流存储不可用，fail-closed 503")
         return _registration_unavailable_response()
     if retry > 0:
-        _retry_mode = ("email_verify"
-                       if mode == "email_verify_invite_activation"
-                       else mode if mode in ("invite_only", "public")
-                       else "invite_only")
         return _register_landing_page(
-            mode=_retry_mode,
+            mode="public",
             error="尝试过于频繁，请稍后再试", error_code="locked",
             retry_after=int(retry), status=429,
             headers={"Retry-After": str(max(1, int(retry)))})
 
-    if mode == "email_verify_invite_activation":
-        return _register_email_verify_post(ip_hash)
-
     if mode == "public":
         return _register_public_post(ip_hash)
 
-    # invite_only：表单校验（本地形状错误，非枚举信号；不回显邀请码）。
-    # login_id 字段为登录账号（docs §8.2：邀请绑定的是「允许兑换的登录
-    # 账号」；批次 C 起表单字段名即 login_id，email 入参已删除）。
-    # P1-3 收口（J：邮箱=唯一用户名）：login_id 必须邮箱形态，规范化值
-    # 贯穿兑换与建号；display_name 输入保留但只是纯展示字段。
-    login_id = (request.form.get("login_id") or "").strip()
-    display_name = (request.form.get("display_name") or "").strip()
-    password = request.form.get("password") or ""
-    confirm = request.form.get("password_confirm") or ""
-    form_error = None
-    if not invite_token:
-        form_error = "请填写邀请码"
-    elif not login_id:
-        form_error = "请填写登录账号"
-    else:
-        try:
-            login_id = registration_store.validate_email(login_id)
-        except registration_store.EmailVerifyError:
-            form_error = "登录账号需为有效的邮箱地址（邮箱即用户名）"
-    if form_error is None and not password.strip():
-        form_error = "密码不能为全空白字符"
-    if form_error is None and len(password) < \
-            registration_store.MIN_PASSWORD_LENGTH:
-        form_error = "密码长度至少 %d 位（推荐使用密码管理器生成的长口令）" \
-            % registration_store.MIN_PASSWORD_LENGTH
-    if form_error is None and password != confirm:
-        form_error = "两次输入的密码不一致"
-    if form_error:
-        return _register_form_error(form_error, "invalid")
-
-    # 原子兑换（docs §4.3）：失败统一文案（无细分状态），计数到限流桶。
-    # 批次 D1 13 / Batch B wave 2（§4.4）：注册兑换**不读取** pt_acq
-    # cookie、Referer 或 UTM——兑换事务与来源上下文彻底解耦（站点统计故障
-    # 绝不能阻断注册）；redeem_invite 的 acq 形参已随 R3 Wave2-Compat 物理删除。
-    try:
-        result = registration_store.redeem_invite(
-            invite_token, login_id, password, display_name or None)
-    except registration_store.InviteRedeemError:
-        try:
-            auth_limit_store.record_registration_failure(ip_hash, invite_hash)
-        except Exception:
-            app.logger.exception("注册失败计数写入异常（不影响统一错误响应）")
-        app.logger.warning(
-            "邀请码兑换失败（invite 状态不外泄，错误统一）")
-        return _register_form_error(
-            "邀请码无效或当前不可用；请核对后重试，或联系管理员",
-            "invite_invalid_or_unavailable", status=403)
-    except Exception:
-        app.logger.exception("邀请码兑换异常（统一错误，不外泄细节）")
-        return _register_form_error(
-            "注册暂不可用，请稍后重试或联系管理员", "unavailable", status=503)
-
-    # 成功：不自动登录——清匿名 session、轮换 CSRF，跳登录页（docs §4.4）
-    session.clear()
-    rotate_csrf_token()
-    _audit("registration.user_created", target_type="user",
-           target_id=result["user"]["user_id"],
-           detail={"invite_id": result["invite_id"],
-                   "ai_access": bool(result["user"].get("ai_access"))})
-    resp = redirect("/login")
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
-
-
-def _register_email_verify_post(ip_hash):
-    """email_verify_invite_activation 的 POST：邮箱验证请求（I 线流程 1；
-    2026-10-08 设计 §3/§6/§11 重写）。
-
-    处理顺序（§11）：CSRF（全局闸）→ 格式校验 → IP 限流（register() 已完成）
-    → 入口解析 → Turnstile → 单事务配额+入队。
-
-    - 只收 email（不填邀请码、不发额度）；
-    - 入口（§6）：生产部署未知 Host 拒绝发信（中性 unavailable + 求助）；
-    - Turnstile（REGISTRATION_TURNSTILE_REQUIRED 时必须通过；校验服务不可
-      用/未配齐 fail-closed 不发信；失败不占邮箱发送额度）；
-    - 状态渲染（§5/§7）：submitted / cooldown（含倒计时）/ limit（含恢复
-      时间）/ processing / challenge_* / unavailable——现有/未知邮箱同一
-      结构，不再统一声称「验证邮件已发送」；
-    - 入队成功后 best-effort 即时排水（worker 循环为权威发送方）。
-    """
-    # P1-2：写前重查（防御层；register() 顶部已查过一次，此处紧贴写路径）
-    if _effective_registration_mode() != \
-            registration_store.MODE_EMAIL_VERIFY_INVITE_ACTIVATION:
-        return _register_landing_page(mode="closed", status=403)
-    mode = "email_verify"
-    # submission_id 重放：先于 Turnstile 回放已记录状态（无入队；§8）
-    replay = _register_replay_response(mode)
-    if replay is not None:
-        return replay
-    email = (request.form.get("email") or "").strip()
-    try:
-        registration_store.validate_email(email)
-    except registration_store.EmailVerifyError:
-        return _register_form_error(
-            "请输入有效的邮箱地址", "invalid", mode=mode)
-    entry = _registration_entry_site()
-    if entry.get("refused"):
-        return _register_entry_refused_state(mode)
-    tstate = _turnstile_guard(registration_antibot.ACTION_REGISTRATION_START)
-    if tstate is not None:
-        return _register_state_response(tstate, mode)
-    unavailable = _register_state("unavailable", help_reason="unavailable")
-    try:
-        result = registration_store.request_verification_email(
-            email,
-            flow=registration_store.MODE_EMAIL_VERIFY_INVITE_ACTIVATION,
-            action="start", entry_origin=entry["origin"],
-            form_locale=(request.form.get("form_locale") or "").strip()
-            or entry["default_locale"],
-            submission_id=_register_form_submission_id())
-    except registration_store.EmailVerifyError as exc:
-        if exc.code == "bad_input":
-            return _register_form_error(
-                "请输入有效的邮箱地址", "invalid", mode=mode)
-        app.logger.warning("邮箱验证请求被统一状态吸收（code=%s）", exc.code)
-        return _register_state_response(unavailable, mode)
-    except Exception:
-        app.logger.exception("邮箱验证入队异常（统一状态）")
-        return _register_state_response(unavailable, mode)
-    _register_drain_async()
-    return _register_state_response(_register_state_from_store(result, mode),
-                                    mode)
+    # 理论不可达（词表只剩 closed/public）；fail-closed 兜底
+    return jsonify(error="当前未开放自助注册",
+                   code="registration_closed"), 403
 
 
 def _register_drain_async():
@@ -5431,18 +5301,18 @@ def _registration_unavailable_response():
 
 
 # =========================================================================== #
-# I+J：邮箱验证 + 邀请码激活路由（设计文档第 8 节 + review J / P2-4）
+# 验证邮件落地与消费（2026-10-08 §4：邀请码激活退役，只剩 public 建号 +
+# 登录惰性激活）
 #
 # 流程红线：
 #   1. GET /verify-email **只展示不消费** token（消费仅 POST
 #      /api/registration/verify）；
-#   2. 密码在邮箱确认之后设置（POST /api/registration/verify 带
-#      token + CSRF + 密码，原子创建 pending_activation 用户）；
-#   3. 身份永远从 session 推导（enrollment scope 的 user_id/email），绝不信
-#      请求体里的身份字段；
-#   4. activate_registered_user 单事务（闸 → 锁 → CAS 消费邀请码 → active →
-#      按面值建一次性总额度 → 审计），绝不走会插入第二个用户的
-#      redeem_invite；already_active 不消费不充值。
+#   2. public token（有 intent）：POST 原子建 active 账号 + 额度 + 协议
+#      凭据（complete_public_registration 单事务）；
+#   3. legacy token（无 intent 的旧 email_verify 链接）：不再建 pending
+#      账号——403 registration_closed 引导重走公开注册（token 不消费）；
+#   4. 存量 pending_activation 用户由 login() 惰性激活
+#      （lazy_activate_pending_user：状态机 + 公开注册同口径额度，幂等）。
 # =========================================================================== #
 def _verify_email_state_view(token):
     """token → 模板视图（只读解析；state + 掩码邮箱，不消费）。"""
@@ -5518,17 +5388,19 @@ def _public_verify_page_context(intent):
 
 @app.route("/api/registration/verify", methods=["POST"])
 def api_registration_verify():
-    """消费验证 token + 设置密码，原子创建 pending_activation 用户（流程 2）。
+    """消费验证 token + 设置密码，public 原子建 active 账号（§4.2）。
 
     - CSRF 走全局 before_request 闸（/api/* 只认 X-CSRF-Token 头）；
-    - body: {token, password, password_confirm?, research_direction?,
-      share_research_data?}；密码策略 15..200；申请字段可选（SER-8：缺
-      research_direction 跳过申请提交；提供了但非法在建号前 400，不废
-      token）；建号成功后 best-effort 提交申请，响应带 application_submitted；
-    - registration_store.verify_email_create_user 单事务：token 一次性消费
-      + 建号（J：login_id=规范化邮箱；与存量 login_id 冲突进待补绑）；
-    - 错误统一 code：invalid_request（形状）/ invalid_or_expired /
-      email_taken（对外统一文案，不区分是已注册还是待激活占用）。
+    - body: {token, password, password_confirm?, research_opt_in?,
+      terms_version?, terms_sha256?, research_version?, research_sha256?}；
+      密码策略 15..200；
+    - 流程由 token 绑定的 intent 决定：public（有 intent）→
+      complete_public_registration 原子建号；legacy（无 intent 的旧
+      email_verify 链接）→ 2026-10-08 §4 起退役，403 registration_closed
+      （token 不消费，引导重新走公开注册）；
+    - 错误统一 code：invalid_request（形状）/ registration_closed /
+      invalid_or_expired / email_taken / registration_daily_limit（429）等
+      （对外统一文案，不区分是已注册还是待激活占用）。
     """
     if request.is_json:
         body = request.get_json(silent=True) or {}
@@ -5551,65 +5423,19 @@ def api_registration_verify():
                      registration_store.MAX_PASSWORD_LENGTH),
             code="invalid_request"), 400
     # P1 public 分流：流程由 token 绑定的 intent 决定（§4.4：intent 固定签
-    # 发时 flow_mode，不把链接在切模式后静默改语义）；无 intent 的旧链接
-    # 走原 email_verify_invite_activation 流程
+    # 发时 flow_mode，不把链接在切模式后静默改语义）。2026-10-08 §4 起
+    # legacy email_verify 流程退役：旧链接（无 intent）不再建 pending 号，
+    # 统一 403 registration_closed 引导重新走公开注册（token 不消费）。
     try:
         _flow = registration_store.verify_token_flow(token)
     except Exception:
         app.logger.exception("验证 token 流程判定失败（按 legacy 处理）")
         _flow = "legacy"
-    if _flow == "public":
-        return _api_registration_verify_public(body, token, password)
-    # SER-8 测试申请（可选字段）：形状**先于** token 消费校验——非法请求
-    # 直接 400，绝不废掉一次性 token。缺 research_direction = 老前端兼容
-    # （跳过申请提交，application_submitted=false，前端兜底引导激活页内
-    # 再申请）；提供了但非法（方向不在四个值内 / share 非 bool）→ 400。
-    application_request = None
-    if body.get("research_direction") is not None:
-        try:
-            application_request = test_application_store.validate(
-                body.get("research_direction"),
-                body.get("share_research_data"))
-        except ValueError as exc:
-            return jsonify(error=str(exc), code="invalid_request"), 400
-    try:
-        result = registration_store.verify_email_create_user(token, password)
-    except registration_store.EmailVerifyError as exc:
-        if exc.code == "bad_input":
-            return jsonify(error="验证信息无效或已过期",
-                           code="invalid_or_expired"), 400
-        if exc.code == "email_taken":
-            return jsonify(error="该邮箱已被占用，请直接登录或联系管理员",
-                           code="email_taken"), 409
-        return jsonify(error="验证链接无效或已过期，请重新请求验证邮件",
-                       code="invalid_or_expired"), 400
-    except Exception:
-        app.logger.exception("邮箱验证建号异常（统一错误）")
-        return jsonify(error="注册暂不可用，请稍后重试",
-                       code="registration_unavailable"), 503
-    session.clear()
-    rotate_csrf_token()
-    _audit("registration.pending_user_created", target_type="user",
-           target_id=result["user"]["user_id"],
-           detail={"email_masked": registration_store.mask_login_id(
-               result["email"]),
-               "pending_bind": bool(result.get("pending_bind"))})
-    # SER-8：建号成功后 best-effort 提交测试申请（submit 自开事务，**非**
-    # 建号同事务——可接受）。失败（如管理员通知邮箱未配置）只记日志，不
-    # 回滚建号：响应 application_submitted=false，前端兜底引导用户在激活
-    # 页（enrollment 会话）内重新提交。重复申请由 submit_tx 幂等吸收。
-    application_submitted = False
-    if application_request is not None:
-        try:
-            application_submitted = bool(test_application_store.submit(
-                result["user"]["user_id"],
-                application_request["research_direction"],
-                application_request["share_research_data"]))
-        except Exception:
-            app.logger.exception("测试申请提交失败（不阻断建号）")
-            application_submitted = False
-    return jsonify(ok=True, next="/login", activation_required=True,
-                   application_submitted=application_submitted)
+    if _flow != "public":
+        return jsonify(
+            error="注册流程已更新，请返回注册页重新开始",
+            code="registration_closed"), 403
+    return _api_registration_verify_public(body, token, password)
 
 
 def _api_registration_verify_public(body, token, password):
@@ -5727,119 +5553,41 @@ def api_registration_public_status():
                    resets_at=status["resets_at"])
     resp.headers["Cache-Control"] = "no-store"
     return resp
-
-
-def _require_enrollment():
-    """enrollment 受限会话守卫（激活面专用）。返回 (enr, None) 或 (None, resp)。
-
-    身份**只**从 session 推导（_enrollment_session_valid 已回查用户仍处于
-    pending_activation 且未禁用）；请求体里的任何身份字段一律忽略。
-    """
-    enr = _enrollment_session_valid()
-    if enr is None:
-        # D2（2026-09-10）：与激活接口其它错误对齐——中文 error + 机器 code；
-        # 禁止把裸机器码放进 error（前端原样渲染成红条）
-        return None, (jsonify(error="登录状态已失效，请重新登录后再试",
-                              code="auth_required"), 401)
-    return enr, None
-
-
 @app.route("/activate", methods=["GET"])
 def activate_page():
-    """激活页（enrollment 受限会话专用；未持会话 302 /login）。"""
-    if AUTH_ENABLED:
-        enr = _enrollment_session_valid()
-        if enr is None:
-            return redirect("/login")
-        email_masked = registration_store.mask_login_id(enr.get("email") or "")
-    else:
-        email_masked = ""
-    resp = Response(render_template(
-        "activate.html", email_masked=email_masked,
-        csrf_token=ensure_csrf_token()), 200)
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
+    """激活页退役（2026-10-08 §4）：邀请码激活下线，302 /login。
+
+    pending_activation 用户在登录成功时惰性激活（login() →
+    registration_store.lazy_activate_pending_user），不再有激活页/激活会话。
+    """
+    return redirect("/login")
 
 
 @app.route("/api/account/enrollment", methods=["GET"])
 def api_account_enrollment():
-    """enrollment 会话状态（激活页数据源）：掩码邮箱 + 状态。"""
+    """enrollment 会话状态端点退役（2026-10-08 §4）。
+
+    登录不再签发受限 enrollment session（pending 用户惰性激活后走正常登录）。
+    对已登录调用方稳定 410 endpoint_retired（匿名经认证闸照常 401），不读
+    session、不回显任何 token。
+    """
     if not AUTH_ENABLED:
-        return jsonify(error="enrollment 需要启用认证"), 400
-    enr, err = _require_enrollment()
-    if err:
-        return err
-    return jsonify(state="pending_activation",
-                   email_masked=registration_store.mask_login_id(
-                       enr.get("email") or ""),
-                   purpose=enr.get("purpose") or "activation")
+        return jsonify(error="该入口已退役", code="endpoint_retired"), 410
+    return jsonify(error="激活流程已退役：账号在登录时自动激活，请直接登录",
+                   code="endpoint_retired"), 410
 
 
 @app.route("/api/account/activate", methods=["POST"])
 def api_account_activate():
-    """邀请码激活（流程 5）：enrollment session + CSRF + 邀请码。
+    """邀请码激活端点退役（2026-10-08 §4）。
 
-    - 身份从 session 推导（_require_enrollment），不信请求身份字段；
-    - registration_store.activate_registered_user 单事务：锁序沿用
-      provisioning 闸 → CAS 消费邀请码 → activation_state=active → pending
-      测试申请收口为 activated_by_invite（R7 2026-09-19，同事务）→ 按邀请
-      面值建一次性总额度 → 审计；**绝不**调用 redeem_invite；
-    - already_active：不消费、不充值 → 409（与管理员审批并发时后到一方的
-      明确幂等/冲突状态）；
-    - 邀请码无效/过期/撤销/已消费 → 403 统一
-      invite_invalid_or_unavailable；
-    - 成功：清 enrollment session，轮换 CSRF，客户端跳 /login 重新登录。
+    对已登录调用方稳定 410 endpoint_retired（匿名经认证闸照常 401），不读
+    请求体、不消费任何邀请码、不回显 token；pending 用户由登录惰性激活。
     """
     if not AUTH_ENABLED:
-        return jsonify(error="激活需要启用认证"), 400
-    enr, err = _require_enrollment()
-    if err:
-        return err
-    # P1-2：提交写前重查生效模式——注册暂停只停激活写路径（统一 403
-    # registration_closed；只暂停：token、pending 用户、审计、队列一律不动）
-    if _effective_registration_mode() != \
-            registration_store.MODE_EMAIL_VERIFY_INVITE_ACTIVATION:
-        return jsonify(
-            error="注册当前未开放，激活暂不可用；请稍后再试或联系管理员",
-            code="registration_closed"), 403
-    body = request.get_json(silent=True) or request.form
-    invite_token = (body.get("invite_code") or body.get("invite_token")
-                    or "").strip()
-    if not invite_token:
-        return jsonify(error="请填写邀请码", code="invalid_request"), 400
-    try:
-        result = registration_store.activate_registered_user(
-            enr["user_id"], invite_token)
-    except registration_store.ActivationError as exc:
-        if exc.code == "already_active":
-            # 不消费、不充值；会话已无激活事项可办
-            session.clear()
-            return jsonify(error="账号已激活，请直接登录",
-                           code="already_active"), 409
-        if exc.code in ("user_disabled", "user_missing", "not_pending"):
-            session.clear()
-            return jsonify(error="账号状态不可激活，请联系管理员",
-                           code="activation_unavailable"), 403
-        return jsonify(error="激活失败，请稍后重试",
-                       code="activation_failed"), 400
-    except registration_store.InviteRedeemError:
-        return jsonify(error="邀请码无效或当前不可用；请核对后重试，或联系管理员",
-                       code="invite_invalid_or_unavailable"), 403
-    except spend_store.ProvisioningMaintenanceError:
-        return jsonify(error="系统维护中（cutover），暂停激活；请稍后重试",
-                       code="ai_dispatch_maintenance"), 503
-    except Exception:
-        app.logger.exception("邀请码激活异常（统一错误）")
-        return jsonify(error="激活暂不可用，请稍后重试",
-                       code="activation_unavailable"), 503
-    session.clear()
-    rotate_csrf_token()
-    _audit("registration.activation_flow_done", target_type="user",
-           target_id=result["user"]["user_id"],
-           detail={"invite_id": result["invite_id"],
-                   "application_closed":
-                       bool(result.get("application_closed"))})
-    return jsonify(ok=True, next="/login")
+        return jsonify(error="该入口已退役", code="endpoint_retired"), 410
+    return jsonify(error="激活流程已退役：账号在登录时自动激活，请直接登录",
+                   code="endpoint_retired"), 410
 
 
 # =========================================================================== #
@@ -6493,75 +6241,15 @@ def api_research_viewer_events():
 
 @app.route("/api/registration/resend", methods=["POST"])
 def api_registration_resend():
-    """验证邮件重发（受限）：与 start 同事务入队 + 同配额 + 同一文案。
+    """退役（2026-10-08 §4）：旧 email_verify 形态的 JSON 重发接口下线。
 
-    匿名可调（enrollment 白名单同样放行——pending 用户换邮箱重新走验证属
-    新请求）。body: {email}；对未知/已存在/超限邮箱一律同一响应（反枚举）。
-    P1-2：入队写前重查生效模式——注册暂停时统一 403 registration_closed
-    （只暂停：不写队列、不发邮件、不动已有 token）。
-    IP 前缀限流（review 2026-09-14 附带观察加固）：本端点对任意邮箱统一
-    ok，若无 IP 维度闸，单一来源即可用数十个不同邮箱把应用级日预算
-    （VERIFY_APP_DAILY_BUDGET）耗尽，当天所有真实注册静默收不到验证邮件。
-    与 POST /register 共用同一 reg_ip_daily 桶（24 小时 30 次尝试，成功也
-    计——两入口都是「触发一封验证邮件」的同一动作面）；锁定时同样统一
-    ok 响应（IP 维度信息不构成邮箱枚举信号），仅不再入队。
+    该端点只服务于 email_verify_invite_activation 模式（已从词表移除，
+    永远 403）；public 流程的主动重发是 POST /register/resend（表单 +
+    Turnstile + submission_id 幂等，见 register_resend）。对任何已登录/
+    匿名调用方稳定 410 endpoint_retired，不写队列、不动任何 token。
     """
-    # P1-2：写前重查生效模式（与 activate/verify-start 共用同一权威判定）
-    if _effective_registration_mode() != \
-            registration_store.MODE_EMAIL_VERIFY_INVITE_ACTIVATION:
-        return jsonify(error="注册当前未开放，请稍后再试",
-                       code="registration_closed"), 403
-    # IP 前缀限流（与 register POST 同款原语；存储不可用 fail-closed 503）
-    import auth_limit_store
-    ip_hash = _ip_prefix_hash(request.remote_addr or "")
-    try:
-        retry = auth_limit_store.check_registration_locked(ip_hash)
-        if retry <= 0:
-            retry = auth_limit_store.record_registration_attempt(ip_hash)
-    except Exception:
-        app.logger.exception("重发限流存储不可用，fail-closed 503")
-        return _registration_unavailable_response()
-    if retry > 0:
-        app.logger.warning(
-            "验证邮件重发被 IP 限流吸收（锁定剩余 %d 秒，不入队）", retry)
-        return jsonify(ok=True)
-    # 2026-10-08 设计 §7/§11：本端点可触发新验证邮件投递——
-    # REGISTRATION_TURNSTILE_REQUIRED 时必须通过校验（JSON body 的
-    # cf-turnstile-response 同样接受）；失败/不可用 fail-closed 不入队，
-    # 响应仍统一 ok（无枚举信号）
-    if _turnstile_guard(registration_antibot.ACTION_REGISTRATION_RESEND) \
-            is not None:
-        app.logger.warning("验证邮件重发被 Turnstile 拦截（不入队）")
-        return jsonify(ok=True)
-    if request.is_json:
-        body = request.get_json(silent=True) or {}
-    else:
-        body = request.form
-    email = (body.get("email") or "").strip()
-    # §6：生产部署未知 Host 不发验证邮件（中性 ok，无枚举信号）
-    if _registration_entry_site().get("refused"):
-        app.logger.warning(
-            "验证邮件重发被入口映射拒绝（host=%s，不入队）",
-            registration_antibot.request_hostname(request.host) or "-")
-        return jsonify(ok=True)
-    try:
-        registration_store.enqueue_email_verification(
-            email, base_url=_registration_email_base_url(),
-            form_locale=(body.get("form_locale") or "zh"))
-    except registration_store.EmailVerifyError as exc:
-        if exc.code == "bad_input":
-            return jsonify(error="请输入有效的邮箱地址",
-                           code="invalid_request"), 400
-        app.logger.warning("验证邮件重发被统一文案吸收（code=%s）", exc.code)
-    except Exception:
-        app.logger.exception("验证邮件重发入队异常（统一文案）")
-    else:
-        try:
-            registration_mail_worker.drain_async()
-        except Exception:
-            app.logger.warning("重发邮件即时排水启动失败（留待 worker）",
-                               exc_info=True)
-    return jsonify(ok=True)
+    return jsonify(error="该注册重发入口已退役：请返回注册页重新开始",
+                   code="endpoint_retired"), 410
 
 
 # =========================================================================== #
@@ -8449,75 +8137,17 @@ _check_registration_preconditions_or_warn()
 
 
 
-# =========================================================================== #
-# P0-B 邀请注册管理（docs §4.6 / §4.2 / §3.7）
-#
-# 全部 owner-only + Cookie session + 统一 CSRF（before_request）；PG-only
-# （旧 json/dual 503 pg_backend_required 门已随 R3 Wave3 退役）。安全要点：
-#   - 创建接口**仅首次响应**返回明文邀请码，且 Cache-Control: no-store；
-#   - 列表/审计/日志永不返回 token / token_hash；owner 列表只显示邮箱掩码、
-#     过期时间与状态；
-#   - owner 创建邀请码受每分钟/每日上限（auth_limit_store，PG 权威）；
-#   - invited 用户 ai_access 由邀请码模板决定（默认 false），owner 可显式授予。
-# =========================================================================== #
-#: 邀请码 TTL 默认 7 天、上限 30 天（docs §4.2）
-_INVITE_DEFAULT_TTL_HOURS = 168
-_INVITE_MAX_TTL_HOURS = 720
-
-
-def _registration_invite_owner_hash():
-    """owner 主体限流 hash（创建频率；不存明文 user_id）。"""
-    uid = current_identity().get("user_id") or "owner"
-    return hmac.new(
-        ("regowner:" + _auth_hash_salt()).encode("utf-8"),
-        uid.encode("utf-8"), hashlib.sha256).hexdigest()
-
-
-#: 批次 D1（§4.4）：邀请不再携带来源——owner API 视图删除的退役键
-#:（列保留只读历史行；新邀请行三列为空/NULL，见 registration_store。
-#: 旧 monthly_limit_nano_cny 键已随 R3 Wave2-Compat 从 SELECT 一并移除）
-_INVITE_RETIRED_VIEW_FIELDS = ("cohort", "source_code", "campaign_id")
-
-
-def _invite_public_view(invite: dict) -> dict:
-    """邀请行 → owner API 视图（绑定身份 + 掩码 + 状态；绝不含 token/hash）。
-
-    批次 C（docs §4.2/§8.2）：邀请绑定字段语义为「允许兑换的登录账号
-    （login_id）」。视图输出 ``login_id_masked``（掩码口径不变）与
-    ``bound_identity``（展示 J：owner 管理台主列 = 完整绑定值——owner-only
-    可信面，user_id 本就全量可见；公开面仍只出掩码）。
-
-    批次 D1（§4.4）/ Batch B wave 2：视图删除 source_code/campaign_id/cohort
-    回显（邀请只负责注册，不携带来源）；初始金额字段改用
-    ``total_limit_nano_cny``（monthly_limit_nano_cny 旧键已随 R3 Wave2-Compat
-    从视图与 store SELECT 一并移除）。
-    """
-    now = time.time()
-    out = dict(invite)
-    out.pop("token_hash", None)
-    out.pop("token", None)
-    bound = out.pop("login_id_normalized", None)
-    out["login_id_masked"] = registration_store.mask_login_id(bound)
-    out["bound_identity"] = bound or None
-    for key in _INVITE_RETIRED_VIEW_FIELDS:
-        out.pop(key, None)
-    if out.get("revoked_at") is not None:
-        out["status"] = "revoked"
-    elif out.get("consumed_at") is not None:
-        out["status"] = "consumed"
-    elif out.get("expires_at") is not None and out["expires_at"] <= now:
-        out["status"] = "expired"
-    else:
-        out["status"] = "open"
-    return out
-
-
 # --------------------------------------------------------------------------- #
 # 注册模式设置 service（批次 D §5.3：权威实现只此一份，旧路由与 Admin API v1
 # 共同调用，不复制校验逻辑）。
 # --------------------------------------------------------------------------- #
 def _registration_settings_payload() -> dict:
-    """注册模式 GET 权威 payload（存储值 × 前置条件闸 + 支持的模式词表）。"""
+    """注册模式 GET 权威 payload（存储值 × 前置条件闸 + 支持的模式词表）。
+
+    2026-10-08 §4：词表只剩 closed/public（旧存储值 invite_only /
+    email_verify_invite_activation 由 settings_store 读取按非法值 fail-closed
+    处理为 closed）。
+    """
     stored = _registration_mode_stored()
     failures = []
     if stored in _REGISTRATION_GATED_MODES:
@@ -8528,8 +8158,7 @@ def _registration_settings_payload() -> dict:
     return {
         "mode": effective,
         "stored_mode": stored,
-        "supported_modes": ["closed", "invite_only",
-                            "email_verify_invite_activation", "public"],
+        "supported_modes": ["closed", "public"],
         "precondition_failures": failures,
         "registration_open": effective in _REGISTRATION_GATED_MODES,
         "backend": platform_features.current_backend(),
@@ -8546,12 +8175,11 @@ def _set_registration_mode_service(mode, actor_user_id):
     P1 起接受 public：env 前置（TLS/Secure Cookie/邮件通道/载荷密钥/哈希
     盐/管理员通知邮箱）+ 双协议文稿发布检查，未满足 400
     registration_preconditions_failed（缺项文案不含凭据）。
+    2026-10-08 §4：只接受 closed/public（邀请码形态退役）。
     """
-    if mode not in ("closed", "invite_only",
-                    "email_verify_invite_activation", "public"):
+    if mode not in ("closed", "public"):
         return None, (400, "invalid_request",
-                      "mode 需为 closed / invite_only / "
-                      "email_verify_invite_activation / public")
+                      "mode 需为 closed / public")
     if mode in _REGISTRATION_GATED_MODES:
         failures = _registration_precondition_failures(mode=mode)
         if mode == registration_store.MODE_PUBLIC and not failures:
@@ -9383,13 +9011,20 @@ def admin_v1_overview():
 
 @app.route("/api/admin/v1/users", methods=["GET"])
 def admin_v1_users():
-    """用户列表（§10.2 只读）：cursor(offset) 分页 + 搜索 + enabled/ai_access 筛选。
+    """用户列表（§10.2 只读）：cursor(offset) 分页 + 搜索 + enabled/ai_access
+    筛选 + kind/sort 参数（2026-10-08 §2）。
 
     每行：display name、login ID 掩码、role、enabled、ai_access、创建时间、
-    注册方式、金额余额/caps（未开户 null；json 后端 null）、最近 AI 调用
-    时间（json 后端 null）。turn 使用/上限字段已随批次 F turn 消费闸退役
-    删除；campaign/source 用户级归因已随批次 D1（§4.4）整键删除（用户列表
-    不再查询/返回任何来源字段）。
+    注册方式、``account_kind``（real|dogfood）、``last_login_at``（格式与
+    created_at 相同的 epoch 秒；未登录过 null）、金额余额/caps（未开户
+    null；json 后端 null）、最近 AI 调用时间（json 后端 null）。
+
+    - ``kind=real|dogfood|all``（默认 real）：按 users.account_kind 筛选
+      （all = 不筛选）；
+    - ``sort=joined_desc|joined_asc|last_login_desc``（默认 joined_desc）：
+      **分页前**对全量完成排序，user_id 作稳定次键；``last_login_desc`` 下
+      ``last_login_at IS NULL`` 恒排末尾（同样按 user_id 稳定）。前端切换
+      筛选/排序时清空 cursor（offset 分页在全量排序后切片，语义稳定）。
 
     spend 字段（Batch B wave 2，§Batch B API/bridge 契约）：按角色 + target
     返回**互斥**形态原样透传——role=user 且 target=total_allowance →
@@ -9409,10 +9044,33 @@ def admin_v1_users():
     search = (request.args.get("q") or "").strip().lower() or None
     enabled_f = _admin_v1_flag_arg("enabled")
     ai_f = _admin_v1_flag_arg("ai_access")
+    kind = (request.args.get("kind") or "real").strip() or "real"
+    if kind not in ("real", "dogfood", "all"):
+        return _admin_v1_error(
+            400, "invalid_request", "kind 需为 real / dogfood / all")
+    sort = (request.args.get("sort") or "joined_desc").strip() or "joined_desc"
+    if sort not in ("joined_desc", "joined_asc", "last_login_desc"):
+        return _admin_v1_error(
+            400, "invalid_request",
+            "sort 需为 joined_desc / joined_asc / last_login_desc")
 
     users = user_store.list_users()
-    users.sort(key=lambda u: (float(u.get("created_at") or 0.0),
-                              str(u.get("user_id") or "")))
+    if kind != "all":
+        users = [u for u in users
+                 if (u.get("account_kind") or "real") == kind]
+    # 排序在分页前对全量完成（§2：用户量小，内存排序 + offset 分页）；
+    # user_id 稳定次键；last_login_at IS NULL 恒排末尾。
+    if sort == "joined_asc":
+        users.sort(key=lambda u: (float(u.get("created_at") or 0.0),
+                                  str(u.get("user_id") or "")))
+    elif sort == "last_login_desc":
+        users.sort(key=lambda u: (
+            u.get("last_login_at") is None,
+            -(float(u.get("last_login_at") or 0.0)),
+            str(u.get("user_id") or "")))
+    else:
+        users.sort(key=lambda u: (-float(u.get("created_at") or 0.0),
+                                  str(u.get("user_id") or "")))
     if search:
         # 展示 J：搜索支持精确/模糊邮箱——q 含 @ 时按规范化邮箱精确匹配
         # 命中，否则对 login_id/email/display_name 做子串（模糊）匹配
@@ -9481,6 +9139,10 @@ def admin_v1_users():
             "enabled": not bool(u.get("disabled")),
             "ai_access": bool(u.get("ai_access")),
             "created_at": u.get("created_at"),
+            # 2026-10-08 §2：分类 + 最近登录（格式与 created_at 相同；
+            # 未登录过 null——「暂无记录」）
+            "account_kind": u.get("account_kind") or "real",
+            "last_login_at": u.get("last_login_at"),
             "registration_method": reg_methods.get(uid, "manual"),
             # 批次 D1（§4.4）：campaign/source 用户级归因字段整键删除
             #（历史数据仍冻结在 user_acquisition 表，仅审计工具可达）
@@ -9914,6 +9576,39 @@ def admin_v1_users_ai_access(user_id):
     return jsonify(user=_admin_v1_user_out(user))
 
 
+@app.route("/api/admin/v1/users/<user_id>/account-kind", methods=["POST"])
+def admin_v1_users_account_kind(user_id):
+    """设置账号分类（2026-10-08 §2；body {account_kind: "real"|"dogfood"}）。
+
+    - 与 enable/ai-access 同组语义：owner 权限（_require_owner_admin_v1，
+      预览态拒绝）+ 全局 CSRF（before_request）；
+    - 值未变 → 不写审计（返回当前值）；变化 → 审计
+      ``admin.user.account_kind``，detail 记录前后值；
+    - 不改 session、额度、角色、启用状态（auth_version 不推进——分类是纯
+      管理标注，不影响任何凭据语义）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    body = request.get_json(silent=True) or {}
+    kind = body.get("account_kind")
+    if kind not in user_store.ACCOUNT_KINDS:
+        return _admin_v1_error(
+            400, "invalid_request",
+            "account_kind 需为 %s" % (user_store.ACCOUNT_KINDS,))
+    try:
+        after, changed, before = user_store.set_user_account_kind(user_id, kind)
+    except ValueError as exc:
+        return _admin_v1_error(400, "invalid_request", str(exc))
+    if after is None:
+        return _admin_v1_error(404, "user_not_found", "用户不存在")
+    if changed:
+        _audit("admin.user.account_kind", target_type="user",
+               target_id=user_id,
+               detail={"from": before, "to": after})
+    return jsonify(user_id=user_id, account_kind=after, changed=bool(changed))
+
+
 @app.route("/api/admin/v1/users/<user_id>/password-reset", methods=["POST"])
 def admin_v1_users_password_reset(user_id):
     """重置普通用户密码（镜像旧 3877：owner → 409；hash 与 auth_version+1 同事务）。"""
@@ -9983,152 +9678,24 @@ def admin_v1_users_discard_pending(user_id):
 
 @app.route("/api/admin/v1/invites", methods=["GET"])
 def admin_v1_invites_list():
-    """邀请列表（cursor offset 分页 + 掩码视图；token/hash 永不返回）。"""
-    auth = _require_owner_admin_v1()
-    if auth:
-        return auth
-    limit = _admin_v1_limit_arg()
-    cur = _admin_v1_decode_cursor(request.args.get("cursor"))
-    offset = int(cur.get("o") or 0) if cur else 0
-    if offset < 0:
-        offset = 0
-    try:
-        # list_invites 只有 limit 参数（内部上限 1000）：offset 分页按
-        # 「取 offset+limit+1 再切片」实现，邀请规模远小于上限，足够
-        invites = registration_store.list_invites(
-            limit=min(offset + limit + 1, 1000))
-    except Exception:
-        app.logger.exception("admin v1 invites 读取失败")
-        return _admin_v1_error(500, "internal", "邀请列表读取失败")
-    page = invites[offset:offset + limit]
-    has_more = len(invites) > offset + limit
-    next_cursor = None
-    if has_more:
-        next_cursor = _admin_v1_encode_cursor({"o": offset + limit})
-    # 金额字段（total_limit_nano_cny，Batch B wave 2）十进制字符串化（§5 v0.3）
-    return jsonify(invites=[_admin_v1_nano_out(_invite_public_view(i))
-                            for i in page],
-                   next_cursor=next_cursor, limit=limit)
+    """邀请列表退役（2026-10-08 §4）：邀请码注册下线。
+
+    对任何已登录调用方稳定 410 endpoint_retired（匿名经认证闸 401），
+    不读 registration_invites、不返回任何历史 token/hash。
+    """
+    return _admin_v1_retired("邀请码管理（注册只剩 closed/public）")
 
 
 @app.route("/api/admin/v1/invites", methods=["POST"])
 def admin_v1_invites_create():
-    """创建一次性邀请码（owner；限流 + 字段校验）。
-
-    明文 code 仅本响应返回一次（no-store）。Batch B wave 2（§Batch B 数据
-    模型 6 / §Batch D1 13）：可选 ``total_limit_nano_cny``（十进制字符串
-    nano-CNY | null=不建额度行，兑换用户由 cutover/默认处理）——兑换事务内
-    为新用户建一次性总额度（registration_store，source="invite"；不再建
-    user_override）。旧 ``monthly_limit_nano_cny`` 已随 R3 Wave2-Compat 退役：
-    body 带该键一律 400 retired_spend_field（绝不静默忽略）。
-    邀请不再携带来源：``source_code``/``campaign_id``/``cohort`` 出现在
-    body 一律 400 retired_invite_field（D1 13；§4.4）。
-    """
-    auth = _require_owner_admin_v1()
-    if auth:
-        return auth
-    import auth_limit_store
-    owner_hash = _registration_invite_owner_hash()
-    try:
-        retry = auth_limit_store.check_owner_invite_creation_locked(owner_hash)
-    except Exception:
-        app.logger.exception("邀请码创建限流存储不可用，fail-closed 503")
-        return _admin_v1_error(500, "internal", "邀请码创建拒绝")
-    if retry > 0:
-        return (jsonify(error={"code": "rate_limited",
-                               "message": "邀请码创建过于频繁，请稍后再试",
-                               "retry_after_seconds": max(1, int(retry))}),
-                429, {"Retry-After": str(max(1, int(retry)))})
-
-    body = request.get_json(silent=True) or {}
-    # 绑定登录账号只接受 login_id（批次 C 删除 email 兼容入参；旧端点删除时
-    # 本校验随 R3 wave1 迁入）：email 键仍出现说明是旧客户端——显式 400，
-    # 绝不静默降级为不绑定邀请（高风险形态）。
-    if "email" in body:
-        return _admin_v1_error(
-            400, "invalid_request",
-            "email 入参已随批次 C 移除，绑定登录账号请改用 login_id")
-    # 批次 D1 13（§4.4）：来源字段退役——接受即 400（不再静默忽略，
-    # 防止旧调用方误以为来源仍被记录）
-    retired = [k for k in ("source_code", "campaign_id", "cohort")
-               if body.get(k) is not None]
-    if retired:
-        return _admin_v1_error(
-            400, "retired_invite_field",
-            "邀请不再携带来源字段：%s（§4.4 邀请与来源解耦）"
-            % ", ".join(sorted(retired)))
-    if body.get("monthly_limit_nano_cny") is not None:
-        return _admin_v1_error(
-            400, "retired_spend_field",
-            "monthly_limit_nano_cny 已退役（R3 单轨为一次性总额度）："
-            "请改用 total_limit_nano_cny")
-    login_id = body.get("login_id")
-    if login_id is not None:
-        login_id = str(login_id).strip()
-        if not login_id:
-            return _admin_v1_error(
-                400, "invalid_request", "绑定登录账号传空字符串请改传 null（不绑定）")
-        if len(login_id) > 120:
-            return _admin_v1_error(400, "invalid_request",
-                                   "绑定登录账号过长（≤120 字符）")
-        if any(ch.isspace() for ch in login_id):
-            return _admin_v1_error(400, "invalid_request",
-                                   "绑定登录账号不能包含空白字符")
-    try:
-        ttl_hours = int(body.get("ttl_hours") or _INVITE_DEFAULT_TTL_HOURS)
-    except (TypeError, ValueError):
-        return _admin_v1_error(400, "invalid_request", "ttl_hours 需为整数小时")
-    if not 1 <= ttl_hours <= _INVITE_MAX_TTL_HOURS:
-        return _admin_v1_error(400, "invalid_request",
-                               "ttl_hours 需在 1–%d 之间" % _INVITE_MAX_TTL_HOURS)
-    ai_access = body.get("ai_access")
-    if ai_access is not None and not isinstance(ai_access, bool):
-        return _admin_v1_error(400, "invalid_request", "ai_access 需为布尔值")
-    note = body.get("note")
-    if note is not None and (not isinstance(note, str) or len(note) > 200):
-        return _admin_v1_error(400, "invalid_request",
-                               "note 需为 ≤200 字符的字符串")
-    # Batch B wave 2：初始**总额度**模板（十进制字符串 nano-CNY | null=不建行）
-    try:
-        total_limit = _admin_v1_amount_in(
-            body.get("total_limit_nano_cny"), "total_limit_nano_cny")
-    except ValueError as exc:
-        return _admin_v1_error(400, "invalid_request", str(exc))
-
-    try:
-        auth_limit_store.record_owner_invite_creation(owner_hash)
-        invite = registration_store.create_invite(
-            current_identity().get("user_id"), login_id=login_id,
-            ttl_seconds=ttl_hours * 3600,
-            ai_access=bool(ai_access),
-            note=note or "",
-            total_limit_nano_cny=total_limit)
-    except ValueError as exc:
-        return _admin_v1_error(400, "invalid_request", str(exc))
-    except registration_store.RegistrationStoreError as exc:
-        return _admin_v1_error(500, "internal", str(exc))
-    out = _admin_v1_nano_out(_invite_public_view(invite))
-    out["token"] = invite["token"]  # 明文码仅此一次
-    resp = jsonify(invite=out)
-    resp.headers["Cache-Control"] = "no-store"
-    resp.headers["Pragma"] = "no-cache"
-    return resp
+    """创建邀请码退役（2026-10-08 §4）：不再产生任何邀请码。"""
+    return _admin_v1_retired("邀请码创建（注册只剩 closed/public）")
 
 
 @app.route("/api/admin/v1/invites/<invite_id>/revoke", methods=["POST"])
 def admin_v1_invites_revoke(invite_id):
-    """撤销邀请（镜像旧 4142：幂等；已消费拒绝撤销）。"""
-    auth = _require_owner_admin_v1()
-    if auth:
-        return auth
-    try:
-        invite = registration_store.revoke_invite(
-            invite_id, current_identity().get("user_id"))
-    except registration_store.InviteNotFoundError:
-        return _admin_v1_error(404, "invite_not_found", "邀请码不存在")
-    except registration_store.RegistrationStoreError as exc:
-        return _admin_v1_error(409, "invite_not_revocable", str(exc))
-    return jsonify(invite=_admin_v1_nano_out(_invite_public_view(invite)))
+    """撤销邀请退役（2026-10-08 §4）；不回显 invite_id/token。"""
+    return _admin_v1_retired("邀请码撤销（注册只剩 closed/public）")
 
 
 # --------------------------------------------------------------------------- #
@@ -11166,19 +10733,28 @@ def admin_v1_slides_inventory():
     的支持格式文件清单，仅名称+大小，**不做任何隐式认领/建行**）。每行：
     name、size_bytes、owner_user_id、owner 展示名/掩码 login_id（无归属
     null）、public、alias、note、archived（归档项目只读保护）、
-    granted_to_owner（是否已显式授权给当前 actor-owner）、granted_at，
-    另加 slide_id / asset_state / storage_layout / file_exists /
-    original_filename / display_name / format_ext；asset_state=failed 的行
-    附 ``failure``（失败证据溯源：code / inferred / source / source_state /
-    source_ref / occurred_at——只读任务表机器码，详见
-    _admin_v1_slide_failure_provenance）。
-    按 name 升序 cursor/limit 分页（管理列表禁全量返回的既有口径）。
+    ``created_at``（首次登记时间 = slides.created_at）、
+    ``temporary_view``（管理员临时查看状态，见下），另加 slide_id /
+    asset_state / storage_layout / file_exists / original_filename /
+    display_name / format_ext；asset_state=failed 的行附 ``failure``（失败
+    证据溯源：code / inferred / source / source_state / source_ref /
+    occurred_at——只读任务表机器码，详见 _admin_v1_slide_failure_provenance）。
+    顶层附 ``server_now``（epoch 秒；前端倒计时/剩余分钟以它为基准）。
 
-    兼容过渡：盘上无 slides 行的支持格式文件同时以「未注册」形态并入 items
-    （owner_user_id/public/granted 等按空值呈现、asset_state=None、
-    unregistered=True），维持管理台「磁盘上看得见的文件都在清单里」的既有
-    口径（test_admin_inventory_lists_all_and_marks_grants 冻结）；其权威
-    报告面是 orphan_files，P2 收口后 items 仅含 DB 行。
+    排序（2026-10-08 §3.1）：已登记切片按 ``slides.created_at`` 新→旧
+    （``slide_id`` 稳定次键）cursor/limit 分页（管理列表禁全量返回的既有
+    口径）；未注册文件接在其后（组内按名升序，维持既有独立口径，不并入
+    正常行序）。
+
+    temporary_view（actor = 当前登录 owner）：
+      - ``own``：切片属于 actor 本人（查看不需要授权）；
+      - ``unavailable``：不可读（非 ready / 非 id_bundle / 文件缺失——
+        原因见 asset_state/file_exists 等既有字段；未注册行同此档）；
+      - ``active``：actor 有未到期授权（附 granted_at/expires_at）；
+      - ``ended``：授权行存在但已到期（附历史 expires_at）；
+      - ``none``：无任何授权行。
+    旧 granted_to_owner/granted_at/grant_recorded 字段已随永久授权端点退役
+    删除（§3.1）。
     """
     auth = _require_owner_admin_v1()
     if auth:
@@ -11190,17 +10766,30 @@ def admin_v1_slides_inventory():
         offset = 0
 
     # 1) DB 资产行（含非 ready）——权威清单（alias 取自既有 meta 投影）
-    rows = []
     try:
         descs = slide_store.list_all_descriptors()
         alias_all = share_store.get_all_slide_meta_full()
     except Exception:
         app.logger.exception("admin v1 slides inventory 资产行读取失败")
         return _admin_v1_error(500, "internal", "切片清单读取失败")
+    # 首次登记时间（slides.created_at，epoch 秒；inventory 排序键）
+    created_by_sid = {}
+    try:
+        conn = pg_store.connect()
+        try:
+            with conn.cursor() as q:
+                q.execute("SELECT slide_id, extract(epoch from created_at)::"
+                          "float8 AS created_at FROM slides")
+                created_by_sid = {r[0]: float(r[1]) for r in q.fetchall()}
+        finally:
+            conn.close()
+    except Exception:
+        app.logger.exception("admin v1 slides inventory created_at 读取失败")
+        return _admin_v1_error(500, "internal", "切片清单读取失败")
     by_name = {}
     for desc in descs:
         # 行键：冻结 legacy 名（旧资产）或 slide_id（新资产无唯一名——原始
-        # 文件名可重复）；visibility 端点两种寻址都接受
+        # 文件名可重复）；temporary-view 端点按 slide_id 寻址
         name = desc.legacy_filename or desc.slide_id
         file_exists, size = _admin_v1_entry_stat(desc)
         by_name[name] = {
@@ -11218,6 +10807,7 @@ def admin_v1_slides_inventory():
             "file_exists": file_exists,
             "size_bytes": size,
             "servable": _admin_v1_desc_servable(desc),
+            "created_at": created_by_sid.get(desc.slide_id),
         }
 
     # 2) 目录扫描——仅产出 orphan_files（无 slides 行的文件；只报告不认领），
@@ -11250,6 +10840,8 @@ def admin_v1_slides_inventory():
             "file_exists": True,
             "size_bytes": size,
             "unregistered": True,
+            "servable": False,
+            "created_at": None,
         }
     orphan_files.sort(key=lambda f: f["name"])
 
@@ -11258,19 +10850,25 @@ def admin_v1_slides_inventory():
                    if m.get("asset_state") == "failed" and m.get("slide_id")}
     failures = _admin_v1_slide_failure_provenance(failed_meta)
 
-    names = sorted(by_name)
+    # 排序（§3.1）：已登记 created_at 新→旧（slide_id 次键）；未登记接后
+    registered = [n for n, m in by_name.items() if not m.get("unregistered")]
+    unregistered = [n for n, m in by_name.items() if m.get("unregistered")]
+    registered.sort(key=lambda n: (
+        -(by_name[n].get("created_at") or 0.0), by_name[n].get("slide_id") or n))
+    unregistered.sort()
+    names = registered + unregistered
 
     archived = _archived_slide_names()
     owner_uid = _admin_v1_owner_uid()
-    # included 与实际收录同口径：授权行绑定的 slide_id 等于该资产当前 ID，
-    # 且资产可服务（ready + id_bundle + 入口在盘）——可见集只认这一形态
-    # （slide_store.visible_ready_slide_ids）。授权行在、资产不可服务时
-    # granted_to_owner=false、grant_recorded=true（不把无效授权报成已加入）。
+    # actor 的授权行（含已到期——ended 档要展示）；同一 slide_id 取最晚到期
     grants_by_sid = {}
     try:
         for g in share_store.list_slide_view_grants():
             if owner_uid and g.get("user_id") == owner_uid and g.get("slide_id"):
-                grants_by_sid.setdefault(g["slide_id"], g)
+                prev = grants_by_sid.get(g["slide_id"])
+                if prev is None or (g.get("expires_at") or 0) > \
+                        (prev.get("expires_at") or 0):
+                    grants_by_sid[g["slide_id"]] = g
     except Exception:
         app.logger.exception("admin v1 slides inventory 授权标注读取失败")
         return _admin_v1_error(500, "internal", "切片清单读取失败")
@@ -11290,6 +10888,7 @@ def admin_v1_slides_inventory():
     has_more = len(page) > limit
     page = page[:limit]
 
+    now = time.time()
     items = []
     for name in page:
         meta = by_name[name]
@@ -11300,7 +10899,20 @@ def admin_v1_slides_inventory():
                        if owner_user else "")
         grant = grants_by_sid.get(meta.get("slide_id")) \
             if meta.get("slide_id") else None
-        included = bool(grant) and bool(meta.get("servable"))
+        # temporary_view 状态机（§3.1/§3.4）：own > unavailable > active/ended/none
+        if not meta.get("servable"):
+            tv_status, tv_granted, tv_expires = "unavailable", None, None
+        elif owner_uid and slide_owner == owner_uid:
+            tv_status, tv_granted, tv_expires = "own", None, None
+        elif grant is not None and (grant.get("expires_at") or 0) > now:
+            tv_status = "active"
+            tv_granted = grant.get("granted_at")
+            tv_expires = grant.get("expires_at")
+        elif grant is not None:
+            tv_status, tv_granted, tv_expires = "ended", None, \
+                grant.get("expires_at")
+        else:
+            tv_status, tv_granted, tv_expires = "none", None, None
         item = {
             "name": name,
             "size_bytes": meta.get("size_bytes") or 0,
@@ -11318,10 +10930,13 @@ def admin_v1_slides_inventory():
             "alias": meta.get("alias", ""),
             "note": meta.get("note", ""),
             "archived": name in archived,
-            "granted_to_owner": included,
-            "granted_at": grant.get("granted_at") if included else None,
-            "grant_recorded": bool(grant),
-            # P1-B2 新字段（旧字段原样保留）
+            "created_at": meta.get("created_at"),
+            "temporary_view": {
+                "status": tv_status,
+                "granted_at": tv_granted,
+                "expires_at": tv_expires,
+            },
+            # P1-B2 字段
             "slide_id": meta.get("slide_id"),
             "asset_state": meta.get("asset_state"),
             "storage_layout": meta.get("storage_layout"),
@@ -11347,7 +10962,8 @@ def admin_v1_slides_inventory():
     return jsonify(items=items, next_cursor=next_cursor, limit=limit,
                    owner_user_id=owner_uid, orphan_files=orphan_files,
                    orphan_objects=orphan_objects,
-                   staging_residue=staging_residue)
+                   staging_residue=staging_residue,
+                   server_now=now)
 
 
 #: .staging/ 任务键的四个键空间（P5 合同 §1.5「任务键可判」）：
@@ -11558,83 +11174,143 @@ def admin_v1_staging_residue_cleanup():
 
 @app.route("/api/admin/v1/slides/<path:name>/visibility", methods=["POST"])
 def admin_v1_slide_visibility(name):
-    """给 owner 建立/收回某切片的 view 授权（幂等）。body: {granted: bool}。
+    """退役（2026-10-08 §3.1）：永久自授权端点下线，改走 temporary-view。
 
-    - 寻址：slide_id 或冻结 legacy 名（清单 items[].name 原样回传即可）；
-      无 slides 行的盘上文件不建行、不授权（404）。
-    - granted=true：资产须可服务（ready + id_bundle + 入口在盘），否则 409
-      slide_not_servable——授权不会生效时不报成功（未迁移的旧布局、已删除）。
-      已存在则幂等成功（audit 标 already_granted）。
-    - granted=false：按 slide_id 收回（无授权亦幂等成功，audit 标 existed），
-      不要求可服务。
-    - 授权对象是当前 actor-owner（自授权；本地免认证开发态 owner 无稳定
-      user_id → 400 owner_uid_missing，可见集为空属预期形态）。
-    - audit：admin.slide_visibility.grant / revoke（best-effort，业务写后）。
+    对任何**已登录**调用方稳定 410 endpoint_retired，不再建立任何授权。
+    管理员查看走 POST/DELETE /api/admin/v1/slides/<slide_id>/temporary-view
+    （1 小时临时查看，可提前结束）。
+    """
+    return _admin_v1_retired("切片永久授权入口（请改用临时查看）")
+
+
+#: 管理员临时查看时长（2026-10-08 §3.1：常量，不接受时长参数）
+TEMPORARY_VIEW_SECONDS = 3600
+
+
+def _admin_v1_temporary_view_not_servable_error(desc):
+    """不可服务 → 409 slide_not_servable（文案与旧 visibility 端点同源）。"""
+    if desc.asset_state in (slide_store.SlideState.DELETED,
+                            slide_store.SlideState.DELETING):
+        msg = "切片已删除，无法加入工作区"
+    elif desc.storage_layout != slide_store.StorageLayout.ID_BUNDLE:
+        msg = "切片尚未迁移到新存储布局，加入后也不会显示；请先完成存量迁移"
+    else:
+        msg = "切片当前不可读取（状态 %s），加入后也不会显示" % desc.asset_state
+    return _admin_v1_error(409, "slide_not_servable", msg)
+
+
+@app.route("/api/admin/v1/slides/<slide_id>/temporary-view",
+           methods=["POST"])
+def admin_v1_slide_temporary_view_start(slide_id):
+    """开启管理员临时查看（2026-10-08 §3.1；owner 权限 + CSRF）。
+
+    - 受益人固定为当前登录 actor（自授权），不接受时长参数
+      （TEMPORARY_VIEW_SECONDS=3600 常量）；
+    - 切片不存在 → 404；不可读（非 ready / 非 id_bundle / 文件缺失）→ 409
+      ``slide_not_servable``；切片属于 actor 本人 → 409 ``own_slide``；
+    - 已有 ``expires_at > now()`` 的授权 → 原样返回不续期（幂等）；
+      否则 upsert（granted_at=now、expires_at=now+1h、granted_by=actor）并写
+      审计 ``admin.slide_temporary_view.start``（detail 记 started）；
+    - 响应：``{"slide_id", "temporary_view": {"status":"active","granted_at",
+      "expires_at"}, "server_now"}``（时间一律 epoch 秒）。
     """
     auth = _require_owner_admin_v1()
     if auth:
         return auth
-    if not name.startswith("sld_"):
-        safe = _sanitize_name(name)
-        if not safe or safe != name:
-            return _admin_v1_error(400, "invalid_request", "非法文件名")
+    ref = (slide_id or "").strip()
+    if not ref.startswith("sld_"):
+        return _admin_v1_error(404, "slide_not_found",
+                               "切片不存在（temporary-view 只接受 slide_id）")
     try:
-        desc = _admin_v1_resolve_slide(name)
+        desc = slide_store.resolve_slide_id(ref)
     except Exception:
-        app.logger.exception("admin visibility 切片解析失败：%s", name)
+        app.logger.exception("admin temporary-view 切片解析失败：%s", ref)
         return _admin_v1_error(500, "internal", "切片解析失败")
     if desc is None:
         return _admin_v1_error(404, "slide_not_found", "切片不存在")
-    body = request.get_json(silent=True) or {}
-    granted = body.get("granted")
-    if not isinstance(granted, bool):
-        return _admin_v1_error(400, "invalid_request",
-                               "granted 需为布尔（true=授权，false=收回）")
     owner_uid = _admin_v1_owner_uid()
     if not owner_uid:
         return _admin_v1_error(
             400, "owner_uid_missing",
             "当前部署 owner 无稳定 user_id（本地免认证开发态），"
-            "无法建立/收回显式授权")
-    sid = desc.slide_id
-    legacy_name = desc.legacy_filename
-    grant_key = legacy_name or sid
-    if granted:
-        if not _admin_v1_desc_servable(desc):
-            if desc.asset_state in (slide_store.SlideState.DELETED,
-                                    slide_store.SlideState.DELETING):
-                msg = "切片已删除，无法加入工作区"
-            elif desc.storage_layout != slide_store.StorageLayout.ID_BUNDLE:
-                msg = "切片尚未迁移到新存储布局，加入后也不会显示；请先完成存量迁移"
-            else:
-                msg = "切片当前不可读取（状态 %s），加入后也不会显示" % desc.asset_state
-            return _admin_v1_error(409, "slide_not_servable", msg)
-        result = share_store.grant_slide_view(
-            owner_uid, grant_key, granted_by=owner_uid, slide_id=sid)
-        _audit("admin.slide_visibility.grant", target_type="slide",
-               target_id=sid, slide=grant_key,
-               detail={"granted_to": owner_uid,
-                       "slide_id": sid,
-                       "already_granted": bool(result.get("already_granted"))})
-        return jsonify(name=name, slide_id=sid, granted=True,
-                       already_granted=bool(result.get("already_granted")))
-    existed = share_store.revoke_slide_view_by_id(owner_uid, sid)
-    if legacy_name:
-        existed = share_store.revoke_slide_view(owner_uid, legacy_name) or existed
-    # 升级 B R6d：撤销联动——失效该切片上已失去收录关系的 run grants，并对
-    # 仍在运行的相关 run 走既有取消/收尾机制（不把前端关流当取消成功；费用
-    # hold 按既有结算机制处理，不提前释放）。sidecar 会话按 legacy 名查询，
-    # 无名资产只走 run grant 复查（与删除编排同口径）。
-    cancelled = _cancel_sidecar_runs_for_owners(
-        legacy_name, [owner_uid], reason="visibility_revoked") \
-        if legacy_name else []
-    _revoke_stale_run_grants(slide=legacy_name, reason="visibility_revoked")
-    _audit("admin.slide_visibility.revoke", target_type="slide",
-           target_id=sid, slide=grant_key,
-           detail={"revoked_from": owner_uid, "slide_id": sid,
-                   "existed": bool(existed), "runs_cancelled": cancelled})
-    return jsonify(name=name, slide_id=sid, granted=False,
-                   existed=bool(existed), runs_cancelled=cancelled)
+            "无法建立临时查看授权")
+    if desc.owner_user_id and desc.owner_user_id == owner_uid:
+        return _admin_v1_error(409, "own_slide",
+                               "切片属于本人，无需临时查看（可直接查看）")
+    if not _admin_v1_desc_servable(desc):
+        return _admin_v1_temporary_view_not_servable_error(desc)
+    grant_key = desc.legacy_filename or desc.slide_id
+    try:
+        result = share_store.start_slide_view_grant_timed(
+            owner_uid, grant_key, granted_by=owner_uid,
+            slide_id=desc.slide_id, ttl_seconds=TEMPORARY_VIEW_SECONDS)
+    except Exception:
+        app.logger.exception("admin temporary-view 开启失败：%s", desc.slide_id)
+        return _admin_v1_error(500, "internal", "临时查看开启失败")
+    _audit("admin.slide_temporary_view.start", target_type="slide",
+           target_id=desc.slide_id, slide=grant_key,
+           slide_id=desc.slide_id,
+           detail={"granted_to": owner_uid, "slide_id": desc.slide_id,
+                   "started": bool(result.get("started")),
+                   "expires_at": result.get("expires_at")})
+    return jsonify(
+        slide_id=desc.slide_id,
+        temporary_view={
+            "status": "active",
+            "granted_at": result.get("granted_at"),
+            "expires_at": result.get("expires_at"),
+        },
+        server_now=time.time())
+
+
+@app.route("/api/admin/v1/slides/<slide_id>/temporary-view",
+           methods=["DELETE"])
+def admin_v1_slide_temporary_view_end(slide_id):
+    """结束管理员临时查看（2026-10-08 §3.1；owner 权限 + CSRF；幂等）。
+
+    把 actor 对该切片**未到期**的授权 ``expires_at`` 置为 now()，调用
+    ``_revoke_run_grants_for_slide_id`` 取消派生 AI 运行授权，写审计
+    ``admin.slide_temporary_view.end``。已结束/不存在时同样 200（幂等），
+    响应 ``{"slide_id", "temporary_view": {"status": "ended"|"none"},
+    "server_now"}``。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    ref = (slide_id or "").strip()
+    try:
+        desc = slide_store.resolve_slide_id(ref) if ref.startswith("sld_") \
+            else None
+    except Exception:
+        app.logger.exception("admin temporary-view 结束解析失败：%s", ref)
+        return _admin_v1_error(500, "internal", "切片解析失败")
+    owner_uid = _admin_v1_owner_uid()
+    if not owner_uid:
+        return _admin_v1_error(
+            400, "owner_uid_missing",
+            "当前部署 owner 无稳定 user_id（本地免认证开发态），"
+            "无法结束临时查看授权")
+    grant_key = (desc.legacy_filename or desc.slide_id) if desc else ref
+    try:
+        status = share_store.end_slide_view_grant(
+            owner_uid, grant_key,
+            slide_id=(desc.slide_id if desc else
+                      (ref if ref.startswith("sld_") else None)))
+    except Exception:
+        app.logger.exception("admin temporary-view 结束失败：%s", ref)
+        return _admin_v1_error(500, "internal", "临时查看结束失败")
+    if desc is not None and status == "ended":
+        # 撤销联动：失效该切片上派生的 run grants（§3.3 主动结束）
+        _revoke_run_grants_for_slide_id(desc.slide_id,
+                                        name=desc.legacy_filename)
+    _audit("admin.slide_temporary_view.end", target_type="slide",
+           target_id=(desc.slide_id if desc else ref), slide=grant_key,
+           slide_id=(desc.slide_id if desc else None),
+           detail={"ended_for": owner_uid, "result": status})
+    return jsonify(
+        slide_id=(desc.slide_id if desc else ref),
+        temporary_view={"status": status},
+        server_now=time.time())
 
 
 @app.route("/api/admin/v1/ai/unowned-sessions", methods=["GET"])
@@ -11979,12 +11655,49 @@ def api_slides():
     逐行门禁；目录上无 slides 行的文件不再出现）。每 item 追加
     slide_id/original_filename/display_name/format_ext（旧字段——含 alias——
     原样保留，P2 起前端切 ID）。
+
+    2026-10-08 §3.2：对「仅凭有效临时授权可见、非本人所有」的切片每项附加
+    ``temporary_view_expires_at``（epoch 秒）——Viewer 据此归入「临时查看」
+    虚拟文件夹并在到期时清屏；服务端门禁（expires_at > now()）是唯一权限
+    依据，该字段只作展示/倒计时。
     """
+    descs = _visible_slide_descs()
+    ident = current_identity()
+    uid = ident.get("user_id") or None
+    # 主体当前未到期的临时查看授权（slide_id → expires_at）
+    temp_grants = {}
+    if uid:
+        try:
+            temp_grants = share_store.active_slide_view_grants_for_user(uid)
+        except Exception:
+            app.logger.warning("/api/slides 临时查看授权读取失败（按无授权"
+                               "展示）", exc_info=True)
+            temp_grants = {}
+    temp_only = {}
+    if temp_grants:
+        is_owner_role = ident.get("role") == user_store.ROLE_OWNER
+        for sid, expires in temp_grants.items():
+            d = next((x for x in descs if x.slide_id == sid), None)
+            if d is None or (d.owner_user_id or "") == (uid or ""):
+                continue
+            if not is_owner_role:
+                # user 主体：public / share 成员可见的切片并非「仅凭临时授权」
+                if d.public:
+                    continue
+                try:
+                    if slide_store.has_share_permission(uid, sid, "view"):
+                        continue
+                except Exception:
+                    app.logger.warning("临时查看标注的 share 成员判定失败"
+                                       "（按仅临时查看处理）：%s", sid,
+                                       exc_info=True)
+            temp_only[sid] = expires
+
     items = []
-    for desc in _visible_slide_descs():
+    for desc in descs:
         try:
             path = _desc_read_path(desc)
-            items.append(_slide_info_dict_desc(desc, path))
+            item = _slide_info_dict_desc(desc, path)
         except Exception as e:
             # 打开失败等（路径穿越校验抛 HTTP 异常也在此收集为 error 项，
             # 单个失败不阻塞列表）
@@ -12000,8 +11713,7 @@ def api_slides():
                 size = _desc_path(desc).stat().st_size
             except Exception:
                 size = 0
-            items.append(
-                {
+            item = {
                     "name": desc.legacy_filename,
                     "size_bytes": size,
                     "width": None,
@@ -12019,7 +11731,9 @@ def api_slides():
                     "note": note,
                     "error": str(getattr(e, "description", e)),
                 }
-            )
+        if desc.slide_id in temp_only:
+            item["temporary_view_expires_at"] = temp_only[desc.slide_id]
+        items.append(item)
     return jsonify(items)
 
 
@@ -14816,6 +14530,51 @@ def api_admin_plugins_install():
 # --------------------------------------------------------------------------- #
 # run grant 发放（§7.6 第 2 步；docs §11.1-1 fail-closed）
 # --------------------------------------------------------------------------- #
+def _temporary_view_only_cap(slide_id, user_ctx):
+    """主体对切片的读取仅来自临时查看时的到期钳制（2026-10-08 §3.3）。
+
+    返回 (cap_seconds|None, error|None)：
+      - None：主体是 owner 本人 / 无有效临时授权 / 另有 public/share 通道
+        （读取并非「仅来自临时查看」）——不钳制；
+      - cap_seconds：有效临时授权的剩余秒数（expires_at - now）；
+      - error：应拒绝起跑（剩余 ≤0——临时查看到期与起跑并发，fail-closed）。
+    """
+    uid = (user_ctx or {}).get("user_id") or None
+    if not uid or not slide_id:
+        return None, None
+    try:
+        grants = share_store.active_slide_view_grants_for_user(uid)
+    except Exception:
+        app.logger.warning("run grant 临时查看钳制读取失败（fail-closed 不"
+                           "钳制，TTL 兜底）：%s", slide_id, exc_info=True)
+        return None, None
+    expires = grants.get(slide_id)
+    if expires is None:
+        return None, None
+    # 主体是切片 owner → 读取并非仅来自临时查看
+    try:
+        desc = slide_store.resolve_slide_id(slide_id)
+    except Exception:
+        desc = None
+    if desc is not None and (desc.owner_user_id or "") == (uid or ""):
+        return None, None
+    # user 主体另有 public / share 成员通道 → 并非仅来自临时查看
+    if (user_ctx or {}).get("role") != user_store.ROLE_OWNER:
+        if desc is not None and desc.public:
+            return None, None
+        try:
+            if slide_store.has_share_permission(uid, slide_id, "view"):
+                return None, None
+        except Exception:
+            app.logger.warning("run grant 钳制的 share 成员判定失败（按仅"
+                               "临时查看钳制）：%s", slide_id, exc_info=True)
+    remaining = float(expires) - time.time()
+    if remaining <= 0:
+        return None, (jsonify(error="临时查看已结束，无法启动 AI 任务",
+                              code="temporary_view_expired"), 403)
+    return remaining, None
+
+
 def _issue_run_grant(slide, user_ctx, config, slide_id=None):
     """起跑时发放 run grant 并注入 sidecar 请求 config["run_grant"]。
 
@@ -14826,6 +14585,9 @@ def _issue_run_grant(slide, user_ctx, config, slide_id=None):
     P2（合同 §3.3/R-09）：run_grants 行双写 slide_id + slide 快照；未显式给
     ID 时按名解析（解析不到保持 NULL——历史无行形态）。config["run_grant"]
     附 slide_id（HistoPilot RunGrantRef 消费）。
+    2026-10-08 §3.3：主体对切片的读取仅来自临时查看（非 owner）时，运行授权
+    到期取 min(现有 TTL, 临时查看 expires_at)——AI 能力不超越临时查看时限；
+    剩余 ≤0（到期与起跑并发）fail-closed 拒绝。
     """
     if not config or not slide:
         app.logger.error("run grant 签发失败：slide/config 缺失（fail-closed）")
@@ -14840,13 +14602,22 @@ def _issue_run_grant(slide, user_ctx, config, slide_id=None):
             slide_id = share_store.get_slide_id(slide)
         except Exception:
             slide_id = None
+    ttl = _RUN_GRANT_TTL_SECONDS
+    cap, cap_err = _temporary_view_only_cap(slide_id, user_ctx)
+    if cap_err is not None:
+        app.logger.warning("run grant 签发拒绝：临时查看已到期（slide_id=%s）",
+                           slide_id)
+        config["run_grant_reject"] = cap_err
+        return False
+    if cap is not None and cap < ttl:
+        ttl = cap
     try:
         grant = share_store.create_run_grant(
             installation_id=installation_id,
             slide=slide,
             session_id="",
             created_by_user_id=(user_ctx or {}).get("user_id"),
-            ttl_seconds=_RUN_GRANT_TTL_SECONDS,
+            ttl_seconds=ttl,
             slide_id=slide_id,
         )
     except Exception:
@@ -15539,6 +15310,10 @@ def _ai_run_prepare(user_ctx, body, slide, need_grant, slide_id=None):
         config["session_owner"] = user_ctx["user_id"]
     if need_grant and not _issue_run_grant(slide, user_ctx, config,
                                             slide_id=slide_id):
+        # 临时查看到期（§3.3）：_issue_run_grant 已在 config 注入具体拒绝响应
+        reject = config.get("run_grant_reject")
+        if isinstance(reject, tuple) and len(reject) == 2:
+            return reject
         return (jsonify(error="run grant 签发失败，已拒绝起跑（fail-closed）"), 503)
     # 插件能力注入（docs §5.1）：官方模式专用——demo 路径（/api/demo/ai/run）
     # 直接用 _build_sidecar_config 组装，不经本函数，零改动。
@@ -22448,18 +22223,30 @@ def _project_member_entries(body):
 
 @app.route("/api/project/create", methods=["POST"])
 def api_project_create():
-    """创建项目。JSON: {name, note?, slide_ids? | slides?}。可选 Idempotency-Key。
+    """创建项目。JSON: {name, note?, slide_ids? | slides?, parent_project_id?}。
+    可选 Idempotency-Key。
 
     非 list 的 slides/slide_ids 返回 400（不得静默吞成空集合）。带键时
     (user, key) 幂等：同载荷返回原 pid，异载荷 409。
     P2（合同 §3.2）：slide_ids 优先（新客户端）；成员须解析到已存在 ready
     资产；project_slides 双写 slide_id + 名快照。
+    2026-10-08 §5.3：可选 ``parent_project_id``（null/缺省=根；字符串须为
+    非空 ≤64）建子文件夹——层级/同 owner/归档校验在存储事务内，非法
+    400/403/409 带可读原因（code: parent_not_found / parent_not_owner /
+    parent_archived / parent_depth_exceeded）。
     """
     from project_create_http import handle_create
     ident = current_identity()
     body = request.get_json(silent=True) or {}
     if not isinstance(body, dict):
         return jsonify(error="请求体需为 JSON 对象"), 400
+    parent_raw = body.get("parent_project_id")
+    if parent_raw is not None:
+        if not isinstance(parent_raw, str) or not parent_raw.strip() \
+                or len(parent_raw) > 64:
+            return jsonify(error="parent_project_id 需为 null 或非空字符串"
+                           "（≤64 字符）", code="invalid_request"), 400
+        parent_raw = parent_raw.strip()
     try:
         entries = _project_member_entries(body)
     except ValueError as e:
@@ -22479,7 +22266,8 @@ def api_project_create():
     id_bundle_ids = [sid for n, sid in zip(names, sids) if not n]
     key = request.headers.get("Idempotency-Key")
     payload, status = handle_create(
-        ident, body, key, slides_override=legacy_names)
+        ident, body, key, slides_override=legacy_names,
+        parent_project_id=parent_raw)
     if status == 200:
         pid = (payload or {}).get("pid")
         if pid:
@@ -22559,10 +22347,14 @@ def api_project_detail(pid):
 
 @app.route("/api/project/<pid>", methods=["PATCH"])
 def api_project_update(pid):
-    """更新项目字段。JSON: {name?, note?, slide_ids? | slides?}。
+    """更新项目字段。JSON: {name?, note?, slide_ids? | slides?,
+    parent_project_id?}。
 
     Stage 3a-2a：owner 任意；user 仅自己。P2（合同 §3.2）：slide_ids 优先
     （新客户端）；成员须解析到已存在 ready 资产；双列写入。
+    2026-10-08 §5.3：``parent_project_id`` = 移动文件夹——null = 移到根；
+    字符串 = 移到该父（事务内锁 owner 行 + 环/层级/同 owner/归档校验），
+    非法 400/403/409 带可读原因（code 同 create）。
     """
     if not _can_access_project(pid):
         return _denied()
@@ -22581,13 +22373,27 @@ def api_project_update(pid):
         # 名数组与 ID 逐位配对进 store 双写（"" 名 = id_bundle 快照由 ID 携带）
         slides = names if (names or sids) else None
         slide_ids = sids or None
-    proj = share_store.update_project(
-        pid,
-        name=body.get("name"),
-        note=body.get("note"),
-        slides=slides,
-        slide_ids=slide_ids,
-    )
+    parent = share_store.PROJECT_PARENT_UNCHANGED
+    if "parent_project_id" in body:
+        raw = body.get("parent_project_id")
+        if raw is None:
+            parent = None  # null = 移到根
+        elif isinstance(raw, str) and raw.strip() and len(raw) <= 64:
+            parent = raw.strip()
+        else:
+            return jsonify(error="parent_project_id 需为 null 或非空字符串"
+                           "（≤64 字符）", code="invalid_request"), 400
+    try:
+        proj = share_store.update_project(
+            pid,
+            name=body.get("name"),
+            note=body.get("note"),
+            slides=slides,
+            slide_ids=slide_ids,
+            parent_project_id=parent,
+        )
+    except share_store.ProjectParentError as exc:
+        return jsonify(error=exc.message, code=exc.code), exc.status
     if proj is None:
         return jsonify(error="项目不存在"), 404
     return jsonify(proj)

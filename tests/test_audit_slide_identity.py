@@ -103,8 +103,10 @@ def seed_references(conn, token):
           "INSERT INTO grants (id, token, user_id, active) "
           "VALUES ('grt_1', %s, 'usr_b', true)", (token,))
     _exec(conn,
-          "INSERT INTO slide_view_grants (slide_name, user_id, slide_id) "
-          "VALUES ('a.svs', 'usr_b', 'sld_a')")
+          "INSERT INTO slide_view_grants (slide_name, user_id, slide_id, "
+                "expires_at) "
+          "VALUES ('a.svs', 'usr_b', 'sld_a', "
+          " now() + interval '30 days')")
     _exec(conn, "INSERT INTO projects (project_id, name) VALUES ('prj_1', 'P')")
     _exec(conn,
           "INSERT INTO project_slides (project_id, slide) "
@@ -547,13 +549,16 @@ def test_unresolved_grants(audit, conn, pg_uri, tmp_path):
           "VALUES ('grt_2', 'tok_dangle', 'usr_b', true)")
     # 孤儿 view grant（无 meta 行、NULL id——0035 形态，当前仍生效）。
     _exec(conn,
-          "INSERT INTO slide_view_grants (slide_name, user_id) "
-          "VALUES ('ghostview.svs', 'usr_b')")
+          "INSERT INTO slide_view_grants (slide_name, user_id, "
+          "expires_at) VALUES ('ghostview.svs', 'usr_b', "
+          " now() + interval '30 days')")
     # 生代不匹配的 view grant（a.svs 的 slides 行是 sld_a；PK 是
     # (slide_name, user_id)，故用不同 user_id 与正确授权并存）。
     _exec(conn,
-          "INSERT INTO slide_view_grants (slide_name, user_id, slide_id) "
-          "VALUES ('a.svs', 'usr_a', 'sld_other')")
+          "INSERT INTO slide_view_grants (slide_name, user_id, slide_id, "
+                "expires_at) "
+          "VALUES ('a.svs', 'usr_a', 'sld_other', "
+          " now() + interval '30 days')")
     # demo_catalog 悬空 slide_id。
     _exec(conn,
           "INSERT INTO demo_catalog (slide_id) VALUES ('sld_missing')")

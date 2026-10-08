@@ -336,6 +336,7 @@ def test_schema_migrations_recorded(conn):
         # registration_mail_redeliveries（复用原 token 的重发投递）与
         # registration_submissions（submission_id 幂等 + 匿名 receipt）。
         "0079_registration_antibot_redelivery.sql",
+        "0080_admin_viewer.sql",
     ]
 
 

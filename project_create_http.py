@@ -19,16 +19,21 @@ app.py 的 ``/api/project/create`` 由协调者接线（本模块不改 app.py�
 """
 
 import project_idempotency_store as _store
+from share_store_pg import ProjectParentError
 
 
-def handle_create(ident, body, idempotency_key, slides_override=None):
+def handle_create(ident, body, idempotency_key, slides_override=None,
+                  parent_project_id=None):
     """执行创建，返回 ``(payload_dict, status_code)``。
 
     - ``ident``：``current_identity()`` dict（至少含 user_id / role）；
-    - ``body``：JSON dict（{name, note?, slides?}）；
+    - ``body``：JSON dict（{name, note?, slides?, parent_project_id?}）；
     - ``idempotency_key``：请求头 ``Idempotency-Key``（可 None=旧行为）；
     - ``slides_override``：HTTP 层经 ``_validate_slide_names`` 清洗后的
-      slide 名列表；给出时**替换** body.slides（body 只作形状来源）。
+      slide 名列表；给出时**替换** body.slides（body 只作形状来源）；
+    - ``parent_project_id``：可选父文件夹（2026-10-08 §5.3；层级/同
+      owner/归档校验在存储事务内，非法 → ``ProjectParentError`` 映射
+      400/403/409 带可读原因）。
     """
     try:
         name, note, _slides = _store.validate_create_payload(body)
@@ -39,11 +44,14 @@ def handle_create(ident, body, idempotency_key, slides_override=None):
         proj = _store.create_project_idempotent(
             name=name, note=note, slides=slides,
             owner_user_id=ident["user_id"], requester_role=ident["role"],
-            idempotency_key=idempotency_key)
+            idempotency_key=idempotency_key,
+            parent_project_id=parent_project_id)
     except _store.IdempotencyConflict as exc:
         return {"error": str(exc), "code": exc.code}, 409
     except PermissionError:
         return {"error": "无权创建项目"}, 403
+    except ProjectParentError as exc:
+        return {"error": exc.message, "code": exc.code}, exc.status
     # duplicate=True 是内部标记；HTTP 响应与首次创建同形状，去掉即可
     proj.pop("duplicate", None)
     return proj, 200

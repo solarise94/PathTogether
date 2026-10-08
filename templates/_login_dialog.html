@@ -6,9 +6,10 @@
      （服务端 login_open / register_open 直开对应视图）。
    - 无 JS 退化：服务端 open 属性 + hidden 属性直出对应视图（CSS 居中浮层）。
    - 注册复用既有 POST /register API（同一 CSRF/限流/模式策略），后端不重复造。
-   - 文案口径（R2）：首屏「验证邮箱并提交申请，管理员审核通过后即可使用。」；
-     发送后「验证邮件已发送，请查收。」；不写权限/额度类实现型说明。
-   ========================================================================= #}
+   - 2026-10-08 §4：邀请码注册退役——注册只剩 public（邮箱验证 + 双协议
+     勾选）；closed 为关闭态说明，不再有邀请码输入。
+   - 文案口径：public 首屏「验证邮箱并设置密码，即可开始使用。」
+ ========================================================================= #}
 {% if not signed_in %}
 <dialog class="login-dialog" id="login-dialog" aria-labelledby="{% if register_open %}register-dialog-title{% else %}login-dialog-title{% endif %}"{% if login_open or register_open %} open{% endif %}>
   <div class="login-dialog-card" role="document">
@@ -116,32 +117,16 @@
       {% else %}
       <h2 id="register-dialog-title" data-i18n="register.dialog.title">注册 HistoPilot</h2>
       {% if registration_mode == "public" %}
-      <!-- public 无管理员审核环节：验证邮箱 + 设密码即开通（§4.2 原子建号） -->
       <p class="login-dialog-subtitle" data-i18n="register.dialog.subtitle.public">验证邮箱并设置密码，即可开始使用。</p>
-      {% else %}
-      <p class="login-dialog-subtitle" data-i18n="register.dialog.subtitle">验证邮箱并提交申请，管理员审核通过后即可使用。</p>
       {% endif %}
       {% if register_error %}
       <div class="login-dialog-error" role="alert">
         {% if register_error_code == 'locked' %}<span data-i18n="login.error.locked">尝试过于频繁，请稍后再试</span>
         {% else %}{{ register_error }}{% endif %}
-        {% if register_retry_after %}<span id="register-dialog-countdown" data-retry-seconds="{{ register_retry_after }}"></span>{% endif %}
+        {% if register_retry_after %}<span id="register-dialog-countdown" class="login-dialog-countdown" data-retry-seconds="{{ register_retry_after }}"></span>{% endif %}
       </div>
       {% endif %}
-      {% if registration_mode == "email_verify" %}
-      <form method="POST" action="/register" id="register-dialog-form" autocomplete="on">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-        <input type="hidden" name="submission_id" value="{{ register_submission_id or '' }}" />
-        <input type="hidden" name="form_locale" value="{{ entry_site.default_locale if entry_site else 'zh' }}" />
-        <label for="register-dialog-email" data-i18n="register.dialog.email">邮箱地址</label>
-        <input id="register-dialog-email" name="email" type="email" required maxlength="254"
-               autocomplete="email" spellcheck="false"
-               data-i18n-ph="register.dialog.email.ph" placeholder="you@example.com" />
-        <p class="login-dialog-hint" data-i18n="register.dialog.email.hint">验证成功后，该邮箱将作为你的登录账号。</p>
-        {% if turnstile and turnstile.enabled %}<div id="register-turnstile" data-sitekey="{{ turnstile.site_key }}" data-action="{{ turnstile.action }}"></div>{% endif %}
-        <button class="login-dialog-submit" type="submit" data-i18n="register.dialog.submit">发送验证邮件</button>
-      </form>
-      {% elif registration_mode == "public" %}
+      {% if registration_mode == "public" %}
       {% if register_terms and register_research %}
       <!-- P1 public（docs §3.1/§3.3）：恰好两个独立复选框，均不预勾选；
            必选未勾选时客户端提示并且服务端拒绝；第二项不选也能注册。
@@ -176,36 +161,10 @@
       <div class="login-dialog-message" role="status">注册暂不可用，请稍后重试</div>
       <p class="login-dialog-subtitle">协议文稿发布中，公开注册暂未开放。</p>
       {% endif %}
-      {% elif registration_mode == "invite_only" %}
-      <form method="POST" action="/register" id="register-dialog-form" autocomplete="on">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-        <label for="register-dialog-invite" data-i18n="register.invite.code">邀请码</label>
-        <input id="register-dialog-invite" name="invite_token" type="text" required
-               autocomplete="off" spellcheck="false"
-               data-i18n-ph="register.invite.code.ph" placeholder="粘贴管理员发送的邀请码" />
-        <label for="register-dialog-login-id" data-i18n="register.invite.email">登录账号（邮箱）</label>
-        <input id="register-dialog-login-id" name="login_id" type="email" required maxlength="254"
-               autocomplete="username" spellcheck="false"
-               data-i18n-ph="register.invite.email.ph" placeholder="you@example.com" />
-        <p class="login-dialog-hint" data-i18n="register.dialog.email.hint">验证成功后，该邮箱将作为你的登录账号。</p>
-        <label for="register-dialog-display" data-i18n="register.invite.display">显示名（可选，仅展示）</label>
-        <input id="register-dialog-display" name="display_name" type="text" maxlength="120"
-               autocomplete="nickname"
-               data-i18n-ph="register.invite.display.ph" placeholder="其他人看到的名字（不用于登录，也不作为身份）" />
-        <label for="register-dialog-password" data-i18n="register.invite.password">设置密码</label>
-        <input id="register-dialog-password" name="password" type="password" required minlength="15"
-               maxlength="200" autocomplete="new-password"
-               data-i18n-ph="register.invite.password.ph" placeholder="至少 15 位，推荐使用密码管理器生成的长口令" />
-        <label for="register-dialog-password-confirm" data-i18n="register.invite.confirm">确认密码</label>
-        <input id="register-dialog-password-confirm" name="password_confirm" type="password" required
-               minlength="15" maxlength="200" autocomplete="new-password" />
-        <p class="login-dialog-hint" data-i18n="register.invite.password.hint">至少 15 位，可直接使用密码管理器生成并粘贴；不要求大小写或符号组合。</p>
-        <button class="login-dialog-submit" type="submit" data-i18n="register.invite.submit">创建账号</button>
-      </form>
       {% else %}
-      <!-- 注册关闭（含 fail-closed 降级）：无可提交表单，仍按服务端策略 -->
-      <div class="login-dialog-message" role="status" data-i18n="register.title">当前采用邀请注册</div>
-      <p class="login-dialog-subtitle" data-i18n="register.desc">测试账号由管理员创建。如果你已收到账号，请直接登录。</p>
+      <!-- 注册关闭（含 fail-closed 降级）：无可提交表单（2026-10-08 §4：邀请码注册退役） -->
+      <div class="login-dialog-message" role="status" data-i18n="register.title.closed">当前未开放注册</div>
+      <p class="login-dialog-subtitle" data-i18n="register.desc.closed">注册暂未开放。如果你已有账号，请直接登录。</p>
       {% endif %}
       <div class="login-dialog-links">
         <a href="/login" data-auth-switch="login" data-i18n="register.dialog.have_account">已有账号？登录</a>

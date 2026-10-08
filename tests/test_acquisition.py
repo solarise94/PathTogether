@@ -98,12 +98,13 @@ def _cookie_state(client):
         return False, None, None
     return True, c.value, c
 
-def _mk_invite(owner_uid, login_id=None, **kw):
-    return registration_store.create_invite(owner_uid, login_id=login_id, **kw)
-
-def _redeem(inv, login_id):
-    return registration_store.redeem_invite(
-        inv["token"], login_id, "longpassword123")
+def _mk_user(login_id, display_name=None, actor_uid=None):
+    """建号（2026-10-08 §4：邀请兑换退役；归因解耦语义由建号组合原语承担）。"""
+    import user_store_pg
+    user, allowance = user_store_pg.create_user_with_total_allowance(
+        login_id, "longpassword123", display_name=display_name,
+        actor_user_id=actor_uid)
+    return {"user": user, "total_allowance": allowance}
 
 # =========================================================================== #
 # 1. 纯清理函数（json/PG 双跑）
@@ -436,66 +437,53 @@ def test_visit_rows_are_immutable_events_not_upserted():
     assert {v["source_code"] for v in visits} == {"a", "b"}
 
 def test_redeem_writes_no_user_acquisition_but_total_allowance():
-    """Batch B §4.4/§Batch B + R3 单轨：兑换与归因解耦——无论触点/UTM/邀请
-    来源如何，兑换成功但 user_acquisition **零新增**；额度面恒为一次性总额度：
-    带初始面值邀请同事务建行（source=invite），无面值邀请按 defaults 基线
-    建行；user_override 过渡策略已随单轨删除（恒零新增）。"""
+    """Batch B §4.4/§Batch B + R3 单轨（2026-10-08 §4 起由建号原语承担）：
+    无论触点/UTM 来源如何，建号成功但 user_acquisition **零新增**；额度面
+    恒为一次性总额度（显式面值建行，无面值按 defaults 基线建行；
+    user_override 过渡策略已随单轨删除，恒零新增）。"""
+    import user_store_pg
     owner = _mk_owner()
     _seed_campaign("camp-web", "websrc")
-    _seed_campaign("camp-inv", "invsrc")
     vid = acq_store.new_visitor_id()
     acq_store.record_visit(visitor_id=vid, source_code="websrc",
                            campaign_id="camp-web")
     before = _acq_total()
-    inv = _mk_invite(owner["user_id"], campaign_id="camp-inv",
-                     total_limit_nano_cny=12 * 10 ** 9)
-    out = _redeem(inv, "prio1@x.com")
-    # 单轨：注册成功、归因零新增；同事务建 allowance（source=invite）
+    out = _mk_user("prio1@x.com", actor_uid=owner["user_id"])
+    # 建号成功、归因零新增；同事务建 allowance（组合原语）
     assert user_store.get_user_by_login_id("prio1@x.com") is not None
-    assert out["total_allowance"]["limit_nano_cny"] == 12 * 10 ** 9
-    assert out["total_allowance"]["source"] == "invite"
+    assert out["total_allowance"]["limit_nano_cny"] == 20 * 10 ** 9
     assert _acq_total() == before
     assert _ua(out["user"]["user_id"]) is None
     assert _count_override_rows() == 0
-    # 无初始面值的邀请：按 defaults 基线（20 CNY）建行
-    inv2 = _mk_invite(owner["user_id"])
-    out2 = _redeem(inv2, "prio2@x.com")
-    assert out2["total_allowance"]["limit_nano_cny"] == 20 * 10 ** 9
-    assert _count_override_rows() == 0
-    assert _acq_total() == before
 
 def test_expired_visits_and_tampered_visitor_are_ignored_frozen():
-    """Batch B：触点过期/visitor 不匹配语义随写路径冻结一并退役——兑换根本
-    不读取触点；本用例锁定「兑换后归因行仍为零」。"""
+    """Batch B：触点过期/visitor 不匹配语义随写路径冻结一并退役——建号
+    根本不读取触点；本用例锁定「建号后归因行仍为零」。"""
     owner = _mk_owner()
     vid = acq_store.new_visitor_id()
     acq_store.record_visit(visitor_id=vid, source_code="expired-src")
     _expire_all_visits()
     before = _acq_total()
-    inv = _mk_invite(owner["user_id"])
-    out = _redeem(inv, "exp@x.com")
+    out = _mk_user("exp@x.com", actor_uid=owner["user_id"])
     assert _acq_total() == before
     # visitor 不匹配（另一访客）同样无关紧要——不读取
     other = acq_store.new_visitor_id()
     assert other != vid
-    out2 = _redeem(_mk_invite(owner["user_id"]), "tamper@x.com")
+    out2 = _mk_user("tamper@x.com", actor_uid=owner["user_id"])
     assert _acq_total() == before
 
 def test_redeem_succeeds_even_if_acquisition_store_broken(monkeypatch):
     """Batch B 红线：站点统计故障绝不能阻断注册——归因已不在兑换事务内，
     insert_user_acquisition 注入失败不再影响兑换（用户创建、邀请消费）。"""
     owner = _mk_owner()
-    inv = _mk_invite(owner["user_id"], login_id="boom@x.com")
 
     def _boom(*a, **kw):
         raise RuntimeError("injected acquisition failure")
 
     monkeypatch.setattr(acq_store, "insert_user_acquisition", _boom)
-    out = registration_store.redeem_invite(inv["token"], "boom@x.com",
-                                           "longpassword123")
+    out = _mk_user("boom@x.com", actor_uid=owner["user_id"])
     assert user_store.get_user_by_login_id("boom@x.com") is not None
-    row = registration_store.get_invite(inv["invite_id"])
-    assert row["use_count"] == 1 and row["consumed_at"] is not None
+    assert out["total_allowance"] is not None
     assert _acq_total() == 0  # 全程零归因写入
 
 def test_visit_retention_deletes_scrubs_and_is_idempotent(monkeypatch):
@@ -578,18 +566,30 @@ def test_acquisition_retention_daemon_switch(monkeypatch):
         and th.daemon is True
 
 def test_register_route_full_acquisition_flow(monkeypatch):
-    """Batch D1 16/17 全链路：/r/ 只做安全 302（零触点行、清 cookie）、注册
-    成功且 user_acquisition **零新增**（注册与归因彻底解耦）。"""
+    """Batch D1 16/17 全链路（2026-10-08 §4 后走 public 流程）：/r/ 只做
+    安全 302（零触点行、清 cookie）、注册提交成功且 user_acquisition
+    **零新增**（注册与归因彻底解耦）。"""
     _satisfy_preconditions(monkeypatch)
     _seed_campaign("camp-flow", "mywebpage")
     owner = _mk_owner()
     app_mod.AUTH_ENABLED = True
     client = _client()
     _owner_session(client, owner)
+    # public 模式（邀请码注册已退役）：env 前置 + 双文稿
+    import agreement_store
+    import registration_mail_worker  # noqa: F401  # sender 前置
+    monkeypatch.setenv("REGISTRATION_MAIL_SENDER", "agent_mail_cli")
+    monkeypatch.setenv("REGISTRATION_AGENT_MAIL_CLI", "/usr/bin/true")
+    monkeypatch.setenv("REGISTRATION_MAIL_PAYLOAD_KEY", "k")
+    monkeypatch.setenv("SECRET_KEY", "s")
+    monkeypatch.setenv("REGISTRATION_ADMIN_EMAIL", "admin@x.com")
+    agreement_store.ensure_builtin_documents()
+    for dt in ("user_agreement", "research_sharing"):
+        doc = [d for d in agreement_store.builtin_documents()
+               if d["document_type"] == dt][0]
+        agreement_store.publish_document(dt, doc["version"])
     assert client.put("/api/admin/v1/settings/registration",
-                      json={"mode": "invite_only"}).status_code == 200
-    inv = client.post("/api/admin/v1/invites",
-                      json={"login_id": "flow-acq@x.com"}).get_json()["invite"]
+                      json={"mode": "public"}).status_code == 200
     anon = _client()
     before = _acq_total()
     # 访客从旧 mywebpage CTA 进入：安全 302，触点表零新增、旧 cookie 被清除
@@ -598,25 +598,22 @@ def test_register_route_full_acquisition_flow(monkeypatch):
     assert "Expires=Thu, 01 Jan 1970" in r.headers.get("Set-Cookie", "")
     assert _visits_total() == 0  # record_visit 不再被 /r/ 调用
     anon.get("/register")
+    terms = agreement_store.current_published("user_agreement")
+    research = agreement_store.current_published("research_sharing")
     r2 = anon.post("/register", data={
-        "invite_token": inv["token"], "login_id": "flow-acq@x.com",
-        "password": "longpassword123", "password_confirm": "longpassword123"})
-    assert r2.status_code == 302, r2.get_data(as_text=True)
-    user = user_store.get_user_by_login_id("flow-acq@x.com")
-    assert user is not None  # 注册成功（不再被归因写路径阻断）
-    assert _ua(user["user_id"]) is None and _acq_total() == before
-    # 兑换 audit 不携带来源/归因字段
-    conn = _pg_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT detail::text AS d FROM audit_events WHERE "
-                        "action='registration.user_created'")
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-    assert rows  # app 层审计在（字段本就不含来源）
-    # 邀请码绝不进 URL/query
-    assert inv["token"] not in r2.get_data(as_text=True)
+        "email": "flow-acq@x.com",
+        "terms_accepted": "1",
+        "terms_version": terms["version"],
+        "terms_sha256": terms["content_sha256"],
+        "research_version": research["version"],
+        "research_sha256": research["content_sha256"]})
+    # public 首步只入队验证邮件（200 状态页），不建账号、零归因
+    assert r2.status_code == 200, r2.get_data(as_text=True)
+    assert user_store.get_user_by_login_id("flow-acq@x.com") is None
+    assert _acq_total() == before
+    # 提交响应不带任何来源/归因字段
+    body = r2.get_data(as_text=True)
+    assert "campaign" not in body and "source_code" not in body
 
 def test_admin_summary_funnel_reads_frozen_history_only():
     """Batch B：漏斗汇总继续可读**历史**行；新注册不再进入漏斗
@@ -632,8 +629,8 @@ def test_admin_summary_funnel_reads_frozen_history_only():
     _insert_historical_attribution(attr_user["user_id"], v,
                                    campaign="camp-f1")
     _insert_usage_event(attr_user["user_id"], hours_back=2)
-    # 兑换不再产生归因：新用户不进漏斗
-    _redeem(_mk_invite(owner["user_id"]), "funnew@x.com")
+    # 建号不再产生归因：新用户不进漏斗
+    _mk_user("funnew@x.com", actor_uid=owner["user_id"])
     summary = acq_store.admin_funnel_summary()
     rows = {(r["source_code"], r["campaign_id"]): r for r in summary["items"]}
     c1 = rows[("srcf1", "camp-f1")]
@@ -657,9 +654,8 @@ def test_admin_users_endpoint_no_new_attribution_but_masking_kept(monkeypatch):
                                    referrer_domain="https://a.example.com/x?q=1")
     time.sleep(0.01)
     last = acq_store.record_visit(visitor_id=vid, source_code="s2")
-    out = registration_store.redeem_invite(
-        _mk_invite(owner["user_id"], login_id="Maskme@x.com")["token"],
-        "maskme@x.com", "longpassword123", "Masked User")
+    out = _mk_user("maskme@x.com", display_name="Masked User",
+                   actor_uid=owner["user_id"])
     # 明细端点物理删除：路由不存在（404）即无任何来源明细出口
     r = client.get("/api/admin/v1/acquisition/users?limit=10")
     assert r.status_code == 404
@@ -686,9 +682,7 @@ def test_admin_v1_users_row_attribution_frozen_to_null(monkeypatch):
     _satisfy_preconditions(monkeypatch)
     owner = _mk_owner()
     app_mod.AUTH_ENABLED = True
-    out = _redeem(_mk_invite(owner["user_id"], login_id="campfill@x.com",
-                             source_code="srcfill"),
-                  "campfill@x.com")
+    out = _mk_user("campfill@x.com", actor_uid=owner["user_id"])
     client = _client()
     _owner_session(client, owner)
     r = client.get("/api/admin/v1/users?q=campfill@x.com").get_json()
@@ -697,7 +691,8 @@ def test_admin_v1_users_row_attribution_frozen_to_null(monkeypatch):
     # 归因键整键删除（不是留位 null）——历史行存在与否都不再回显
     assert "source" not in item
     assert "campaign" not in item
-    assert item["registration_method"] == "invite"
+    # 2026-10-08 §4：邀请兑换退役，组合原语建号标 manual
+    assert item["registration_method"] == "manual"
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

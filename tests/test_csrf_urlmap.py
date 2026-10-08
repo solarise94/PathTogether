@@ -230,27 +230,29 @@ class TestShareRoisEndpoint:
         # 显式授权 a.svs 后切片可见（幂等：重复授权状态不变），但 userA 在
         # 该切片上的私有标注不因此对 owner 可见（0056：owner 工作台非全量
         # dump；标注级可见需 annotation_grants 显式授权）
-        r = oc.post("/api/admin/v1/slides/%s/visibility" % sa,
-                    json={"granted": True})
+        r = oc.post("/api/admin/v1/slides/%s/temporary-view"
+                    % share_store.get_slide_id(sa))
         assert r.status_code == 200, r.get_data(as_text=True)
-        r = oc.post("/api/admin/v1/slides/%s/visibility" % sa,
-                    json={"granted": True})
+        expires = r.get_json()["temporary_view"]["expires_at"]
+        # 重复开启幂等（返回原到期不续期）
+        r = oc.post("/api/admin/v1/slides/%s/temporary-view"
+                    % share_store.get_slide_id(sa))
         assert r.status_code == 200
-        assert r.get_json()["already_granted"] is True
+        assert r.get_json()["temporary_view"]["expires_at"] == expires
         r = oc.get("/api/share/rois")
         assert {x["slide"] for x in r.get_json()} == set()
         r = oc.get("/api/annotations?slide=%s" % sa)
         assert r.status_code == 200
         assert r.get_json()["annotations"] == []
 
-        # 收回后切片再次不可见（幂等收回）
-        r = oc.post("/api/admin/v1/slides/%s/visibility" % sa,
-                    json={"granted": False})
+        # 结束后切片再次不可见（幂等结束）
+        r = oc.delete("/api/admin/v1/slides/%s/temporary-view"
+                      % share_store.get_slide_id(sa))
         assert r.status_code == 200
-        r = oc.post("/api/admin/v1/slides/%s/visibility" % sa,
-                    json={"granted": False})
+        r = oc.delete("/api/admin/v1/slides/%s/temporary-view"
+                      % share_store.get_slide_id(sa))
         assert r.status_code == 200
-        assert r.get_json()["existed"] is False
+        assert r.get_json()["temporary_view"]["status"] == "none"
         r = oc.get("/api/share/rois")
         assert {x["slide"] for x in r.get_json()} == set()
         assert oc.get("/api/annotations?slide=%s" % sa).status_code == 403

@@ -176,7 +176,8 @@ def seed_full_world(conn, up):
                 "('sht_1', %s::jsonb)",
           (json.dumps(["ok.svs", "ghost.svs"]),))
     _exec(conn, "INSERT INTO slide_view_grants (slide_name, user_id, "
-                "slide_id) VALUES ('ok.svs', 'usr_b', NULL)")
+                "slide_id, expires_at) VALUES ('ok.svs', 'usr_b', NULL, "
+                " now() + interval '30 days')")
     conn.commit()
 
 
@@ -459,8 +460,10 @@ def test_view_grants_only_counted_no_name_matching(conn, up, tmp_path):
     conn.commit()
     (up / "ok.svs").write_bytes(b"A" * 10)
     _exec(conn, "INSERT INTO slide_view_grants (slide_name, user_id, "
-                "slide_id) VALUES ('ok.svs', 'usr_b', NULL), "
-                "('ok.svs', 'usr_c', 'sld_ok')")
+                "slide_id, expires_at) VALUES ('ok.svs', 'usr_b', NULL, "
+                " now() + interval '30 days'), "
+                "('ok.svs', 'usr_c', 'sld_ok', "
+                " now() + interval '30 days')")
     conn.commit()
 
     report = run_backfill(up, tmp_path, apply=True)

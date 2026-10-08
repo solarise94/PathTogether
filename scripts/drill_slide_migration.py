@@ -134,8 +134,10 @@ def _seed_relations(conn):
           "('grt_drill_1', %s, %s, true), ('grt_drill_2', %s, %s, true)",
           (TOK_SHARE, BOB, TOK_TOMB, BOB))
     _exec(conn,
-          "INSERT INTO slide_view_grants (slide_name, user_id, slide_id) "
-          "VALUES ('specimen.svs', %s, 'sld_drill_svs01')", (BOB,))
+          "INSERT INTO slide_view_grants (slide_name, user_id, slide_id, "
+                "expires_at) "
+          "VALUES ('specimen.svs', %s, 'sld_drill_svs01', "
+          " now() + interval '30 days')", (BOB,))
     _exec(conn, "INSERT INTO projects (project_id, name) "
                 "VALUES ('prj_drill_1', '迁移演练项目')")
     _exec(conn,

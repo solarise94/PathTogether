@@ -177,8 +177,9 @@ def test_authorize_view_grant_only_by_slide_id(conn):
     with conn.cursor() as cur:
         # slide_id 级授权：放行
         cur.execute(
-            "INSERT INTO slide_view_grants (slide_name, user_id, slide_id) "
-            "VALUES ('legacy-a.svs', 'usr_g', %s)", (target.slide_id,))
+            "INSERT INTO slide_view_grants (slide_name, user_id, slide_id, "
+            "expires_at) VALUES ('legacy-a.svs', 'usr_g', %s, "
+            "now() + interval '30 days')", (target.slide_id,))
         conn.commit()
     assert slide_store.authorize_read(target, actor_user_id="usr_g")
     # 只认 slide_id 不认 slide_name：授权行绑到别的 slide_id 时，
@@ -186,9 +187,10 @@ def test_authorize_view_grant_only_by_slide_id(conn):
     other = _alloc_ready(owner="usr_o2", name="legacy-a.svs")
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO slide_view_grants (slide_name, user_id, slide_id) "
-            "VALUES (%s, 'usr_g2', %s)", (other.original_filename,
-                                          target.slide_id))
+            "INSERT INTO slide_view_grants (slide_name, user_id, slide_id, "
+            "expires_at) VALUES (%s, 'usr_g2', %s, "
+            "now() + interval '30 days')", (other.original_filename,
+                                            target.slide_id))
         conn.commit()
     assert not slide_store.authorize_read(other, actor_user_id="usr_g2")
 
@@ -369,8 +371,9 @@ def test_update_display_name_keeps_alias_and_grants(conn):
             ("sld_meta1", "keep.svs", "usr_o", False, "ready",
              "objects/sld_meta1/data.svs"))
         cur.execute(
-            "INSERT INTO slide_view_grants (slide_name, user_id, slide_id) "
-            "VALUES ('keep.svs', 'usr_g', 'sld_meta1')")
+            "INSERT INTO slide_view_grants (slide_name, user_id, slide_id, "
+            "expires_at) VALUES ('keep.svs', 'usr_g', 'sld_meta1', "
+            "now() + interval '30 days')")
         conn.commit()
     assert slide_store.authorize_read(
         slide_store.resolve_legacy_alias("keep.svs"), actor_user_id="usr_g")

@@ -94,13 +94,31 @@ def _pg():
 
 
 def _pending_user(email, direction="other", share=False):
-    out = registration_store.enqueue_email_verification(
-        email, base_url="https://repair.example.com")
-    registration_store.verify_email_create_user(out["token"],
-                                                "longpassword123")
-    user = user_store.get_user_by_login_id(email.lower())
-    assert user is not None
-    test_application_store.submit(user["user_id"], direction, share)
+    """直插 pending_activation 用户（存量 email_verify 形态；2026-10-08 §4：
+    verify 建号退役）并提交申请。"""
+    import secrets
+    from werkzeug.security import generate_password_hash
+    email = email.lower()
+    uid = "usr_" + secrets.token_urlsafe(8)
+    conn = _pg()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (user_id, login_id, display_name, "
+                "password_hash, role, created_at, disabled, ai_config, "
+                "ai_access, activation_state, activation_source, "
+                "activation_updated_at, email, email_normalized, "
+                "email_verified_at) VALUES (%s,%s,%s,%s,'user', now(), FALSE, "
+                "'{}'::jsonb, FALSE, 'pending_activation', "
+                "'invite_activation', now(), %s, %s, now()) RETURNING user_id",
+                (uid, email, email, generate_password_hash("longpassword123"),
+                 email, email))
+            uid = cur.fetchone()["user_id"]
+        conn.commit()
+    finally:
+        conn.close()
+    user = user_store.get_user(uid)
+    test_application_store.submit(uid, direction, share)
     return user
 
 
@@ -162,15 +180,21 @@ def _build_scenarios():
     user_c = _pending_user("repair-c@x.com")
     user_d = _pending_user("repair-d@x.com")
     user_e = _pending_user("repair-e@x.com")
-    inv_a = registration_store.create_invite(owner["user_id"])
-    inv_b = registration_store.create_invite(owner["user_id"])
-    registration_store.activate_registered_user(user_a["user_id"],
-                                                inv_a["token"])
-    registration_store.activate_registered_user(user_b["user_id"],
-                                                inv_b["token"])
-    # 修复后正常激活已即时收口 → 回拨模拟历史滞留
-    _rewind_to_pending(user_a["user_id"])
-    _rewind_to_pending(user_b["user_id"])
+    # A/B：历史「邀请码激活成功但申请滞留 pending」形态——直接构造
+    # （active + activation_source='invite' + pending 申请；2026-10-08 §4 起
+    # activate_registered_user 退役，不再有真实入口）
+    for u in (user_a, user_b):
+        conn = _pg()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET activation_state='active', "
+                    "activation_source='invite', activation_updated_at=now(), "
+                    "ai_access=TRUE WHERE user_id=%s", (u["user_id"],))
+            conn.commit()
+        finally:
+            conn.close()
+        _rewind_to_pending(u["user_id"])
     client = csrf_client(app_mod.app.test_client())
     app_mod.app.config["TESTING"] = True
     app_mod.AUTH_ENABLED = True

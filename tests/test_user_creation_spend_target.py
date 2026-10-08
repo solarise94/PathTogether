@@ -5,8 +5,9 @@
 role=user 的授权面**恒**为一次性总额度（ai_spend_total_allowances），demo=
 每周窗口、owner=每月窗口不受影响：
 
-- 建号（user_store_pg.create_user_with_total_allowance）与兑换
-  （registration_store.redeem_invite）**必须**同事务建 allowance 行：
+- 建号（user_store_pg.create_user_with_total_allowance）与登录惰性激活
+  （registration_store.lazy_activate_pending_user，2026-10-08 §4 起替代
+  已退役的邀请码兑换）**必须**同事务建 allowance 行：
   显式 X 按面值建行（default_version=None）；无 X 解析全局默认
   （**只查** ai_spend_total_defaults，default_version=默认行版本）；
   defaults 缺行 → ValueError ``total_default_missing``（路由层 400；
@@ -20,8 +21,8 @@ role=user 的授权面**恒**为一次性总额度（ai_spend_total_allowances�
 - create_user_with_total_allowance：显式 X / defaults 行解析 / 缺默认
   fail-closed（用户零残留）；
 - create_user（role=user 委托）：无 X 走默认建行；
-- redeem_invite：模板面值建行（source=invite）、无面值走默认、缺默认
-  拒绝且回滚（invite 不消费）。
+- 兑换（redeem_invite）已随邀请码注册退役删除；「默认解析/缺默认回滚」
+  由惰性激活承担（test_spend_total_allowances.py）。
 
 运行：RUN_PG_TESTS=1 python3 -m pytest tests/test_user_creation_spend_target.py -q
 """
@@ -33,7 +34,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
 import pytest  # noqa: E402
 
-import registration_store  # noqa: E402
 import spend_store  # noqa: E402
 import user_store  # noqa: E402
 import user_store_pg  # noqa: E402
@@ -205,56 +205,9 @@ def test_create_user_delegate_always_builds_allowance():
 
 
 # --------------------------------------------------------------------------- #
-# 2. 兑换恒建 allowance（registration_store.redeem_invite）
+# 2. 兑换（redeem_invite）已随邀请码注册退役删除（2026-10-08 §4）：
+#    「无面值解析默认 / 缺默认 fail-closed 整体回滚」的同款语义由登录惰性
+#    激活（lazy_activate_pending_user）承担，见 test_spend_total_allowances
+#    .test_lazy_activation_creates_allowance_atomically /
+#    test_lazy_activation_missing_default_fails_closed。
 # --------------------------------------------------------------------------- #
-def test_redeem_without_limit_resolves_default():
-    """兑换无模板面值 → 解析默认建行（source=invite，default_version=默认
-    版本；旧 monthly 列运行时不再读取——0032 已回填 total 列）。"""
-    bh.seed_spend_settings()
-    owner = _mk_owner()
-    inv = registration_store.create_invite(owner["user_id"],
-                                           login_id="r-default@x.com")
-    out = registration_store.redeem_invite(inv["token"], "r-default@x.com",
-                                           "password-123456")
-    allowance = out["total_allowance"]
-    assert allowance is not None
-    assert allowance["source"] == "invite"
-    assert allowance["limit_nano_cny"] == 20 * 10 ** 9
-    assert allowance["default_version"] == _defaults_version()
-    assert "spend_override_policy" not in out  # 兼容键已物理删除（Wave2）
-    assert _override_rows() == 0
-
-
-def test_redeem_with_explicit_limit_creates_allowance():
-    """兑换带模板面值 → 按面值建行（default_version=None），不建 override。"""
-    bh.seed_spend_settings()
-    owner = _mk_owner()
-    inv = registration_store.create_invite(
-        owner["user_id"], login_id="r-x@x.com",
-        total_limit_nano_cny=9 * 10 ** 9)
-    out = registration_store.redeem_invite(inv["token"], "r-x@x.com",
-                                           "password-123456")
-    allowance = out["total_allowance"]
-    assert allowance is not None
-    assert allowance["limit_nano_cny"] == 9 * 10 ** 9
-    assert allowance["source"] == "invite"
-    assert allowance["default_version"] is None
-    assert "spend_override_policy" not in out  # 兼容键已物理删除（Wave2）
-    assert _override_rows(out["user"]["user_id"]) == 0
-
-
-def test_redeem_without_any_default_fails_closed():
-    """兑换且 defaults 缺行 → ValueError total_default_missing；整体回滚
-    （用户不创建、邀请不消费）。"""
-    bh.seed_spend_settings()
-    _clear_defaults()
-    owner = _mk_owner()
-    inv = registration_store.create_invite(owner["user_id"],
-                                           login_id="r-miss@x.com")
-    with pytest.raises(ValueError) as exc_info:
-        registration_store.redeem_invite(inv["token"], "r-miss@x.com",
-                                         "password-123456")
-    assert "total_default_missing" in str(exc_info.value)
-    assert user_store.get_user_by_login_id("r-miss@x.com") is None
-    row = registration_store.get_invite(inv["invite_id"])
-    assert row["consumed_at"] is None and row["use_count"] == 0

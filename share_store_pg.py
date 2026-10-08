@@ -658,20 +658,33 @@ def list_grants_for_user(user_id):
 # 「删除 → 同名再上传」替换资产后，即使行未被清理也不再匹配新内容；删除
 # 路径（revoke_slide_view_grants_for_slide）按名 + slide_id 清理行。
 # --------------------------------------------------------------------------- #
-def grant_slide_view(user_id, slide_name, granted_by=None, slide_id=None):
-    """建立 view 授权（幂等 + 显式资产生代重绑定）。
+def grant_slide_view(user_id, slide_name, granted_by=None, slide_id=None,
+                     ttl_seconds=None):
+    """建立 view 授权（幂等 + 显式资产生代重绑带；2026-10-08 §3 起带到期时间）。
 
-    返回 {"already_granted", "granted_at"}。行不存在 → 插入（绑定当前
-    slide_id）；已存在同名行 → 幂等成功（保留首次 granted_at/granted_by），
-    但当资产生代失配（行上 slide_id ≠ 本次给定值）时**更新为当前 slide_id**
-    ——升级 B R7 失效语义的另一半：同名替换后旧授权不自动生效，需要重新
-    添加；重新添加即显式重绑当前资产生代（COALESCE 允许孤儿切片以 NULL
-    授权行保持 NULL）。user_id/slide_name 需非空字符串。
+    返回 {"already_granted", "granted_at", "expires_at"}。行不存在 → 插入
+    （绑定当前 slide_id，expires_at = now()+ttl）；已存在同名行 → 幂等成功
+    （保留首次 granted_at/granted_by/expires_at），但当资产生代失配（行上
+    slide_id ≠ 本次给定值）时**更新为当前 slide_id**——升级 B R7 失效语义的
+    另一半：同名替换后旧授权不自动生效，需要重新添加；重新添加即显式重绑
+    当前资产生代（COALESCE 允许孤儿切片以 NULL 授权行保持 NULL）。
+    user_id/slide_name 需非空字符串。
+
+    0080 起 expires_at NOT NULL：``ttl_seconds`` 缺省按「实质不过期」处理
+    （100 年）——该函数不再有生产写入方（旧 visibility 端点已退役），仅供
+    测试/工具构造授权；生产临时查看走 start/end_slide_view_grant_timed。
     """
     if not isinstance(user_id, str) or not user_id:
         raise ValueError("user_id 不能为空")
     if not isinstance(slide_name, str) or not slide_name:
         raise ValueError("slide_name 不能为空")
+    try:
+        ttl = float(ttl_seconds) if ttl_seconds is not None \
+            else 100 * 365 * 24 * 3600.0
+    except (TypeError, ValueError):
+        ttl = 100 * 365 * 24 * 3600.0
+    if ttl <= 0:
+        raise ValueError("ttl_seconds 需为正数")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -681,40 +694,134 @@ def grant_slide_view(user_id, slide_name, granted_by=None, slide_id=None):
                 # 用 rowcount 区分插入/幂等更新）。
                 cur.execute(
                     "INSERT INTO slide_view_grants (slide_name, user_id, "
-                    "granted_by, slide_id) VALUES (%s,%s,%s,%s) ON CONFLICT "
-                    "(slide_name, user_id) DO UPDATE SET slide_id = "
+                    "granted_by, slide_id, expires_at) "
+                    "VALUES (%s,%s,%s,%s, now() + (%s * interval '1 second')) "
+                    "ON CONFLICT (slide_name, user_id) DO UPDATE SET slide_id = "
                     "COALESCE(EXCLUDED.slide_id, slide_view_grants.slide_id) "
                     "RETURNING (xmax = 0) AS inserted, extract(epoch from "
-                    "granted_at)::float8 AS granted_at",
+                    "granted_at)::float8 AS granted_at, "
+                    "extract(epoch from expires_at)::float8 AS expires_at",
                     (slide_name, user_id, granted_by or None,
-                     slide_id or None),
+                     slide_id or None, ttl),
                 )
                 row = cur.fetchone()
                 inserted = bool(row["inserted"])
                 if not inserted:
-                    # 幂等重放：granted_at 语义保留「首次授权时间」
+                    # 幂等重放：granted_at/expires_at 语义保留「首次授权」值
                     cur.execute(
                         "SELECT extract(epoch from granted_at)::float8 AS "
-                        "granted_at FROM slide_view_grants "
+                        "granted_at, extract(epoch from expires_at)::float8 "
+                        "AS expires_at FROM slide_view_grants "
                         "WHERE slide_name=%s AND user_id=%s",
                         (slide_name, user_id),
                     )
                     row = cur.fetchone()
-                else:
-                    row = {"granted_at": time.time()}
         return {
             "user_id": user_id,
             "slide_name": slide_name,
             "granted_by": granted_by or None,
             "already_granted": not inserted,
             "granted_at": row["granted_at"] if row else None,
+            "expires_at": row["expires_at"] if row else None,
         }
     finally:
         conn.close()
 
 
-def revoke_slide_view(user_id, slide_name):
-    """收回 view 授权（幂等）。返回是否确有授权被移除。"""
+def start_slide_view_grant_timed(user_id, slide_name, granted_by=None,
+                                 slide_id=None, ttl_seconds=3600.0):
+    """管理员临时查看「开启」（2026-10-08 §3.1；单事务幂等）。
+
+    - 已有 ``expires_at > now()`` 的授权 → 原样返回（``started=False``，
+      **不续期**——重复开启返回原到期，天然幂等）；
+    - 否则刷新授权窗口：``granted_at=now(), expires_at=now()+ttl,
+      granted_by, slide_id``（过期行被重新开启 = 新窗口）。
+
+    行寻址以 (slide_id, user_id) 唯一索引（0067）为权威：同一主体对同一
+    slide_id 至多一行（历史行可能以 legacy 名或 slide_id 为 slide_name 键，
+    混合键形态在锁内归一刷新，绝不插第二行）。
+
+    返回 ``{"started", "granted_at", "expires_at"}``（epoch 秒）。
+    """
+    if not isinstance(user_id, str) or not user_id:
+        raise ValueError("user_id 不能为空")
+    if not isinstance(slide_name, str) or not slide_name:
+        raise ValueError("slide_name 不能为空")
+    try:
+        ttl = float(ttl_seconds)
+    except (TypeError, ValueError):
+        raise ValueError("ttl_seconds 需为数值")
+    if ttl <= 0:
+        raise ValueError("ttl_seconds 需为正数")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                # 权威行：该主体对该 slide_id 的行（任意键形态）
+                if slide_id:
+                    cur.execute(
+                        "SELECT slide_name, extract(epoch from granted_at)::"
+                        "float8 AS granted_at, extract(epoch from expires_at)"
+                        "::float8 AS expires_at FROM slide_view_grants "
+                        "WHERE user_id=%s AND slide_id=%s FOR UPDATE",
+                        (user_id, slide_id))
+                    row = cur.fetchone()
+                    if row is not None:
+                        if row["expires_at"] > time.time():
+                            return {"started": False,
+                                    "granted_at": row["granted_at"],
+                                    "expires_at": row["expires_at"]}
+                        # 过期：原地刷新窗口（新 granted_at/expires_at；
+                        # slide_name 归一为当前键——历史行可能以 slide_id
+                        # 字符串为名键，按名读路径依赖与 legacy 名一致）
+                        cur.execute(
+                            "UPDATE slide_view_grants SET slide_name=%s, "
+                            "granted_by=%s, slide_id=%s, granted_at=now(), "
+                            "expires_at=now() + (%s * interval '1 second') "
+                            "WHERE user_id=%s AND slide_id=%s RETURNING "
+                            "extract(epoch from granted_at)::float8 AS "
+                            "granted_at, extract(epoch from expires_at)::"
+                            "float8 AS expires_at",
+                            (slide_name, granted_by or None, slide_id, ttl,
+                             user_id, slide_id))
+                        r2 = cur.fetchone()
+                        return {"started": True,
+                                "granted_at": r2["granted_at"],
+                                "expires_at": r2["expires_at"]}
+                # 无 (slide_id, user) 行：按 (slide_name, user) upsert
+                # （孤儿/历史 NULL-ID 形态；命中唯一索引冲突不可达——上面
+                # 已按 slide_id 归一）
+                cur.execute(
+                    "INSERT INTO slide_view_grants "
+                    "(slide_name, user_id, granted_by, slide_id, granted_at, "
+                    " expires_at) VALUES (%s,%s,%s,%s, now(), "
+                    " now() + (%s * interval '1 second')) "
+                    "ON CONFLICT (slide_name, user_id) DO UPDATE SET "
+                    "granted_by=EXCLUDED.granted_by, "
+                    "slide_id=COALESCE(EXCLUDED.slide_id, "
+                    "slide_view_grants.slide_id), granted_at=now(), "
+                    "expires_at=EXCLUDED.expires_at "
+                    "RETURNING extract(epoch from granted_at)::float8 AS "
+                    "granted_at, extract(epoch from expires_at)::float8 AS "
+                    "expires_at",
+                    (slide_name, user_id, granted_by or None,
+                     slide_id or None, ttl))
+                r3 = cur.fetchone()
+                # 本分支必然开新窗口（新行或同键过期行刷新）
+                return {"started": True,
+                        "granted_at": r3["granted_at"],
+                        "expires_at": r3["expires_at"]}
+    finally:
+        conn.close()
+
+
+def end_slide_view_grant(user_id, slide_name, slide_id=None):
+    """管理员临时查看「结束」（2026-10-08 §3.1；幂等）。
+
+    把该主体对该切片**未到期**的授权 ``expires_at`` 置为 now()（已到期/无行
+    不动）。按 slide_id（权威，0067 唯一索引）命中，缺省回退 slide_name。
+    返回 "ended"（确有未到期授权被结束）或 "none"（幂等重放）。
+    """
     if not isinstance(user_id, str) or not user_id:
         raise ValueError("user_id 不能为空")
     if not isinstance(slide_name, str) or not slide_name:
@@ -723,32 +830,41 @@ def revoke_slide_view(user_id, slide_name):
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM slide_view_grants "
-                    "WHERE slide_name=%s AND user_id=%s",
-                    (slide_name, user_id),
-                )
-                return cur.rowcount > 0
+                if slide_id:
+                    cur.execute(
+                        "UPDATE slide_view_grants SET expires_at=now() "
+                        "WHERE user_id=%s AND (slide_id=%s OR slide_name=%s) "
+                        "AND expires_at > now()",
+                        (user_id, slide_id, slide_name))
+                else:
+                    cur.execute(
+                        "UPDATE slide_view_grants SET expires_at=now() "
+                        "WHERE slide_name=%s AND user_id=%s "
+                        "AND expires_at > now()", (slide_name, user_id))
+                return "ended" if cur.rowcount > 0 else "none"
     finally:
         conn.close()
 
 
-def revoke_slide_view_by_id(user_id, slide_id):
-    """按资产 ID 收回某主体的 view 授权（幂等；无唯一名的新资产用此口径）。"""
-    if not isinstance(user_id, str) or not user_id:
-        raise ValueError("user_id 不能为空")
-    if not isinstance(slide_id, str) or not slide_id:
-        raise ValueError("slide_id 不能为空")
+def active_slide_view_grants_for_user(user_id):
+    """主体当前**未到期**的 slide_view_grants：{slide_id: expires_at(epoch)}。
+
+    /api/slides 的 temporary_view_expires_at 标注与 AI run grant 到期钳制
+    （§3.2/§3.3）共用；只返回行上 slide_id 非空的授权。
+    """
+    if not user_id:
+        return {}
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "DELETE FROM slide_view_grants "
-                    "WHERE user_id=%s AND slide_id=%s",
-                    (user_id, slide_id),
-                )
-                return cur.rowcount > 0
+                    "SELECT slide_id, extract(epoch from expires_at)::float8 "
+                    "AS expires_at FROM slide_view_grants "
+                    "WHERE user_id=%s AND slide_id IS NOT NULL "
+                    "AND expires_at > now()", (user_id,))
+                return {r["slide_id"]: float(r["expires_at"])
+                        for r in cur.fetchall()}
     finally:
         conn.close()
 
@@ -790,6 +906,7 @@ def slide_view_grants_for_user(user_id):
     升级 B R7：要求授权行资产生代（slide_id）与 slides 行当前值一致
     （IS NOT DISTINCT FROM，双方皆 NULL 的孤儿授权照常生效）——同名资产
     替换后旧授权不再匹配新内容（配合删除路径的按名清理，失效语义双保险）。
+    2026-10-08 §3.2：只认未到期行（expires_at > now()，0080 起）。
     """
     if not user_id:
         return set()
@@ -801,6 +918,7 @@ def slide_view_grants_for_user(user_id):
                     "SELECT g.slide_name FROM slide_view_grants g "
                     "LEFT JOIN slides s ON s.legacy_filename = g.slide_name "
                     "WHERE g.user_id=%s "
+                    "AND g.expires_at > now() "
                     "AND g.slide_id IS NOT DISTINCT FROM s.slide_id",
                     (user_id,),
                 )
@@ -810,11 +928,11 @@ def slide_view_grants_for_user(user_id):
 
 
 def list_slide_view_grants():
-    """返回全部 view 授权行（inventory 标注「是否已授权给 owner」用）。
+    """返回全部 view 授权行（inventory 标注管理员临时查看状态用）。
 
-    行形态 {slide_name, user_id, granted_by, granted_at(epoch), slide_id}；
-    按授权时间降序。表不存在前（迁移未跑）调用方会拿到编程错误——
-    ensure_schema 在 app 启动期 fail-fast，运行期表必然存在。
+    行形态 {slide_name, user_id, granted_by, granted_at(epoch), slide_id,
+    expires_at(epoch)}；按授权时间降序。表不存在前（迁移未跑）调用方会拿到
+    编程错误——ensure_schema 在 app 启动期 fail-fast，运行期表必然存在。
     """
     conn = _connect()
     try:
@@ -822,7 +940,8 @@ def list_slide_view_grants():
             with c.cursor() as cur:
                 cur.execute(
                     "SELECT slide_name, user_id, granted_by, slide_id, "
-                    "extract(epoch from granted_at)::float8 AS granted_at "
+                    "extract(epoch from granted_at)::float8 AS granted_at, "
+                    "extract(epoch from expires_at)::float8 AS expires_at "
                     "FROM slide_view_grants ORDER BY granted_at DESC, "
                     "slide_name, user_id",
                 )
@@ -833,6 +952,7 @@ def list_slide_view_grants():
                         "granted_by": r["granted_by"],
                         "slide_id": r["slide_id"],
                         "granted_at": r["granted_at"],
+                        "expires_at": r["expires_at"],
                     }
                     for r in cur.fetchall()
                 ]
@@ -2308,12 +2428,15 @@ def _project_slide_rows(cur, slides, slide_ids=None):
 
 
 def create_project(name, note="", slides=None, owner_user_id=None,
-                   requester_role=None, slide_ids=None):
+                   requester_role=None, slide_ids=None, parent_project_id=None):
     """创建项目。pid=secrets.token_urlsafe(10)。返回新建项目 dict（含 pid）。
 
     P2（合同 §3.2/R-07）：slide_ids 优先或名数组（alias 解析）；project_slides
     写 slide_id + 文本快照双列；唯一键 (project_id, slide_id)——同名不同 ID
     可并存（0067 部分唯一索引）。
+    2026-10-08 §5.3：可选 ``parent_project_id`` 建子文件夹——事务内锁 owner
+    项目行并校验（存在/同 owner/未归档/层级 ≤5），非法抛
+    :class:`ProjectParentError`（路由层映射 400/403/409）。
     """
     _reject_guest_write(requester_role)
     pid = "prj_" + secrets.token_urlsafe(10)
@@ -2326,15 +2449,21 @@ def create_project(name, note="", slides=None, owner_user_id=None,
         "created_at": now,
         "owner_user_id": owner_user_id or _OWNER_USER_ID or None,
         "archived": False,  # Stage 3c-2：归档纯只读开关，默认未归档
+        "parent_project_id": parent_project_id or None,
     }
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
+                if parent_project_id:
+                    _validate_parent_tx(cur, proj["owner_user_id"],
+                                        parent_project_id)
                 cur.execute(
-                    "INSERT INTO projects (project_id, name, note, owner_user_id, "
-                    "created_at) VALUES (%s,%s,%s,%s, to_timestamp(%s))",
-                    (pid, proj["name"], proj["note"], proj["owner_user_id"], now))
+                    "INSERT INTO projects (project_id, name, note, "
+                    "owner_user_id, created_at, parent_project_id) "
+                    "VALUES (%s,%s,%s,%s, to_timestamp(%s), %s)",
+                    (pid, proj["name"], proj["note"], proj["owner_user_id"],
+                     now, proj["parent_project_id"]))
                 rows = _project_slide_rows(cur, list(slides or []),
                                           slide_ids)
                 for i, (s, sid) in enumerate(rows):
@@ -2352,9 +2481,144 @@ def create_project(name, note="", slides=None, owner_user_id=None,
 
 
 _PROJ_SEL = (
-    "project_id, name, note, owner_user_id, archived, "
+    "project_id, name, note, owner_user_id, archived, parent_project_id, "
     "extract(epoch from created_at)::float8 AS created_at"
 )
+
+
+# --------------------------------------------------------------------------- #
+# 文件夹层级（2026-10-08 docs/admin-viewer-simplified-20261008.md §5.3）
+#
+# 文件夹 = 现有项目（project_id/成员/分享/归档语义不变），UI 文案叫「文件夹」。
+# parent_project_id 校验：父项目存在且同 owner、未归档、不能是自己或自己的
+# 子孙、层级不超过 5；移动/创建在事务内先 FOR UPDATE 锁住该 owner 的全部
+# 项目行再做环检测（并发移动串行化，owner 内不可能成环）。
+# --------------------------------------------------------------------------- #
+#: 文件夹最大层级（根=1；层级不超过 5）
+PROJECT_MAX_DEPTH = 5
+
+#: update_project 的 parent_project_id 「不修改」哨兵（None = 移到根）
+PROJECT_PARENT_UNCHANGED = object()
+
+
+class ProjectParentError(Exception):
+    """文件夹层级校验失败（§5.3）。status ∈ {400, 403, 409}；code/message
+    供路由层映射稳定错误信封。"""
+
+    def __init__(self, status, code, message):
+        self.status = int(status)
+        self.code = str(code)
+        self.message = str(message)
+        super().__init__(message)
+
+
+def _lock_owner_projects_tx(cur, owner_user_id):
+    """锁住该 owner 的全部项目行（FOR UPDATE，事务内），返回
+    {project_id: row}。并发移动/创建同一 owner 的文件夹在此串行化。"""
+    cur.execute(
+        "SELECT project_id, parent_project_id, archived, owner_user_id "
+        "FROM projects WHERE owner_user_id=%s ORDER BY project_id FOR UPDATE",
+        (owner_user_id,))
+    return {r["project_id"]: dict(r) for r in cur.fetchall()}
+
+
+def _lookup_parent_global(cur, parent_project_id):
+    """父项目的全库快照（区分 404/403 用；权威校验在 owner 行锁之后）。"""
+    cur.execute(
+        "SELECT project_id, parent_project_id, archived, owner_user_id "
+        "FROM projects WHERE project_id=%s", (parent_project_id,))
+    row = cur.fetchone()
+    return dict(row) if row is not None else None
+
+
+def _chain_depth(rows_by_id, pid):
+    """pid 的层级（根=1）：沿 parent 链向上计数；环（脏数据）按已访问截断。"""
+    d = 0
+    node = pid
+    seen = set()
+    while node is not None and node not in seen:
+        seen.add(node)
+        d += 1
+        row = rows_by_id.get(node)
+        node = row["parent_project_id"] if row else None
+    return d
+
+
+def _descendant_max_relative_depth(rows_by_id, pid):
+    """pid 子树内相对 pid 的最大深度（pid 自身=0）。"""
+    children = {}
+    for row in rows_by_id.values():
+        parent = row["parent_project_id"]
+        if parent:
+            children.setdefault(parent, []).append(row["project_id"])
+    best = 0
+    stack = [(pid, 0)]
+    seen = set()
+    while stack:
+        node, rel = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        best = max(best, rel)
+        for child in children.get(node, []):
+            stack.append((child, rel + 1))
+    return best
+
+
+def _validate_parent_tx(cur, owner_user_id, parent_project_id, *,
+                        self_id=None):
+    """事务内校验父项目并锁 owner 行（§5.3）。
+
+    返回锁定快照 rows_by_id（移动路径复用做环/层级检测）。非法抛
+    :class:`ProjectParentError`：
+      - 父不存在 → 400 parent_not_found；
+      - 父属其他 owner → 403 parent_not_owner；
+      - 父已归档 → 409 parent_archived；
+      - 自引用 / 移入自己的子孙 → 409 parent_cycle；
+      - 超过 5 层 → 409 parent_depth_exceeded。
+    """
+    parent = _lookup_parent_global(cur, parent_project_id)
+    if parent is None:
+        raise ProjectParentError(400, "parent_not_found", "父文件夹不存在")
+    if (parent["owner_user_id"] or "") != (owner_user_id or ""):
+        raise ProjectParentError(
+            403, "parent_not_owner", "不能把其他用户的文件夹作为父级")
+    rows_by_id = _lock_owner_projects_tx(cur, owner_user_id)
+    parent_locked = rows_by_id.get(parent_project_id)
+    if parent_locked is None:
+        # 锁窗口内被删除：按不存在处理
+        raise ProjectParentError(400, "parent_not_found", "父文件夹不存在")
+    if parent_locked["archived"]:
+        raise ProjectParentError(
+            409, "parent_archived", "父文件夹已归档，不能放入子文件夹")
+    if self_id is not None:
+        if parent_project_id == self_id:
+            raise ProjectParentError(
+                409, "parent_cycle", "不能把文件夹设为自己的父级")
+        node = parent_project_id
+        seen = set()
+        while node is not None and node not in seen:
+            if node == self_id:
+                raise ProjectParentError(
+                    409, "parent_cycle", "不能把文件夹移动到自己的子文件夹内")
+            seen.add(node)
+            row = rows_by_id.get(node)
+            node = row["parent_project_id"] if row else None
+        # 层级：新自身层级 = 父层级 + 1；子树整体随移动平移，最深 descendant
+        # 不得超过 5
+        new_self_depth = _chain_depth(rows_by_id, parent_project_id) + 1
+        rel_max = _descendant_max_relative_depth(rows_by_id, self_id)
+        if new_self_depth + rel_max > PROJECT_MAX_DEPTH:
+            raise ProjectParentError(
+                409, "parent_depth_exceeded",
+                "文件夹层级超过 %d 层上限" % PROJECT_MAX_DEPTH)
+    else:
+        # 新建子文件夹：父层级 + 1 ≤ 5
+        if _chain_depth(rows_by_id, parent_project_id) + 1 > PROJECT_MAX_DEPTH:
+            raise ProjectParentError(
+                409, "parent_depth_exceeded",
+                "文件夹层级超过 %d 层上限" % PROJECT_MAX_DEPTH)
+    return rows_by_id
 
 
 # 用户删除（deleting/deleted）的资产不属于项目的活动视图：列表、计数与
@@ -2416,16 +2680,39 @@ def get_project(pid):
         conn.close()
 
 
-def update_project(pid, *, name=None, note=None, slides=None, slide_ids=None):
-    """更新项目字段（仅更新非 None 字段）。返回更新后的 dict；不存在返回 None。"""
+def update_project(pid, *, name=None, note=None, slides=None, slide_ids=None,
+                   parent_project_id=PROJECT_PARENT_UNCHANGED):
+    """更新项目字段（仅更新非 None 字段）。返回更新后的 dict；不存在返回 None。
+
+    2026-10-08 §5.3：``parent_project_id`` 支持「移动文件夹」——
+    PROJECT_PARENT_UNCHANGED（缺省）= 不动；None = 移到根；str = 移到该父
+    （事务内锁 owner 行 + 环/层级/同 owner/归档校验，非法抛
+    :class:`ProjectParentError`）。
+    """
+    move_parent = parent_project_id is not PROJECT_PARENT_UNCHANGED
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                cur.execute("SELECT name FROM projects WHERE project_id=%s", (pid,))
+                cur.execute("SELECT name, owner_user_id FROM projects "
+                            "WHERE project_id=%s", (pid,))
                 prow = cur.fetchone()
                 if prow is None:
                     return None
+                if move_parent:
+                    if parent_project_id:
+                        _validate_parent_tx(
+                            cur, prow["owner_user_id"], parent_project_id,
+                            self_id=pid)
+                        cur.execute(
+                            "UPDATE projects SET parent_project_id=%s "
+                            "WHERE project_id=%s",
+                            (parent_project_id, pid))
+                    else:
+                        # null = 移到根
+                        cur.execute(
+                            "UPDATE projects SET parent_project_id=NULL "
+                            "WHERE project_id=%s", (pid,))
                 if name is not None:
                     cur.execute("UPDATE projects SET name=%s WHERE project_id=%s",
                                 (str(name).strip() or prow["name"] or "未命名项目",

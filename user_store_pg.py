@@ -225,14 +225,18 @@ _SEL_HASH = (
     "extract(epoch from created_at)::float8 AS created_at, disabled, ai_config, "
     "ai_access, auth_version, activation_state, activation_source, "
     "email, email_normalized, "
-    "extract(epoch from email_verified_at)::float8 AS email_verified_at"
+    "extract(epoch from email_verified_at)::float8 AS email_verified_at, "
+    "account_kind, "
+    "extract(epoch from last_login_at)::float8 AS last_login_at"
 )
 _SEL_PUBLIC = (
     "user_id, login_id, display_name, role, "
     "extract(epoch from created_at)::float8 AS created_at, disabled, ai_config, "
     "ai_access, auth_version, activation_state, activation_source, "
     "email, email_normalized, "
-    "extract(epoch from email_verified_at)::float8 AS email_verified_at"
+    "extract(epoch from email_verified_at)::float8 AS email_verified_at, "
+    "account_kind, "
+    "extract(epoch from last_login_at)::float8 AS last_login_at"
 )
 
 
@@ -545,6 +549,68 @@ def set_user_disabled(user_id, flag):
                 )
                 row = cur.fetchone()
         return _public(row) if row else None
+    finally:
+        conn.close()
+
+
+def record_login_success(user_id):
+    """登录成功时间戳（2026-10-08 §2）：``last_login_at = GREATEST(
+    COALESCE(last_login_at, '-infinity'), now())``。
+
+    只在 login() 正常成功路径调用——登录失败/刷新/AI 请求/注册完成（不自动
+    登录）都不更新。GREATEST+COALESCE 保证单调不回退（时钟回拨防御）；返回
+    是否确有该用户行。旧用户保持 NULL 直到首次成功登录。
+    """
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET last_login_at = GREATEST("
+                    "COALESCE(last_login_at, '-infinity'), now()) "
+                    "WHERE user_id=%s",
+                    (user_id,),
+                )
+                return cur.rowcount == 1
+    finally:
+        conn.close()
+
+
+#: users.account_kind 合法词表（0080 CHECK 同源）
+ACCOUNT_KINDS = ("real", "dogfood")
+
+
+def set_user_account_kind(user_id, account_kind):
+    """设置账号分类（real|dogfood，2026-10-08 §2）。
+
+    返回 ``(after, changed, before)``：``after``=生效值；``changed``=是否确有
+    变化（值未变不写、调用方据此免审计）；``before``=变更前值（供审计
+    detail 记录前后值）。用户不存在返回 ``(None, False, None)``。
+
+    不改 session、额度、角色、启用状态（auth_version 不推进——分类是纯管理
+    标注，不影响任何凭据语义）。
+    """
+    if account_kind not in ACCOUNT_KINDS:
+        raise ValueError("account_kind 需为 %s" % (ACCOUNT_KINDS,))
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT account_kind FROM users WHERE user_id=%s "
+                    "FOR UPDATE", (user_id,))
+                row = cur.fetchone()
+                if row is None:
+                    return None, False, None
+                before = row["account_kind"] or "real"
+                if before == account_kind:
+                    return before, False, before
+                cur.execute(
+                    "UPDATE users SET account_kind=%s WHERE user_id=%s "
+                    "RETURNING account_kind",
+                    (account_kind, user_id))
+                after = cur.fetchone()["account_kind"]
+                return after, True, before
     finally:
         conn.close()
 

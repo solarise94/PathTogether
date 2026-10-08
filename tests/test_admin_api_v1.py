@@ -199,10 +199,18 @@ def test_users_pagination_search_and_filters():
         if not cursor:
             break
     assert len(seen) == 6 and len(set(seen)) == 6
-    # 创建时间升序
+    # 2026-10-08 §2：默认 joined_desc（新→旧）；joined_asc 显式给出为升序
     r0 = c.get("/api/admin/v1/users?limit=100").get_json()
     times = [item["created_at"] for item in r0["items"]]
+    assert times == sorted(times, reverse=True)
+    r0 = c.get("/api/admin/v1/users?limit=100&sort=joined_asc").get_json()
+    times = [item["created_at"] for item in r0["items"]]
     assert times == sorted(times)
+    # last_login_desc：NULL 恒排末尾（本轮全部未登录 → 全空不炸即可）
+    r0 = c.get("/api/admin/v1/users?limit=100&sort=last_login_desc").get_json()
+    assert len(r0["items"]) == 6
+    assert all(item["last_login_at"] is None for item in r0["items"])
+    assert all(item["account_kind"] == "real" for item in r0["items"])
 
     # 搜索（login id / 显示名）
     r = c.get("/api/admin/v1/users?q=member 2").get_json()

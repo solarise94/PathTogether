@@ -42,12 +42,13 @@ REGISTRATION_MODE_KEY = "registration_mode"
 #: 接线）。cutover apply 先 CAS false→true，提交后 CAS true→false。
 AI_DISPATCH_MAINTENANCE_KEY = "ai_dispatch_maintenance"
 
-#: 合法模式（I 线：email_verify_invite_activation 为「邮箱验证 + 邀请码激活」
-#: 两段式；P1（docs/agent-plan-20260921 §4）起 public 正式支持——生效仍需
-#: 通过 registration_store 的前置闸（TLS/Secure Cookie/邮件通道/管理员通知
-#: 邮箱/双协议文稿），未满足降级 closed）
-REGISTRATION_MODES = ("closed", "invite_only",
-                      "email_verify_invite_activation", "public")
+#: 合法模式（2026-10-08 docs/admin-viewer-simplified-20261008.md §4：邀请码
+#: 形态退役，只剩 closed/public；P1（docs/agent-plan-20260921 §4）起 public
+#: 正式支持——生效仍需通过 registration_store 的前置闸（TLS/Secure Cookie/
+#: 邮件通道/管理员通知邮箱/双协议文稿），未满足降级 closed。旧存储值
+#: invite_only / email_verify_invite_activation 读取按非法值 fail-closed
+#: 处理为 closed（生产已是 public 不受影响）。
+REGISTRATION_MODES = ("closed", "public")
 
 _log = logging.getLogger("svs.settings")
 

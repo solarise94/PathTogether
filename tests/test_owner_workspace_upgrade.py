@@ -233,9 +233,11 @@ def test_ai_sessions_list_scoped_for_authenticated_owner(fake_sidecar):
 # =========================================================================== #
 # R6d：撤销联动（run grant 失效 + 运行中 run 取消）
 # =========================================================================== #
-def test_end_temporary_view_revokes_derived_run_grants(fake_sidecar):
-    """结束临时查看后：派生 run grant 立即失效（§3.1/§3.3 主动结束撤销
-    运行授权；sidecar 取消是旧永久收回端点行为，不在新契约内）。"""
+def test_end_temporary_view_revokes_grants_and_cancels_running(fake_sidecar):
+    """结束临时查看后：派生 run grant 立即失效（§3.1/§3.3），且对运行中
+    的 sidecar run 发起既有取消（round-2 补齐——旧永久收回端点同款联动：
+    只取消「running 且属被撤主体」的 run；finished/他人 run 不动；费用
+    hold 不被触碰）。"""
 
     owner, usera = _setup_two_owners()
     slide = _touch("a.svs")
@@ -244,15 +246,34 @@ def test_end_temporary_view_revokes_derived_run_grants(fake_sidecar):
     grant = _install_grant(slide, owner)
     assert share_store.get_run_grant(grant["grant_id"])["revoked"] is False
 
-    # 结束临时查看（§3.1）：run grant 撤销钩子；运行中 run 的 sidecar 取消
-    # 属旧永久收回端点行为，新契约不承诺（grant 失效即 fail-closed）
+    fake = fake_sidecar
+    fake.register_json("GET", "/sessions", body={"sessions": [
+        {"id": "sess-run-1", "owner": owner["user_id"], "status": "running"},
+        {"id": "sess-done", "owner": owner["user_id"], "status": "finished"},
+        {"id": "sess-other", "owner": usera["user_id"], "status": "running"},
+    ]})
+    fake.register_json("POST", "/cancel", body={"ok": True})
+
     r = _revoke(slide, owner)
     assert r.status_code == 200
     assert r.get_json()["temporary_view"]["status"] == "ended"
+    # 只对「running 且属被撤主体」的 run 发起取消；finished / 他人 run 不动
+    assert r.get_json()["runs_cancelled"] == ["sess-run-1"]
+    cancels = [c for c in fake.calls
+               if c["method"] == "POST" and c["path"] == "/cancel"]
+    assert [c["body"]["session_id"] for c in cancels] == ["sess-run-1"]
     # run grant 已失效（下一次工具派发 fail-closed）
     assert share_store.get_run_grant(grant["grant_id"])["revoked"] is True
     assert share_store.get_run_grant(grant["grant_id"])["revoked_at"] \
         is not None
+    # 幂等：再次结束（none）不再触发取消
+    fake.calls.clear()
+    r2 = _revoke(slide, owner)
+    assert r2.status_code == 200
+    assert r2.get_json()["temporary_view"]["status"] == "none"
+    assert r2.get_json()["runs_cancelled"] == []
+    assert not [c for c in fake.calls
+                if c["method"] == "POST" and c["path"] == "/cancel"]
 
 
 def test_slide_delete_clears_view_grants_no_orphans():
@@ -296,7 +317,7 @@ def test_slide_delete_clears_view_grants_no_orphans():
     assert slide_store.resolve_slide_id(old_slide_id).asset_state == "deleted"
 
     # 显式重新授权（按新资产生代）才恢复 owner 可见
-    share_store.grant_slide_view(owner["user_id"], slide,
+    share_store.grant_slide_view(owner["user_id"], slide, 30 * 24 * 3600,
                                  slide_id=new_slide_id)
     visible = {i.get("slide_id") for i in co.get("/api/slides").get_json()}
     assert new_slide_id in visible

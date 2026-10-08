@@ -403,7 +403,7 @@ def test_ai_session_filter_uses_subject_during_preview(fake_sidecar):
     # 读隔离（review P0 2026-09-05）× 升级 B：owner 不默认可见他人切片——
     # 本用例关注 AI 会话过滤参数注入，经管理口径补收录（绑定资产生代）让
     # owner 过切片读闸
-    share_store.grant_slide_view(owner["user_id"], sa,
+    share_store.grant_slide_view(owner["user_id"], sa, 30 * 24 * 3600,
                                  slide_id=share_store.get_slide_id(sa))
     fake_sidecar.register_json(
         "GET", "/sessions", body=[{"session_id": "s1"}])

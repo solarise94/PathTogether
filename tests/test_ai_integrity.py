@@ -198,7 +198,7 @@ def test_cancel_slide_branch_owner_only(fake_sidecar):
     # 升级 B：认证 owner 按 slide 取消需对该切片有当前收录（未添加拒绝）。
     co = _login(_client(auth_enabled=True), owner)
     assert co.post("/api/ai/cancel", json={"slide": slide}).status_code == 403
-    share_store.grant_slide_view(owner["user_id"], slide,
+    share_store.grant_slide_view(owner["user_id"], slide, 30 * 24 * 3600,
                                  slide_id=share_store.get_slide_id(slide))
     assert co.post("/api/ai/cancel", json={"slide": slide}).status_code == 200
     # AUTH_ENABLED=False（归一 owner，内部兼容）也可以。

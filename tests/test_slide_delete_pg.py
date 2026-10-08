@@ -397,7 +397,7 @@ def test_legacy_delete_unified_physical_tombstone_freeze_no_refund(tmp_path):
     assoc.mkdir()
     (assoc / "x").write_bytes(b"assoc")
     # 授权面：view grant（按名+ID）+ share 成员 + run grant
-    share_store.grant_slide_view(ub, name, slide_id=sid)
+    share_store.grant_slide_view(ub, name, 30 * 24 * 3600, slide_id=sid)
     share = share_store.create_share([name], 24, creator_user_id=owner_uid,
                                      slide_ids=[sid])
     share_store.claim_share(share["token"], ub)
@@ -518,7 +518,7 @@ def test_delete_invalidates_entry_points_positive_negative(tmp_path):
     sid_b = publish_test_slide("ent-b.tif", TIFF, owner_user_id=uid,
                                upload_dir=UPLOAD_DIR)
     for sid, nm in ((sid_a, "ent-a.tif"), (sid_b, "ent-b.tif")):
-        share_store.grant_slide_view(uid, nm, slide_id=sid)
+        share_store.grant_slide_view(uid, nm, 30 * 24 * 3600, slide_id=sid)
         share_store.create_run_grant("inst-%s" % sid[-4:], nm,
                                      created_by_user_id=uid, slide_id=sid)
         import demo_store

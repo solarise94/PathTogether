@@ -249,6 +249,27 @@ def test_not_servable_409_and_own_slide_409_and_migrated_grant_denied():
     assert oc.get("/api/slides/%s/info" % old).status_code == 200
 
 
+def test_grant_slide_view_requires_explicit_ttl():
+    """round-2 收紧：grant_slide_view 的 ttl_seconds 必填（无缺省）——
+    任何调用方都不可能因漏传而造出「永久」授权。"""
+    owner, usera = _setup()
+    sid = publish_test_slide("ttl-guard.tif", make_tiff_bytes(),
+                             owner_user_id=usera["user_id"])
+    # 漏传 → TypeError（必填参数）
+    with pytest.raises(TypeError):
+        share_store.grant_slide_view(owner["user_id"], "ttl-guard.tif",
+                                     slide_id=sid)
+    # 非正数 → ValueError
+    with pytest.raises(ValueError):
+        share_store.grant_slide_view(owner["user_id"], "ttl-guard.tif", 0,
+                                     slide_id=sid)
+    with pytest.raises(ValueError):
+        share_store.grant_slide_view(owner["user_id"], "ttl-guard.tif", -5,
+                                     slide_id=sid)
+    assert _sql("SELECT count(*) FROM slide_view_grants WHERE slide_id=%s",
+                (sid,), fetch=True)[0][0] == 0
+
+
 def test_old_visibility_route_410():
     """P0-1：旧 POST /visibility → 410 endpoint_retired（不建任何授权）。"""
     owner, usera = _setup()

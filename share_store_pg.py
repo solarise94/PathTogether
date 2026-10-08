@@ -658,8 +658,8 @@ def list_grants_for_user(user_id):
 # 「删除 → 同名再上传」替换资产后，即使行未被清理也不再匹配新内容；删除
 # 路径（revoke_slide_view_grants_for_slide）按名 + slide_id 清理行。
 # --------------------------------------------------------------------------- #
-def grant_slide_view(user_id, slide_name, granted_by=None, slide_id=None,
-                     ttl_seconds=None):
+def grant_slide_view(user_id, slide_name, ttl_seconds, granted_by=None,
+                     slide_id=None):
     """建立 view 授权（幂等 + 显式资产生代重绑带；2026-10-08 §3 起带到期时间）。
 
     返回 {"already_granted", "granted_at", "expires_at"}。行不存在 → 插入
@@ -670,21 +670,22 @@ def grant_slide_view(user_id, slide_name, granted_by=None, slide_id=None,
     当前资产生代（COALESCE 允许孤儿切片以 NULL 授权行保持 NULL）。
     user_id/slide_name 需非空字符串。
 
-    0080 起 expires_at NOT NULL：``ttl_seconds`` 缺省按「实质不过期」处理
-    （100 年）——该函数不再有生产写入方（旧 visibility 端点已退役），仅供
-    测试/工具构造授权；生产临时查看走 start/end_slide_view_grant_timed。
+    0080 起 expires_at NOT NULL：``ttl_seconds`` 是**必填**正数（round-2
+    收紧：无缺省——任何调用方都不可能因漏传而造出「永久」授权）。该函数
+    不再有生产写入方（旧 visibility 端点已退役），仅供测试/工具构造授权
+    （测试可显式传长 TTL 表达「实质不过期」）；生产临时查看走
+    start/end_slide_view_grant_timed。
     """
     if not isinstance(user_id, str) or not user_id:
         raise ValueError("user_id 不能为空")
     if not isinstance(slide_name, str) or not slide_name:
         raise ValueError("slide_name 不能为空")
     try:
-        ttl = float(ttl_seconds) if ttl_seconds is not None \
-            else 100 * 365 * 24 * 3600.0
+        ttl = float(ttl_seconds)
     except (TypeError, ValueError):
-        ttl = 100 * 365 * 24 * 3600.0
+        raise ValueError("ttl_seconds 需为正数（必填，秒）")
     if ttl <= 0:
-        raise ValueError("ttl_seconds 需为正数")
+        raise ValueError("ttl_seconds 需为正数（必填，秒）")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:

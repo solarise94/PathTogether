@@ -219,7 +219,8 @@ def test_delete_then_reupload_new_id_no_inheritance(tmp_path):
     sid_a = publish_test_slide("inherit.tif", TIFF, owner_user_id=uid_a,
                                upload_dir=UPLOAD_DIR)
     # 建立全部引用面：view grant / share+claim / 标注 / run grant / Demo
-    share_store.grant_slide_view(uid_b, "inherit.tif", slide_id=sid_a)
+    share_store.grant_slide_view(uid_b, "inherit.tif", 30 * 24 * 3600,
+                                 slide_id=sid_a)
     share = share_store.create_share(
         ["inherit.tif"], 24, creator_user_id=uid_a, slide_ids=[sid_a])
     token = share["token"]

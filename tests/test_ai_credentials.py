@@ -334,7 +334,7 @@ def test_sessions_user_filter_owner_all():
     _own("s.svs", u["user_id"])
     # 读隔离（review P0 2026-09-05）× 升级 B：owner 不默认可见他人切片——
     # 本用例关注 sessions 过滤参数注入，经管理口径补收录（绑定资产生代）
-    share_store.grant_slide_view(o["user_id"], "s.svs",
+    share_store.grant_slide_view(o["user_id"], "s.svs", 30 * 24 * 3600,
                                  slide_id=share_store.get_slide_id("s.svs"))
 
     fake = _install_fake()

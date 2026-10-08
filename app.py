@@ -11269,10 +11269,13 @@ def admin_v1_slide_temporary_view_end(slide_id):
     """结束管理员临时查看（2026-10-08 §3.1；owner 权限 + CSRF；幂等）。
 
     把 actor 对该切片**未到期**的授权 ``expires_at`` 置为 now()，调用
-    ``_revoke_run_grants_for_slide_id`` 取消派生 AI 运行授权，写审计
-    ``admin.slide_temporary_view.end``。已结束/不存在时同样 200（幂等），
-    响应 ``{"slide_id", "temporary_view": {"status": "ended"|"none"},
-    "server_now"}``。
+    ``_revoke_run_grants_for_slide_id`` 取消派生 AI 运行授权，并对仍在
+    运行的相关 sidecar run 走既有取消/收尾机制（round-2 补齐：与旧永久
+    收回端点同款 ``_cancel_sidecar_runs_for_owners`` 联动——sidecar 会话
+    按 legacy 名查询，id_bundle 无名资产只走 run grant 复查，同旧口径），
+    写审计 ``admin.slide_temporary_view.end``。已结束/不存在时同样 200
+    （幂等），响应 ``{"slide_id", "temporary_view": {"status":
+    "ended"|"none"}, "runs_cancelled", "server_now"}``。
     """
     auth = _require_owner_admin_v1()
     if auth:
@@ -11299,17 +11302,26 @@ def admin_v1_slide_temporary_view_end(slide_id):
     except Exception:
         app.logger.exception("admin temporary-view 结束失败：%s", ref)
         return _admin_v1_error(500, "internal", "临时查看结束失败")
+    cancelled = []
     if desc is not None and status == "ended":
-        # 撤销联动：失效该切片上派生的 run grants（§3.3 主动结束）
+        # 撤销联动 1/2：失效该切片上派生的 run grants（§3.3 主动结束）
         _revoke_run_grants_for_slide_id(desc.slide_id,
                                         name=desc.legacy_filename)
+        # 撤销联动 2/2（round-2）：对运行中的 sidecar run 发起既有取消/
+        # 收尾（旧永久收回端点同款；费用 hold 按既有结算机制收尾）
+        cancelled = _cancel_sidecar_runs_for_owners(
+            desc.legacy_filename, [owner_uid],
+            reason="temporary_view_ended") \
+            if desc.legacy_filename else []
     _audit("admin.slide_temporary_view.end", target_type="slide",
            target_id=(desc.slide_id if desc else ref), slide=grant_key,
            slide_id=(desc.slide_id if desc else None),
-           detail={"ended_for": owner_uid, "result": status})
+           detail={"ended_for": owner_uid, "result": status,
+                   "runs_cancelled": cancelled})
     return jsonify(
         slide_id=(desc.slide_id if desc else ref),
         temporary_view={"status": status},
+        runs_cancelled=cancelled,
         server_now=time.time())
 
 

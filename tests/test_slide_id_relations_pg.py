@@ -287,7 +287,8 @@ def test_rename_display_name_keeps_id_and_grants():
     name = _touch_tiff("rename.tif")
     sid = _register(name, owner["user_id"])
     # userb 获得显式 view grant
-    share_store.grant_slide_view(userb["user_id"], name, granted_by=owner["user_id"],
+    share_store.grant_slide_view(userb["user_id"], name, 30 * 24 * 3600,
+                                 granted_by=owner["user_id"],
                                  slide_id=sid)
     cb = _client()
     _login(cb, "b@x.com", "userBpass123456")
@@ -384,7 +385,7 @@ def test_old_credentials_rejected_for_new_asset():
     # 旧 share（含 old）、旧 view grant（userb → old）、旧 run grant（old）
     token = c.post("/api/share/create", json={
         "slides": [n_old], "expires_hours": 24}).get_json()["token"]
-    share_store.grant_slide_view(userb["user_id"], n_old,
+    share_store.grant_slide_view(userb["user_id"], n_old, 30 * 24 * 3600,
                                   granted_by=owner["user_id"],
                                   slide_id=id_old)
     grant = share_store.create_run_grant("inst-p2", n_old,

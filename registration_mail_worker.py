@@ -222,6 +222,88 @@ def build_public_verify_email_body(email, token, base_url):
     return subject, body
 
 
+def build_verify_email_body_for_site(email, token, *, entry_origin,
+                                     form_locale="zh", flow="legacy"):
+    """按**冻结入口与语言**构造验证邮件正文（registration-antibot 设计
+    2026-10-08 §6/§9）：站点名、验证链接、帮助页链接全部来自
+    ``entry_origin``（入队时冻结；本函数绝不读 PUBLIC_BASE_URL/env 选
+    域名），语言取 ``form_locale``（zh|en）；``flow`` ∈ public|legacy
+    决定文案口径。
+
+    供 registration_store.request_verification_email 在入队/重发时调用
+    （构造发生在 app 侧事务内；worker 只发送冻结密文）。帮助链接为该
+    入口域名上的绝对 /registration-help 链接。
+    """
+    import registration_antibot
+    origin = str(entry_origin or "").strip().rstrip("/")
+    if not origin:
+        raise MailSenderUnavailable(
+            "注册入口 origin 未配置，无法构造验证链接")
+    site = registration_antibot.site_name_for_origin(origin)
+    link = origin + "/verify-email?token=" + str(token)
+    help_link = origin + "/registration-help"
+    if str(form_locale or "zh").strip().lower() == "en":
+        subject = "%s email verification (valid for 30 minutes)" % site
+        if flow == "public":
+            body = (
+                "Hello,\n\n"
+                "Someone (usually you) just requested a %s account for "
+                "%s.\n"
+                "Open the link below within 30 minutes to complete "
+                "registration:\n\n%s\n\n"
+                "The link can only be used once. After verifying, set a "
+                "password and the account is ready — no admin approval "
+                "needed. Self-service registration allows up to 5 new "
+                "accounts per day (refreshed at 00:00 Beijing time, "
+                "subject to remaining quota at completion); receiving "
+                "this email does not reserve a slot.\n\n"
+                "If the email never arrives or you cannot finish "
+                "registration, visit %s to contact the author.\n\n"
+                "If you did not request this, please ignore this email.\n"
+                % (site, str(email), link, help_link))
+        else:
+            body = (
+                "Hello,\n\n"
+                "Someone (usually you) just requested %s registration "
+                "for %s.\n"
+                "Open the link below within 30 minutes to verify this "
+                "email address:\n\n%s\n\n"
+                "The link can only be used once. After verifying, set a "
+                "password and submit your application; if you already "
+                "have an invitation code, you can activate directly.\n\n"
+                "If the email never arrives or verification fails, visit "
+                "%s to contact the author.\n\n"
+                "If you did not request this, please ignore this email.\n"
+                % (site, str(email), link, help_link))
+        return subject, body
+    subject = "%s 邮箱验证（30 分钟内有效）" % site
+    if flow == "public":
+        body = (
+            "你好，\n\n"
+            "有人（通常是你本人）刚用邮箱 %s 请求注册 %s。\n"
+            "请在 30 分钟内打开下面的链接完成注册：\n\n"
+            "%s\n\n"
+            "该链接只能使用一次。验证后设置密码即可直接使用，无需管理员"
+            "审批。\n当前开放邮箱验证注册，每日最多 5 个新自助账号，名额于"
+            "北京时间每日 00:00 更新，以完成注册时的剩余名额为准；发送或"
+            "收到本邮件不代表已预留名额。若链接过期，请重新申请验证邮件。\n"
+            "如长时间未收到邮件或无法完成注册，可访问 %s 联系作者。\n\n"
+            "如果你没有请求过注册，请忽略本邮件。\n"
+            % (str(email), site, link, help_link))
+    else:
+        body = (
+            "你好，\n\n"
+            "有人（通常是你本人）刚用邮箱 %s 请求注册 %s。\n"
+            "请在 30 分钟内打开下面的链接完成邮箱验证：\n\n"
+            "%s\n\n"
+            "该链接只能使用一次。验证后请设置密码并提交使用申请，管理员"
+            "审核通过后即可使用；如果你已有邀请码，也可以凭邀请码直接激"
+            "活。\n如长时间未收到邮件或无法完成验证，可访问 %s 联系作者。\n\n"
+            "如果你没有请求过注册，请忽略本邮件。\n"
+            % (str(email), site, link, help_link))
+    return subject, body
+
+
 def build_registration_created_body(*, user_id, email, source, day,
                                     successful_count, daily_limit, base_url):
     """自助注册成功的管理员通知正文（P1，docs §4.5）。返回 (subject, body)。
@@ -657,8 +739,108 @@ def drain_once(limit=_DRAIN_BATCH, sender=None, environ=None) -> int:
                         "attempts=attempts+1, sent_at=now(), last_error=NULL "
                         "WHERE job_id=%s", (row["job_id"],))
             sent += 1
+        # 0079：重发投递同样由 worker 排水（独立循环，原作业排空后继续）
+        sent += _drain_redeliveries(conn, snd, limit, registration_open)
     finally:
         conn.close()
+    return sent
+
+
+def _drain_redeliveries(conn, snd, limit, registration_open) -> int:
+    """0079 重发投递排水（drain_once 内调用；每条独立事务）。
+
+    领取 queued/未达上限 failed 的 registration_mail_redeliveries；发送前
+    锁原作业行并复核未消费/未作废/未过期且 intent 未完成（§4：注册完成、
+    token 作废、链接过期、模式关闭都能阻止尚未发出的重发）；复核不通过
+    置 cancelled（不再领取）。失败分类与原作业同规则：确定失败有界重试、
+    uncertain 不自动重试。返回成功发送条数。
+    """
+    if not registration_open:
+        return 0
+    sent = 0
+    for _ in range(max(1, min(int(limit), 200))):
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT r.redelivery_id, r.job_id, r.email_normalized, "
+                    "r.payload_enc, r.attempts "
+                    "FROM registration_mail_redeliveries r "
+                    "WHERE (r.status='queued' OR (r.status='failed' "
+                    "  AND r.attempts < %s)) "
+                    "AND r.scheduled_at <= now() "
+                    "ORDER BY r.created_at, r.redelivery_id "
+                    "LIMIT 1 FOR UPDATE OF r SKIP LOCKED",
+                    (_MAX_SEND_ATTEMPTS,))
+                rrow = cur.fetchone()
+                if rrow is None:
+                    break
+                # 发送前锁原作业行并复核仍可发（§4；与完成事务互斥串行）；
+                # 复核不通过 → cancelled，不发送、不再领取
+                cur.execute(
+                    "SELECT j.job_id FROM registration_mail_jobs j "
+                    "LEFT JOIN registration_intents i "
+                    "  ON i.mail_job_id = j.job_id "
+                    "WHERE j.job_id=%s AND j.purpose='email_verify' "
+                    "AND j.expires_at > now() AND j.consumed_at IS NULL "
+                    "AND j.status IN ('queued','sent','uncertain','failed') "
+                    "AND (i.intent_id IS NULL OR i.completed_at IS NULL) "
+                    "FOR UPDATE OF j",
+                    (rrow["job_id"],))
+                if cur.fetchone() is None:
+                    cur.execute(
+                        "UPDATE registration_mail_redeliveries SET "
+                        "status='cancelled', "
+                        "last_error='original_not_sendable' "
+                        "WHERE redelivery_id=%s AND status IN "
+                        "('queued','failed')",
+                        (rrow["redelivery_id"],))
+                    _log.warning(
+                        "重发投递取消：原验证请求已完成/作废/过期"
+                        "（redelivery=%s）", rrow["redelivery_id"])
+                    continue
+                try:
+                    payload = decrypt_payload(rrow["payload_enc"])
+                    snd.send(rrow["email_normalized"],
+                             str(payload.get("subject") or ""),
+                             str(payload.get("body") or ""))
+                except MailSenderUncertainError as exc:
+                    # 远端可能已接受：置 uncertain，绝不自动重发（P1-1 同规）
+                    cur.execute(
+                        "UPDATE registration_mail_redeliveries SET "
+                        "status='uncertain', attempts=attempts+1, "
+                        "last_error=%s WHERE redelivery_id=%s",
+                        (str(exc)[:120], rrow["redelivery_id"]))
+                    _log.warning(
+                        "重发投递结果不确定（redelivery=%s）：置 uncertain，"
+                        "不自动重发", rrow["redelivery_id"])
+                    continue
+                except MailSenderError as exc:
+                    attempts = int(rrow["attempts"] or 0)
+                    if attempts + 1 >= _MAX_SEND_ATTEMPTS:
+                        cur.execute(
+                            "UPDATE registration_mail_redeliveries SET "
+                            "status='failed', attempts=attempts+1, "
+                            "last_error=%s WHERE redelivery_id=%s",
+                            (str(exc)[:120], rrow["redelivery_id"]))
+                    else:
+                        delay = _RETRY_BACKOFF_BASE_SECONDS * (2 ** attempts)
+                        cur.execute(
+                            "UPDATE registration_mail_redeliveries SET "
+                            "status='failed', attempts=attempts+1, "
+                            "last_error=%s, scheduled_at=now() + "
+                            "(%s * interval '1 second') "
+                            "WHERE redelivery_id=%s",
+                            (str(exc)[:120], delay, rrow["redelivery_id"]))
+                    _log.warning("重发投递失败（redelivery=%s 第 %d/%d 次）",
+                                 rrow["redelivery_id"], attempts + 1,
+                                 _MAX_SEND_ATTEMPTS)
+                    continue
+                cur.execute(
+                    "UPDATE registration_mail_redeliveries SET "
+                    "status='sent', attempts=attempts+1, sent_at=now(), "
+                    "last_error=NULL WHERE redelivery_id=%s",
+                    (rrow["redelivery_id"],))
+        sent += 1
     return sent
 
 

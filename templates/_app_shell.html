@@ -142,6 +142,21 @@
 
       <div class="spacer"></div>
 
+      {# 改版 2026-10-08（admin-viewer-simplified §5.1/§5.4）：顶栏新增「搜索」与
+         「分享」两个浮层入口（图标+文字，≤768px 由既有 .tb-txt 隐藏规则收成图标）。
+         搜索浮层替换旧侧栏内联过滤（§5.4）；分享浮层承接原侧栏「分享管理」整块
+         （§5.1，表单/列表 DOM 原样迁入 #tb-share-pop，id 不变）。 #}
+      {% if mode != 'demo' %}
+      <button id="tb-search-btn" class="tool-btn tb-search-btn" type="button"
+              aria-haspopup="dialog" aria-expanded="false" aria-controls="tb-search-pop"
+              data-i18n-title="tb.search.title" title="搜索切片"
+              aria-label="搜索切片" data-i18n-aria="tb.search.title"><span aria-hidden="true">⌕</span><span class="tb-txt" data-i18n="tb.search"> 搜索</span></button>
+      <button id="tb-share-btn" class="tool-btn tb-share-btn" type="button"
+              aria-haspopup="dialog" aria-expanded="false" aria-controls="tb-share-pop"
+              data-i18n-title="tb.share.title" title="分享管理"
+              aria-label="分享管理" data-i18n-aria="tb.share.title"><span aria-hidden="true">⇗</span><span class="tb-txt" data-i18n="tb.share"> 分享</span></button>
+      {% endif %}
+
       <span id="zoom-badge" class="zoom-badge">—</span>
       <button id="zoom-native" class="icon-btn zoom-native-btn" type="button"
               data-i18n-title="tb.zoom.native" data-i18n-aria="tb.zoom.native"
@@ -219,27 +234,16 @@
         <a href="/login" class="logout-link" data-i18n="demo.footer.login">登录后继续使用</a>
       </div>
       {% else %}
-      <div class="sidebar-top">
-        {# 切片搜索（2026-09-22 重做，slide-search-autofill-bug）：默认只渲染
-           「搜索切片」按钮 + 空容器，输入框由 app.js 点击后才创建——首屏 DOM
-           不存在任何搜索输入框，浏览器/密码管理器不会把账号邮箱自动填进来。
-           Demo 分支的常驻搜索框在 demo.html 分支，不走此方案。 #}
-        <button id="slide-search-btn" type="button" class="btn secondary block slide-search-btn"
-                aria-expanded="false" aria-controls="slide-search-area"
-                data-i18n="sb.search.btn" data-i18n-title="sb.search.btn.title"
-                title="按名称或别名过滤切片列表">搜索切片</button>
-        <div id="slide-search-area" class="slide-search-area"></div>
-        {# W3/W4/W6 2026-09-14：侧栏只留两个主入口——「导入切片」统一抽屉 +
-           「新建项目」对话框；内联 new-project-form / format-req 已移除
-           （格式申请迁入导入抽屉次级入口）。#file-input 保持隐藏，上传管线
-           （COS 统一上传 /api/ingestions，见 U0–U6）不变，进度行照旧显示在这里。 #}
-        <button id="import-slides-btn" class="btn primary block" data-i18n="sb.upload">导入切片</button>
-        <button id="new-project-btn" class="btn secondary block" data-i18n="sb.new.project">＋ 新建项目</button>
-        {# accept 静态 fallback（含 raster-image 的 .bmp/.jpg/.jpeg）：接口不可用时的
-           兜底；与 app.js FILE_INPUT_ACCEPT_FALLBACK 同文 = acceptFromCatalog(
-           FORMAT_CATALOG_FALLBACK) 的展开；目录可用时由 app.js 按
-           /api/slide-formats（selectable_for_upload）重新派生。契约由
-           tests/js/raster-image-compat.test.ts 锁定防漂移。 #}
+      {# ====================== 改版 2026-10-08：文件夹/切片浏览器（§5.1–5.3） ======================
+         左栏改为「当前位置 + ＋ 菜单 + 文件夹 ⋯ 菜单 + 堆叠卡片 + 固定翻页」。
+         - ＋ 菜单：导入切片（原侧栏顶部按钮迁入，同一 #import-slides-btn id 与
+           导入抽屉管线）、新建文件夹（原「＋ 新建项目」对话框，#new-project-btn id
+           保留；提交带 parent_project_id=当前文件夹）。
+         - 文件夹 ⋯ 菜单：重命名 / 移动到… / 分享此文件夹 / 删除文件夹（子文件夹
+           回到根、切片不删——确认框说明）。根目录/临时查看不渲染 ⋯。
+         - #file-input 与上传进度容器保留：上传管线不变，进度行照旧显示在这里。
+         - 底部账户区保留。旧侧栏搜索（slide-search）由顶栏「搜索」浮层替代。 #}
+      <div class="sidebar-top fb-top">
         <input id="file-input" type="file"
                accept=".svs,.tif,.tiff,.ome.tif,.ome.tiff,.ndpi,.vms,.vmu,.scn,.bif,.svslide,.bmp,.jpg,.jpeg,.kfb,.kfbf,.mrxs,.zip"
                hidden />
@@ -251,81 +255,41 @@
         <div id="upload-progress-list" class="upload-progress-list"></div>
       </div>
 
-      <div class="sidebar-scroll">
-        <div class="section-head" data-i18n="sb.section.projects">项目</div>
-        <div id="project-list" class="project-list"></div>
-
-        <div id="unfiled-section" class="section">
-          <div class="section-head row" id="unfiled-toggle">
-            <span class="caret">▾</span>
-            <span class="section-title" data-i18n="sb.section.unfiled">未归类切片</span>
-            <span id="unfiled-count" class="count-badge">0</span>
-          </div>
-          <div id="unfiled-body" class="section-body">
-            <div id="unfiled-list" class="unfiled-list"></div>
-            <div class="unfiled-ops">
-              <button id="unfiled-new-project" class="btn secondary small" data-i18n="sb.unfiled.new.project">新建项目(含选中)</button>
-              <button id="unfiled-share" class="btn primary small" data-i18n="sb.unfiled.share">分享选中</button>
-            </div>
-          </div>
+      <div class="fb-head" id="fb-head">
+        <button id="fb-up-btn" class="icon-btn fb-up" type="button" hidden
+                aria-label="返回上一级文件夹" data-i18n-aria="fb.up.aria"
+                data-i18n-title="fb.up.aria" title="返回上一级文件夹">‹</button>
+        <span id="fb-location" class="fb-location" title="我的切片">我的切片</span>
+        <span id="fb-count" class="fb-count"></span>
+        <span class="fb-head-gap"></span>
+        <button id="fb-plus-btn" class="icon-btn fb-plus" type="button"
+                aria-label="添加" data-i18n-aria="fb.plus.aria" data-i18n-title="fb.plus.aria"
+                title="添加" aria-haspopup="menu" aria-expanded="false" aria-controls="fb-plus-menu">＋</button>
+        <div id="fb-plus-menu" class="fb-menu" role="menu" aria-label="添加" hidden>
+          <button id="import-slides-btn" class="btn secondary block" role="menuitem" data-i18n="sb.upload">导入切片</button>
+          <button id="new-project-btn" class="btn secondary block" role="menuitem" data-i18n="sb.new.folder">＋ 新建文件夹</button>
         </div>
-
-        <div class="section">
-          <div class="section-head row" id="share-mgr-toggle">
-            <span class="caret">▾</span>
-            <span class="section-title" data-i18n="sb.section.share">分享管理</span>
-          </div>
-          <div id="share-mgr-body" class="section-body">
-          {# 分享选项竖排（2026-09-23：三个下拉在窄侧栏并排会截断文案，如
-             「矩形：仅预设 6/6.5mm」被切成「矩形：仅预设」）；CSS 见
-             .share-row.share-selects #}
-          <div class="share-row share-selects">
-            <select id="share-expires-select" class="select">
-                <option value="6" data-i18n="sb.share.expires.6">6 小时</option>
-                <option value="24" selected data-i18n="sb.share.expires.24">24 小时</option>
-                <option value="72" data-i18n="sb.share.expires.72">3 天</option>
-                <option value="168" data-i18n="sb.share.expires.168">7 天</option>
-                <option value="custom" data-i18n="sb.share.expires.custom">自定义</option>
-              </select>
-              <input id="share-expires-custom" class="input" type="number"
-                     min="0.1" max="720" step="0.1" data-i18n-ph="sb.share.hours.ph" placeholder="小时" style="display:none;" />
-              <select id="share-roi-size-select" class="select" data-i18n-title="sb.share.roi.title" title="矩形标记可选尺寸">
-                <option value="both" selected data-i18n="sb.share.roi.both">标记：两者</option>
-                <option value="6" data-i18n="sb.share.roi.6">仅 6mm</option>
-                <option value="6.5" data-i18n="sb.share.roi.6.5">仅 6.5mm</option>
-              </select>
-              {# 升级 C（§6.4）：矩形策略档位。旧分享缺字段一律 preset_only；
-                   custom 仅在创建者显式选择时授予任意宽高矩形。#}
-              <select id="share-rect-policy-select" class="select" data-i18n-title="sb.share.rect.title" title="矩形标记策略">
-                <option value="preset_only" selected data-i18n="sb.share.rect.preset">矩形：仅预设 6/6.5mm</option>
-                <option value="custom" data-i18n="sb.share.rect.custom">矩形：允许自定义宽高</option>
-              </select>
-            </div>
-            <div class="share-row share-perms" role="group" data-i18n-title="sb.share.perm.title" title="链接权限">
-              <label class="perm-chip">
-                <input type="checkbox" id="share-perm-view" checked disabled />
-                <span data-i18n="sb.share.perm.view">仅查看</span>
-              </label>
-              <label class="perm-chip">
-                <input type="checkbox" id="share-perm-annotate" />
-                <span data-i18n="sb.share.perm.annotate">允许标注</span>
-              </label>
-              <label class="perm-chip">
-                <input type="checkbox" id="share-perm-download" />
-                <span data-i18n="sb.share.perm.download">允许下载</span>
-              </label>
-            </div>
-            <p class="share-perm-hint" id="share-perm-hint" data-i18n="sb.share.perm.hint" hidden>只能分享你拥有的切片</p>
-            <button id="share-create-btn" class="btn primary block" data-i18n="sb.share.create">分享选中切片</button>
-
-            <div id="share-result" class="share-result" style="display:none;">
-              <input id="share-result-url" class="share-result-url" readonly />
-              <button id="share-result-copy" class="btn primary small" data-i18n="sb.share.copy">复制</button>
-            </div>
-
-            <div id="share-list" class="share-list"></div>
-          </div>
+        <button id="fb-folder-btn" class="icon-btn fb-folder-btn" type="button" hidden
+                aria-label="当前文件夹操作" data-i18n-aria="fb.folder.menu.aria"
+                data-i18n-title="fb.folder.menu.aria" title="当前文件夹操作"
+                aria-haspopup="menu" aria-expanded="false" aria-controls="fb-folder-menu">⋯</button>
+        <div id="fb-folder-menu" class="fb-menu" role="menu" aria-label="当前文件夹操作" hidden>
+          <button id="fb-rename" class="fb-menu-item" role="menuitem" data-i18n="fb.rename">重命名</button>
+          <button id="fb-move" class="fb-menu-item" role="menuitem" data-i18n="fb.move">移动到…</button>
+          <button id="fb-share-folder" class="fb-menu-item" role="menuitem" data-i18n="fb.share">分享此文件夹</button>
+          <button id="fb-delete" class="fb-menu-item danger" role="menuitem" data-i18n="fb.delete">删除文件夹</button>
         </div>
+      </div>
+
+      <div id="fb-stack" class="fb-stack" role="group" aria-label="文件夹与切片堆叠" data-i18n-aria="fb.stack.aria"></div>
+
+      <div class="fb-pager" id="fb-pager">
+        <button id="fb-prev-btn" class="icon-btn fb-page-btn" type="button"
+                aria-label="上一叠" data-i18n-aria="fb.page.prev" title="上一叠">‹</button>
+        <span id="fb-page-info" class="fb-page-info" role="status" aria-live="polite"></span>
+        <button id="fb-next-btn" class="icon-btn fb-page-btn" type="button"
+                aria-label="下一叠" data-i18n-aria="fb.page.next" title="下一叠">›</button>
+      </div>
 
       <div class="sidebar-bottom">
         <!-- 管理工作台入口：仅 owner 可见（PR5 后 /admin 的唯一 UI 入口；
@@ -350,6 +314,9 @@
 
     <main id="viewer-wrap">
       <div id="viewer"></div>
+      {# 改版 2026-10-08（§5.1）：当前切片名 = 画面左上角紧凑标签（不新增第二行
+         顶栏）。内容由 app.js 随 openSlide/清屏更新；未打开切片时隐藏。 #}
+      <div id="canvas-slide-label" class="canvas-slide-label" hidden></div>
       {# 升级 A + 主页升级 H3：无切片空态（正式版与 Demo 共用）。侧栏默认收起后
          这里保留明显的「选择切片」入口；app.js/demo.js 在切片打开后隐藏、未打开
          时显示。正式版（H3 注册→上传闭环）：加「上传你的第一张切片」（复用既有
@@ -874,6 +841,89 @@
       </div>
     </div>
   </div>
+  {% endif %}
+
+  {# ====================== 顶栏「搜索」浮层（§5.4，仅正式版） ======================
+     在 /api/slides 已鉴权全量上本地匹配（显示名/别名/原文件名，大小写不敏感），
+     不受当前文件夹限制。结果行：缩略图 + 名称 + 所在位置（多文件夹 +N）+
+     slide_id 末 6 位消歧。点击结果：左栏切到所在文件夹并翻页 → openSlide → 关闭。
+     输入框由 app.js 打开时创建（沿用 slide-search-autofill-bug 的防自动填充方案：
+     首屏 DOM 无搜索输入框）。 #}
+  {% if mode != 'demo' %}
+  <div id="tb-search-pop" class="toolbar-pop tb-search-pop" role="dialog"
+       aria-label="搜索切片" data-i18n-aria="tb.search.title" hidden>
+    <div class="tb-search-head">
+      <span class="tb-search-title" data-i18n="tb.search.pop.title">搜索切片</span>
+      <button id="tb-search-close" class="icon-btn close" aria-label="关闭" data-i18n-aria="picker.close">×</button>
+    </div>
+    <div id="tb-search-area" class="tb-search-area"></div>
+    <div id="tb-search-results" class="tb-search-results"></div>
+  </div>
+
+  {# ====================== 顶栏「分享」浮层（§5.1，仅正式版） ======================
+     原侧栏「分享管理」整块迁入（有效期/ROI/策略/权限/创建/复制/链接列表/撤销），
+     功能不变。默认分享对象=当前打开的切片；「选择切片…」复用切片选择器多选；
+     文件夹「⋯ → 分享此文件夹」复用 shareProject。 #}
+  <div id="tb-share-pop" class="toolbar-pop tb-share-pop" role="dialog"
+       aria-label="分享管理" data-i18n-aria="sb.section.share" hidden>
+    <div class="tb-share-head">
+      <span class="tb-share-title" data-i18n="sb.section.share">分享管理</span>
+      <button id="tb-share-close" class="icon-btn close" aria-label="关闭" data-i18n-aria="picker.close">×</button>
+    </div>
+    <p class="share-target-line" id="share-target-line"></p>
+    <button id="share-pick-btn" type="button" class="btn secondary small share-pick-btn"
+            data-i18n="sb.share.pick">选择切片…</button>
+    <div id="share-mgr-body" class="share-mgr-body">
+      {# 分享选项竖排（2026-09-23：三个下拉在窄侧栏并排会截断文案，如
+         「矩形：仅预设 6/6.5mm」被切成「矩形：仅预设」）；CSS 见
+         .share-row.share-selects #}
+      <div class="share-row share-selects">
+        <select id="share-expires-select" class="select">
+            <option value="6" data-i18n="sb.share.expires.6">6 小时</option>
+            <option value="24" selected data-i18n="sb.share.expires.24">24 小时</option>
+            <option value="72" data-i18n="sb.share.expires.72">3 天</option>
+            <option value="168" data-i18n="sb.share.expires.168">7 天</option>
+            <option value="custom" data-i18n="sb.share.expires.custom">自定义</option>
+          </select>
+          <input id="share-expires-custom" class="input" type="number"
+                 min="0.1" max="720" step="0.1" data-i18n-ph="sb.share.hours.ph" placeholder="小时" style="display:none;" />
+          <select id="share-roi-size-select" class="select" data-i18n-title="sb.share.roi.title" title="矩形标记可选尺寸">
+            <option value="both" selected data-i18n="sb.share.roi.both">标记：两者</option>
+            <option value="6" data-i18n="sb.share.roi.6">仅 6mm</option>
+            <option value="6.5" data-i18n="sb.share.roi.6.5">仅 6.5mm</option>
+          </select>
+          {# 升级 C（§6.4）：矩形策略档位。旧分享缺字段一律 preset_only；
+               custom 仅在创建者显式选择时授予任意宽高矩形。#}
+          <select id="share-rect-policy-select" class="select" data-i18n-title="sb.share.rect.title" title="矩形标记策略">
+            <option value="preset_only" selected data-i18n="sb.share.rect.preset">矩形：仅预设 6/6.5mm</option>
+            <option value="custom" data-i18n="sb.share.rect.custom">矩形：允许自定义宽高</option>
+          </select>
+        </div>
+        <div class="share-row share-perms" role="group" data-i18n-title="sb.share.perm.title" title="链接权限">
+          <label class="perm-chip">
+            <input type="checkbox" id="share-perm-view" checked disabled />
+            <span data-i18n="sb.share.perm.view">仅查看</span>
+          </label>
+          <label class="perm-chip">
+            <input type="checkbox" id="share-perm-annotate" />
+            <span data-i18n="sb.share.perm.annotate">允许标注</span>
+          </label>
+          <label class="perm-chip">
+            <input type="checkbox" id="share-perm-download" />
+            <span data-i18n="sb.share.perm.download">允许下载</span>
+          </label>
+        </div>
+        <p class="share-perm-hint" id="share-perm-hint" data-i18n="sb.share.perm.hint" hidden>只能分享你拥有的切片</p>
+        <button id="share-create-btn" class="btn primary block" data-i18n="sb.share.create">分享选中切片</button>
+
+        <div id="share-result" class="share-result" style="display:none;">
+          <input id="share-result-url" class="share-result-url" readonly />
+          <button id="share-result-copy" class="btn primary small" data-i18n="sb.share.copy">复制</button>
+        </div>
+
+        <div id="share-list" class="share-list"></div>
+      </div>
+    </div>
   {% endif %}
 
   <div id="tbb-more-mask" class="tbb-more-mask"></div>

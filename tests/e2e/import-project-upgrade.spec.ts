@@ -17,9 +17,10 @@
  *      由 UI 负责人让它们变绿（不允许 skip）。
  *
  * ---------------------------------------------------------------------------
- * UI 选择器契约（与 2026-09-14 工作区实际实现 / templates/_app_shell.html 对齐）：
- *   #import-slides-btn        侧栏主按钮「导入切片」
- *   #new-project-btn          侧栏主按钮「新建项目」
+ * UI 选择器契约（改版 2026-10-08：侧栏=文件夹浏览器；两主入口迁入「＋」菜单）：
+ *   #fb-plus-btn              文件夹浏览器头部「＋」菜单按钮
+ *   #import-slides-btn        ＋菜单项「导入切片」（打开导入抽屉）
+ *   #new-project-btn          ＋菜单项「＋ 新建文件夹」（原「新建项目」对话框）
  *   #import-drawer            导入抽屉（hidden 属性切换；role=dialog）
  *   #import-tab-local         「本地文件」页签
  *   #import-tab-baidu         「百度分享」页签
@@ -30,7 +31,7 @@
  *   #pcd-confirm/#pcd-cancel  创建/取消（提交中 #pcd-confirm disabled）
  *   #format-req-btn           抽屉内「申请新格式支持」次级入口
  *   #format-req-form          申请表单（label.imp-field[for=fr-*] 持久可见）
- *   #project-list             侧栏项目列表（成功创建后定位处）
+ *   #fb-stack                 文件夹浏览器堆叠区（成功创建后新文件夹卡定位处）
  * ---------------------------------------------------------------------------
  */
 import { expect, test, type Page } from "@playwright/test";
@@ -259,20 +260,24 @@ test.describe("API 契约：百度能力与转换任务（U07/U08）", () => {
 // =========================================================================== //
 
 test.describe("UI：侧栏双主按钮与新建项目对话框（U02/U03）", () => {
-  test("U02-UI: 侧栏「导入切片/新建项目」双主按钮可见", async ({ page }) => {
+  test("U02-UI: ＋菜单内「导入切片/新建文件夹」双入口可见", async ({ page }) => {
     await loginAsUser(page);
     await page.goto("/app");
+    await page.locator("#menu-btn").click(); // 桌面默认收起侧栏 → 展开
+    await page.locator("#fb-plus-btn").click();
     await expect(page.locator("#import-slides-btn")).toBeVisible();
     await expect(page.locator("#import-slides-btn"))
       .toContainText(/导入切片|Import slides/);
     await expect(page.locator("#new-project-btn")).toBeVisible();
     await expect(page.locator("#new-project-btn"))
-      .toContainText(/新建项目|New project/);
+      .toContainText(/新建文件夹|New folder/);
   });
 
-  test("U02-UI: 对话框创建空项目并出现在项目列表", async ({ page }) => {
+  test("U02-UI: 对话框创建空文件夹并出现在浏览器堆叠区", async ({ page }) => {
     await loginAsUser(page);
     await page.goto("/app");
+    await page.locator("#menu-btn").click();
+    await page.locator("#fb-plus-btn").click();
     await page.locator("#new-project-btn").click();
     const mask = page.locator("#project-create-mask");
     await expect(mask).toBeVisible();
@@ -281,8 +286,8 @@ test.describe("UI：侧栏双主按钮与新建项目对话框（U02/U03）", ()
     await page.locator("#pcd-name").fill(name);
     await page.locator("#pcd-confirm").click();
     await expect(mask).toBeHidden();
-    // 成功定位：项目出现在侧栏项目列表
-    await expect(page.locator("#project-list")).toContainText(name, { timeout: 10_000 });
+    // 成功定位：新文件夹卡出现在文件夹浏览器（根目录内新建 → 原地可见）
+    await expect(page.locator("#fb-stack")).toContainText(name, { timeout: 10_000 });
   });
 
   test("U03-UI: 慢响应下双击确认 + Enter 只发一次 POST（提交锁）", async ({ page }) => {
@@ -304,6 +309,8 @@ test.describe("UI：侧栏双主按钮与新建项目对话框（U02/U03）", ()
       }
     });
 
+    await page.locator("#menu-btn").click();
+    await page.locator("#fb-plus-btn").click();
     await page.locator("#new-project-btn").click();
     await expect(page.locator("#project-create-mask")).toBeVisible();
     const name = `${RUN}-ui-idem`;
@@ -312,7 +319,7 @@ test.describe("UI：侧栏双主按钮与新建项目对话框（U02/U03）", ()
     await page.locator("#pcd-confirm").dblclick();
     await page.locator("#pcd-note").press("Enter");
 
-    await expect(page.locator("#project-list")).toContainText(name, { timeout: 15_000 });
+    await expect(page.locator("#fb-stack")).toContainText(name, { timeout: 15_000 });
     expect(posts, "in-flight 期间重复触发只能产生一次 POST").toHaveLength(1);
   });
 });
@@ -321,7 +328,8 @@ test.describe("UI：导入抽屉（U05/U08）", () => {
   test("U08-UI: 百度页签可见；默认未启用给原因并禁用动作", async ({ page }) => {
     await loginAsUser(page);
     await page.goto("/app");
-
+    await page.locator("#menu-btn").click();
+    await page.locator("#fb-plus-btn").click();
     await page.locator("#import-slides-btn").click();
     const drawer = page.locator("#import-drawer");
     await expect(drawer).toBeVisible();
@@ -344,7 +352,8 @@ test.describe("UI：导入抽屉（U05/U08）", () => {
   test("U05-UI: 申请新格式支持表单有持久可见的字段 label", async ({ page }) => {
     await loginAsUser(page);
     await page.goto("/app");
-
+    await page.locator("#menu-btn").click();
+    await page.locator("#fb-plus-btn").click();
     await page.locator("#import-slides-btn").click();
     const drawer = page.locator("#import-drawer");
     await expect(drawer).toBeVisible();

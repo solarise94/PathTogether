@@ -149,7 +149,7 @@ const VIEWER_STUB = `
   };
   var viewer = {
     container: null,
-    canvas: {},
+    canvas: null,
     viewport: viewport,
     currentOverlays: [],
     addHandler: function () {},
@@ -163,7 +163,15 @@ const VIEWER_STUB = `
     forceResize: function () {},
   };
   window.HP_ViewerCore = {
-    create: function (el) { viewer.container = el; return viewer; },
+    create: function (el) {
+      viewer.container = el;
+      // 真实节点（openSlide 的底图缩略图层 insertBefore(baseThumbEl, canvas)
+      // 需要真正的子节点；OpenSeadragon 生产环境亦然）
+      viewer.canvas = document.createElement("div");
+      viewer.canvas.className = "osd-canvas-stub";
+      el.appendChild(viewer.canvas);
+      return viewer;
+    },
   };
   window.OpenSeadragon = {
     Point: function (x, y) { this.x = x; this.y = y; },
@@ -293,21 +301,19 @@ async function serveFixture(
 }
 
 async function openSlideRow(page: Page): Promise<void> {
-	// 桌面默认侧栏收起（visibility:hidden）→ 先展开再点击切片行
+	// 改版 2026-10-08：切片行=堆叠卡片 .fb-hit；桌面默认侧栏收起 → 先展开再点击
 	const collapsed = await page.locator("#sidebar").evaluate((el) =>
 		el.classList.contains("collapsed"),
 	);
 	if (collapsed) {
 		await page.locator("#menu-btn").click();
 	}
-	// 点行内名称区（避开行首复选框：其 click 有 stopPropagation）
 	await page
-		.locator(".slide-row", { hasText: "Fixture Slide A" })
+		.locator(".fb-hit", { hasText: "Fixture Slide A" })
 		.first()
-		.locator(".slide-mid")
 		.click();
 	// openSlide 完成（info 拉取并写入 document.title）后再继续
-		await expect(page).toHaveTitle(/Fixture Slide A · HistoPilot Beta/);
+	await expect(page).toHaveTitle(/Fixture Slide A · HistoPilot Beta/);
 }
 
 // ---------------------------------------------------------------------------
@@ -353,83 +359,48 @@ const FOUR_SLIDES = Array.from({ length: 4 }, (_, i) => ({
 }));
 
 async function expandSidebar(page: Page, expectedCount = "4") {
-	// 桌面默认收起；已展开时再点会收起，先看状态
+	// 改版 2026-10-08：侧栏=文件夹浏览器；计数 = #fb-count（当前位置条目数）
 	const collapsed = await page.locator("#sidebar").evaluate((el) =>
 		el.classList.contains("collapsed"),
 	);
 	if (collapsed) await page.locator("#menu-btn").click();
-	await expect(page.locator("#unfiled-count")).toHaveText(expectedCount);
+	await expect(page.locator("#fb-count")).toHaveText(expectedCount);
 }
 
-test.describe("切片搜索：按需创建（2026-09-22 重做）", () => {
-	test("初始加载/打开侧栏/「选择切片」都不创建搜索输入框", async ({ page }) => {
+test.describe("顶栏搜索浮层（改版 2026-10-08 §5.4，替换旧侧栏内联过滤）", () => {
+	test("初始 DOM 无搜索输入框；打开浮层才创建并聚焦；Esc 关闭并把焦点还给按钮；重开为空查询", async ({ page }) => {
 		await page.setViewportSize({ width: 1440, height: 900 });
 		const errors = trackConsoleErrors(page);
 		await serveFixture(page);
 		await mockOwnerWithSlides(page, FOUR_SLIDES);
 		await page.goto(FIXTURE_HOST + "/fixture");
-		// 验收 1：初始 DOM 无搜索 input（按需创建，不是隐藏）
-		await expect(page.locator("#slide-search")).toHaveCount(0);
-		const btn = page.locator("#slide-search-btn");
-		await expect(btn).toHaveAttribute("aria-expanded", "false");
-		await expect(btn).toHaveAttribute("aria-controls", "slide-search-area");
-		// 打开侧栏：4 张未归类全部可见，仍无 input
-		await page.locator("#menu-btn").click();
-		await expect(page.locator("#unfiled-count")).toHaveText("4");
-		await expect(page.locator("#unfiled-list .slide-row:visible")).toHaveCount(4);
-		await expect(page.locator("#slide-search")).toHaveCount(0);
-		// 「选择切片」：展开侧栏但不创建 input；焦点落在搜索按钮
-		await page.locator("#viewer-empty-pick").click();
-		await expect(page.locator("#slide-search")).toHaveCount(0);
-		await expect(page.locator("#slide-search-btn")).toBeFocused();
-		expect(errors).toEqual([]);
-	});
-
-	test("点击「搜索切片」：创建唯一输入框并聚焦；反复开关不重复、无残留", async ({ page }) => {
-		await page.setViewportSize({ width: 1440, height: 900 });
-		await serveFixture(page);
-		await mockOwnerWithSlides(page, FOUR_SLIDES);
-		await page.goto(FIXTURE_HOST + "/fixture");
-		await expandSidebar(page);
-		await page.locator("#slide-search-btn").click();
-		const input = page.locator("#slide-search");
-		// 验收 2：只创建一个输入框，焦点正确，属性齐全
+		// 初始 DOM 无搜索 input（按需创建，防自动填充方案沿用）
+		await expect(page.locator("#tb-search-input")).toHaveCount(0);
+		await expect(page.locator("#tb-search-btn")).toHaveAttribute("aria-expanded", "false");
+		await expect(page.locator("#tb-search-btn")).toContainText("搜索");
+		// 打开：输入框唯一、聚焦、防自动填充属性齐全
+		await page.locator("#tb-search-btn").click();
+		const input = page.locator("#tb-search-input");
 		await expect(input).toHaveCount(1);
 		await expect(input).toBeVisible();
 		await expect(input).toBeFocused();
 		await expect(input).toHaveAttribute("type", "search");
 		await expect(input).toHaveAttribute("autocomplete", "off");
-		await expect(input).toHaveAttribute("name", "slide-filter");
-		await expect(page.locator("#slide-search-btn")).toHaveAttribute("aria-expanded", "true");
-		// 可见用途标签（不只靠 placeholder）+ 带名称/tooltip 的关闭按钮
-		await expect(page.locator("label[for='slide-search']")).toHaveText("按名称或别名搜索");
-		const close = page.locator("#slide-search-close");
-		await expect(close).toBeVisible();
-		await expect(close).toHaveAttribute("aria-label", "关闭搜索");
-		await expect(close).toHaveAttribute("title", "关闭搜索");
-		// 关闭：移除输入框、恢复列表、焦点回按钮
-		await close.click();
-		await expect(page.locator("#slide-search")).toHaveCount(0);
-		await expect(page.locator("#slide-search-btn")).toBeFocused();
-		await expect(page.locator("#slide-search-btn")).toHaveAttribute("aria-expanded", "false");
-		await expect(page.locator("#unfiled-list .slide-row:visible")).toHaveCount(4);
-		// 反复开关 3 次：无重复 id/控件、事件照常工作、重开为空查询
-		for (let i = 0; i < 3; i++) {
-			await page.locator("#slide-search-btn").click();
-			await expect(page.locator("#slide-search")).toHaveCount(1);
-			await expect(page.locator("#slide-search-close")).toHaveCount(1);
-			await expect(page.locator("#slide-search")).toHaveValue("");
-			await page.locator("#slide-search").fill("Specimen 1");
-			await expect(page.locator("#unfiled-count")).toHaveText("1/4");
-			await page.locator("#slide-search-close").click();
-			await expect(page.locator("#unfiled-count")).toHaveText("4");
-		}
-		expect(await page.evaluate(() =>
-			document.querySelectorAll("#slide-search, #slide-search-close, label[for='slide-search']").length,
-		)).toBe(0);
+		await expect(input).toHaveAttribute("name", "slide-search-pop");
+		await expect(page.locator("#tb-search-btn")).toHaveAttribute("aria-expanded", "true");
+		// Esc：关闭 + 焦点还按钮
+		await input.press("Escape");
+		await expect(page.locator("#tb-search-pop")).toBeHidden();
+		await expect(page.locator("#tb-search-btn")).toBeFocused();
+		await expect(page.locator("#tb-search-btn")).toHaveAttribute("aria-expanded", "false");
+		// 重开：空查询、无残留结果
+		await page.locator("#tb-search-btn").click();
+		await expect(input).toHaveValue("");
+		await expect(page.locator(".tb-search-result")).toHaveCount(0);
+		expect(errors).toEqual([]);
 	});
 
-	test("正常查询：别名/文件名/大小写/中文/粘贴可用；邮箱无匹配显示提示与 0/4；Escape 关闭", async ({ page }, testInfo) => {
+	test("查询匹配：显示名/文件名（大小写不敏感）+中文+粘贴；结果带位置；无匹配给提示", async ({ page }, testInfo) => {
 		await page.setViewportSize({ width: 1440, height: 900 });
 		const errors = trackConsoleErrors(page);
 		await serveFixture(page);
@@ -439,28 +410,33 @@ test.describe("切片搜索：按需创建（2026-09-22 重做）", () => {
 			{ name: "sample-2.svs", alias: "Specimen 2" },
 			{ name: "sample-3.svs", alias: "Specimen 3" },
 		]);
+		// sample-0/1 已进「胃癌研究」文件夹（文件夹=项目）
+		await page.route(FIXTURE_HOST + "/api/projects", (route) => route.fulfill({
+			json: [{
+				pid: "p1", name: "胃癌研究", note: "", slide_count: 2, roi_count: 0,
+				slides: ["sample-0.svs", "sample-1.svs"],
+			}],
+		}));
 		await page.goto(FIXTURE_HOST + "/fixture");
-		await expandSidebar(page);
-		await page.locator("#slide-search-btn").click();
-		const input = page.locator("#slide-search");
-		const rows = page.locator("#unfiled-list .slide-row:visible");
-		const count = page.locator("#unfiled-count");
-
-		// 别名（大小写不敏感）
+		await page.locator("#tb-search-btn").click();
+		const input = page.locator("#tb-search-input");
+		const results = page.locator(".tb-search-result");
+		// 显示名（大小写不敏感）：搜索不受当前文件夹限制——根目录就能搜到文件夹内的切片
 		await input.fill("specimen 2");
-		await expect(rows).toHaveCount(1);
-		await expect(rows.first()).toHaveAttribute("data-name", "sample-2.svs");
-		await expect(count).toHaveText("1/4");
-		// 完整文件名（大写）
+		await expect(results).toHaveCount(1);
+		await expect(results.first()).toHaveAttribute("data-slide-id", "sample-2.svs");
 		await input.fill("SAMPLE-0.SVS");
-		await expect(rows).toHaveCount(1);
-		await expect(rows.first()).toHaveAttribute("data-name", "sample-0.svs");
-		// 中文别名（keyboard.insertText 近似 IME 提交路径；先清空再插入）
+		await expect(results).toHaveCount(1);
+		await expect(results.first()).toContainText("Specimen 0");
+		// 位置行：项目内切片显示所在文件夹名
+		await expect(results.first().locator(".tsr-loc")).toContainText("胃癌研究");
+		// 中文别名（keyboard.insertText 近似 IME 提交路径）
 		await input.fill("");
 		await page.keyboard.insertText("标本一");
-		await expect(rows).toHaveCount(1);
-		await expect(rows.first()).toHaveAttribute("data-name", "sample-1.svs");
-		// 粘贴路径：合成 paste 事件 + input 事件（Chromium 无法在不安全源触发真实剪贴板粘贴）
+		await expect(results).toHaveCount(1);
+		await expect(results.first()).toHaveAttribute("data-slide-id", "sample-1.svs");
+		await expect(results.first().locator(".tsr-loc")).toContainText("胃癌研究");
+		// 粘贴路径：合成 paste 事件 + input 事件
 		await input.evaluate((element) => {
 			const el = element as HTMLInputElement;
 			const dt = new DataTransfer();
@@ -469,286 +445,143 @@ test.describe("切片搜索：按需创建（2026-09-22 重做）", () => {
 			el.value = "Specimen 3";
 			el.dispatchEvent(new Event("input", { bubbles: true }));
 		});
-		await expect(rows).toHaveCount(1);
-		await expect(rows.first()).toHaveAttribute("data-name", "sample-3.svs");
-		// 邮箱查询不被一刀切拒绝：作为普通查询给出 0/4 + 显式提示
-		// （先手动折叠未归类分区：过滤期间分区必须自动展开，提示不能藏在折叠体里）
-		await page.locator("#unfiled-toggle").click();
-		await expect(page.locator("#unfiled-body")).toBeHidden();
+		await expect(results).toHaveCount(1);
+		await expect(results.first()).toHaveAttribute("data-slide-id", "sample-3.svs");
+		// 邮箱查询：普通查询处理 → 显式「没有匹配的切片」提示
 		await input.fill("owner@example.test");
-		await expect(count).toHaveText("0/4");
-		await expect(page.locator("#unfiled-body")).toBeVisible();
-		await expect(page.locator(".unfiled-filter-empty")).toBeVisible();
-		await expect(page.locator(".unfiled-filter-empty")).toHaveText("没有匹配的切片");
-		// 无项目账号过滤时项目区也不留空白：给「没有匹配的项目」提示
-		await expect(page.locator(".proj-filter-empty")).toBeVisible();
-		await expect(page.locator(".proj-filter-empty")).toHaveText("没有匹配的项目");
-		await page.screenshot({ path: testInfo.outputPath("no-matches-desktop.png") });
-		// Escape 关闭：移除输入框、4 行恢复、计数复位
-		await input.press("Escape");
-		await expect(page.locator("#slide-search")).toHaveCount(0);
-		await expect(page.locator("#unfiled-list .slide-row:visible")).toHaveCount(4);
-		await expect(count).toHaveText("4");
-		await expect(page.locator(".unfiled-filter-empty")).toHaveCount(0);
-		// 关闭后项目区提示同样移除
-		await expect(page.locator(".proj-filter-empty")).toHaveCount(0);
-		await expect(page.locator("#slide-search-btn")).toBeFocused();
+		await expect(page.locator(".tb-search-empty")).toBeVisible();
+		await expect(page.locator(".tb-search-empty")).toHaveText("没有匹配的切片");
+		await page.screenshot({ path: testInfo.outputPath("search-no-matches.png") });
+		// 清空：结果区清空（回到待输入态）
+		await input.fill("");
+		await expect(page.locator(".tb-search-empty")).toHaveCount(0);
+		await expect(page.locator(".tb-search-result")).toHaveCount(0);
 		expect(errors).toEqual([]);
 	});
 
-	test("自动填充防护（模拟 :-webkit-autofill）：标记值被清空并恢复列表；正常输入不受影响", async ({ page }, testInfo) => {
+	test("点击结果：定位并打开切片（document.title 更新）+ 浮层关闭", async ({ page }) => {
 		await page.setViewportSize({ width: 1440, height: 900 });
+		const errors = trackConsoleErrors(page);
 		await serveFixture(page);
 		await mockOwnerWithSlides(page, FOUR_SLIDES);
 		await page.goto(FIXTURE_HOST + "/fixture");
-		await expandSidebar(page);
-		await page.locator("#slide-search-btn").click();
-		// 正常输入仍过滤
-		await page.locator("#slide-search").fill("Specimen 1");
-		await expect(page.locator("#unfiled-count")).toHaveText("1/4");
-		// 模拟浏览器原生 autofill 标记（真实密码管理器行为需实机验证，见验证记录）
-		await page.locator("#slide-search").evaluate((element) => {
-			const el = element as HTMLInputElement;
-			const matches = el.matches;
-			el.matches = function (selector) {
-				return selector === ":-webkit-autofill" || matches.call(this, selector);
-			};
-			el.value = "owner@example.test";
-			el.dispatchEvent(new Event("input", { bubbles: true }));
-		});
-		await expect(page.locator("#slide-search")).toHaveValue("");
-		await expect(page.locator("#unfiled-list .slide-row:visible")).toHaveCount(4);
-		await expect(page.locator("#unfiled-count")).toHaveText("4");
-		// 读取路径同样检测：模拟 autofill 值直接进入（无 input 事件）后触发列表重渲
-		// （语言切换 → renderProjects/renderUnfiled → getSlideQuery）
-		await page.locator("#slide-search").evaluate((element) => {
-			const el = element as HTMLInputElement;
-			const matches = el.matches;
-			el.matches = function (selector) {
-				return selector === ":-webkit-autofill" || matches.call(this, selector);
-			};
-			el.value = "owner@example.test";
-		});
-		await page.locator(".lang-toggle").click();
-		await expect(page.locator("#slide-search")).toHaveValue("");
-		await expect(page.locator("#unfiled-list .slide-row:visible")).toHaveCount(4);
-		await expect(page.locator("#unfiled-count")).toHaveText("4");
-		await page.screenshot({ path: testInfo.outputPath("autofill-cleared.png") });
+		// 侧栏保持默认收起：点击结果应自动展开并定位
+		await page.locator("#tb-search-btn").click();
+		await page.locator("#tb-search-input").fill("Specimen 1");
+		await page.locator(".tb-search-result").first().click();
+		await expect(page).toHaveTitle(/Specimen 1 · HistoPilot Beta/);
+		await expect(page.locator("#tb-search-pop")).toBeHidden();
+		// 侧栏已展开且选中标记落在该卡片（aria-pressed）
+		await expect(page.locator("#sidebar")).not.toHaveClass(/collapsed/);
+		const card = page.locator(".fb-hit", { hasText: "Specimen 1" }).first();
+		await expect(card).toHaveAttribute("aria-pressed", "true");
+		expect(errors).toEqual([]);
 	});
 
-	test("项目场景：项目名命中显示整组；切片命中展开所属项目；清空恢复", async ({ page }) => {
-		await page.setViewportSize({ width: 1440, height: 900 });
-		await serveFixture(page);
-		await mockOwnerWithSlides(page, FOUR_SLIDES);
-		await page.route(FIXTURE_HOST + "/api/projects", (route) => route.fulfill({
-			json: [{
-				pid: "p1", name: "胃癌研究", note: "", slide_count: 2, roi_count: 0,
-				slides: ["sample-0.svs", "sample-1.svs"],
-			}],
-		}));
-		await page.goto(FIXTURE_HOST + "/fixture");
-		await expandSidebar(page, "2"); // sample-0/1 已进项目，未归类只剩 2 张
-		await page.locator("#slide-search-btn").click();
-		const input = page.locator("#slide-search");
-		// 项目名命中：项目行 + 其全部切片可见；未归类全部滤掉（0/2 + 提示）
-		await input.fill("胃癌研究");
-		await expect(page.locator(".proj-row")).toBeVisible();
-		await expect(page.locator(".proj-row .slide-row:visible")).toHaveCount(2);
-		await expect(page.locator("#unfiled-count")).toHaveText("0/2");
-		await expect(page.locator(".unfiled-filter-empty")).toBeVisible();
-		// 只命中项目内切片：项目展开、仅命中行可见
-		await input.fill("Specimen 1");
-		await expect(page.locator(".proj-row")).toHaveClass(/expanded/);
-		await expect(page.locator(".proj-row .slide-row:visible")).toHaveCount(1);
-		await expect(page.locator(".proj-row .slide-row:visible")).toHaveAttribute("data-name", "sample-1.svs");
-		await expect(page.locator("#unfiled-count")).toHaveText("0/2");
-		// 关闭搜索：未归类恢复 2 行可见，全部行 display 复位
-		await page.locator("#slide-search-close").click();
-		await expect(page.locator("#unfiled-count")).toHaveText("2");
-		await expect(page.locator("#unfiled-list .slide-row:visible")).toHaveCount(2);
-		await expect(page.locator(".proj-row .slide-row:visible")).toHaveCount(2);
-		// 全部滤掉时项目区不留空白：显示「没有匹配的项目」提示
-		await page.locator("#slide-search-btn").click();
-		await page.locator("#slide-search").fill("zzz-无匹配");
-		await expect(page.locator(".proj-row")).toBeHidden();
-		await expect(page.locator(".proj-filter-empty")).toBeVisible();
-		await expect(page.locator(".proj-filter-empty")).toHaveText("没有匹配的项目");
-		await expect(page.locator(".unfiled-filter-empty")).toBeVisible();
-		// 清空恢复：提示消失、项目行/真实空态归位
-		await page.locator("#slide-search").fill("");
-		await expect(page.locator(".proj-filter-empty")).toHaveCount(0);
-		await expect(page.locator(".proj-row")).toBeVisible();
-		await page.locator("#slide-search-close").click();
-		// 分享选项竖排后长文案完整可见（修「矩形：仅预设…」截断）：
-		// #share-rect-policy-select 占满侧栏宽度（并排时只有约 1/3）
-		await expect(page.locator("#share-rect-policy-select")).toContainText("矩形：仅预设 6/6.5mm");
-		const rectSel = await page.locator("#share-rect-policy-select").evaluate((el) => {
-			const r = el.getBoundingClientRect();
-			return { w: r.width, parent: el.parentElement!.className };
-		});
-		expect(rectSel.w).toBeGreaterThanOrEqual(150);
-		expect(rectSel.parent).toContain("share-selects");
-	});
-
-	test("列表重载与侧栏收展：查询重放不丢失；关闭后重载显示全部；无隐藏查询", async ({ page }) => {
-		await page.setViewportSize({ width: 1440, height: 900 });
-		await serveFixture(page);
-		await mockOwnerWithSlides(page, FOUR_SLIDES);
-		await page.goto(FIXTURE_HOST + "/fixture");
-		await expandSidebar(page);
-		await page.locator("#slide-search-btn").click();
-		await page.locator("#slide-search").fill("Specimen 1");
-		await expect(page.locator("#unfiled-count")).toHaveText("1/4");
-		// 列表重渲（语言切换触发 renderProjects/renderUnfiled 重放查询）
-		await page.locator(".lang-toggle").click();
-		await expect(page.locator("#unfiled-count")).toHaveText("1/4");
-		await expect(page.locator("#unfiled-list .slide-row:visible")).toHaveCount(1);
-		// 动态控件文案随语言刷新（EN）
-		await expect(page.locator("label[for='slide-search']")).toHaveText("Search by name or alias");
-		await expect(page.locator("#slide-search")).toHaveAttribute("aria-label", "Filter the slide list by file name or alias");
-		// 侧栏收起再展开：搜索条件保留且可见（不留用户看不到的过滤）
-		await page.locator("#menu-btn").click();
-		await expect(page.locator("#sidebar")).toHaveClass(/collapsed/);
-		await page.locator("#menu-btn").click();
-		await expect(page.locator("#slide-search")).toHaveValue("Specimen 1");
-		await expect(page.locator("#slide-search")).toBeVisible();
-		await expect(page.locator("#unfiled-count")).toHaveText("1/4");
-		// 关闭搜索后重载：全部显示
-		await page.locator("#slide-search-close").click();
-		await page.locator(".lang-toggle").click();
-		await expect(page.locator("#unfiled-count")).toHaveText("4");
-		await expect(page.locator("#unfiled-list .slide-row:visible")).toHaveCount(4);
-	});
-
-	test("真实空态：无未归类切片时不显示「没有匹配的切片」", async ({ page }) => {
-		await page.setViewportSize({ width: 1440, height: 900 });
-		await serveFixture(page);
-		await page.route(FIXTURE_HOST + "/api/auth/info", (route) => route.fulfill({
-			json: { ...AUTH_USER, role: "owner", actor: { ...AUTH_USER.actor, role: "owner" } },
-		}));
-		await page.route(FIXTURE_HOST + "/api/slides", (route) => route.fulfill({ json: [] }));
-		await page.route(FIXTURE_HOST + "/api/projects", (route) => route.fulfill({ json: [] }));
-		await page.goto(FIXTURE_HOST + "/fixture");
-		await expandSidebar(page, "0");
-		await page.locator("#slide-search-btn").click();
-		await page.locator("#slide-search").fill("任意查询");
-		// 没有上传切片 ≠ 没有匹配：保持真实空态文案与 0 计数
-		await expect(page.locator(".unfiled-empty")).toHaveText("无未归类切片");
-		await expect(page.locator(".unfiled-filter-empty")).toHaveCount(0);
-		await expect(page.locator("#unfiled-count")).toHaveText("0");
-	});
-
-	test("手机抽屉：Escape 只关搜索不关抽屉；打开抽屉/「选择切片」不创建输入框", async ({ page }) => {
+	test("手机（390）：顶栏搜索可用；Esc 只关浮层不关抽屉；焦点回按钮", async ({ page }) => {
 		await page.setViewportSize({ width: 390, height: 844 });
 		const errors = trackConsoleErrors(page);
 		await serveFixture(page);
 		await mockOwnerWithSlides(page, FOUR_SLIDES);
 		await page.goto(FIXTURE_HOST + "/fixture");
-		await expect(page.locator("#slide-search")).toHaveCount(0);
-		// 「选择切片」开抽屉但不创建 input
+		// 顶栏搜索（抽屉未开时）：图标态（.tb-txt 隐藏）仍可点击；浮层在视口内
+		await page.locator("#tb-search-btn").click();
+		const input = page.locator("#tb-search-input");
+		await expect(input).toBeVisible();
+		await input.fill("Specimen 2");
+		await expect(page.locator(".tb-search-result")).toHaveCount(1);
+		// Esc：关闭浮层、焦点回搜索按钮
+		await input.press("Escape");
+		await expect(page.locator("#tb-search-pop")).toBeHidden();
+		await expect(page.locator("#tb-search-btn")).toBeFocused();
+		// 抽屉与搜索互不干扰：开抽屉（模态遮罩覆盖工具栏）→ Esc 关抽屉
 		await page.locator("#viewer-empty-pick").click();
 		await expect(page.locator("#sidebar")).toHaveClass(/open/);
-		await expect(page.locator("#slide-search")).toHaveCount(0);
-		await expect(page.locator("#unfiled-list .slide-row:visible")).toHaveCount(4);
-		// 抽屉内开搜索并输入
-		await page.locator("#slide-search-btn").click();
-		await page.locator("#slide-search").fill("Specimen 2");
-		await expect(page.locator("#unfiled-count")).toHaveText("1/4");
-		// Escape：只关搜索，抽屉保持打开；焦点回搜索按钮
-		await page.locator("#slide-search").press("Escape");
-		await expect(page.locator("#slide-search")).toHaveCount(0);
-		await expect(page.locator("#sidebar")).toHaveClass(/open/);
-		await expect(page.locator("#unfiled-count")).toHaveText("4");
-		await expect(page.locator("#slide-search-btn")).toBeFocused();
-		// 再按 Escape：关抽屉（搜索已关，普通行为不受影响）
 		await page.keyboard.press("Escape");
 		await expect(page.locator("#sidebar")).not.toHaveClass(/open/);
 		expect(errors).toEqual([]);
 	});
 
-	test("视口与遮挡检查：1440×900 / 441×975 / 390×844 下控件完整、Console 无新增错误", async ({ page }, testInfo) => {
+	test("视口与遮挡检查：1440/1024/390 浮层锚定按钮下方且不越视口；窄屏按钮收成图标", async ({ page }, testInfo) => {
 		const errors = trackConsoleErrors(page);
 		await serveFixture(page);
 		await mockOwnerWithSlides(page, FOUR_SLIDES);
 		await page.goto(FIXTURE_HOST + "/fixture");
+		// 溢出收放（P0 修复）：按钮可能被实测折入 ⋯ 菜单——经菜单点击
+		async function clickFolded(id: string) {
+			if (await page.locator("#" + id).isVisible().catch(() => false)) {
+				await page.locator("#" + id).click();
+				return;
+			}
+			await page.locator("#tbb-more-btn").click();
+			await page.locator("#" + id).click();
+		}
 		const cases = [
-			{ name: "desktop-1440", width: 1440, height: 900, mobile: false },
-			{ name: "user-screenshot-441", width: 441, height: 975, mobile: true },
-			{ name: "phone-390", width: 390, height: 844, mobile: true },
+			{ name: "desktop-1440", width: 1440, height: 900 },
+			{ name: "laptop-1024", width: 1024, height: 800 },
+			{ name: "phone-390", width: 390, height: 844 },
 		];
 		for (const vp of cases) {
 			await page.setViewportSize({ width: vp.width, height: vp.height });
-			// 侧栏可见（桌面=展开；≤768=开抽屉）
-			const isMobile = await page.evaluate(() =>
-				!!window.matchMedia("(max-width: 768px)").matches);
-			if (isMobile) {
-				if (!(await page.locator("#sidebar").evaluate((el) => el.classList.contains("open")))) {
-					await page.locator("#menu-btn").click();
-				}
-			} else {
-				await expandSidebar(page);
+			await page.waitForTimeout(150);
+			// 按钮要么在行内、要么已折入 ⋯ 菜单——两者都必须可触达（P0 契约）
+			const inline = await page.locator("#tb-search-btn").isVisible().catch(() => false);
+			if (!inline) {
+				await expect(page.locator("#tb-search-btn")).toBeAttached();
 			}
-			await page.locator("#slide-search-btn").click();
-			await page.locator("#slide-search").fill("owner@example.test");
-			// 控件均在侧栏范围内、无匹配提示与 0/4 计数可见
-			await expect(page.locator("#unfiled-count")).toHaveText("0/4");
-			await expect(page.locator(".unfiled-filter-empty")).toBeVisible();
-			const boxes = await page.evaluate(() => {
-				const sb = document.getElementById("sidebar")!.getBoundingClientRect();
-				const inSidebar = (sel: string) => {
-					const el = document.querySelector(sel);
-					if (!el) return null;
-					const r = el.getBoundingClientRect();
-					return { l: r.left, r: r.right, t: r.top, b: r.bottom };
-				};
-				return {
-					sidebar: { l: sb.left, r: sb.right },
-					input: inSidebar("#slide-search"),
-					close: inSidebar("#slide-search-close"),
-					label: inSidebar("label[for='slide-search']"),
-				};
+			await clickFolded("tb-search-btn");
+			const pop = await page.locator("#tb-search-pop").evaluate((el) => {
+				const r = el.getBoundingClientRect();
+				return { l: r.left, r: r.right, t: r.top, b: r.bottom };
 			});
-			for (const [key, box] of Object.entries(boxes)) {
-				if (!box) throw new Error(`missing box: ${key}`);
-				expect(box.l, `${vp.name}/${key} left in sidebar`).toBeGreaterThanOrEqual(boxes.sidebar.l - 0.5);
-				expect(box.r, `${vp.name}/${key} right in sidebar`).toBeLessThanOrEqual(boxes.sidebar.r + 0.5);
-			}
-			await page.screenshot({ path: testInfo.outputPath(`viewport-${vp.name}.png`) });
-			// 关闭恢复，进入下一视口
-			await page.locator("#slide-search-close").click();
-			await expect(page.locator("#unfiled-count")).toHaveText("4");
+			expect(pop.l, vp.name + " 浮层左缘在视口内").toBeGreaterThanOrEqual(0);
+			expect(pop.r, vp.name + " 浮层右缘在视口内").toBeLessThanOrEqual(vp.width + 0.5);
+			await page.screenshot({ path: testInfo.outputPath(`search-${vp.name}.png`) });
+			await page.keyboard.press("Escape");
+			await expect(page.locator("#tb-search-pop")).toBeHidden();
+			// 折入 ⋯ 的路径：关闭上面可能打开的 ⋯ 菜单
+			await page.keyboard.press("Escape");
 		}
 		expect(errors).toEqual([]);
 	});
 
-	test("基础回归：过滤态下打开切片/勾选/新建项目/分享入口正常；Demo 搜索维持原状", async ({ page }) => {
+	test("基础回归：搜索打开切片/＋菜单入口/分享浮层可达；Demo 壳不渲染搜索/分享按钮", async ({ page }) => {
 		await page.setViewportSize({ width: 1440, height: 900 });
 		await serveFixture(page);
 		await mockOwnerWithSlides(page, FOUR_SLIDES);
 		await page.goto(FIXTURE_HOST + "/fixture");
-		await expandSidebar(page);
-		await page.locator("#slide-search-btn").click();
-		await page.locator("#slide-search").fill("Specimen 1");
-		await expect(page.locator("#unfiled-count")).toHaveText("1/4");
-		const row = page.locator("#unfiled-list .slide-row:visible").first();
-		// 勾选可用
-		await row.locator(".slide-check").check();
-		await expect(row.locator(".slide-check")).toBeChecked();
-		// 过滤态点击行打开切片
-		await row.locator(".slide-mid").click();
+		// 搜索打开切片
+		await page.locator("#tb-search-btn").click();
+		await page.locator("#tb-search-input").fill("Specimen 1");
+		await page.locator(".tb-search-result").first().click();
 		await expect(page).toHaveTitle(/Specimen 1 · HistoPilot Beta/);
-		// 新建项目对话框与分享入口正常
+		// ＋菜单：导入切片/新建文件夹可达；新建对话框正常
+		await page.locator("#fb-plus-btn").click();
+		await expect(page.locator("#import-slides-btn")).toBeVisible();
+		await expect(page.locator("#import-slides-btn")).toContainText(/导入切片|Import slides/);
 		await page.locator("#new-project-btn").click();
 		await expect(page.locator("#project-create-mask")).toBeVisible();
 		await page.locator("#pcd-cancel").click();
 		await expect(page.locator("#project-create-mask")).toBeHidden();
-		await expect(page.locator("#unfiled-share")).toBeVisible();
-		// Demo 分支：常驻搜索框仍在模板中（本次重做不扩展到 Demo）
-		const demoPage = page;
-		await serveFixture(demoPage, { mode: "demo" });
-		await demoPage.goto(FIXTURE_HOST + "/fixture");
-		await expect(demoPage.locator("#slide-search")).toHaveCount(1);
-		await expect(demoPage.locator("#slide-search-btn")).toHaveCount(0);
+		// 分享浮层：表单完整迁入（有效期/ROI/策略/权限/创建/列表）
+		await page.locator("#tb-share-btn").click();
+		const pop = page.locator("#tb-share-pop");
+		await expect(pop).toBeVisible();
+		await expect(pop.locator("#share-rect-policy-select")).toContainText("矩形：仅预设 6/6.5mm");
+		const rectSel = await pop.locator("#share-rect-policy-select").evaluate((el) => {
+			const r = el.getBoundingClientRect();
+			return { w: r.width };
+		});
+		expect(rectSel.w).toBeGreaterThanOrEqual(150);
+		await expect(pop.locator("#share-create-btn")).toBeVisible();
+		await expect(pop.locator("#share-list")).toBeVisible();
+		await expect(pop.locator("#share-pick-btn")).toContainText(/选择切片|Choose slides/);
+		// Demo 分支：常驻搜索框仍在模板中（本次重做不扩展到 Demo）；无顶栏搜索/分享按钮
+		await serveFixture(page, { mode: "demo" });
+		await page.goto(FIXTURE_HOST + "/fixture");
+		await expect(page.locator("#slide-search")).toHaveCount(1);
+		await expect(page.locator("#tb-search-btn")).toHaveCount(0);
+		await expect(page.locator("#tb-share-btn")).toHaveCount(0);
 	});
 });
 

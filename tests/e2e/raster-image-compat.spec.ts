@@ -111,7 +111,8 @@ async function login(page: Page, loginId: string, password: string) {
  * 点开，并以「aria-expanded=true + 元素真实可见」双确认收尾。 */
 async function expandSidebar(page: Page) {
 	const menuBtn = page.locator("#menu-btn");
-	const marker = page.locator("#import-slides-btn");
+	// 改版 2026-10-08：位置标签常驻（导入入口已迁入「＋」菜单）
+	const marker = page.locator("#fb-location");
 	await expect(menuBtn).toHaveAttribute("aria-expanded", /^(true|false)$/);
 	if ((await menuBtn.getAttribute("aria-expanded")) === "true") {
 		await expect(marker).toBeVisible({ timeout: 5_000 });
@@ -187,7 +188,7 @@ test.describe("BMP 普通图片兼容（主站 + 分享页真实浏览器走查�
 			.toContainText("入库完成", { timeout: 30_000 });
 
 		// 上传成功自动打开：侧栏出现该切片行，元信息显示「无物理标尺」
-		const slideRow = page.locator(`.slide-row[data-name="${BMP_NAME}"]`);
+		const slideRow = page.locator(`.fb-hit[data-name="${BMP_NAME}"]`);
 		await expect(slideRow).toBeVisible();
 		await expect(slideRow.locator(".slide-meta")).toContainText("无物理标尺");
 
@@ -265,7 +266,7 @@ test.describe("BMP 普通图片兼容（主站 + 分享页真实浏览器走查�
 		// /api/annotations 像素坐标逐项一致
 		await page.reload();
 		await expandSidebar(page);
-		const row2 = page.locator(`.slide-row[data-name="${BMP_NAME}"]`);
+		const row2 = page.locator(`.fb-hit[data-name="${BMP_NAME}"]`);
 		await expect(row2).toBeVisible();
 		await row2.click();
 		await expect(page.locator("#viewer .openseadragon-canvas")).toBeVisible({ timeout: 20_000 });
@@ -306,16 +307,23 @@ test.describe("BMP 普通图片兼容（主站 + 分享页真实浏览器走查�
 		});
 		await page.setViewportSize({ width: 1440, height: 900 });
 
-		// user 登录主站，经真实 UI 建立对该 BMP 的分享：
-		// 勾选「允许标注」→ 勾选切片 → 「分享选中切片」（POST /api/share/create）。
-		//（#unfiled-share 在 app.js 未绑定监听，可用入口是分享管理区按钮）
+		// user 登录主站，经真实 UI 建立对该 BMP 的分享（改版 2026-10-08）：
+		// 顶栏「分享」浮层 → 勾选「允许标注」→ 选择切片…（选择器多选）→
+		// 「分享选中切片」（POST /api/share/create）。
 		await login(page, CREDS.userLogin, CREDS.userPassword);
 		await page.goto("/app");
 		await expandSidebar(page);
-		const slideRow = page.locator(`.slide-row[data-name="${BMP_NAME}"]`);
+		const slideRow = page.locator(`.fb-hit[data-name="${BMP_NAME}"]`);
 		await expect(slideRow).toBeVisible();
+		await page.locator("#tb-share-btn").click();
 		await page.locator("#share-perm-annotate").check();
-		await slideRow.locator(".slide-check").check();
+		await page.locator("#share-pick-btn").click();
+		const pickerItem = page.locator(`.picker-item:has-text("${BMP_NAME}")`);
+		await expect(pickerItem).toBeVisible();
+		await pickerItem.locator("input[type=checkbox]").check();
+		await page.locator("#picker-confirm").click();
+		// 确认后回到分享浮层（目标已回填）→ 直接创建
+		await expect(page.locator("#tb-share-pop")).toBeVisible();
 		await page.locator("#share-create-btn").click();
 		let shareUrl = "";
 		await expect.poll(async () => {

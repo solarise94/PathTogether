@@ -2954,6 +2954,10 @@
       var saved = localStorage.getItem(STORAGE_KEY);
       if (saved === "zh" || saved === "en") return saved;
     } catch (e) {}
+    // Explicit user choice wins; otherwise each public site has its own default.
+    var host = (window.location && window.location.hostname || "").toLowerCase();
+    if (host === "histopilot.cn") return "zh";
+    if (host === "histopilot.com") return "en";
     var nav = (navigator.language || navigator.userLanguage || "en").toLowerCase();
     return nav.indexOf("zh") === 0 ? "zh" : "en";
   }

@@ -55,10 +55,13 @@ MAIL_PURPOSE_EMAIL_CHANGE = "email_change"
 #: token 有效期（与注册验证同款 30 分钟）
 EMAIL_CHANGE_TTL_SECONDS = registration_store.VERIFY_TOKEN_TTL_SECONDS
 
-#: 同邮箱冷却/限额（防登录用户借改绑轰炸任意收件箱；口径同注册配额）
-EMAIL_CHANGE_COOLDOWN_SECONDS = registration_store.VERIFY_COOLDOWN_SECONDS
-EMAIL_CHANGE_HOURLY_LIMIT = registration_store.VERIFY_HOURLY_LIMIT
-EMAIL_CHANGE_DAILY_LIMIT = registration_store.VERIFY_DAILY_LIMIT
+#: 同邮箱冷却/限额（防登录用户借改绑轰炸任意收件箱）。2026-10-08 注册配额
+#: 改为防刷口径（2 次/24h、5 分钟冷却，registration-antibot 设计 §3）后，
+#: 改绑配额与注册配额**解耦**——登录用户本人操作保留原 60s/时 3/日 5 口径，
+#: 不随匿名注册防刷参数联动。
+EMAIL_CHANGE_COOLDOWN_SECONDS = 60
+EMAIL_CHANGE_HOURLY_LIMIT = 3
+EMAIL_CHANGE_DAILY_LIMIT = 5
 
 
 class EmailChangeError(RuntimeError):

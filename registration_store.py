@@ -730,12 +730,17 @@ VERIFY_TOKEN_BYTES = 32
 #: 验证 token 有效期（30 分钟，设计文档第 8 节）
 VERIFY_TOKEN_TTL_SECONDS = 30 * 60
 
-#: 配额（同邮箱维度，权威数据源 = registration_mail_jobs 行数）：
-#: 60s 冷却 / 每小时 3 / 每天 5；应用全局日预算 40。
-VERIFY_COOLDOWN_SECONDS = 60
-VERIFY_HOURLY_LIMIT = 3
-VERIFY_DAILY_LIMIT = 5
+#: 配额（registration-antibot 设计 2026-10-08 §3）：同邮箱滚动 24h 最多
+#: **2 次接纳投递**（首封 + 主动重发；覆盖 /register、重发、所有域名、所有
+#: 进程；失败/排队/结果不确定的投递也占额度，「确定未发出」的有界重试是同
+#: 一投递不重复占额）；两次接纳至少间隔 5 分钟。Turnstile 失败不占额度。
+VERIFY_COOLDOWN_SECONDS = 300
+VERIFY_DAILY_LIMIT = 2
+#: 全站滚动 24h 验证邮件预算（jobs + redeliveries 合计）
 VERIFY_APP_DAILY_BUDGET = 40
+#: §4.3：原链接剩余有效期不足该秒数（或已过期）时，重发改为签发新 token
+#: 与新 intent（「请使用最新邮件中的链接」状态）
+VERIFY_REUSE_MIN_REMAINING_SECONDS = 300
 
 #: 邮件用途（0037 CHECK 约束同词表）
 MAIL_PURPOSE_EMAIL_VERIFY = "email_verify"
@@ -810,110 +815,628 @@ def _new_verify_token() -> str:
 
 
 # --------------------------------------------------------------------------- #
-# 入队（start / resend 同事务入队 + 配额）
+# 入队（registration-antibot 设计 2026-10-08 §3/§4/§8）：
+#   计数 + 入队在**同一**数据库事务、固定顺序 advisory lock（全站额度锁 →
+#   邮箱锁）内完成，锁内重新检查计数；网络校验（Turnstile）在锁外由调用方
+#   先行完成。所有初次发送与重发路径共用同一锁序。
 # --------------------------------------------------------------------------- #
-def _verify_quota_counts_tx(cur, email_norm, purpose=None):
-    """同事务读取该邮箱配额占用：(cooldown, hourly, daily, app_daily)。
+import registration_antibot as _antibot
 
-    ``purpose`` 给定时只计该用途作业（P1 public 入队只计 email_verify——
-    「发送验证邮件日 5 封」与「新注册日 5 个」是两个不同计数器，docs
-    §4.3；registration_created 等通知不占用邮箱验证配额）。缺省 None
-    保持旧口径（全部用途），旧 email_verify_invite_activation 路径行为
-    不变。
+
+def _advisory_lock_key(namespace: str, value: str = "") -> int:
+    """advisory lock 键（sha256 前 8 字节取正 int63；域分离命名空间）。"""
+    digest = hashlib.sha256(
+        ("regverify-lock:" + str(namespace) + ":" + str(value or ""))
+        .encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
+
+
+def _acquire_delivery_locks_tx(cur, email_norm):
+    """固定顺序取注册验证投递锁：全站额度锁 → 邮箱锁（所有路径同序，
+    pg_advisory_xact_lock 随事务结束释放；锁内必须重新检查计数）。"""
+    cur.execute("SELECT pg_advisory_xact_lock(%s)",
+                (_advisory_lock_key("verify_global"),))
+    cur.execute("SELECT pg_advisory_xact_lock(%s)",
+                (_advisory_lock_key("verify_email", email_norm),))
+
+
+def _delivery_quota_tx(cur, email_norm):
+    """锁内权威投递计数（jobs + redeliveries 合计，均只计 email_verify 用途）。
+
+    返回 ``{"email_24h", "email_last_ts", "email_earliest_24h_ts",
+    "global_24h", "global_earliest_24h_ts"}``（ts 为 epoch 秒或 None）。
+    「接纳投递」= 一次入队（job 行或 redelivery 行）；行存在即占额（失败/
+    排队/不确定都算，§3）；「确定未发出」的有界重试在同一行内不重复占额。
     """
-    purpose_sql = " AND purpose=%s" if purpose else ""
-    params = (email_norm, purpose) if purpose else (email_norm,)
     cur.execute(
-        "SELECT "
-        " count(*) FILTER (WHERE created_at > now() - interval '"
-        + str(VERIFY_COOLDOWN_SECONDS) + " seconds') AS cooldown, "
-        " count(*) FILTER (WHERE created_at > now() - interval '1 hour') "
-        "   AS hourly, "
-        " count(*) FILTER (WHERE created_at > now() - interval '24 hours') "
-        "   AS daily "
-        "FROM registration_mail_jobs WHERE email_normalized=%s"
-        + purpose_sql,
-        params)
+        "WITH deliver AS ("
+        "  SELECT created_at FROM registration_mail_jobs "
+        "  WHERE email_normalized=%s AND purpose=%s"
+        "  UNION ALL"
+        "  SELECT r.created_at FROM registration_mail_redeliveries r"
+        "  JOIN registration_mail_jobs j ON j.job_id = r.job_id"
+        "  WHERE r.email_normalized=%s AND j.purpose=%s"
+        ") SELECT count(*) FILTER ("
+        "    WHERE created_at > now() - interval '24 hours') AS n24, "
+        "  extract(epoch from max(created_at))::float8 AS last_ts, "
+        "  extract(epoch from (min(created_at) FILTER ("
+        "    WHERE created_at > now() - interval '24 hours')))::float8 "
+        "    AS earliest24 "
+        "FROM deliver",
+        (email_norm, MAIL_PURPOSE_EMAIL_VERIFY,
+         email_norm, MAIL_PURPOSE_EMAIL_VERIFY))
     row = cur.fetchone()
     cur.execute(
-        "SELECT count(*) AS app_daily FROM registration_mail_jobs "
-        "WHERE created_at > now() - interval '24 hours'"
-        + purpose_sql,
-        (purpose,) if purpose else ())
-    return (int(row["cooldown"]), int(row["hourly"]), int(row["daily"]),
-            int(cur.fetchone()["app_daily"]))
+        "SELECT ("
+        "  (SELECT count(*) FROM registration_mail_jobs"
+        "    WHERE purpose=%s AND created_at > now() - interval '24 hours')"
+        "  + (SELECT count(*) FROM registration_mail_redeliveries r"
+        "      JOIN registration_mail_jobs j ON j.job_id = r.job_id"
+        "      WHERE j.purpose=%s AND r.created_at > now() - "
+        "        interval '24 hours')"
+        " ) AS g24, "
+        " extract(epoch from ("
+        "  SELECT least(min(a.t), min(b.t)) FROM "
+        "   (SELECT created_at AS t FROM registration_mail_jobs"
+        "     WHERE purpose=%s AND created_at > now() - interval '24 hours')"
+        "     a,"
+        "   (SELECT r.created_at AS t FROM registration_mail_redeliveries r"
+        "     JOIN registration_mail_jobs j ON j.job_id = r.job_id"
+        "     WHERE j.purpose=%s AND r.created_at > now() - "
+        "       interval '24 hours') b"
+        " ))::float8 AS gearliest",
+        (MAIL_PURPOSE_EMAIL_VERIFY,) * 4)
+    grow = cur.fetchone()
+    return {
+        "email_24h": int(row["n24"] or 0),
+        "email_last_ts": float(row["last_ts"]) if row["last_ts"] else None,
+        "email_earliest_24h_ts":
+            float(row["earliest24"]) if row["earliest24"] else None,
+        "global_24h": int(grow["g24"] or 0),
+        "global_earliest_24h_ts":
+            float(grow["gearliest"]) if grow["gearliest"] else None,
+    }
 
 
-def enqueue_email_verification(email, base_url=None,
-                               ttl_seconds=VERIFY_TOKEN_TTL_SECONDS):
-    """请求邮箱验证（start/resend 共用）：配额 → 作废旧 token → 入队。
+def _submission_row_state(row) -> dict:
+    """registration_submissions 行 → request_verification_email 状态 dict。"""
+    def _epoch(v):
+        return float(v) if v is not None else None
+    return {"kind": str(row["state_kind"]),
+            "resend_available_at": _epoch(row["resend_available_at"]),
+            "resume_at": _epoch(row["resume_at"]),
+            "job_id": row["job_id"], "redelivery_id": row["redelivery_id"],
+            "email": row["email_normalized"],
+            "receipt_id": row["receipt_id"],
+            "submission_id": row["submission_id"],
+            "replayed": True,
+            "token": None, "expires_at": None,
+            "intent_id": None, "registration_request_id": None}
 
-    单个 PostgreSQL 事务内完成：
-      1. 配额检查（权威数据源 = registration_mail_jobs 行数；超限抛
-         EmailVerifyError('rate_limited')，路由层对外与成功**同一文案**）；
-      2. 该邮箱未消费旧作业全部作废（status='superseded'）——同邮箱任意
-         时刻至多一个可用 token（一次性语义的一部分）；
-      3. INSERT 新作业（token_hash + 加密冻结正文；明文 token 绝不落库）。
 
-    冻结正文由 registration_mail_worker.build_verify_email_body 构造（含
-    ``<base_url>/verify-email?token=<明文>`` 链接）并经 encrypt_payload 加密。
+def _record_submission_tx(cur, submission_id, email_norm, action, kind,
+                          job_id=None, redelivery_id=None,
+                          resend_available_at=None, resume_at=None):
+    """记录提交（submission_id 幂等 + 匿名 receipt）。
 
-    返回 ``{"job_id", "email", "token", "expires_at"}``——``token`` 明文
-    **只在返回值出现一次**（经邮件外发；绝不进日志/审计/URL 以外存储）。
+    交付类（submitted/new_link/resend_submitted）行签发 receipt_id——
+    session 只存该随机 id，库内映射原请求/作业；receipt 绝不含 token 或
+    账号身份。非交付类（cooldown/limit/processing）不签发 receipt（沿用
+    上一次交付的 receipt 上下文）。重放由 submission_id 主键吸收。
     """
+    if not submission_id:
+        return None, None
+    sid = str(submission_id).strip()
+    if not sid or len(sid) > 64:
+        return None, None
+    receipt_id = None
+    if kind in ("submitted", "new_link", "resend_submitted"):
+        receipt_id = "rrc_" + secrets.token_urlsafe(12)
+    cur.execute(
+        "INSERT INTO registration_submissions "
+        "(submission_id, receipt_id, email_normalized, action, state_kind, "
+        " job_id, redelivery_id, resend_available_at, resume_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (submission_id) DO NOTHING "
+        "RETURNING submission_id, receipt_id",
+        (sid, receipt_id, email_norm, str(action), str(kind), job_id,
+         redelivery_id,
+         resend_available_at, resume_at))
+    row = cur.fetchone()
+    if row is not None:
+        return sid, row["receipt_id"]
+    # 冲突 = 并发重放同 submission_id：读回已记录状态（不重复入队）
+    return sid, None
+
+
+def _origin_from_frozen_payload(payload) -> str:
+    """加密冻结正文中恢复验证链接 origin（仅历史行 entry_origin 为 NULL 时）。
+
+    只接受白名单 origin（registration_antibot.TRUSTED_ENTRY_ORIGINS）；
+    识别不了返回 ""（不跨入口重发，改发新 token）。绝不把 token/正文带出。
+    """
+    import re as _re
+    text = ""
+    for key in ("link", "body"):
+        v = payload.get(key) if isinstance(payload, dict) else None
+        if isinstance(v, str) and v:
+            text = v
+            break
+    m = _re.search(r"https://[A-Za-z0-9.\-]+(?::\d+)?/verify-email\?token=",
+                   text)
+    if not m:
+        return ""
+    origin = m.group(0)[: -len("/verify-email?token=")]
+    return origin if origin in _antibot.TRUSTED_ENTRY_ORIGINS else ""
+
+
+def _token_from_frozen_payload(payload):
+    """加密冻结正文中恢复明文 token（仅在服务器内用于构造重发正文；
+    绝不进日志/审计，重发载荷重新加密落库）。失败返回 None。"""
+    import re as _re
+    if isinstance(payload, dict):
+        tok = payload.get("token")
+        if isinstance(tok, str) and tok:
+            return tok
+        text = ""
+        for key in ("link", "body"):
+            v = payload.get(key)
+            if isinstance(v, str) and v:
+                text = v
+                break
+        m = _re.search(r"/verify-email\?token=([A-Za-z0-9_\-]{16,})", text)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _active_job_tx(cur, email_norm, flow):
+    """当前可复用的有效验证作业（§4）：最新未消费/未作废/未过期候选行。
+
+    public 流程附带 intent 未完成条件（已完成 intent 的原链接不再重发）。
+    返回行 dict 或 None（含 payload_enc/entry_origin/form_locale/expires_at）。
+    """
+    intent_join = ("LEFT JOIN registration_intents i "
+                   "ON i.mail_job_id = j.job_id") \
+        if flow == MODE_PUBLIC else ""
+    intent_cond = (" AND (i.intent_id IS NULL OR i.completed_at IS NULL)") \
+        if flow == MODE_PUBLIC else ""
+    cur.execute(
+        "SELECT j.job_id, j.status, j.payload_enc, j.entry_origin, "
+        "j.form_locale, extract(epoch from j.expires_at)::float8 "
+        "  AS expires_at "
+        "FROM registration_mail_jobs j " + intent_join + " "
+        "WHERE j.email_normalized=%s AND j.purpose=%s "
+        "AND j.consumed_at IS NULL "
+        "AND j.status IN ('queued','sent','uncertain','failed') "
+        "AND j.expires_at > now()" + intent_cond + " "
+        "ORDER BY j.created_at DESC, j.job_id LIMIT 1",
+        (email_norm, MAIL_PURPOSE_EMAIL_VERIFY))
+    row = cur.fetchone()
+    return dict(row) if row is not None else None
+
+
+def _latest_intent_completed_tx(cur, email_norm) -> bool:
+    """该邮箱最新 public intent 是否已完成（完成后的重发一律中性吸收）。"""
+    cur.execute(
+        "SELECT completed_at FROM registration_intents "
+        "WHERE email_normalized=%s ORDER BY created_at DESC LIMIT 1",
+        (email_norm,))
+    row = cur.fetchone()
+    return row is not None and row["completed_at"] is not None
+
+
+def _latest_open_intent_tx(cur, email_norm):
+    """该邮箱最新**未完成** public intent（近过期重发签新 token 时复制其
+    协议选择，§4.5）；无则 None。"""
+    cur.execute(
+        "SELECT terms_version, terms_sha256, research_opt_in, "
+        "research_version, research_sha256 FROM registration_intents "
+        "WHERE email_normalized=%s AND completed_at IS NULL "
+        "ORDER BY created_at DESC LIMIT 1",
+        (email_norm,))
+    row = cur.fetchone()
+    return dict(row) if row is not None else None
+
+
+def lookup_registration_receipt(receipt_id):
+    """匿名 registration receipt → 原请求上下文（§8）。
+
+    返回 ``{"email", "job_id"}`` 或 None。receipt 只是随机 id → 库内映射，
+    绝不携带 token/账号身份；未知/缺失回 None（调用方给中性 form 状态）。
+    """
+    rid = str(receipt_id or "").strip()
+    if not rid or len(rid) > 64:
+        return None
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT email_normalized, job_id FROM "
+                    "registration_submissions WHERE receipt_id=%s "
+                    "ORDER BY created_at DESC LIMIT 1", (rid,))
+                row = cur.fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return {"email": row["email_normalized"], "job_id": row["job_id"]}
+
+
+def request_verification_email(email, *, flow, action="start",
+                               entry_origin=None, form_locale="zh",
+                               submission_id=None, terms_accepted=None,
+                               terms_version=None, terms_sha256=None,
+                               research_opt_in=False, research_version=None,
+                               research_sha256=None,
+                               ttl_seconds=VERIFY_TOKEN_TTL_SECONDS) -> dict:
+    """统一的验证邮件请求（§3/§4/§6/§8）：单事务锁定顺序核对配额并入队。
+
+    前置：调用方已完成 CSRF / 格式校验 / IP 限流 / Turnstile（网络校验在
+    锁外）。本函数在一个 PostgreSQL 事务内：
+
+      1. 固定顺序 advisory lock（全站额度锁 → 邮箱锁），锁内重查计数；
+      2. submission_id 幂等：已记录的提交**原样回放已记录状态**，不双入队
+         （断网重试只产生一个任务）；
+      3. 冷却（两次接纳 ≥5 分钟）/ 同邮箱 24h 2 次 / 全站 24h 40 次 →
+         对应 kind（cooldown/limit），**不作废任何已有 token**；
+      4. 已完成 intent：中性 submitted 状态（不重发、不泄露账号状态）；
+      5. 原作业仍在排队（worker 处理中）→ processing（不并行新增重发）；
+      6. 有效 token 剩余 ≥5 分钟 → **redelivery**：复用同一 token/协议证明/
+         过期时间（同入口同语言复用原加密正文；跨入口/换语言从受保护原载荷
+         取 token 构造新正文）；剩余 <5 分钟或已过期 → 新 token+intent
+         （kind=new_link）；无有效作业 → 新 token（kind=submitted/new_link）。
+         public 流程**不再**在新请求时作废旧 token（§4 有效链接保留）；
+         legacy 流程保留作废语义（仅在真实投递时）。
+
+    返回 dict（kind ∈ submitted/cooldown/limit/processing/resend_submitted/
+    new_link）：``{"kind", "resend_available_at", "resume_at", "job_id",
+    "redelivery_id", "token", "expires_at", "intent_id",
+    "registration_request_id", "email", "submission_id", "receipt_id",
+    "replayed"}``。``token`` 明文只在交付类返回值出现一次（经邮件外发）。
+    """
+    import agreement_store
     import registration_mail_worker as mail_worker
+    if flow not in (MODE_PUBLIC, MODE_EMAIL_VERIFY_INVITE_ACTIVATION):
+        raise ValueError("flow 需为 public 或 email_verify_invite_activation")
+    if action not in ("start", "resend"):
+        raise ValueError("action 需为 start 或 resend")
     email_norm = validate_email(email)
+    locale = _antibot.normalize_form_locale(form_locale)
+    # 投递语言（zh|en，jobs/redeliveries.form_locale）与协议文稿 locale
+    # （intents.form_locale，agreement_store 键）分开：zh → zh-CN（默认
+    # 文稿），en → en；complete_public_registration 沿用 intent 值查文稿
+    doc_locale = "zh-CN" if locale == "zh" else locale
     try:
         ttl = int(ttl_seconds)
     except (TypeError, ValueError):
         raise ValueError("ttl_seconds 需为整数")
     if ttl <= 0 or ttl > 24 * 3600:
         raise ValueError("ttl_seconds 需在 (0, 86400] 内")
-    token = _new_verify_token()
-    subject, body = mail_worker.build_verify_email_body(
-        email_norm, token, base_url)
-    payload_enc = mail_worker.encrypt_payload(
-        {"subject": subject, "body": body, "purpose": MAIL_PURPOSE_EMAIL_VERIFY,
-         "email": email_norm})
-    token_hash = verify_token_hash(token)
-    job_id = "rmj_" + secrets.token_urlsafe(8)
+    origin = (str(entry_origin or "").strip().rstrip("/") or "")
+
+    # 协议文稿校验在事务外（agreement_store 自管连接）；只影响 public 首次
+    # 提交（action='start'）。resend 不重收协议字段：token 复用沿用原协议
+    # 证明；近过期签发新 intent 时**复制原 intent 的选择**（§4.5：不通过
+    # 重发偷偷覆盖用户选择；实质更新由最终验证页重新确认）。
+    terms_doc = research_doc = None
+    if flow == MODE_PUBLIC and action == "start":
+        if not terms_accepted or not terms_version or not terms_sha256:
+            raise PublicRegistrationError("terms_required")
+        try:
+            terms_doc = _require_published_document_fallback(
+                PUBLIC_TERMS_DOCUMENT_TYPE, terms_version, terms_sha256,
+                doc_locale)
+        except agreement_store.DocumentNotPublishedError as exc:
+            raise PublicRegistrationError("terms_required") from exc
+        research_opt_in = bool(research_opt_in)
+        if research_opt_in:
+            if not research_version or not research_sha256:
+                raise PublicRegistrationError("research_document_required")
+            try:
+                research_doc = _require_published_document_fallback(
+                    PUBLIC_RESEARCH_DOCUMENT_TYPE, research_version,
+                    research_sha256, doc_locale)
+            except agreement_store.DocumentNotPublishedError as exc:
+                raise PublicRegistrationError(
+                    "research_document_required") from exc
+        else:
+            research_doc = _current_published_fallback(
+                PUBLIC_RESEARCH_DOCUMENT_TYPE, doc_locale)
+
+    now = time.time()
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                cooldown, hourly, daily, app_daily = \
-                    _verify_quota_counts_tx(cur, email_norm)
-                if cooldown > 0 or hourly >= VERIFY_HOURLY_LIMIT \
-                        or daily >= VERIFY_DAILY_LIMIT \
-                        or app_daily >= VERIFY_APP_DAILY_BUDGET:
-                    raise EmailVerifyError("rate_limited")
-                # 作废同邮箱全部未消费旧 token（一次性 + 单活）：
-                # P1-1 起 uncertain（发送结果不确定）同样持有可用链接，一并
-                # 作废，维持「同邮箱任意时刻至多一个可用 token」
-                cur.execute(
-                    "UPDATE registration_mail_jobs SET status='superseded' "
-                    "WHERE email_normalized=%s AND purpose=%s "
-                    "AND consumed_at IS NULL "
-                    "AND status IN ('queued','sent','uncertain')",
-                    (email_norm, MAIL_PURPOSE_EMAIL_VERIFY))
+                _acquire_delivery_locks_tx(cur, email_norm)
+                # 2) submission_id 幂等重放（§8）
+                if submission_id:
+                    cur.execute(
+                        "SELECT submission_id, receipt_id, email_normalized, "
+                        "state_kind, job_id, redelivery_id, "
+                        "extract(epoch from resend_available_at)::float8 "
+                        "  AS resend_available_at, "
+                        "extract(epoch from resume_at)::float8 AS resume_at "
+                        "FROM registration_submissions WHERE submission_id=%s",
+                        (str(submission_id).strip(),))
+                    row = cur.fetchone()
+                    if row is not None:
+                        return _submission_row_state(row)
+                quota = _delivery_quota_tx(cur, email_norm)
+                # 2.5) 已完成 intent：中性 submitted（§4.4 不重发不泄露）。
+                # 先于配额检查——已完成邮箱的后续请求不得借 cooldown/limit
+                # 状态差异泄露「该邮箱有过注册活动」
+                if flow == MODE_PUBLIC \
+                        and _latest_intent_completed_tx(cur, email_norm):
+                    sid, _ = _record_submission_tx(
+                        cur, submission_id, email_norm, action, "submitted")
+                    return {"kind": "submitted",
+                            "resend_available_at": now +
+                            VERIFY_COOLDOWN_SECONDS, "resume_at": None,
+                            "job_id": None, "redelivery_id": None,
+                            "token": None, "expires_at": None,
+                            "intent_id": None,
+                            "registration_request_id": None,
+                            "email": email_norm, "submission_id": sid,
+                            "receipt_id": None, "replayed": False}
+                # 3) 冷却 / 邮箱额度 / 全站预算（顺序固定；均不动已有 token）
+                if quota["email_last_ts"] is not None \
+                        and now - quota["email_last_ts"] \
+                        < VERIFY_COOLDOWN_SECONDS:
+                    resend_at = quota["email_last_ts"] + \
+                        VERIFY_COOLDOWN_SECONDS
+                    _log.warning(
+                        "cooldown email=%s entry=%s resend_in=%ds",
+                        _antibot.salted_email_tag(email_norm), origin or "-",
+                        max(0, int(resend_at - now)))
+                    sid, _ = _record_submission_tx(
+                        cur, submission_id, email_norm, action, "cooldown",
+                        resend_available_at=_dt_from_epoch(resend_at))
+                    return {"kind": "cooldown",
+                            "resend_available_at": resend_at, "resume_at": None,
+                            "job_id": None, "redelivery_id": None,
+                            "token": None, "expires_at": None,
+                            "intent_id": None,
+                            "registration_request_id": None,
+                            "email": email_norm, "submission_id": sid,
+                            "receipt_id": None, "replayed": False}
+                resume_at = None
+                if quota["global_24h"] >= VERIFY_APP_DAILY_BUDGET:
+                    base_ts = quota["global_earliest_24h_ts"] or now
+                    resume_at = base_ts + 24 * 3600
+                    kind = "global_send_limit"
+                elif quota["email_24h"] >= VERIFY_DAILY_LIMIT:
+                    base_ts = quota["email_earliest_24h_ts"] or now
+                    resume_at = base_ts + 24 * 3600
+                    kind = "email_send_limit"
+                if resume_at is not None:
+                    _log.warning(
+                        "%s email=%s entry=%s resume_in=%ds", kind,
+                        _antibot.salted_email_tag(email_norm),
+                        origin or "-", max(0, int(resume_at - now)))
+                    sid, _ = _record_submission_tx(
+                        cur, submission_id, email_norm, action, "limit",
+                        resume_at=_dt_from_epoch(resume_at))
+                    return {"kind": "limit", "resend_available_at": None,
+                            "resume_at": resume_at, "job_id": None,
+                            "redelivery_id": None, "token": None,
+                            "expires_at": None, "intent_id": None,
+                            "registration_request_id": None,
+                            "email": email_norm, "submission_id": sid,
+                            "receipt_id": None, "replayed": False}
+                active = _active_job_tx(cur, email_norm, flow)
+                # 5) 原作业仍在排队：worker 处理中，不并行新增重发任务
+                if active is not None and active["status"] == "queued":
+                    sid, _ = _record_submission_tx(
+                        cur, submission_id, email_norm, action, "processing")
+                    return {"kind": "processing",
+                            "resend_available_at": now +
+                            VERIFY_COOLDOWN_SECONDS, "resume_at": None,
+                            "job_id": active["job_id"], "redelivery_id": None,
+                            "token": None, "expires_at": None,
+                            "intent_id": None,
+                            "registration_request_id": None,
+                            "email": email_norm, "submission_id": sid,
+                            "receipt_id": None, "replayed": False}
+                first_delivery = quota["email_last_ts"] is None
+                # 6a) 有效 token 剩余 ≥5 分钟 → redelivery 复用同一 token
+                #（仅 public 流程；legacy email_verify 形态保留「新请求 =
+                # 新 token + 作废旧 token」的历史一次性语义）
+                redelivery_id = None
+                if flow == MODE_PUBLIC and active is not None and origin \
+                        and active["expires_at"] - now \
+                        >= VERIFY_REUSE_MIN_REMAINING_SECONDS:
+                    job_origin = active["entry_origin"]
+                    job_locale = _antibot.normalize_form_locale(
+                        active["form_locale"])
+                    reusable_token = None
+                    if not job_origin:
+                        # 历史行：按加密正文链接惰性恢复白名单 origin；
+                        # 恢复不了不跨入口重发（走新 token）
+                        try:
+                            frozen = mail_worker.decrypt_payload(
+                                active["payload_enc"])
+                            job_origin = _origin_from_frozen_payload(frozen)
+                        except Exception:
+                            job_origin = ""
+                    if job_origin == origin and job_locale == locale:
+                        payload_enc = active["payload_enc"]
+                    else:
+                        try:
+                            frozen = mail_worker.decrypt_payload(
+                                active["payload_enc"])
+                            reusable_token = _token_from_frozen_payload(frozen)
+                        except Exception:
+                            reusable_token = None
+                        if not reusable_token:
+                            frozen_payload = None
+                        else:
+                            subject, body = \
+                                mail_worker.build_verify_email_body_for_site(
+                                    email_norm, reusable_token,
+                                    entry_origin=origin, form_locale=locale,
+                                    flow=flow)
+                            frozen_payload = mail_worker.encrypt_payload(
+                                {"subject": subject, "body": body,
+                                 "purpose": MAIL_PURPOSE_EMAIL_VERIFY,
+                                 "email": email_norm,
+                                 "token": reusable_token})
+                        if frozen_payload is None:
+                            payload_enc = None  # 落到新 token 分支
+                        else:
+                            payload_enc = frozen_payload
+                    if payload_enc is not None:
+                        redelivery_id = "rmr_" + secrets.token_urlsafe(8)
+                        cur.execute(
+                            "INSERT INTO registration_mail_redeliveries "
+                            "(redelivery_id, job_id, email_normalized, "
+                            " payload_enc, status, entry_origin, form_locale) "
+                            "VALUES (%s,%s,%s,%s,'queued',%s,%s)",
+                            (redelivery_id, active["job_id"], email_norm,
+                             payload_enc, origin, locale))
+                        _log.warning(
+                            "mail_redelivery_queued job=%s email=%s "
+                            "entry=%s locale=%s", active["job_id"],
+                            _antibot.salted_email_tag(email_norm), origin,
+                            locale)
+                        sid, receipt = _record_submission_tx(
+                            cur, submission_id, email_norm, action,
+                            "resend_submitted", job_id=active["job_id"],
+                            redelivery_id=redelivery_id,
+                            resend_available_at=_dt_from_epoch(
+                                now + VERIFY_COOLDOWN_SECONDS))
+                        return {"kind": "resend_submitted",
+                                "resend_available_at": now +
+                                VERIFY_COOLDOWN_SECONDS, "resume_at": None,
+                                "job_id": active["job_id"],
+                                "redelivery_id": redelivery_id,
+                                "token": None, "expires_at":
+                                    active["expires_at"],
+                                "intent_id": None,
+                                "registration_request_id": None,
+                                "email": email_norm, "submission_id": sid,
+                                "receipt_id": receipt, "replayed": False}
+                # 6b) 新 token（首封 / 近过期 / 无有效作业）
+                token = _new_verify_token()
+                subject, body = \
+                    mail_worker.build_verify_email_body_for_site(
+                        email_norm, token, entry_origin=origin,
+                        form_locale=locale, flow=flow)
+                payload_enc = mail_worker.encrypt_payload(
+                    {"subject": subject, "body": body,
+                     "purpose": MAIL_PURPOSE_EMAIL_VERIFY,
+                     "email": email_norm, "token": token})
+                token_hash = verify_token_hash(token)
+                job_id = "rmj_" + secrets.token_urlsafe(8)
+                if flow == MODE_EMAIL_VERIFY_INVITE_ACTIVATION:
+                    # legacy：真实投递时作废旧 token（保持原一次性语义；
+                    # 冷却/额度拒绝路径在上面已提前返回，不会到这里作废）
+                    cur.execute(
+                        "UPDATE registration_mail_jobs SET "
+                        "status='superseded' WHERE email_normalized=%s "
+                        "AND purpose=%s AND consumed_at IS NULL "
+                        "AND status IN ('queued','sent','uncertain')",
+                        (email_norm, MAIL_PURPOSE_EMAIL_VERIFY))
                 cur.execute(
                     "INSERT INTO registration_mail_jobs "
                     "(job_id, purpose, email_normalized, token_hash, "
-                    " payload_enc, status, expires_at) "
+                    " payload_enc, status, expires_at, entry_origin, "
+                    " form_locale) "
                     "VALUES (%s,%s,%s,%s,%s,'queued', "
-                    " now() + (%s * interval '1 second')) "
+                    " now() + (%s * interval '1 second'), %s, %s) "
                     "RETURNING extract(epoch from expires_at)::float8 "
                     "AS expires_at",
                     (job_id, MAIL_PURPOSE_EMAIL_VERIFY, email_norm,
-                     token_hash, payload_enc, ttl))
+                     token_hash, payload_enc, ttl, origin or None,
+                     locale or None))
                 expires_at = float(cur.fetchone()["expires_at"])
+                intent_id = request_id = None
+                if flow == MODE_PUBLIC:
+                    # start：用本次表单校验过的选择；resend（近过期新 token）
+                    # 复制原 intent 的选择（§4.5）；无原 intent（历史 legacy
+                    # 作业）→ 新作业不带 intent，走 legacy 验证页
+                    if terms_doc is not None:
+                        new_terms = (terms_doc["version"],
+                                     terms_doc["content_sha256"],
+                                     research_opt_in,
+                                     research_doc["version"]
+                                     if research_doc else None,
+                                     research_doc["content_sha256"]
+                                     if research_doc else None)
+                    else:
+                        orig = _latest_open_intent_tx(cur, email_norm)
+                        new_terms = (
+                            (orig["terms_version"], orig["terms_sha256"],
+                             bool(orig["research_opt_in"]),
+                             orig["research_version"],
+                             orig["research_sha256"])) if orig else None
+                    if new_terms is not None:
+                        intent_id = "rint_" + secrets.token_urlsafe(8)
+                        request_id = "rreq_" + secrets.token_urlsafe(16)
+                        cur.execute(
+                            "INSERT INTO registration_intents "
+                            "(intent_id, registration_request_id, mail_job_id,"
+                            " email_normalized, flow_mode, terms_version, "
+                            " terms_sha256, terms_accepted_at, research_opt_in,"
+                            " research_version, research_sha256, form_locale, "
+                            " source_origin) "
+                            "VALUES (%s,%s,%s,%s,'public',%s,%s,now(),%s,%s,%s,"
+                            "%s,%s)",
+                            (intent_id, request_id, job_id, email_norm,
+                             new_terms[0], new_terms[1], new_terms[2],
+                             new_terms[3], new_terms[4],
+                             doc_locale, origin or None))
+                kind = "submitted" if first_delivery else "new_link"
+                _log.warning(
+                    "mail_queued job=%s email=%s entry=%s locale=%s kind=%s",
+                    job_id, _antibot.salted_email_tag(email_norm),
+                    origin or "-", locale, kind)
+                sid, receipt = _record_submission_tx(
+                    cur, submission_id, email_norm, action, kind,
+                    job_id=job_id, resend_available_at=_dt_from_epoch(
+                        now + VERIFY_COOLDOWN_SECONDS))
+                return {"kind": kind,
+                        "resend_available_at": now + VERIFY_COOLDOWN_SECONDS,
+                        "resume_at": None, "job_id": job_id,
+                        "redelivery_id": None, "token": token,
+                        "expires_at": expires_at, "intent_id": intent_id,
+                        "registration_request_id": request_id,
+                        "email": email_norm, "submission_id": sid,
+                        "receipt_id": receipt, "replayed": False}
     except psycopg.errors.UniqueViolation:
-        # token_hash 撞唯一键概率可忽略；防御性统一失败
+        # token_hash/submission_id 撞唯一键概率可忽略；防御性统一失败
         raise EmailVerifyError("bad_input")
     finally:
         conn.close()
-    return {"job_id": job_id, "email": email_norm, "token": token,
-            "expires_at": expires_at}
+
+
+def _dt_from_epoch(epoch):
+    """epoch 秒 → timestamptz（datetime）；None 透传。"""
+    if epoch is None:
+        return None
+    return datetime.fromtimestamp(float(epoch), tz=timezone.utc)
+
+
+def enqueue_email_verification(email, base_url=None,
+                               form_locale="zh",
+                               ttl_seconds=VERIFY_TOKEN_TTL_SECONDS):
+    """请求邮箱验证（legacy email_verify 模式 start/resend 共用；兼容包装）。
+
+    新配额/锁序语义见 :func:`request_verification_email`。真实投递返回
+    ``{"job_id", "email", "token", "expires_at"}``（token 明文只出现一次）；
+    冷却/额度/处理中 → EmailVerifyError('rate_limited')（路由层对外与成功
+    **同一文案**，无枚举信号；细分只进日志）。
+    """
+    result = request_verification_email(
+        email, flow=MODE_EMAIL_VERIFY_INVITE_ACTIVATION,
+        entry_origin=(str(base_url or "").strip().rstrip("/") or None),
+        form_locale=form_locale, ttl_seconds=ttl_seconds)
+    if result["kind"] not in ("submitted", "new_link"):
+        raise EmailVerifyError("rate_limited")
+    return {"job_id": result["job_id"], "email": result["email"],
+            "token": result["token"], "expires_at": result["expires_at"]}
 
 
 def check_verify_token(token):
@@ -1444,14 +1967,53 @@ def public_document_failures() -> list:
     return failures
 
 
+def _doc_locale_candidates(locale):
+    """文稿 locale 查找序列（2026-10-08 设计 §6：.com 默认 en，但协议文稿
+    可能暂只有 zh-CN 发布——en 入口回落 zh-CN canonical 文稿，version/hash
+    校验照旧严格；en 文稿发布后自动优先）。"""
+    seen = []
+    for loc in (str(locale or "").strip(), "zh-CN"):
+        if loc and loc not in seen:
+            seen.append(loc)
+    return seen
+
+
 def _current_published_tx(cur, document_type, locale):
-    """同事务读当前 published 文稿（返回 dict 或 None）。"""
-    cur.execute(
-        "SELECT version, content_sha256 FROM agreement_documents "
-        "WHERE document_type=%s AND locale=%s AND status='published'",
-        (document_type, locale))
-    row = cur.fetchone()
-    return dict(row) if row is not None else None
+    """同事务读当前 published 文稿（locale 回落 zh-CN；返回 dict 或 None）。"""
+    for loc in _doc_locale_candidates(locale):
+        cur.execute(
+            "SELECT version, content_sha256 FROM agreement_documents "
+            "WHERE document_type=%s AND locale=%s AND status='published'",
+            (document_type, loc))
+        row = cur.fetchone()
+        if row is not None:
+            return dict(row)
+    return None
+
+
+def _require_published_document_fallback(document_type, version, sha256,
+                                         locale):
+    """require_published_document 的 locale 回落版（en 入口 → zh-CN 文稿）；
+    全部 locale 都未发布该版本时抛 DocumentNotPublishedError。"""
+    import agreement_store
+    last = None
+    for loc in _doc_locale_candidates(locale):
+        try:
+            return agreement_store.require_published_document(
+                document_type, version, sha256, locale=loc)
+        except agreement_store.DocumentNotPublishedError as exc:
+            last = exc
+    raise last
+
+
+def _current_published_fallback(document_type, locale):
+    """current_published 的 locale 回落版（zh-CN 兜底）。"""
+    import agreement_store
+    for loc in _doc_locale_candidates(locale):
+        doc = agreement_store.current_published(document_type, locale=loc)
+        if doc is not None:
+            return doc
+    return None
 
 
 def _stored_registration_mode_tx(cur) -> str:
@@ -1475,122 +2037,28 @@ def enqueue_public_verification(email, *, terms_accepted, terms_version,
                                 research_version=None, research_sha256=None,
                                 base_url=None, form_locale="zh-CN",
                                 ttl_seconds=VERIFY_TOKEN_TTL_SECONDS):
-    """public 注册请求验证邮件（§3.3.1）：邮箱 + 双协议选择 → intent + 邮件。
+    """public 注册请求验证邮件（§3.3.1 兼容包装；权威实现见
+    :func:`request_verification_email`）。
 
-    - 必选《用户协议与数据处理说明》：``terms_accepted`` 必须为严格 True
-      （路由层经 :func:`parse_wire_bool` 解析），且 version/hash 命中**当前
-      published** 文稿，否则 PublicRegistrationError('terms_required')
-      （条款缺失/版本不匹配后端拒绝，§3.1）；
-    - 可选《数据共享与软件改进协议》：``research_opt_in`` 严格布尔，false
-      或未提供按 false 处理、不能拒绝注册；True 时 version/hash 必填且命中
-      当前 published（否则 'research_document_required'）；false 时服务端
-      自行记录当前 published 版本/hash 备查（可为 None）；
-    - 配额与旧 email_verify 形态同口径（同邮箱 60s 冷却/时 3/日 5、应用日
-      预算 40），但**只计 email_verify 用途**（§4.3：验证邮件计数器与注册
-      名额计数器分离）；超限抛 EmailVerifyError('rate_limited')，路由层与
-      成功同一文案（无枚举信号）；
-    - 同事务：作废旧 token → INSERT email_verify job → INSERT intent
-      （mail_job_id 一对一、registration_request_id 服务端生成、
-      terms_accepted_at 服务端 now()）；
-    - **不占名额、不建账号、不收密码**（计数时点在验证完成的原子事务）。
-
-    返回 ``{"job_id", "intent_id", "registration_request_id", "email",
-    "token", "expires_at"}``（token 明文仅此一次，经邮件外发）。
+    真实投递（首封/近过期新 token）返回 ``{"job_id", "intent_id",
+    "registration_request_id", "email", "token", "expires_at"}``（token 明文
+    仅此一次，经邮件外发）；冷却/额度/处理中 → EmailVerifyError
+    ('rate_limited')（路由层与成功同一文案，无枚举信号）。
     """
-    import agreement_store
-    import registration_mail_worker as mail_worker
-    email_norm = validate_email(email)
-    if not terms_accepted or not terms_version or not terms_sha256:
-        raise PublicRegistrationError("terms_required")
-    try:
-        terms_doc = agreement_store.require_published_document(
-            PUBLIC_TERMS_DOCUMENT_TYPE, terms_version, terms_sha256,
-            locale=form_locale)
-    except agreement_store.DocumentNotPublishedError as exc:
-        raise PublicRegistrationError("terms_required") from exc
-    research_opt_in = bool(research_opt_in)
-    research_doc = None
-    if research_opt_in:
-        if not research_version or not research_sha256:
-            raise PublicRegistrationError("research_document_required")
-        try:
-            research_doc = agreement_store.require_published_document(
-                PUBLIC_RESEARCH_DOCUMENT_TYPE, research_version,
-                research_sha256, locale=form_locale)
-        except agreement_store.DocumentNotPublishedError as exc:
-            raise PublicRegistrationError(
-                "research_document_required") from exc
-    else:
-        # false 有效：服务端记录当前 published 版本/hash 备查（缺文稿不拒
-        # 注册——false 不引用文稿；前置闸保证 public 生效时双文稿齐备）
-        research_doc = agreement_store.current_published(
-            PUBLIC_RESEARCH_DOCUMENT_TYPE, locale=form_locale)
-    try:
-        ttl = int(ttl_seconds)
-    except (TypeError, ValueError):
-        raise ValueError("ttl_seconds 需为整数")
-    if ttl <= 0 or ttl > 24 * 3600:
-        raise ValueError("ttl_seconds 需在 (0, 86400] 内")
-    token = _new_verify_token()
-    subject, body = mail_worker.build_public_verify_email_body(
-        email_norm, token, base_url)
-    payload_enc = mail_worker.encrypt_payload(
-        {"subject": subject, "body": body, "purpose": MAIL_PURPOSE_EMAIL_VERIFY,
-         "email": email_norm})
-    token_hash = verify_token_hash(token)
-    job_id = "rmj_" + secrets.token_urlsafe(8)
-    intent_id = "rint_" + secrets.token_urlsafe(8)
-    request_id = "rreq_" + secrets.token_urlsafe(16)
-    conn = _connect()
-    try:
-        with pg_store.transaction(conn) as c:
-            with c.cursor() as cur:
-                cooldown, hourly, daily, app_daily = _verify_quota_counts_tx(
-                    cur, email_norm, purpose=MAIL_PURPOSE_EMAIL_VERIFY)
-                if cooldown > 0 or hourly >= VERIFY_HOURLY_LIMIT \
-                        or daily >= VERIFY_DAILY_LIMIT \
-                        or app_daily >= VERIFY_APP_DAILY_BUDGET:
-                    raise EmailVerifyError("rate_limited")
-                # 作废同邮箱全部未消费旧 token（一次性 + 单活；旧 intent 随
-                # 旧 job 一并失效——token 不再可用即 intent 不再可完成）
-                cur.execute(
-                    "UPDATE registration_mail_jobs SET status='superseded' "
-                    "WHERE email_normalized=%s AND purpose=%s "
-                    "AND consumed_at IS NULL "
-                    "AND status IN ('queued','sent','uncertain')",
-                    (email_norm, MAIL_PURPOSE_EMAIL_VERIFY))
-                cur.execute(
-                    "INSERT INTO registration_mail_jobs "
-                    "(job_id, purpose, email_normalized, token_hash, "
-                    " payload_enc, status, expires_at) "
-                    "VALUES (%s,%s,%s,%s,%s,'queued', "
-                    " now() + (%s * interval '1 second')) "
-                    "RETURNING extract(epoch from expires_at)::float8 "
-                    "AS expires_at",
-                    (job_id, MAIL_PURPOSE_EMAIL_VERIFY, email_norm,
-                     token_hash, payload_enc, ttl))
-                expires_at = float(cur.fetchone()["expires_at"])
-                cur.execute(
-                    "INSERT INTO registration_intents "
-                    "(intent_id, registration_request_id, mail_job_id, "
-                    " email_normalized, flow_mode, terms_version, terms_sha256, "
-                    " terms_accepted_at, research_opt_in, research_version, "
-                    " research_sha256, form_locale) "
-                    "VALUES (%s,%s,%s,%s,'public',%s,%s,now(),%s,%s,%s,%s)",
-                    (intent_id, request_id, job_id, email_norm,
-                     terms_doc["version"], terms_doc["content_sha256"],
-                     research_opt_in,
-                     research_doc["version"] if research_doc else None,
-                     research_doc["content_sha256"] if research_doc else None,
-                     str(form_locale or "zh-CN")[:32]))
-    except psycopg.errors.UniqueViolation:
-        # token_hash/request_id 撞唯一键概率可忽略；防御性统一失败
-        raise EmailVerifyError("bad_input")
-    finally:
-        conn.close()
-    return {"job_id": job_id, "intent_id": intent_id,
-            "registration_request_id": request_id, "email": email_norm,
-            "token": token, "expires_at": expires_at}
+    result = request_verification_email(
+        email, flow=MODE_PUBLIC, action="start",
+        entry_origin=(str(base_url or "").strip().rstrip("/") or None),
+        form_locale=form_locale,
+        terms_accepted=terms_accepted, terms_version=terms_version,
+        terms_sha256=terms_sha256, research_opt_in=research_opt_in,
+        research_version=research_version, research_sha256=research_sha256,
+        ttl_seconds=ttl_seconds)
+    if result["kind"] not in ("submitted", "new_link"):
+        raise EmailVerifyError("rate_limited")
+    return {"job_id": result["job_id"], "intent_id": result["intent_id"],
+            "registration_request_id": result["registration_request_id"],
+            "email": result["email"], "token": result["token"],
+            "expires_at": result["expires_at"]}
 
 
 def verify_token_flow(token) -> str:
@@ -1959,6 +2427,12 @@ def complete_public_registration(token, password, *, research_opt_in=None,
                      "day": str(quota_day),
                      "successful_count": day_count,
                      "completion_id": completion_id})
+        # §8 事件：registration_completed（WARNING——生产 gunicorn 有效级别；
+        # 只带掩码邮箱标识/日桶，绝不带 token/密码/完整邮箱）
+        _log.warning(
+            "registration_completed email=%s day=%s count=%d",
+            _antibot.salted_email_tag(email_norm), str(quota_day),
+            day_count)
         return {"ok": True, "next": "/login?registered=1",
                 "replayed": False, "user": user, "email": email_norm,
                 "day": str(quota_day), "successful_count": day_count,

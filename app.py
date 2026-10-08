@@ -4808,6 +4808,10 @@ def _register_email_verify_post(ip_hash):
             registration_store.MODE_EMAIL_VERIFY_INVITE_ACTIVATION:
         return _register_landing_page(mode="closed", status=403)
     mode = "email_verify"
+    # submission_id 重放：先于 Turnstile 回放已记录状态（无入队；§8）
+    replay = _register_replay_response(mode)
+    if replay is not None:
+        return replay
     email = (request.form.get("email") or "").strip()
     try:
         registration_store.validate_email(email)
@@ -4932,19 +4936,48 @@ def _register_state(kind, resend_available_at=None, resume_at=None,
     }
 
 
+def _register_submission_id_secret() -> str:
+    """submission_id 签名密钥（域分离前缀；盐链与注册验证侧同源，env 可
+    覆盖；secret 绝不进日志/模板）。"""
+    for name in ("REGISTRATION_VERIFY_HASH_SALT", "AUTH_SUBJECT_HASH_SALT",
+                 "SECRET_KEY"):
+        v = (os.environ.get(name) or "").strip()
+        if v:
+            return v
+    return "pt-register-submission-v1"
+
+
+def _register_submission_id_sign(rand: str) -> str:
+    return hmac.new(
+        ("regsub:" + _register_submission_id_secret()).encode("utf-8"),
+        str(rand).encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+
+
 def _register_fresh_submission_id():
-    """签发新的注册表单 submission_id（存 session；服务端幂等键，§8）。"""
-    sid = "rsb_" + secrets.token_urlsafe(12)
-    session["register_pending_submission"] = sid
-    return sid
+    """签发无状态签名 submission_id：``rsb_<random>.<hmac16>``（≤64 字符）。
+
+    服务端可验签、不写 session（GET 渲染不再改写会话 cookie；id 由签发方
+    签名背书，非客户端自选）。幂等键语义见 registration_store
+    registration_submissions（§8）。"""
+    rand = secrets.token_urlsafe(12)
+    return "rsb_%s.%s" % (rand, _register_submission_id_sign(rand))
 
 
 def _register_form_submission_id():
-    """取表单提交的 submission_id（服务端签发；防御性限长/字符集）。"""
-    sid = (request.form.get("submission_id") or "").strip()
-    if sid and len(sid) <= 64 and re.fullmatch(r"[A-Za-z0-9_\-]+", sid):
-        return sid
-    return None
+    """取并验证表单 submission_id：签名常数时间比较；伪造/缺签/超长 →
+    None（按无 submission_id 处理——照常提交，仅无幂等保护）。"""
+    raw = (request.form.get("submission_id") or "").strip()
+    if not raw or len(raw) > 64 or not raw.startswith("rsb_"):
+        return None
+    rand, sep, sig = raw[4:].rpartition(".")
+    if not sep or not rand or not sig:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_\-]{8,64}", rand) \
+            or not re.fullmatch(r"[0-9a-f]{16}", sig):
+        return None
+    if not hmac.compare_digest(sig, _register_submission_id_sign(rand)):
+        return None
+    return raw
 
 
 def _turnstile_request_token():
@@ -4957,6 +4990,38 @@ def _turnstile_request_token():
         v = body.get(registration_antibot.TURNSTILE_TOKEN_FIELD)
         tok = (str(v).strip() if isinstance(v, str) else "") or ""
     return tok
+
+
+def _register_replay_response(mode):
+    """已记录 submission_id 的提交：**先于 Turnstile** 直接回放已记录状态。
+
+    浏览器/断网重试携带的是已消费的一次性挑战 token（timeout-or-duplicate
+    会被判 challenge_failed）——重放不是新请求，不得因挑战重放被拒（§8
+    幂等优先）。只读查询（无锁、无入队、不打 siteverify）；未记录/无效
+    id → None（走正常校验链）。已记录状态里的 receipt 一并恢复到 session
+    （与首次提交后的会话语义一致）。
+    """
+    sid = _register_form_submission_id()
+    if not sid:
+        return None
+    try:
+        recorded = registration_store.lookup_registration_submission(sid)
+    except Exception:
+        app.logger.warning(
+            "registration submission 重放查询异常（按未记录处理，走正常"
+            "校验链）", exc_info=True)
+        return None
+    if recorded is None:
+        return None
+    if recorded.get("receipt_id"):
+        session["register_receipt"] = recorded["receipt_id"]
+    state = _register_state(
+        recorded.get("kind"),
+        resend_available_at=recorded.get("resend_available_at"),
+        resume_at=recorded.get("resume_at"),
+        help_reason={"cooldown": "cooldown", "limit": "limit"}.get(
+            recorded.get("kind")))
+    return _register_state_response(state, mode)
 
 
 def _turnstile_guard(action):
@@ -5059,6 +5124,10 @@ def _register_public_post(ip_hash):
     if _effective_registration_mode() != registration_store.MODE_PUBLIC:
         return _register_landing_page(mode="closed", status=403)
     mode = "public"
+    # submission_id 重放：先于 Turnstile 回放已记录状态（无入队；§8）
+    replay = _register_replay_response(mode)
+    if replay is not None:
+        return replay
     email = (request.form.get("email") or "").strip()
     terms_accepted = registration_store.parse_wire_bool(
         request.form.get("terms_accepted"))
@@ -5154,6 +5223,11 @@ def register_resend():
             mode="public", error="尝试过于频繁，请稍后再试",
             error_code="locked", retry_after=int(retry), status=429,
             headers={"Retry-After": str(max(1, int(retry)))})
+    # submission_id 重放：先于 Turnstile 回放已记录状态（无入队；§8——
+    # 重发请求的断网/浏览器重试同样携带已消费挑战 token）
+    replay = _register_replay_response("public")
+    if replay is not None:
+        return replay
     entry = _registration_entry_site()
     if entry.get("refused"):
         return _register_entry_refused_state("public")
@@ -5271,14 +5345,24 @@ def registration_help_page():
         site_name = "HistoPilot"
     title_zh, title_en = _REGISTRATION_HELP_COPY[reason]
     from urllib.parse import quote
-    mailto = "mailto:%s?subject=%s&body=%s" % (
-        REGISTRATION_HELP_AUTHOR_EMAIL,
-        quote(REGISTRATION_HELP_MAIL_SUBJECT, safe=""),
-        quote(_registration_help_mail_body(origin, locale), safe=""))
+
+    def _mailto(body_locale):
+        return "mailto:%s?subject=%s&body=%s" % (
+            REGISTRATION_HELP_AUTHOR_EMAIL,
+            quote(REGISTRATION_HELP_MAIL_SUBJECT, safe=""),
+            quote(_registration_help_mail_body(origin, body_locale),
+                  safe=""))
+
+    # §5：按当前语言提供中英文版本——主链接 href 为入口默认语言（无 JS
+    # 可用），data-mailto-zh / data-mailto-en 供前端按用户已选语言切换
+    mailto_zh = _mailto("zh")
+    mailto_en = _mailto("en")
+    mailto_href = mailto_zh if locale == "zh" else mailto_en
     resp = make_response(render_template(
         "registration_help.html", reason=reason, title_zh=title_zh,
         title_en=title_en, site_name=site_name, entry_origin=origin,
-        locale=locale, mailto_href=mailto,
+        locale=locale, mailto_href=mailto_href, mailto_href_zh=mailto_zh,
+        mailto_href_en=mailto_en,
         author_email=REGISTRATION_HELP_AUTHOR_EMAIL))
     return _apply_landing_security_headers(resp, allow_turnstile=False)
 

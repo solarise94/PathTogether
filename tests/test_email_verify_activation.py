@@ -222,7 +222,7 @@ def test_register_email_mode_post_unified_copy(monkeypatch):
 
     def _normalize(body):
         # 每次渲染签发新的 submission_id（幂等键），比较前归一
-        return re.sub(r"rsb_[A-Za-z0-9_\-]+", "rsb_X", body)
+        return re.sub(r"rsb_[A-Za-z0-9_.\-]+", "rsb_X", body)
 
     r1 = _post("New.User@Example.COM ")
     assert r1.status_code == 200

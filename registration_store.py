@@ -1064,6 +1064,41 @@ def lookup_registration_receipt(receipt_id):
     return {"email": row["email_normalized"], "job_id": row["job_id"]}
 
 
+def lookup_registration_submission(submission_id):
+    """submission_id → 已记录提交状态（§8 幂等重放的**只读**查询）。
+
+    无 advisory lock、无入队、无任何写副作用——供发送路径在 Turnstile
+    **之前**识别断网/浏览器重试并直接回放已记录状态（重放携带的是已
+    消费的一次性挑战 token，不能因 challenge_rejected 拒答）。返回
+    ``{"kind", "resend_available_at", "resume_at", "job_id",
+    "redelivery_id", "email", "receipt_id", "submission_id",
+    "replayed": True, ...}`` 或 None（未记录/形状非法）。
+    """
+    sid = str(submission_id or "").strip()
+    if not sid or len(sid) > 64:
+        return None
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT submission_id, receipt_id, email_normalized, "
+                    "state_kind, job_id, redelivery_id, "
+                    "extract(epoch from resend_available_at)::float8 "
+                    "  AS resend_available_at, "
+                    "extract(epoch from resume_at)::float8 AS resume_at "
+                    "FROM registration_submissions WHERE submission_id=%s",
+                    (sid,))
+                row = cur.fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    state = _submission_row_state(row)
+    state["replayed"] = True
+    return state
+
+
 def request_verification_email(email, *, flow, action="start",
                                entry_origin=None, form_locale="zh",
                                submission_id=None, terms_accepted=None,

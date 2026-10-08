@@ -345,6 +345,18 @@ def verify(token, *, action, remoteip=None, expected_hostname=None,
                 str(c) in ("timeout-or-duplicate",) for c in codes):
             return TurnstileResult("rejected", "replayed")
         return TurnstileResult("rejected", "challenge_failed")
+    # 开发/测试放行（REGISTRATION_TURNSTILE_ALLOW_TEST_KEYS 且确用测试密钥
+    # 时）：Cloudflare 测试密钥的 siteverify 回包没有 action 字段、hostname
+    # 恒为 example.com（metadata.result_with_testing_key=true）——本地端到
+    # 端联调无法通过 action/hostname 检查，故仅在**三者同时成立**（allow
+    # 标志 + 配置确为测试密钥 + 回包自带 testing-key 标记）时跳过这两项
+    # 检查（success 仍必须为 True）。生产不可达：未带 allow 标志的测试密钥
+    # 在配置层已按「未配置」fail-closed。
+    metadata = payload.get("metadata")
+    testing_key_response = isinstance(metadata, dict) and \
+        metadata.get("result_with_testing_key") is True
+    if testing_key_response and cfg.allow_test_keys and cfg.uses_test_keys:
+        return TurnstileResult("ok", "test_key_relaxed")
     if payload.get("action") != action:
         return TurnstileResult("rejected", "action_mismatch")
     hostname = request_hostname(payload.get("hostname"))

@@ -73,9 +73,12 @@
     <span class="badge" data-i18n="reghelp.badge">注册帮助</span>
     <h1 class="title">{{ title_zh }}<span data-i18n="reghelp.{{ reason }}.title"> · {{ title_en }}</span></h1>
     <p class="desc" data-i18n="reghelp.desc">如果你没有收到验证邮件、链接打不开或无法完成注册，可以给作者发邮件说明情况，作者会协助你排查。点击下方按钮将打开你的邮件客户端并预填内容，你可以先检查再发送。</p>
-    {# 主操作：给作者发邮件（mailto；主题/正文已按当前语言标准 URL 编码）。
-       正文模板只带当前受信任注册入口域名——不带邮箱/token/完整链接/IP。 #}
-    <a class="btn primary" id="reghelp-mail" href="{{ mailto_href }}" data-i18n="reghelp.mail">给作者发邮件</a>
+    {# 主操作：给作者发邮件（mailto；主题/正文已按语言标准 URL 编码）。
+       href=入口默认语言版本（无 JS 可用）；data-mailto-zh / data-mailto-en
+       供前端按用户当前语言切换（§5：zh/en 双版本跟随用户语言，而非域名
+       默认）。正文模板只带当前受信任注册入口域名——不带邮箱/token/完整
+       链接/IP。 #}
+    <a class="btn primary" id="reghelp-mail" href="{{ mailto_href }}" data-mailto-zh="{{ mailto_href_zh }}" data-mailto-en="{{ mailto_href_en }}" data-i18n="reghelp.mail">给作者发邮件</a>
     <button class="btn secondary" type="button" id="reghelp-copy" data-author-email="{{ author_email }}" data-i18n="reghelp.copy">复制作者邮箱</button>
     <p class="author-email" id="reghelp-email-text">{{ author_email }}</p>
     <a class="btn secondary" href="/register" data-i18n="reghelp.back">返回注册</a>

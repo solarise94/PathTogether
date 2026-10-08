@@ -250,7 +250,7 @@ def _terms_form(email="a@x.com", submission_id=None):
             "terms_version": terms["version"],
             "terms_sha256": terms["content_sha256"],
             "submission_id": submission_id or
-            ("rsb_" + _secrets.token_urlsafe(12))}
+            app_mod._register_fresh_submission_id()}
 
 
 def _backdate_deliveries(email, minutes):
@@ -414,6 +414,58 @@ def test_remoteip_only_with_trusted_client_ip(monkeypatch):
     assert "remoteip" not in rec2.calls[0]["data"]
 
 
+def test_verify_test_key_relaxation(monkeypatch):
+    """测试密钥 siteverify 放行（R1 review 修复 4）：Cloudflare 测试密钥的
+    回包**没有 action 字段、hostname 恒为 example.com**——仅当 allow 标志 +
+    配置确为测试密钥 + 回包自带 result_with_testing_key 标记三者同时成立
+    时跳过 action/hostname 检查（success 仍必须为 True）；其余情形一律走
+    严格检查（生产不可达：无 allow 标志的测试密钥在配置层已 not
+    configured）。"""
+    # 放行：allow 标志 + 测试密钥 + 回包 testing-key 标记
+    _enable_turnstile(monkeypatch,
+                      site_key="1x00000000000000000000AA",
+                      secret="1x0000000000000000000000000000000AA",
+                      hostnames="localhost", allow_test_keys=True)
+    cfg = registration_antibot.load_turnstile_config()
+    relaxed = {"success": True, "hostname": "example.com",
+               "error-codes": [],
+               "metadata": {"result_with_testing_key": True}}
+    rec = _SiteverifyRecorder([dict(relaxed)])
+    result = registration_antibot.verify(
+        "tok", action="registration_start", expected_hostname="localhost",
+        config=cfg, http_post=rec)
+    assert result.status == "ok" and result.reason == "test_key_relaxed"
+    # 不放行：回包缺 testing-key 标记（metadata 缺失）→ 严格检查照旧
+    rec2 = _SiteverifyRecorder([{"success": True,
+                                 "hostname": "example.com"}])
+    r2 = registration_antibot.verify(
+        "tok", action="registration_start", expected_hostname="localhost",
+        config=cfg, http_post=rec2)
+    assert r2.status == "rejected"
+    # 不放行：回包 testing-key 标记存在但 allow 标志关闭 → 配置层 fail-closed
+    # （not_configured，且无网络调用）
+    monkeypatch.delenv("REGISTRATION_TURNSTILE_ALLOW_TEST_KEYS",
+                       raising=False)
+    _enable_turnstile(monkeypatch,
+                      site_key="1x00000000000000000000AA",
+                      secret="1x0000000000000000000000000000000AA",
+                      hostnames="localhost")
+    cfg2 = registration_antibot.load_turnstile_config()
+    rec3 = _SiteverifyRecorder([dict(relaxed)])
+    r3 = registration_antibot.verify("tok", action="registration_start",
+                                     config=cfg2, http_post=rec3)
+    assert r3.status == "unavailable" and r3.reason == "not_configured"
+    assert rec3.calls == []
+    # 不放行：真密钥 + 回包伪造 testing-key 标记 → 严格 action/hostname 检查
+    _enable_turnstile(monkeypatch)
+    cfg3 = registration_antibot.load_turnstile_config()
+    rec4 = _SiteverifyRecorder([dict(relaxed)])
+    r4 = registration_antibot.verify(
+        "tok", action="registration_start",
+        expected_hostname="histopilot.cn", config=cfg3, http_post=rec4)
+    assert r4.status == "rejected" and r4.reason == "action_mismatch"
+
+
 def test_entry_site_map_and_fallbacks():
     # 映射：.cn / .com / 旧 .fun 归一 .cn（§6）
     assert registration_antibot.entry_site_for_host("histopilot.cn")[
@@ -434,6 +486,121 @@ def test_entry_site_map_and_fallbacks():
     assert registration_antibot.normalize_form_locale("EN") == "en"
     assert registration_antibot.normalize_form_locale("bogus", "en") == "en"
     assert registration_antibot.normalize_form_locale(None) == "zh"
+
+
+# =========================================================================== #
+# 1b. submission_id 重放：先于 Turnstile 回放已记录状态（R1 review 修复 1）
+# =========================================================================== #
+def test_submission_replay_answered_before_turnstile(monkeypatch):
+    """重放先于 Turnstile：断网/浏览器重试携带的是已消费的一次性挑战
+    token（siteverify 判 timeout-or-duplicate）——重放不是新请求，直接回放
+    已记录状态；不打 siteverify、不入队（§8）。"""
+    client, rec = _turnstile_http(monkeypatch, [_ok_response()])
+    email = "replay.t@x.com"
+    sid = app_mod._register_fresh_submission_id()
+    form = dict(_terms_form(email), submission_id=sid,
+                **{"cf-turnstile-response": "tok"})
+    r1 = client.post("/register", data=form, headers={"Host": "histopilot.cn"})
+    assert 'data-state-kind="submitted"' in r1.get_data(as_text=True)
+    assert len(rec.calls) == 1
+    # 第二次：同 submission_id（同表单重试），siteverify 现在会判重放——
+    # 但重放检查先于 Turnstile，siteverify 根本不被调用
+    rec.responses = [{"success": False,
+                      "error-codes": ["timeout-or-duplicate"]}]
+    r2 = client.post("/register", data=form, headers={"Host": "histopilot.cn"})
+    assert 'data-state-kind="submitted"' in r2.get_data(as_text=True)
+    assert len(rec.calls) == 1  # siteverify 未被调用
+    assert _count("SELECT count(*) FROM registration_mail_jobs") == 1
+    # /register/resend 的重放同样先于 Turnstile
+    _set_job_status_sent(email)
+    _backdate_deliveries(email, minutes=10)
+    rec.responses = [_ok_response(action="registration_resend")]
+    sid2 = app_mod._register_fresh_submission_id()
+    rr = client.post("/register/resend", data={
+        "submission_id": sid2, "form_locale": "zh",
+        "cf-turnstile-response": "tok"},
+        headers={"Host": "histopilot.cn"})
+    assert 'data-state-kind="resend_submitted"' in rr.get_data(as_text=True)
+    assert len(rec.calls) == 2
+    rec.responses = [{"success": False,
+                      "error-codes": ["timeout-or-duplicate"]}]
+    rr2 = client.post("/register/resend", data={
+        "submission_id": sid2, "form_locale": "zh",
+        "cf-turnstile-response": "tok"},
+        headers={"Host": "histopilot.cn"})
+    assert 'data-state-kind="resend_submitted"' in rr2.get_data(as_text=True)
+    assert len(rec.calls) == 2  # 重放未打 siteverify
+    assert _delivery_total(email) == 2
+    assert _count("SELECT count(*) FROM registration_submissions") == 2
+
+
+def test_submission_replay_before_turnstile_email_verify_mode(monkeypatch):
+    """email_verify 模式的 /register POST：重放同样先于 Turnstile。"""
+    _open_public_mode(monkeypatch)
+    settings_store.set_registration_mode(
+        "email_verify_invite_activation", updated_by="t")
+    _enable_turnstile(monkeypatch)
+    rec = _SiteverifyRecorder([_ok_response()])
+    monkeypatch.setattr(registration_antibot, "_siteverify_post", rec)
+    client = _cn_client()
+    sid = app_mod._register_fresh_submission_id()
+    form = {"email": "ev.replay@x.com", "submission_id": sid,
+            "cf-turnstile-response": "tok"}
+    r1 = client.post("/register", data=form, headers={"Host": "histopilot.cn"})
+    assert 'data-state-kind="submitted"' in r1.get_data(as_text=True)
+    assert len(rec.calls) == 1
+    rec.responses = [{"success": False,
+                      "error-codes": ["timeout-or-duplicate"]}]
+    r2 = client.post("/register", data=form, headers={"Host": "histopilot.cn"})
+    assert 'data-state-kind="submitted"' in r2.get_data(as_text=True)
+    assert len(rec.calls) == 1
+    assert _count("SELECT count(*) FROM registration_mail_jobs") == 1
+
+
+def test_submission_id_signature_forged_ignored(monkeypatch):
+    """submission_id 必须服务端签名（R1 review 修复 2）：伪造/缺签 id 不命中
+    重放、不落 submissions 行（按无 id 处理，照常提交仅无幂等）。"""
+    client = _public_client(monkeypatch)
+    sid = app_mod._register_fresh_submission_id()
+    assert sid.startswith("rsb_") and "." in sid and len(sid) <= 64
+    r1 = client.post("/register", data=_terms_form("sig@x.com",
+                                                   submission_id=sid),
+                     headers={"Host": "histopilot.cn"})
+    assert 'data-state-kind="submitted"' in r1.get_data(as_text=True)
+    assert _one("SELECT submission_id FROM registration_submissions")[
+        "submission_id"] == sid
+    # 伪造签名：不命中重放 → 走正常链路（冷却内 → cooldown，非 submitted
+    # 重放），且不新增 submissions 行
+    forged = "rsb_%s.deadbeefdeadbeef" % _secrets.token_urlsafe(12)
+    r2 = client.post("/register", data=_terms_form("sig@x.com",
+                                                   submission_id=forged),
+                     headers={"Host": "histopilot.cn"})
+    assert 'data-state-kind="cooldown"' in r2.get_data(as_text=True)
+    assert _count("SELECT count(*) FROM registration_submissions") == 1
+    # 无签名段的裸 id 同样忽略
+    bare = "rsb_" + _secrets.token_urlsafe(12)
+    r3 = client.post("/register", data=_terms_form("sig@x.com",
+                                                   submission_id=bare),
+                     headers={"Host": "histopilot.cn"})
+    assert 'data-state-kind="cooldown"' in r3.get_data(as_text=True)
+    assert _count("SELECT count(*) FROM registration_submissions") == 1
+    assert _count("SELECT count(*) FROM registration_mail_jobs") == 1
+
+
+def test_get_landing_does_not_write_pending_submission_session(monkeypatch):
+    """GET 渲染不再写 session（R1 review 修复 2）：submission_id 为无状态
+    签名 id，register_pending_submission 会话键不复存在。"""
+    app_mod.app.config["TESTING"] = True
+    app_mod.AUTH_ENABLED = True
+    plain = app_mod.app.test_client()
+    r = plain.get("/")
+    assert r.status_code == 200
+    with plain.session_transaction() as s:
+        assert "register_pending_submission" not in s
+    # 签名 id 自验证（表单渲染侧的格式断言见 widget 上下文用例）
+    sid = app_mod._register_fresh_submission_id()
+    rand, _, sig = sid[4:].rpartition(".")
+    assert app_mod._register_submission_id_sign(rand) == sig
 
 
 # =========================================================================== #
@@ -547,7 +714,7 @@ def test_resend_after_cooldown_redelivery_and_original_link_completes(
     _backdate_deliveries("resend@x.com", minutes=10)
     # 主动重发（§3；§4.2 复用同一 token）。回执已写入 session：重发请求
     # 无 receipt 会回中性 form 态（下有专测），这里成功即证明回执生效。
-    sid = "rsb_" + _secrets.token_urlsafe(12)
+    sid = app_mod._register_fresh_submission_id()
     r2 = client.post("/register/resend", data={
         "submission_id": sid, "form_locale": "zh"},
         headers={"Host": "histopilot.cn"})
@@ -580,13 +747,13 @@ def test_third_delivery_in_24h_refused_with_resume_at(monkeypatch):
     assert 'data-state-kind="submitted"' in r1.get_data(as_text=True)
     _set_job_status_sent(email)
     _backdate_deliveries(email, minutes=10)
-    client.post("/register/resend", data={"submission_id": "rsb_x1",
+    client.post("/register/resend", data={"submission_id": app_mod._register_fresh_submission_id(),
                                           "form_locale": "zh"},
                 headers={"Host": "histopilot.cn"})
     assert _count("SELECT count(*) FROM registration_mail_redeliveries") == 1
     # 第三次（再出冷却）：limit 态 + resume_at（§3 两次上限）
     _backdate_deliveries(email, minutes=10)
-    r3 = client.post("/register/resend", data={"submission_id": "rsb_x2",
+    r3 = client.post("/register/resend", data={"submission_id": app_mod._register_fresh_submission_id(),
                                                "form_locale": "zh"},
                      headers={"Host": "histopilot.cn"})
     body3 = r3.get_data(as_text=True)
@@ -654,7 +821,7 @@ def test_pending_redelivery_cancelled_after_completion(monkeypatch):
     assert n0 == 1
     token = _token_from_mail(sent0[0][2])
     _backdate_deliveries(email, minutes=10)
-    r = client.post("/register/resend", data={"submission_id": "rsb_d1",
+    r = client.post("/register/resend", data={"submission_id": app_mod._register_fresh_submission_id(),
                                               "form_locale": "zh"},
                     headers={"Host": "histopilot.cn"})
     assert 'data-state-kind="resend_submitted"' in r.get_data(as_text=True)
@@ -697,7 +864,7 @@ def test_near_expiry_resend_issues_new_token(monkeypatch):
     _exec("UPDATE registration_mail_jobs SET created_at = now() - "
           "interval '10 minutes', expires_at = now() + interval '3 minutes' "
           "WHERE email_normalized=%s", (email,))
-    r = client.post("/register/resend", data={"submission_id": "rsb_n1",
+    r = client.post("/register/resend", data={"submission_id": app_mod._register_fresh_submission_id(),
                                               "form_locale": "zh"},
                     headers={"Host": "histopilot.cn"})
     assert 'data-state-kind="new_link"' in r.get_data(as_text=True)
@@ -755,7 +922,7 @@ def test_concurrent_accepted_requests_cannot_exceed_cap(monkeypatch):
 
 def test_submission_id_replay_enqueues_once(monkeypatch):
     client = _public_client(monkeypatch)
-    sid = "rsb_" + _secrets.token_urlsafe(12)
+    sid = app_mod._register_fresh_submission_id()
     form = dict(_terms_form("idem@x.com"), submission_id=sid)
     r1 = client.post("/register", data=form, headers={"Host": "histopilot.cn"})
     r2 = client.post("/register", data=form, headers={"Host": "histopilot.cn"})
@@ -772,7 +939,7 @@ def test_submission_id_replay_enqueues_once(monkeypatch):
 def test_resend_without_receipt_neutral_form_state(monkeypatch):
     client = _public_client(monkeypatch)
     # 无 receipt（全新会话）→ 中性 form 状态指向表单（§8）
-    r = client.post("/register/resend", data={"submission_id": "rsb_n0",
+    r = client.post("/register/resend", data={"submission_id": app_mod._register_fresh_submission_id(),
                                               "form_locale": "zh"},
                     headers={"Host": "histopilot.cn"})
     body = r.get_data(as_text=True)
@@ -920,6 +1087,39 @@ def test_registration_help_mailto_encoding(monkeypatch):
     assert "Registration entry: https://histopilot.com" in decoded
 
 
+def test_registration_help_mailto_both_locales(monkeypatch):
+    """帮助页 mailto 双语版本（R1 review 修复 3）：href=入口默认语言（无 JS
+    可用），data-mailto-zh / data-mailto-en 供前端按用户当前语言切换；两
+    版本正文都只带当前受信任入口域名。"""
+    from urllib.parse import unquote
+    _open_public_mode(monkeypatch)
+    pattern = (r'<a class="btn primary" id="reghelp-mail" '
+               r'href="([^"]+)" data-mailto-zh="([^"]+)" '
+               r'data-mailto-en="([^"]+)"')
+    # .cn（默认 zh）：href = zh 版
+    r = _cn_client().get("/registration-help?reason=general",
+                         headers={"Host": "histopilot.cn"})
+    m = re.search(pattern, r.get_data(as_text=True))
+    assert m, "主链接应携带 href + data-mailto-zh/en 双版本"
+    href, zh, en = (unquote(x) for x in m.groups())
+    assert href == zh
+    assert "注册入口：https://histopilot.cn" in zh
+    assert "Registration entry: https://histopilot.cn" in en
+    # .com（默认 en）：href = en 版；两版本入口域名跟随当前入口
+    r2 = _com_client().get("/registration-help?reason=general",
+                           headers={"Host": "histopilot.com"})
+    m2 = re.search(pattern, r2.get_data(as_text=True))
+    assert m2
+    href2, zh2, en2 = (unquote(x) for x in m2.groups())
+    assert href2 == en2
+    assert "Registration entry: https://histopilot.com" in en2
+    assert "注册入口：https://histopilot.com" in zh2
+    # 编码/不回显规则：两版本均不含 token/任意输入
+    for variant in (zh, en, zh2, en2):
+        assert "token" not in variant.lower()
+    assert "HistoPilot 注册遇到问题 / Registration help" in zh
+
+
 def test_help_page_public_without_login_and_no_turnstile(monkeypatch):
     """帮助页：无需登录（_REGISTRATION_PUBLIC_PATHS 放行）、无需 Turnstile
     （不开挑战也可访问）。"""
@@ -1002,8 +1202,9 @@ def test_turnstile_widget_context_and_form_fields(monkeypatch):
     assert m.group(2) == "registration_start"
     assert SECRET not in body
     # 表单携带 submission_id + form_locale（幂等键 + 语言）
-    assert re.search(r'name="submission_id" value="rsb_[A-Za-z0-9_\-]+"',
-                     body)
+    assert re.search(
+        r'name="submission_id" value="rsb_[A-Za-z0-9_\-]+\.[0-9a-f]{16}"',
+        body)
     assert 'name="form_locale" value="zh"' in body
     # entry_site 契约（§7）
     assert re.search(r'<input type="hidden" name="form_locale" '
@@ -1014,7 +1215,7 @@ def test_turnstile_widget_context_and_form_fields(monkeypatch):
 # 7. 反枚举与状态结构（§5/§9.7）
 # =========================================================================== #
 def _normalize(body):
-    return re.sub(r"rsb_[A-Za-z0-9_\-]+", "rsb_X", body)
+    return re.sub(r"rsb_[A-Za-z0-9_.\-]+", "rsb_X", body)
 
 
 def test_known_and_unknown_email_identical_response_structure(monkeypatch):

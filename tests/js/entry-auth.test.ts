@@ -270,6 +270,16 @@ describe("entry-auth（登录/注册统一弹窗）", () => {
 		expect(prevented).toBe(before + 1);
 	});
 
+	it("submit 已被前置护栏拦截（defaultPrevented）时不武装双击防护（Turnstile 无 token 提交后按钮不被永久禁用）", () => {
+		const ctx = makeDoc();
+		load(ctx.doc);
+		const handlers = (ctx.registerForm._clickHandlers["submit"] || []);
+		// register-turnstile.js（捕获阶段）已 preventDefault 的事件：
+		// entry-auth.js 不置 dataset.submitting、不禁用按钮（否则表单无法重试）
+		handlers[0]({ preventDefault() {}, defaultPrevented: true });
+		expect(ctx.registerForm.dataset.submitting).toBeUndefined();
+	});
+
 	it("限流倒计时：归零前禁用提交按钮（归零立即恢复）", () => {
 		const ctx = makeDoc({ retrySeconds: "0" });
 		load(ctx.doc);

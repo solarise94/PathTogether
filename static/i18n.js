@@ -409,6 +409,8 @@
       "login.pwd.hide.aria": "隐藏密码",
       // 本人改密成功后的登录页提示（docs §7.1-7）
       "login.password_changed": "密码已修改，请使用新密码重新登录",
+      // 注册成功后转登录的提示（P1 public §4.2；模板默认同值）
+      "login.registered": "注册成功，请使用邮箱和密码登录",
 
       // ---- 入口分流页（docs §3.2） ----
       "entry.demo": "直接体验 Demo",
@@ -500,6 +502,8 @@
       "register.dialog.title": "注册 HistoPilot",
       "register.dialog.subtitle": "验证邮箱并提交申请，管理员审核通过后即可使用。",
       "register.dialog.subtitle.public": "验证邮箱并设置密码，即可开始使用。",
+      // P1 public 每日额度提示（模板默认同值）
+      "register.public.quota.hint": "当前开放邮箱验证注册，每日最多 5 个新自助账号，名额于北京时间每日 00:00 更新，以完成注册时的剩余名额为准。",
       "register.dialog.email": "邮箱地址",
       "register.dialog.email.ph": "you@example.com",
       "register.dialog.email.hint": "验证成功后，该邮箱将作为你的登录账号。",
@@ -525,6 +529,65 @@
       "register.invite.confirm": "确认密码",
       "register.invite.submit": "创建账号",
       "register.invite.submitting": "创建中…",
+
+      // ---- 注册防刷状态机与求助（2026-10-08 设计 §5/§7；zh 默认值与
+      //      _login_dialog.html / registration_help.html 模板默认一致） ----
+      "register.state.submitted.title": "验证邮件请求已提交",
+      "register.state.submitted": "验证邮件请求已提交。请检查收件箱和垃圾邮件，邮件可能需要几分钟送达。",
+      "register.state.cooldown.title": "请稍候再试",
+      "register.state.cooldown": "请求已受理。两次发送请求至少间隔 5 分钟；已发送的验证链接仍然有效，请先检查收件箱和垃圾邮件。",
+      "register.state.resend_submitted.title": "重发请求已提交",
+      "register.state.resend_submitted": "重发请求已提交。请使用最新一封邮件中的链接（此前邮件中的链接仍然有效）。",
+      "register.state.new_link.title": "已重新发送验证邮件",
+      "register.state.new_link": "原链接即将过期，已签发新的验证邮件。请使用最新邮件中的链接完成注册。",
+      "register.state.processing.title": "邮件正在处理",
+      "register.state.processing": "验证邮件正在处理，请稍候；稍后仍可联系作者。",
+      "register.state.limit.title": "发送次数已达上限",
+      "register.state.limit": "为避免重复发送，验证邮件发送次数已达上限；已发送的验证链接在有效期内仍可完成注册。可给作者发邮件协助排查。",
+      "register.state.challenge_failed.title": "安全验证未完成",
+      "register.state.challenge_failed": "安全验证未完成，本次未发送验证邮件。请重新完成验证后再试。",
+      "register.state.challenge_unavailable.title": "验证服务暂时不可用",
+      "register.state.challenge_unavailable": "安全验证服务暂时不可用，本次未发送验证邮件。请稍后重试，或给作者发邮件。",
+      "register.state.unavailable.title": "暂时无法发送验证邮件",
+      "register.state.unavailable": "暂时无法发送验证邮件，请稍后重试；给你带来的不便请联系作者协助排查。",
+      "register.state.help.again": "仍未收到邮件或无法完成注册？可以给作者发邮件，我会协助你排查。",
+      "register.state.resend.submit": "重新发送验证邮件",
+      "register.state.resend.wait": "{time} 后可重新发送",
+      "register.state.limit.resume": "预计 {time}（本地时间）后可再次自助发送",
+      "register.help.link": "注册遇到问题？给作者发邮件",
+      "register.help.cta": "给作者发邮件",
+      // Turnstile 就地提示（register-turnstile.js；中性措辞，绝不说「机器人」）
+      "register.turnstile.pending": "请先完成下方的安全验证",
+      "register.turnstile.unavailable": "安全验证暂时无法加载，请检查网络后重试",
+      "register.turnstile.retry": "重试",
+
+      // ---- 注册帮助页（/registration-help；zh 默认值与模板一致） ----
+      "reghelp.badge": "注册帮助",
+      "reghelp.general.title": "注册遇到问题",
+      "reghelp.challenge.title": "安全验证未完成",
+      "reghelp.cooldown.title": "请求过于频繁，请稍候",
+      "reghelp.limit.title": "验证邮件发送已达上限",
+      "reghelp.unavailable.title": "验证邮件服务暂时不可用",
+      "reghelp.link_invalid.title": "验证链接无效",
+      "reghelp.link_expired.title": "验证链接已过期",
+      "reghelp.submit_error.title": "提交出错",
+      "reghelp.desc": "如果你没有收到验证邮件、链接打不开或无法完成注册，可以给作者发邮件说明情况，作者会协助你排查。点击下方按钮将打开你的邮件客户端并预填内容，你可以先检查再发送。",
+      "reghelp.mail": "给作者发邮件",
+      "reghelp.copy": "复制作者邮箱",
+      "reghelp.copied": "已复制",
+      "reghelp.back": "返回注册",
+      "reghelp.template.title": "邮件内容预览（发送前可修改）",
+      "reghelp.footer": "仅用于研究、教学和软件演示，不用于临床诊断。",
+
+      // ---- 验证页错误态（verify_email.html；zh 默认值与模板一致） ----
+      "verify.error.expired.title": "链接已过期",
+      "verify.error.expired.desc": "验证链接有效期 30 分钟，且只能使用一次。请返回注册页重新请求验证邮件。",
+      "verify.error.consumed.title": "链接已使用",
+      "verify.error.consumed.desc": "该验证链接已被使用（邮箱验证一次性）。如你尚未完成注册，请重新请求验证邮件；如已完成验证，请直接登录。",
+      "verify.error.consumed.login": "前往登录",
+      "verify.error.invalid.title": "链接无效",
+      "verify.error.invalid.desc": "验证链接无效或已失效。请返回注册页重新请求验证邮件。",
+      "verify.error.retry": "重新请求验证邮件",
 
       // ---- Demo 页（Phase 2 只读 Viewer） ----
       "demo.title": "Demo 体验",
@@ -1863,6 +1926,8 @@
       "login.pwd.hide.aria": "Hide password",
       // Notice after a successful self password change (docs §7.1-7)
       "login.password_changed": "Password changed. Please log in again with your new password.",
+      // Notice after completing registration and returning to login (P1 public §4.2)
+      "login.registered": "Sign-up complete. Log in with your email and password.",
 
       // ---- 入口分流页（docs §3.2） ----
       "entry.demo": "Try the Demo",
@@ -1955,6 +2020,8 @@
       "register.dialog.title": "Sign up for HistoPilot",
       "register.dialog.subtitle": "Verify your email and submit an application — you can start once an administrator approves it.",
       "register.dialog.subtitle.public": "Verify your email and set a password to start right away — no admin approval needed.",
+      // P1 public daily quota notice (mirrors the template default)
+      "register.public.quota.hint": "Email verification sign-up is open with up to 5 new self-service accounts per day. The quota resets at 00:00 Beijing time; the remaining quota at the moment you finish signing up is what counts.",
       "register.dialog.email": "Email address",
       "register.dialog.email.ph": "you@example.com",
       "register.dialog.email.hint": "After verification, this email address becomes your login name.",
@@ -1981,6 +2048,66 @@
       "register.invite.confirm": "Confirm password",
       "register.invite.submit": "Create account",
       "register.invite.submitting": "Creating…",
+
+      // ---- Registration anti-abuse state machine & author help (design
+      //      2026-10-08 §5/§7; zh defaults mirror the template text) ----
+      "register.state.submitted.title": "Verification email requested",
+      "register.state.submitted": "Your verification email request has been submitted. Please check your inbox and spam folder — it can take a few minutes to arrive.",
+      "register.state.cooldown.title": "Please wait a moment",
+      "register.state.cooldown": "Your request was received. Emails can be requested at least 5 minutes apart. The verification link already sent is still valid — please check your inbox and spam folder first.",
+      "register.state.resend_submitted.title": "Resend request submitted",
+      "register.state.resend_submitted": "Your resend request has been submitted. Please use the link in the latest email (links in earlier emails remain valid).",
+      "register.state.new_link.title": "A new verification email has been sent",
+      "register.state.new_link": "The previous link was about to expire, so a new verification email has been issued. Please use the link in the latest email to finish signing up.",
+      "register.state.processing.title": "Your email is being processed",
+      "register.state.processing": "The verification email is being processed. Please wait a moment; you can still email the author later.",
+      "register.state.limit.title": "Verification email limit reached",
+      "register.state.limit": "To avoid repeated sends, the verification email limit has been reached. Links already sent remain valid until they expire, and you can still finish signing up with them. You can email the author for help troubleshooting.",
+      "register.state.challenge_failed.title": "Security check not completed",
+      "register.state.challenge_failed": "The security check was not completed, so no email was sent this time. Please complete the check and try again.",
+      "register.state.challenge_unavailable.title": "Verification service temporarily unavailable",
+      "register.state.challenge_unavailable": "The security check service is temporarily unavailable, so no email was sent this time. Please try again later, or email the author.",
+      "register.state.unavailable.title": "Cannot send the verification email right now",
+      "register.state.unavailable": "The verification email cannot be sent right now. Please try again later, or email the author for help.",
+      "register.state.help.again": "Still no email, or stuck partway? Email the author and I'll help you sort it out.",
+      "register.state.resend.submit": "Resend verification email",
+      "register.state.resend.wait": "Resend available in {time}",
+      "register.state.limit.resume": "Self-service can resume around {time} (local time)",
+      "register.help.link": "Having trouble? Email the author",
+      "register.help.cta": "Email the author",
+      // Turnstile inline notices (register-turnstile.js; neutral wording,
+      // never implies the user is a bot)
+      "register.turnstile.pending": "Please complete the security check below first",
+      "register.turnstile.unavailable": "The security check couldn't load. Please check your connection and try again.",
+      "register.turnstile.retry": "Retry",
+
+      // ---- Registration help page (/registration-help) ----
+      "reghelp.badge": "Registration help",
+      "reghelp.general.title": "Registration problem",
+      "reghelp.challenge.title": "Security check not completed",
+      "reghelp.cooldown.title": "Too many requests, please wait",
+      "reghelp.limit.title": "Verification email limit reached",
+      "reghelp.unavailable.title": "Verification email temporarily unavailable",
+      "reghelp.link_invalid.title": "Verification link invalid",
+      "reghelp.link_expired.title": "Verification link expired",
+      "reghelp.submit_error.title": "Submission error",
+      "reghelp.desc": "If you didn't receive the verification email, the link doesn't open, or you can't finish signing up, email the author and I'll help you troubleshoot. The button below opens your email client with a pre-filled draft you can review before sending.",
+      "reghelp.mail": "Email the author",
+      "reghelp.copy": "Copy author email",
+      "reghelp.copied": "Copied",
+      "reghelp.back": "Back to registration",
+      "reghelp.template.title": "Email preview (edit before sending)",
+      "reghelp.footer": "For research, teaching and software demonstration only — not for clinical diagnosis.",
+
+      // ---- Email verification error states (verify_email.html) ----
+      "verify.error.expired.title": "Link expired",
+      "verify.error.expired.desc": "Verification links are valid for 30 minutes and can only be used once. Please request a new verification email from the sign-up page.",
+      "verify.error.consumed.title": "Link already used",
+      "verify.error.consumed.desc": "This verification link has already been used (email verification is one-time only). If you haven't finished signing up, please request a new email; if you have, just log in.",
+      "verify.error.consumed.login": "Go to login",
+      "verify.error.invalid.title": "Link invalid",
+      "verify.error.invalid.desc": "This verification link is invalid or no longer active. Please request a new verification email from the sign-up page.",
+      "verify.error.retry": "Request a new verification email",
 
       // ---- Demo page (Phase 2 read-only viewer) ----
       "demo.title": "Demo",

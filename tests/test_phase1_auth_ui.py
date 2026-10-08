@@ -505,11 +505,13 @@ def test_index_entry_landing_page_content(monkeypatch):
     assert "登录工作台" in body and "上传切片" in body
     # 无内联脚本（CSP script-src 'self'）；标题由 i18n.js 按 data-page=entry 同步
     # entry-releases.js：What's New 发布说明（2026-09-20），同为静态 self 脚本
-    assert body.count("<script") == 4
+    # register-turnstile.js：注册弹窗 Turnstile 按需加载（2026-10-08 设计 §5/§7）
+    assert body.count("<script") == 5
     assert 'src="/static/i18n.js' in body
     assert 'src="/static/entry.js' in body
     assert 'src="/static/entry-releases.js' in body
     assert 'src="/static/entry-auth.js' in body
+    assert 'src="/static/register-turnstile.js' in body
     assert 'data-page="entry"' in body
     assert 'id="principle"' in body
     assert "受控 Demo" not in body
@@ -548,11 +550,12 @@ def test_entry_landing_source_guards():
     assert 'class="skip-link"' in html
     # 语言切换沿用 .lang-toggle
     assert 'class="lang-toggle"' in html
-    assert html.count("<script") == 4
+    assert html.count("<script") == 5
     assert 'src="/static/i18n.js' in html
     assert 'src="/static/entry.js' in html
     assert 'src="/static/entry-releases.js' in html
     assert 'src="/static/entry-auth.js' in html
+    assert 'src="/static/register-turnstile.js' in html
     assert 'data-page="entry"' in html
     assert 'id="principle"' in html
     # 登录弹窗：entry.html include _login_dialog.html（login.html 已删除）

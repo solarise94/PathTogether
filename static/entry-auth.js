@@ -56,6 +56,19 @@
       var field = (p[name] || dialog).querySelector('input:not([type="hidden"])');
       if (field) field.focus();
     }
+    // 广播当前视图（register-turnstile.js 据此按需加载/重置挑战；
+    // CustomEvent 缺失的旧环境静默跳过——挑战加载退化由其自身 init 兜底）
+    dispatchViewEvent(name, true);
+  }
+
+  // hp-auth-view：detail = {view, open}。register-turnstile.js 监听本事件
+  // 决定何时加载/重置 Turnstile（注册视图可见才加载，登录视图不加载）。
+  function dispatchViewEvent(name, open) {
+    try {
+      document.dispatchEvent(new CustomEvent('hp-auth-view', {
+        detail: { view: name, open: !!open }
+      }));
+    } catch (e) { /* 无 CustomEvent 环境：跳过（加载器有 init 兜底） */ }
   }
 
   function switchTo(name) {
@@ -90,6 +103,8 @@
 
   function afterClose() {
     setBodyClass(false);
+    // 通知 register-turnstile.js 弹窗已关闭（重置挑战等收尾由其决定）
+    dispatchViewEvent(currentView(), false);
     if (opener && typeof opener.focus === 'function') {
       try { opener.focus(); } catch (e) { /* 触发元素可能已不在 DOM */ }
     }
@@ -143,6 +158,9 @@
 
   dialog.querySelectorAll('form').forEach(function (form) {
     form.addEventListener('submit', function (ev) {
+      // Turnstile 提交护栏（register-turnstile.js，捕获阶段）已拦截本次提交
+      // （无 token）时不武装双击防护——否则按钮被永久禁用、表单无法重试。
+      if (ev.defaultPrevented) return;
       if (form.dataset.submitting === '1') { ev.preventDefault(); return; }
       form.dataset.submitting = '1';
       var btn = form.querySelector('button[type="submit"]');

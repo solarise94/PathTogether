@@ -1971,9 +1971,16 @@ def share_roi_add(token):
             roi_desc, root=UPLOAD_DIR)
     except ValueError:
         return jsonify(error="slide 不属于该分享"), 403
-    safe = roi_desc.legacy_filename
-    # Stage 3c-2（docs §v1.5）：归档项目内切片只读，guest 亦不可标注
-    if _reject_archived_slide(share, safe, slide_id=roi_desc.slide_id):
+    # 2026-10-08 缺陷修复：ID-only 资产无 legacy 名——名快照回退
+    # original_filename（与 /api/annotation、/api/share/create 的快照口径
+    # 一致），避免 rois.slide / change_log.slide（NOT NULL）落 NULL。
+    safe = roi_desc.legacy_filename or roi_desc.original_filename or ""
+    # Stage 3c-2（docs §v1.5）：归档项目内切片只读，guest 亦不可标注。
+    # P2（缺口②）语义保持：归档判定仍按 legacy 名（ID-only → None 走
+    # slide_id 通道——project_slides 对 id_bundle 成员的快照是 ""，用
+    # original_filename 名比对会漏判）。
+    if _reject_archived_slide(share, roi_desc.legacy_filename,
+                              slide_id=roi_desc.slide_id):
         return jsonify(error="切片已归档只读"), 403
 
     # 收集几何字段透传给 store 校验。升级 C：rect 增加成对 w/h（v2）。

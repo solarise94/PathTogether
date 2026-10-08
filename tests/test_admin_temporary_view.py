@@ -347,12 +347,7 @@ def test_expired_temporary_view_blocks_ai_run_at_gate():
     assert r2.status_code in (400, 503), r2.get_data(as_text=True)
 
 
-@pytest.mark.parametrize("preserve_uploader", [
-    False,
-    pytest.param(True, marks=pytest.mark.xfail(
-        strict=True, raises=AssertionError,
-        reason="KNOWN: ending admin view revokes uploader AI grant too; Opus owns fix")),
-])
+@pytest.mark.parametrize("preserve_uploader", [False, True])
 def test_end_temporary_view_revokes_run_grants(preserve_uploader):
     inst = _bootstrap_plugin()
     owner, usera = _setup()

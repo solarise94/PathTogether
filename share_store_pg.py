@@ -977,6 +977,10 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
     P2（合同 §3.1/R-08）：``slide_id`` 显式传入（id_bundle 资产/已解析的
     调用方）或按 legacy 名解析（slides.legacy_filename 冻结映射）；解析不到
     保持 NULL = unresolved。rois/change_log 双写 slide_id + slide 快照。
+    2026-10-08 缺陷修复（R-04）：slide ∈ share 成员判定改 share_slides
+    ID 关系（slide_id 已知时；与读通道同源），仅无 ID 的历史名行回退
+    shares.slides JSONB 名快照——ID-only 资产（无 legacy 名）此前被名快照
+    误拒 400「slide not in share」。
     """
     _reject_guest_write(requester_role)
     if type not in ROI_TYPES:
@@ -1002,7 +1006,24 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
                     share = _fetch_share(cur, token)
                     if share is None or not _is_active(share):
                         raise ValueError("share invalid")
-                    if slide not in (share.get("slides") or []):
+                    # 2026-10-08 缺陷修复（R-04 同口径）：slide ∈ share 判定
+                    # 优先走 share_slides(token, slide_id) ID 关系——与读通道
+                    # （share_server._require_slide*）及路由层同一授权来源；
+                    # ID-only 资产无 legacy 名（slide 为 None/空），旧
+                    # shares.slides JSONB 名快照判定必误拒「slide not in
+                    # share」。无 slide_id（未解析到资产的历史名行）才回退
+                    # 名快照兜底。
+                    member_sid = slide_id
+                    if not member_sid:
+                        member_sid = _slide_id_of_name(cur, slide)
+                    if member_sid:
+                        cur.execute(
+                            "SELECT 1 FROM share_slides "
+                            "WHERE token=%s AND slide_id=%s LIMIT 1",
+                            (token, member_sid))
+                        if cur.fetchone() is None:
+                            raise ValueError("slide not in share")
+                    elif slide not in (share.get("slides") or []):
                         raise ValueError("slide not in share")
                 # 0056 幂等：client_action_id（有 owner 时）已落 → 复用返回
                 if client_action_id and (owner_user_id or _OWNER_USER_ID):
@@ -1053,6 +1074,18 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
                     "ai" if (is_admin and not shared) else "human")
                 # P2：slide_id 双写解析（显式优先；名解析失败保持 NULL）
                 eff_slide_id = slide_id or _slide_id_of_name(cur, slide)
+                # 2026-10-08 缺陷修复：ID-only 资产无名快照（slide 为 None/""）
+                # 时按 slide_id 回查名称快照（legacy → original_filename，
+                # 与 /api/annotation、/api/share/create 口径一致）——保证
+                # rois.slide / change_log.slide（NOT NULL）非空。
+                if not slide and eff_slide_id:
+                    cur.execute(
+                        "SELECT legacy_filename, original_filename "
+                        "FROM slides WHERE slide_id=%s", (eff_slide_id,))
+                    _snap = cur.fetchone()
+                    if _snap is not None:
+                        slide = (_snap["legacy_filename"]
+                                 or _snap["original_filename"] or "")
                 # index = 该 token 全部 roi（含 tombstone）中新增前的数量
                 cur.execute("SELECT count(*) FROM rois WHERE token=%s", (token,))
                 total = int(cur.fetchone()["count"])

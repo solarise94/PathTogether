@@ -294,12 +294,9 @@ test.describe("BMP 普通图片兼容（主站 + 分享页真实浏览器走查�
 		await page.mouse.move(scx + 50, scy + 40, { steps: 8 });
 		await page.mouse.up();
 		const roiResp = await roiRespPromise;
-		// ID-only published assets have no legacy filename. The store currently
-		// rechecks membership using that null filename after the route accepts ID.
 		const roiResult = await roiResp.json();
 		expect([200, 400]).toContain(roiResp.status());
 		if (roiResp.status() === 400) expect(roiResult.error).toBe("slide not in share");
-		test.fail(true, "share_store_pg.add_roi rejects ID-only assets; handed to Opus");
 		expect(roiResp.status(), JSON.stringify(roiResult)).toBe(200);
 		const savedArrow = (await roiReqPromise).postDataJSON() as {
 			slide_id: string; type: string; x1: number; y1: number; x2: number; y2: number;

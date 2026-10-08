@@ -11269,7 +11269,9 @@ def admin_v1_slide_temporary_view_end(slide_id):
     """结束管理员临时查看（2026-10-08 §3.1；owner 权限 + CSRF；幂等）。
 
     把 actor 对该切片**未到期**的授权 ``expires_at`` 置为 now()，调用
-    ``_revoke_run_grants_for_slide_id`` 取消派生 AI 运行授权，并对仍在
+    ``_revoke_run_grants_for_slide_id``（created_by_user_id=actor）只取消
+    **actor 本人派生**的 AI 运行授权（2026-10-08 修复：上传者/其他独立
+    授权用户的 grant 不受影响），并对仍在
     运行的相关 sidecar run 走既有取消/收尾机制（round-2 补齐：与旧永久
     收回端点同款 ``_cancel_sidecar_runs_for_owners`` 联动——sidecar 会话
     按 legacy 名查询，id_bundle 无名资产只走 run grant 复查，同旧口径），
@@ -11304,9 +11306,13 @@ def admin_v1_slide_temporary_view_end(slide_id):
         return _admin_v1_error(500, "internal", "临时查看结束失败")
     cancelled = []
     if desc is not None and status == "ended":
-        # 撤销联动 1/2：失效该切片上派生的 run grants（§3.3 主动结束）
+        # 撤销联动 1/2：失效该切片上**本管理员（owner_uid）派生**的 run
+        # grants（§3.3 主动结束；2026-10-08 修复：created_by_user_id 过滤
+        # ——上传者及其他独立授权用户的 run grant 不受影响，保持有效）
         _revoke_run_grants_for_slide_id(desc.slide_id,
-                                        name=desc.legacy_filename)
+                                        name=desc.legacy_filename,
+                                        created_by_user_id=owner_uid,
+                                        trigger="temporary_view_ended")
         # 撤销联动 2/2（round-2）：对运行中的 sidecar run 发起既有取消/
         # 收尾（旧永久收回端点同款；费用 hold 按既有结算机制收尾）
         cancelled = _cancel_sidecar_runs_for_owners(
@@ -12862,11 +12868,18 @@ def run_slide_delete_worker_once(*, max_jobs=1, worker_id=None):
     return done
 
 
-def _revoke_run_grants_for_slide_id(slide_id, *, name=None):
+def _revoke_run_grants_for_slide_id(slide_id, *, name=None,
+                                    created_by_user_id=None,
+                                    trigger="slide_deleted"):
     """run grants 撤销联动（P3 合同 §5 by-ID 删除用；P5 起两个删除端点
     统一经 _slide_delete_invalidations 调用）：按 slide_id（权威）＋历史
     NULL-ID 同名行兜底（P2 list_run_grants 双口径——撤销钩子必须覆盖全部
-    行）。"""
+    行）。
+
+    2026-10-08 缺陷修复：``created_by_user_id`` 给出时只撤销**该创建者**
+    名下的 grant（管理员结束临时查看只撤自己派生的运行授权——上传者及
+    其他独立授权用户的 grant 保持有效）；切片删除路径不传该参数 → 仍撤销
+    全部（语义不变）。``trigger`` 仅影响审计事件标注。"""
     try:
         if slide_id:
             grants = share_store.list_run_grants(slide_id=slide_id,
@@ -12883,10 +12896,14 @@ def _revoke_run_grants_for_slide_id(slide_id, *, name=None):
     for g in grants:
         if g.get("revoked"):
             continue
+        if (created_by_user_id is not None
+                and (g.get("created_by_user_id") or "")
+                != created_by_user_id):
+            continue
         try:
             share_store.revoke_run_grant(g["grant_id"])
             _audit_grant_event("run_grant.revoke", g["grant_id"],
-                               g.get("slide"), {"trigger": "slide_deleted"})
+                               g.get("slide"), {"trigger": trigger})
         except Exception:
             app.logger.warning("run grant 撤销失败：%s", g.get("grant_id"),
                                exc_info=True)

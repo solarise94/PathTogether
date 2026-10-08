@@ -1112,17 +1112,22 @@ body.login-dialog-open { overflow: hidden; }
 .login-dialog-submit:disabled { opacity: 0.5; cursor: default; }
 
 .login-dialog-links {
-  display: flex;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  justify-items: start;
   gap: 8px;
   margin-top: 16px;
   font-size: 13px;
 }
 .login-dialog-links a {
+  max-width: 100%;
+  min-height: 32px;
+  line-height: 1.5;
+  padding: 6px 0;
+  overflow-wrap: break-word;
   color: var(--text);
   text-decoration: none;
   border-bottom: 1px solid var(--line-strong);
-  padding-bottom: 1px;
 }
 .login-dialog-links a:hover { border-bottom-color: var(--text); }
 
@@ -1220,7 +1225,7 @@ a.login-dialog-primary-link:focus-visible { outline: 2px solid #fff; outline-off
 @media (max-width: 720px) {
   .login-dialog { width: calc(100vw - 24px); max-height: calc(100vh - 24px); }
   .login-dialog-card { padding: 28px 20px 22px; }
-  .login-dialog-links { flex-direction: column; gap: 10px; }
+  .login-dialog-links { gap: 10px; }
 }
 
 /* Prominent local converter entry, available with or without an account. */

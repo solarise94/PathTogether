@@ -7,7 +7,7 @@
   <title>HistoPilot · 邮箱验证</title>
   <!-- D1（2026-09-10）：空 data URI favicon，避免浏览器自动 GET /favicon.ico 撞鉴权闸 -->
   <link rel="icon" href="data:," />
-  <script src="/static/i18n.js?v=20261008b"></script>
+  <script src="/static/i18n.js?v=20261008c"></script>
   <style>
     :root {
       --accent: #007AFF;
@@ -183,12 +183,12 @@
       <div class="field">
         <label class="check-row" for="terms_re">
           <input id="terms_re" type="checkbox" value="1" />
-          <span>《用户协议与数据处理说明》已更新：我已重新阅读并接受<a href="/legal/user-agreement" target="_blank" rel="noopener noreferrer">最新版本</a>（必选）。</span>
+          <span><span data-i18n="verify.agreement.terms.updated">《用户协议与数据处理说明》已更新：我已重新阅读并接受</span> <a href="/legal/user-agreement" target="_blank" rel="noopener noreferrer" data-i18n="verify.agreement.latest">最新版本</a> <span data-i18n="register.agreement.required">（必选）</span></span>
         </label>
       </div>
       {% else %}
       <!-- 展示用户此前主动做出的选择（§3.3.3：展示不是替未操作用户预勾选） -->
-      <p class="hint" style="margin-bottom:14px;">你已在请求验证邮件时接受<a href="/legal/user-agreement" target="_blank" rel="noopener noreferrer">《用户协议与数据处理说明》</a>（版本 {{ public_ctx.terms_version }}）。</p>
+      <p class="hint" style="margin-bottom:14px;"><span data-i18n="verify.agreement.accepted">你已在请求验证邮件时接受</span> <a href="/legal/user-agreement" target="_blank" rel="noopener noreferrer" data-i18n="register.agreement.terms">《用户协议与数据处理说明》</a> <span data-i18n="verify.agreement.version" data-i18n-vars="version:{{ public_ctx.terms_version }}">（版本 {{ public_ctx.terms_version }}）。</span></p>
       {% endif %}
       {% if public_ctx.research_doc %}
       <div class="field">
@@ -197,9 +197,9 @@
                重新明确同意；仅当未变化且用户此前勾选时才保留 checked -->
           <input id="research_opt" type="checkbox" value="1"{% if public_ctx.research_opt_in and not public_ctx.research_changed %} checked{% endif %} />
           {% if public_ctx.research_changed %}
-          <span><a href="/legal/research-sharing" target="_blank" rel="noopener noreferrer">《数据共享与软件改进协议》</a>已更新，请重新确认是否同意（自愿，可随时撤回；不选不影响注册、登录、读片和 AI 额度）。</span>
+          <span><a href="/legal/research-sharing" target="_blank" rel="noopener noreferrer" data-i18n="register.agreement.research">《数据共享与软件改进协议》</a> <span data-i18n="verify.agreement.research.updated">已更新，请重新确认是否同意（自愿，可随时撤回；不选不影响注册、登录、读片和 AI 额度）。</span></span>
           {% else %}
-          <span>我自愿同意<a href="/legal/research-sharing" target="_blank" rel="noopener noreferrer">《数据共享与软件改进协议》</a>（自愿，可随时撤回；不选不影响注册、登录、读片和 AI 额度）。</span>
+          <span><span data-i18n="register.agreement.research.accept">我自愿同意</span> <a href="/legal/research-sharing" target="_blank" rel="noopener noreferrer" data-i18n="register.agreement.research">《数据共享与软件改进协议》</a> <span data-i18n="register.agreement.research.optional">（自愿，可随时撤回；不选也能注册、登录、读片和使用相同 AI 额度策略）</span></span>
           {% endif %}
         </label>
         {% if public_ctx.research_changed %}

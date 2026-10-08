@@ -162,11 +162,11 @@
         <p class="login-dialog-hint" data-i18n="register.public.quota.hint">当前开放邮箱验证注册，每日最多 5 个新自助账号，名额于北京时间每日 00:00 更新，以完成注册时的剩余名额为准。</p>
         <label class="login-dialog-check" for="register-dialog-terms">
           <input id="register-dialog-terms" name="terms_accepted" type="checkbox" value="1" required />
-          <span>我已阅读并接受<a href="{{ register_terms.url }}" target="_blank" rel="noopener noreferrer">《用户协议与数据处理说明》</a>（必选）</span>
+          <span><span data-i18n="register.agreement.accept">我已阅读并接受</span> <a href="{{ register_terms.url }}" target="_blank" rel="noopener noreferrer" data-i18n="register.agreement.terms">《用户协议与数据处理说明》</a> <span data-i18n="register.agreement.required">（必选）</span></span>
         </label>
         <label class="login-dialog-check" for="register-dialog-research">
           <input id="register-dialog-research" name="research_opt_in" type="checkbox" value="1" />
-          <span>我自愿同意<a href="{{ register_research.url }}" target="_blank" rel="noopener noreferrer">《数据共享与软件改进协议》</a>（自愿，可随时撤回；不选也能注册、登录、读片和使用相同 AI 额度策略）</span>
+          <span><span data-i18n="register.agreement.research.accept">我自愿同意</span> <a href="{{ register_research.url }}" target="_blank" rel="noopener noreferrer" data-i18n="register.agreement.research">《数据共享与软件改进协议》</a> <span data-i18n="register.agreement.research.optional">（自愿，可随时撤回；不选也能注册、登录、读片和使用相同 AI 额度策略）</span></span>
         </label>
         {% if turnstile and turnstile.enabled %}<div id="register-turnstile" data-sitekey="{{ turnstile.site_key }}" data-action="{{ turnstile.action }}"></div>{% endif %}
         <button class="login-dialog-submit" type="submit" data-i18n="register.dialog.submit">发送验证邮件</button>

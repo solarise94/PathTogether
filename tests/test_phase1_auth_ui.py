@@ -772,7 +772,7 @@ def test_register_get_closed_state_page():
     r = client.get("/register")
     assert r.status_code == 200
     body = r.get_data(as_text=True)
-    assert "当前采用邀请注册" in body
+    assert "当前未开放注册" in body
     assert 'href="/login"' in body
     assert 'href="/demo"' in body
     # 弹窗直开且注册视图激活（登录视图收起）
@@ -791,7 +791,7 @@ def test_register_post_always_rejected_phase1():
     r = client.post("/register", json={
         "login_id": "n@x.com", "password": "password1password1"})
     assert r.status_code == 403
-    assert "邀请注册" in (r.get_json() or {}).get("error", "")
+    assert "未开放自助注册" in (r.get_json() or {}).get("error", "")
     # PG 后端 registration_open=true 时也一律 403（第一阶段）
     r2 = client.post("/register", json={
         "login_id": "n@x.com", "password": "password1password1"},
@@ -816,20 +816,18 @@ def test_login_dialog_register_view_template_requirements():
     assert 'id="register-view" data-auth-pane="register"' in text
     assert "{% if login_open or register_open %} open{% endif %}" in text
     assert "{% if not register_open %} hidden{% endif %}" in text
-    # 注册视图核心文案（R2 简明口径）
-    assert "验证邮箱并提交申请，管理员审核通过后即可使用。" in text
-    assert "验证邮件已发送，请查收。" in text
+    # 注册视图核心文案（2026-10-08 §4：public 唯一开放模式）
+    assert "验证邮箱并设置密码，即可开始使用。" in text
+    assert "管理员审核通过后即可使用" not in text
     assert "验证邮箱本身不授予" not in text
     assert "不授予任何工作区" not in text
+    # 邀请码输入已删（invite_only 形态退役）
+    assert 'name="invite_token"' not in text
     # 注册表单复用既有 API（POST /register + CSRF），不是新后端
     assert 'action="/register"' in text
-    assert text.count('name="csrf_token"') >= 2  # 登录 + 注册表单各一
     # 登录安全 next 默认 /app（R3）
     assert 'value="{{ login_next_url or \'/app\' }}"' in text
-    # 保留密码设置与显示名输入（invite_only 形态）；分享选择只在验证页
-    assert 'name="password"' in text and 'name="password_confirm"' in text
-    assert 'autocomplete="new-password"' in text
-    assert 'name="display_name"' in text
+    assert 'name="display_name"' not in text  # invite_only 形态退役
 
 
 def test_entry_auth_js_register_switch_and_dialog_discipline():
@@ -862,10 +860,13 @@ def test_registration_mode_reads_settings_store(monkeypatch):
     # json 后端下打开前置条件闸（PG 运行时三条件真实满足）
     monkeypatch.setattr(app_mod, "_registration_precondition_failures",
                         lambda *a, **k: [])
+    # public 的文稿前置一并满足（未发布文稿会把生效值降级 closed）
+    monkeypatch.setattr(app_mod.registration_store, "public_document_failures",
+                        lambda: [])
     monkeypatch.setattr(app_mod.settings_store, "get_registration_mode",
-                        lambda: "invite_only")
+                        lambda: "public")
     body = client.get("/api/admin/v1/settings").get_json()["registration"]
-    assert body["mode"] == "invite_only"
+    assert body["mode"] == "public"
     assert body["registration_open"] is True
     monkeypatch.setattr(app_mod.settings_store, "get_registration_mode",
                         lambda: "closed")

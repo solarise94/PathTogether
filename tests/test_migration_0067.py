@@ -314,18 +314,23 @@ def test_share_slides_and_project_slides_constraints(conn):
 
         # slide_view_grants：(slide_id, user_id) 部分唯一（不同 slide_name 也不行）
         cur.execute("INSERT INTO slide_view_grants (slide_name, user_id, "
-                    "slide_id) VALUES ('n1.svs','usr_v','sld_rel1')")
+                    "slide_id, expires_at) VALUES ('n1.svs','usr_v','sld_rel1',"
+                    " now() + interval '30 days')")
         conn.commit()
         with pytest.raises(psycopg.errors.UniqueViolation):
             cur.execute("INSERT INTO slide_view_grants (slide_name, user_id, "
-                        "slide_id) VALUES ('n2.svs','usr_v','sld_rel1')")
+                        "slide_id, expires_at) VALUES "
+                        "('n2.svs','usr_v','sld_rel1',"
+                        " now() + interval '30 days')")
             conn.commit()
         conn.rollback()
         # slide_id 为 NULL 不受限（0034/0035 孤儿授权形态保留）
-        cur.execute("INSERT INTO slide_view_grants (slide_name, user_id) "
-                    "VALUES ('n3.svs','usr_v')")
-        cur.execute("INSERT INTO slide_view_grants (slide_name, user_id) "
-                    "VALUES ('n4.svs','usr_v')")
+        cur.execute("INSERT INTO slide_view_grants (slide_name, user_id, "
+                    "expires_at) VALUES ('n3.svs','usr_v',"
+                    " now() + interval '30 days')")
+        cur.execute("INSERT INTO slide_view_grants (slide_name, user_id, "
+                    "expires_at) VALUES ('n4.svs','usr_v',"
+                    " now() + interval '30 days')")
         conn.commit()
 
         # project_slides：(project_id, slide_id) 部分唯一；同名不同 ID 可并存

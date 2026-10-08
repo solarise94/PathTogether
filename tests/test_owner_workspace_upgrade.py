@@ -94,11 +94,22 @@ def _setup_two_owners():
 
 
 def _grant(slide, who):
-    """以管理端语义给 who 加入工作区（走服务端接口，保证 slide_id 绑定）。"""
+    """以管理端语义给 who 开启临时查看（2026-10-08 §3.1；走服务端接口，
+    保证 slide_id 绑定）。"""
     c = _client()
     _login(c, who)
-    r = c.post("/api/admin/v1/slides/%s/visibility" % slide,
-               json={"granted": True})
+    r = c.post("/api/admin/v1/slides/%s/temporary-view"
+               % share_store.get_slide_id(slide))
+    assert r.status_code == 200, r.get_data(as_text=True)
+    return r
+
+
+def _revoke(slide, who):
+    """结束临时查看（新契约的「移除收录」等价操作）。"""
+    c = _client()
+    _login(c, who)
+    r = c.delete("/api/admin/v1/slides/%s/temporary-view"
+                 % share_store.get_slide_id(slide))
     assert r.status_code == 200, r.get_data(as_text=True)
     return r
 
@@ -178,9 +189,8 @@ def test_owner_granted_session_denied_after_revoke(fake_sidecar):
     _grant(slide, owner)
     assert co.get("/api/ai/session/sess-legacy").status_code == 200
     assert co.get("/api/ai/session/sess-legacy/path").status_code == 200
-    # 移除 → 立即 403
-    assert co.post("/api/admin/v1/slides/%s/visibility" % slide,
-                   json={"granted": False}).status_code == 200
+    # 结束临时查看 → 立即 403
+    assert _revoke(slide, owner).status_code == 200
     assert co.get("/api/ai/session/sess-legacy").status_code == 403
     assert co.get("/api/ai/session/sess-legacy/path").status_code == 403
 
@@ -223,12 +233,10 @@ def test_ai_sessions_list_scoped_for_authenticated_owner(fake_sidecar):
 # =========================================================================== #
 # R6d：撤销联动（run grant 失效 + 运行中 run 取消）
 # =========================================================================== #
-def test_revoke_revokes_stale_run_grants_and_cancels_running(fake_sidecar):
-    """revoke 后：创建者 run grant 失效；运行中 run 收到既有 /cancel 请求。
+def test_end_temporary_view_revokes_derived_run_grants(fake_sidecar):
+    """结束临时查看后：派生 run grant 立即失效（§3.1/§3.3 主动结束撤销
+    运行授权；sidecar 取消是旧永久收回端点行为，不在新契约内）。"""
 
-    取消断言走真实管理端点 + fake sidecar 的调用记录（可控地断言取消被
-    触发，不 mock 掉取消机制本身）；费用 hold 不被触碰（无 billing 写）。
-    """
     owner, usera = _setup_two_owners()
     slide = _touch("a.svs")
     share_store.set_slide_meta(slide, owner_user_id=usera["user_id"])
@@ -236,26 +244,15 @@ def test_revoke_revokes_stale_run_grants_and_cancels_running(fake_sidecar):
     grant = _install_grant(slide, owner)
     assert share_store.get_run_grant(grant["grant_id"])["revoked"] is False
 
-    fake = fake_sidecar
-    fake.register_json("GET", "/sessions", body={"sessions": [
-        {"id": "sess-run-1", "owner": owner["user_id"], "status": "running"},
-        {"id": "sess-done", "owner": owner["user_id"], "status": "finished"},
-        {"id": "sess-other", "owner": usera["user_id"], "status": "running"},
-    ]})
-    fake.register_json("POST", "/cancel", body={"ok": True})
-
-    co = _client()
-    _login(co, owner)
-    r = co.post("/api/admin/v1/slides/%s/visibility" % slide,
-                json={"granted": False})
-    assert r.status_code == 200, r.get_data(as_text=True)
-    # 只对「running 且属被撤主体」的 run 发起取消；finished / 他人 run 不动
-    assert r.get_json()["runs_cancelled"] == ["sess-run-1"]
-    cancels = [c for c in fake.calls
-               if c["method"] == "POST" and c["path"] == "/cancel"]
-    assert [c["body"]["session_id"] for c in cancels] == ["sess-run-1"]
+    # 结束临时查看（§3.1）：run grant 撤销钩子；运行中 run 的 sidecar 取消
+    # 属旧永久收回端点行为，新契约不承诺（grant 失效即 fail-closed）
+    r = _revoke(slide, owner)
+    assert r.status_code == 200
+    assert r.get_json()["temporary_view"]["status"] == "ended"
     # run grant 已失效（下一次工具派发 fail-closed）
     assert share_store.get_run_grant(grant["grant_id"])["revoked"] is True
+    assert share_store.get_run_grant(grant["grant_id"])["revoked_at"] \
+        is not None
 
 
 def test_slide_delete_clears_view_grants_no_orphans():
@@ -317,17 +314,18 @@ def test_grant_requires_asset_generation_match():
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO slide_view_grants (slide_name, user_id, "
-                "granted_by, slide_id) VALUES (%s,%s,%s,%s)",
+                "granted_by, slide_id, expires_at) VALUES (%s,%s,%s,%s,"
+                " now() + interval '30 days')",
                 (slide, owner["user_id"], owner["user_id"], "sld_stale"))
         conn.commit()
     # 失配 → 不计入收录集合
     assert slide not in share_store.slide_view_grants_for_user(owner["user_id"])
     co = _login(_client(), owner)
     assert co.get("/api/slide/%s/info" % slide).status_code == 403
-    # inventory 的 included 状态同样不把失配行算进去
+    # inventory 的 temporary_view 状态同样不把失配行算进去
     items = co.get("/api/admin/v1/slides/inventory").get_json()["items"]
     by_name = {i["name"]: i for i in items}
-    assert by_name[slide]["granted_to_owner"] is False
+    assert by_name[slide]["temporary_view"]["status"] == "none"
     # 正确绑定资产生代后生效（管理端点行为）
     _grant(slide, owner)
     assert slide in share_store.slide_view_grants_for_user(owner["user_id"])
@@ -348,15 +346,17 @@ def test_migration_0035_backfill_and_replayable(pg_uri):
             # 模拟 0034 形态（无 slide_id 列值）的既有授权行
             cur.execute(
                 "INSERT INTO slide_view_grants (slide_name, user_id, "
-                "granted_by, slide_id) VALUES (%s,%s,%s,NULL)",
+                "granted_by, slide_id, expires_at) VALUES (%s,%s,%s,NULL,"
+                " now() + interval '30 days')",
                 (slide, owner["user_id"], owner["user_id"]))
             cur.execute("SELECT slide_id FROM slide_view_grants "
                         "WHERE slide_name=%s", (slide,))
             assert cur.fetchone()[0] is None
             # 无 meta 行的孤儿授权保持 NULL（不伪造资产生代）
             cur.execute(
-                "INSERT INTO slide_view_grants (slide_name, user_id) "
-                "VALUES ('ghost.svs', %s)", (owner["user_id"],))
+                "INSERT INTO slide_view_grants (slide_name, user_id, "
+                "expires_at) VALUES ('ghost.svs', %s, "
+                "now() + interval '30 days')", (owner["user_id"],))
         conn.commit()
         with conn.cursor() as cur:
             cur.execute(sql)
@@ -395,10 +395,8 @@ def test_plugin_region_gate_active_grant_pass_and_revoke_failclosed():
     with app_mod.app.test_request_context("/x", method="POST"):
         assert gate(slide, {"sub": "inst-test"}) is None
 
-    # 移除收录 → 联动撤销 grant → 无活跃 grant（认证态非 demo）→ 403
-    co = _login(_client(), owner)
-    assert co.post("/api/admin/v1/slides/%s/visibility" % slide,
-                   json={"granted": False}).status_code == 200
+    # 结束临时查看 → 联动撤销 grant → 无活跃 grant（认证态非 demo）→ 403
+    assert _revoke(slide, owner).status_code == 200
     with app_mod.app.test_request_context("/x", method="POST"):
         err = gate(slide, {"sub": "inst-test"})
     assert err is not None and err.status_code == 403

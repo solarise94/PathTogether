@@ -534,27 +534,23 @@ def test_submission_replay_answered_before_turnstile(monkeypatch):
     assert _count("SELECT count(*) FROM registration_submissions") == 2
 
 
-def test_submission_replay_before_turnstile_email_verify_mode(monkeypatch):
-    """email_verify 模式的 /register POST：重放同样先于 Turnstile。"""
+def test_register_replay_flow_public_only(monkeypatch):
+    """2026-10-08 §4：旧 email_verify 模式不可存储（读取即 closed）——重放
+    语义只在 public 流程存在（test_submission_replay_before_turnstile 覆盖）；
+    本用例锁定旧模式值写入即拒、POST 403、零入队。"""
     _open_public_mode(monkeypatch)
-    settings_store.set_registration_mode(
-        "email_verify_invite_activation", updated_by="t")
-    _enable_turnstile(monkeypatch)
-    rec = _SiteverifyRecorder([_ok_response()])
-    monkeypatch.setattr(registration_antibot, "_siteverify_post", rec)
+    with pytest.raises(ValueError):
+        settings_store.set_registration_mode(
+            "email_verify_invite_activation", updated_by="t")
+    settings_store.set_setting(settings_store.REGISTRATION_MODE_KEY,
+                                "email_verify_invite_activation")
     client = _cn_client()
     sid = app_mod._register_fresh_submission_id()
     form = {"email": "ev.replay@x.com", "submission_id": sid,
             "cf-turnstile-response": "tok"}
     r1 = client.post("/register", data=form, headers={"Host": "histopilot.cn"})
-    assert 'data-state-kind="submitted"' in r1.get_data(as_text=True)
-    assert len(rec.calls) == 1
-    rec.responses = [{"success": False,
-                      "error-codes": ["timeout-or-duplicate"]}]
-    r2 = client.post("/register", data=form, headers={"Host": "histopilot.cn"})
-    assert 'data-state-kind="submitted"' in r2.get_data(as_text=True)
-    assert len(rec.calls) == 1
-    assert _count("SELECT count(*) FROM registration_mail_jobs") == 1
+    assert r1.status_code == 403
+    assert _count("SELECT count(*) FROM registration_mail_jobs") == 0
 
 
 def test_submission_id_signature_forged_ignored(monkeypatch):
@@ -1288,36 +1284,8 @@ def test_state_contract_keys_present(monkeypatch):
 
 
 # =========================================================================== #
-# 8. 旧 /api/registration/resend（email_verify 模式）：Turnstile 覆盖（§7）
+# 8. 旧 /api/registration/resend 已退役（2026-10-08 §4：410，不入队不校验）
 # =========================================================================== #
-def test_legacy_resend_api_turnstile_required(monkeypatch):
-    _open_public_mode(monkeypatch)
-    settings_store.set_registration_mode(
-        "email_verify_invite_activation", updated_by="t")
-    _enable_turnstile(monkeypatch)
-    rec = _SiteverifyRecorder([
-        {"success": False, "error-codes": ["invalid-input-response"]}])
-    monkeypatch.setattr(registration_antibot, "_siteverify_post", rec)
-    client = _cn_client()
-    r = client.post("/api/registration/resend",
-                    json={"email": "legacy@x.com",
-                          "cf-turnstile-response": "tok"},
-                    headers={"Host": "histopilot.cn"})
-    # 统一 ok（无枚举）；但未入队
-    assert r.status_code == 200 and r.get_json()["ok"] is True
-    assert _count("SELECT count(*) FROM registration_mail_jobs") == 0
-    # 通过后正常入队（JSON 字段 cf-turnstile-response 同样接受）
-    rec2 = _SiteverifyRecorder(
-        [_ok_response(action="registration_resend")])
-    monkeypatch.setattr(registration_antibot, "_siteverify_post", rec2)
-    r2 = client.post("/api/registration/resend",
-                     json={"email": "legacy@x.com",
-                           "cf-turnstile-response": "tok"},
-                     headers={"Host": "histopilot.cn"})
-    assert r2.status_code == 200 and r2.get_json()["ok"] is True
-    assert _count("SELECT count(*) FROM registration_mail_jobs") == 1
-
-
 # =========================================================================== #
 # 9. 迁移 0079
 # =========================================================================== #

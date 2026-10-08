@@ -95,9 +95,9 @@ _WRITE_ENDPOINTS = [
     ("POST", "/api/admin/v1/users/u_x/disable"),
     ("POST", "/api/admin/v1/users/u_x/ai-access"),
     ("POST", "/api/admin/v1/users/u_x/password-reset"),
-    ("GET", "/api/admin/v1/invites"),
-    ("POST", "/api/admin/v1/invites"),
-    ("POST", "/api/admin/v1/invites/inv_x/revoke"),
+    # 2026-10-08 §4：invites 三端点已 410 退役（同 users.create 语义），
+    # 不再列入「owner 门控写端点」遍历面；退役语义由
+    # test_email_verify_activation.test_admin_invite_endpoints_retired 锁定。
 ]
 
 def test_anonymous_gets_401_on_every_write_endpoint():
@@ -224,91 +224,3 @@ def test_ai_access_set_and_unset():
 # 8. invites（PG）：创建校验 / token 仅一次 / 撤销（Batch B wave 2：来源字段
 #    退役 400 retired_invite_field；初始金额字段 total_limit_nano_cny）
 # --------------------------------------------------------------------------- #
-def test_invites_create_token_once_and_slug_validation():
-    owner, _u = _setup_users()
-    c = _login(_client(), owner)
-    r = c.post("/api/admin/v1/invites", json={
-        "login_id": "invitee@x.com", "ttl_hours": 24, "ai_access": True,
-        "note": "n"})
-    assert r.status_code == 200, r.get_json()
-    invite = r.get_json()["invite"]
-    assert invite["token"]  # 明文仅此一次
-    assert r.headers.get("Cache-Control") == "no-store"
-    # 列表永不回 token/token_hash
-    r2 = c.get("/api/admin/v1/invites")
-    assert r2.status_code == 200
-    items = r2.get_json()["invites"]
-    assert len(items) == 1
-    assert "token" not in items[0] and "token_hash" not in items[0]
-    assert items[0]["login_id_masked"]
-    # Batch D1 13（§4.4）：来源字段退役——slug 校验随字段一并退役，任何
-    # source_code/campaign_id/cohort 出现在请求体 → 400 retired_invite_field
-    for field in ("source_code", "campaign_id", "cohort"):
-        r_ret = c.post("/api/admin/v1/invites", json={field: "Bad Slug!"})
-        assert r_ret.status_code == 400, field
-        assert r_ret.get_json()["error"]["code"] == "retired_invite_field"
-    # 初始总额度模板：JSON number 拒绝；十进制字符串接受
-    assert c.post("/api/admin/v1/invites", json={
-        "total_limit_nano_cny": 5}).status_code == 400
-    assert c.post("/api/admin/v1/invites", json={
-        "total_limit_nano_cny": "5"}).status_code == 200
-    # R3 Wave2-Compat：旧 monthly 字段退役——body 带该键（含与 total 同传）
-    # 一律 400 retired_spend_field（绝不静默忽略）
-    r_amb = c.post("/api/admin/v1/invites", json={
-        "total_limit_nano_cny": "5", "monthly_limit_nano_cny": "5"})
-    assert r_amb.status_code == 400
-    assert r_amb.get_json()["error"]["code"] == "retired_spend_field"
-    r_ret = c.post("/api/admin/v1/invites", json={
-        "monthly_limit_nano_cny": "5"})
-    assert r_ret.status_code == 400
-    assert r_ret.get_json()["error"]["code"] == "retired_spend_field"
-    # ttl 边界（0 会回退默认 TTL——与旧端点 `or 默认值` 语义一致；负数/超限 400）
-    assert c.post("/api/admin/v1/invites",
-                  json={"ttl_hours": -5}).status_code == 400
-    assert c.post("/api/admin/v1/invites",
-                  json={"ttl_hours": 721}).status_code == 400
-
-def test_invites_pagination():
-    owner, _u = _setup_users()
-    c = _login(_client(), owner)
-    for i in range(5):
-        assert c.post("/api/admin/v1/invites", json={"ttl_hours": 1}
-                      ).status_code == 200
-    r = c.get("/api/admin/v1/invites?limit=2")
-    body = r.get_json()
-    assert len(body["invites"]) == 2 and body["next_cursor"]
-    r2 = c.get("/api/admin/v1/invites?limit=2&cursor=" + body["next_cursor"])
-    body2 = r2.get_json()
-    assert len(body2["invites"]) == 2
-    seen = {i["invite_id"] for i in body["invites"] + body2["invites"]}
-    assert len(seen) == 4  # 无重复
-
-def test_invites_revoke_semantics():
-    owner, _u = _setup_users()
-    c = _login(_client(), owner)
-    invite = c.post("/api/admin/v1/invites", json={"ttl_hours": 1}
-                    ).get_json()["invite"]
-    r = c.post("/api/admin/v1/invites/%s/revoke" % invite["invite_id"])
-    assert r.status_code == 200
-    assert r.get_json()["invite"]["status"] == "revoked"
-    # 幂等：再次撤销仍 200
-    assert c.post("/api/admin/v1/invites/%s/revoke" % invite["invite_id"]
-                  ).status_code == 200
-    assert c.post("/api/admin/v1/invites/inv_ghost/revoke").status_code == 404
-    # 已消费邀请不可撤销
-    import registration_store
-    consumed = registration_store.create_invite(
-        owner["user_id"], ttl_seconds=3600)
-    # 直接把 use_count 置满并写 consumed_at，构造已消费行
-    conn = billing_store._connect()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE registration_invites SET consumed_at=now(), "
-                "use_count=1 WHERE invite_id=%s", (consumed["invite_id"],))
-        conn.commit()
-    finally:
-        conn.close()
-    r = c.post("/api/admin/v1/invites/%s/revoke" % consumed["invite_id"])
-    assert r.status_code == 409
-

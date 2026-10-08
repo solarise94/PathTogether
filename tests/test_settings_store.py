@@ -6,6 +6,7 @@ PostgreSQL 唯一后端（仅 RUN_PG_TESTS=1）：UPSERT 读写、CAS、registra
 
 PG 侧表由 conftest 每用例 TRUNCATE（platform_settings 在清单内）。
 """
+import pytest
 import settings_store
 from pg_compat import BACKEND
 
@@ -34,6 +35,10 @@ def test_registration_mode_missing_row_bootstraps_closed():
     assert settings_store.get_registration_mode() == "closed"
     assert settings_store.get_setting(settings_store.REGISTRATION_MODE_KEY) \
         == "closed"
-    # owner 显式切换后立即权威
-    settings_store.set_registration_mode("invite_only", updated_by="usr_owner")
-    assert settings_store.get_registration_mode() == "invite_only"
+    # owner 显式切换后立即权威（2026-10-08 §4：词表只剩 closed/public；
+    # 旧值 invite_only 不再可写）
+    settings_store.set_registration_mode("public", updated_by="usr_owner")
+    assert settings_store.get_registration_mode() == "public"
+    with pytest.raises(ValueError):
+        settings_store.set_registration_mode("invite_only",
+                                             updated_by="usr_owner")

@@ -216,16 +216,28 @@ def test_register_email_mode_post_unified_copy(monkeypatch):
     _open_email_mode(monkeypatch)
     app_mod.AUTH_ENABLED = True
     client = _client()
-    r1 = client.post("/register", data={"email": "New.User@Example.COM "})
+
+    def _post(email):
+        return client.post("/register", data={"email": email})
+
+    def _normalize(body):
+        # 每次渲染签发新的 submission_id（幂等键），比较前归一
+        return re.sub(r"rsb_[A-Za-z0-9_\-]+", "rsb_X", body)
+
+    r1 = _post("New.User@Example.COM ")
     assert r1.status_code == 200
-    done1 = r1.get_data(as_text=True)
-    # 未知邮箱：同一文案（无枚举信号）
-    r2 = client.post("/register", data={"email": "ghost@nowhere.test"})
-    assert r2.get_data(as_text=True) == done1
-    # 超限（60s 冷却）：仍是同一文案
-    r3 = client.post("/register", data={"email": "new.user@example.com"})
-    assert r3.get_data(as_text=True) == done1
-    # 入队规范化：job email = 规范化值；同邮箱冷却只 1 个 job
+    done1 = _normalize(r1.get_data(as_text=True))
+    # 未知邮箱：同一状态/文案（无枚举信号）
+    r2 = _post("ghost@nowhere.test")
+    assert _normalize(r2.get_data(as_text=True)) == done1
+    assert 'data-state-kind="submitted"' in done1
+    # 2026-10-08 设计 §3：5 分钟冷却内重复提交 → cooldown 状态（同一结构；
+    # 不作废已有 token，不再统一声称「邮件已发送」）
+    r3 = _post("new.user@example.com")
+    body3 = _normalize(r3.get_data(as_text=True))
+    assert 'data-state-kind="cooldown"' in body3
+    assert "验证邮件请求已提交" in done1
+    # 入队规范化：job email = 规范化值；同邮箱冷却只 1 个 job（不作废重发）
     conn = pg_store_connect()
     try:
         with conn.cursor() as cur:
@@ -243,18 +255,22 @@ def test_register_email_mode_post_unified_copy(monkeypatch):
 
 
 def test_register_email_mode_done_view_copy(monkeypatch):
-    """R2：发送后注册弹窗内展示「验证邮件已发送，请查收。」（不跳独立页）。"""
+    """R2→2026-10-08 设计 §5：提交后注册弹窗内展示 submitted 状态
+    （「验证邮件请求已提交」；不跳独立页，不声称「邮件已发送」）。"""
     _open_email_mode(monkeypatch)
     app_mod.AUTH_ENABLED = True
     client = _client()
     r = client.post("/register", data={"email": "done.view@x.com"})
     assert r.status_code == 200
     body = r.get_data(as_text=True)
-    assert "验证邮件已发送，请查收。" in body
+    assert "验证邮件请求已提交" in body
+    assert "邮件已发送" not in body
     # 完成视图不再提供邮箱表单（防重复提交歧义）；保留重新填写与登录入口
     assert 'name="email"' not in body
     assert "重新填写邮箱" in body
     assert "已有账号？登录" in body
+    # 帮助入口（§5：低强调「给作者发邮件」链接始终存在）
+    assert "/registration-help" in body
     # 弹窗仍直开（register_open），登录视图收起
     assert 'id="register-view" data-auth-pane="register">' in body
     assert 'id="login-view" data-auth-pane="login" hidden>' in body
@@ -262,28 +278,29 @@ def test_register_email_mode_done_view_copy(monkeypatch):
 
 
 def test_register_done_view_again_link_navigates_to_clean_form(monkeypatch):
-    """发送成功态「重新填写邮箱」真实导航 /register 深链接（2026-09-19 修复：
-    链接带 data-auth-nav 显式 opt-out，entry-auth.js 不拦截原地切换——此时
-    注册视图已是发送成功态，切换等于没动）。深链接由服务端重新渲染介绍主页
-    + 干净注册表单（register_done=False、无 sent 视图），可重新填写/重发。"""
+    """提交成功态「重新填写邮箱」真实导航 /register 深链接（2026-09-19 修复；
+    2026-10-08 设计 §5 状态化后语义不变：链接带 data-auth-nav 显式 opt-out，
+    entry-auth.js 不拦截原地切换）。深链接由服务端重新渲染介绍主页 + 干净
+    注册表单（register_state=form、无状态视图），可重新填写/重发。"""
     _open_email_mode(monkeypatch)
     app_mod.AUTH_ENABLED = True
     client = _client()
     r = client.post("/register", data={"email": "again.nav@x.com"})
     assert r.status_code == 200
     done = r.get_data(as_text=True)
-    assert "验证邮件已发送，请查收。" in done
+    assert "验证邮件请求已提交" in done
     # i18n 键不变 + 显式 opt-out 属性存在（允许真实导航）
     assert 'data-i18n="register.dialog.again">重新填写邮箱</a>' in done
     assert "data-auth-nav" in done
-    # 深链接 GET /register：干净注册表单（register_done=False、无 sent 视图）
+    # 深链接 GET /register：干净注册表单（form 态、无提交后状态视图）
     r2 = client.get("/register")
     assert r2.status_code == 200
     clean = r2.get_data(as_text=True)
-    assert "验证邮件已发送，请查收。" not in clean
+    assert "验证邮件请求已提交" not in clean
     assert "请查收验证邮件" not in clean
     assert 'id="register-dialog-form"' in clean
     assert 'name="email"' in clean
+    assert 'id="register-state"' not in clean
     assert "data-auth-nav" not in clean  # 干净表单不再渲染该链接
     assert "no-store" in r2.headers.get("Cache-Control", "")
 
@@ -303,7 +320,7 @@ def test_register_dialog_full_real_chain(monkeypatch):
     # 2. 弹窗表单提交（同真实 form POST：email + CSRF）
     r = client.post("/register", data={"email": "dialog.chain@x.com"})
     assert r.status_code == 200
-    assert "验证邮件已发送，请查收。" in r.get_data(as_text=True)
+    assert "验证邮件请求已提交" in r.get_data(as_text=True)
     # 3. 真实排水（fake 发送器）：正文带真实 PUBLIC_BASE_URL 链接与 token
     assert registration_mail_worker.drain_once(sender=_fake()) == 1
     to, subject, body = _fake().sent[0]
@@ -421,14 +438,16 @@ def test_verify_creates_pending_user_email_as_login_id(monkeypatch):
     assert r2.status_code == 400
     assert r2.get_json()["code"] == "invalid_or_expired"
     # 新 token 同邮箱 → email_taken（部分唯一索引；不建第二个账号）。
-    # （先把已消费 job 移出 60s 冷却窗口——store 层配额对直接调用方生效）
+    # （先把已消费 job 移出 5 分钟冷却窗口——2026-10-08 设计 §3 的 store
+    # 层配额对直接调用方生效）
     conn = pg_store_connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
                     "UPDATE registration_mail_jobs SET created_at = now() - "
-                    "interval '2 minutes' WHERE email_normalized='alice@x.com'")
+                    "interval '10 minutes' WHERE "
+                    "email_normalized='alice@x.com'")
     finally:
         conn.close()
     out2 = _enqueue("alice@x.com")
@@ -940,9 +959,23 @@ def test_verify_token_only_stored_as_hash():
     assert "verify-email?token=" + out["token"] in payload["body"]
 
 
-def test_resend_quota_cooldown_hourly_daily(monkeypatch):
+def test_resend_quota_cooldown_daily_and_global_budget(monkeypatch):
+    """2026-10-08 设计 §3 配额：同邮箱 5 分钟冷却 + 滚动 24h 两次接纳投递
+    + 全站 24h 40 封（jobs+redeliveries 合计；legacy 路径经兼容包装验证
+    cooldown/limit 分类仍为统一 rate_limited 文案）。"""
     email = "quota@x.com"
     _enqueue(email)
+    # 直接置 sent（否则出冷却后的请求会命中 processing：worker 仍在处理
+    # 时不并行新增投递，§3；本用例不开注册模式，不走 drain）
+    conn0 = pg_store_connect()
+    conn0.autocommit = True
+    try:
+        with conn0.cursor() as cur:
+            cur.execute(
+                "UPDATE registration_mail_jobs SET status='sent' "
+                "WHERE email_normalized=%s", (email,))
+    finally:
+        conn0.close()
     with pytest.raises(registration_store.EmailVerifyError) as ei:
         _enqueue(email)
     assert ei.value.code == "rate_limited"
@@ -952,36 +985,23 @@ def test_resend_quota_cooldown_hourly_daily(monkeypatch):
     conn.autocommit = True
     try:
         with conn.cursor() as cur:
-            # 绕过冷却：把现有 job 回填到 2 小时前（出冷却/时窗、留 24h 内），
-            # 逐条灌到「小时 3」上限
+            # 出 5 分钟冷却后第二封可入队；第三封触发同邮箱 24h 两次上限
             cur.execute(
                 "UPDATE registration_mail_jobs SET created_at = now() - "
-                "interval '2 hours' WHERE email_normalized=%s", (email,))
-            for _ in range(registration_store.VERIFY_HOURLY_LIMIT):
-                # 每轮先把全部 job 回填出冷却/时窗，再入队（新 job 落在 now()）
-                cur.execute(
-                    "UPDATE registration_mail_jobs SET created_at = now() - "
-                    "interval '2 hours' WHERE email_normalized=%s", (email,))
-                _enqueue(email)
-            with pytest.raises(registration_store.EmailVerifyError) as eh:
-                _enqueue(email)
-            assert eh.value.code == "rate_limited"
-            # 全部回填出 1 小时窗口（仍在 24h 内）→ 填满「日上限 5」后拒绝
-            cur.execute(
-                "UPDATE registration_mail_jobs SET created_at = now() - "
-                "interval '2 hours' WHERE email_normalized=%s", (email,))
-            cur.execute(
-                "SELECT count(*)::int AS n FROM registration_mail_jobs "
-                "WHERE email_normalized=%s AND created_at > now() - "
-                "interval '24 hours'", (email,))
-            existing_daily = int(cur.fetchone()["n"])
-            for _ in range(registration_store.VERIFY_DAILY_LIMIT
-                           - existing_daily):
-                _enqueue(email)
+                "interval '10 minutes' WHERE email_normalized=%s", (email,))
+            _enqueue(email)
             with pytest.raises(registration_store.EmailVerifyError) as ed:
                 _enqueue(email)
             assert ed.value.code == "rate_limited"
-            # 应用日预算 40：清掉本邮箱 job，全局灌 40 条（24h 内）
+            # 仍在 24h 窗口内（回填不出窗口）→ 依旧拒绝
+            cur.execute(
+                "UPDATE registration_mail_jobs SET created_at = now() - "
+                "interval '23 hours' WHERE email_normalized=%s", (email,))
+            with pytest.raises(registration_store.EmailVerifyError) as ed2:
+                _enqueue(email)
+            assert ed2.value.code == "rate_limited"
+            # 应用日预算 40：清掉本邮箱 job，全局灌满 40 条（24h 内；含
+            # redeliveries 计数的权威口径）
             cur.execute(
                 "DELETE FROM registration_mail_jobs WHERE "
                 "email_normalized=%s", (email,))
@@ -1424,14 +1444,14 @@ def test_uncertain_token_superseded_by_new_request(monkeypatch):
     snd = _UncertainAfterDataSender()
     registration_mail_worker.drain_once(sender=snd)
     assert _mail_job_row(out["token"])["status"] == "uncertain"
-    # 出 60s 冷却窗后重新入队（冷却以 job 行数计）
+    # 出 5 分钟冷却窗后重新入队（2026-10-08 设计 §3；冷却以投递行数计）
     conn = pg_store_connect()
     conn.autocommit = True
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE registration_mail_jobs SET created_at = now() - "
-                "interval '2 minutes' WHERE email_normalized='sup@x.com'")
+                "interval '10 minutes' WHERE email_normalized='sup@x.com'")
     finally:
         conn.close()
     out2 = _enqueue("sup@x.com")

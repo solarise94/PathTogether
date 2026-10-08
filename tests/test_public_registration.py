@@ -753,7 +753,8 @@ def test_http_end_to_end_register_verify_login(monkeypatch):
         "terms_sha256": terms["content_sha256"],
     })
     assert r.status_code == 200
-    assert "验证邮件已发送" in r.get_data(as_text=True)  # 统一文案
+    # 2026-10-08 设计 §5：submitted 状态统一文案（不再声称「邮件已发送」）
+    assert "验证邮件请求已提交" in r.get_data(as_text=True)
     # 排水取 token（fake 发送器）
     fake = registration_mail_worker.install_fake_sender()
     fake.clear()
@@ -883,8 +884,13 @@ def test_http_register_post_uniform_copy_for_known_email(monkeypatch):
     r1 = _post("known@x.com")
     r2 = _post("unknown@x.com")
     assert r1.status_code == r2.status_code == 200
-    assert "验证邮件已发送" in r1.get_data(as_text=True)
-    assert "验证邮件已发送" in r2.get_data(as_text=True)
+    # 2026-10-08 设计 §5/§7：同一状态结构 + 同一文案（无枚举信号）
+    b1 = r1.get_data(as_text=True)
+    b2 = r2.get_data(as_text=True)
+    assert "验证邮件请求已提交" in b1
+    assert "验证邮件请求已提交" in b2
+    assert 'data-state-kind="submitted"' in b1
+    assert 'data-state-kind="submitted"' in b2
 
 
 # =========================================================================== #

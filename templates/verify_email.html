@@ -210,6 +210,7 @@
       </div>
       {% endif %}
       <button class="btn primary" type="submit" id="verify-submit">完成注册</button>
+      <p class="hint" style="margin-top:12px;"><a href="/registration-help?reason=submit_error">提交遇到问题？给作者发邮件</a></p>
     </form>
     {% else %}
     <h1 class="title"><span data-i18n="verify.valid.title">验证你的邮箱</span> <span class="state-ok">✓</span></h1>
@@ -264,20 +265,24 @@
       </div>
       <button class="btn primary" type="submit" id="verify-submit"
               data-i18n="verify.apply.submit">申请测试</button>
+      <p class="hint" style="margin-top:12px;"><a href="/registration-help?reason=submit_error">提交遇到问题？给作者发邮件</a></p>
     </form>
     {% endif %}
     {% elif state == "expired" %}
     <h1 class="title">链接已过期 <span class="state-bad">✕</span></h1>
     <p class="desc">验证链接有效期 30 分钟，且只能使用一次。请返回注册页重新请求验证邮件。</p>
     <a class="btn secondary" href="/register">重新请求验证邮件</a>
+    <a class="btn secondary" href="/registration-help?reason=link_expired">注册遇到问题？给作者发邮件</a>
     {% elif state == "consumed" %}
     <h1 class="title">链接已使用 <span class="state-bad">✕</span></h1>
     <p class="desc">该验证链接已被使用（邮箱验证一次性）。如你尚未完成注册，请重新请求验证邮件；如已完成验证，请直接登录。</p>
     <a class="btn secondary" href="/login">前往登录</a>
+    <a class="btn secondary" href="/registration-help?reason=submit_error">注册遇到问题？给作者发邮件</a>
     {% else %}
     <h1 class="title">链接无效 <span class="state-bad">✕</span></h1>
     <p class="desc">验证链接无效或已失效。请返回注册页重新请求验证邮件。</p>
     <a class="btn secondary" href="/register">重新请求验证邮件</a>
+    <a class="btn secondary" href="/registration-help?reason=link_invalid">注册遇到问题？给作者发邮件</a>
     {% endif %}
     <p class="footer" data-i18n="verify.footer">仅用于研究、教学和软件演示，不用于临床诊断。</p>
   </main>

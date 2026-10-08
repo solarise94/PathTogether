@@ -103,6 +103,7 @@ import demo_store
 # registration_mail_worker 的 MailSender 适配边界（app 绝不直接外发）。
 import registration_store
 import registration_mail_worker
+import registration_antibot
 # P1-3 身份收口（review P1-3：邮箱=唯一用户名收尾）：邮箱改绑闭环 /
 # 存量冲突清单 / orphan pending 处置的存储原语（复用 registration_mail_jobs
 # 队列与 registration_store 公开校验函数；详见 identity_store 模块 docstring）。
@@ -988,6 +989,11 @@ _REGISTRATION_PUBLIC_PATHS = frozenset({
     "/verify-email-change",
     "/api/registration/verify",
     "/api/registration/resend",
+    # 2026-10-08 设计 §5/§8：public 主动重发（表单 POST；CSRF 走全局闸，
+    # 绑定匿名 registration receipt）与注册帮助页（无需登录、无需 Turnstile，
+    # 只接受固定 reason 词表）
+    "/register/resend",
+    "/registration-help",
     # P1：public 名额公共快照（只读、无枚举信号；§4.3）
     "/api/registration/public-status",
 })
@@ -3146,18 +3152,43 @@ except ValueError as _csp_exc:
     raise SystemExit("[startup] %s" % _csp_exc)
 
 
-def _apply_landing_security_headers(resp):
-    """公开介绍页：禁止中间缓存、禁止被嵌入；无 inline script/style，CSP 不放 'unsafe-inline'。"""
+def _turnstile_csp_sources_needed() -> bool:
+    """landing 页 CSP 是否需要放行 Turnstile 官方源（2026-10-08 设计 §7）：
+    仅当页面渲染注册弹窗（email_verify/public 模式）且 Turnstile 已配置
+    （widget 真会加载）时追加 script-src/frame-src
+    https://challenges.cloudflare.com——不放开任意第三方域名或
+    'unsafe-inline'，不动 connect-src，其它页面 CSP 不变。"""
+    mode = _registration_dialog_mode()
+    if mode not in ("email_verify", "public"):
+        return False
+    return registration_antibot.load_turnstile_config().available
+
+
+def _apply_landing_security_headers(resp, allow_turnstile=True):
+    """公开介绍页：禁止中间缓存、禁止被嵌入；无 inline script/style，CSP 不放 'unsafe-inline'。
+
+    2026-10-08 设计 §7：渲染注册弹窗的 landing 页（/、/login、/register）
+    在 Turnstile 已配置时向 script-src 与 frame-src 追加
+    https://challenges.cloudflare.com（Cloudflare 官方 CSP 要求）；默认
+    （未配置/非弹窗页 allow_turnstile=False，如 /registration-help）CSP 与
+    历史值逐字节一致。
+    """
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     resp.headers["Pragma"] = "no-cache"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    script_src = "'self'"
+    frame_directive = ""
+    if allow_turnstile and _turnstile_csp_sources_needed():
+        script_src += " https://challenges.cloudflare.com"
+        frame_directive = "frame-src https://challenges.cloudflare.com; "
     resp.headers["Content-Security-Policy"] = (
-        "default-src 'none'; script-src 'self'; style-src 'self'; "
+        "default-src 'none'; script-src " + script_src + "; style-src 'self'; "
         "img-src 'self' data:; font-src 'self'; connect-src 'self'"
         + "".join(" " + s for s in CSP_EXTRA_CONNECT_SOURCES) + "; "
-        "base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+        "base-uri 'none'; form-action 'self'; " + frame_directive +
+        "frame-ancestors 'none'"
     )
     return resp
 
@@ -3264,6 +3295,14 @@ def _entry_signed_in_context():
         "registration_mode": registration_mode,
         "register_error": None, "register_error_code": None,
         "register_done": False, "register_retry_after": 0,
+        # 2026-10-08 设计 §5/§7：注册弹窗状态机默认值（提交后由
+        # _register_state_response 覆写）。表单页每次渲染签发新的
+        # submission_id（幂等键）；turnstile/entry_site 由映射与配置推导。
+        "register_state": {"kind": "form", "resend_available_at": None,
+                           "resume_at": None, "help_reason": None},
+        "turnstile": registration_antibot.turnstile_widget_context(),
+        "entry_site": _entry_site_context_value(),
+        "register_submission_id": _register_fresh_submission_id(),
     }
     # public 模式必须随首页/登录页就注入协议上下文：弹窗经 entry-auth.js 原地
     # 切换到注册视图（无服务端往返），渲染时缺 register_terms/register_research
@@ -4749,45 +4788,68 @@ def register():
 
 
 def _register_email_verify_post(ip_hash):
-    """email_verify_invite_activation 的 POST：邮箱验证请求（I 线流程 1）。
+    """email_verify_invite_activation 的 POST：邮箱验证请求（I 线流程 1；
+    2026-10-08 设计 §3/§6/§11 重写）。
 
-    - 只收 email（不填邀请码、不发额度；J：注册页不再要求独立登录账号/
-      显示名——验证成功后以规范化邮箱为唯一用户名）；
-    - P1-2：入队写前重查生效模式（与 activate/resend 同一权威判定）——
-      注册暂停只停新验证请求（统一 403 registration_closed），token、
-      pending 用户、审计、队列一律不动；
-    - registration_store.enqueue_email_verification 同事务入队 + 配额
-      （60s 冷却 / 时 3 / 日 5 / 应用日预算 40）；
-    - **统一文案**：已存在/未知邮箱/超限/内部异常一律同一响应（反枚举；
-      超限不回 429——429 本身是「该邮箱活跃」的枚举信号）；
-    - 入队成功后 best-effort 即时排水（失败留 queued，worker 循环为权威
-      发送方）；异步排水不改变响应时序与文案。
+    处理顺序（§11）：CSRF（全局闸）→ 格式校验 → IP 限流（register() 已完成）
+    → 入口解析 → Turnstile → 单事务配额+入队。
+
+    - 只收 email（不填邀请码、不发额度）；
+    - 入口（§6）：生产部署未知 Host 拒绝发信（中性 unavailable + 求助）；
+    - Turnstile（REGISTRATION_TURNSTILE_REQUIRED 时必须通过；校验服务不可
+      用/未配齐 fail-closed 不发信；失败不占邮箱发送额度）；
+    - 状态渲染（§5/§7）：submitted / cooldown（含倒计时）/ limit（含恢复
+      时间）/ processing / challenge_* / unavailable——现有/未知邮箱同一
+      结构，不再统一声称「验证邮件已发送」；
+    - 入队成功后 best-effort 即时排水（worker 循环为权威发送方）。
     """
     # P1-2：写前重查（防御层；register() 顶部已查过一次，此处紧贴写路径）
     if _effective_registration_mode() != \
             registration_store.MODE_EMAIL_VERIFY_INVITE_ACTIVATION:
         return _register_landing_page(mode="closed", status=403)
+    mode = "email_verify"
     email = (request.form.get("email") or "").strip()
     try:
-        registration_store.enqueue_email_verification(
-            email, base_url=_registration_email_base_url())
+        registration_store.validate_email(email)
+    except registration_store.EmailVerifyError:
+        return _register_form_error(
+            "请输入有效的邮箱地址", "invalid", mode=mode)
+    entry = _registration_entry_site()
+    if entry.get("refused"):
+        return _register_entry_refused_state(mode)
+    tstate = _turnstile_guard(registration_antibot.ACTION_REGISTRATION_START)
+    if tstate is not None:
+        return _register_state_response(tstate, mode)
+    unavailable = _register_state("unavailable", help_reason="unavailable")
+    try:
+        result = registration_store.request_verification_email(
+            email,
+            flow=registration_store.MODE_EMAIL_VERIFY_INVITE_ACTIVATION,
+            action="start", entry_origin=entry["origin"],
+            form_locale=(request.form.get("form_locale") or "").strip()
+            or entry["default_locale"],
+            submission_id=_register_form_submission_id())
     except registration_store.EmailVerifyError as exc:
         if exc.code == "bad_input":
-            # 本地形状错误可回显（与 invite_only 表单校验同口径；不泄露
-            # 任何账号存在性）
             return _register_form_error(
-                "请输入有效的邮箱地址", "invalid", mode="email_verify")
-        # rate_limited / 其他：统一文案（无枚举信号）
-        app.logger.warning("邮箱验证请求被统一文案吸收（code=%s）", exc.code)
+                "请输入有效的邮箱地址", "invalid", mode=mode)
+        app.logger.warning("邮箱验证请求被统一状态吸收（code=%s）", exc.code)
+        return _register_state_response(unavailable, mode)
     except Exception:
-        app.logger.exception("邮箱验证入队异常（统一文案）")
-    else:
-        try:
-            registration_mail_worker.drain_async()
-        except Exception:
-            app.logger.warning("验证邮件即时排水启动失败（留待 worker）",
-                               exc_info=True)
-    return _register_email_verify_done_page()
+        app.logger.exception("邮箱验证入队异常（统一状态）")
+        return _register_state_response(unavailable, mode)
+    _register_drain_async()
+    return _register_state_response(_register_state_from_store(result, mode),
+                                    mode)
+
+
+def _register_drain_async():
+    """入队后 best-effort 即时排水（失败留 queued，worker 循环为权威）。"""
+    try:
+        registration_mail_worker.drain_async()
+    except Exception:
+        app.logger.warning("验证邮件即时排水启动失败（留待 worker）",
+                           exc_info=True)
 
 
 def _public_register_agreements_context():
@@ -4819,41 +4881,184 @@ def _public_register_agreements_context():
     return ctx
 
 
-# 注册入口与访问统计的 request_host 使用同一请求 Host。这里只允许产品明确
-# 开放的两个公网入口，绝不把任意 Host 头反射进验证邮件；其它 Host（本地开发、
-# 测试或内部代理）继续回退到部署配置 PUBLIC_BASE_URL。
-_REGISTRATION_EMAIL_ENTRY_ORIGINS = {
-    "histopilot.com": "https://HistoPilot.com",
-    "pt.solarise94.fun": "https://pt.solarise94.fun",
-}
+# 注册入口与访问统计的 request_host 使用同一请求 Host（2026-10-08 设计 §6
+# 收敛为统一站点映射 registration_antibot.ENTRY_SITES：验证邮件链接、站点
+# 显示名、帮助页链接、默认语言共用一份映射）。绝不把任意 Host 头反射进
+# 验证邮件；生产部署（PUBLIC_BASE_URL 命中映射内生产入口）遇到未知 Host
+# 一律拒绝发信（中性 unavailable + 求助入口），不静默回退别的域名；其它
+# 环境（本地开发/测试）继续回退部署配置 PUBLIC_BASE_URL。
+
+
+def _registration_entry_site():
+    """本次注册请求的入口站点（§6）。
+
+    返回 site dict（origin/name/default_locale/mapped）；生产部署未知
+    Host → ``{"refused": True}``（调用方拒绝发信并记录日志）。Host 只取
+    request.host，绝不取 X-Forwarded-Host/Origin/Referer/next/隐藏域。
+    """
+    return registration_antibot.resolve_entry_site(
+        request.host, os.environ.get("PUBLIC_BASE_URL"))
+
+
+def _entry_site_context_value():
+    """模板 entry_site 上下文（§7 契约：origin/name/default_locale）；
+    生产未知 Host（refused）时为 None（表单照常渲染，发送路径拒绝）。"""
+    entry = _registration_entry_site()
+    if entry and not entry.get("refused"):
+        return {"origin": entry["origin"], "name": entry["name"],
+                "default_locale": entry["default_locale"]}
+    return None
 
 
 def _registration_email_base_url():
-    """按本次注册入口选择验证邮件 origin；未知 Host 安全回退 canonical 配置。"""
-    raw_host = (request.host or "").strip()
-    try:
-        hostname = (urlparse("//" + raw_host).hostname or "").lower().rstrip(".")
-    except ValueError:
-        hostname = ""
-    selected = _REGISTRATION_EMAIL_ENTRY_ORIGINS.get(hostname)
-    if selected:
-        return selected
-    return (os.environ.get("PUBLIC_BASE_URL") or "").strip()
+    """兼容旧调用点（identity_store 改绑链接等）：本次入口 origin；refused
+    （生产未知 Host）时回退部署配置 PUBLIC_BASE_URL——改绑是登录用户本人
+    流程，不在注册防刷「拒绝发信」范围内，保留原回退行为。"""
+    entry = _registration_entry_site()
+    if entry and not entry.get("refused"):
+        return entry["origin"]
+    return (os.environ.get("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+
+
+def _register_state(kind, resend_available_at=None, resume_at=None,
+                    help_reason=None) -> dict:
+    """注册弹窗提交后状态（§5/§7 契约；现有/未知/受限邮箱同结构无枚举）。"""
+    return {
+        "kind": str(kind),
+        "resend_available_at": (int(resend_available_at)
+                                if resend_available_at else None),
+        "resume_at": int(resume_at) if resume_at else None,
+        "help_reason": help_reason or None,
+    }
+
+
+def _register_fresh_submission_id():
+    """签发新的注册表单 submission_id（存 session；服务端幂等键，§8）。"""
+    sid = "rsb_" + secrets.token_urlsafe(12)
+    session["register_pending_submission"] = sid
+    return sid
+
+
+def _register_form_submission_id():
+    """取表单提交的 submission_id（服务端签发；防御性限长/字符集）。"""
+    sid = (request.form.get("submission_id") or "").strip()
+    if sid and len(sid) <= 64 and re.fullmatch(r"[A-Za-z0-9_\-]+", sid):
+        return sid
+    return None
+
+
+def _turnstile_request_token():
+    """取 Turnstile token：表单域优先；JSON body 同名字段（§7 覆盖 form 和
+    JSON）。"""
+    tok = (request.form.get(registration_antibot.TURNSTILE_TOKEN_FIELD)
+           or "").strip()
+    if not tok and request.is_json:
+        body = request.get_json(silent=True) or {}
+        v = body.get(registration_antibot.TURNSTILE_TOKEN_FIELD)
+        tok = (str(v).strip() if isinstance(v, str) else "") or ""
+    return tok
+
+
+def _turnstile_guard(action):
+    """发送前置 Turnstile 校验（§3/§7/§11：IP 限流之后、配额事务之前）。
+
+    返回 None（通过或未启用）或 register_state dict（challenge_failed /
+    challenge_unavailable——均不入队、不占邮箱发送额度）。required 但
+    未配齐/含测试密钥 → unavailable 分类，fail-closed 绝不静默发信。
+    """
+    cfg = registration_antibot.load_turnstile_config()
+    if not cfg.required:
+        return None
+    result = registration_antibot.verify(
+        _turnstile_request_token(), action=action,
+        remoteip=(request.remote_addr or "").strip(),
+        expected_hostname=registration_antibot.request_hostname(request.host),
+        config=cfg)
+    if result.ok:
+        return None
+    req_id = secrets.token_hex(8)
+    if result.status == "rejected":
+        app.logger.warning(
+            "challenge_rejected req=%s entry=%s reason=%s", req_id,
+            registration_antibot.request_hostname(request.host) or "-",
+            result.reason)
+        return _register_state("challenge_failed", help_reason="challenge")
+    app.logger.warning(
+        "challenge_unavailable req=%s entry=%s reason=%s", req_id,
+        registration_antibot.request_hostname(request.host) or "-",
+        result.reason)
+    return _register_state("challenge_unavailable", help_reason="challenge")
+
+
+def _register_state_context(state, mode):
+    """渲染注册提交后状态所需上下文（§5/§7）：register_state/turnstile/
+    entry_site + 新 submission_id（重发表单幂等键）。"""
+    entry = _registration_entry_site()
+    entry_site = None
+    if entry and not entry.get("refused"):
+        entry_site = {"origin": entry["origin"], "name": entry["name"],
+                      "default_locale": entry["default_locale"]}
+    return {
+        "register_state": state,
+        "turnstile": registration_antibot.turnstile_widget_context(),
+        "entry_site": entry_site,
+        "register_submission_id": _register_fresh_submission_id(),
+        "registration_mode": mode,
+    }
+
+
+def _register_entry_refused_state(mode):
+    """生产部署未知 Host（§6 信任边界）：拒绝发信，中性 unavailable + 求助。"""
+    app.logger.warning(
+        "registration entry host not mapped in production (host=%s)",
+        registration_antibot.request_hostname(request.host) or "-")
+    return _register_state_response(
+        _register_state("unavailable", help_reason="unavailable"), mode)
+
+
+def _register_state_response(state, mode, status=200):
+    """按 register_state 渲染注册弹窗（现有/未知/受限邮箱同一结构）。"""
+    ctx = _register_state_context(state, mode)
+    return _register_landing_page(mode=mode, status=status, **{
+        "register_state": ctx["register_state"],
+        "turnstile": ctx["turnstile"],
+        "entry_site": ctx["entry_site"],
+        "register_submission_id": ctx["register_submission_id"]})
+
+
+def _register_state_from_store(result, mode):
+    """store 结果 → register_state（§7 kind 映射）+ session receipt。"""
+    kind = result.get("kind")
+    help_reason = {"cooldown": "cooldown", "limit": "limit"}.get(kind)
+    state = _register_state(
+        kind, resend_available_at=result.get("resend_available_at"),
+        resume_at=result.get("resume_at"), help_reason=help_reason)
+    if result.get("receipt_id"):
+        session["register_receipt"] = result["receipt_id"]
+    return state
 
 
 def _register_public_post(ip_hash):
-    """public 的 POST：邮箱 + 双协议选择 → 验证邮件 + intent（§3.3.1）。
+    """public 的 POST：邮箱 + 双协议选择 → 验证邮件 + intent（§3.3.1；
+    2026-10-08 设计 §3/§4/§6/§11 重写）。
 
-    - 必选协议未勾选 → 表单错误（本地校验，非枚举信号）；协议版本/hash 与
-      当前 published 不匹配（旧页面/篡改）→ 表单错误提示刷新；
-    - 可选研究选择缺省按 false（不能拒绝注册）；
-    - 已存在/未知邮箱/超限/内部异常一律**同一完成页**（无枚举信号）；
-    - **不占名额、不建账号、不收密码**（名额计数在验证完成的原子事务）；
-    - 入队成功后 best-effort 即时排水（worker 循环为权威发送方）。
+    处理顺序（§11）：CSRF → 格式/协议校验 → IP 限流（register() 已完成）
+    → 入口解析 → Turnstile → 单事务配额+入队。
+
+    - 必选协议未勾选 → 表单错误（本地校验，非枚举信号）；协议版本/hash
+      与当前 published 不匹配 → 表单错误提示刷新；
+    - 入口（§6）：生产部署未知 Host 拒绝发信（中性 unavailable + 求助）；
+    - Turnstile：required 时必须通过（失败/不可用 fail-closed 不入队、
+      不占额度）；
+    - 状态渲染（§5/§7）：submitted / cooldown / resend_submitted /
+      new_link / processing / limit / challenge_* / unavailable——现有/
+      未知邮箱同一结构；冷却内重复提交**不作废**已有 token；
+    - **不占名额、不建账号、不收密码**；入队成功后 best-effort 排水。
     """
     # 写前重查（防御层；register() 顶部已查过一次，此处紧贴写路径）
     if _effective_registration_mode() != registration_store.MODE_PUBLIC:
         return _register_landing_page(mode="closed", status=403)
+    mode = "public"
     email = (request.form.get("email") or "").strip()
     terms_accepted = registration_store.parse_wire_bool(
         request.form.get("terms_accepted"))
@@ -4862,10 +5067,21 @@ def _register_public_post(ip_hash):
     if not terms_accepted:
         return _register_form_error(
             "请先阅读并勾选《用户协议与数据处理说明》（必选）",
-            "terms_required", mode="public")
+            "terms_required", mode=mode)
+    entry = _registration_entry_site()
+    if entry.get("refused"):
+        return _register_entry_refused_state(mode)
+    tstate = _turnstile_guard(registration_antibot.ACTION_REGISTRATION_START)
+    if tstate is not None:
+        return _register_state_response(tstate, mode)
+    unavailable = _register_state("unavailable", help_reason="unavailable")
     try:
-        registration_store.enqueue_public_verification(
-            email,
+        result = registration_store.request_verification_email(
+            email, flow=registration_store.MODE_PUBLIC, action="start",
+            entry_origin=entry["origin"],
+            form_locale=(request.form.get("form_locale") or "").strip()
+            or entry["default_locale"],
+            submission_id=_register_form_submission_id(),
             terms_accepted=True,
             terms_version=(request.form.get("terms_version") or "").strip(),
             terms_sha256=(request.form.get("terms_sha256") or "").strip(),
@@ -4873,54 +5089,226 @@ def _register_public_post(ip_hash):
             research_version=(
                 request.form.get("research_version") or "").strip(),
             research_sha256=(
-                request.form.get("research_sha256") or "").strip(),
-            base_url=_registration_email_base_url())
+                request.form.get("research_sha256") or "").strip())
     except registration_store.PublicRegistrationError as exc:
         if exc.code in ("terms_required", "research_document_required"):
             return _register_form_error(
                 "协议版本已更新，请刷新页面后重新阅读并勾选确认",
-                "terms_required", mode="public")
+                "terms_required", mode=mode)
         if exc.code == "document_not_published":
             return _register_form_error(
                 "注册暂不可用，请稍后重试", "unavailable",
-                status=503, mode="public")
-        # bad_input（来自 validate_email 的 EmailVerifyError 在下方捕获；
-        # PublicRegistrationError 其余 code）→ 统一文案
-        app.logger.warning("public 验证邮件请求被统一文案吸收（code=%s）",
+                status=503, mode=mode)
+        app.logger.warning("public 验证邮件请求被统一状态吸收（code=%s）",
                            exc.code)
+        return _register_state_response(unavailable, mode)
     except registration_store.EmailVerifyError as exc:
         if exc.code == "bad_input":
             return _register_form_error(
-                "请输入有效的邮箱地址", "invalid", mode="public")
-        app.logger.warning("public 验证邮件请求被统一文案吸收（code=%s）",
+                "请输入有效的邮箱地址", "invalid", mode=mode)
+        app.logger.warning("public 验证邮件请求被统一状态吸收（code=%s）",
                            exc.code)
+        return _register_state_response(unavailable, mode)
     except Exception:
-        app.logger.exception("public 验证邮件入队异常（统一文案）")
+        app.logger.exception("public 验证邮件入队异常（统一状态）")
+        return _register_state_response(unavailable, mode)
+    _register_drain_async()
+    return _register_state_response(_register_state_from_store(result, mode),
+                                    mode)
+
+
+@app.route("/register/resend", methods=["POST"])
+def register_resend():
+    """public 主动重发（2026-10-08 设计 §3/§4/§6/§8）。
+
+    - 表单：csrf_token（全局闸）/ cf-turnstile-response / form_locale /
+      submission_id（幂等键）；**绑定服务端签发的匿名 registration
+      receipt**（session 内随机 id → 库内映射原请求/作业；receipt 不暴露
+      token 与账号身份）；无 receipt → 中性 form 状态（回到注册表单）；
+    - 处理顺序（§11）：CSRF → 模式 → IP 限流 → 入口 → Turnstile
+      （action=registration_resend）→ 单事务配额+入队；
+    - 规则（§4）：冷却内不投递不作废；允许的重发**复用同一 token/协议
+      证明/过期时间**（redelivery 行，验证查询仍只查原作业）；剩余 <5 分钟
+      或过期 → 新 token+intent（「请使用最新邮件中的链接」）；已完成
+      intent 不再重发（中性状态）；额度用尽 → limit（含恢复时间）；
+    - 不复用/不修改旧 /api/registration/resend（那是 email_verify 模式的
+      JSON 接口）。
+    """
+    mode = _effective_registration_mode()
+    if mode != registration_store.MODE_PUBLIC:
+        return jsonify(error="注册当前未开放，请稍后再试",
+                       code="registration_closed"), 403
+    # IP 前缀限流（与 POST /register 共用 reg_ip_daily 桶；存储不可用
+    # fail-closed 503）
+    import auth_limit_store
+    ip_hash = _ip_prefix_hash(request.remote_addr or "")
+    try:
+        retry = auth_limit_store.check_registration_locked(ip_hash)
+        if retry <= 0:
+            retry = auth_limit_store.record_registration_attempt(ip_hash)
+    except Exception:
+        app.logger.exception("重发限流存储不可用，fail-closed 503")
+        return _registration_unavailable_response()
+    if retry > 0:
+        return _register_landing_page(
+            mode="public", error="尝试过于频繁，请稍后再试",
+            error_code="locked", retry_after=int(retry), status=429,
+            headers={"Retry-After": str(max(1, int(retry)))})
+    entry = _registration_entry_site()
+    if entry.get("refused"):
+        return _register_entry_refused_state("public")
+    tstate = _turnstile_guard(registration_antibot.ACTION_REGISTRATION_RESEND)
+    if tstate is not None:
+        return _register_state_response(tstate, "public")
+    # 匿名 receipt → 原请求上下文；无 receipt → 中性 form 状态（指向表单）
+    receipt = (session.get("register_receipt") or "").strip()
+    try:
+        receipt_row = registration_store.lookup_registration_receipt(receipt)
+    except Exception:
+        app.logger.exception("registration receipt 查询异常（中性 form 态）")
+        receipt_row = None
+    if receipt_row is None:
+        return _register_state_response(
+            _register_state("form", help_reason=None), "public")
+    unavailable = _register_state("unavailable", help_reason="unavailable")
+    try:
+        result = registration_store.request_verification_email(
+            receipt_row["email"], flow=registration_store.MODE_PUBLIC,
+            action="resend", entry_origin=entry["origin"],
+            form_locale=(request.form.get("form_locale") or "").strip()
+            or entry["default_locale"],
+            submission_id=_register_form_submission_id())
+    except registration_store.EmailVerifyError as exc:
+        app.logger.warning("public 重发被统一状态吸收（code=%s）", exc.code)
+        return _register_state_response(unavailable, "public")
+    except Exception:
+        app.logger.exception("public 重发入队异常（统一状态）")
+        return _register_state_response(unavailable, "public")
+    _register_drain_async()
+    return _register_state_response(_register_state_from_store(result, "public"),
+                                    "public")
+
+
+#: 注册帮助页 reason 固定词表（§5：服务端只接受固定原因，不回显任意错误
+#: 文本或外部跳转地址；未知 reason → general）
+REGISTRATION_HELP_REASONS = (
+    "general", "challenge", "cooldown", "limit", "unavailable",
+    "link_invalid", "link_expired", "submit_error",
+)
+
+_REGISTRATION_HELP_COPY = {
+    "general": ("注册遇到问题",
+                "Registration problem"),
+    "challenge": ("安全验证未完成",
+                  "Security challenge not completed"),
+    "cooldown": ("请求过于频繁，请稍候",
+                 "Too many requests, please wait"),
+    "limit": ("验证邮件发送已达上限",
+              "Verification email limit reached"),
+    "unavailable": ("验证邮件服务暂时不可用",
+                    "Verification email temporarily unavailable"),
+    "link_invalid": ("验证链接无效",
+                     "Verification link invalid"),
+    "link_expired": ("验证链接已过期",
+                     "Verification link expired"),
+    "submit_error": ("提交出错",
+                     "Submission error"),
+}
+
+#: 帮助页主操作（§5）：用户主动给作者发邮件（复用主页公开地址；应用不
+#: 自动替用户发邮件）；主题/正文标准 URL 编码，正文模板不带邮箱/token/
+#: 完整链接/IP——只有「注册入口」由页面填当前受信任域名
+REGISTRATION_HELP_AUTHOR_EMAIL = "solarise94@gmail.com"
+REGISTRATION_HELP_MAIL_SUBJECT = "HistoPilot 注册遇到问题 / Registration help"
+
+
+def _registration_help_mail_body(entry_origin, locale) -> str:
+    """帮助页 mailto 预填正文（§5 模板；注册入口=当前受信任域名）。"""
+    origin = entry_origin or ""
+    if locale == "en":
+        return (
+            "Hello, I ran into a problem while registering for HistoPilot.\n\n"
+            "Registration email: (fill in yourself)\n"
+            "Approximate time of attempt: (fill in yourself)\n"
+            "Registration entry: %s\n"
+            "Problem: no email received / link does not open / verification"
+            " does not complete / other\n"
+            "Message shown on the page: (fill in yourself)\n\n"
+            "Please help me look into this. Thank you.\n" % (origin or "-"))
+    return (
+        "你好，我在注册 HistoPilot 时遇到了问题。\n\n"
+        "注册邮箱：（请自行填写）\n"
+        "大致尝试时间：（请自行填写）\n"
+        "注册入口：%s\n"
+        "问题：没有收到邮件 / 链接打不开 / 验证无法完成 / 其他\n"
+        "页面显示的提示：（请自行填写）\n\n"
+        "请协助排查，谢谢。\n" % (origin or "-"))
+
+
+@app.route("/registration-help", methods=["GET"])
+def registration_help_page():
+    """注册帮助页（§5）：无需登录、无需 Turnstile。
+
+    - reason 只接受固定词表（未知 → general）；绝不回显任意错误文本、
+      query 其余参数或外部跳转地址；
+    - 主操作「给作者发邮件」（mailto，主题/正文标准 URL 编码）；正文模板
+      只带当前受信任注册入口域名——不带邮箱/token/完整验证链接/IP；
+    - 「复制作者邮箱」按钮 + 「返回注册」（相对 /register，留在当前入口
+      域名）；landing 风格安全响应头（无 Turnstile CSP——本页不渲染注册
+      弹窗）。
+    """
+    reason = (request.args.get("reason") or "").strip().lower()
+    if reason not in REGISTRATION_HELP_REASONS:
+        reason = "general"
+    entry = _registration_entry_site()
+    if entry and not entry.get("refused"):
+        origin, locale = entry["origin"], entry["default_locale"]
+        site_name = entry["name"]
     else:
-        try:
-            registration_mail_worker.drain_async()
-        except Exception:
-            app.logger.warning("验证邮件即时排水启动失败（留待 worker）",
-                               exc_info=True)
-    return _register_landing_page(mode="public", done=True)
+        # 生产未知 Host：帮助页仍可用，入口行退部署配置（不反射请求 Host）
+        origin = (os.environ.get("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+        locale = "zh"
+        site_name = "HistoPilot"
+    title_zh, title_en = _REGISTRATION_HELP_COPY[reason]
+    from urllib.parse import quote
+    mailto = "mailto:%s?subject=%s&body=%s" % (
+        REGISTRATION_HELP_AUTHOR_EMAIL,
+        quote(REGISTRATION_HELP_MAIL_SUBJECT, safe=""),
+        quote(_registration_help_mail_body(origin, locale), safe=""))
+    resp = make_response(render_template(
+        "registration_help.html", reason=reason, title_zh=title_zh,
+        title_en=title_en, site_name=site_name, entry_origin=origin,
+        locale=locale, mailto_href=mailto,
+        author_email=REGISTRATION_HELP_AUTHOR_EMAIL))
+    return _apply_landing_security_headers(resp, allow_turnstile=False)
 
 
 def _register_landing_page(mode, error=None, error_code=None, done=False,
-                           retry_after=0, status=200, headers=None):
-    """注册弹窗页（R2 2026-09-19）：渲染介绍主页 + 直开注册视图。
+                           retry_after=0, status=200, headers=None,
+                           register_state=None, turnstile=None,
+                           entry_site=None, register_submission_id=None):
+    """注册弹窗页（R2 2026-09-19；2026-10-08 设计 §5/§7 状态化）：
+    渲染介绍主页 + 直开注册视图。
 
-    - /register 深链接：介绍主页上下文 + register_open=True（entry-auth.js
-      升级为模态；无 JS 时 CSS 浮层直出）；
-    - 注册错误回显（表单错误 / 429 限流）：同一页面直开注册视图并保留错误，
-      与登录弹窗的 login_open/login_error 模式对称；
-    - public 模式注入当前 published 双协议上下文（版本/hash 随表单提交，
-      服务端权威校验——旧页面提交的过期版本标识会被拒绝并提示刷新）；
+    - /register 深链接：介绍主页上下文 + register_open=True；
+    - 注册错误回显（表单错误 / 429 限流）：同一页面直开注册视图并保留错误；
+    - public 模式注入当前 published 双协议上下文；
+    - register_state/turnstile/entry_site/register_submission_id 覆写
+      提交后状态渲染（缺省用 _entry_signed_in_context 的表单态默认值）；
     - 统一 no-store + 介绍页安全响应头（与 _landing_response 同口径）。
     """
     ctx = _entry_signed_in_context()
     ctx.update(register_open=True, registration_mode=mode,
                register_error=error, register_error_code=error_code,
                register_done=bool(done), register_retry_after=int(retry_after or 0))
+    if register_state is not None:
+        ctx["register_state"] = register_state
+    if turnstile is not None:
+        ctx["turnstile"] = turnstile
+    if entry_site is not None:
+        ctx["entry_site"] = entry_site
+    if register_submission_id is not None:
+        ctx["register_submission_id"] = register_submission_id
     if mode == "public":
         ctx.update(_public_register_agreements_context())
     resp = make_response(render_template("entry.html", **ctx), status)
@@ -4932,12 +5320,13 @@ def _register_landing_page(mode, error=None, error_code=None, done=False,
 
 
 def _register_email_verify_done_page():
-    """邮箱验证请求的统一完成视图（已知/未知/超限同文案，no-store）。
-
-    R2：发送后文案统一「验证邮件已发送，请查收。」；仍在注册弹窗内展示，
-    不再跳独立完成页。
-    """
+    """邮箱验证请求的统一完成视图（保留旧内部调用点兼容；状态化渲染见
+    :func:`_register_state_response`——email_verify 模式 POST 现走状态机）。"""
     return _register_landing_page(mode="email_verify", done=True)
+
+
+# 注：_register_email_verify_done_page 自 2026-10-08 状态化重写后无内部
+# 调用方，保留为外部脚本/测试兼容入口。
 
 
 def _register_form_error(message, error_code, status=200, mode="invite_only"):
@@ -6052,14 +6441,29 @@ def api_registration_resend():
         app.logger.warning(
             "验证邮件重发被 IP 限流吸收（锁定剩余 %d 秒，不入队）", retry)
         return jsonify(ok=True)
+    # 2026-10-08 设计 §7/§11：本端点可触发新验证邮件投递——
+    # REGISTRATION_TURNSTILE_REQUIRED 时必须通过校验（JSON body 的
+    # cf-turnstile-response 同样接受）；失败/不可用 fail-closed 不入队，
+    # 响应仍统一 ok（无枚举信号）
+    if _turnstile_guard(registration_antibot.ACTION_REGISTRATION_RESEND) \
+            is not None:
+        app.logger.warning("验证邮件重发被 Turnstile 拦截（不入队）")
+        return jsonify(ok=True)
     if request.is_json:
         body = request.get_json(silent=True) or {}
     else:
         body = request.form
     email = (body.get("email") or "").strip()
+    # §6：生产部署未知 Host 不发验证邮件（中性 ok，无枚举信号）
+    if _registration_entry_site().get("refused"):
+        app.logger.warning(
+            "验证邮件重发被入口映射拒绝（host=%s，不入队）",
+            registration_antibot.request_hostname(request.host) or "-")
+        return jsonify(ok=True)
     try:
         registration_store.enqueue_email_verification(
-            email, base_url=_registration_email_base_url())
+            email, base_url=_registration_email_base_url(),
+            form_locale=(body.get("form_locale") or "zh"))
     except registration_store.EmailVerifyError as exc:
         if exc.code == "bad_input":
             return jsonify(error="请输入有效的邮箱地址",

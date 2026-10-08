@@ -876,14 +876,14 @@ def _delivery_quota_tx(cur, email_norm):
         "        interval '24 hours')"
         " ) AS g24, "
         " extract(epoch from ("
-        "  SELECT least(min(a.t), min(b.t)) FROM "
-        "   (SELECT created_at AS t FROM registration_mail_jobs"
-        "     WHERE purpose=%s AND created_at > now() - interval '24 hours')"
-        "     a,"
-        "   (SELECT r.created_at AS t FROM registration_mail_redeliveries r"
+        "  SELECT min(t) FROM ("
+        "   SELECT created_at AS t FROM registration_mail_jobs"
+        "     WHERE purpose=%s AND created_at > now() - interval '24 hours'"
+        "   UNION ALL"
+        "   SELECT r.created_at AS t FROM registration_mail_redeliveries r"
         "     JOIN registration_mail_jobs j ON j.job_id = r.job_id"
         "     WHERE j.purpose=%s AND r.created_at > now() - "
-        "       interval '24 hours') b"
+        "       interval '24 hours') deliver"
         " ))::float8 AS gearliest",
         (MAIL_PURPOSE_EMAIL_VERIFY,) * 4)
     grow = cur.fetchone()

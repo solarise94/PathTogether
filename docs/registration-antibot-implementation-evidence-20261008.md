@@ -54,3 +54,15 @@
 - 跨入口重发通过在另一域名重新提交 `/register` 实现（会话 cookie 按域名隔离），额度与复用规则相同。
 - 英文入口在英文协议文稿发布前回退中文已发布文稿（版本/hash 仍严格校验）。
 - 主工作区 `slide-id-refactor` 上未提交的注册文案改动（站点名、去掉名额提示、研究协议不重复询问）未并入本分支；合并时 `registration_mail_worker.py` 与相关模板会冲突，需人工取舍。
+
+## 7. 发布交接复核
+
+- 复核线上 `suite-20261008-domains` 的代码 revision 与分支基线只差文档，应用代码一致；生产 Turnstile 配置和已有 secret 均未发现。
+- 用户确认控制台 widget 为托管模式，允许 `histopilot.cn` 和 `histopilot.com`；服务端生产白名单仅取这两个域名。
+- 修复全站发送额度恢复时间查询：原来 jobs 与 redeliveries 做交叉连接，重发表为空时最早投递时间变为 NULL，会额外延迟恢复。改为合并投递时间后取最早值，新增真实 PostgreSQL 回归测试。
+- 独立复跑注册、防刷、认证、CSP、Containerfile 与迁移相关 7 个测试文件：**257 passed**；完整前端 JS：**949 passed / 2 skipped**。
+- 新增 `deploy/registration-antibot/` 发布工具：公开变量白名单、0600 secret 文件检查、交互式隐藏输入、基线和候选镜像身份检查、隔离数据库/挂载验收、备份、切换与回滚；离线部署保护检查 **10 passed**。
+- homepc 发布目录为 `/home/solarise/releases/suite-20261008-registration`（0700），secret 文件 `turnstile.secret.env`（0600）。用户授权写 env 并排除 Git；已检查本机和 homepc 的 env/Cloudflare 配置，没有实际 secret 或 Cloudflare API 凭据，不能从公开 sitekey 推导 secret。
+- `accept-check` 不对生产库执行迁移；生产快照恢复到独立 PostgreSQL 容器，所有可写生产挂载替换为隔离目录，所有后台 worker 关闭。缺密钥的验收只能证明缺配置时的行为，不能作为上线就绪证明。
+- 实际 token 重放测试必须使用新的 submission ID；同 submission ID 重试应幂等回放。微信/邮箱内置浏览器须真实设备验证，尚不能据测试密钥浏览器结果宣称完成。
+- 当前仍未推送、未切换生产；生产密钥保存并重跑隔离验收后，再进行正式部署批准。

@@ -675,6 +675,26 @@ def _public_client(monkeypatch, host="histopilot.cn"):
     return _HostClient(host)
 
 
+def test_global_limit_resume_uses_first_delivery_when_no_redeliveries(monkeypatch):
+    client = _public_client(monkeypatch)
+    response = client.post('/register', data=_terms_form('global.resume@x.com'),
+                           headers={'Host': 'histopilot.cn'})
+    assert 'data-state-kind="submitted"' in response.get_data(as_text=True)
+    assert _count('SELECT count(*) FROM registration_mail_redeliveries') == 0
+    _backdate_deliveries('global.resume@x.com', minutes=120)
+    earliest = _one('SELECT extract(epoch from min(created_at))::float8 AS ts '
+                    'FROM registration_mail_jobs')['ts']
+    monkeypatch.setattr(registration_store, 'VERIFY_APP_DAILY_BUDGET', 1)
+    terms = agreement_store.current_published('user_agreement')
+    result = registration_store.request_verification_email(
+        'next.global@x.com', flow=registration_store.MODE_PUBLIC, action='start',
+        entry_origin=CN, form_locale='zh', terms_accepted=True,
+        terms_version=terms['version'], terms_sha256=terms['content_sha256'])
+    assert result['kind'] == 'limit'
+    assert abs(result['resume_at'] - (earliest + 24 * 3600)) < 1
+    assert _count('SELECT count(*) FROM registration_mail_jobs') == 1
+
+
 def test_first_submit_enqueues_once_and_cooldown_preserves_token(
         monkeypatch):
     client = _public_client(monkeypatch)

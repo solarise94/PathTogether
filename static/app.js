@@ -3294,7 +3294,10 @@
       });
       els.fbPlusBtn.addEventListener("click", function (e) {
         e.stopPropagation();
-        if (els.fbPlusMenu.parentNode) { if (els.fbPlusMenu.__close) els.fbPlusMenu.__close(); return; }
+        if (els.fbPlusMenu.parentNode === document.body) {
+          if (els.fbPlusMenu.__close) els.fbPlusMenu.__close();
+          return;
+        }
         openFbMenuEl(els.fbPlusMenu, els.fbPlusBtn);
       });
     }
@@ -3307,7 +3310,10 @@
       });
       els.fbFolderBtn.addEventListener("click", function (e) {
         e.stopPropagation();
-        if (els.fbFolderMenu.parentNode) { if (els.fbFolderMenu.__close) els.fbFolderMenu.__close(); return; }
+        if (els.fbFolderMenu.parentNode === document.body) {
+          if (els.fbFolderMenu.__close) els.fbFolderMenu.__close();
+          return;
+        }
         openFbMenuEl(els.fbFolderMenu, els.fbFolderBtn);
       });
     }
@@ -3831,11 +3837,13 @@
     var refs = Object.keys(pickerCtx.selected).filter(function (k) { return pickerCtx.selected[k]; });
     if (refs.length === 0) { toast(t("picker.need.slide"), "error"); return; }
     if (pickerCtx.mode === "share") {
-      // 分享多选：回填浮层目标（保持浮层打开，直接可点「分享选中切片」）
+      // 分享多选：回填浮层目标并重新打开浮层（选择器遮罩打开期间浮层按
+      // 「点击外部」规则收起，确认后回到分享浮层直接可点「分享选中切片」）
       sharePendingSlides = refs;
       updateShareTargetLine();
       toast(t("sb.share.picked.toast", { n: refs.length }), "info");
       closeSlidePicker();
+      if (sharePopCtl) sharePopCtl.open();
       return;
     }
     var pid = pickerCtx.targetPid;

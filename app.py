@@ -5301,18 +5301,18 @@ def _registration_unavailable_response():
 
 
 # =========================================================================== #
-# I+J：邮箱验证 + 邀请码激活路由（设计文档第 8 节 + review J / P2-4）
+# 验证邮件落地与消费（2026-10-08 §4：邀请码激活退役，只剩 public 建号 +
+# 登录惰性激活）
 #
 # 流程红线：
 #   1. GET /verify-email **只展示不消费** token（消费仅 POST
 #      /api/registration/verify）；
-#   2. 密码在邮箱确认之后设置（POST /api/registration/verify 带
-#      token + CSRF + 密码，原子创建 pending_activation 用户）；
-#   3. 身份永远从 session 推导（enrollment scope 的 user_id/email），绝不信
-#      请求体里的身份字段；
-#   4. activate_registered_user 单事务（闸 → 锁 → CAS 消费邀请码 → active →
-#      按面值建一次性总额度 → 审计），绝不走会插入第二个用户的
-#      redeem_invite；already_active 不消费不充值。
+#   2. public token（有 intent）：POST 原子建 active 账号 + 额度 + 协议
+#      凭据（complete_public_registration 单事务）；
+#   3. legacy token（无 intent 的旧 email_verify 链接）：不再建 pending
+#      账号——403 registration_closed 引导重走公开注册（token 不消费）；
+#   4. 存量 pending_activation 用户由 login() 惰性激活
+#      （lazy_activate_pending_user：状态机 + 公开注册同口径额度，幂等）。
 # =========================================================================== #
 def _verify_email_state_view(token):
     """token → 模板视图（只读解析；state + 掩码邮箱，不消费）。"""

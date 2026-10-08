@@ -7,7 +7,7 @@
 
 International nginx trusts `CF-IPCountry` only when the underlying connection peer (`$realip_remote_addr`) is in the configured Cloudflare ranges. A direct-origin caller cannot trigger geo-routing by forging that header. Preserve the existing CF-Connecting-IP trust configuration; review ranges when Cloudflare updates them.
 
-Deploy `homepc-nginx.conf` to homePC `~/.config/pt-edge/nginx.conf` (retains the existing separate `histopilot-cn.conf` include); deploy `international-nginx.conf` to the LA host `/etc/nginx/conf.d/histopilot.com.conf`. Back up, syntax-check, then reload each nginx service. Language defaults are shipped in the application image's `static/i18n.js`.
+Deploy `homepc-nginx.conf` to homePC `~/.config/pt-edge/nginx.conf` (retains the existing separate `histopilot-cn.conf` include); deploy `international-nginx.conf` to the **active international origin** `/etc/nginx/conf.d/histopilot.com.conf` (verify current routing before deployment). Back up, syntax-check, then reload each nginx service. Language defaults are shipped in the application image's `static/i18n.js`.
 
 The user explicitly chose a full old-domain redirect after being informed that browser OPFS/localStorage and login cookies cannot move between these domains. Old files remain in that browser origin but are temporarily inaccessible through normal navigation. Do not clear site storage as part of this change. A future recovery operation can temporarily restore the old origin.
 

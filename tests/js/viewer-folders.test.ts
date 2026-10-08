@@ -329,7 +329,7 @@ describe("叠页大小与露出条带（§5.2 纯函数）", () => {
 		expect(ps(0, 5)).toBe(1);
 	});
 
-	it.fails("KNOWN: 多文件夹时应利用可用空间，而非每页只显示一张卡", async () => {
+	it("多文件夹时应利用可用空间，而非每页只显示一张卡", async () => {
 		const h = bootApp(s => {
 			seedNone(s);
 			s.routes.set("/api/projects", () => ({ status: 200, body:
@@ -512,7 +512,7 @@ describe("搜索（§5.4）", () => {
 		expect(fb.locationText(fb.search("normal")[0])).toContain("fb.unfiled");
 	});
 
-	it.fails("KNOWN: 混合文件夹与切片时，搜索定位后目标卡可见并能打开", async () => {
+	it("混合文件夹与切片时，搜索定位后目标卡可见并能打开", async () => {
 		let slides: Array<Record<string, unknown>> = [];
 		const h = bootApp((s) => {
 			slides = seedNone(s);
@@ -558,7 +558,7 @@ describe("临时查看到期（§5.5）", () => {
 		return slides;
 	}
 
-	it.fails("KNOWN: 列表 epoch 秒到期、info 无标记：有效期内可看，到期后无人操作也清屏", async () => {
+	it("列表 epoch 秒到期、info 无标记：有效期内可看，到期后无人操作也清屏", async () => {
 		vi.useFakeTimers();
 		vi.setSystemTime(new Date("2026-10-08T00:00:00Z"));
 		const h = bootApp((s) => { seedTemp(s, Date.now() / 1000 + 5); });
@@ -585,6 +585,10 @@ describe("临时查看到期（§5.5）", () => {
 		expect(toastTexts).toContain("tempview.ended");
 		// 画布标签清空
 		expect(h.els["canvas-slide-label"].hidden).toBe(true);
+		// 回到「未打开切片」基线：空态卡回归、缩放徽章复位（顶栏无残留切片上下文）
+		expect(h.els["viewer-empty"].hidden).toBe(false);
+		expect(h.els["zoom-badge"].textContent).toBe("—");
+		expect(h.els["header-zoom-badge"].textContent).toBe("—");
 	});
 
 	it("DEF-3：info 不带标记时回读列表标记 → 到期 403 仍清屏 + 临时提示 + 列表刷新", async () => {
@@ -619,6 +623,10 @@ describe("临时查看到期（§5.5）", () => {
 		expect(refetched.length).toBeGreaterThan(0);
 		// 临时文件夹已被列表移除
 		expect(fbFolders(h).some((c) => c.dataset.pid === "__temp__")).toBe(false);
+		// 403 清屏路径同一基线：空态卡回归、缩放徽章复位
+		expect(h.els["viewer-empty"].hidden).toBe(false);
+		expect(h.els["zoom-badge"].textContent).toBe("—");
+		expect(h.els["header-zoom-badge"].textContent).toBe("—");
 	});
 
 	it("403/404（服务端拒绝）→ 同口径清屏；普通切片 404 维持报错不清屏", async () => {

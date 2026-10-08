@@ -1744,8 +1744,14 @@
           // info.asset_revision（"mtime_ns:size"）随 info 响应下发；边缘路径
           // （render fields 读取失败等）可能缺键 → 宽容置 null
           revision: info.asset_revision || null,
-          // 临时查看到期时间（§5.5；后端合入前字段缺失 = 普通切片，不定时器）
-          temporaryViewExpiresAt: info.temporary_view_expires_at || null,
+          // 临时查看到期时间（§5.5）：真实后端把 temporary_view_expires_at
+          // 放在 /api/slides 列表项上（epoch 秒），/info 不带——info 有值用
+          // info，否则回读列表项；两者统一归一为毫秒时间戳（缺失=普通切片，
+          // 不定时器）。原始 epoch 秒直接 new Date() 会被当毫秒 → 立即过期。
+          temporaryViewExpiresAt: tempExpiryMs(
+            info.temporary_view_expires_at != null
+              ? info.temporary_view_expires_at
+              : (listedInfo && listedInfo.temporary_view_expires_at)),
         };
         state.mppX = info.mpp_x;
         state.rotation = 0;
@@ -1822,6 +1828,26 @@
   // 计时器只负责清屏。
   var tempViewTimer = null;
 
+  // 到期时间归一为毫秒时间戳：真实后端列表下发 epoch 秒；/info 可能带同样
+  // 的秒值；既有夹具/旧口径也接受 ISO 字符串。无效/缺失 → null（不定时器）。
+  // 阈值 1e11：2026 年的 epoch 秒 ≈1.8e9、毫秒 ≈1.8e12，秒值绝无可能超过
+  // 1e11（那是公元 5138 年），据此区分两种单位。
+  function tempExpiryMs(v) {
+    if (v == null || v === "") return null;
+    if (typeof v === "number") {
+      if (!isFinite(v)) return null;
+      return v > 1e11 ? Math.round(v) : v * 1000;
+    }
+    var raw = String(v).trim();
+    if (!raw) return null;
+    if (/^-?\d+(\.\d+)?$/.test(raw)) {
+      var n = Number(raw);
+      return n > 1e11 ? Math.round(n) : n * 1000;
+    }
+    var parsed = Date.parse(raw);
+    return isFinite(parsed) ? parsed : null;
+  }
+
   function clearTempViewTimer() {
     if (tempViewTimer) {
       clearTimeout(tempViewTimer);
@@ -1831,24 +1857,60 @@
 
   function armTempViewTimer(slide) {
     clearTempViewTimer();
-    if (!slide || !slide.temporaryViewExpiresAt) return;
-    var ms = new Date(slide.temporaryViewExpiresAt).getTime() - Date.now();
+    if (!slide) return;
+    var expiryMs = tempExpiryMs(slide.temporaryViewExpiresAt);
+    if (expiryMs == null) return;
+    var ms = expiryMs - Date.now();
     if (!isFinite(ms)) return;
     if (ms <= 0) { endTemporaryView(); return; }
     tempViewTimer = setTimeout(function () { endTemporaryView(); }, ms);
   }
 
+  // 深链竞态补设（?slide=<id> 直接打开）：info 响应可能先于 /api/slides 到达，
+  // openSlide 当时读不到列表上的临时标记（真实后端标记只在列表下发）。列表
+  // 每次加载/刷新后为当前打开的切片补读一次标记并补设计时器（已有标记不动）。
+  function rearmTempViewTimerFromList() {
+    if (!state.slide || state.slide.temporaryViewExpiresAt) return;
+    var listed = findSlideInfo(state.slide.id || state.slide.name);
+    if (!listed || !listed.temporary_view_expires_at) return;
+    state.slide.temporaryViewExpiresAt = tempExpiryMs(listed.temporary_view_expires_at);
+    armTempViewTimer(state.slide);
+  }
+
+  // ---------- 无切片基线状态（初始 / 删除 / 临时到期共用） ----------
+  // 关闭画面并把 UI 回落到「从未打开切片」的初始口径：空态卡回归、画布标签
+  // 清空、缩放徽章复位「—」、画质档与通道 chrome（通道钮/RGB 徽章/面板）
+  // 隐藏——任何切片上下文控件都不得残留。
+  function enterNoSlideUiState() {
+    state.slide = null;
+    state.mppX = null;
+    state.roiMode = null;
+    clearTempViewTimer();
+    updateDocTitle(null);
+    updateMppSetterVisibility();
+    if (roiBox) exitRoi();
+    if (viewer) viewer.close();
+    clearBaseThumb();
+    updateCanvasSlideLabel();
+    updateViewerEmptyState();
+    // 缩放徽章直接复位到初始模板口径（不依赖 OSD close 后的内部状态）
+    if (els.zoomBadge) els.zoomBadge.textContent = "—";
+    if (els.headerZoomBadge) els.headerZoomBadge.textContent = "—";
+    // 通道钮/RGB 徽章/通道面板回初始隐藏（destroy 同时作废在途响应；
+    // 下一次 handleInfo 开头会再次 destroy，复用安全）
+    if (channelCtrl && channelCtrl.destroy) channelCtrl.destroy();
+    // 画质档（标准/精细）隐藏并清当前 display 状态
+    if (window.HP_ViewerEncoding && HP_ViewerEncoding.resetForClose) {
+      HP_ViewerEncoding.resetForClose();
+    }
+    // 上下文控件消失/出现 → 顶栏重测溢出折放
+    setTimeout(function () { try { applyToolbarTier(); } catch (e) {} }, 150);
+  }
+
   function endTemporaryView() {
     clearTempViewTimer();
     var cur = state.slide;
-    // 关闭画面（与 deleteSlide 清屏同口径）
-    state.slide = null;
-    state.mppX = null;
-    updateDocTitle(null);
-    updateMppSetterVisibility();
-    updateCanvasSlideLabel();
-    if (roiBox) exitRoi();
-    if (viewer) viewer.close();
+    enterNoSlideUiState();
     // 本地标记已结束：卡片与缩略图立即移除，再从 /api/slides 拉权威状态
     //（到期后服务端不再下发该切片；DEF-3 验收要求「刷新列表」）
     if (cur && (cur.id || cur.name)) {
@@ -1858,7 +1920,6 @@
     renderFolderBrowser();
     toast(t("tempview.ended"), "info");
     reloadProjectsAndUnfiled().catch(function () {});
-    setTimeout(function () { try { applyToolbarTier(); } catch (e) {} }, 150);
   }
 
   // ---------- 当前切片名画布标签（§5.1：紧凑标签，不新增第二行） ----------
@@ -2649,6 +2710,7 @@
       allSlides = results[0] || [];
       allProjects = results[1] || [];
       renderFolderBrowser();
+      rearmTempViewTimerFromList();
       renderShareList(shareListFrom(results[2]));
     }).catch(function (e) {
       toast(t("load.fail", { e: e }), "error");
@@ -2666,6 +2728,7 @@
       allProjects = results[0] || [];
       allSlides = results[1] || [];
       renderFolderBrowser();
+      rearmTempViewTimerFromList();
     });
   }
 
@@ -2731,13 +2794,53 @@
 
   // 每叠页数：可用高度 − 文件夹卡占用 − 一张完整卡 → 余量按最紧露出条带
   // （FB_MIN_GAP）折算——保证整页在最挤时也放得下；铺开是渲染期的自适应。
-  // 纯函数（vitest 锁行为）：上限 8、下限 1。
+  // 纯函数（vitest 锁行为）：上限 8、下限 1。（渲染/定位现改用下方
+  // fbPackPages 按页装箱；本函数保留为单叠容量的口径基线与测试面。）
   function fbPageSize(availH, folderCount) {
     var used = (folderCount || 0) * (FB_FOLDER_H + FB_FOLDER_GAP);
     var remaining = (availH || 0) - used - FB_CARD_H;
     var n = Math.floor(remaining / FB_MIN_GAP) + 1;
     if (!isFinite(n)) n = FB_MAX_PAGE;
     return Math.max(1, Math.min(FB_MAX_PAGE, n));
+  }
+
+  // 有序条目（渲染与搜索定位共用同一顺序，§5.2）：文件夹卡在前、切片卡在后。
+  function fbOrderedEntries(folderKey) {
+    var e = fbEntries(folderKey);
+    return e.folders.map(function (f) {
+      return { kind: "folder", key: f.key, name: f.name, count: f.count, virtual: !!f.virtual };
+    }).concat(e.slides.map(function (s) {
+      return { kind: "slide", s: s, sid: slideRefOf(s), name: s.name || s.original_filename || slideRefOf(s) };
+    }));
+  }
+
+  // 叠页装箱（§5.2）：按**本页实际条目**的真实高度装箱——文件夹卡 56+8、
+  // 切片卡首张即整卡 104、之后每张再占一条露出条带（下限 28，最挤也放得下）。
+  // 只计本页条目：不在本页的文件夹绝不摊派到每一页的预算（修「目录里 N 个
+  // 文件夹把页容量压到 1 张」）。每页 ≤8、下限 1。返回页数组（渲染与搜索
+  // 定位共用同一函数，页码/页内容恒一致）。
+  function fbPackPages(items, availH) {
+    var pages = [];
+    var cur = [];
+    var curH = 0;
+    var slides = 0;
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      var cost = it.kind === "folder"
+        ? FB_FOLDER_H + FB_FOLDER_GAP
+        : (slides === 0 ? FB_CARD_H : FB_MIN_GAP);
+      if (cur.length >= FB_MAX_PAGE || (cur.length > 0 && curH + cost > availH)) {
+        pages.push(cur);
+        cur = [];
+        curH = 0;
+        slides = 0;
+      }
+      cur.push(it);
+      curH += cost;
+      if (it.kind === "slide") slides += 1;
+    }
+    if (cur.length) pages.push(cur);
+    return pages.length ? pages : [[]]; // 空目录也保持单页（页码恒 1/1）
   }
 
   // 露出条带高度：短叠按剩余高度铺开（P1：贴到翻页钮上方为止），上限=整卡
@@ -2904,10 +3007,11 @@
   }
 
   // 定位切片所在文件夹并翻到其所在叠（搜索结果点击 / 建后定位共用）。
-  // 首个所在文件夹（或根目录 / 临时查看）+ 页码 = 索引 ÷ 当前叠大小。
+  // 在与渲染完全相同的**合并有序条目**（文件夹前、切片后）里找索引，再用
+  // 同一个装箱函数折算页码——修复只按切片序号算页（文件夹偏移被漏掉）。
   function fbLocateSlide(sinfo) {
     if (!sinfo) return;
-    var ref = sinfo.slide_id || sinfo.name;
+    var ref = String(sinfo.slide_id || sinfo.name);
     var pid = null;
     for (var i = 0; i < allProjects.length; i++) {
       var p = allProjects[i];
@@ -2916,13 +3020,20 @@
       if (inP) { pid = p.pid; break; }
     }
     var key = pid || (sinfo.temporary_view_expires_at ? FB_TEMP_KEY : null);
-    var entries = fbEntries(key);
-    var pageSize = fbPageSize(fbStackAvailH(), entries.folders.length);
+    var ordered = fbOrderedEntries(key);
     var idx = -1;
-    entries.slides.forEach(function (sl, j) {
-      if (idx < 0 && (sl.slide_id || sl.name) === ref) idx = j;
+    ordered.forEach(function (it, j) {
+      if (idx < 0 && it.kind === "slide" && it.sid === ref) idx = j;
     });
-    fbGo(key, idx >= 0 ? Math.floor(idx / pageSize) : 0);
+    if (idx < 0) { fbGo(key, 0); return; }
+    var pages = fbPackPages(ordered, fbStackAvailH());
+    var page = 0;
+    for (; page < pages.length; page++) {
+      if (idx < pages[page].length) break;
+      idx -= pages[page].length;
+    }
+    if (page >= pages.length) page = pages.length - 1;
+    fbGo(key, page);
   }
 
   var FB_FOLDER_SVG = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>';
@@ -2935,25 +3046,26 @@
       fbState.folder = null;
       fbState.page = 0;
     }
-    var entries = fbEntries(fbState.folder);
-    var totalItems = entries.folders.length + entries.slides.length;
-    var pageSize = fbPageSize(fbStackAvailH(), entries.folders.length);
-    var totalPages = Math.max(1, Math.ceil(totalItems / pageSize));
+    var availH = fbStackAvailH();
+    // 与搜索定位共用同一有序条目 + 装箱函数（§5.2）：页按本页条目真实高度
+    // 装箱（文件夹卡 56+8、切片卡整卡/露出条带），≤8 张/页，下限 1。
+    var ordered = fbOrderedEntries(fbState.folder);
+    var pages = fbPackPages(ordered, availH);
+    var totalItems = ordered.length;
+    var totalPages = pages.length;
     fbState.page = Math.max(0, Math.min(fbState.page, totalPages - 1));
     fbState.totalPages = totalPages;
+    var pageEntries = pages[fbState.page] || [];
 
     els.fbStack.innerHTML = "";
-    var pageEntries = entries.folders.map(function (f) {
-      return { kind: "folder", key: f.key, name: f.name, count: f.count, virtual: !!f.virtual };
-    }).concat(entries.slides.map(function (s) {
-      return { kind: "slide", s: s, sid: slideRefOf(s), name: s.name || s.original_filename || slideRefOf(s) };
-    })).slice(fbState.page * pageSize, fbState.page * pageSize + pageSize);
-
     var top = 0;
     var activeRef = activeSlideRef();
     var focusIdx = 0;
-    // 露出条带按当前叠的卡片数与可用高度自适应（短叠铺满、上限整卡高）
-    var gap = fbBandGap(fbStackAvailH(), entries.folders.length, pageEntries.filter(function (e) { return e.kind === "slide"; }).length);
+    // 露出条带按**本页**的文件夹卡数与切片数自适应（短叠铺满、上限整卡高）
+    var pageFolders = 0;
+    pageEntries.forEach(function (e) { if (e.kind === "folder") pageFolders += 1; });
+    var pageSlides = pageEntries.length - pageFolders;
+    var gap = fbBandGap(availH, pageFolders, pageSlides);
     pageEntries.forEach(function (entry, j) {
       var node;
       if (entry.kind === "folder") {
@@ -6789,14 +6901,8 @@
         if (!r.ok) return r.json().then(function (j) { throw new Error(j.error); });
         if (state.slide && (byId ? state.slide.id === slideId
                                  : state.slide.name === legacyName)) {
-          state.slide = null; state.mppX = null; state.roiMode = null;
-          clearTempViewTimer();
-          updateDocTitle(null);
-          updateMppSetterVisibility();
-          updateCanvasSlideLabel();
-          if (roiBox) exitRoi();
-          if (viewer) viewer.close();
-          setTimeout(function () { try { applyToolbarTier(); } catch (e) {} }, 150);
+          // 与临时到期共用同一无切片基线（空态卡回归 + 顶栏上下文复位）
+          enterNoSlideUiState();
         }
         toast(t("del.slide.done", { name: name }), "success");
         loadAll();
@@ -9061,6 +9167,12 @@
     opts = opts || {};
     if (!btn || !pop) return null;
     var open = false;
+    // 程序化 open（分享选择器确认后重开浮层等）可能发生在同一 click 事件的
+    // 冒泡路径上：紧随其后的 document click 不能按「点击外部」把刚打开的
+    // 浮层关掉。一次性标记由下一个 document click 消费；setTimeout(0) 兜底
+    // 重置——微任务检查点会出现在同一派发的两个 listener 之间（提前清标记），
+    // 宏任务则保证等整个 click 派发结束后才跑，不吞之后真正的外点关闭。
+    var skipNextOutsideClick = false;
     function setOpen(v) {
       v = !!v;
       if (v === open) { if (v) positionToolbarPop(btn, pop); return; }
@@ -9086,6 +9198,7 @@
     });
     document.addEventListener("click", function (e) {
       if (!open) return;
+      if (skipNextOutsideClick) { skipNextOutsideClick = false; return; }
       var tgt = e.target;
       if (tgt && tgt.closest &&
           (tgt.closest("#" + pop.id) || tgt.closest("#" + btn.id))) return;
@@ -9102,7 +9215,11 @@
     }
     toolbarPopClosers.push(closer);
     return {
-      open: function () { setOpen(true); },
+      open: function () {
+        skipNextOutsideClick = true;
+        setTimeout(function () { skipNextOutsideClick = false; }, 0);
+        setOpen(true);
+      },
       close: closer,
       isOpen: function () { return open; },
     };

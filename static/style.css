@@ -603,7 +603,9 @@ button {
 
 /* ---------- 左侧边栏：Finder 源列表风 ---------- */
 #sidebar {
-  width: 320px;
+  /* 改版 2026-10-08（§5.1）：左栏=文件夹/切片浏览器，宽约 160px 档
+     （176px 兼顾中文文件夹名与露出条带；桌面可折叠，手机抽屉另行加宽） */
+  width: 176px;
   background: var(--sidebar-bg);
   backdrop-filter: blur(20px) saturate(180%);
   -webkit-backdrop-filter: blur(20px) saturate(180%);

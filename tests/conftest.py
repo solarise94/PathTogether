@@ -207,6 +207,10 @@ _BUSINESS_TABLES = (
     "registration_intents",
     "public_registration_completions",
     "public_registration_days",
+    # 0079 起：注册防刷——重发投递行与提交幂等/回执行（redeliveries 引用
+    # registration_mail_jobs CASCADE 已覆盖，显式列出防跨用例残留配额占用）
+    "registration_mail_redeliveries",
+    "registration_submissions",
     # 0062 起：P2 研究副本删除任务（users 外键 CASCADE 已覆盖，显式列出
     # 防跨用例残留删除任务/幂等占用唯一 active 槽）
     "research_data_deletion_jobs",

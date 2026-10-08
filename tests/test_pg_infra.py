@@ -330,6 +330,12 @@ def test_schema_migrations_recorded(conn):
         # 文件头后随创建声明，摄取 worker 在 open_slide 之前按
         # upload_direct_class 核验声明与实际字节相符。
         "0078_ingestion_direct_class.sql",
+        # 注册防刷与入口一致性（docs/registration-antibot-and-author-help-
+        # design-20261008.md §4/§6/§8）：registration_mail_jobs 冻结
+        # entry_origin/form_locale、registration_intents.source_origin、
+        # registration_mail_redeliveries（复用原 token 的重发投递）与
+        # registration_submissions（submission_id 幂等 + 匿名 receipt）。
+        "0079_registration_antibot_redelivery.sql",
     ]
 
 

@@ -436,6 +436,10 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 			// 与 researchDeletionJobs.retry（复活为 pending 交 worker 真实
 			// 清理，users:write）——同域不扩域，35 → 37。服务端没有（也不允许
 			// 有）直接置 completed 的桥方法或 REST 入口。
+			// 2026-10-08（admin-viewer-simplified §6）：删 4（slides.
+			// setVisibility + invites.list/create/revoke）、增 4（users.
+			// setAccountKind、slides.startTemporaryView/endTemporaryView、
+			// viewer.open 只读宿主方法）——37 → 37
 			expect(Object.keys(table)).toHaveLength(37);
 			expect(table["admin.formatRequests.list"]).toBe("admin:users:read");
 			expect(table["admin.formatRequests.get"]).toBe("admin:users:read");
@@ -445,57 +449,63 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 			expect(table["admin.researchDeletionJobs.list"]).toBe("admin:users:read");
 			expect(table["admin.researchDeletionJobs.retry"]).toBe("admin:users:write");
 			expect(table["admin.settings.model"]).toBe("admin:settings:read");
-		expect(table["admin.settings.model.update"]).toBe("admin:settings:write");
-		expect(table["admin.slides.inventory"]).toBe("admin:slides:read");
-		expect(table["admin.slides.setVisibility"]).toBe("admin:slides:write");
-		expect(table["admin.auth.get"]).toBe("admin:overview:read");
-		expect(table["admin.overview.get"]).toBe("admin:overview:read");
-		expect(table["admin.users.list"]).toBe("admin:users:read");
-		expect(table["admin.users.setEnabled"]).toBe("admin:users:write");
-		expect(table["admin.users.setAiAccess"]).toBe("admin:users:write");
-		expect(table["admin.users.resetPassword"]).toBe("admin:users:write");
-		expect(table["admin.invites.list"]).toBe("admin:invites:read");
-		expect(table["admin.invites.create"]).toBe("admin:invites:write");
-		expect(table["admin.invites.revoke"]).toBe("admin:invites:write");
-		expect(table["admin.billing.usage.list"]).toBe("admin:billing:read");
-		expect(table["admin.billing.ledger.list"]).toBe("admin:billing:read");
-		expect(table["admin.billing.providerBalance.get"]).toBe("admin:billing:read");
-		expect(table["admin.billing.providerBalance.refresh"]).toBe("admin:billing:read");
-		expect(table["admin.audit.list"]).toBe("admin:audit:read");
-		// PR5 修订（UI parity）：身份预览（写 owner session，归 users:write）+
-		// 插件管理（独立 plugins:read/write，不复用 users/billing）
-		expect(table["admin.users.startPreview"]).toBe("admin:users:write");
-		expect(table["admin.plugins.list"]).toBe("admin:plugins:read");
-		expect(table["admin.plugins.setEnabled"]).toBe("admin:plugins:write");
-		expect(table["admin.plugins.rotateSecret"]).toBe("admin:plugins:write");
-		// 批次 D（§6.5）：统一设置页（settings 独立权限；金额窗口调整归
-		// settings:write）
-		expect(table["admin.settings.get"]).toBe("admin:settings:read");
-		expect(table["admin.settings.update"]).toBe("admin:settings:write");
-		expect(table["admin.spend.currentWindow.adjust"]).toBe("admin:settings:write");
-		// 批次 F：运行时安全参数写（settings/runtime）
-		expect(table["admin.settings.runtime.update"]).toBe("admin:settings:write");
-		// wave 2 新增只读统计（复用 overview:read）
-		expect(table["admin.spend.demoStats.get"]).toBe("admin:overview:read");
-		expect(table["admin.siteStats.get"]).toBe("admin:overview:read");
-		// wave 2 新增 user 一次性总额度 CAS 写（users:write）
-		expect(table["admin.spend.userTotalLimit.set"]).toBe("admin:users:write");
-		expect(table["admin.spend.userTotalLimit.restoreDefault"]).toBe("admin:users:write");
-		// wave 2 已删方法：不在表内 → dispatch 门按既有语义回 unknown_method
-		//（旧 REST 兼容端点的 410 由服务端负责，桥层不再出现这些名字）
-		expect(table["admin.turnBudgets.get"]).toBeUndefined();
-		expect(table["admin.turnBudgets.update"]).toBeUndefined();
-		expect(table["admin.billing.account.get"]).toBeUndefined();
-		expect(table["admin.billing.account.updateCaps"]).toBeUndefined();
-		expect(table["admin.billing.adjust"]).toBeUndefined();
-		expect(table["admin.acquisition.summary"]).toBeUndefined();
-		expect(table["admin.acquisition.list"]).toBeUndefined();
-		expect(table["admin.users.setSpendOverride"]).toBeUndefined();
-		// R6（2026-09-19）退役方法：同样不在表内 → 稳定 unknown_method
-		expect(table["admin.users.create"]).toBeUndefined();
-		expect(table["admin.users.identityConflicts"]).toBeUndefined();
-		expect(table["admin.users.discardPending"]).toBeUndefined();
-	});
+			expect(table["admin.settings.model.update"]).toBe("admin:settings:write");
+			// 2026-10-08：临时查看（write）与只读宿主「查看」方法
+			expect(table["admin.slides.inventory"]).toBe("admin:slides:read");
+			expect(table["admin.slides.startTemporaryView"]).toBe("admin:slides:write");
+			expect(table["admin.slides.endTemporaryView"]).toBe("admin:slides:write");
+			expect(table["admin.viewer.open"]).toBe("admin:slides:read");
+			expect(table["admin.auth.get"]).toBe("admin:overview:read");
+			expect(table["admin.overview.get"]).toBe("admin:overview:read");
+			expect(table["admin.users.list"]).toBe("admin:users:read");
+			expect(table["admin.users.setEnabled"]).toBe("admin:users:write");
+			expect(table["admin.users.setAiAccess"]).toBe("admin:users:write");
+			expect(table["admin.users.resetPassword"]).toBe("admin:users:write");
+			expect(table["admin.users.setAccountKind"]).toBe("admin:users:write");
+			expect(table["admin.billing.usage.list"]).toBe("admin:billing:read");
+			expect(table["admin.billing.ledger.list"]).toBe("admin:billing:read");
+			expect(table["admin.billing.providerBalance.get"]).toBe("admin:billing:read");
+			expect(table["admin.billing.providerBalance.refresh"]).toBe("admin:billing:read");
+			expect(table["admin.audit.list"]).toBe("admin:audit:read");
+			// PR5 修订（UI parity）：身份预览（写 owner session，归 users:write）+
+			// 插件管理（独立 plugins:read/write，不复用 users/billing）
+			expect(table["admin.users.startPreview"]).toBe("admin:users:write");
+			expect(table["admin.plugins.list"]).toBe("admin:plugins:read");
+			expect(table["admin.plugins.setEnabled"]).toBe("admin:plugins:write");
+			expect(table["admin.plugins.rotateSecret"]).toBe("admin:plugins:write");
+			// 批次 D（§6.5）：统一设置页（settings 独立权限；金额窗口调整归
+			// settings:write）
+			expect(table["admin.settings.get"]).toBe("admin:settings:read");
+			expect(table["admin.settings.update"]).toBe("admin:settings:write");
+			expect(table["admin.spend.currentWindow.adjust"]).toBe("admin:settings:write");
+			// 批次 F：运行时安全参数写（settings/runtime）
+			expect(table["admin.settings.runtime.update"]).toBe("admin:settings:write");
+			// wave 2 新增只读统计（复用 overview:read）
+			expect(table["admin.spend.demoStats.get"]).toBe("admin:overview:read");
+			expect(table["admin.siteStats.get"]).toBe("admin:overview:read");
+			// wave 2 新增 user 一次性总额度 CAS 写（users:write）
+			expect(table["admin.spend.userTotalLimit.set"]).toBe("admin:users:write");
+			expect(table["admin.spend.userTotalLimit.restoreDefault"]).toBe("admin:users:write");
+			// wave 2 已删方法：不在表内 → dispatch 门按既有语义回 unknown_method
+			//（旧 REST 兼容端点的 410 由服务端负责，桥层不再出现这些名字）
+			expect(table["admin.turnBudgets.get"]).toBeUndefined();
+			expect(table["admin.turnBudgets.update"]).toBeUndefined();
+			expect(table["admin.billing.account.get"]).toBeUndefined();
+			expect(table["admin.billing.account.updateCaps"]).toBeUndefined();
+			expect(table["admin.billing.adjust"]).toBeUndefined();
+			expect(table["admin.acquisition.summary"]).toBeUndefined();
+			expect(table["admin.acquisition.list"]).toBeUndefined();
+			expect(table["admin.users.setSpendOverride"]).toBeUndefined();
+			// R6（2026-09-19）退役方法：同样不在表内 → 稳定 unknown_method
+			expect(table["admin.users.create"]).toBeUndefined();
+			expect(table["admin.users.identityConflicts"]).toBeUndefined();
+			expect(table["admin.users.discardPending"]).toBeUndefined();
+			// 2026-10-08（§6）退役方法：切片可见性写 + 邀请三方法 → unknown_method
+			expect(table["admin.slides.setVisibility"]).toBeUndefined();
+			expect(table["admin.invites.list"]).toBeUndefined();
+			expect(table["admin.invites.create"]).toBeUndefined();
+			expect(table["admin.invites.revoke"]).toBeUndefined();
+		});
 
 	it("declares param schemas for every read method (whitelist + types)", () => {
 		const { AdminBridgeHost } = loadModule();
@@ -562,10 +572,10 @@ describe("AdminBridge host — PR3b read backend proxy (§9 Admin API v1)", () =
 		expect(rs[0].env.result).toEqual(overview);
 	});
 
-	it("admin.users.list maps cursor/limit/filters into the query string", async () => {
+	it("admin.users.list maps cursor/limit/filters/kind/sort into the query string", async () => {
 		const { handle, posted, contentWindow } = makeReadHost(async (url) => {
 			expect(url).toBe(
-				"/api/admin/v1/users?cursor=abc&limit=25&q=alice&enabled=true&ai_access=false",
+				"/api/admin/v1/users?cursor=abc&limit=25&q=alice&enabled=true&ai_access=false&kind=dogfood&sort=last_login_desc",
 			);
 			return { status: 200, ok: true, body: { items: [], next_cursor: null } };
 		});
@@ -574,7 +584,22 @@ describe("AdminBridge host — PR3b read backend proxy (§9 Admin API v1)", () =
 			source: contentWindow,
 			data: requestEnv(nonce0(posted), "r1", "admin.users.list", {
 				cursor: "abc", limit: 25, q: "alice", enabled: true, ai_access: false,
+				kind: "dogfood", sort: "last_login_desc",
 			}),
+		});
+		await ticks();
+		expect(responses(posted, "r1")[0].env.ok).toBe(true);
+	});
+
+	it("admin.users.list omits absent kind/sort (server defaults real/joined_desc)", async () => {
+		const { handle, posted, contentWindow } = makeReadHost(async (url) => {
+			expect(url).toBe("/api/admin/v1/users?limit=50");
+			return { status: 200, ok: true, body: { items: [], next_cursor: null } };
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.users.list", { limit: 50 }),
 		});
 		await ticks();
 		expect(responses(posted, "r1")[0].env.ok).toBe(true);
@@ -860,10 +885,11 @@ describe("AdminBridge host — wave 2 只读聚合（Demo 周统计 / 站点访�
 
 describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () => {
 	const ALL_WRITE = [
-		"admin:users:write", "admin:invites:read", "admin:invites:write",
+		"admin:users:write",
 		// 批次 F：turn-budgets:write 已从桥上移除（服务端 410）；runtime 写
 		// 走 admin:settings:write。wave 2：billing:write 已随人工调账/caps
-		// 退役一并删除
+		// 退役一并删除。2026-10-08：invites:read/write 已从 manifest 词表
+		// 移除（邀请页退役），不再作为授权能力出现
 		"admin:settings:write",
 	];
 
@@ -970,47 +996,235 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 		});
 	});
 
-	it("admin.invites.list/create/revoke map to the v1 invite endpoints (wave 2 contract)", async () => {
+	it("2026-10-08: admin.invites.* / admin.slides.setVisibility are retired — unknown_method, no backend call", async () => {
+		// 邀请页退役 + 旧 workspace 收录授权模型被 1 小时临时查看取代：
+		// 四个方法整行删除（权限映射/参数 schema/后端映射一并移除），
+		// dispatch 门稳定 unknown_method，绝不发出任何 HTTP。
+		const calls: Array<{ url: string; method?: string }> = [];
+		const { handle, posted, contentWindow } = makeWriteHost(async (url, o) => {
+			calls.push({
+				url, method: (o as { method?: string } | undefined)?.method,
+			});
+			return { status: 200, ok: true, body: {} };
+		});
+		handle._handleIframeLoad();
+		const nonce = nonce0(posted);
+		const retired: Array<[string, string, unknown]> = [
+			["r1", "admin.invites.list", { limit: 25 }],
+			["r2", "admin.invites.create", { ttl_seconds: 604800, ai_access: true }],
+			["r3", "admin.invites.revoke", { invite_id: "inv_9" }],
+			["r4", "admin.slides.setVisibility", { name: "a.svs", granted: true }],
+		];
+		for (const [rid, method, payload] of retired) {
+			handle._handleWindowMessage({
+				source: contentWindow,
+				data: requestEnv(nonce, rid, method, payload),
+			});
+		}
+		await ticks();
+		for (const [rid, method] of retired) {
+			const rs = responses(posted, rid);
+			expect(rs, method).toHaveLength(1);
+			expect(rs[0].env.ok, method).toBe(false);
+			expect((rs[0].env.error as { code: string }).code, method)
+				.toBe("unknown_method");
+		}
+		expect(calls).toEqual([]); // 后端零调用
+		expect(handle.stats().handled).toBe(0);
+	});
+
+	it("admin.users.setAccountKind POSTs the account-kind body (owner + CSRF via jsonWrite)", async () => {
 		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
 		const { handle, posted, contentWindow } = makeWriteHost(async (url, o) => {
 			calls.push({
 				url, method: (o as { method?: string } | undefined)?.method,
-				body: (o as { body?: string } | undefined)?.body
-					? JSON.parse(String((o as { body?: string }).body)) : undefined,
+				body: JSON.parse(String((o as { body?: string }).body)),
 			});
-			if (url.startsWith("/api/admin/v1/invites") && !calls[0].method) {
-				return { status: 200, ok: true, body: { invites: [], next_cursor: null } };
-			}
-			return { status: 200, ok: true, body: { invite: {} } };
+			return { status: 200, ok: true, body: { user: { account_kind: "dogfood" } } };
 		});
 		handle._handleIframeLoad();
 		const nonce = nonce0(posted);
 		handle._handleWindowMessage({
 			source: contentWindow,
-			data: requestEnv(nonce, "r1", "admin.invites.list", { limit: 25, cursor: "k9" }),
-		});
-		handle._handleWindowMessage({
-			source: contentWindow,
-			data: requestEnv(nonce, "r2", "admin.invites.create", {
-				ttl_seconds: 604800, ai_access: true, total_limit_nano_cny: "2500000000",
+			data: requestEnv(nonce, "r1", "admin.users.setAccountKind", {
+				user_id: "usr_7", account_kind: "dogfood",
 			}),
 		});
 		handle._handleWindowMessage({
 			source: contentWindow,
-			data: requestEnv(nonce, "r3", "admin.invites.revoke", { invite_id: "inv_9" }),
+			data: requestEnv(nonce, "r2", "admin.users.setAccountKind", {
+				user_id: "usr_7", account_kind: "real",
+			}),
 		});
 		await ticks();
-		expect(calls[0]).toEqual({ url: "/api/admin/v1/invites?cursor=k9&limit=25" });
+		expect(calls[0]).toEqual({
+			url: "/api/admin/v1/users/usr_7/account-kind", method: "POST",
+			body: { account_kind: "dogfood" },
+		});
 		expect(calls[1]).toEqual({
-			url: "/api/admin/v1/invites", method: "POST",
-			body: {
-				login_id: undefined, ttl_seconds: 604800, ai_access: true,
-				note: undefined, total_limit_nano_cny: "2500000000",
+			url: "/api/admin/v1/users/usr_7/account-kind", method: "POST",
+			body: { account_kind: "real" },
+		});
+		// schema 门：account_kind 枚举外 / 缺字段 / 未声明字段 → invalid_params
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r3", "admin.users.setAccountKind", {
+				user_id: "usr_7", account_kind: "admin",
+			}),
+		});
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r4", "admin.users.setAccountKind", {
+				user_id: "usr_7",
+			}),
+		});
+		await ticks();
+		for (const rid of ["r3", "r4"]) {
+			expect((responses(posted, rid)[0].env.error as { code: string }).code)
+				.toBe("invalid_params");
+		}
+		expect(calls).toHaveLength(2);
+	});
+
+	it("admin.slides.startTemporaryView POSTs / endTemporaryView DELETEs the temporary-view path", async () => {
+		const calls: Array<{ url: string; method?: string }> = [];
+		const { handle, posted, contentWindow } = makeWriteHost(async (url, o) => {
+			calls.push({
+				url, method: (o as { method?: string } | undefined)?.method,
+			});
+			return {
+				status: 200, ok: true,
+				body: {
+					slide_id: "sld_abc123",
+					temporary_view: { status: "active", granted_at: 1, expires_at: 3601 },
+					server_now: 1,
+				},
+			};
+		}, ["admin:slides:write"]); // §6：临时查看写归 slides:write（独立权限域）
+		handle._handleIframeLoad();
+		const nonce = nonce0(posted);
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r1", "admin.slides.startTemporaryView", {
+				slide_id: "sld_abc123",
+			}),
+		});
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r2", "admin.slides.endTemporaryView", {
+				slide_id: "sld_abc123",
+			}),
+		});
+		await ticks();
+		expect(calls[0]).toEqual({
+			url: "/api/admin/v1/slides/sld_abc123/temporary-view", method: "POST",
+		});
+		expect(calls[1]).toEqual({
+			url: "/api/admin/v1/slides/sld_abc123/temporary-view", method: "DELETE",
+		});
+		// schema 门：slide_id 必须 sld_ 前缀 + urlsafe 字符集（路径参数防线）
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r3", "admin.slides.startTemporaryView", {
+				slide_id: "old-name.svs",
+			}),
+		});
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r4", "admin.slides.endTemporaryView", {
+				slide_id: "sld_abc/../admin",
+			}),
+		});
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce, "r5", "admin.slides.endTemporaryView", {}),
+		});
+		await ticks();
+		for (const rid of ["r3", "r4", "r5"]) {
+			expect((responses(posted, rid)[0].env.error as { code: string }).code, rid)
+				.toBe("invalid_params");
+		}
+		expect(calls).toHaveLength(2);
+	});
+
+	it("admin.viewer.open opens /?slide=<id> in a new tab host-side; zero HTTP", async () => {
+		// §6：iframe 不能也不应直接导航宿主——「查看」由宿主 window.open 执行
+		//（_blank + noopener），不经任何 fetch。
+		const opened: Array<{ href: string; target: string; features: string }> = [];
+		const { AdminBridgeHost, crypto } = loadModule();
+		const posted2: Posted[] = [];
+		const contentWindow2 = {
+			postMessage: (env: Record<string, unknown>, targetOrigin: string) =>
+				posted2.push({ env, targetOrigin }),
+		};
+		const fakeWindow: Record<string, unknown> = {
+			crypto,
+			fetch: async () => { throw new Error("raw fetch"); },
+			console,
+			setTimeout,
+			clearTimeout,
+			open: (href: string, target: string, features: string) => {
+				opened.push({ href, target, features });
+				return {};
 			},
+			document: {
+				readyState: "complete",
+				getElementById: () => null,
+				addEventListener() {},
+			},
+		};
+		const handle2 = AdminBridgeHost.create({
+			iframe: { contentWindow: contentWindow2, addEventListener() {}, getAttribute: () => "x", setAttribute() {} },
+			permissions: ["admin:slides:read"],
+			crypto,
+			fetchJson: async () => ({ status: 200, ok: true, body: {} }),
+			ensureOwner: async () => true,
+			timeoutMs: 5000,
+			window: fakeWindow, // open 记录器挂在宿主 window 上（create 默认用模块 window）
 		});
-		expect(calls[2]).toEqual({
-			url: "/api/admin/v1/invites/inv_9/revoke", method: "POST", body: {},
+		handle2._handleIframeLoad();
+		handle2._handleWindowMessage({
+			source: contentWindow2,
+			data: requestEnv(nonce0(posted2), "r1", "admin.viewer.open", {
+				slide_id: "sld_abcDEF-1",
+			}),
 		});
+		await ticks();
+		const rs = responses(posted2, "r1");
+		expect(rs).toHaveLength(1);
+		expect(rs[0].env.ok).toBe(true);
+		expect(rs[0].env.result).toEqual({ opened: true, slide_id: "sld_abcDEF-1" });
+		expect(opened).toEqual([{
+			href: "/?slide=sld_abcDEF-1", target: "_blank", features: "noopener",
+		}]);
+		// 非法 slide_id：宿主侧二次校验 → invalid_params，不开窗
+		handle2._handleWindowMessage({
+			source: contentWindow2,
+			data: requestEnv(nonce0(posted2), "r2", "admin.viewer.open", {
+				slide_id: "javascript:alert(1)",
+			}),
+		});
+		await ticks();
+		expect((responses(posted2, "r2")[0].env.error as { code: string }).code)
+			.toBe("invalid_params");
+		expect(opened).toHaveLength(1);
+	});
+
+	it("admin.viewer.open requires admin:slides:read and a working host open", async () => {
+		const { handle, posted, contentWindow } = makeHost({
+			permissions: ["admin:users:read"], // 未申请 slides:read
+			fetchJson: async () => ({ status: 200, ok: true, body: {} }),
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.viewer.open", {
+				slide_id: "sld_ok",
+			}),
+		});
+		await ticks();
+		expect((responses(posted, "r1")[0].env.error as { code: string }).code)
+			.toBe("permission_denied");
 	});
 
 	it("admin.settings.runtime.update PUTs whitelisted safety fields (batch F)", async () => {
@@ -1106,10 +1320,11 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 			["admin.users.setEnabled", { user_id: "u1" }],                        // 缺 enabled
 			["admin.users.setEnabled", { user_id: "u1", enabled: "yes" }],       // boolean
 			["admin.users.resetPassword", { user_id: "u1", password: "" }],      // minLength
-			["admin.invites.create", { ttl_seconds: 999999999 }],                 // max 2592000
-			["admin.invites.create", { ttl_seconds: 604800, cohort: "beta" }],    // 未声明字段（wave 2 归因字段删除）
-			["admin.invites.create", { evil: 1 }],                                // 未声明字段
-			["admin.invites.revoke", {}],                                         // 缺 invite_id
+			// 2026-10-08：setAccountKind 枚举 / 临时查看 slide_id 形态
+			["admin.users.setAccountKind", { user_id: "u1", account_kind: "admin" }], // 枚举外
+			["admin.slides.startTemporaryView", { slide_id: "a b" }],            // pattern（空格）
+			["admin.slides.startTemporaryView", { slide_id: "sld_" }],           // pattern 需 sld_+≥1 位
+			["admin.viewer.open", { slide_id: "sld_x", extra: 1 }],              // 未声明字段
 			// 批次 F：runtime 安全参数校验（integer / min 1 / 未声明字段）
 			["admin.settings.runtime.update", { platform_task_max_steps: 1.5 }], // integer
 			["admin.settings.runtime.update", { platform_task_max_steps: 0 }],   // min 1
@@ -1133,7 +1348,9 @@ describe("AdminBridge host — PR5 write methods (§9 Admin API v1 writes)", () 
 				user_id: "u1", total_limit_nano_cny: "1", expected_version: 0,
 			}],                                                                    // version min 1
 			["admin.spend.userTotalLimit.restoreDefault", { user_id: "u1" }],      // 缺 expected_version
-			["admin.invites.list", { q: "evil" }],                                // 未声明字段
+			// 2026-10-08：users.list 新参数枚举（kind/sort）
+			["admin.users.list", { kind: "admin" }],                              // 枚举外
+			["admin.users.list", { sort: "name_asc" }],                           // 枚举外
 		];
 		for (let i = 0; i < bad.length; i++) {
 			handle._handleWindowMessage({
@@ -1753,50 +1970,42 @@ describe("AdminBridge host — wave 2：users/invites 总额度字段过桥（Ba
 		expect(calls).toHaveLength(0); // 后端零调用
 	});
 
-	it("admin.invites.create forwards total_limit_nano_cny + ttl_seconds (no attribution fields)", async () => {
-		const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
+	it("2026-10-08: admin.invites.create retired — any payload (incl. legacy attribution fields) is unknown_method", async () => {
+		// 邀请退役后 invites 三方法整行删除（ Batch B/D1 的额度模板转发语义
+		// 一并消失）；总额度调整唯一出口 = admin.spend.userTotalLimit.set。
+		const calls: Array<{ url: string; method?: string }> = [];
 		const { handle, posted, contentWindow } = makeHost({
+			// 合成场景：即使该能力被（错误地）授予，也稳定 unknown_method
+			//（manifest 已不再申请 admin:invites:write）
 			permissions: ["admin:invites:write"],
 			fetchJson: async (url, o) => {
 				calls.push({
 					url, method: (o as { method?: string } | undefined)?.method,
-					body: JSON.parse(String((o as { body?: string }).body)),
 				});
 				return { status: 200, ok: true, body: { invite: {} } };
 			},
 		});
 		handle._handleIframeLoad();
-		handle._handleWindowMessage({
-			source: contentWindow,
-			data: requestEnv(nonce0(posted), "r1", "admin.invites.create", {
-				ttl_seconds: 86400, ai_access: true,
-				total_limit_nano_cny: "2500000000",
-			}),
-		});
+		const payloads: Array<Record<string, unknown>> = [
+			{ ttl_seconds: 86400, ai_access: true, total_limit_nano_cny: "2500000000" },
+			{ ttl_seconds: 86400, source_code: "mywebpage" },
+			{ ttl_seconds: 86400, cohort: "beta" },
+		];
+		for (let i = 0; i < payloads.length; i++) {
+			handle._handleWindowMessage({
+				source: contentWindow,
+				data: requestEnv(nonce0(posted), "r" + i, "admin.invites.create",
+					payloads[i]),
+			});
+		}
 		await ticks();
-		expect(responses(posted, "r1")[0].env.ok).toBe(true);
-		const body = calls[0].body as Record<string, unknown>;
-		expect(body.total_limit_nano_cny).toBe("2500000000");
-		expect(body.ttl_seconds).toBe(86400);
-		// 负数/小数形态拒绝（pattern ^[0-9]{1,19}$）
-		handle._handleWindowMessage({
-			source: contentWindow,
-			data: requestEnv(nonce0(posted), "r2", "admin.invites.create", {
-				ttl_seconds: 86400, total_limit_nano_cny: "-5",
-			}),
-		});
-		// source_code/campaign_id/cohort 已随归因退役删除：携带即拒
-		handle._handleWindowMessage({
-			source: contentWindow,
-			data: requestEnv(nonce0(posted), "r3", "admin.invites.create", {
-				ttl_seconds: 86400, source_code: "mywebpage",
-			}),
-		});
-		await ticks();
-		expect((responses(posted, "r2")[0].env.error as { code: string }).code)
-			.toBe("invalid_params");
-		expect((responses(posted, "r3")[0].env.error as { code: string }).code)
-			.toBe("invalid_params");
+		for (let i = 0; i < payloads.length; i++) {
+			const rs = responses(posted, "r" + i);
+			expect(rs).toHaveLength(1);
+			expect(rs[0].env.ok).toBe(false);
+			expect((rs[0].env.error as { code: string }).code).toBe("unknown_method");
+		}
+		expect(calls).toHaveLength(0); // 后端零调用
 	});
 });
 

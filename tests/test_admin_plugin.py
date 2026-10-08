@@ -599,13 +599,19 @@ def test_admin_manifest_v1_1_validates():
     data = json.loads(ADMIN_MANIFEST.read_text(encoding="utf-8"))
     assert M.validate_manifest(data) == []
     assert M.check_manifest_schema_supported(data["manifestSchemaVersion"]) is True
-    # wave 2（2026-09-03，review-2026-09-02-upload-user-limits-admin-ui-cleanup.md
-    # Batch C5-6/D1）：manifest adminPermissions 删除 turn read / billing write /
-    # acquisition read；SDK 词表同步删除（含早已无 manifest 消费者的
-    # turn-budgets:write 死枚举），断言改为「精确等于新 11 项词表」
-    assert set(data["adminPermissions"]) == set(M.MANIFEST_ADMIN_PERMISSIONS)
+    # wave 2（2026-09-03）：manifest adminPermissions 删除 turn read /
+    # billing write / acquisition read。2026-10-08（admin-viewer-simplified
+    # §4/§6）：邀请页退役——admin.invites.* 桥方法整行删除，manifest 同步
+    # 移除 admin:invites:read/write（SDK 词表 plugins/sdk/manifest.py 保留
+    # 这两个枚举值——非本线文件；manifest 是其真子集，校验器允许）。
+    # 期望集合 = SDK 词表 − 邀请两项 = 11 项。
+    expected_perms = (set(M.MANIFEST_ADMIN_PERMISSIONS)
+                      - {"admin:invites:read", "admin:invites:write"})
+    assert set(data["adminPermissions"]) == expected_perms
+    assert len(data["adminPermissions"]) == 11
     for retired in ("admin:turn-budgets:read", "admin:turn-budgets:write",
-                    "admin:billing:write", "admin:acquisition:read"):
+                    "admin:billing:write", "admin:acquisition:read",
+                    "admin:invites:read", "admin:invites:write"):
         assert retired not in data["adminPermissions"]
     # 站点访问 / Demo 周统计复用 admin:overview:read（不新增权限域）
     assert "admin:overview:read" in data["adminPermissions"]
@@ -957,7 +963,11 @@ def test_admin_manifest_plugin_version_bumped_with_hashes():
     # 2026-09-21 0.4.12：新增「研究删除」页（admin.researchDeletionJobs.
     # list/retry 桥方法，复用 users 权限域不扩域；终态 failed 删除任务的
     # 最小人工处置，completed 只能由 worker 清理成功产生），hashes/pin 同步
-    assert data["pluginVersion"] == "0.4.15"  # hashes/pin 同步
+    # 2026-10-08 0.4.16（admin-viewer-simplified §2/§3.4/§4/§6）：用户页
+    # 四列改版（分类/最近登录/setAccountKind）+ 切片页临时查看改版
+    #（start/endTemporaryView + viewer.open 宿主开新标签）+ 邀请页退役
+    #（admin.invites.* 桥方法删除）+ 注册模式收敛 closed/public，hashes/pin 同步
+    assert data["pluginVersion"] == "0.4.16"  # hashes/pin 同步
     assert "admin:settings:read" in data["adminPermissions"]
     assert "admin:settings:write" in data["adminPermissions"]
     assert "admin:slides:read" in data["adminPermissions"]

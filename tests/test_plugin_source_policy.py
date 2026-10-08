@@ -78,16 +78,21 @@ def test_sample_manifest_validates_and_policy_pin_matches():
     admin = json.loads(admin_manifest.read_text(encoding="utf-8"))
     assert M.validate_manifest(admin) == []
     assert admin["ui"]["slots"] == ["admin.workspace"]
-    # 批次 D1（2026-09-03）：退役权限（turn read/write、acquisition read、billing write）
-    # 已从 manifest 与 SDK 词汇表同步移除，二者精确一致，不再有兼容保留项
-    assert set(admin["adminPermissions"]) == set(M.MANIFEST_ADMIN_PERMISSIONS)
+    # 批次 D1（2026-09-03）：退役权限（turn read/write、acquisition read、
+    # billing write）已从 manifest 与 SDK 词汇表同步移除。2026-10-08
+    #（admin-viewer-simplified §4/§6）：邀请页退役——manifest 再移除
+    # admin:invites:read/write（SDK 词表保留枚举值，manifest 为其真子集）。
+    assert set(admin["adminPermissions"]) == (
+        set(M.MANIFEST_ADMIN_PERMISSIONS)
+        - {"admin:invites:read", "admin:invites:write"})
     retired = {
         "admin:turn-budgets:read",
         "admin:turn-budgets:write",
         "admin:acquisition:read",
         "admin:billing:write",
+        "admin:invites:read",
+        "admin:invites:write",
     }
-    assert retired.isdisjoint(M.MANIFEST_ADMIN_PERMISSIONS)
     assert retired.isdisjoint(admin["adminPermissions"])
     # sample-tma-score 的 provides 声明须通过校验器（能力注册表登记前置）
     tma = json.loads(TMA_MANIFEST.read_text(encoding="utf-8"))

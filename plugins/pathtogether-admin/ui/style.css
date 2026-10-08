@@ -418,6 +418,35 @@ body {
   background: rgba(255, 149, 0, 0.12);
 }
 
+/* ---- 2026-10-08（§2）：用户页分类筛选（分段按钮）+ 分类标签 ---- */
+.adm-kind-seg {
+  display: inline-flex; gap: 4px; align-items: center;
+  flex: 0 0 auto;
+}
+.adm-kind-btn {
+  font-size: 13px; padding: 6px 12px; border-radius: 8px;
+  border: 1px solid var(--separator); background: var(--card);
+  color: var(--text); cursor: pointer; white-space: nowrap;
+  font-family: inherit; line-height: 1.4;
+}
+.adm-kind-btn:hover { background: var(--accent-soft); }
+.adm-kind-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.adm-kind-btn[aria-pressed="true"] {
+  border-color: var(--accent); color: var(--accent);
+  background: var(--accent-soft); font-weight: 600;
+}
+.adm-kind-tag {
+  display: inline-block; padding: 0 7px; border-radius: 6px;
+  font-size: 11px; font-weight: 600; line-height: 20px;
+  color: var(--accent); background: var(--accent-soft);
+  vertical-align: middle;
+}
+.adm-kind-tag--dogfood {
+  color: #b25000; background: rgba(255, 149, 0, 0.12);
+}
+.adm-kind-actions { margin-top: 4px; }
+.adm-kind-actions button { font-size: 12px; padding: 3px 8px; margin: 0 4px 0 0; }
+
 /* 页内二次确认条（sandbox 无 allow-modals，window.confirm 不可用） */
 .adm-confirm {
   display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
@@ -543,11 +572,15 @@ body {
   .adm-nav-btn::before { font-size: 14px; }
   .adm-nav-btn[data-page="overview"]::before { content: "概"; }
   .adm-nav-btn[data-page="users"]::before { content: "户"; }
-  .adm-nav-btn[data-page="identity"]::before { content: "冲"; }
-  .adm-nav-btn[data-page="invites"]::before { content: "邀"; }
+  .adm-nav-btn[data-page="slides"]::before { content: "片"; }
+  .adm-nav-btn[data-page="format-requests"]::before { content: "格"; }
+  .adm-nav-btn[data-page="test-applications"]::before { content: "测"; }
+  .adm-nav-btn[data-page="research-deletion"]::before { content: "删"; }
+  .adm-nav-btn[data-page="settings"]::before { content: "设"; }
   .adm-nav-btn[data-page="billing"]::before { content: "账"; }
   .adm-nav-btn[data-page="plugins"]::before { content: "件"; }
   .adm-nav-btn[data-page="audit"]::before { content: "审"; }
+  /* 2026-10-08：invites/identity 图标规则随页面退役移除；10 页各有图标 */
 }
 @media (max-width: 767px) {
   .adm-nav-toggle { display: inline-block; }
@@ -561,11 +594,14 @@ body {
   .adm-nav-btn { font-size: 14px; padding: 8px 12px; flex: 1 1 auto; text-align: center; }
   /* 平板图标字符规则带 [data-page]（特异性 0,2,1），通用 ::before 复位
      （0,1,1）压不过它——390px 同时命中两个媒体查询时必须按同特异性逐页
-     复位，否则出现「概概览/户用户」首字符重复（P0-1 回归） */
+     复位，否则出现「概概览/户用户」首字符重复（P0-1 回归）。
+     2026-10-08：全 10 页逐一复位（invites/identity 随页面退役移除）。 */
   .adm-nav-btn[data-page="overview"]::before,
   .adm-nav-btn[data-page="users"]::before,
-  .adm-nav-btn[data-page="identity"]::before,
-  .adm-nav-btn[data-page="invites"]::before,
+  .adm-nav-btn[data-page="slides"]::before,
+  .adm-nav-btn[data-page="format-requests"]::before,
+  .adm-nav-btn[data-page="test-applications"]::before,
+  .adm-nav-btn[data-page="research-deletion"]::before,
   .adm-nav-btn[data-page="settings"]::before,
   .adm-nav-btn[data-page="billing"]::before,
   .adm-nav-btn[data-page="plugins"]::before,
@@ -575,14 +611,15 @@ body {
   .adm-root { padding: 12px; }
   .adm-card { padding: 16px; }
   .adm-kv { grid-template-columns: 120px 1fr; }
-  /* §4.3：390px 保留 显示名/状态/AI/本月用量/剩余/详情；角色、登录账号、
-     最近调用收进详情抽屉——不靠无限横向滚动适配 */
+  /* §4.3：390px 保留 用户/加入时间/最近登录/分类 四列（2026-10-08 §2）；
+     次要列机制对其它列表照旧——不靠无限横向滚动适配 */
   .adm-table { min-width: 0; }
   .adm-table td, .adm-table th { white-space: normal; }
   .adm-table td { word-break: normal; overflow-wrap: anywhere; }
-  .adm-table--users .adm-col-secondary { display: none; }
-  /* 390px 用户表收成 4 列 = 显示名 / 状态+AI / 额度剩余 / 操作——
-     角色次要列隐藏，剩余列必须保留（状态元信息行本就始终可见） */
-  /* 首列给最小宽度，避免显示名逐字符竖排（仍不产生页面级横向滚动） */
+  /* 390px 用户表首列给最小宽度，避免显示名逐字符竖排（仍不产生页面级横向滚动） */
   .adm-table--users td:first-child, .adm-table--users th:first-child { min-width: 96px; }
+  .adm-table--users .adm-col-secondary { display: none; }
+  /* 切片页首列（切片名/上传者）同样给最小宽度，避免名称逐字符竖排 */
+  #adm-slides-table td:first-child, #adm-slides-table th:first-child { min-width: 110px; }
+  .adm-kind-seg { flex-wrap: wrap; }
 }

@@ -352,9 +352,22 @@ COMMENT ON COLUMN run_grants.allow_ai_drawing IS
   `allow_ai_drawing`）或直接依赖写端 403 软拒绝（tools.ts:2062 现状已软拒）。
   推荐：保留本地 run 级检查（廉价）+ 写端权威 403（已有），verify 扩展为可选
   诊断，不在 execute 热路径增加一跳。
-- 目标一致性：run 携带冻结 `target`；draw 工具的 pending 快照 bbox 与 target
-  显著偏离（无交集）时拒绝并说明（快照-attestation 链仍保证几何锚定在模型
-  实际看到的图，target 是第二道范围闸）。
+- 目标一致性：run 携带冻结 `target`；HP 授权成立时以冻结前缀
+  （`withSkillTargetContext`，与 viewport/attachment 前缀同风格）把范围告知
+  模型——roi/annotation/viewport 给 level-0 bbox（annotation 附引用声明：
+  只新建待复核标记，不改动原标注），slide 说明为明确全片（沿用分步观察/
+  预算机制，不得声称单次视野即全片完成）；前缀同时附追问指令（目标范围
+  不明确时先追问，不要猜）。bbox 形态的 target 注入
+  `RunConfig.skill_target`：draw 工具执行时**包围盒与 target 无交集 → 软
+  拒绝不落库**（kind=slide 或无 target 不限制）。快照-attestation 链仍保证
+  几何锚定在模型实际看到的图，target 是第二道范围闸。
+- **断线/崩溃恢复语义（修复1c，主代理 review）**：同 request_id 的
+  retry/resume（resumeDispatchedAction）**不恢复 skill_delineate**——恢复
+  的 run 按未授权执行（不装配描绘工具，fail-closed）；action_input 中持久
+  化的冻结范围前缀随文本保留（仅作上下文）。SSE 断线重连
+  （GET /session/:id/stream）不新建 run，grant 仍有效，授权不中断。
+  **branch（askBranch）路径恒不装配描绘工具**：判定只在 runMain/continueMain
+  preamble（主代理已接受此收窄）。
 - 停止/终态：run 终态即撤 grant（既有）；HP 侧 fatal/cancel 语义不变。
 
 ### 4.2 PT 两条写路径改为 run grant 复查

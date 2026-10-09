@@ -377,7 +377,9 @@ test.describe("顶栏搜索浮层（改版 2026-10-08 §5.4，替换旧侧栏内
 		// 初始 DOM 无搜索 input（按需创建，防自动填充方案沿用）
 		await expect(page.locator("#tb-search-input")).toHaveCount(0);
 		await expect(page.locator("#tb-search-btn")).toHaveAttribute("aria-expanded", "false");
-		await expect(page.locator("#tb-search-btn")).toContainText("搜索");
+		// 改版第四轮 §1.2：按钮为纯图标（不再含文字），名称由 aria-label 承载
+		await expect(page.locator("#tb-search-btn")).toHaveAttribute("aria-label", "搜索切片");
+		await expect(page.locator("#tb-search-btn .tb-svg")).toBeVisible();
 		// 打开：输入框唯一、聚焦、防自动填充属性齐全
 		await page.locator("#tb-search-btn").click();
 		const input = page.locator("#tb-search-input");
@@ -858,11 +860,16 @@ test("舒适密度：堆叠卡片不越过翻页栏，滑出预览在画布之�
   }
   await cards.first().hover();
   await expect(cards.first()).toHaveClass(/extracted/);
-  await expect.poll(() => cards.first().evaluate(el => {
-    const preview = el.querySelector(".fb-card")!;
-    const r = preview.getBoundingClientRect();
-    const edge = document.querySelector("#sidebar")!.getBoundingClientRect().right;
-    const hit = document.elementFromPoint(Math.min(r.right - 12, edge + 12), r.top + r.height / 2);
-    return !!hit && preview.contains(hit);
+  // 改版第四轮 §1.1：抽出呈现改为 body 直挂浮层（.fb-pullout）——画布之上、
+  // 不受侧栏 overflow/层叠影响。侧栏右缘外 12px 命中的一定是浮层卡片，
+  // 且浮层的父级是 body（不在侧栏裁剪容器内）。
+  await expect.poll(() => page.evaluate(() => {
+    const sidebar = document.querySelector("#sidebar")!;
+    const edge = sidebar.getBoundingClientRect().right;
+    const hit = document.querySelector(".fb-hit.extracted")!;
+    const hr = hit.getBoundingClientRect();
+    const at = document.elementFromPoint(edge + 12, hr.top + hr.height / 2);
+    const pop = document.querySelector(".fb-pullout");
+    return !!at && !!pop && pop.contains(at) && pop.parentElement === document.body;
   })).toBe(true);
 });

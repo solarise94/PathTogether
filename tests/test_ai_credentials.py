@@ -401,6 +401,7 @@ def test_no_auth_full_compat():
     _reset_config()
     _setup_platform()
     _touch("x.svs")
+    register_slide_row("x.svs")  # 会话列表按已登记资产走读门禁（d53bf495）
     fake = _install_fake()
 
     def run_handler(body, query, headers, kwargs):

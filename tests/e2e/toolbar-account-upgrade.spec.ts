@@ -948,3 +948,65 @@ test("手机页脚弹窗收起侧栏，不让抽屉遮罩拦截关闭按钮", as
     await expect(page.locator(`#${name}-mask`)).toBeHidden();
   }
 });
+
+test("连续选片：穿过浮卡覆盖区仍逐张命中，相邻卡联动且不重建", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await serveFixture(page);
+  await mockOwnerWithSlides(page, Array.from({ length: 12 }, (_, i) => ({ name: `fan-${i}.svs`, alias: `样例切片 ${i + 1}` })));
+  const errors: string[] = [];
+  page.on('pageerror', e => errors.push(e.message));
+  if (process.env.REVIEW_SHOTS) {
+    const mockup = readFileSync(resolve(here, '../../docs/design-assets/admin-viewer-20261008/viewer-folders.html'), 'utf8');
+    const data = mockup.match(/data:image\/webp;base64,([A-Za-z0-9+/=]+)/)![1];
+    await page.route('**/*thumbnail*', r => r.fulfill({ contentType: 'image/webp', body: Buffer.from(data, 'base64') }));
+  }
+  await page.goto(FIXTURE_HOST + '/fixture');
+  await expandSidebar(page, '12');
+  const hits = page.locator('.fb-hit');
+  await expect(page.locator('#sidebar')).toHaveCSS('width', '224px');
+  await expect.poll(() => hits.count()).toBeGreaterThanOrEqual(5);
+  const boxes = await hits.evaluateAll(nodes => nodes.map(node => {
+    const r = node.getBoundingClientRect();
+    return { x: r.left, y: r.top, width: r.width, height: r.height, id: (node as HTMLElement).dataset.slideId! };
+  }));
+  const x = boxes[0].x + boxes[0].width * .65; // Through the preview, not the narrow left gutter.
+  await page.mouse.move(x, boxes[0].y + 20);
+  await expect(page.locator('.fb-hit.extracted')).toHaveAttribute('data-slide-id', boxes[0].id);
+  await page.evaluate(() => { (window as any).__fanNodes = [...document.querySelectorAll('.fb-fan-card')]; });
+  const down = boxes.map((_, i) => i).slice(1);
+  for (const indices of [down, down.slice(0, -1).reverse()]) {
+    for (const i of indices) {
+      await page.mouse.move(x, boxes[i].y + 20, { steps: process.env.FAN_VIDEO ? 16 : 6 });
+      await expect(page.locator('.fb-hit.extracted')).toHaveAttribute('data-slide-id', boxes[i].id);
+    }
+  }
+  await page.mouse.move(x, boxes[3].y + 22);
+  await expect(page.locator('.fb-hit.extracted')).toHaveAttribute('data-slide-id', boxes[3].id);
+  expect(await page.evaluate(() => (window as any).__fanNodes.every((node: Element, i: number) => document.querySelectorAll('.fb-fan-card')[i] === node))).toBe(true);
+  for (const i of [2, 4]) {
+    const neighbour = page.locator(`.fb-fan-card[data-slide-id="${boxes[i].id}"]`);
+    expect(await neighbour.evaluate(el => parseFloat((el as HTMLElement).style.left))).toBeGreaterThan(boxes[i].x + 6);
+  }
+  await expect(page.locator('#viewer-empty')).toBeVisible(); // Hover must never open slides.
+  if (process.env.REVIEW_SHOTS) await page.screenshot({ path: join(process.env.REVIEW_SHOTS, 'fan-desktop.png') });
+  // Click at the same stationary row coordinate: the overlaid previous card
+  // must never open instead. Record the real application info request.
+  const request = page.waitForRequest(r => /\/api\/slide\/.*\/info/.test(r.url()));
+  await page.mouse.click(x, boxes[3].y + 22);
+  expect(decodeURIComponent((await request).url())).toContain('/' + boxes[3].id + '/info');
+  await expect(page.locator('.fb-fan-card')).toHaveCount(0);
+  // Leaving, changing page and collapsing the sidebar must restore all sources.
+  await page.mouse.move(x, boxes[2].y + 20);
+  await expect(page.locator('.fb-fan-card')).not.toHaveCount(0);
+  await page.mouse.move(700, 220);
+  await expect(page.locator('.fb-fan-card')).toHaveCount(0);
+  await page.mouse.move(x, boxes[2].y + 20);
+  await expect(page.locator('.fb-fan-card')).not.toHaveCount(0);
+  await page.locator('#fb-next-btn').click();
+  await expect(page.locator('.fb-fan-card')).toHaveCount(0);
+  await hits.first().hover({ position: { x: 12, y: 20 } });
+  await expect(page.locator('.fb-pullout')).toBeVisible();
+  await page.locator('#menu-btn').click();
+  await expect(page.locator('.fb-fan-card')).toHaveCount(0);
+  expect(errors).toEqual([]);
+});

@@ -4938,14 +4938,6 @@ button {
   transform-origin: left center;
   color: var(--text);
 }
-.fb-hit.extracted { z-index: 40 !important; }
-.fb-hit.extracted .fb-card {
-  pointer-events: auto;
-  width: 240px;
-  transform: translate(40px, -7px) rotate(-3deg);
-  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.18);
-  border-color: var(--accent);
-}
 .fb-hit:focus-visible .fb-card { border-color: var(--accent); }
 .fb-hit.active .fb-card { border-color: var(--accent); }
 .fb-hit.active .fb-card-label { background: var(--accent-fill); }
@@ -5036,7 +5028,6 @@ button {
 
 /* 窄侧栏（手机抽屉 ≤768px）：滑出幅度收窄，避免横向越界 */
 @media (max-width: 768px) {
-  .fb-hit.extracted .fb-card { width: calc(100% - 38px); transform: translate(32px, -4px); }
   .fb-stack { margin: 0 8px; }
   .tb-search-pop,
   .tb-share-pop {
@@ -5050,51 +5041,43 @@ button {
    置于断点覆盖之后：手机 + 减动效同样不旋转（评审 P2）。 */
 @media (prefers-reduced-motion: reduce) {
   .fb-card { transition: none !important; }
-  .fb-hit.extracted .fb-card { transform: translateX(32px) !important; }
 }
 
-/* 从原叠中浮起，浮层挂 body 以跨过侧栏裁切。左侧留连续划选命中带。 */
-.fb-pullout {
+/* Continuous fan: portals reuse stable source hit bands. Adjacent previews are
+   decorative; the active one routes clicks using the stationary pointer map. */
+.fb-fan-card {
   position: fixed;
-  z-index: 515;
-  width: 240px;
-  max-width: calc(100vw - 32px);
   margin: 0;
   padding: 0;
   border: 0;
   background: transparent;
-  cursor: pointer;
-  transform: rotate(-3deg);
+  pointer-events: none;
   transform-origin: left center;
-  animation: fb-card-lift 180ms ease-out;
+  transition: left 100ms ease-out, top 100ms ease-out, width 100ms ease-out,
+              height 100ms ease-out, transform 100ms ease-out;
 }
-.fb-pullout .fb-pullout-card {
+.fb-fan-card.fb-pullout { pointer-events: auto; cursor: pointer; }
+.fb-fan-card .fb-pullout-card {
   position: static;
   width: 100%;
-  height: 160px;
+  height: 100%;
   transform: none;
-  pointer-events: auto;
-  border-color: var(--accent);
-  background: var(--bg-panel-solid, #fff);
-  box-shadow: 0 12px 28px rgba(0, 0, 0, .22);
-}
-.fb-pullout .fb-card-label { background: transparent; }
-.fb-pullout .fb-card-menu { color: var(--text-2); }
-.fb-card, .fb-folder { background: var(--bg-panel-solid, #fff); }
-/* 只保留一张可见卡，原位置继续承担键盘焦点和划选命中。 */
-body.fb-pullout-on .fb-hit.fb-preview-source .fb-card {
-  opacity: 0;
-  width: 100%;
-  transform: none !important;
-  transition: none !important;
   pointer-events: none;
+  background: var(--bg-panel-solid, #fff);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, calc(.06 + .14 * var(--fan-weight, 0)));
 }
-@keyframes fb-card-lift {
-  from { transform: translate(-32px, 7px) rotate(0); opacity: .65; }
-  to { transform: rotate(-3deg); opacity: 1; }
+.fb-fan-card.fb-pullout .fb-pullout-card { border-color: var(--accent); }
+.fb-fan-card .fb-card-menu[hidden] { display: none; }
+.fb-fan-card .fb-card-label { background: transparent; }
+.fb-card, .fb-folder { background: var(--bg-panel-solid, #fff); }
+body.fb-pullout-on .fb-hit.fb-preview-source > .fb-card,
+body.fb-pullout-on .fb-hit.fb-preview-source > .fb-card-menu {
+  opacity: 0;
+  pointer-events: none;
+  transform: none !important;
 }
 @media (prefers-reduced-motion: reduce) {
-  .fb-pullout { animation: none; transform: none; }
+  .fb-fan-card { transition: none; transform: none !important; }
 }
 
 /* 2026-10-09：舒适密度。单行工具栏继续由实测宽度折叠；不缩小命中区来挤按钮。

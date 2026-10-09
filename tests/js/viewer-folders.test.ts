@@ -72,7 +72,7 @@ function bootEl(id = ""): BootEl {
 		value: "",
 		children,
 		dataset: {},
-		style: {},
+		style: { setProperty(k: string, v: string) { this[k] = v; } } as unknown as Record<string, string>,
 		classList: {
 			add: (...names) => names.forEach((n) => classes.add(n)),
 			remove: (...names) => names.forEach((n) => classes.delete(n)),
@@ -200,7 +200,7 @@ function bootApp(seed?: (s: Seedable) => void, opts: { search?: string } = {}) {
 	const closes = { n: 0 };
 	const fakeViewer = {
 		container: {
-			style: {},
+			style: { setProperty(k: string, v: string) { this[k] = v; } } as unknown as Record<string, string>,
 			getBoundingClientRect: () => ({ width: 800, height: 600, left: 0, top: 0 }),
 			insertBefore() {},
 		},

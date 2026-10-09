@@ -3028,7 +3028,7 @@
   //   根目录 = 顶层文件夹 + 「临时查看」虚拟文件夹（仅有临时授权切片时）+ 未归类切片
   //   文件夹 = 子文件夹卡片 + 该文件夹的切片卡片堆叠
   // 堆叠：每叠最多 FB_MAX_PAGE 张、按可用高度缩减（文件夹卡占用同一预算）；
-  // 纵向重叠、悬停整卡右滑预览（180ms，prefers-reduced-motion 关闭位移）；
+  // 纵向重叠、按鼠标位置连续展开相邻卡（减弱动态效果时取消插值和旋转）；
   // 翻页只换列表不动 Viewer；页码按文件夹记在内存（fbState.pages，刷新不保留）。
   // =========================================================================
   var FB_TEMP_KEY = "__temp__";   // 「临时查看」虚拟文件夹键（不对应项目）
@@ -3475,20 +3475,21 @@
     menuBtn.setAttribute("aria-label", t("fb.folder.menu.aria"));
     menuBtn.addEventListener("click", function (ev) {
       ev.stopPropagation();
+      fbPulloutHide();
       openFbSlideMenu(menuBtn, s, sid, sname);
     });
     hit.appendChild(menuBtn);
 
-    // 悬停只预览：不打开切片、不改倍率/AI/标注（点击才 openSlide）。
-    // 抽出呈现由 body 级浮层 .fb-pullout 承担（§1.1）；.extracted 只保留
-    // 命中区 z 抬升语义（浮层接管期间原位卡的 transform 由 CSS 抑制）。
+    // The first hover opens the fan; moving within it has no per-card delay.
     hit.addEventListener("pointerenter", function (e) {
       if (e && e.pointerType === "touch") return;
+      if (fbFanDismissedAt && e && Math.abs(e.clientX - fbFanDismissedAt.x) < 2 && Math.abs(e.clientY - fbFanDismissedAt.y) < 2) return;
+      if (fbFan) { fbFanMove(e); return; }
       if (fbPulloutShowTimer) clearTimeout(fbPulloutShowTimer);
-      // Give a direct click time to land before the preview crosses its target.
       fbPulloutShowTimer = setTimeout(function () {
         fbPulloutShowTimer = null;
         fbPulloutShow(hit);
+        fbFanMove(e);
       }, 80);
     });
     hit.addEventListener("pointerleave", function () {
@@ -3501,7 +3502,7 @@
     hit.addEventListener("blur", function () {
       fbPulloutScheduleHide();
     });
-    hit.addEventListener("click", function () { openSlide(sid); });
+    hit.addEventListener("click", function () { fbPulloutHide(); openSlide(sid); });
     hit.addEventListener("keydown", function (e) { fbStackKeydown(e, hit); });
     return hit;
   }
@@ -3517,109 +3518,175 @@
     if (next && typeof next.focus === "function") { try { next.focus(); } catch (err) {} }
   }
 
-  // ---------- 悬停抽出层（改版第四轮 §1.1） ----------
-  // 旧实现在侧栏内 transform 滑出 .fb-card：侧栏的 backdrop-filter / 收起
-  // 过渡 / ≤768px 抽屉的 overflow:hidden 都可能裁剪或压低它的层级（§1.1
-  // 反馈：卡片被画布遮住、在侧栏边缘被切）。现在抽出呈现改为 body 直挂的
-  // 固定定位浮层（.fb-pullout，z 515：高于 AI 面板 56 / 顶栏 60，低于工具栏
-  // 浮层 520 与卡片 ⋯ 菜单 620），位置自命中区 getBoundingClientRect 计算
-  // 并钳回视口——不再受任何祖先裁剪/层叠影响。
-  // 浮卡从原位置右移 40px 并轻微倾斜；原位卡隐去，保留左侧稳定命中带。
-  // 浮层仍挂 body，避免裁切。相邻卡的左侧命中区不被浮卡覆盖，可连续划选。
-  var FB_PULLOUT_W = 240;
+  // Continuous, distance-based fan (Dock-style magnification). Geometry comes
+  // from the stationary hit bands, never the animated cards. One portal per
+  // visible slide is reused for the whole gesture; at most eight on a page.
   var fbPulloutEl = null;
   var fbPulloutHit = null;
   var fbPulloutHideTimer = null;
   var fbPulloutShowTimer = null;
+  var fbFan = null;
+  var fbFanDismissedAt = null;
+
+  function fbPulloutKeep() {
+    if (fbPulloutHideTimer) { clearTimeout(fbPulloutHideTimer); fbPulloutHideTimer = null; }
+  }
 
   function fbPulloutHide() {
     if (fbPulloutShowTimer) { clearTimeout(fbPulloutShowTimer); fbPulloutShowTimer = null; }
-    if (fbPulloutHideTimer) {
-      clearTimeout(fbPulloutHideTimer);
-      fbPulloutHideTimer = null;
+    fbPulloutKeep();
+    if (fbFan) {
+      fbFan.items.forEach(function (item) {
+        item.hit.classList.remove("extracted", "fb-preview-source");
+        if (item.pop.parentNode) item.pop.parentNode.removeChild(item.pop);
+      });
     }
-    if (fbPulloutEl && fbPulloutEl.parentNode && fbPulloutEl.parentNode.removeChild) {
-      try { fbPulloutEl.parentNode.removeChild(fbPulloutEl); } catch (e) {}
-    }
-    if (fbPulloutHit) fbPulloutHit.classList.remove("extracted", "fb-preview-source");
+    fbFan = null;
     fbPulloutEl = null;
     fbPulloutHit = null;
-    try { document.body.classList.remove("fb-pullout-on"); } catch (e) {}
+    document.body.classList.remove("fb-pullout-on");
   }
 
   function fbPulloutScheduleHide() {
-    // 命中区 → 浮层的过渡：延迟收回（指针进入浮层会取消），避免闪烁
-    if (fbPulloutHideTimer) clearTimeout(fbPulloutHideTimer);
-    fbPulloutHideTimer = setTimeout(function () {
-      fbPulloutHideTimer = null;
-      fbPulloutHide();
-    }, 90);
+    fbPulloutKeep();
+    fbPulloutHideTimer = setTimeout(fbPulloutHide, 90);
+  }
+
+  function fbFanSelect(index) {
+    if (!fbFan) return;
+    fbFan.items.forEach(function (item, i) {
+      var active = i === index;
+      item.hit.classList.toggle("extracted", active);
+      item.pop.classList.toggle("fb-pullout", active);
+      if (item.menu) item.menu.hidden = !active;
+      if (active) { fbPulloutHit = item.hit; fbPulloutEl = item.pop; }
+    });
+  }
+
+  function fbFanPaint(fan) {
+    if (fbFan !== fan) return;
+    fan.pending = false;
+    var reduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    fan.items.forEach(function (item, i) {
+      var distance = i - fan.position;
+      // A smooth bell reaches both immediate neighbours, with no discontinuity
+      // when crossing a band boundary. Transitions interpolate from current CSS.
+      var weight = Math.pow(Math.max(0, Math.cos(Math.min(Math.abs(distance) / 2, 1) * Math.PI / 2)), 2);
+      var width = item.rect.width + (240 - item.rect.width) * weight;
+      var height = Math.min(FB_CARD_H + 32 * weight, fan.bottom - fan.top);
+      var left = Math.max(16, Math.min(item.rect.left + 40 * weight, fan.right - width));
+      var top = item.rect.top - 28 * weight + Math.sin(distance * Math.PI / 2) * 32 * weight;
+      top = Math.max(fan.top, Math.min(top, fan.bottom - height));
+      item.pop.style.left = left.toFixed(2) + "px";
+      item.pop.style.top = top.toFixed(2) + "px";
+      item.pop.style.width = width.toFixed(2) + "px";
+      item.pop.style.height = height.toFixed(2) + "px";
+      item.pop.style.transform = reduced ? "none" : "rotate(" + (-3 * weight).toFixed(2) + "deg)";
+      item.pop.style.zIndex = String(item.hit === fbPulloutHit ? 515 : 505 + Math.round(weight * 8));
+      item.pop.style.setProperty("--fan-weight", weight.toFixed(3));
+    });
+  }
+
+  function fbFanPosition(position, index) {
+    if (!fbFan) return;
+    fbPulloutKeep();
+    fbFan.position = position;
+    fbFanSelect(index);
+    if (fbFan.pending) return;
+    fbFan.pending = true;
+    var fan = fbFan;
+    (window.requestAnimationFrame || function (cb) { setTimeout(cb, 16); })(function () { fbFanPaint(fan); });
+  }
+
+  function fbFanMove(e) {
+    if (!fbFan || !e || e.pointerType === "touch" || e.buttons ||
+        typeof e.clientX !== "number" || typeof e.clientY !== "number") return;
+    // An expanded card can cover several rows. In the sidebar, use pointer Y
+    // against original bands regardless of which portal received this event.
+    var items = fbFan.items;
+    var first = items[0].rect, last = items[items.length - 1].rect;
+    if (e.clientX < first.left || e.clientX > first.right || e.clientY < first.top || e.clientY >= last.bottom) return;
+    var index = items.length - 1;
+    for (var i = 0; i < items.length; i++) {
+      if (e.clientY < items[i].rect.bottom) { index = i; break; }
+    }
+    var position = index;
+    var center = items[index].center;
+    var adjacent = e.clientY < center ? index - 1 : index + 1;
+    if (items[adjacent]) {
+      position += (e.clientY - center) / Math.abs(items[adjacent].center - center);
+    }
+    fbFanPosition(Math.max(0, Math.min(items.length - 1, position)), index);
+  }
+
+  function fbFanActivate(e, menu) {
+    if (!fbFan || !fbPulloutHit) return;
+    // Resolve from the current pointer, not the node left under it by animation.
+    fbFanMove(e);
+    var hit = fbPulloutHit;
+    fbFanDismissedAt = e && typeof e.clientX === "number" ? { x: e.clientX, y: e.clientY } : null;
+    var sourceMenu = hit.querySelector(".fb-card-menu");
+    fbPulloutHide();
+    if (menu && sourceMenu) sourceMenu.click();
+    else hit.click();
   }
 
   function fbPulloutShow(hit) {
-    var card = hit && hit.querySelector ? hit.querySelector(".fb-card") : null;
-    if (!card) return;
-    if (hit === fbPulloutHit && fbPulloutEl) {
-      if (fbPulloutHideTimer) { clearTimeout(fbPulloutHideTimer); fbPulloutHideTimer = null; }
-      return;
-    }
-    fbPulloutHide();
-    hit.classList.add("extracted", "fb-preview-source");
-    var pop = document.createElement("div");
-    pop.className = "fb-pullout";
-    pop.setAttribute("aria-hidden", "true");
-    var clone = card.cloneNode ? card.cloneNode(true) : null;
-    if (!clone) return;
-    clone.className = "fb-card fb-pullout-card";
-    pop.appendChild(clone);
-    var sourceMenu = hit.querySelector(".fb-card-menu");
-    if (sourceMenu && sourceMenu.cloneNode) {
-      var floatingMenu = sourceMenu.cloneNode(true);
-      floatingMenu.tabIndex = -1; // 原卡仍是唯一键盘/读屏入口
-      floatingMenu.addEventListener("click", function (e) {
-        e.stopPropagation();
-        sourceMenu.click();
-        fbPulloutHide();
-      });
-      pop.appendChild(floatingMenu);
-    }
-    try { document.body.appendChild(pop); } catch (e) { return; }
-    var r = null;
-    try { r = hit.getBoundingClientRect ? hit.getBoundingClientRect() : null; } catch (e) {}
-    var vw = window.innerWidth || 1024;
-    var vh = window.innerHeight || 768;
-    var w = FB_PULLOUT_W;
-    var h = 160;
-    try {
-      if (pop.offsetWidth) w = pop.offsetWidth;
-      if (pop.offsetHeight) h = pop.offsetHeight;
-    } catch (e) {}
-    var left = (r && isFinite(r.left) ? r.left : 0) + 40;
-    var top = (r && isFinite(r.top) ? r.top : 0) - 7;
-    // 留出倾斜后的外接边界，避免靠近视口时切角。
-    if (left + w > vw - 16) left = vw - 16 - w;
-    if (left < 16) left = 16;
-    if (top + h > vh - 16) top = vh - 16 - h;
-    if (top < 16) top = 16;
-    pop.style.left = Math.round(left) + "px";
-    pop.style.top = Math.round(top) + "px";
-    fbPulloutEl = pop;
-    fbPulloutHit = hit;
-    try { document.body.classList.add("fb-pullout-on"); } catch (e) {}
-    // 浮层内点击 = 打开该切片（与旧实现「点击滑出卡打开」一致）；
-    // 指针进入浮层取消延迟收回，离开即收
-    pop.addEventListener("click", function () {
-      if (fbPulloutHit && typeof fbPulloutHit.click === "function") {
-        try { fbPulloutHit.click(); } catch (e) {}
+    if (!hit || !hit.querySelector(".fb-card")) return;
+    fbPulloutKeep();
+    if (fbFan) {
+      for (var n = 0; n < fbFan.items.length; n++) {
+        if (fbFan.items[n].hit === hit) { fbFanPosition(n, n); return; }
       }
+      fbPulloutHide();
+    }
+    var nodes = Array.prototype.filter.call(hit.parentNode ? hit.parentNode.children : [hit], function (node) {
+      return node.classList.contains("fb-hit");
     });
-    pop.addEventListener("pointerenter", function () {
-      if (fbPulloutHideTimer) { clearTimeout(fbPulloutHideTimer); fbPulloutHideTimer = null; }
+    if (nodes.indexOf(hit) < 0) nodes = [hit];
+    var stackRect = els.fbStack && els.fbStack.getBoundingClientRect ? els.fbStack.getBoundingClientRect() : null;
+    var fan = {
+      items: [], position: 0, pending: false,
+      top: Math.max(16, stackRect && stackRect.height ? nodes[0].getBoundingClientRect().top - 8 : 16),
+      bottom: Math.min(window.innerHeight - 16, stackRect && stackRect.height ? stackRect.bottom : window.innerHeight - 16),
+      right: window.innerWidth - 16,
+    };
+    nodes.forEach(function (node, i) {
+      var rect = node.getBoundingClientRect();
+      var pop = document.createElement("div");
+      pop.className = "fb-fan-card";
+      pop.dataset.slideId = node.dataset.slideId || "";
+      pop.setAttribute("aria-hidden", "true");
+      var clone = node.querySelector(".fb-card").cloneNode(true);
+      clone.className = "fb-card fb-pullout-card";
+      pop.appendChild(clone);
+      var sourceMenu = node.querySelector(".fb-card-menu");
+      var menu = null;
+      if (sourceMenu) {
+        menu = sourceMenu.cloneNode(true);
+        menu.tabIndex = -1;
+        menu.hidden = true;
+        menu.addEventListener("click", function (e) { e.stopPropagation(); fbFanActivate(e, true); });
+        pop.appendChild(menu);
+      }
+      var next = nodes[i + 1];
+      var band = next ? next.getBoundingClientRect().top - rect.top
+        : (i > 0 ? rect.top - fan.items[i - 1].rect.top : rect.height);
+      fan.items.push({ hit: node, pop: pop, menu: menu, rect: rect, center: rect.top + Math.min(rect.height, band) / 2 });
+      pop.addEventListener("pointerenter", fbPulloutKeep);
+      pop.addEventListener("pointerleave", fbPulloutScheduleHide);
+      pop.addEventListener("click", function (e) { fbFanActivate(e, false); });
+      document.body.appendChild(pop);
+      node.classList.add("fb-preview-source");
     });
-    pop.addEventListener("pointerleave", fbPulloutScheduleHide);
+    fbFan = fan;
+    document.body.classList.add("fb-pullout-on");
+    var index = nodes.indexOf(hit);
+    fan.position = index;
+    fbFanSelect(index);
+    fbFanPaint(fan);
   }
 
-  // 布局变化时抽层必须收回（命中区已移动/消失，浮层位置失真）
   function fbPulloutOnLayoutChange() { fbPulloutHide(); }
 
   // ---------- 通用小菜单（＋ / 文件夹 ⋯ / 卡片 ⋯ / 加入文件夹 / 移动到） ----------
@@ -11183,6 +11250,12 @@
     initAIPanelController();
     bindEvents();
     // 抽出层跟随窗口尺寸/滚动失效（改版第四轮 §1.1；捕获式滚动含侧栏内滚）
+    document.addEventListener("pointermove", function (e) {
+      if (fbFanDismissedAt && (Math.abs(e.clientX - fbFanDismissedAt.x) >= 2 || Math.abs(e.clientY - fbFanDismissedAt.y) >= 2)) fbFanDismissedAt = null;
+      fbFanMove(e);
+    }, true);
+    document.addEventListener("keydown", function (e) { if (e.key === "Escape") fbPulloutHide(); });
+    window.addEventListener("blur", fbPulloutHide);
     window.addEventListener("resize", fbPulloutOnLayoutChange);
     document.addEventListener("scroll", function () {
       // A pending hover measures its anchor after scrolling; only an already

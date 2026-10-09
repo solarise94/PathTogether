@@ -39,6 +39,9 @@
     "annotation.create": "annotation:write",
     "annotation.read": "annotation:read",
     "annotation.focus": "viewer:navigate",
+    // E3「描绘技能目标」：只读几何/身份读取（选中标注 > 选框 ROI > 视野 +
+    // slide_id/revision），无导航无写操作 → 与 selection.getBbox 同档。
+    "viewer.getSkillTarget": "slide:metadata:read",
   };
 
   // 仅这些 ID 可走特权通道。未知 ID fail-closed，禁止靠「不在表内」冒充 histopilot。

@@ -11281,6 +11281,14 @@
                mppX: state.slide.mppX, mppY: state.slide.mppY };
     }));
     host.onRequest("selection.getBbox", gate("selection.getBbox", function () { return currentSelectionBbox(); }));
+    host.onRequest("viewer.getSkillTarget", gate("viewer.getSkillTarget", function () {
+      // E3 描绘技能（viewer-drawing-skill-contract §2.1 target）：返回发送时
+      // 冻结的技能目标——优先级：选中标注 > 选框 ROI > 当前视野；含 slide_id /
+      // asset_revision 与 annotation 元数据。只读语义：只读几何读取，无副作用；
+      // 无切片 / 临时查看切片（只读视图）→ available:false + reason——插件据此
+      // 在 @ 候选显示「暂不可用」说明并引导到有编辑权限的工作台，不发写意图。
+      return currentSkillTarget();
+    }));
     host.onRequest("viewer.getViewport", gate("viewer.getViewport", function () {
       // P1「普通发送绑定浏览器当前视野」：返回当前 OpenSeadragon 视野的
       // level-0 像素 bbox {x,y,w,h}，供插件随 run/continue 发送附带，使
@@ -11519,6 +11527,59 @@
                w: rectItemW(editItem), h: rectItemH(editItem) };
     }
     return null;
+  }
+
+  // E3（viewer-drawing-skill-contract §2.1）：viewer.getSkillTarget 的单一实现。
+  // 技能目标冻结的宿主侧取值（发送时由插件经桥调用一次；本函数只读，无副作用）：
+  //   - kind="annotation"：当前选中标注（稳定 annotation_id + revision + level-0
+  //     包围盒）。结果永远是新建 pending 标记——本查询不授予编辑该标注的权限；
+  //   - kind="roi"：选框 ROI（level-0，取整）；
+  //   - kind="viewport"：当前视野 level-0 bbox（level0ViewportBbox 单一实现）；
+  //   - slide_id / asset_revision 随当前切片身份下发（宽容缺省 null——旧后端
+  //     DTO 无 slide_id / asset_revision 时，切片一致性由 PT /api/ai/run 的
+  //     slide ref 校验兜底）；
+  //   - 无切片 → {available:false, reason:"no_slide"}；临时查看切片（§5.5 只读
+  //     视图）→ {available:false, reason:"readonly"}——都不抛错，插件按「暂
+  //     不可用」说明呈现。
+  function currentSkillTarget() {
+    if (!state.slide) return { available: false, reason: "no_slide" };
+    if (state.slide.temporaryViewExpiresAt) return { available: false, reason: "readonly" };
+    var slideId = state.slide.id || null;
+    var assetRevision = state.slide.revision || null;
+    // 1) 选中标注优先（须有稳定 annotation_id；几何取三形包围盒，非法回落）。
+    if (editItem && editItem.annotation_id) {
+      var ab = annoItemBbox(editItem);
+      if (ab) {
+        return {
+          available: true, kind: "annotation", bbox: ab,
+          slide_id: slideId, asset_revision: assetRevision,
+          annotation_id: String(editItem.annotation_id),
+          annotation_revision: Number(editItem.revision) > 0 ? Math.round(Number(editItem.revision)) : null,
+        };
+      }
+    }
+    // 2) 选框 ROI。
+    if (state.roi && state.roi.w > 0 && state.roi.h > 0) {
+      return {
+        available: true, kind: "roi",
+        bbox: {
+          x: Math.round(Number(state.roi.x) || 0),
+          y: Math.round(Number(state.roi.y) || 0),
+          w: Math.round(Number(state.roi.w) || 0),
+          h: Math.round(Number(state.roi.h) || 0),
+        },
+        slide_id: slideId, asset_revision: assetRevision,
+        annotation_id: null, annotation_revision: null,
+      };
+    }
+    // 3) 当前视野（viewer 未就绪/几何非法 → available:false，不抛错）。
+    var vb = level0ViewportBbox();
+    if (!vb) return { available: false, reason: "viewer_not_ready" };
+    return {
+      available: true, kind: "viewport", bbox: vb,
+      slide_id: slideId, asset_revision: assetRevision,
+      annotation_id: null, annotation_revision: null,
+    };
   }
 
   // 标注面板行内的 AI 动作按钮（fork 快速问答 / branch 从此处深读）。

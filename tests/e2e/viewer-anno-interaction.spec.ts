@@ -13,12 +13,8 @@
  *    → 解锁请求单独发（geometry_locked，无 geom 键）；
  *  - 分享页：polygon 分享投影可见；只读标记拖动零 PATCH。
  *
- * 已知后端缺口（不在本轮前端清单内，联调项见文件尾 fixme 用例）：
- *  id_bundle 切片（P2 后所有新上传）legacy_filename=NULL，`_resolve_anno_by_id`
- *  的 `can_annotate_slide(roi.slide)` 走名通道 → 工作台按 id PATCH 一律 403
- *  「无权访问」（token/index 路由与读路径正常）。因此「松手 PATCH 必须 200 +
- *  刷新保持」的端到端断言以 test.fixme 记录，待后端把 by-id 写路径改走 ID
- *  通道后取消 fixme 即可（前端请求载荷契约已在下方逐条验证）。
+ *  - by-id 写路径（松手保存、工具条锁定）在 id_bundle 切片上按 slide_id
+ *    鉴权，200 后刷新保持几何与锁状态（文件尾用例）。
  */
 import { expect, test, type Page } from "@playwright/test";
 import { readFileSync } from "node:fs";
@@ -264,6 +260,17 @@ test.describe("viewer 标注交互（§5.4/§6，真实后端）", () => {
 		await page.screenshot({ path: `${EVIDENCE_DIR}/e2e-selected-toolbar.png` });
 
 		// --- 已选中：按住拖动 = 移动整个对象（一次 PATCH；差量、带 CAS） ---
+		// 首个 PATCH 模拟服务端失败，用于 §6.4「未保存 · 重试」路径
+		let failNext = true;
+		await page.route((url) => annoPatchUrl(url), async (route) => {
+			if (route.request().method() === "PATCH" && failNext) {
+				failNext = false;
+				await route.fulfill({ status: 503, contentType: "application/json",
+					body: JSON.stringify({ error: "unavailable" }) });
+				return;
+			}
+			await route.continue();
+		});
 		const c2 = await markerCenter(page);
 		await page.mouse.move(c2.x, c2.y);
 		await page.mouse.down();
@@ -280,10 +287,18 @@ test.describe("viewer 标注交互（§5.4/§6，真实后端）", () => {
 		expect(Math.abs((moved!.y - panned!.y) - 30),
 			`拖动位移 dy=${moved!.y - panned!.y}`).toBeLessThanOrEqual(4);
 
-		// --- §6.4：保存失败（已知后端 id_bundle 名通道缺口 → 403）时
-		//        保留草稿并显示「未保存 · 点击重试」，不显示成功 ---
-		await expect(page.locator(".anno-save-status.unsaved")).toBeVisible({ timeout: 10_000 });
+		// --- §6.4：保存失败时保留草稿并显示「未保存 · 点击重试」，不显示成功；
+		//        重试走真实后端 200 ---
+		const unsaved = page.locator(".anno-save-status.unsaved");
+		await expect(unsaved).toBeVisible({ timeout: 10_000 });
 		await page.screenshot({ path: `${EVIDENCE_DIR}/e2e-unsaved-chip.png` });
+		const [retry] = await Promise.all([
+			page.waitForResponse((r) => r.request().method() === "PATCH"
+				&& annoPatchUrl(new URL(r.url()))),
+			unsaved.click(),
+		]);
+		expect(retry.status()).toBe(200);
+		await expect(unsaved).toHaveCount(0);
 	});
 
 	test("编辑态拖右下角缩放：四角双轴，PATCH 载荷 w/h 变大且 x/y 不增", async ({ page }) => {
@@ -553,11 +568,9 @@ test.describe("viewer 标注交互（§5.4/§6，真实后端）", () => {
 	});
 
 	// ------------------------------------------------------------------
-	// 待后端联调（已知缺口，见文件头说明）：by-id 写路径在 id_bundle 切片上
-	// 403，因此「PATCH 200 + 服务端持久化」暂时无法端到端断言。后端把
-	// `_resolve_anno_by_id` 的写能力判定改走 ID 通道后，取消下方 fixme。
+	// 工作台 by-id 写路径端到端：松手一次 PATCH、工具条锁定、刷新后保持。
 	// ------------------------------------------------------------------
-	test.fixme("松手 PATCH 200 + 刷新保持（待后端 by-id 写路径支持 id_bundle 切片）", async ({ page }) => {
+	test("松手 PATCH 200 + 刷新保持（by-id 写路径按 slide_id 鉴权）", async ({ page }) => {
 		const SID = CREDS.rasterSlides.workbench.slide_id;
 		await initSession(page);
 		await login(page, CREDS.userLogin, CREDS.userPassword);
@@ -578,6 +591,20 @@ test.describe("viewer 标注交互（§5.4/§6，真实后端）", () => {
 			r.request().method() === "PATCH" && annoPatchUrl(new URL(r.url())));
 		expect(resp.status()).toBe(200);
 		const body = (resp.request().postDataJSON() as { geom: Record<string, number> }).geom;
+		// 真实工具条「锁定位置」：单独请求、无 geom、带 CAS，服务端 200
+		const lockBtn = page.locator("#anno-obj-toolbar .aot-lock");
+		await expect(lockBtn).toBeVisible();
+		const [lockResp] = await Promise.all([
+			page.waitForResponse((r) => r.request().method() === "PATCH"
+				&& annoPatchUrl(new URL(r.url()))
+				&& "geometry_locked" in ((r.request().postDataJSON() || {}) as object)),
+			lockBtn.click(),
+		]);
+		const lockReq = lockResp.request().postDataJSON() as Record<string, unknown>;
+		expect(lockReq.geometry_locked).toBe(true);
+		expect(lockReq).not.toHaveProperty("geom");
+		expect(typeof lockReq.expected_revision).toBe("number");
+		expect(lockResp.status()).toBe(200);
 		await page.reload();
 		await expandSidebar(page);
 		await page.locator(`.fb-hit[data-slide-id="${SID}"]`).click();
@@ -587,6 +614,6 @@ test.describe("viewer 标注交互（§5.4/§6，真实后端）", () => {
 		((replay.j.annotations || []) as Array<{ items?: Array<Record<string, unknown>> }>)
 			.forEach((grp) => (grp.items || []).forEach((it) => items.push(it)));
 		expect(items.find((it) => it.annotation_id === annoId))
-			.toMatchObject(body);
+			.toMatchObject({ ...body, geometry_locked: true });
 	});
 });

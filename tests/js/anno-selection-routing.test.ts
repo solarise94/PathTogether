@@ -76,7 +76,59 @@ describe("§6.1 统一选中视觉（share.js）", () => {
 
 	it("锁定/只读对象不画编辑手柄（drawEditHandles 调用点过 canDragShareItem）", () => {
 		expect(shareSrc).toMatch(
-			/editItem && state\.editing && canDragShareItem\(editItem\) && state\.showAnno/);
+			/editItem && canDragShareItem\(editItem\) && state\.showAnno/);
+	});
+});
+
+describe("§6.2 选中即可拖柄（首次点击选择，下一次按住即可移动/直接拖控制点）", () => {
+	it("app：手柄显示不再以「编辑态」为前提，但锁定/只读仍无柄", () => {
+		const fn = extractFn(appSrc, "redrawAnnoCanvas");
+		expect(fn).toMatch(/editItem && state\.showAnno && canDragItem\(editItem\)/);
+		expect(fn).not.toMatch(/editing && state\.showAnno/);
+	});
+
+	it("app：容器路由的控制点命中不要求先点「编辑备注」", () => {
+		const fn = extractFn(appSrc, "routeObjectPointerDown");
+		expect(fn).toMatch(/if \(editItem && canDragItem\(editItem\)\) \{/);
+		expect(fn).not.toMatch(/editItem && editing && canDragItem/);
+		// 拖柄优先于本体移动（角/端点/包围框柄命中先于 move）
+		const idxHandle = fn.indexOf("hitHandle");
+		const idxMove = fn.indexOf('startEditDrag(e, hit, "move"');
+		expect(idxHandle).toBeGreaterThan(-1);
+		expect(idxMove).toBeGreaterThan(idxHandle);
+	});
+
+	it("app：画布层遗留编辑分支同口径（无 editing 前置）", () => {
+		const fn = extractFn(appSrc, "onAnnoPointerDown");
+		expect(fn).toMatch(/if \(editItem && canDragItem\(editItem\)\) \{/);
+		expect(fn).not.toMatch(/editItem && editing && canDragItem/);
+	});
+
+	it("share：手柄显示与容器路由同样去掉 editing/state.editing 前提", () => {
+		const redraw = extractFn(shareSrc, "redrawAnnoCanvas");
+		expect(redraw).toMatch(/editItem && canDragShareItem\(editItem\) && state\.showAnno/);
+		expect(redraw).not.toMatch(/state\.editing && canDragShareItem/);
+		const route = extractFn(shareSrc, "routeObjectPointerDown");
+		expect(route).toMatch(/if \(editItem && canDragShareItem\(editItem\)\) \{/);
+		expect(route).not.toMatch(/editItem && state\.editing && canDragShareItem/);
+		const canvas = extractFn(shareSrc, "onAnnoPointerDown");
+		expect(canvas).toMatch(/if \(editItem && canDragShareItem\(editItem\)\) \{/);
+	});
+
+	it("「编辑备注」仍是备注卡入口：selectEditItem 复位卡片模式、编辑卡两态保留", () => {
+		// 选中复位 note-card 模式（handlesActive 已并入选中语义）
+		expect(extractFn(appSrc, "selectEditItem")).toMatch(/editing = false/);
+		expect(extractFn(shareSrc, "selectEditItem")).toMatch(/state\.editing = false/);
+		// 编辑卡的 ✎ 编辑入口仍把卡片切到保存/取消模式
+		expect(appSrc).toMatch(/editing = true;/);
+		expect(shareSrc).toMatch(/state\.editing = true;/);
+	});
+
+	it("锁定/只读对象依旧无柄（canDragItem 闸保留在显示与路由两处）", () => {
+		expect(extractFn(appSrc, "redrawAnnoCanvas")).toMatch(/canDragItem\(editItem\)/);
+		expect(extractFn(appSrc, "routeObjectPointerDown")).toMatch(/canDragItem\(editItem\)/);
+		expect(extractFn(shareSrc, "redrawAnnoCanvas")).toMatch(/canDragShareItem\(editItem\)/);
+		expect(extractFn(shareSrc, "routeObjectPointerDown")).toMatch(/canDragShareItem\(editItem\)/);
 	});
 });
 

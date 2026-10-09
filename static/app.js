@@ -1064,7 +1064,8 @@
 
   // 编辑模式状态：选中/拖动（管理端所有标注可编辑）
   // editItem：flatItems 中的引用（可改本地几何）；editDrag：拖动会话
-  // editing：是否处于「显式编辑态」（进入后画手柄、可拖动，防误挪位置）
+  // editing：备注卡的「保存/取消」模式（§6.2 改版后柄显示与拖动只看
+  // 选中 + canDragItem，不再以此标志为前提；仅备注卡按钮形态用）
   var editItem = null;
   var editDrag = null;
   var editing = false;
@@ -6074,8 +6075,8 @@
         annoCtx.restore();
       });
     }
-    // 编辑手柄（仅显式编辑态才画，纯选中不画，防误挪位置；锁定/只读无手柄 §6.3）
-    if (editItem && editing && state.showAnno && canDragItem(editItem)) {
+    // 编辑手柄（§6.2：首次点击选择即可直接拖控制点；§6.3：锁定/只读无柄）
+    if (editItem && state.showAnno && canDragItem(editItem)) {
       drawEditHandles(editItem);
     }
     // 绘制中的预览
@@ -6592,7 +6593,7 @@
   function selectEditItem(it) {
     editItem = it;
     // §6.1：选中不再隐藏其它标记（「只看这条」收进 ⋯ 菜单，与选择分开）
-    editing = false;  // 选中只是查看，不进入可拖动编辑态
+    editing = false;  // 备注卡回到查看形态（柄显示只看 canDragItem，§6.2）
     state.polygonVertexEdit = null;
     editBeforeSnapshot = {
       token: it.token,
@@ -6963,15 +6964,15 @@
     if (!state.showAnno) return;
     e.preventDefault(); e.stopPropagation();
     var sp = screenPt(e);
-    // 显式编辑态且点中手柄 → 拖动手柄（平移/缩放必须先进入编辑态）
-    if (editItem && editing && canDragItem(editItem)) {
+    // 点中手柄 → 拖动手柄（§6.2：选中即可拖柄；锁定/只读无柄）
+    if (editItem && canDragItem(editItem)) {
       var hd = hitHandle(sp.x, sp.y, editItem);
       if (hd) {
         startEditDrag(e, editItem, hd);
         return;
       }
     }
-    // 命中标注 → 重新选中查看（editing 复位，不直接平移；要改需先点"✎ 编辑"）
+    // 命中标注 → 重新选中查看（备注卡复位；选中即可拖柄/移动，§6.2）
     var hit = hitAnno(sp.x, sp.y);
     if (hit) {
       selectEditItem(hit);
@@ -7406,8 +7407,9 @@
     if (rectToolActive() || state.drawMode) return;  // 显式绘制：画布层自有路径
     if (!state.showAnno) return;
     var sp = screenPt(e);
-    // 1) 已选中 + 显式编辑态：控制点命中 → 调整（角双轴/边单轴/端点/顶点）
-    if (editItem && editing && canDragItem(editItem)) {
+    // 1) 已选中可编辑对象：控制点命中 → 调整（角双轴/边单轴/端点/包围框柄；
+    //    §6.2「可直接拖控制点调整」——无需先点「编辑备注」）
+    if (editItem && canDragItem(editItem)) {
       var hd = hitHandle(sp.x, sp.y, editItem);
       if (hd) {
         consumePointer(e);
@@ -7417,8 +7419,7 @@
     }
     var hit = hitAnno(sp.x, sp.y);
     // 2) 已选中、未锁、可编辑的本体 → 移动整个对象（消费）
-    if (hit && hit === editItem && canDragItem(hit) &&
-        !(editItem && editing && hitHandle(sp.x, sp.y, editItem))) {
+    if (hit && hit === editItem && canDragItem(hit)) {
       consumePointer(e);
       startEditDrag(e, hit, "move", viewer.container);
       updateAnnoToolbarPos();
@@ -7494,7 +7495,8 @@
     if (state.polygonVertexEdit === it) { finishPolygonVertexEdit(it); return; }
     state.polygonVertexEdit = it;
     it.__vertexEditStart = snapshotGeom(it);
-    editing = true;  // 进入可拖动编辑态（画顶点/加顶点柄）
+    // （顶点/加顶点柄由 editHandles 的 polygonVertexEdit 分支渲染；
+    //   editing 只表示备注卡模式，不再承担柄显示职责）
     closeAnnoToolbarMenu();
     renderAnnoToolbar();
     redrawAnnoCanvas();
@@ -8409,7 +8411,7 @@
         toast(t("draw.cancelled"), "info");
         return;
       }
-      if (editItem && editing && editBeforeSnapshot &&
+      if (editItem && editBeforeSnapshot &&
           !geomEqual(editBeforeSnapshot.geom, buildEditGeom(editItem))) {
         e.preventDefault();
         var s0 = editBeforeSnapshot.geom, it0 = editItem;
@@ -8859,7 +8861,7 @@
     if (match) {
       editItem = match;     // 选中态：drawAnnoItem 会给蓝色描边
       // §6.1：定位 ≠ 只看——选中不再隐藏其它标记（focus 只由 ⋯「只看此标记」控制）
-      editing = false;      // 只高亮，不开可拖动编辑态
+      editing = false;      // 备注卡查看形态（选中本身即可拖柄，§6.2）
       closeEditCard();      // 不弹编辑卡（仅点击行，非"编辑"按钮）
       openAnnoToolbar();
       redrawAnnoCanvas();
@@ -9212,7 +9214,7 @@
   function jumpAndEditAnno(it) {
     var match = jumpToAnno(it);
     if (match) {
-      editing = false;        // 打开"查看态"编辑卡（含 ✎ 编辑入口）
+      editing = false;        // 打开"查看态"编辑卡（✎ 切保存/取消形态）
       openEditCard(match);
     }
   }

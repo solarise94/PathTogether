@@ -260,6 +260,9 @@ test.describe("viewer 标注交互（§5.4/§6，真实后端）", () => {
 		await page.screenshot({ path: `${EVIDENCE_DIR}/e2e-selected-toolbar.png` });
 
 		// --- 已选中：按住拖动 = 移动整个对象（一次 PATCH；差量、带 CAS） ---
+		// 选中基线（含手柄范围）：与拖动后的量测同态，位移对比不受
+		// 「选中态画柄/未选中态无柄」的外扩差影响
+		const selBb = await annoCanvasBBox(page);
 		// 首个 PATCH 模拟服务端失败，用于 §6.4「未保存 · 重试」路径
 		let failNext = true;
 		await page.route((url) => annoPatchUrl(url), async (route) => {
@@ -282,10 +285,10 @@ test.describe("viewer 标注交互（§5.4/§6，真实后端）", () => {
 		expect(patchBodies[0]).toHaveProperty("expected_revision");
 		expect(patchBodies[0]).not.toHaveProperty("note"); // 差量：备注不夹带
 		const moved = await annoCanvasBBox(page);
-		expect(Math.abs((moved!.x - panned!.x) - 40),
-			`拖动位移 dx=${moved!.x - panned!.x}`).toBeLessThanOrEqual(4);
-		expect(Math.abs((moved!.y - panned!.y) - 30),
-			`拖动位移 dy=${moved!.y - panned!.y}`).toBeLessThanOrEqual(4);
+		expect(Math.abs((moved!.x - selBb!.x) - 40),
+			`拖动位移 dx=${moved!.x - selBb!.x}`).toBeLessThanOrEqual(3);
+		expect(Math.abs((moved!.y - selBb!.y) - 30),
+			`拖动位移 dy=${moved!.y - selBb!.y}`).toBeLessThanOrEqual(3);
 
 		// --- §6.4：保存失败时保留草稿并显示「未保存 · 点击重试」，不显示成功；
 		//        重试走真实后端 200 ---
@@ -301,7 +304,7 @@ test.describe("viewer 标注交互（§5.4/§6，真实后端）", () => {
 		await expect(unsaved).toHaveCount(0);
 	});
 
-	test("编辑态拖右下角缩放：四角双轴，PATCH 载荷 w/h 变大且 x/y 不增", async ({ page }) => {
+	test("选中后直接拖右下角缩放（§6.2 可直接拖控制点，无需先点编辑备注）", async ({ page }) => {
 		const SID = CREDS.rasterSlides.workbench.slide_id;
 		await initSession(page);
 		await login(page, CREDS.userLogin, CREDS.userPassword);
@@ -320,15 +323,16 @@ test.describe("viewer 标注交互（§5.4/§6，真实后端）", () => {
 			}
 		});
 
-		// 选中 → 工具条「编辑备注」进入显式编辑态（画手柄）
+		// 单击选中：手柄立即显示（§6.2/§6.1「只有真正可编辑时才显示调整柄」
+		// ——选中即可拖控制点，「编辑备注」只是备注卡入口）
 		const c = await markerCenter(page);
 		await page.mouse.click(c.x, c.y);
 		const toolbar = page.locator("#anno-obj-toolbar");
 		await expect(toolbar).toBeVisible();
-		await toolbar.locator(".aot-note").click();
-		await page.waitForTimeout(300); // 重绘手柄
+		await expect(toolbar).toContainText("编辑备注"); // 备注卡入口仍在
+		await page.waitForTimeout(400); // 重绘选中轮廓 + 手柄
 
-		// 拖右下角手柄（外接框右下角内 2px）
+		// 直接拖右下角控制点（外接框右下角内 2px；不点「编辑备注」）
 		const bb = await annoCanvasBBox(page);
 		expect(bb).toBeTruthy();
 		const hx = bb!.cx + bb!.x + bb!.w - 2;

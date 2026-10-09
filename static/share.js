@@ -179,7 +179,8 @@
   // 编辑模式状态：选中/拖动
   // editItem：当前选中的标注（currentRois 中的引用副本，可改本地几何）
   // editDrag：拖动会话 {handle, pointerId, ...起点快照}
-  // state.editing：是否处于「显式编辑态」（进入后画手柄、可拖动，防误挪位置）
+  // state.editing：备注卡的「保存/取消」模式（§6.2 改版后柄显示与拖动只看
+  // 选中 + canDragShareItem；分享端拖完仍显式保存，契约不变）
   var editItem = null;
   var editDrag = null;
 
@@ -1100,8 +1101,8 @@
         drawAnnoItem(it, labelColor(it.label), selected, !animating);
       });
     }
-    // 编辑手柄（仅显式编辑态才画，纯选中不画，防误挪位置；锁定/只读无手柄 §6.3）
-    if (editItem && state.editing && canDragShareItem(editItem) && state.showAnno) {
+    // 编辑手柄（§6.2：首次点击选择即可直接拖控制点；§6.3：锁定/只读无柄）
+    if (editItem && canDragShareItem(editItem) && state.showAnno) {
       drawEditHandles(editItem);
     }
     // 绘制中预览
@@ -1894,8 +1895,9 @@
     if (rectModeActive() || state.drawMode) return;  // 显式绘制：画布层自有路径
     if (!state.showAnno) return;
     var sp = screenPt(e);
-    // 1) 已选中 + 显式编辑态：控制点命中 → 调整
-    if (editItem && state.editing && canDragShareItem(editItem)) {
+    // 1) 已选中可编辑对象：控制点命中 → 调整（§6.2「可直接拖控制点调整」；
+    //    拖完仍等用户点「保存」——分享端显式保存契约不变）
+    if (editItem && canDragShareItem(editItem)) {
       var hd = hitHandle(sp.x, sp.y, editItem);
       if (hd) {
         consumePointer(e);
@@ -1987,7 +1989,8 @@
     if (state.polygonVertexEdit === it) { finishPolygonVertexEdit(it); return; }
     state.polygonVertexEdit = it;
     it.__vertexEditStart = snapshotGeom(it);
-    state.editing = true;
+    // （顶点/加顶点柄由 editHandles 的 polygonVertexEdit 分支渲染；
+    //   state.editing 只表示备注卡模式，不再承担柄显示职责）
     closeAnnoToolbarMenu();
     renderAnnoToolbar();
     redrawAnnoCanvas();
@@ -2333,8 +2336,8 @@
     if (!state.showAnno) return;
     e.preventDefault(); e.stopPropagation();
     var sp = screenPt(e);
-    // 显式编辑态且点中手柄 → 拖动手柄（平移/缩放必须先进入编辑态）
-    if (editItem && state.editing && canDragShareItem(editItem)) {
+    // 点中手柄 → 拖动手柄（§6.2：选中即可拖柄；锁定/只读无柄）
+    if (editItem && canDragShareItem(editItem)) {
       var hd = hitHandle(sp.x, sp.y, editItem);
       if (hd) {
         startEditDrag(e, editItem, hd);

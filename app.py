@@ -2602,6 +2602,34 @@ def _parse_snapshot_provenance(body, require_snapshot_id=False):
     return prov, None
 
 
+def _parse_skill_provenance(body):
+    """描绘写请求的技能溯源字段（0082 / 契约 §6，可选 additive）。
+
+    - ``skill`` ∈ {"delineate"}；``skill_intent`` ∈ {"explicit","natural"}
+      且必须与 skill 一同携带；
+    - 给出即校验形态（畸形 → err，调用方一律 400，不把垃圾持久化）；
+    - 仅点列（polygon/freehand）路径调用——矩形 create_annotation 保持现状，
+      不带技能溯源。
+
+    授权不依赖本字段（grant 列才是闸门）；它只标注「本次结果由技能调用创建」。
+    返回 (dict, err)：dict 为仅含合法给出键的 provenance 增量。
+    """
+    out = {}
+    skill = body.get("skill")
+    if skill is not None:
+        if skill != "delineate":
+            return None, "skill 需为 delineate"
+        out["skill"] = skill
+    intent = body.get("skill_intent")
+    if intent is not None:
+        if intent not in ("explicit", "natural"):
+            return None, "skill_intent 需为 explicit|natural"
+        if skill is None:
+            return None, "skill_intent 需与 skill 一同携带"
+        out["skill_intent"] = intent
+    return out, None
+
+
 # --------------------------------------------------------------------------- #
 # P1-3（二轮 review）：来源快照 provenance 权威归属验证
 # --------------------------------------------------------------------------- #
@@ -17662,10 +17690,190 @@ def _validate_ai_attachments(body, slide):
                     return None, (jsonify(
                         error="revision_conflict",
                         current_revision=current), 409)
-            rec["annotation_id"] = aid
-            rec["revision"] = int(roi.get("revision") or 1)
-            rec["type"] = roi.get("type")
+        rec["annotation_id"] = aid
+        rec["revision"] = int(roi.get("revision") or 1)
+        rec["type"] = roi.get("type")
         out.append(rec)
+    return out, None
+
+
+_AI_SKILL_WHITELIST = frozenset({"delineate"})
+_AI_SKILL_TARGET_KINDS = frozenset({"viewport", "roi", "annotation", "slide"})
+
+
+def _validate_ai_skill_request(body, slide, slide_id=None):
+    """描绘技能请求键的校验与白名单重建（0082 / 契约 §2，E1c）。
+
+    浏览器 run|continue body 可带四键（全部**提示不是凭证**，授权由 HP 判定 +
+    grant 列执法）：
+      - ``requested_skills``: ["delineate"]（白名单；空数组合法=无请求）；
+      - ``skill_intent``: "explicit" | "natural"（可选）；
+      - ``dismissed_skills``: 同白名单（用户删除「描绘 · 本次」标签）；
+      - ``target``: {slide_id, asset_revision?, kind, bbox?, annotation_id?,
+        annotation_revision?}——发送时冻结的目标范围。
+    四键全缺 → (None, None)（旧 UI 不带，行为不变）。
+
+    target 校验（先于预算预占，零副作用拒绝）：
+      - slide_id 必填且必须与本次 run 指向同一资产（不符 400 slide_ref_conflict
+        ——跨切片草稿不得携带旧几何）；
+      - asset_revision 给出则与当前权威 revision 比对，不符 409
+        slide_revision_conflict（同 expected_asset_revision 语义）；
+      - kind ∈ viewport|roi|annotation|slide；viewport/roi 必带合法 bbox
+        （同 _validate_ai_viewport 口径）；slide 不带 bbox；
+      - kind=annotation：annotation_id 必填，标注存在、未删除、属于本切片、
+        当前主体可读，annotation_revision 与当前一致（不符 409
+        revision_conflict）。引用只提供范围——不授予编辑该标注的权限。
+
+    返回 (parsed, err)：parsed 为仅含合法给出键的白名单 dict（供转发 payload）；
+    err 非 None 时为 Flask (body, status) tuple。
+    """
+    if not isinstance(body, dict):
+        return None, None
+    keys = ("requested_skills", "skill_intent", "dismissed_skills", "target")
+    if not any(k in body for k in keys):
+        return None, None
+    out = {}
+
+    def _skill_list(name):
+        v = body.get(name)
+        if v is None:
+            return None, None
+        if not isinstance(v, list) or not all(
+                isinstance(s, str) for s in v):
+            return None, (jsonify(error="%s 需为字符串数组" % name,
+                                  code="invalid_argument"), 400)
+        bad = [s for s in v if s not in _AI_SKILL_WHITELIST]
+        if bad:
+            return None, (jsonify(
+                error="%s 含未知技能 %r（白名单：delineate）" % (name, bad),
+                code="invalid_argument"), 400)
+        return v, None
+
+    req, err = _skill_list("requested_skills")
+    if err is not None:
+        return None, err
+    if req is not None:
+        out["requested_skills"] = req
+    dis, err = _skill_list("dismissed_skills")
+    if err is not None:
+        return None, err
+    if dis is not None:
+        out["dismissed_skills"] = dis
+
+    intent = body.get("skill_intent")
+    if intent is not None:
+        if intent not in ("explicit", "natural"):
+            return None, (jsonify(
+                error="skill_intent 需为 explicit|natural",
+                code="invalid_argument"), 400)
+        out["skill_intent"] = intent
+
+    target = body.get("target")
+    if target is not None:
+        if not isinstance(target, dict):
+            return None, (jsonify(error="target 需为对象",
+                                  code="invalid_argument"), 400)
+        kind = target.get("kind")
+        if kind not in _AI_SKILL_TARGET_KINDS:
+            return None, (jsonify(
+                error="target.kind 需为 viewport|roi|annotation|slide",
+                code="invalid_argument"), 400)
+        t_slide_id = target.get("slide_id")
+        if not isinstance(t_slide_id, str) or not t_slide_id:
+            return None, (jsonify(error="target.slide_id 必填",
+                                  code="invalid_argument"), 400)
+        # 目标切片必须与本次 run 指向同一资产（跨切片草稿不携带旧几何）。
+        # 修复4（主代理 review）：run 已知 slide_id 时**先比较后解析**——不符
+        # 直接 400 slide_ref_conflict，不解析外部 id（不向任意 slide_id 暴露
+        # 存在性：404 与 400 不再可区分）。仅名通道（run 无 slide_id）才需要
+        # 解析 target.slide_id 以取得可比对的名。
+        if slide_id is not None:
+            if t_slide_id != slide_id:
+                return None, (jsonify(
+                    error="target.slide_id 与本次对话切片不符",
+                    code="slide_ref_conflict"), 400)
+        else:
+            try:
+                t_desc = slide_store.resolve_slide_id(t_slide_id)
+            except Exception:
+                app.logger.warning("target.slide_id 解析失败（fail-closed）：%s",
+                                   t_slide_id, exc_info=True)
+                t_desc = None
+            if t_desc is None:
+                return None, (jsonify(error="target.slide_id 不存在",
+                                      code="slide_not_found"), 404)
+            t_name = (getattr(t_desc, "legacy_filename", None)
+                      or getattr(t_desc, "original_filename", None) or "")
+            if slide is not None and t_name and t_name != slide:
+                return None, (jsonify(
+                    error="target.slide_id 与本次对话切片不符",
+                    code="slide_ref_conflict"), 400)
+        clean = {"slide_id": t_slide_id, "kind": kind}
+        # 资产 revision：给出即比对（快照过期 → 409，不静默写）。
+        asset_rev = target.get("asset_revision")
+        if asset_rev is not None:
+            if not isinstance(asset_rev, str) or not asset_rev.strip():
+                return None, (jsonify(
+                    error="target.asset_revision 需为非空字符串",
+                    code="invalid_argument"), 400)
+            cur_rev = _slide_revision(t_desc)
+            if asset_rev != cur_rev:
+                return None, (jsonify(
+                    error="slide_revision_conflict",
+                    current_slide_asset_revision=cur_rev), 409)
+            clean["asset_revision"] = asset_rev
+        if kind in ("viewport", "roi"):
+            bbox = target.get("bbox")
+            if bbox is None:
+                return None, (jsonify(
+                    error="target.kind=%s 必须携带 bbox" % kind,
+                    code="invalid_argument"), 400)
+            vp, vp_err = _validate_ai_viewport({"viewport": bbox})
+            if vp_err is not None:
+                return None, vp_err
+            clean["bbox"] = vp
+        if kind == "annotation":
+            aid = target.get("annotation_id")
+            if not isinstance(aid, str) or not aid:
+                return None, (jsonify(
+                    error="target.kind=annotation 必须携带 annotation_id",
+                    code="invalid_argument"), 400)
+            roi = share_store.get_roi_by_annotation_id(aid)
+            if roi is None or roi.get("deleted"):
+                return None, (jsonify(error="标注不存在",
+                                      code="annotation_not_found"), 404)
+            # 修复5（主代理 review）：归属比较 slide_id 优先——ID-only/迁移
+            # 资产的 roi.slide 名可能为空或旧别名（生产曾因名比较误拒 400）。
+            # 双方都有 slide_id → 只比 ID；任一侧缺 ID → 回退名比较；名也
+            # 缺失时不在此处拦截（存在性/可见性仍有 can_read 兜底）。
+            roi_sid = roi.get("slide_id") or None
+            if slide_id is not None and roi_sid is not None:
+                if roi_sid != slide_id:
+                    return None, (jsonify(error="标注不属于当前切片",
+                                          code="forbidden"), 403)
+            else:
+                roi_name = roi.get("slide") or ""
+                if roi_name and slide and roi_name != slide:
+                    return None, (jsonify(error="标注不属于当前切片",
+                                          code="forbidden"), 403)
+            subject = annotation_access.subject_from_request()
+            if not annotation_access.can_read_annotation(subject, roi):
+                return None, (jsonify(error="标注不存在",
+                                      code="annotation_not_found"), 404)
+            expected = target.get("annotation_revision")
+            try:
+                expected = int(expected)
+            except (TypeError, ValueError):
+                return None, (jsonify(error="target.annotation_revision 需为整数",
+                                      code="invalid_argument"), 400)
+            current = int(roi.get("revision") or 1)
+            if expected != current:
+                return None, (jsonify(
+                    error="revision_conflict",
+                    current_revision=current), 409)
+            clean["annotation_id"] = aid
+            clean["annotation_revision"] = current
+        out["target"] = clean
     return out, None
 
 
@@ -18004,16 +18212,19 @@ def internal_ai_annotate():
     body_type = body.get("type")
     points_norm = None
     snap_prov = {}
+    skill_prov = {}
     if body_type in ("polygon", "freehand"):
-        # P1-4 收口（review-2026-09-07）：legacy internal 通道与 plugin v1
-        # 同闸——polygon/freehand 描绘要求会话镜像开关为 true（无 session_id
-        # 或镜像无行/false 一律 403 fail closed），internal token 不再单独
-        # 放行描绘写入。
-        mirror_flag = share_store.get_ai_session_drawing_flag(
-            str(body.get("session_id") or ""))
-        if mirror_flag is not True:
+        # 描绘技能闸门（0082 / 契约 §4.2，裁决 2/3）：legacy internal 通道同
+        # 样以 run grant 复查——按 session+slide 查活跃（未撤/未过期）且
+        # allow_ai_drawing=true 的 grant，并复查创建者写权限；无 → 403
+        # fail closed。internal token 只完成传输鉴权，不构成描绘授权；
+        # 旧会话镜像（ai_session_drawing_flags）不再参与写入授权。
+        active = _active_drawing_grant_for_session(
+            str(body.get("session_id") or ""), eff_slide_id, safe)
+        if active is None:
             return jsonify(
-                error="本会话未开启「允许 AI 描绘」（或平台无其开启记录）",
+                error="本次对话未获描绘技能授权（无活跃 allow_ai_drawing 的 "
+                      "run grant）；描绘写入被拒绝",
                 code="ai_drawing_disabled"), 403
         # P1-5 + P1-3（二轮 review）：legacy internal 通道与 plugin v1 同一
         # 溯源要求——polygon 必带 snapshot_id；携带 snapshot_id 的描绘必须
@@ -18037,6 +18248,10 @@ def internal_ai_annotate():
         points_norm, perr = _validate_annotation_points(safe, body_type, body)
         if perr is not None:
             return jsonify(error=perr[0]), 400
+        # 技能溯源（0082 / 契约 §6）：可选 additive，仅点列路径。
+        skill_prov, skill_perr = _parse_skill_provenance(body)
+        if skill_perr is not None:
+            return jsonify(error=skill_perr, code="invalid_request"), 400
 
     if points_norm is None:
         x = _parse_num("x")
@@ -18089,6 +18304,8 @@ def internal_ai_annotate():
                     if k != "snapshot_attestation"}
     if prov_persist:
         provenance.update(prov_persist)
+    if skill_prov:
+        provenance.update(skill_prov)
     try:
         if points_norm is not None:
             # H（AI 描绘）点列落库：source="ai" → review_status 默认 pending
@@ -18530,6 +18747,50 @@ def _verify_run_grant(grant_id, slide, installation_id, expect_session=None,
         if bound != expect_session:
             return False, "session_mismatch"
     return True, ""
+
+
+def _active_drawing_grant_for_session(session_id, slide_id=None, slide=None):
+    """legacy internal 描绘通道的授权复查（0082 / 契约 §4.2，裁决 2）。
+
+    按 session 查活跃（未撤销、未过期）且 allow_ai_drawing=true、切片匹配
+    （slide_id 权威；历史 NULL-ID 行按冻结名兜底）的 run grant，并逐条复查
+    创建者写权限（_run_grant_creator_allowed 同口径）。命中返回 grant dict；
+    无/读失败返回 None（fail-closed——internal token 只完成传输鉴权，绝不
+    构成描绘授权）。多条命中取最新一条（同一 session 一次逻辑 run 只有一条
+    活跃 grant；防御性取新）。
+    """
+    if not session_id:
+        return None
+    try:
+        grants = share_store.list_run_grants_for_session(session_id)
+    except Exception:
+        app.logger.warning("internal 描绘授权按 session 查询失败（fail-closed）",
+                           exc_info=True)
+        return None
+    now = time.time()
+    for g in reversed(grants):  # list 为 created_at 升序 → 倒序取最新
+        if g.get("revoked"):
+            continue
+        try:
+            if float(g.get("expires_at") or 0) <= now:
+                continue
+        except (TypeError, ValueError):
+            continue
+        if g.get("allow_ai_drawing") is not True:
+            continue
+        grant_sid = g.get("slide_id") or None
+        if slide_id is not None:
+            if grant_sid is not None and grant_sid != slide_id:
+                continue
+            if grant_sid is None and slide is not None \
+                    and g.get("slide") != slide:
+                continue
+        elif slide is not None and g.get("slide") != slide:
+            continue
+        if not _run_grant_creator_allowed(g):
+            continue
+        return g
+    return None
 
 
 def _audit_grant_event(action, grant_id, slide, detail, slide_id=None):
@@ -19108,8 +19369,8 @@ def plugin_v1_annotate(slide, _by_id=False):
     升级 C：矩形接受成对 width_px/height_px（v2 通用矩形）或仅 side_px
     （v1 正方形兼容）；v2 与 side_px 冲突拒绝。
     H（AI 描绘）：type=polygon|freehand 时改走点列（3~500 点；polygon 为简单
-    多边形校验），授权仍走 run grant（绑定 session）；会话级开关由 HistoPilot
-    侧裁剪+纵深拒绝。
+    多边形校验），授权走 run grant（绑定 session）+ grant 的 allow_ai_drawing
+    列（0082：HP 判定成立后经 /skills 端点置 true；旧会话镜像不再参与授权）。
     """
     claims, err = _require_plugin_token("annotation:write")
     if err is not None:
@@ -19138,21 +19399,19 @@ def plugin_v1_annotate(slide, _by_id=False):
     # （expect_session 校验已保证二者相等，见上方 _verify_run_grant）。
     session_id = session_id or grant.get("session_id") or ""
 
-    # P1-4（review-2026-09-07）：AI 描绘写端复核——平台本地镜像授权，不在写
-    # 路径同步回调 HP。H 批次把开关裁剪放在 HistoPilot 侧（工具不装配+纵深
-    # 拒绝），但旧 sidecar / 伪造重放可绕过 HP 直捅本端点写 polygon。修法：
-    # 代理路由（/api/ai/session/<sid>/drawing）在 HP 成功后把权威布尔 upsert
-    # 进镜像表（ai_session_drawing_flags，0039）；本写入口对 polygon|freehand
-    # 查镜像——**无行或 false 一律 403 ai_drawing_disabled（fail closed）**，
-    # 不落库。矩形路径（create_annotation）不受此闸影响；人类分享页 polygon
+    # 描绘技能闸门（0082 / 契约 §4.2，裁决 3）：polygon|freehand 只认本 run
+    # grant 的 allow_ai_drawing 列（HP 判定成立后经 /skills 端点置 true）。
+    # 旧会话镜像（ai_session_drawing_flags）自本切换起**不再参与写入授权**——
+    # 镜像 true ≠ 可写；一次逻辑 run 一次授权，grant 撤销/过期/TTL 即拒。
+    # 矩形路径（create_annotation）不受此闸影响；人类分享页 polygon
     # （share 端点）同样不受影响。
     body_type = body.get("type")
     if body_type in ("polygon", "freehand"):
-        mirror_flag = share_store.get_ai_session_drawing_flag(session_id)
-        if mirror_flag is not True:
+        if grant.get("allow_ai_drawing") is not True:
             return _plugin_error(
                 403, "ai_drawing_disabled",
-                "本会话未开启「允许 AI 描绘」（或平台无其开启记录）；描绘写入被拒绝",
+                "本次对话未获描绘技能授权（run grant 无 allow_ai_drawing）；"
+                "描绘写入被拒绝",
                 details={"session_id": session_id})
 
     label = body.get("label")
@@ -19175,8 +19434,9 @@ def plugin_v1_annotate(slide, _by_id=False):
 
     # H（AI 描绘）：type=polygon|freehand 时走点列路径（3~500 点；polygon 额外
     # 做 ≥3 不同顶点/非零面积/拒绝自交校验），不再走矩形 parser。授权由上方
-    # run grant（绑定 session）+ 镜像开关（P1-4）双重把关。
+    # run grant（绑定 session）+ grant 的 allow_ai_drawing 列（0082）双重把关。
     points_norm = None
+    skill_prov = {}
     if body_type in ("polygon", "freehand"):
         # P1-5（review-2026-09-07）：来源快照溯源。描绘必须可追溯到模型看到
         # 的那张快照——polygon 缺 snapshot_id 直接 400（不落库，不给静默降级）；
@@ -19199,6 +19459,10 @@ def plugin_v1_annotate(slide, _by_id=False):
         points_norm, perr = _validate_annotation_points(safe, body_type, body)
         if perr is not None:
             return _plugin_error(400, "invalid_request", perr[0], details=perr[1])
+        # 技能溯源（0082 / 契约 §6）：可选 additive，仅点列路径（矩形保持现状）。
+        skill_prov, skill_perr = _parse_skill_provenance(body)
+        if skill_perr is not None:
+            return _plugin_error(400, "invalid_request", skill_perr)
     else:
         snap_prov = {}
 
@@ -19258,6 +19522,8 @@ def plugin_v1_annotate(slide, _by_id=False):
                     if k != "snapshot_attestation"}
     if prov_persist:
         provenance.update(prov_persist)
+    if skill_prov:
+        provenance.update(skill_prov)
     try:
         if points_norm is not None:
             # H（AI 描绘）点列落库：source="ai" → review_status 默认 pending
@@ -19364,6 +19630,67 @@ def plugin_v1_run_grant_bind():
     _audit("run_grant.bind", target_type="run_grant", target_id=grant_id,
            slide=grant.get("slide"), detail={"session_id": session_id})
     return jsonify(ok=True, grant_id=grant_id, session_id=session_id)
+
+
+@app.route("/api/plugin/v1/run-grants/<grant_id>/skills", methods=["POST"])
+def plugin_v1_run_grant_skills(grant_id):
+    """描绘技能置位（0082 / docs/viewer-drawing-skill-contract-20261009.md §3.2）。
+
+    Bearer plugin JWT（annotation:write）。body: {session_id, skills, intent}。
+    HP 在 run 接受处完成意图判定后调用；仅 false→true、幂等；**不提供 false
+    通道**——收回靠既有 revoke/expiry（run 终态/cancel/TTL/权限钩子）。
+
+    校验（裁决 5）：skills 白名单（仅 delineate）；intent ∈ explicit|natural；
+    置位经 share_store.set_run_grant_skill_delineate 在**同一事务（行锁）**内
+    完成——installation 匹配、未撤销、未过期、已绑定同一 session、创建者对该
+    切片仍有写权限（_run_grant_creator_allowed 同口径，含临时查看到期、只读
+    分享/fork 不可）。失败路径零副作用（事务内无写）。
+    旧 PT 无本端点 → HP 404 → 本 run 无描绘（fail-closed，契约 §5 矩阵）。
+    """
+    claims, err = _require_plugin_token("annotation:write")
+    if err is not None:
+        return err
+    body = request.get_json(silent=True) or {}
+    session_id = body.get("session_id")
+    if not isinstance(session_id, str) or not _REQUEST_ID_RE.match(session_id):
+        return _plugin_error(400, "invalid_request",
+                             "session_id 必填（1–128 [A-Za-z0-9_-]）")
+    skills = body.get("skills")
+    if not isinstance(skills, list) or not skills \
+            or not all(isinstance(s, str) for s in skills) \
+            or set(skills) != {"delineate"}:
+        return _plugin_error(400, "invalid_request",
+                             "skills 需为 [\"delineate\"]（白名单）")
+    intent = body.get("intent")
+    if intent not in ("explicit", "natural"):
+        return _plugin_error(400, "invalid_request",
+                             "intent 需为 explicit|natural")
+    try:
+        ok, reason = share_store.set_run_grant_skill_delineate(
+            grant_id, session_id, intent,
+            installation_id=claims.get("sub") or "",
+            creator_allowed=_run_grant_creator_allowed)
+    except ValueError as e:
+        return _plugin_error(400, "invalid_request", str(e))
+    except Exception:
+        app.logger.exception("run grant 技能置位失败（fail-closed）")
+        return _plugin_error(503, "store_unavailable", "置位失败，请重试")
+    if not ok:
+        if reason == "grant_not_found":
+            return _plugin_error(404, "not_found", "run grant 不存在")
+        return _plugin_error(
+            403, "run_grant_invalid",
+            "run grant 技能置位被拒（%s）" % reason,
+            details={"reason": reason})
+    _audit("run_grant.skill_grant", target_type="run_grant",
+           target_id=grant_id, detail={
+               "session_id": session_id, "skills": ["delineate"],
+               "intent": intent, "via": "plugin_v1"})
+    grant = share_store.get_run_grant(grant_id) or {}
+    return jsonify(ok=True, grant_id=grant_id, skills=["delineate"],
+                   intent=intent,
+                   allow_ai_drawing=grant.get("allow_ai_drawing") is True,
+                   drawing_bound_at=grant.get("drawing_bound_at"))
 
 
 @app.route("/api/plugin/v1/run-grants/verify", methods=["POST"])
@@ -20956,6 +21283,12 @@ def api_ai_run():
                     body = dict(body)
                     body["render_context"] = a["render_context"]
                     break
+    # 描绘技能请求键（0082 / 契约 §2）：白名单校验 + target 冻结（切片一致、
+    # 资产 revision、annotation 引用）。全部是提示不是凭证——判定在 HP、
+    # 执法在 grant 列。校验先于预算预占（零副作用拒绝）。
+    skill_req, skill_err = _validate_ai_skill_request(body, slide, slide_id)
+    if skill_err is not None:
+        return skill_err
     prep = _ai_run_prepare(user_ctx, body, slide, need_grant=True,
                            slide_id=slide_id)
     if not isinstance(prep, dict):
@@ -20987,6 +21320,10 @@ def api_ai_run():
         payload["viewport"] = viewport
     if atts:
         payload["attachments"] = atts
+    # 描绘技能请求键白名单透传（0082 / 契约 §2.2）：仅经 _validate_ai_skill_request
+    # 重建的干净 dict 进 payload；HP 消费，旧 HP 忽略未知键。
+    if skill_req:
+        payload.update(skill_req)
     # §9.1：浏览器 render_context 服务端再校验（revision 绑定 + fingerprint 重算）
     # → camelCase 注入 config；审计带 asset revision + render fingerprint。
     audit_rc, rc_err = _ai_run_inject_render_context(payload, slide, body)
@@ -20999,6 +21336,13 @@ def api_ai_run():
     # fingerprint/revision——只记几何事实，不记任务文本）。
     if viewport:
         audit_detail["viewport"] = viewport
+    if skill_req:
+        audit_detail["skills_requested"] = skill_req.get(
+            "requested_skills") or []
+        if skill_req.get("skill_intent"):
+            audit_detail["skill_intent"] = skill_req["skill_intent"]
+        if skill_req.get("dismissed_skills"):
+            audit_detail["skills_dismissed"] = skill_req["dismissed_skills"]
     # fix-2026-09-11：审计带上创建参数方向的描绘授权（仅 true 时）。
     if draft_allow_drawing is True:
         audit_detail["allow_ai_drawing"] = True
@@ -21075,6 +21419,11 @@ def api_ai_continue():
                     body = dict(body)
                     body["render_context"] = a["render_context"]
                     break
+    # 描绘技能请求键（0082 / 契约 §2）：同 /run——continue 的新 grant 重新
+    # 判定（裁决 6），target 同口径冻结；校验先于预算预占（零副作用拒绝）。
+    skill_req, skill_err = _validate_ai_skill_request(body, slide, slide_id)
+    if skill_err is not None:
+        return skill_err
     prep = _ai_run_prepare(user_ctx, body, slide, need_grant=True,
                            slide_id=slide_id)
     if not isinstance(prep, dict):
@@ -21095,6 +21444,9 @@ def api_ai_continue():
         payload["viewport"] = viewport
     if atts:
         payload["attachments"] = atts
+    # 描绘技能请求键白名单透传（同 /run）。
+    if skill_req:
+        payload.update(skill_req)
     # §9.1：render_context 服务端再校验 + camelCase 注入（同 /run）。
     audit_rc, rc_err = _ai_run_inject_render_context(payload, slide, body)
     if rc_err is not None:

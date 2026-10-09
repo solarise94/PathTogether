@@ -204,10 +204,12 @@ def test_add_roi_human_polygon_review_none():
 def test_internal_annotate_polygon_points_path(monkeypatch):
     _touch()
     monkeypatch.setattr(app_mod, "_require_internal", lambda: None)
-    # P1-4 收口：internal 通道描绘同样复核镜像开关——本文件聚焦几何路径，
-    # 统一预置「已开启」；闸门关/无行行为见 test_ai_drawing_gate。
-    monkeypatch.setattr(app_mod.share_store, "get_ai_session_drawing_flag",
-                        lambda sid: True)
+    # 0082 起：internal 通道描绘改按活跃 run grant（allow_ai_drawing=true）
+    # 复查——本文件聚焦几何路径，统一预置「已授权」grant；闸门自身的开/关/
+    # 无 grant 行为见 test_ai_drawing_gate。
+    monkeypatch.setattr(app_mod, "_active_drawing_grant_for_session",
+                        lambda sid, slide_id=None, slide=None: {
+                            "grant_id": "g-geom", "allow_ai_drawing": True})
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
     monkeypatch.setattr(app_mod, "_ai_write_revision",
@@ -239,10 +241,12 @@ def test_internal_annotate_polygon_points_path(monkeypatch):
 def test_internal_annotate_freehand_points_path(monkeypatch):
     _touch()
     monkeypatch.setattr(app_mod, "_require_internal", lambda: None)
-    # P1-4 收口：internal 通道描绘同样复核镜像开关——本文件聚焦几何路径，
-    # 统一预置「已开启」；闸门关/无行行为见 test_ai_drawing_gate。
-    monkeypatch.setattr(app_mod.share_store, "get_ai_session_drawing_flag",
-                        lambda sid: True)
+    # 0082 起：internal 通道描绘改按活跃 run grant（allow_ai_drawing=true）
+    # 复查——本文件聚焦几何路径，统一预置「已授权」grant；闸门自身的开/关/
+    # 无 grant 行为见 test_ai_drawing_gate。
+    monkeypatch.setattr(app_mod, "_active_drawing_grant_for_session",
+                        lambda sid, slide_id=None, slide=None: {
+                            "grant_id": "g-geom", "allow_ai_drawing": True})
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
     monkeypatch.setattr(app_mod, "_ai_write_revision",
@@ -260,10 +264,12 @@ def test_internal_annotate_freehand_points_path(monkeypatch):
 def test_internal_annotate_polygon_mutually_exclusive_with_rect(monkeypatch):
     _touch()
     monkeypatch.setattr(app_mod, "_require_internal", lambda: None)
-    # P1-4 收口：internal 通道描绘同样复核镜像开关——本文件聚焦几何路径，
-    # 统一预置「已开启」；闸门关/无行行为见 test_ai_drawing_gate。
-    monkeypatch.setattr(app_mod.share_store, "get_ai_session_drawing_flag",
-                        lambda sid: True)
+    # 0082 起：internal 通道描绘改按活跃 run grant（allow_ai_drawing=true）
+    # 复查——本文件聚焦几何路径，统一预置「已授权」grant；闸门自身的开/关/
+    # 无 grant 行为见 test_ai_drawing_gate。
+    monkeypatch.setattr(app_mod, "_active_drawing_grant_for_session",
+                        lambda sid, slide_id=None, slide=None: {
+                            "grant_id": "g-geom", "allow_ai_drawing": True})
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
     monkeypatch.setattr(app_mod, "_ai_write_revision",
@@ -281,10 +287,12 @@ def test_internal_annotate_polygon_mutually_exclusive_with_rect(monkeypatch):
 def test_internal_annotate_polygon_self_intersecting_rejected(monkeypatch):
     _touch()
     monkeypatch.setattr(app_mod, "_require_internal", lambda: None)
-    # P1-4 收口：internal 通道描绘同样复核镜像开关——本文件聚焦几何路径，
-    # 统一预置「已开启」；闸门关/无行行为见 test_ai_drawing_gate。
-    monkeypatch.setattr(app_mod.share_store, "get_ai_session_drawing_flag",
-                        lambda sid: True)
+    # 0082 起：internal 通道描绘改按活跃 run grant（allow_ai_drawing=true）
+    # 复查——本文件聚焦几何路径，统一预置「已授权」grant；闸门自身的开/关/
+    # 无 grant 行为见 test_ai_drawing_gate。
+    monkeypatch.setattr(app_mod, "_active_drawing_grant_for_session",
+                        lambda sid, slide_id=None, slide=None: {
+                            "grant_id": "g-geom", "allow_ai_drawing": True})
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
     monkeypatch.setattr(app_mod, "_ai_write_revision",
@@ -302,10 +310,12 @@ def test_internal_annotate_polygon_self_intersecting_rejected(monkeypatch):
 def test_internal_annotate_polygon_out_of_slide_bounds_rejected(monkeypatch):
     _touch()
     monkeypatch.setattr(app_mod, "_require_internal", lambda: None)
-    # P1-4 收口：internal 通道描绘同样复核镜像开关——本文件聚焦几何路径，
-    # 统一预置「已开启」；闸门关/无行行为见 test_ai_drawing_gate。
-    monkeypatch.setattr(app_mod.share_store, "get_ai_session_drawing_flag",
-                        lambda sid: True)
+    # 0082 起：internal 通道描绘改按活跃 run grant（allow_ai_drawing=true）
+    # 复查——本文件聚焦几何路径，统一预置「已授权」grant；闸门自身的开/关/
+    # 无 grant 行为见 test_ai_drawing_gate。
+    monkeypatch.setattr(app_mod, "_active_drawing_grant_for_session",
+                        lambda sid, slide_id=None, slide=None: {
+                            "grant_id": "g-geom", "allow_ai_drawing": True})
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
     monkeypatch.setattr(app_mod, "_ai_write_revision",
@@ -332,10 +342,12 @@ def test_internal_annotate_rect_path_regression(monkeypatch):
     """无 type 的既有矩形请求行为不变（H 不改变 create_annotation 矩形通道）。"""
     _touch()
     monkeypatch.setattr(app_mod, "_require_internal", lambda: None)
-    # P1-4 收口：internal 通道描绘同样复核镜像开关——本文件聚焦几何路径，
-    # 统一预置「已开启」；闸门关/无行行为见 test_ai_drawing_gate。
-    monkeypatch.setattr(app_mod.share_store, "get_ai_session_drawing_flag",
-                        lambda sid: True)
+    # 0082 起：internal 通道描绘改按活跃 run grant（allow_ai_drawing=true）
+    # 复查——本文件聚焦几何路径，统一预置「已授权」grant；闸门自身的开/关/
+    # 无 grant 行为见 test_ai_drawing_gate。
+    monkeypatch.setattr(app_mod, "_active_drawing_grant_for_session",
+                        lambda sid, slide_id=None, slide=None: {
+                            "grant_id": "g-geom", "allow_ai_drawing": True})
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
     monkeypatch.setattr(app_mod, "_ai_write_revision",
@@ -363,10 +375,12 @@ def test_internal_annotate_rect_path_regression(monkeypatch):
 def test_internal_annotate_polygon_requires_label_and_valid_type(monkeypatch):
     _touch()
     monkeypatch.setattr(app_mod, "_require_internal", lambda: None)
-    # P1-4 收口：internal 通道描绘同样复核镜像开关——本文件聚焦几何路径，
-    # 统一预置「已开启」；闸门关/无行行为见 test_ai_drawing_gate。
-    monkeypatch.setattr(app_mod.share_store, "get_ai_session_drawing_flag",
-                        lambda sid: True)
+    # 0082 起：internal 通道描绘改按活跃 run grant（allow_ai_drawing=true）
+    # 复查——本文件聚焦几何路径，统一预置「已授权」grant；闸门自身的开/关/
+    # 无 grant 行为见 test_ai_drawing_gate。
+    monkeypatch.setattr(app_mod, "_active_drawing_grant_for_session",
+                        lambda sid, slide_id=None, slide=None: {
+                            "grant_id": "g-geom", "allow_ai_drawing": True})
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
     monkeypatch.setattr(app_mod, "_ai_write_revision",
@@ -395,7 +409,8 @@ def _mock_plugin_channel(monkeypatch, valid=True):
     monkeypatch.setattr(app_mod, "_require_plugin_token",
                         lambda scope=None: ({"sub": "inst1"}, None))
     grant = {"grant_id": "g1", "slide": "demo.svs", "installation_id": "inst1",
-             "created_by_user_id": "u1", "session_id": "sess1"}
+             "created_by_user_id": "u1", "session_id": "sess1",
+             "allow_ai_drawing": True}
     monkeypatch.setattr(
         app_mod, "_verify_run_grant",
         (lambda gid, slide, inst, expect_session=None, slide_id=None: (True, "")) if valid
@@ -407,9 +422,9 @@ def _mock_plugin_channel(monkeypatch, valid=True):
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
     monkeypatch.setattr(app_mod, "_ai_write_revision",
                             lambda gate, safe: "rev0")
-    # P1-4 起：plugin v1 写入口复核本地镜像开关——本文件聚焦几何/点列路径，
-    # 统一预置「已开启」镜像；闸门自身的开/关/无行行为见 test_ai_drawing_gate。
-    share_store.upsert_ai_session_drawing_flag("sess1", True)
+    # 0082 起：plugin v1 写入口只认 run grant 的 allow_ai_drawing 列——本文件
+    # 聚焦几何/点列路径，grant 统一带 allow_ai_drawing=true；闸门自身的开/关
+    # 行为见 test_ai_drawing_gate。
 
 
 # P1-5 起：plugin v1 polygon 必带来源快照溯源（快照 bbox 与点列外接框不必

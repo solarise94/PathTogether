@@ -1,16 +1,20 @@
 # -*- coding: utf-8 -*-
-"""P1-4 / P1-5（review-2026-09-07）：AI 描绘的平台写端复核与来源快照溯源。
+"""AI 描绘的平台写端复核与来源快照溯源（0082 起按 run grant 技能授权）。
 
 覆盖（PT 侧，本文件专属）：
-  P1-4 写端镜像闸门（ai_session_drawing_flags，0039）：
-    - 镜像从未见过 session（无行）→ 伪造 polygon 403 ai_drawing_disabled
-      （fail closed，不落库）；
-    - 镜像 false（用户已关闭）→ 伪造 polygon 403，无新 ROI；
-    - 开启（镜像 true）→ polygon 200 落库；
-    - 运行中关闭（true → false）→ 迟到 polygon 403，无新 ROI；
-    - freehand 同受闸门约束；矩形路径不受影响（无镜像行仍 200）；
-    - 代理路由 /api/ai/session/<sid>/drawing：HP 200 且带权威布尔 → 镜像
-      upsert；HP 200 畸形体 / HP 5xx → 镜像不变（不推定开关状态）。
+  0082 写端技能闸门（run_grants.allow_ai_drawing 列；契约
+  docs/viewer-drawing-skill-contract-20261009.md §4，裁决 3 无过渡窗口）：
+    - grant 列缺省 false / 显式 false（/skills 未置位）→ 伪造 polygon 403
+      ai_drawing_disabled（fail closed，不落库）——默认拒绝；
+    - grant 列 true（HP 判定成立后经 /skills 端点置位）→ polygon 200 落库；
+    - run 终态（grant 撤销/过期）→ 迟到 polygon 403，无新 ROI；
+    - freehand 同受闸门约束；矩形路径不受影响；
+    - 旧会话镜像（ai_session_drawing_flags）true 不再放行写入（无授权效力）。
+  /skills 机器端点（0082 §3.2，裁决 5 事务内创建者复查）：
+    installation 不符 / 未 bind / session 不符 / 撤销 / 过期 / 创建者失权 /
+    白名单外技能 / 幂等重放。
+  旧镜像代理路由 /api/ai/session/<sid>/drawing：保持可写、generation/CAS
+    机制不变（契约 §4.3），但其镜像值不参与写入授权。
   fix-2026-09-11 创建参数链路：
     - fresh 首发携带 allow_ai_drawing:true → 严格布尔透传 + run 接受后镜像
       true → 伪造 polygon 不再 403；fresh 不带 flag（含显式 false）→ 不透传
@@ -91,12 +95,18 @@ def _snap_prov(**overrides):
     return prov
 
 
-def _mock_plugin_channel(monkeypatch, valid=True):
-    """插件 v1 通道 mock（token/grant/installation；与 geom 测试同款口径）。"""
+def _mock_plugin_channel(monkeypatch, valid=True, drawing=True):
+    """插件 v1 通道 mock（token/grant/installation；与 geom 测试同款口径）。
+
+    0082 起闸门只认 grant.allow_ai_drawing：drawing=True/False 直接控列值；
+    drawing=None 时 grant dict 不带该键（模拟未置位的历史行形态）。
+    """
     monkeypatch.setattr(app_mod, "_require_plugin_token",
                         lambda scope=None: ({"sub": "inst1"}, None))
     grant = {"grant_id": "g1", "slide": "demo.svs", "installation_id": "inst1",
              "created_by_user_id": "u1", "session_id": "sess1"}
+    if drawing is not None:
+        grant["allow_ai_drawing"] = drawing
     monkeypatch.setattr(
         app_mod, "_verify_run_grant",
         (lambda gid, slide, inst, expect_session=None, slide_id=None: (True, "")) if valid
@@ -126,12 +136,12 @@ def _no_rois():
 
 
 # =========================================================================== #
-# P1-4：写端镜像闸门
+# 0082：写端技能闸门（run grant 的 allow_ai_drawing 列；默认拒绝）
 # =========================================================================== #
-def test_gate_fail_closed_when_mirror_never_seen(monkeypatch):
-    """镜像无行（平台从未见过该 session 的开启记录）→ 伪造 polygon 403。"""
+def test_gate_fail_closed_when_grant_lacks_skill(monkeypatch):
+    """默认拒绝：grant 无 allow_ai_drawing（/skills 未置位）→ 伪造 polygon 403。"""
     _touch()
-    _mock_plugin_channel(monkeypatch, valid=True)
+    _mock_plugin_channel(monkeypatch, valid=True, drawing=None)
     c = app_mod.app.test_client()
     r = _post_polygon(c, **_snap_prov())
     assert r.status_code == 403, r.get_data(as_text=True)
@@ -141,11 +151,10 @@ def test_gate_fail_closed_when_mirror_never_seen(monkeypatch):
     assert _no_rois()  # 未落库
 
 
-def test_gate_blocks_forged_polygon_when_off(monkeypatch):
-    """开关关闭（镜像 false）→ 伪造/重放 polygon 403，无新 ROI。"""
+def test_gate_blocks_forged_polygon_when_flag_false(monkeypatch):
+    """grant.allow_ai_drawing 显式 false → 伪造/重放 polygon 403，无新 ROI。"""
     _touch()
-    _mock_plugin_channel(monkeypatch, valid=True)
-    share_store.upsert_ai_session_drawing_flag("sess1", False)
+    _mock_plugin_channel(monkeypatch, valid=True, drawing=False)
     c = app_mod.app.test_client()
     r = _post_polygon(c, **_snap_prov())
     assert r.status_code == 403
@@ -153,11 +162,10 @@ def test_gate_blocks_forged_polygon_when_off(monkeypatch):
     assert _no_rois()
 
 
-def test_gate_allows_polygon_when_on(monkeypatch):
-    """开关开启（镜像 true）→ polygon 200 落库（run grant 通道不变）。"""
+def test_gate_allows_polygon_when_skill_granted(monkeypatch):
+    """grant 列 true（HP 判定成立 + /skills 置位）→ polygon 200 落库。"""
     _touch()
-    _mock_plugin_channel(monkeypatch, valid=True)
-    share_store.upsert_ai_session_drawing_flag("sess1", True)
+    _mock_plugin_channel(monkeypatch, valid=True, drawing=True)
     c = app_mod.app.test_client()
     r = _post_polygon(c, **_snap_prov())
     assert r.status_code == 200, r.get_data(as_text=True)
@@ -166,31 +174,45 @@ def test_gate_allows_polygon_when_on(monkeypatch):
     assert roi["review_status"] == "pending"
 
 
-def test_gate_blocks_late_polygon_after_midrun_off(monkeypatch):
-    """运行中关闭：先开→写成功，再关→迟到 polygon 403 且无新 ROI。"""
+def test_gate_blocks_late_polygon_after_run_end(monkeypatch):
+    """迟到写入：run 终态撤销 grant 后 → 迟到 polygon 403 且无新 ROI
+    （旧保护「运行中关闭」迁移为「run 终态撤 grant」——同一默认拒绝语义）。"""
     _touch()
-    _mock_plugin_channel(monkeypatch, valid=True)
-    share_store.upsert_ai_session_drawing_flag("sess1", True)
+    _mock_plugin_channel(monkeypatch, valid=True, drawing=True)
     c = app_mod.app.test_client()
     r1 = _post_polygon(c, effect_key="ek-gate-open", **_snap_prov())
     assert r1.status_code == 200
     first = share_store.get_roi(share_store.ADMIN_TOKEN, 0)
     assert first is not None
-    # 运行中用户关闭（经代理路由镜像写回 false——这里直写镜像等价）。
-    share_store.upsert_ai_session_drawing_flag("sess1", False)
+    # run 终态：SSE 结束/cancel → 平台撤销 session 的 grant（真实路径是
+    # _revoke_run_grants_for_session；这里以校验失败 mock 等价呈现）。
+    _mock_plugin_channel(monkeypatch, valid=False, drawing=True)
     r2 = _post_polygon(c, effect_key="ek-gate-late", **_snap_prov())
     assert r2.status_code == 403
-    assert r2.get_json()["error"]["code"] == "ai_drawing_disabled"
+    assert r2.get_json()["error"]["code"] == "run_grant_invalid"
     late = share_store.get_roi(share_store.ADMIN_TOKEN, 1)
     assert late is None  # 迟到写入未落库
     assert share_store.get_roi(share_store.ADMIN_TOKEN, 0)["annotation_id"] \
         == first["annotation_id"]
 
 
-def test_gate_covers_freehand_too(monkeypatch):
-    """freehand 同受闸门约束（镜像无行 → 403）。"""
+def test_gate_ignores_stale_session_mirror(monkeypatch):
+    """旧镜像 true 不再有授权效力：镜像 true + grant 列 false → 仍 403
+    （0082 裁决 3：镜像表保留但不参与写入授权）。"""
     _touch()
-    _mock_plugin_channel(monkeypatch, valid=True)
+    _mock_plugin_channel(monkeypatch, valid=True, drawing=False)
+    share_store.upsert_ai_session_drawing_flag("sess1", True)  # 旧开关遗留 true
+    c = app_mod.app.test_client()
+    r = _post_polygon(c, **_snap_prov())
+    assert r.status_code == 403
+    assert r.get_json()["error"]["code"] == "ai_drawing_disabled"
+    assert _no_rois()
+
+
+def test_gate_covers_freehand_too(monkeypatch):
+    """freehand 同受闸门约束（grant 列 false → 403）。"""
+    _touch()
+    _mock_plugin_channel(monkeypatch, valid=True, drawing=False)
     c = app_mod.app.test_client()
     r = c.post("/api/plugin/v1/slides/demo.svs/annotations", json={
         "label": "AI 描图", "type": "freehand",
@@ -203,9 +225,9 @@ def test_gate_covers_freehand_too(monkeypatch):
 
 
 def test_gate_does_not_touch_rect_path(monkeypatch):
-    """矩形路径不受闸门影响：镜像无行仍 200（create_annotation 通道不变）。"""
+    """矩形路径不受闸门影响：grant 列 false 仍 200（create_annotation 通道不变）。"""
     _touch()
-    _mock_plugin_channel(monkeypatch, valid=True)
+    _mock_plugin_channel(monkeypatch, valid=True, drawing=False)
     c = app_mod.app.test_client()
     r = c.post("/api/plugin/v1/slides/demo.svs/annotations", json={
         "label": "AI-rect", "x": 5, "y": 5, "width_px": 220, "height_px": 90,
@@ -218,8 +240,7 @@ def test_gate_does_not_touch_rect_path(monkeypatch):
 def test_gate_still_requires_run_grant(monkeypatch):
     """闸门在 run grant 之后：grant 无效仍是 403 run_grant_invalid（优先级不变）。"""
     _touch()
-    _mock_plugin_channel(monkeypatch, valid=False)
-    share_store.upsert_ai_session_drawing_flag("sess1", True)
+    _mock_plugin_channel(monkeypatch, valid=False, drawing=True)
     c = app_mod.app.test_client()
     r = _post_polygon(c, **_snap_prov())
     assert r.status_code == 403
@@ -347,8 +368,9 @@ def test_proxy_disable_local_write_failure_returns_503(monkeypatch):
 
 
 def test_proxy_disable_then_late_write_blocked(monkeypatch):
-    """二轮 review P1-2 回归③：关闭（即便 HP 响应丢失）之后，迟到的
-    plugin v1 polygon 写入立即被写端闸门拒绝（镜像已是 false）。"""
+    """二轮 review P1-2 回归③（0082 迁移）：代理关闭路径不变（镜像照写），
+    迟到写入的拒绝自 0082 起由 grant 列把守——未置位（false）→ 403
+    ai_drawing_disabled（默认拒绝保护迁移，不删除断言）。"""
     _mock_proxy_owner(monkeypatch)
     c = _browser_client(app_mod.app)
     share_store.upsert_ai_session_drawing_flag("sess1", True)
@@ -360,9 +382,9 @@ def test_proxy_disable_then_late_write_blocked(monkeypatch):
     _proxy_toggle(c, enabled=False)
     assert share_store.get_ai_session_drawing_flag("sess1") is False
 
-    # 迟到写入：镜像 false → 写入口拒绝（与 test_gate_blocks_* 同一口径）
+    # 迟到写入：grant 列未置位 → 写入口拒绝（与 test_gate_blocks_* 同一口径）
     _touch()
-    _mock_plugin_channel(monkeypatch, valid=True)
+    _mock_plugin_channel(monkeypatch, valid=True, drawing=False)
     r = _post_polygon(c, effect_key="ek-late-after-off", **_snap_prov())
     assert r.status_code == 403
     assert r.get_json()["error"]["code"] == "ai_drawing_disabled"
@@ -534,9 +556,9 @@ def test_proxy_stale_open_response_cannot_override_later_close(monkeypatch):
     assert r.get_json()["code"] == "stale_generation"
     # 关键：镜像未被旧开启响应写回 true
     assert share_store.get_ai_session_drawing_flag("sess1") is False
-    # 迟到描绘仍被拒
+    # 迟到描绘仍被拒（0082：grant 列未置位 → 默认拒绝）
     _touch()
-    _mock_plugin_channel(monkeypatch, valid=True)
+    _mock_plugin_channel(monkeypatch, valid=True, drawing=False)
     r2 = _post_polygon(c, effect_key="ek-late-stale-open", **_snap_prov())
     assert r2.status_code == 403
     assert r2.get_json()["error"]["code"] == "ai_drawing_disabled"
@@ -902,15 +924,29 @@ def test_freehand_with_snapshot_id_requires_attestation(monkeypatch):
 
 
 # =========================================================================== #
-# P1-4 收口：legacy /internal/ai/annotate 通道同闸（internal token 不再单独
-# 放行描绘写入；几何路径回归见 test_ai_drawing_geom）
+# 0082（裁决 2）：legacy /internal/ai/annotate 通道——按 session+slide 查活跃
+# 且 allow_ai_drawing=true 的 run grant；internal token 只完成传输鉴权，不构成
+# 描绘授权（真实 store 造 grant，覆盖端到端闸门语义）
 # =========================================================================== #
 def _mock_internal_channel(monkeypatch):
     monkeypatch.setattr(app_mod, "_require_internal", lambda: None)
     monkeypatch.setattr(app_mod, "_demo_public_mode", lambda: False)
     monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
     monkeypatch.setattr(app_mod, "_ai_write_revision",
-                            lambda gate, safe: "rev0")
+                        lambda gate, safe: "rev0")
+
+
+def _make_internal_drawing_grant(session_id="sess-int-1", flagged=True):
+    """真实 store 造一条绑定 session 的 run grant（flagged=True 时置位技能列）。"""
+    g = share_store.create_run_grant("inst1", "demo.svs", session_id="",
+                                     created_by_user_id=None)
+    share_store.bind_run_grant_session(g["grant_id"], session_id)
+    if flagged:
+        ok, reason = share_store.set_run_grant_skill_delineate(
+            g["grant_id"], session_id, "explicit",
+            creator_allowed=lambda gr: True)
+        assert ok, reason
+    return g
 
 
 def _post_internal_polygon(c, session_id="sess-int-1", **overrides):
@@ -931,7 +967,7 @@ def test_internal_channel_requires_attestation(monkeypatch):
     """legacy 通道：polygon 无 attestation → 400（与 plugin v1 同一强制）。"""
     _touch()
     _mock_internal_channel(monkeypatch)
-    share_store.upsert_ai_session_drawing_flag("sess-int-1", True)
+    _make_internal_drawing_grant("sess-int-1", flagged=True)
     c = app_mod.app.test_client()
     r = _post_internal_polygon(c, snapshot_attestation=None)
     assert r.status_code == 400
@@ -939,8 +975,9 @@ def test_internal_channel_requires_attestation(monkeypatch):
     assert _no_rois()
 
 
-def test_internal_channel_blocked_without_mirror_row(monkeypatch):
-    """internal 通道：镜像无行 → 403 ai_drawing_disabled，不落库。"""
+def test_internal_channel_blocked_without_active_grant(monkeypatch):
+    """internal 通道：无活跃 grant（未判定/未置位）→ 403 ai_drawing_disabled，
+    不落库（internal token 不能绕过——默认拒绝）。"""
     _touch()
     _mock_internal_channel(monkeypatch)
     c = app_mod.app.test_client()
@@ -950,31 +987,60 @@ def test_internal_channel_blocked_without_mirror_row(monkeypatch):
     assert _no_rois()
 
 
-def test_internal_channel_allowed_when_mirror_on(monkeypatch):
-    """internal 通道：镜像 true → 200 落库（与 plugin v1 同闸语义）。"""
+def test_internal_channel_allowed_when_grant_flagged(monkeypatch):
+    """internal 通道：session 有活跃且置位的 grant → 200 落库。"""
     _touch()
     _mock_internal_channel(monkeypatch)
-    share_store.upsert_ai_session_drawing_flag("sess-int-1", True)
+    _make_internal_drawing_grant("sess-int-1", flagged=True)
     c = app_mod.app.test_client()
     r = _post_internal_polygon(c)
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.get_json()["type"] == "polygon"
 
 
-def test_internal_channel_blocks_late_polygon_after_midrun_off(monkeypatch):
-    """internal 通道：运行中关闭（true→false）→ 迟到 polygon 403。"""
+def test_internal_channel_blocks_unflagged_grant(monkeypatch):
+    """internal 通道：grant 活跃但 allow_ai_drawing=false → 403（列未置位）。"""
     _touch()
     _mock_internal_channel(monkeypatch)
-    share_store.upsert_ai_session_drawing_flag("sess-int-1", False)
+    _make_internal_drawing_grant("sess-int-1", flagged=False)
     c = app_mod.app.test_client()
     r = _post_internal_polygon(c)
     assert r.status_code == 403
+    assert r.get_json()["code"] == "ai_drawing_disabled"
+    assert _no_rois()
+
+
+def test_internal_channel_blocks_late_polygon_after_run_end(monkeypatch):
+    """internal 通道：run 终态撤 grant → 迟到 polygon 403（迟到写入保护迁移）。"""
+    _touch()
+    _mock_internal_channel(monkeypatch)
+    g = _make_internal_drawing_grant("sess-int-1", flagged=True)
+    c = app_mod.app.test_client()
+    r1 = _post_internal_polygon(c, effect_key="ek-int-open")
+    assert r1.status_code == 200, r1.get_data(as_text=True)
+    share_store.revoke_run_grant(g["grant_id"])  # run 终态：撤销绑定 grant
+    r2 = _post_internal_polygon(c, effect_key="ek-int-late")
+    assert r2.status_code == 403
+    assert r2.get_json()["code"] == "ai_drawing_disabled"
+    assert share_store.get_roi(share_store.ADMIN_TOKEN, 1) is None  # 无新 ROI
+
+
+def test_internal_channel_ignores_stale_mirror(monkeypatch):
+    """internal 通道：旧镜像 true 不再有授权效力（无活跃 grant 仍 403）。"""
+    _touch()
+    _mock_internal_channel(monkeypatch)
+    share_store.upsert_ai_session_drawing_flag("sess-int-1", True)
+    c = app_mod.app.test_client()
+    r = _post_internal_polygon(c)
+    assert r.status_code == 403
+    assert r.get_json()["code"] == "ai_drawing_disabled"
     assert _no_rois()
 
 
 # =========================================================================== #
 # C2（2026-09-10）：session detail 带回 drawing_mirror，不在 GET 路径回写镜像
-# =========================================================================== #def test_session_detail_includes_drawing_mirror(monkeypatch):
+# =========================================================================== #
+def test_session_detail_includes_drawing_mirror(monkeypatch):
     """GET /api/ai/session/<id> 2xx 附带 session.drawing_mirror。
 
     无行 → false；镜像 true → true。HP allow_ai_drawing 仍透传。GET 不把
@@ -1031,8 +1097,9 @@ def _register_run_sse(fake, session_id):
 
 
 def test_run_create_param_mirrors_drawing_flag(monkeypatch):
-    """fresh + allow_ai_drawing:true：严格布尔透传 → 镜像 true → 伪造描绘写
-    不再 403（创建参数等价「建会话后立刻拨开关」，只消除竞态）；审计带值。"""
+    """fresh + allow_ai_drawing:true：严格布尔透传 + 镜像对齐 + 审计带值。
+    0082 起镜像只是对照记录——写闸只认 grant 列：列 false 时即便镜像 true
+    仍 403；列 true 放行（见尾部双断言）。"""
     fake = _setup_run_env(monkeypatch)
     _register_run_sse(fake, "sess-fresh-1")
     audits = []
@@ -1052,12 +1119,20 @@ def test_run_create_param_mirrors_drawing_flag(monkeypatch):
     run_audits = [d for d in audits
                   if isinstance(d, dict) and d.get("mode") == "run"]
     assert run_audits and run_audits[-1]["allow_ai_drawing"] is True
-    # 写端闸门：该 session 的伪造 polygon 不再 403（attestation sid 对应）
-    _mock_plugin_channel(monkeypatch, valid=True)
+    # 写端闸门只认 grant 列：镜像 true 但列未置位 → 仍 403（默认拒绝不因
+    # 镜像放行）
+    _mock_plugin_channel(monkeypatch, valid=True, drawing=False)
     prov = dict(SNAP_PROV, snapshot_attestation=_attest(sid="sess-fresh-1"))
     r2 = _post_polygon(c, session_id="sess-fresh-1",
                        effect_key="ek-create-param", **prov)
-    assert r2.status_code == 200, r2.get_data(as_text=True)
+    assert r2.status_code == 403
+    assert r2.get_json()["error"]["code"] == "ai_drawing_disabled"
+    assert _no_rois()
+    # grant 列 true（HP 判定 + /skills 置位）→ 放行
+    _mock_plugin_channel(monkeypatch, valid=True, drawing=True)
+    r3 = _post_polygon(c, session_id="sess-fresh-1",
+                       effect_key="ek-create-param-2", **prov)
+    assert r3.status_code == 200, r3.get_data(as_text=True)
     roi = share_store.get_roi(share_store.ADMIN_TOKEN, 0)
     assert roi is not None and roi["type"] == "polygon"
 
@@ -1081,8 +1156,8 @@ def test_run_without_flag_keeps_gate_closed(monkeypatch):
     assert r2.status_code == 200
     assert "allow_ai_drawing" not in fake.calls[-1]["body"]
     assert share_store.get_ai_session_drawing_flag("sess-plain-1") is None
-    # 闸门回归：无镜像行 → 伪造 polygon 403、不落库
-    _mock_plugin_channel(monkeypatch, valid=True)
+    # 闸门回归：grant 列未置位 → 伪造 polygon 403、不落库
+    _mock_plugin_channel(monkeypatch, valid=True, drawing=False)
     prov = dict(SNAP_PROV, snapshot_attestation=_attest(sid="sess-plain-1"))
     r3 = _post_polygon(c, session_id="sess-plain-1", **prov)
     assert r3.status_code == 403
@@ -1152,11 +1227,399 @@ def test_run_create_param_replay_does_not_reopen_closed_mirror(monkeypatch):
     assert share_store.get_ai_session_drawing_generation(
         "sess-replay-1") == gen_after_close
 
-    # 迟到描绘写入仍被闸门拒绝
-    _mock_plugin_channel(monkeypatch, valid=True)
+    # 迟到描绘写入仍被闸门拒绝（0082：grant 列未置位 → 默认拒绝）
+    _mock_plugin_channel(monkeypatch, valid=True, drawing=False)
     prov = dict(SNAP_PROV, snapshot_attestation=_attest(sid="sess-replay-1"))
     r3 = _post_polygon(c, session_id="sess-replay-1",
                        effect_key="ek-replay-closed", **prov)
     assert r3.status_code == 403
     assert r3.get_json()["error"]["code"] == "ai_drawing_disabled"
     assert _no_rois()
+
+
+# =========================================================================== #
+# 0082：/skills 机器端点（裁决 5：同一事务内创建者复查；只 false→true、幂等）
+# =========================================================================== #
+def _mock_skills_channel(monkeypatch, sub="inst1"):
+    monkeypatch.setattr(app_mod, "_require_plugin_token",
+                        lambda scope=None: ({"sub": sub}, None))
+    monkeypatch.setattr(app_mod, "_audit", lambda *a, **k: None)
+
+
+def _post_skills(c, grant_id, session_id="sess1", intent="explicit",
+                 skills=None):
+    return c.post("/api/plugin/v1/run-grants/%s/skills" % grant_id, json={
+        "session_id": session_id,
+        "skills": skills if skills is not None else ["delineate"],
+        "intent": intent,
+    })
+
+
+def _make_bound_grant(session_id="sess1", installation_id="inst1"):
+    g = share_store.create_run_grant(installation_id, "demo.svs",
+                                     session_id="",
+                                     created_by_user_id=None)
+    share_store.bind_run_grant_session(g["grant_id"], session_id)
+    return g
+
+
+def test_skills_endpoint_sets_flag_idempotently(monkeypatch):
+    """置位 happy path：200 + 列 true + drawing_intent；重复调用幂等 200。"""
+    _touch()
+    _mock_skills_channel(monkeypatch)
+    g = _make_bound_grant("sess1")
+    c = app_mod.app.test_client()
+    r = _post_skills(c, g["grant_id"], intent="natural")
+    assert r.status_code == 200, r.get_data(as_text=True)
+    body = r.get_json()
+    assert body["ok"] is True and body["allow_ai_drawing"] is True
+    stored = share_store.get_run_grant(g["grant_id"])
+    assert stored["allow_ai_drawing"] is True
+    assert stored["drawing_intent"] == "natural"
+    assert stored["drawing_bound_at"]
+    r2 = _post_skills(c, g["grant_id"], intent="explicit")
+    assert r2.status_code == 200  # 幂等
+    stored2 = share_store.get_run_grant(g["grant_id"])
+    assert stored2["allow_ai_drawing"] is True
+
+
+def test_skills_endpoint_installation_mismatch(monkeypatch):
+    """身份隔离：installation 不符 → 403，列保持 false（零副作用）。"""
+    _touch()
+    _mock_skills_channel(monkeypatch, sub="inst-other")
+    g = _make_bound_grant("sess1", installation_id="inst1")
+    c = app_mod.app.test_client()
+    r = _post_skills(c, g["grant_id"])
+    assert r.status_code == 403
+    err = r.get_json()["error"]
+    assert err["code"] == "run_grant_invalid"
+    assert err["details"]["reason"] == "installation_mismatch"
+    assert share_store.get_run_grant(g["grant_id"])["allow_ai_drawing"] is False
+
+
+def test_skills_endpoint_requires_bound_session(monkeypatch):
+    """未 bind 的 grant（起跑自查阶段形态）→ 403 grant_unbound。"""
+    _touch()
+    _mock_skills_channel(monkeypatch)
+    g = share_store.create_run_grant("inst1", "demo.svs", session_id="",
+                                     created_by_user_id=None)
+    c = app_mod.app.test_client()
+    r = _post_skills(c, g["grant_id"])
+    assert r.status_code == 403
+    assert r.get_json()["error"]["details"]["reason"] == "grant_unbound"
+
+
+def test_skills_endpoint_session_mismatch(monkeypatch):
+    """身份隔离：grant 绑定 sess-a、请求 sess-b → 403 session_mismatch。"""
+    _touch()
+    _mock_skills_channel(monkeypatch)
+    g = _make_bound_grant("sess-a")
+    c = app_mod.app.test_client()
+    r = _post_skills(c, g["grant_id"], session_id="sess-b")
+    assert r.status_code == 403
+    assert r.get_json()["error"]["details"]["reason"] == "session_mismatch"
+
+
+def test_skills_endpoint_revoked_grant_rejected(monkeypatch):
+    """run 终态撤 grant 后的置位请求 → 403 grant_revoked（迟到置位拒绝）。"""
+    _touch()
+    _mock_skills_channel(monkeypatch)
+    g = _make_bound_grant("sess1")
+    share_store.revoke_run_grant(g["grant_id"])
+    c = app_mod.app.test_client()
+    r = _post_skills(c, g["grant_id"])
+    assert r.status_code == 403
+    assert r.get_json()["error"]["details"]["reason"] == "grant_revoked"
+
+
+def test_skills_endpoint_creator_recheck_in_tx(monkeypatch):
+    """裁决 5：事务内创建者复查——创建者已失写权 → 403 creator_not_allowed，
+    置位零副作用（列保持 false）。"""
+    _touch()
+    _mock_skills_channel(monkeypatch)
+    g = _make_bound_grant("sess1")
+    monkeypatch.setattr(app_mod, "_run_grant_creator_allowed",
+                        lambda grant: False)
+    c = app_mod.app.test_client()
+    r = _post_skills(c, g["grant_id"])
+    assert r.status_code == 403
+    assert r.get_json()["error"]["details"]["reason"] == "creator_not_allowed"
+    assert share_store.get_run_grant(g["grant_id"])["allow_ai_drawing"] is False
+
+
+def test_skills_endpoint_creator_callback_error_fail_closed(monkeypatch):
+    """复查回调抛异常 → 按不允许 fail-closed（403），无副作用。"""
+    _touch()
+    _mock_skills_channel(monkeypatch)
+    g = _make_bound_grant("sess1")
+
+    def _boom(grant):
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(app_mod, "_run_grant_creator_allowed", _boom)
+    c = app_mod.app.test_client()
+    r = _post_skills(c, g["grant_id"])
+    assert r.status_code == 403
+    assert r.get_json()["error"]["details"]["reason"] == "creator_not_allowed"
+
+
+def test_skills_endpoint_request_validation(monkeypatch):
+    """白名单/形态校验：未知技能、坏 intent、缺 session_id、未知 grant。"""
+    _touch()
+    _mock_skills_channel(monkeypatch)
+    g = _make_bound_grant("sess1")
+    c = app_mod.app.test_client()
+    r = _post_skills(c, g["grant_id"], skills=["summarize"])
+    assert r.status_code == 400
+    assert r.get_json()["error"]["code"] == "invalid_request"
+    r2 = _post_skills(c, g["grant_id"], intent="vibes")
+    assert r2.status_code == 400
+    r3 = c.post("/api/plugin/v1/run-grants/%s/skills" % g["grant_id"],
+                json={"skills": ["delineate"], "intent": "explicit"})
+    assert r3.status_code == 400  # 缺 session_id
+    r4 = _post_skills(c, "rgr_nonexistent")
+    assert r4.status_code == 404
+    assert share_store.get_run_grant(g["grant_id"])["allow_ai_drawing"] is False
+
+
+def test_store_set_skill_delineate_semantics():
+    """store 层置位语义：未绑定拒绝、绑定后 0→1、幂等、坏 intent ValueError。"""
+    g0 = share_store.create_run_grant("inst1", "demo.svs", session_id="",
+                                      created_by_user_id=None)
+    ok, reason = share_store.set_run_grant_skill_delineate(
+        g0["grant_id"], "sess-x", "explicit", creator_allowed=None)
+    assert ok is False and reason == "grant_unbound"
+    share_store.bind_run_grant_session(g0["grant_id"], "sess-x")
+    ok2, reason2 = share_store.set_run_grant_skill_delineate(
+        g0["grant_id"], "sess-x", "explicit", creator_allowed=lambda gr: True)
+    assert ok2 is True and reason2 == ""
+    ok3, _ = share_store.set_run_grant_skill_delineate(
+        g0["grant_id"], "sess-x", "natural", creator_allowed=lambda gr: True)
+    assert ok3 is True  # 幂等：已 true 再置 200
+    with pytest.raises(ValueError):
+        share_store.set_run_grant_skill_delineate(g0["grant_id"], "sess-x",
+                                                  "bogus")
+
+
+# =========================================================================== #
+# 0082：run|continue 的技能请求键校验与白名单透传（E1c）
+# =========================================================================== #
+def test_run_forwards_skill_request(monkeypatch):
+    """@描绘 run：requested_skills/skill_intent/dismissed_skills/target 白名单
+    重建后透传 sidecar；审计带 skills_requested。"""
+    fake = _setup_run_env(monkeypatch)
+    _register_run_sse(fake, "sess-skill-1")
+    audits = []
+    monkeypatch.setattr(app_mod, "_audit",
+                        lambda *a, **k: audits.append(k.get("detail")))
+    _touch()
+    sid = share_store.get_slide_id("demo.svs")
+    c = _browser_client(app_mod.app)
+    r = c.post("/api/ai/run?fresh=1", json={
+        "slide": "demo.svs", "task": "@描绘 帮我圈出当前视野的腺体",
+        "requested_skills": ["delineate"], "skill_intent": "explicit",
+        "dismissed_skills": [],
+        "target": {"slide_id": sid, "kind": "viewport",
+                   "bbox": {"x": 0, "y": 0, "w": 800, "h": 600}},
+        "request_id": "req-skill-fwd-1"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    sent = fake.calls[-1]["body"]
+    assert sent["requested_skills"] == ["delineate"]
+    assert sent["skill_intent"] == "explicit"
+    assert sent["dismissed_skills"] == []
+    assert sent["target"]["slide_id"] == sid
+    assert sent["target"]["kind"] == "viewport"
+    assert sent["target"]["bbox"] == {"x": 0, "y": 0, "w": 800, "h": 600}
+    run_audits = [d for d in audits
+                  if isinstance(d, dict) and d.get("mode") == "run"]
+    assert run_audits and run_audits[-1]["skills_requested"] == ["delineate"]
+    assert run_audits[-1]["skill_intent"] == "explicit"
+
+
+def test_run_rejects_unknown_skill_and_malformed_target(monkeypatch):
+    """白名单/形态校验先于预算预占（零副作用拒绝，sidecar 零请求）。"""
+    fake = _setup_run_env(monkeypatch)
+    _touch()
+    sid = share_store.get_slide_id("demo.svs")
+    c = _browser_client(app_mod.app)
+    r = c.post("/api/ai/run?fresh=1", json={
+        "slide": "demo.svs", "task": "总结",
+        "requested_skills": ["summarize"]})
+    assert r.status_code == 400
+    assert r.get_json()["code"] == "invalid_argument"
+    r2 = c.post("/api/ai/run?fresh=1", json={
+        "slide": "demo.svs", "task": "总结",
+        "skill_intent": "vibes"})
+    assert r2.status_code == 400
+    r3 = c.post("/api/ai/run?fresh=1", json={
+        "slide": "demo.svs", "task": "圈",
+        "target": {"slide_id": sid, "kind": "viewport"}})  # 缺 bbox
+    assert r3.status_code == 400
+    assert fake.calls == []
+
+
+def test_run_target_slide_mismatch_rejected(monkeypatch):
+    """跨切片草稿：target.slide_id 指向另一切片 → 400 slide_ref_conflict。"""
+    fake = _setup_run_env(monkeypatch)
+    _touch("demo.svs")
+    _touch("other.svs")
+    other_sid = share_store.get_slide_id("other.svs")
+    c = _browser_client(app_mod.app)
+    r = c.post("/api/ai/run?fresh=1", json={
+        "slide": "demo.svs", "task": "圈出",
+        "target": {"slide_id": other_sid, "kind": "viewport",
+                   "bbox": {"x": 0, "y": 0, "w": 10, "h": 10}}})
+    assert r.status_code == 400
+    assert r.get_json()["code"] == "slide_ref_conflict"
+    assert fake.calls == []
+
+
+def test_run_target_stale_revision_conflict(monkeypatch):
+    """target.asset_revision 过期（快照后切片被替换）→ 409 slide_revision_conflict。"""
+    fake = _setup_run_env(monkeypatch)
+    _touch()
+    sid = share_store.get_slide_id("demo.svs")
+    c = _browser_client(app_mod.app)
+    r = c.post("/api/ai/run?fresh=1", json={
+        "slide": "demo.svs", "task": "圈出",
+        "target": {"slide_id": sid, "kind": "viewport",
+                   "asset_revision": "rev-stale",
+                   "bbox": {"x": 0, "y": 0, "w": 10, "h": 10}}})
+    assert r.status_code == 409
+    assert r.get_json()["error"] == "slide_revision_conflict"
+    assert fake.calls == []
+
+
+def test_run_target_annotation_kind_validated(monkeypatch):
+    """kind=annotation：存在/归属/revision 匹配；不符 409，合法则白名单透传。"""
+    fake = _setup_run_env(monkeypatch)
+    _touch()
+    sid = share_store.get_slide_id("demo.svs")
+    roi = share_store.add_roi(share_store.ADMIN_TOKEN, "demo.svs", "目标区",
+                              x=10, y=10, w=50, h=50)
+    c = _browser_client(app_mod.app)
+    base = {"slide": "demo.svs", "task": "圈出这个标记附近的范围"}
+    r = c.post("/api/ai/run?fresh=1", json=dict(base, target={
+        "slide_id": sid, "kind": "annotation",
+        "annotation_id": roi["annotation_id"],
+        "annotation_revision": int(roi["revision"]) + 5}))
+    assert r.status_code == 409
+    assert r.get_json()["error"] == "revision_conflict"
+    r2 = c.post("/api/ai/run?fresh=1", json=dict(base, target={
+        "slide_id": sid, "kind": "annotation",
+        "annotation_id": "ann_missing", "annotation_revision": 1}))
+    assert r2.status_code == 404
+    assert fake.calls == []
+    _register_run_sse(fake, "sess-skill-2")
+    r3 = c.post("/api/ai/run?fresh=1", json=dict(base, target={
+        "slide_id": sid, "kind": "annotation",
+        "annotation_id": roi["annotation_id"],
+        "annotation_revision": int(roi["revision"])}))
+    assert r3.status_code == 200, r3.get_data(as_text=True)
+    sent = fake.calls[-1]["body"]["target"]
+    assert sent["annotation_id"] == roi["annotation_id"]
+    assert sent["annotation_revision"] == int(roi["revision"])
+
+
+def test_continue_forwards_skill_request(monkeypatch):
+    """continue 的新 grant 重新判定（裁决 6）：技能键同样校验并透传。"""
+    fake = _setup_run_env(monkeypatch)
+    _mock_proxy_owner(monkeypatch)
+    fake.register("POST", "/continue", lambda b, q, h, k: FakeResponse(
+        200, sse_frames=[b"id: 1\nevent: slide_opened\ndata: {}\n\n"],
+        headers={"X-AI-Session-ID": "sess-cont-1"}))
+    _touch()
+    sid = share_store.get_slide_id("demo.svs")
+    c = _browser_client(app_mod.app)
+    r = c.post("/api/ai/continue", json={
+        "slide": "demo.svs", "session_id": "sess-cont-1",
+        "task": "帮我把选框里的坏死区域圈出来",
+        "requested_skills": ["delineate"], "skill_intent": "natural",
+        "target": {"slide_id": sid, "kind": "roi",
+                   "bbox": {"x": 100, "y": 200, "w": 800, "h": 600}}})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    sent = fake.calls[-1]["body"]
+    assert sent["requested_skills"] == ["delineate"]
+    assert sent["skill_intent"] == "natural"
+    assert sent["target"]["kind"] == "roi"
+
+
+# =========================================================================== #
+# 主代理 review 修复4/5：target 校验顺序（不泄露外部 slide_id 存在性）与
+# annotation 归属的 slide_id 优先比较（ID-only 资产名可能为空/别名不同）
+# =========================================================================== #
+def test_target_unknown_slide_id_no_existence_leak(monkeypatch):
+    """修复4：run 已知 slide_id 时先比较——target.slide_id 指向不存在资产
+    也返回 400 slide_ref_conflict（不解析、不泄露存在性 404）。"""
+    fake = _setup_run_env(monkeypatch)
+    _touch()
+    sid = share_store.get_slide_id("demo.svs")
+    c = _browser_client(app_mod.app)
+    r = c.post("/api/ai/run?fresh=1", json={
+        "slide_id": sid, "task": "圈出",
+        "target": {"slide_id": "sld_does_not_exist", "kind": "viewport",
+                   "bbox": {"x": 0, "y": 0, "w": 10, "h": 10}}})
+    assert r.status_code == 400
+    assert r.get_json()["code"] == "slide_ref_conflict"
+    assert fake.calls == []
+
+
+def test_target_other_slide_id_conflict_not_404(monkeypatch):
+    """修复4：target.slide_id 指向另一切片（存在）→ 400 slide_ref_conflict
+    （与 404 存在性泄露区分；两路径同码，存在性不再可区分）。"""
+    fake = _setup_run_env(monkeypatch)
+    _touch("demo.svs")
+    _touch("other.svs")
+    demo_sid = share_store.get_slide_id("demo.svs")
+    other_sid = share_store.get_slide_id("other.svs")
+    c = _browser_client(app_mod.app)
+    r = c.post("/api/ai/run?fresh=1", json={
+        "slide_id": demo_sid, "task": "圈出",
+        "target": {"slide_id": other_sid, "kind": "viewport",
+                   "bbox": {"x": 0, "y": 0, "w": 10, "h": 10}}})
+    assert r.status_code == 400
+    assert r.get_json()["code"] == "slide_ref_conflict"
+    assert fake.calls == []
+
+
+def test_target_annotation_id_only_asset_by_slide_id(monkeypatch):
+    """修复5：roi.slide_id 与本 run slide_id 一致、slide 名为旧别名/空 →
+    通过（ID-only/迁移资产不因名不同被误拒）。"""
+    fake = _setup_run_env(monkeypatch)
+    _touch()
+    sid = share_store.get_slide_id("demo.svs")
+    roi_dict = {"annotation_id": "ann_idonly", "slide": "legacy-alias.svs",
+                "slide_id": sid, "revision": 2, "deleted": False}
+    monkeypatch.setattr(app_mod.share_store, "get_roi_by_annotation_id",
+                        lambda aid: dict(roi_dict) if aid == "ann_idonly" else None)
+    monkeypatch.setattr(app_mod.annotation_access, "can_read_annotation",
+                        lambda subject, roi: True)
+    c = _browser_client(app_mod.app)
+    _register_run_sse(fake, "sess-fix5-ok")
+    r = c.post("/api/ai/run?fresh=1", json={
+        "slide_id": sid, "task": "圈出这个标记附近",
+        "target": {"slide_id": sid, "kind": "annotation",
+                   "annotation_id": "ann_idonly", "annotation_revision": 2}})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    sent = fake.calls[-1]["body"]["target"]
+    assert sent["annotation_id"] == "ann_idonly"
+
+
+def test_target_annotation_slide_id_mismatch_rejected(monkeypatch):
+    """修复5 反例：roi.slide_id 与 run slide_id 不符 → 403（ID 优先判定，
+    即便 roi.slide 名恰好等于 run 名也不放行）。"""
+    fake = _setup_run_env(monkeypatch)
+    _touch()
+    sid = share_store.get_slide_id("demo.svs")
+    other_sid = share_store.get_slide_id("demo.svs") + "x"
+    roi_dict = {"annotation_id": "ann_other", "slide": "demo.svs",
+                "slide_id": other_sid, "revision": 1, "deleted": False}
+    monkeypatch.setattr(app_mod.share_store, "get_roi_by_annotation_id",
+                        lambda aid: dict(roi_dict) if aid == "ann_other" else None)
+    c = _browser_client(app_mod.app)
+    r = c.post("/api/ai/run?fresh=1", json={
+        "slide_id": sid, "task": "圈出这个",
+        "target": {"slide_id": sid, "kind": "annotation",
+                   "annotation_id": "ann_other", "annotation_revision": 1}})
+    assert r.status_code == 403
+    assert fake.calls == []

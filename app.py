@@ -23255,14 +23255,25 @@ def _resolve_anno_by_id(annotation_id, require_write=False, allow_deleted=False)
     if roi.get("deleted") and not allow_deleted:
         return None, (jsonify(error="标注不存在"), 404)
     slide = roi.get("slide") or ""
+    # id_bundle 资产没有 legacy 名，rois.slide 只是显示名快照：按 slide_id 判定
+    desc = None
+    if roi.get("slide_id"):
+        try:
+            desc = slide_store.resolve_slide_id(roi.get("slide_id"))
+        except Exception:  # noqa: BLE001 - 解析失败按名通道（fail-closed 由其判定）
+            desc = None
+    by_id = desc is not None and not desc.legacy_filename
     if require_write:
-        if not can_annotate_slide(slide):
+        allowed = _desc_can_annotate(desc) if by_id else can_annotate_slide(slide)
+        if not allowed:
             return None, _denied()
         subject = annotation_access.subject_from_request()
         if not annotation_access.can_write_annotation(subject, roi):
             return None, _denied("只能修改自己创建的标注")
     else:
-        if not can_view_slide(slide):
+        allowed = (_authorize_or_deny(desc, channel="session") if by_id
+                   else can_view_slide(slide))
+        if not allowed:
             return None, _denied()
         subject = annotation_access.subject_from_request()
         if not annotation_access.can_read_annotation(subject, roi):

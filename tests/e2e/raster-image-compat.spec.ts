@@ -95,6 +95,65 @@ async function canvasCenterHasPixels(page: Page, selector: string): Promise<bool
 	}, selector);
 }
 
+test("选片像扑克牌抽出翻面，等真实瓦片后铺开；减少动画时直接打开", async ({ page }) => {
+  const { slide_id: sid } = CREDS.rasterSlides.workbench;
+  const errors: string[] = [];
+  page.on("pageerror", e => errors.push(e.message));
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  await login(page, CREDS.userLogin, CREDS.userPassword);
+  await page.goto('/app');
+  await expandSidebar(page);
+  const hit = page.locator(`.fb-hit[data-slide-id="${sid}"]`);
+  await expect(page.locator('.fb-hit').first()).toBeVisible();
+  // Earlier full-suite tests may add slides. Find this asset without opening it
+  // first, so the actual image cache is cold for the slow-tile regression.
+  for (let n = 0; n < 20 && !await hit.count(); n++) await page.locator('#fb-next-btn').click();
+  await expect(hit).toBeVisible();
+  let releaseTiles!: () => void;
+  const tileGate = new Promise<void>(resolve => { releaseTiles = resolve; });
+  let tileRequests = 0;
+  await page.route(`**/api/slides/${sid}/tiles/**`, async route => {
+    tileRequests++;
+    await tileGate;
+    await route.continue();
+  });
+  await expect.poll(() => hit.locator("img").evaluate((el: HTMLImageElement) => el.complete && el.naturalWidth > 0)).toBe(true);
+  // Observe actual phases, including the short handoff, without timing-sensitive sleeps.
+  await page.evaluate(() => {
+    (window as any).__dealPhases = [];
+    new MutationObserver(() => {
+      const phase = (document.querySelector('.slide-deal') as HTMLElement)?.dataset.phase;
+      if (phase) (window as any).__dealPhases.push(phase);
+    }).observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['data-phase'] });
+  });
+  await hit.focus();
+  await page.keyboard.press("Enter");
+  const deal = page.locator('.slide-deal');
+  await expect(deal).toHaveAttribute('data-slide-id', sid);
+  await expect(deal).toHaveCSS('pointer-events', 'none');
+  await expect(page.locator('.fb-fan-card')).toHaveCount(0);
+  try {
+    await expect.poll(() => tileRequests).toBeGreaterThan(0);
+    await expect(deal).toHaveAttribute('data-phase', 'waiting');
+    expect(await canvasCenterHasPixels(page, "#viewer .openseadragon-canvas")).toBe(false);
+  } finally { releaseTiles(); }
+  await expect(deal).toHaveCount(0, { timeout: 5000 });
+  await expect(page.locator('.slide-deal-stage')).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).__dealPhases)).toEqual(expect.arrayContaining(['drawing', 'spreading', 'handoff']));
+  await expect.poll(() => canvasCenterHasPixels(page, "#viewer .openseadragon-canvas")).toBe(true);
+  await expect(hit).toHaveAttribute('aria-pressed', 'true');
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.evaluate(() => { (window as any).__dealPhases = []; });
+  const response = page.waitForResponse(r => r.url().includes(`/slides/${sid}/info`));
+  await hit.focus();
+  await page.keyboard.press('Enter');
+  await response;
+  await expect(deal).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).__dealPhases)).toEqual([]);
+  expect(errors).toEqual([]);
+});
+
 test.describe("BMP 普通图片兼容（主站 + 分享页真实浏览器走查）", () => {
 
 	test("主站：BMP 查看 → 缺标尺语义 → 像素 rect 标注 → reload 回放一致", async ({ page }) => {

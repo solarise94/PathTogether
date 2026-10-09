@@ -1010,3 +1010,46 @@ test("连续选片：穿过浮卡覆盖区仍逐张命中，相邻卡联动且�
   await expect(page.locator('.fb-fan-card')).toHaveCount(0);
   expect(errors).toEqual([]);
 });
+
+
+test("抽牌开片：后一次点击接管动画，迟到响应与失败都不留遮挡", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  await serveFixture(page);
+  await mockOwnerWithSlides(page, FOUR_SLIDES);
+  const mockup = readFileSync(resolve(here, '../../docs/design-assets/admin-viewer-20261008/viewer-folders.html'), 'utf8');
+  const data = mockup.match(/data:image\/webp;base64,([A-Za-z0-9+/=]+)/)![1];
+  await page.route('**/*thumbnail*', r => r.fulfill({ contentType: 'image/webp', body: Buffer.from(data, 'base64') }));
+  let release!: () => void;
+  const delayed = new Promise<void>(resolve => { release = resolve; });
+  await page.route('**/api/slide/sample-0.svs/info', async r => {
+    await delayed;
+    await r.fulfill({ json: { ...SLIDE_INFO, name: 'sample-0.svs', display_name: 'Late A' } });
+  });
+  await page.goto(FIXTURE_HOST + '/fixture');
+  await expandSidebar(page);
+  await expect(page.locator('#sidebar')).toHaveCSS('width', '224px');
+  const rows = page.locator('.fb-hit');
+  await expect.poll(() => rows.first().locator('img').evaluate((img: HTMLImageElement) => img.complete && img.naturalWidth > 0)).toBe(true);
+  await rows.nth(0).focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('.slide-deal')).toHaveAttribute('data-slide-id', 'sample-0.svs');
+  await rows.nth(1).focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('.slide-deal')).toHaveAttribute('data-slide-id', 'sample-1.svs');
+  await expect(page.locator('.slide-deal-stage')).toHaveCount(1);
+  const oldResponse = page.waitForResponse('**/api/slide/sample-0.svs/info');
+  release();
+  await oldResponse;
+  await expect(page).toHaveTitle(/Specimen 1/);
+  await expect(page.locator('.slide-deal')).toHaveAttribute('data-slide-id', 'sample-1.svs');
+  await page.keyboard.press('Escape');
+  await expect(page.locator('.slide-deal, .slide-deal-stage')).toHaveCount(0);
+  await page.route('**/api/slide/sample-2.svs/info', r => r.fulfill({ status: 403, json: { error: 'no access' } }));
+  const denied = page.waitForResponse('**/api/slide/sample-2.svs/info');
+  await rows.nth(2).focus();
+  await page.keyboard.press('Enter');
+  await denied;
+  await expect(page.locator('.slide-deal, .slide-deal-stage')).toHaveCount(0);
+  await expect(page).toHaveTitle(/Specimen 1/);
+});

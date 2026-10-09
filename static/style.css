@@ -5212,3 +5212,21 @@ button:focus-visible, a:focus-visible, select:focus-visible, textarea:focus-visi
 /* The application viewport never scrolls; scrollable dialogs own their overflow.
    Unlike hidden, clip also prevents focus/scrollIntoView from shifting the shell. */
 body.app-mode-official { overflow: clip; }
+
+/* A selected slide is dealt from the fan into the workbench. The flight is
+   presentation-only; all pointer/keyboard interaction stays with the app. */
+.slide-deal-stage { position: fixed; z-index: 45; pointer-events: none; background: #262a30; }
+.slide-deal { position: fixed; z-index: 518; pointer-events: none; perspective: 1100px; }
+.slide-deal-card { position: relative; width: 100%; height: 100%; transform-style: preserve-3d; }
+.slide-deal-face { position: absolute; inset: 0; border-radius: 14px; backface-visibility: hidden;
+  overflow: hidden; box-shadow: 0 24px 64px #0005; background: #fff; }
+.slide-deal-front { border: 1px solid #007aff55; }
+.slide-deal-front img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.slide-deal-label { position: absolute; inset: 0 0 auto; padding: 12px 14px; color: #252a32;
+  background: #fffffff2; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.slide-deal-back { transform: rotateY(180deg); display: grid; place-items: center;
+  color: #fff; font-size: 18px; font-weight: 650; letter-spacing: .04em;
+  border: 7px solid #fff; outline: 1px solid #dbe6f5;
+  background: repeating-linear-gradient(45deg, #ffffff0a 0 1px, transparent 1px 10px),
+    repeating-linear-gradient(-45deg, #ffffff0a 0 1px, transparent 1px 10px), #244d82; }
+@media (prefers-reduced-motion: reduce), (max-width: 768px) { .slide-deal, .slide-deal-stage { display: none; } }

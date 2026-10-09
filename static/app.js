@@ -1536,6 +1536,16 @@
     }
     viewer.addHandler("zoom", function () { updateZoomBadge(); syncBaseThumb(); });
     viewer.addHandler("open", onViewerOpen);
+    viewer.addHandler("open-failed", cancelSlideDeal);
+    // Works for both Canvas and WebGL drawers. An open event only means the
+    // tile source is known; do not uncover an empty canvas on a slow connection.
+    viewer.addHandler("tiled-image-drawn", function (e) {
+      if (!slideDeal || !slideDeal.opened || slideDeal.seq !== openSlideSeq ||
+          !e.tiles || !e.tiles.length || !viewer.world ||
+          e.tiledImage !== viewer.world.getItemAt(0)) return;
+      slideDeal.ready = true;
+      spreadSlideDeal(slideDeal);
+    });
     // 底图随平移/缩放实时跟随（animation 每帧触发，跟随最平滑）
     viewer.addHandler("animation", function () { syncBaseThumb(); redrawAnnoCanvas(); });
     // 动画结束补画文本（标签/气泡）：动画期间为流畅省略了文本绘制
@@ -1594,6 +1604,10 @@
   }
 
   function onViewerOpen() {
+    if (slideDeal && slideDeal.seq === openSlideSeq && state.slide &&
+        String(state.slide.id || state.slide.name) === slideDeal.ref) {
+      slideDeal.opened = true;
+    }
     // AI 助手：切片一旦可用即启用触发按钮（插件停用时 aiBtn 不渲染，跳过；
     // 平台人工读片不受影响）。必须放在 channelReopening 分支之前：模板初始
     // disabled，而多通道切片带本地配色时首开被 close 吃掉、最终 open 只走
@@ -1607,12 +1621,14 @@
       state.channelReopening = false;
       updateZoomBadge();
       syncBaseThumb();
+      if (slideDeal) spreadSlideDeal(slideDeal);
       emitSlideOpened();
       return;
     }
     updateZoomBadge();
     // 打开后把底图缩略图对齐到当前视口
     syncBaseThumb();
+    if (slideDeal) spreadSlideDeal(slideDeal);
     // 打开新切片：退出绘制模式、清面板、重置标注画布尺寸
     exitDrawMode();
     resizeAnnoCanvas();
@@ -1945,10 +1961,12 @@
   // 丢弃，不触碰 viewer/state/选中标记。
   var openSlideSeq = 0;
 
-  function openSlide(ref) {
+  function openSlide(ref, cardSource) {
+    cancelSlideDeal();
     // 切换切片前移除旧底图
     clearBaseThumb();
     var seq = ++openSlideSeq;
+    if (cardSource) startSlideDeal(ref, seq, cardSource);
     apiFetch(slideInfoUrl(ref))
       .then(function (r) {
         var st = r.status;
@@ -1974,7 +1992,7 @@
           return;
         }
         var info = res.info;
-        if (info.error) { toast(t("open.fail", { e: info.error }), "error"); return; }
+        if (info.error) { cancelSlideDeal(); toast(t("open.fail", { e: info.error }), "error"); return; }
         state.slide = {
           // slide ID 化（P2 合同 §5.1）：id = slide_id 唯一操作键；name 保持
           // legacy 文件名（显示/快照）；旧后端 DTO 无 slide_id → id 为 null，
@@ -2068,8 +2086,143 @@
         if (isMobileWidth()) sidebarCtrl.closeDrawer();
       })
       .catch(function (e) {
-        if (seq === openSlideSeq) toast(t("open.info.fail", { e: e }), "error");
+        if (seq === openSlideSeq) {
+          cancelSlideDeal();
+          toast(t("open.info.fail", { e: e }), "error");
+        }
       });
+  }
+
+  // A visual bridge only: requests start immediately and keep the existing
+  // last-request-wins guard. Flight never captures input or owns viewer state.
+  var slideDeal = null;
+
+  function captureSlideCard(hit) {
+    if (isMobileWidth() || (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches)) return null;
+    var card = fbPulloutHit === hit && fbPulloutEl ? fbPulloutEl : hit.querySelector(".fb-card");
+    var img = card && card.querySelector("img");
+    // Keyboard focus can create a portal and activate it in the same frame,
+    // before its cloned image has decoded. The source thumbnail is already ready.
+    if (!img || !img.complete || !img.naturalWidth) img = hit.querySelector("img");
+    if (!card || !card.getBoundingClientRect || !img || !img.complete || !img.naturalWidth) return null;
+    var rect = card.getBoundingClientRect();
+    if (!rect.width || !rect.height) rect = hit.querySelector(".fb-card").getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+    var label = hit.querySelector(".fb-card-name");
+    return { rect: rect, src: img.currentSrc || img.src, name: label ? (label.title || label.textContent) : hit.dataset.name };
+  }
+
+  function cancelSlideDeal() {
+    if (!slideDeal) return;
+    var deal = slideDeal;
+    slideDeal = null; // Invalidate all animation/promise callbacks first.
+    clearTimeout(deal.timeout);
+    deal.animations.forEach(function (animation) { animation.cancel(); });
+    if (deal.el.parentNode) deal.el.parentNode.removeChild(deal.el);
+    if (deal.stage.parentNode) deal.stage.parentNode.removeChild(deal.stage);
+  }
+
+  function dealAnimate(deal, el, frames, options) {
+    var animation = el.animate(frames, options);
+    deal.animations.push(animation);
+    // Cancellation is normal when a second selection supersedes this one.
+    return animation.finished.catch(function () {});
+  }
+
+  function startSlideDeal(ref, seq, source) {
+    var root = $("viewer");
+    if (!root || !root.animate) return;
+    var target = root.getBoundingClientRect();
+    if (!target.width || !target.height) return;
+    var el = document.createElement("div");
+    el.className = "slide-deal";
+    el.dataset.slideId = String(ref);
+    el.dataset.phase = "drawing";
+    el.setAttribute("aria-hidden", "true");
+    var card = document.createElement("div");
+    card.className = "slide-deal-card";
+    var front = document.createElement("div");
+    front.className = "slide-deal-face slide-deal-front";
+    var img = document.createElement("img");
+    img.src = source.src;
+    img.alt = "";
+    var label = document.createElement("div");
+    label.className = "slide-deal-label";
+    label.textContent = source.name || "";
+    front.appendChild(img);
+    front.appendChild(label);
+    var back = document.createElement("div");
+    back.className = "slide-deal-face slide-deal-back";
+    back.textContent = "HistoPilot";
+    card.appendChild(front);
+    card.appendChild(back);
+    el.appendChild(card);
+    var r = source.rect;
+    var width = Math.min(300, target.width * .45), height = width * r.height / r.width;
+    var center = { left: target.left + (target.width - width) / 2,
+      top: target.top + (target.height - height) / 2, width: width, height: height };
+    function box(rect) { return { left: rect.left + "px", top: rect.top + "px", width: rect.width + "px", height: rect.height + "px" }; }
+    Object.assign(el.style, box(center));
+    var stage = document.createElement("div");
+    stage.className = "slide-deal-stage";
+    stage.setAttribute("aria-hidden", "true");
+    Object.assign(stage.style, box(target));
+    document.body.appendChild(stage);
+    document.body.appendChild(el);
+    var deal = slideDeal = { el: el, stage: stage, card: card, front: front, label: label, seq: seq,
+      ref: String(ref), center: center, animations: [], ready: false, drawn: false, spreading: false };
+    // A failed/very slow DZI must never leave a decorative card over the workbench.
+    deal.timeout = setTimeout(function () { if (slideDeal === deal) cancelSlideDeal(); }, 8000);
+    var drawn = { left: Math.min(r.left + 110, center.left), top: Math.max(target.top + 12, r.top - 24), width: r.width, height: r.height };
+    dealAnimate(deal, el, [Object.assign(box(r), { offset: 0 }),
+      Object.assign(box(drawn), { offset: .26 }), box(center)],
+      { duration: 620, easing: "cubic-bezier(.22,.7,.2,1)", fill: "both" });
+    dealAnimate(deal, card, [
+      { transform: "rotateY(0deg) rotateZ(-3deg)", offset: 0 },
+      { transform: "rotateY(-22deg) rotateZ(-9deg)", offset: .24 },
+      { transform: "rotateY(180deg) rotateZ(5deg)", offset: .62 },
+      { transform: "rotateY(360deg) rotateZ(0deg)" }
+    ], { duration: 620, easing: "cubic-bezier(.3,.05,.25,1)", fill: "both" }).then(function () {
+      if (slideDeal !== deal) return;
+      deal.drawn = true;
+      deal.el.dataset.phase = "waiting";
+      spreadSlideDeal(deal);
+    });
+  }
+
+  function spreadSlideDeal(deal) {
+    if (slideDeal !== deal || !deal.ready || !deal.drawn || deal.spreading) return;
+    // Use OSD's actual image bounds, including its fit/margins, for the handoff.
+    var root = $("viewer").getBoundingClientRect();
+    var rect;
+    try {
+      var tl = viewer.viewport.imageToViewerElementCoordinates(new OpenSeadragon.Point(0, 0));
+      var br = viewer.viewport.imageToViewerElementCoordinates(new OpenSeadragon.Point(state.slide.width, state.slide.height));
+      rect = { left: root.left + Math.min(tl.x, br.x), top: root.top + Math.min(tl.y, br.y),
+        width: Math.abs(br.x - tl.x), height: Math.abs(br.y - tl.y) };
+    } catch (e) { /* A closing viewer has no landing geometry. */ }
+    if (!rect || !rect.width || !rect.height) { cancelSlideDeal(); return; }
+    // Resizing/zooming during flight should hand control straight back to OSD.
+    if (rect.width > root.width + 2 || rect.height > root.height + 2) { cancelSlideDeal(); return; }
+    deal.spreading = true;
+    deal.el.dataset.phase = "spreading";
+    var c = deal.center;
+    dealAnimate(deal, deal.label, [{ opacity: 1 }, { opacity: 0 }], { duration: 160, fill: "both" });
+    dealAnimate(deal, deal.front, [
+      { borderRadius: "14px", boxShadow: "0 24px 64px #0005" },
+      { borderRadius: "0px", boxShadow: "0 0 0 #0000" }
+    ], { duration: 340, fill: "both" });
+    dealAnimate(deal, deal.el, [
+      { left: c.left + "px", top: c.top + "px", width: c.width + "px", height: c.height + "px" },
+      { left: rect.left + "px", top: rect.top + "px", width: rect.width + "px", height: rect.height + "px" }
+    ], { duration: 340, easing: "cubic-bezier(.2,.7,.2,1)", fill: "forwards" }).then(function () {
+      if (slideDeal !== deal) return;
+      deal.el.dataset.phase = "handoff";
+      dealAnimate(deal, deal.stage, [{ opacity: 1 }, { opacity: 0 }], { duration: 160, fill: "forwards" });
+      return dealAnimate(deal, deal.el, [{ opacity: 1 }, { opacity: 0 }], { duration: 160, fill: "forwards" }).then(function () {
+        if (slideDeal === deal) cancelSlideDeal();
+      });
+    });
   }
 
   // ---------- 临时查看到期（§5.5） ----------
@@ -2132,6 +2285,7 @@
   // 清空、缩放徽章复位「—」、画质档与通道 chrome（通道钮/RGB 徽章/面板）
   // 隐藏——任何切片上下文控件都不得残留。
   function enterNoSlideUiState() {
+    cancelSlideDeal();
     var closedRef = state.slide ? String(state.slide.id || state.slide.name || "") : "";
     state.slide = null;
     state.mppX = null;
@@ -3502,7 +3656,12 @@
     hit.addEventListener("blur", function () {
       fbPulloutScheduleHide();
     });
-    hit.addEventListener("click", function () { fbPulloutHide(); openSlide(sid); });
+    hit.addEventListener("click", function () {
+      // Snapshot the floating card before removing the fan portals.
+      var source = captureSlideCard(hit);
+      fbPulloutHide();
+      openSlide(sid, source);
+    });
     hit.addEventListener("keydown", function (e) { fbStackKeydown(e, hit); });
     return hit;
   }
@@ -3626,8 +3785,7 @@
     var hit = fbPulloutHit;
     fbFanDismissedAt = e && typeof e.clientX === "number" ? { x: e.clientX, y: e.clientY } : null;
     var sourceMenu = hit.querySelector(".fb-card-menu");
-    fbPulloutHide();
-    if (menu && sourceMenu) sourceMenu.click();
+    if (menu && sourceMenu) { fbPulloutHide(); sourceMenu.click(); }
     else hit.click();
   }
 
@@ -11254,9 +11412,10 @@
       if (fbFanDismissedAt && (Math.abs(e.clientX - fbFanDismissedAt.x) >= 2 || Math.abs(e.clientY - fbFanDismissedAt.y) >= 2)) fbFanDismissedAt = null;
       fbFanMove(e);
     }, true);
-    document.addEventListener("keydown", function (e) { if (e.key === "Escape") fbPulloutHide(); });
+    document.addEventListener("keydown", function (e) { if (e.key === "Escape") { fbPulloutHide(); cancelSlideDeal(); } });
     window.addEventListener("blur", fbPulloutHide);
-    window.addEventListener("resize", fbPulloutOnLayoutChange);
+    window.addEventListener("resize", function () { fbPulloutOnLayoutChange(); cancelSlideDeal(); });
+    window.addEventListener("blur", cancelSlideDeal);
     document.addEventListener("scroll", function () {
       // A pending hover measures its anchor after scrolling; only an already
       // placed preview has stale coordinates. Do not eat the first hover.

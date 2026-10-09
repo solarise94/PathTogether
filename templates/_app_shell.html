@@ -52,11 +52,19 @@
 
       {% if C.roi %}
       {# 升级 C（§6.1）：两个固定 ROI 按钮替换为单个「矩形」入口。
+         改版第四轮 §1.2：矩形/箭头/描图/搜索/分享改为大号矢量图标按钮
+         （约 34px 方形内嵌 ~20px 线性 SVG，同一线宽风格），不显示文字；
+         aria-label 与悬停 title 保留中英文名称（data-i18n-aria/title）。
          升级 Review 2026-09-09 §3.3：尺寸五项（宽/高/单位/锁比例/预设）改为
          按钮下方锚定 popover（.toolbar-pop，JS 定位）；主行只留简短摘要
-         （#roi-summary，如 6×6 mm）。#}
+         （#roi-summary，如 6×6 mm）。 #}
       <div class="roi-rect-wrap">
-        <button id="roi-rect-btn" class="tool-btn roi-rect-btn" aria-expanded="false" aria-controls="roi-settings" data-i18n-title="tb.rect.title"><span aria-hidden="true">▭</span><span class="tb-txt" data-i18n="tb.rect"> 矩形</span></button>
+        <button id="roi-rect-btn" class="tool-btn roi-rect-btn tb-icon-btn" aria-expanded="false" aria-controls="roi-settings"
+                data-i18n-title="tb.rect.title" title="矩形选区（拖出，或输入宽高后点击中心放置；Escape 取消）"
+                aria-label="矩形" data-i18n-aria="tb.rect.aria">
+          <svg class="tb-svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <rect x="3.9" y="6.9" width="16.2" height="10.2" rx="1.6"/>
+          </svg></button>
         <span id="roi-summary" class="roi-summary" data-i18n-title="tb.rect.summary.title" title="当前矩形尺寸" hidden></span>
         <div id="roi-settings" class="roi-settings toolbar-pop" role="group" aria-label="矩形尺寸" data-i18n-aria="tb.rect.settings.aria" hidden>
           <label class="roi-set-field"><span data-i18n="tb.rect.w">宽</span>
@@ -87,8 +95,16 @@
          进入「标注选项」popover（更名「标注名称（可选）」）；同一 input id，
          saveAnno 事件逻辑不变。 #}
       <div class="btn-group anno-tools" id="anno-tools-group">
-        <button id="anno-arrow-btn" class="tool-btn" data-i18n-title="tb.anno.arrow.title" disabled><span aria-hidden="true">↗</span><span class="tb-txt" data-i18n="tb.anno.arrow"> 箭头</span></button>
-        <button id="anno-free-btn" class="tool-btn" data-i18n-title="tb.anno.free.title" disabled><span aria-hidden="true">〰</span><span class="tb-txt" data-i18n="tb.anno.free"> 描图</span></button>
+        <button id="anno-arrow-btn" class="tool-btn tb-icon-btn" data-i18n-title="tb.anno.arrow.title"
+                title="箭头标注" aria-label="箭头" data-i18n-aria="tb.anno.arrow.aria" disabled>
+          <svg class="tb-svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M6.5 17.5 17.5 6.5"/><path d="M9.5 6.5h8v8"/>
+          </svg></button>
+        <button id="anno-free-btn" class="tool-btn tb-icon-btn" data-i18n-title="tb.anno.free.title"
+                title="描图标注" aria-label="描图" data-i18n-aria="tb.anno.free.aria" disabled>
+          <svg class="tb-svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M3 14.5c2.3 0 2.3-5 4.5-5s2.2 5 4.5 5 2.3-5 4.5-5 2.2 5 4.5 5"/>
+          </svg></button>
         <button id="anno-more-btn" class="icon-btn anno-more-btn" type="button" aria-label="标注选项"
                 data-i18n-aria="tb.anno.more" data-i18n-title="tb.anno.more" title="标注选项"
                 aria-haspopup="dialog" aria-expanded="false" aria-controls="anno-pop">▾</button>
@@ -142,19 +158,28 @@
 
       <div class="spacer"></div>
 
-      {# 改版 2026-10-08（admin-viewer-simplified §5.1/§5.4）：顶栏新增「搜索」与
-         「分享」两个浮层入口（图标+文字，≤768px 由既有 .tb-txt 隐藏规则收成图标）。
-         搜索浮层替换旧侧栏内联过滤（§5.4）；分享浮层承接原侧栏「分享管理」整块
-         （§5.1，表单/列表 DOM 原样迁入 #tb-share-pop，id 不变）。 #}
+      {# 改版 2026-10-08（admin-viewer-simplified §5.1/§5.4）：顶栏「搜索」与
+         「分享」两个浮层入口。改版第四轮 §1.2：与矩形/箭头/描图统一改为大号
+         矢量图标按钮（~34px 方形，不显示文字；aria-label/title 保留中英）。
+         溢出折叠优先级不变（搜索/分享最后折叠）。 #}
       {% if mode != 'demo' %}
-      <button id="tb-search-btn" class="tool-btn tb-search-btn" type="button"
+      <button id="tb-search-btn" class="tool-btn tb-search-btn tb-icon-btn" type="button"
               aria-haspopup="dialog" aria-expanded="false" aria-controls="tb-search-pop"
               data-i18n-title="tb.search.title" title="搜索切片"
-              aria-label="搜索切片" data-i18n-aria="tb.search.title"><span aria-hidden="true">⌕</span><span class="tb-txt" data-i18n="tb.search"> 搜索</span></button>
-      <button id="tb-share-btn" class="tool-btn tb-share-btn" type="button"
+              aria-label="搜索切片" data-i18n-aria="tb.search.title">
+        <svg class="tb-svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <circle cx="10.8" cy="10.8" r="6.3"/><path d="M15.6 15.6 20.2 20.2"/>
+        </svg></button>
+      <button id="tb-share-btn" class="tool-btn tb-share-btn tb-icon-btn" type="button"
               aria-haspopup="dialog" aria-expanded="false" aria-controls="tb-share-pop"
               data-i18n-title="tb.share.title" title="分享管理"
-              aria-label="分享管理" data-i18n-aria="tb.share.title"><span aria-hidden="true">⇗</span><span class="tb-txt" data-i18n="tb.share"> 分享</span></button>
+              aria-label="分享管理" data-i18n-aria="tb.share.title">
+        <!-- 分享字形 = 原型（docs/design-assets/admin-viewer-20261008/viewer-folders）的
+             lucide share-2：三个节点两两连线；与其他图标同 1.8 线宽描边风格 -->
+        <svg class="tb-svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/>
+          <path d="M8.59 13.51l6.83 3.98M8.59 10.49l6.83-3.98"/>
+        </svg></button>
       {% endif %}
 
       <span id="zoom-badge" class="zoom-badge">—</span>
@@ -203,6 +228,8 @@
             <div id="acct-pop-detail" class="acct-pop-detail"></div>
           </div>
           <button type="button" id="acct-settings-btn" class="acct-settings" data-i18n="acct.settings" hidden>账户设置</button>
+          <!-- 反馈问题（改版第四轮 §3）第二入口：账户弹层内（与侧栏底部链接同功能） -->
+          <button type="button" id="acct-feedback-btn" class="acct-settings" data-i18n="fbk.entry" hidden>反馈问题</button>
         </div>
       </div>
       {% endif %}
@@ -307,6 +334,10 @@
              入口；预览态隐藏（服务端 actor 解析同样拒绝预览态），demo 无登录态不渲染 -->
         <button type="button" id="datashare-btn" class="logout-link changepw-link"
                 data-i18n="acct.datashare" hidden>数据共享</button>
+        <!-- 反馈问题（改版第四轮 §3）：登录用户可见（applyAuthInfo 解锁；
+             demo 壳走另一分支不渲染）。对话框见本模板底部 #feedback-mask -->
+        <button type="button" id="feedback-btn" class="logout-link changepw-link"
+                data-i18n="fbk.entry" hidden>反馈问题</button>
         <button type="button" id="logout-btn" class="logout-link" data-i18n="toast.logout" hidden>退出登录</button>
       </div>
       {% endif %}
@@ -460,6 +491,44 @@
         </div>
       </div>
 
+      <!-- 反馈问题对话框（改版第四轮 §3；仅正式版壳渲染）：
+           描述必填 10–4000 字（实时计数）；「查看将附带的信息」展开显示将要
+           POST 的完整 JSON（含客户端记录器环形缓冲摘要）；一行说明包含/不包含
+           内容。发送经 apiFetch（统一 CSRF），202 提示已收到；429 显示重试
+           时间。隐私口径：只附操作摘要，绝不含输入内容/密码/请求响应正文/
+           Cookie/查询串/图像数据（记录器见 static/feedback-recorder.js）。 -->
+      <div id="feedback-mask" class="picker-mask" style="display:none;">
+        <div class="picker-dialog changepw-dialog feedback-dialog" role="dialog" aria-modal="true"
+             aria-labelledby="feedback-title">
+          <div class="picker-title">
+            <span id="feedback-title" data-i18n="fbk.title">反馈问题</span>
+            <button id="feedback-close" class="icon-btn close" aria-label="关闭" data-i18n-aria="picker.close">×</button>
+          </div>
+          <div class="changepw-body">
+            <label class="changepw-field">
+              <span data-i18n="fbk.desc.label">问题描述</span>
+              <textarea id="feedback-desc" rows="6" maxlength="4000"
+                        data-i18n-ph="fbk.desc.ph"
+                        placeholder="请描述遇到的问题或建议（10–4000 字）"></textarea>
+            </label>
+            <div class="feedback-meta-row">
+              <span id="feedback-count" class="feedback-count">0 / 4000</span>
+            </div>
+            <p class="changepw-hint" data-i18n="fbk.privacy.hint">将附带最近的操作摘要（页面路径、点击的控件、接口状态码、报错）；不含输入内容、密码、切片图像、Cookie 或查询串。</p>
+            <details class="feedback-preview" id="feedback-preview-details">
+              <summary data-i18n="fbk.preview.toggle">查看将附带的信息</summary>
+              <pre id="feedback-preview" class="feedback-preview-json"></pre>
+            </details>
+            <p class="changepw-error" id="feedback-error" role="alert" hidden></p>
+            <p class="feedback-success" id="feedback-success" role="status" hidden data-i18n="fbk.success">已收到，谢谢反馈</p>
+          </div>
+          <div class="picker-footer">
+            <button id="feedback-cancel" class="btn secondary small" data-i18n="acct.changepw.cancel">取消</button>
+            <button id="feedback-submit" class="btn primary" data-i18n="fbk.send">发送</button>
+          </div>
+        </div>
+      </div>
+
       <div id="anno-panel" class="anno-panel" style="display:none;">
         <div class="anno-panel-header">
           <span id="anno-panel-title" data-i18n="anno.panel.title">标注</span>
@@ -513,8 +582,12 @@
         </div>
       </div>
       {% elif histopilot_ui_enabled %}
-      <div id="ai-panel" class="ai-panel" style="display:none;">
-        <div class="ai-panel-header">
+      <!-- 改版第四轮 §1.4：AI 面板可拖动（标题栏）/可调整大小（右下角手柄）。
+           交互全部在宿主侧（app.js 的 AI 面板控制器），不改动 HistoPilot 插件
+           内部；位置/大小钳回切片视框并按用户记入 localStorage（pt.aip.v1|）。
+           ≤768px 维持现有布局：手柄隐藏、拖动不启用。 -->
+      <div id="ai-panel" class="ai-panel ai-dockable" style="display:none;">
+        <div class="ai-panel-header" id="ai-panel-header">
           <span id="ai-panel-title" data-i18n="ai.panel.title">✨ AI 读片助手</span>
           <div class="ai-panel-header-actions">
             <button id="ai-panel-close" class="icon-btn close" aria-label="关闭" data-i18n-aria="picker.close">×</button>
@@ -665,6 +738,9 @@
             </button>
           </div>
         </div>
+
+        <!-- 调整大小手柄（右下角；拖动/钳制逻辑在 app.js；≤768px CSS 隐藏） -->
+        <span id="ai-panel-resize" class="ai-panel-resize" aria-hidden="true"></span>
       </div>
       {% endif %}
     </main>

@@ -79,7 +79,12 @@ button {
   padding: 0 16px;
   gap: 16px;
   flex-shrink: 0;
-  z-index: 10;
+  /* 改版第四轮 §1.3：#app-header 是 body（flex 容器）的 flex 项，z-index:10
+     会为整个 header 建立层叠上下文——「⋯」菜单（.tbb-more z 500）被困在其中，
+     被 #viewer-wrap 内 z 56 的 AI 面板（#ai-panel，无中间层叠上下文、直接参与
+     根层叠）压住。抬到 56 之上（低于抽屉 300/⋯遮罩 490/浮层 520），顶栏所有
+     下拉与浮层即回到 AI 面板之上。 */
+  z-index: 60;
 }
 
 .title-group {
@@ -351,8 +356,10 @@ button {
     display: inline-flex;
     flex-shrink: 0;
   }
-  /* macOS 菜单样式：半透明模糊底、圆角浮层、整行菜单项。
-     绝对定位于 header 正下方右侧；#toolbar 非定位元素，不会裁剪 */
+  /* macOS 菜单样式：白底不透明（评审 P1：半透明 toolbar-bg + blur 会透出
+     下层内容——round4 复查：AI 面板文字透过 ⋯ 菜单显示、顶行发白），材质与
+     工具栏浮层（.toolbar-pop / .tb-search-pop）一致：白底 + 0.5px 边框 +
+     float 阴影。绝对定位于 header 正下方右侧；#toolbar 非定位元素，不会裁剪 */
   #toolbar .tbb-more {
     position: absolute;
     top: calc(100% + 6px);
@@ -362,9 +369,7 @@ button {
     gap: 1px;
     min-width: 168px;
     padding: 5px;
-    background: var(--toolbar-bg);
-    backdrop-filter: blur(20px) saturate(180%);
-    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    background: #fff;
     border: 0.5px solid var(--separator);
     border-radius: 10px;
     box-shadow: var(--shadow-float);
@@ -2366,7 +2371,7 @@ button {
   /* §3.5：账户 chip 在窄屏底栏保持在最右（⋯ 之后），浮层向上弹出 */
   #toolbar .acct-wrap { order: 100; }
   #toolbar .acct-btn { height: 32px; max-width: 120px; }
-  /* ⋯ 溢出面板：底栏上方弹出的紧凑行 */
+  /* ⋯ 溢出面板：底栏上方弹出的紧凑行（白底不透明，与工具栏浮层同材质） */
   #toolbar .tbb-more {
     display: none;
     position: fixed;
@@ -2375,13 +2380,18 @@ button {
     align-items: center;
     gap: 8px;
     padding: 8px 10px;
-    background: var(--toolbar-bg);
-    backdrop-filter: blur(20px) saturate(180%);
-    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    background: #fff;
     border: 0.5px solid var(--separator);
     border-radius: 12px;
     box-shadow: var(--shadow-float);
     z-index: 500;
+    /* 改版第四轮：折叠档收进来的控件总量可能超过窄屏宽度（单行会向左溢出
+       屏幕，菜单里的低频钮不可达）。限宽 + 换行 + 右对齐，超出高度滚动。 */
+    left: 10px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    max-height: 60vh;
+    overflow-y: auto;
   }
   #toolbar .tbb-more.open { display: flex; }
   #toolbar .tbb-more .tool-btn { height: 36px; padding: 0 12px; font-size: 13px; }
@@ -2586,6 +2596,47 @@ button {
   display: inline-flex;
   align-items: center;
   gap: 2px;
+}
+
+/* ---------- AI 面板外框拖动/调整大小（改版第四轮 §1.4） ----------
+   交互全部在宿主侧：标题栏空白拖动、右下角手柄缩放（app.js
+   createAIPanelController，Pointer Events）。≤768px 不启用：手柄隐藏、
+   光标回默认，面板维持现有布局（贴底栏之上）。 */
+.ai-panel.ai-drag-ok .ai-panel-header {
+  cursor: grab;
+  touch-action: none; /* 触摸拖动不滚动页面 */
+}
+.ai-panel.ai-dragging {
+  user-select: none;
+  -webkit-user-select: none;
+}
+.ai-panel.ai-dragging .ai-panel-header { cursor: grabbing; }
+.ai-panel-resize {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 18px;
+  height: 18px;
+  cursor: nwse-resize;
+  touch-action: none;
+  z-index: 5;
+  border-bottom-right-radius: var(--r-panel, 12px);
+  background:
+    linear-gradient(135deg,
+      transparent 0 46%,
+      var(--separator-strong, rgba(0, 0, 0, 0.25)) 46% 54%,
+      transparent 54% 64%,
+      var(--separator-strong, rgba(0, 0, 0, 0.25)) 64% 72%,
+      transparent 72%);
+}
+@media (max-width: 768px) {
+  .ai-panel-resize { display: none; }
+  .ai-panel.ai-drag-ok .ai-panel-header { cursor: default; touch-action: auto; }
+  /* 维持现有布局：面板底缘收在底栏之上（此前由 z 56 > 顶栏 10 的旧层叠
+     顺序隐式保证；顶栏抬到 60 后由几何显式保证，底栏恢复可点） */
+  .ai-panel {
+    bottom: calc(var(--tbb-bar-h, 56px) + var(--safe-bottom, 0px) + 8px);
+  }
 }
 
 /* AI 服务降级横幅（sidecar 不可达；平台功能不受影响） */
@@ -3822,6 +3873,67 @@ button {
   padding: 6px 10px;
 }
 
+/* ---------- 反馈问题对话框（改版第四轮 §3；骨架复用 changepw-dialog） ---------- */
+.feedback-dialog .changepw-field textarea {
+  width: 100%;
+  min-height: 96px;
+  border: 1px solid var(--separator);
+  border-radius: var(--r-btn, 8px);
+  padding: 8px 10px;
+  font-size: 13px;
+  font-family: inherit;
+  line-height: 1.5;
+  color: var(--text);
+  background: #fff;
+  outline: none;
+  resize: vertical;
+}
+.feedback-dialog .changepw-field textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.15);
+}
+.feedback-meta-row {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: -4px;
+}
+.feedback-count {
+  font-size: 11px;
+  color: var(--text-3, var(--text-2));
+  font-variant-numeric: tabular-nums;
+}
+.feedback-preview { margin: 2px 0 0; }
+.feedback-preview > summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--accent);
+  user-select: none;
+}
+.feedback-preview > summary:hover { text-decoration: underline; }
+.feedback-preview-json {
+  margin: 6px 0 0;
+  max-height: 180px;
+  overflow: auto;
+  padding: 8px 10px;
+  border: 0.5px solid var(--separator);
+  border-radius: 8px;
+  background: var(--seg-bg, rgba(0, 0, 0, 0.03));
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text-2);
+}
+.feedback-success {
+  font-size: 13px;
+  font-weight: 600;
+  color: #1a7f37;
+  background: rgba(52, 199, 89, 0.12);
+  border-radius: var(--r-btn, 8px);
+  padding: 8px 10px;
+}
+
 /* -----------------------------------------------------------------------
    viewer 画质档（image-transport-upgrade §3.3）：标准/精细分段与荧光保真标识。
    只做展示：不向产品界面暴露 q、采样、cache key 等实现细节。
@@ -4486,13 +4598,47 @@ button {
 }
 .canvas-slide-label[hidden] { display: none; }
 
-/* ---------- 顶栏搜索/分享按钮：图标+文字，窄屏由 .tb-txt 规则收成图标 ----------
-   溢出收放的「收图标」步骤（改版二评）：折入 ⋯ 之前的过渡档——只留图标，
-   语义由 aria-label/title 保留。 */
+/* ---------- 顶栏图标按钮（改版第四轮 §1.2） ----------
+   搜索/分享/矩形/箭头/描图为大号矢量图标按钮：~34px 方形内嵌 ~20px 线性
+   SVG（统一 1.8 线宽 / 圆角端点），不显示文字；名称由 aria-label（zh/en
+   经 data-i18n-aria）与悬停 title 保留。选中/激活态沿用 .active /
+   [aria-expanded="true"] 既有规则。 */
 .tb-search-btn,
 .tb-share-btn { flex-shrink: 0; }
-#toolbar .tool-btn.tb-icon-only { padding-left: 9px; padding-right: 9px; }
-#toolbar .tool-btn.tb-icon-only .tb-txt { display: none; }
+#toolbar .tool-btn.tb-icon-btn {
+  width: 34px;
+  min-width: 34px;
+  height: 34px;
+  min-height: 34px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--text-2);
+}
+#toolbar .tool-btn.tb-icon-btn .tb-svg {
+  width: 20px;
+  height: 20px;
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+#toolbar .tool-btn.tb-icon-btn:hover:not(:disabled),
+#toolbar .tool-btn.tb-icon-btn:focus-visible { color: var(--text); }
+#toolbar .tool-btn.tb-icon-btn.active { color: var(--accent); }
+/* ≤768px 底栏触控区跟随 --control-h（44px，触控目标不缩） */
+@media (max-width: 768px) {
+  #toolbar .tool-btn.tb-icon-btn {
+    width: var(--control-h);
+    min-width: var(--control-h);
+    height: var(--control-h);
+    min-height: var(--control-h);
+  }
+}
 .tb-search-btn[aria-expanded="true"],
 .tb-share-btn[aria-expanded="true"] {
   background: var(--accent-fill);
@@ -4907,6 +5053,47 @@ button {
   .fb-hit.extracted .fb-card { transform: translateX(32px) !important; }
 }
 
+/* ---------- 悬停抽出层（改版第四轮 §1.1） ----------
+   抽出呈现改为 body 直挂的固定定位浮层：位置由 JS 按命中区
+   getBoundingClientRect 计算（含越界钳回），不再受侧栏 overflow /
+   backdrop-filter / 收起过渡 / 层叠上下文影响——任何断点都完整浮在画布
+   之上。层级 515：高于 AI 面板（56）与顶栏（60），低于工具栏浮层（520）
+   与卡片 ⋯ 菜单（620）。 */
+.fb-pullout {
+  position: fixed;
+  z-index: 515;
+  width: 240px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+.fb-pullout .fb-pullout-card {
+  position: static;
+  width: 100%;
+  height: 128px;
+  transform: none;
+  cursor: pointer;
+  pointer-events: auto;
+  border-color: var(--accent);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.18);
+  transition: opacity 120ms ease;
+}
+@media (prefers-reduced-motion: reduce) {
+  .fb-pullout .fb-pullout-card { transition: none !important; }
+}
+/* 浮层接管抽出呈现期间：命中区内原位卡保持静止原样（避免双重绘制/位移）。
+   需压过上方 prefers-reduced-motion 的 !important 位移。 */
+body.fb-pullout-on .fb-hit.extracted .fb-card {
+  transform: none !important;
+  transition: none !important;
+  width: 100%;
+  pointer-events: none;
+  border-color: var(--separator);
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.08);
+}
+
 
 /* 2026-10-09：舒适密度。单行工具栏继续由实测宽度折叠；不缩小命中区来挤按钮。
    切片 128px / 44px 露出条带、文件夹 64px 与 app.js 的分页预算同步。 */
@@ -4918,7 +5105,6 @@ html, body { font-size: 14px; }
 #toolbar .tool-btn, #toolbar .tbb-more .tool-btn { min-height: var(--control-h); height: var(--control-h); font-size: 14px; line-height: 1; }
 #toolbar .icon-btn { width: var(--control-h); height: var(--control-h); }
 #toolbar .btn-group { gap: 4px; }
-#toolbar .tool-btn.tb-icon-only { min-width: var(--control-h); }
 .lang-toggle, .acct-btn, #toolbar .acct-btn { height: var(--control-h); font-size: 14px; padding: 0 12px; }
 .lang-toggle { min-width: var(--control-h); }
 .seg-control .seg, .viewer-quality-btn { min-height: 36px; font-size: 14px; }

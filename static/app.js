@@ -112,6 +112,32 @@
     "slide.meta.no.scale": { zh: "无物理标尺", en: "no physical scale" },
     "edit.conflict": { zh: "该标注已被他人修改（当前 revision {rev}），已显示当前版本；请基于最新版本重新编辑",
                        en: "This annotation was modified by someone else (current revision {rev}); showing the current version — please re-edit on top of it" },
+
+    // 改版第四轮 §1.2：图标按钮 aria 名称（i18n.js 为主源，此处兜底）
+    "tb.rect.aria": { zh: "矩形", en: "Rectangle" },
+    "tb.anno.arrow.aria": { zh: "箭头", en: "Arrow" },
+    "tb.anno.free.aria": { zh: "描图", en: "Trace" },
+
+    // 改版第四轮 §3：反馈问题（i18n.js 为主源，此处兜底）
+    "fbk.entry": { zh: "反馈问题", en: "Feedback" },
+    "fbk.title": { zh: "反馈问题", en: "Report a problem" },
+    "fbk.desc.label": { zh: "问题描述", en: "Description" },
+    "fbk.desc.ph": { zh: "请描述遇到的问题或建议（10–4000 字）", en: "Describe the problem or suggestion (10–4000 characters)" },
+    "fbk.privacy.hint": { zh: "将附带最近的操作摘要（页面路径、点击的控件、接口状态码、报错）；不含输入内容、密码、切片图像、Cookie 或查询串。",
+                          en: "Attaches a summary of recent activity (page paths, control clicks, API status codes, errors); never your typed input, passwords, slide images, cookies, or query strings." },
+    "fbk.preview.toggle": { zh: "查看将附带的信息", en: "See what will be attached" },
+    "fbk.send": { zh: "发送", en: "Send" },
+    "fbk.sending": { zh: "发送中…", en: "Sending…" },
+    "fbk.success": { zh: "已收到，谢谢反馈", en: "Received — thank you for the feedback" },
+    "fbk.err.short": { zh: "描述至少 10 个字", en: "Please write at least 10 characters" },
+    "fbk.err.long": { zh: "描述最多 4000 字", en: "Please keep the description within 4000 characters" },
+    "fbk.err.rate": { zh: "发送太频繁，请 {time}再试", en: "Too many requests; please retry {time}" },
+    "fbk.err.rate.later": { zh: "稍后", en: "later" },
+    "fbk.err.rate.seconds": { zh: "{n} 秒后", en: "in {n} seconds" },
+    "fbk.err.rate.minutes": { zh: "{n} 分钟后", en: "in {n} minutes" },
+    "fbk.err.too_large": { zh: "附带内容过大，请精简描述后重试", en: "Payload too large; please shorten the description and retry" },
+    "fbk.err.generic": { zh: "发送失败（{status}），请稍后重试", en: "Sending failed ({status}); please retry later" },
+    "fbk.err.network": { zh: "网络异常，发送失败，请稍后重试", en: "Network error — sending failed; please retry later" },
   };
   function tt(key, vars) {
     try {
@@ -196,6 +222,23 @@
     });
   }
 
+  // ---------- 用户反馈记录器桥（改版第四轮 §3） ----------
+  // window.HP_FEEDBACK 由 static/feedback-recorder.js 在本脚本之前装载
+  // （fetch/console/error 包装必须尽早）。记录器缺失（demo 页等）时全部
+  // 为空操作；桥自身任何异常都吞掉，绝不影响主流程。
+  function fbRecLog(kind, data) {
+    try {
+      var rec = window.HP_FEEDBACK;
+      if (rec && typeof rec.log === "function") rec.log(kind, data);
+    } catch (e) {}
+  }
+  function fbRecSetSlide(id) {
+    try {
+      var rec = window.HP_FEEDBACK;
+      if (rec && typeof rec.setCurrentSlide === "function") rec.setCurrentSlide(id);
+    } catch (e) {}
+  }
+
   // 当前登录用户角色（/api/auth/info 缓存）。currentRole/currentUserId 是
   // effective subject（预览中为被预览用户）；actorRole 永远是真实管理员。
   var currentRole = null;
@@ -226,6 +269,11 @@
     // 数据共享入口与改密/改绑同级：预览态隐藏（服务端 actor 解析同样拒绝
     // 预览态变更用户授权）；未登录时 auth_enabled=false 提前返回保持 hidden
     if (els.datashareBtn) { els.datashareBtn.hidden = !!previewState; }
+    // 反馈问题（改版第四轮 §3）：登录后可见（demo 壳不渲染入口；未登录时
+    // auth_enabled=false 在本函数开头提前返回，模板初始 hidden 保持）。
+    // 预览态同样可用（反馈随真实会话上送，服务端记录 actor）。
+    if (els.feedbackBtn) { els.feedbackBtn.hidden = !info.username; }
+    if (els.acctFeedbackBtn) { els.acctFeedbackBtn.hidden = !info.username; }
     // 管理台入口按真实 actor 判定（预览态隐藏——与改密/登出同级约定；
     // 预览中 /admin 仍可手动直达，宿主每条消息回查真实 owner）。
     if (els.adminEntryLink) {
@@ -517,6 +565,177 @@
     els.changeemailSubmitBtn.addEventListener("click", changeemailSubmit);
     els.changeemailNew.addEventListener("keydown", function (e) {
       if (e.key === "Enter") { changeemailSubmit(); }
+    });
+  }
+
+  // ---------- 反馈问题对话框（改版第四轮 §3） ----------
+  // 双入口：侧栏底部链接（#feedback-btn）与账户弹层（#acct-feedback-btn）。
+  // 描述必填 10–4000 字（实时计数）；「查看将附带的信息」展开即渲染将要
+  // POST 的完整 JSON（客户端记录器快照 + 描述原文，所见即所发）。发送经
+  // apiFetch（统一 CSRF）：202 → 「已收到，谢谢反馈」后自动关闭；429 →
+  // 按 retry_after 显示可重试时间；400/413/其余 → 可读报错。Demo 壳无
+  // 本对话框；未登录入口保持模板初始 hidden。
+  var FBK_DESC_MIN = 10;
+  var FBK_DESC_MAX = 4000;
+  var feedbackState = { sending: false, doneTimer: null };
+
+  function feedbackBuildPayload(description) {
+    var client = {};
+    try {
+      var rec = window.HP_FEEDBACK;
+      if (rec && typeof rec.snapshot === "function") client = rec.snapshot();
+    } catch (e) { client = {}; }
+    return { description: description, client: client };
+  }
+
+  function feedbackShowError(msg) {
+    if (!els.feedbackError) return;
+    els.feedbackError.textContent = msg || "";
+    els.feedbackError.hidden = !msg;
+  }
+
+  function feedbackSetSending(on) {
+    feedbackState.sending = !!on;
+    if (els.feedbackSubmitBtn) {
+      els.feedbackSubmitBtn.disabled = !!on;
+      els.feedbackSubmitBtn.textContent = on ? tt("fbk.sending") : tt("fbk.send");
+    }
+  }
+
+  function feedbackRenderPreview() {
+    if (!els.feedbackPreview || !els.feedbackPreviewDetails) return;
+    var open = typeof els.feedbackPreviewDetails.open === "boolean"
+      ? els.feedbackPreviewDetails.open : true;
+    if (!open) { els.feedbackPreview.textContent = ""; return; }
+    var desc = (els.feedbackDesc && els.feedbackDesc.value ? els.feedbackDesc.value : "");
+    els.feedbackPreview.textContent = JSON.stringify(feedbackBuildPayload(desc), null, 2);
+  }
+
+  function feedbackRefreshMeta() {
+    var desc = (els.feedbackDesc && els.feedbackDesc.value) || "";
+    var shown = desc.length > FBK_DESC_MAX ? desc.slice(0, FBK_DESC_MAX).length : desc.length;
+    if (els.feedbackCount) els.feedbackCount.textContent = shown + " / " + FBK_DESC_MAX;
+    if (els.feedbackSubmitBtn && !feedbackState.sending) {
+      els.feedbackSubmitBtn.disabled = desc.trim().length < FBK_DESC_MIN;
+    }
+    feedbackRenderPreview();
+  }
+
+  function feedbackOpen() {
+    if (!els.feedbackMask) return;
+    if (feedbackState.doneTimer) { clearTimeout(feedbackState.doneTimer); feedbackState.doneTimer = null; }
+    feedbackShowError("");
+    if (els.feedbackSuccess) els.feedbackSuccess.hidden = true;
+    if (els.feedbackDesc) els.feedbackDesc.value = "";
+    if (els.feedbackPreviewDetails && "open" in els.feedbackPreviewDetails) {
+      els.feedbackPreviewDetails.open = false;
+    }
+    feedbackSetSending(false);
+    els.feedbackMask.style.display = "";
+    feedbackRefreshMeta();
+    if (els.feedbackDesc && els.feedbackDesc.focus) {
+      setTimeout(function () { try { els.feedbackDesc.focus(); } catch (e) {} }, 30);
+    }
+    // 打开对话框本身也记入操作摘要（帮助还原报错前的操作路径）
+    fbRecLog("action", { control: { id: "feedback-dialog", tag: "dialog" } });
+  }
+
+  function feedbackClose() {
+    if (!els.feedbackMask) return;
+    if (feedbackState.doneTimer) { clearTimeout(feedbackState.doneTimer); feedbackState.doneTimer = null; }
+    els.feedbackMask.style.display = "none";
+  }
+
+  function feedbackSucceeded() {
+    if (els.feedbackSuccess) els.feedbackSuccess.hidden = false;
+    if (els.feedbackDesc) els.feedbackDesc.value = "";
+    feedbackRefreshMeta();
+    toast(tt("fbk.success"), "success");
+    // 状态可见后再自动关闭（2s）
+    feedbackState.doneTimer = setTimeout(function () {
+      feedbackState.doneTimer = null;
+      feedbackClose();
+    }, 2000);
+  }
+
+  function feedbackRetryText(retryAfter) {
+    var s = Number(retryAfter);
+    if (!isFinite(s) || s <= 0) return tt("fbk.err.rate.later");
+    if (s < 60) return tt("fbk.err.rate.seconds", { n: Math.ceil(s) });
+    return tt("fbk.err.rate.minutes", { n: Math.ceil(s / 60) });
+  }
+
+  function feedbackSubmit() {
+    if (feedbackState.sending) return;
+    var desc = ((els.feedbackDesc && els.feedbackDesc.value) || "").trim();
+    if (desc.length < FBK_DESC_MIN) {
+      feedbackShowError(tt("fbk.err.short"));
+      return;
+    }
+    if (desc.length > FBK_DESC_MAX) {
+      feedbackShowError(tt("fbk.err.long"));
+      return;
+    }
+    feedbackShowError("");
+    feedbackSetSending(true);
+    apiFetch("/api/feedback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(feedbackBuildPayload(desc)),
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (b) {
+        return { status: r.status, body: b || {} };
+      });
+    }).then(function (res) {
+      feedbackSetSending(false);
+      if (res.status === 202 || res.status === 200) {
+        feedbackSucceeded();
+        return;
+      }
+      if (res.status === 429) {
+        feedbackShowError(tt("fbk.err.rate", { time: feedbackRetryText(res.body.retry_after) }));
+        return;
+      }
+      if (res.status === 400) {
+        feedbackShowError(tt("fbk.err.short"));
+        return;
+      }
+      if (res.status === 413) {
+        feedbackShowError(tt("fbk.err.too_large"));
+        return;
+      }
+      // 401 由 apiFetch 统一跳登录（auth_required）；其余给可读报错
+      feedbackShowError(tt("fbk.err.generic", { status: res.status || 0 }));
+    }).catch(function () {
+      feedbackSetSending(false);
+      feedbackShowError(tt("fbk.err.network"));
+    });
+  }
+
+  function initFeedbackDialog() {
+    if (!els.feedbackMask) return;   // demo 壳不渲染
+    if (els.feedbackBtn) {
+      els.feedbackBtn.addEventListener("click", feedbackOpen);
+    }
+    if (els.acctFeedbackBtn) {
+      els.acctFeedbackBtn.addEventListener("click", function () {
+        if (acctPopCtl) acctPopCtl.close();
+        feedbackOpen();
+      });
+    }
+    els.feedbackClose.addEventListener("click", feedbackClose);
+    els.feedbackCancel.addEventListener("click", feedbackClose);
+    els.feedbackMask.addEventListener("click", function (e) {
+      if (e.target === els.feedbackMask) { feedbackClose(); }
+    });
+    els.feedbackSubmitBtn.addEventListener("click", feedbackSubmit);
+    els.feedbackDesc.addEventListener("input", feedbackRefreshMeta);
+    // 展开即渲染（并随输入刷新；见 feedbackRefreshMeta → feedbackRenderPreview）
+    els.feedbackPreviewDetails.addEventListener("toggle", feedbackRenderPreview);
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && els.feedbackMask.style.display !== "none") {
+        feedbackClose();
+      }
     });
   }
 
@@ -961,6 +1180,23 @@
     datashareLegacy: $("datashare-legacy"),
     datashareJob: $("datashare-job"),
     datashareError: $("datashare-error"),
+    // 反馈问题（改版第四轮 §3）：侧栏底部 + 账户弹层双入口 + 对话框
+    feedbackBtn: $("feedback-btn"),
+    acctFeedbackBtn: $("acct-feedback-btn"),
+    feedbackMask: $("feedback-mask"),
+    feedbackClose: $("feedback-close"),
+    feedbackCancel: $("feedback-cancel"),
+    feedbackSubmitBtn: $("feedback-submit"),
+    feedbackDesc: $("feedback-desc"),
+    feedbackCount: $("feedback-count"),
+    feedbackPreviewDetails: $("feedback-preview-details"),
+    feedbackPreview: $("feedback-preview"),
+    feedbackError: $("feedback-error"),
+    feedbackSuccess: $("feedback-success"),
+    // AI 面板外框拖动/调整大小（改版第四轮 §1.4；demo 面板无这些 id → 空引用）
+    aiPanel: $("ai-panel"),
+    aiPanelHeader: $("ai-panel-header"),
+    aiPanelResize: $("ai-panel-resize"),
     annoAllToggle: $("anno-all-toggle"),
     // 手机端侧栏抽屉
     menuBtn: $("menu-btn"),
@@ -1807,6 +2043,9 @@
         // 临时查看：按到期时间设定清屏计时器（服务端门禁是唯一权限依据）
         armTempViewTimer(state.slide);
         updateCanvasSlideLabel();
+        // 反馈记录器（§3）：打开切片记入 nav 事件并更新快照的当前切片
+        fbRecSetSlide(info.slide_id || info.name || null);
+        fbRecLog("nav", { slide_id: info.slide_id || info.name || null, phase: "slide_open" });
         // 画质/RGB/mpp 等上下文控件随切片出现 → 顶栏需重测溢出折放（P0：
         // 否则 1440 档打开切片后 ⋯/账户被推出视口）。立即 + 迟一拍各一次
         //（channel 控件挂载可能晚于本回调）。
@@ -1882,6 +2121,7 @@
   // 清空、缩放徽章复位「—」、画质档与通道 chrome（通道钮/RGB 徽章/面板）
   // 隐藏——任何切片上下文控件都不得残留。
   function enterNoSlideUiState() {
+    var closedRef = state.slide ? String(state.slide.id || state.slide.name || "") : "";
     state.slide = null;
     state.mppX = null;
     state.roiMode = null;
@@ -1893,6 +2133,11 @@
     clearBaseThumb();
     updateCanvasSlideLabel();
     updateViewerEmptyState();
+    // 反馈记录器（§3）：清屏（临时查看到期等）记入 nav 事件
+    if (closedRef) {
+      fbRecSetSlide(null);
+      fbRecLog("nav", { slide_id: closedRef, phase: "slide_close" });
+    }
     // 缩放徽章直接复位到初始模板口径（不依赖 OSD close 后的内部状态）
     if (els.zoomBadge) els.zoomBadge.textContent = "—";
     if (els.headerZoomBadge) els.headerZoomBadge.textContent = "—";
@@ -3045,6 +3290,7 @@
   // 渲染当前文件夹（整格重渲；页码在渲染前钳回有效范围）
   function renderFolderBrowser() {
     if (!els.fbStack) return;
+    fbPulloutOnLayoutChange(); // 重渲后命中区全部重建：抽出层立即收回（§1.1）
     // 当前文件夹被删除后回到根目录（§5.3）；临时文件夹恒可用
     if (fbState.folder && fbState.folder !== FB_TEMP_KEY && !fbProject(fbState.folder)) {
       fbState.folder = null;
@@ -3222,14 +3468,26 @@
     });
     hit.appendChild(menuBtn);
 
-    // 悬停只预览：不打开切片、不改倍率/AI/标注（点击才 openSlide）
+    // 悬停只预览：不打开切片、不改倍率/AI/标注（点击才 openSlide）。
+    // 抽出呈现由 body 级浮层 .fb-pullout 承担（§1.1）；.extracted 只保留
+    // 命中区 z 抬升语义（浮层接管期间原位卡的 transform 由 CSS 抑制）。
     hit.addEventListener("pointerenter", function (e) {
       if (e && e.pointerType === "touch") return;
       hit.classList.add("extracted");
+      fbPulloutShow(hit);
     });
-    hit.addEventListener("pointerleave", function () { hit.classList.remove("extracted"); });
-    hit.addEventListener("focus", function () { hit.classList.add("extracted"); });
-    hit.addEventListener("blur", function () { hit.classList.remove("extracted"); });
+    hit.addEventListener("pointerleave", function () {
+      hit.classList.remove("extracted");
+      fbPulloutScheduleHide();
+    });
+    hit.addEventListener("focus", function () {
+      hit.classList.add("extracted");
+      fbPulloutShow(hit);
+    });
+    hit.addEventListener("blur", function () {
+      hit.classList.remove("extracted");
+      fbPulloutScheduleHide();
+    });
     hit.addEventListener("click", function () { openSlide(sid); });
     hit.addEventListener("keydown", function (e) { fbStackKeydown(e, hit); });
     return hit;
@@ -3245,6 +3503,93 @@
     var next = kids[idx + (e.key === "ArrowDown" ? 1 : -1)];
     if (next && typeof next.focus === "function") { try { next.focus(); } catch (err) {} }
   }
+
+  // ---------- 悬停抽出层（改版第四轮 §1.1） ----------
+  // 旧实现在侧栏内 transform 滑出 .fb-card：侧栏的 backdrop-filter / 收起
+  // 过渡 / ≤768px 抽屉的 overflow:hidden 都可能裁剪或压低它的层级（§1.1
+  // 反馈：卡片被画布遮住、在侧栏边缘被切）。现在抽出呈现改为 body 直挂的
+  // 固定定位浮层（.fb-pullout，z 515：高于 AI 面板 56 / 顶栏 60，低于工具栏
+  // 浮层 520 与卡片 ⋯ 菜单 620），位置自命中区 getBoundingClientRect 计算
+  // 并钳回视口——不再受任何祖先裁剪/层叠影响。
+  // 命中区（.fb-hit 条带）布局与命中完全不变：浮层左缘 = 命中区右缘（零重
+  // 叠，命中区上任何点击都落在命中区自身）；触屏不走悬停（点击直接打开）；
+  // 键盘聚焦同样滑出。防闪烁：命中区与浮层边缘相接（无缝隙），指针离开命
+  // 中区时延迟收回，进入浮层即取消。
+  var FB_PULLOUT_W = 240;
+  var fbPulloutEl = null;
+  var fbPulloutHit = null;
+  var fbPulloutHideTimer = null;
+
+  function fbPulloutHide() {
+    if (fbPulloutHideTimer) {
+      clearTimeout(fbPulloutHideTimer);
+      fbPulloutHideTimer = null;
+    }
+    if (fbPulloutEl && fbPulloutEl.parentNode && fbPulloutEl.parentNode.removeChild) {
+      try { fbPulloutEl.parentNode.removeChild(fbPulloutEl); } catch (e) {}
+    }
+    fbPulloutEl = null;
+    fbPulloutHit = null;
+    try { document.body.classList.remove("fb-pullout-on"); } catch (e) {}
+  }
+
+  function fbPulloutScheduleHide() {
+    // 命中区 → 浮层的过渡：延迟收回（指针进入浮层会取消），避免闪烁
+    if (fbPulloutHideTimer) clearTimeout(fbPulloutHideTimer);
+    fbPulloutHideTimer = setTimeout(function () {
+      fbPulloutHideTimer = null;
+      fbPulloutHide();
+    }, 90);
+  }
+
+  function fbPulloutShow(hit) {
+    var card = hit && hit.querySelector ? hit.querySelector(".fb-card") : null;
+    if (!card) return;
+    fbPulloutHide();
+    var pop = document.createElement("div");
+    pop.className = "fb-pullout";
+    pop.setAttribute("aria-hidden", "true");
+    var clone = card.cloneNode ? card.cloneNode(true) : null;
+    if (!clone) return;
+    clone.className = "fb-card fb-pullout-card";
+    pop.appendChild(clone);
+    try { document.body.appendChild(pop); } catch (e) { return; }
+    var r = null;
+    try { r = hit.getBoundingClientRect ? hit.getBoundingClientRect() : null; } catch (e) {}
+    var vw = window.innerWidth || 1024;
+    var vh = window.innerHeight || 768;
+    var w = FB_PULLOUT_W;
+    var h = FB_CARD_H;
+    try {
+      if (pop.offsetWidth) w = pop.offsetWidth;
+      if (pop.offsetHeight) h = pop.offsetHeight;
+    } catch (e) {}
+    var left = r && isFinite(r.right) ? r.right : 0;
+    var top = (r && isFinite(r.top) ? r.top : 0) - 7;
+    if (left + w > vw - 8) left = vw - 8 - w;
+    if (left < 8) left = 8;
+    if (top + h > vh - 8) top = vh - 8 - h;
+    if (top < 8) top = 8;
+    pop.style.left = Math.round(left) + "px";
+    pop.style.top = Math.round(top) + "px";
+    fbPulloutEl = pop;
+    fbPulloutHit = hit;
+    try { document.body.classList.add("fb-pullout-on"); } catch (e) {}
+    // 浮层内点击 = 打开该切片（与旧实现「点击滑出卡打开」一致）；
+    // 指针进入浮层取消延迟收回，离开即收
+    pop.addEventListener("click", function () {
+      if (fbPulloutHit && typeof fbPulloutHit.click === "function") {
+        try { fbPulloutHit.click(); } catch (e) {}
+      }
+    });
+    pop.addEventListener("pointerenter", function () {
+      if (fbPulloutHideTimer) { clearTimeout(fbPulloutHideTimer); fbPulloutHideTimer = null; }
+    });
+    pop.addEventListener("pointerleave", function () { fbPulloutHide(); });
+  }
+
+  // 布局变化时抽层必须收回（命中区已移动/消失，浮层位置失真）
+  function fbPulloutOnLayoutChange() { fbPulloutHide(); }
 
   // ---------- 通用小菜单（＋ / 文件夹 ⋯ / 卡片 ⋯ / 加入文件夹 / 移动到） ----------
   function closeFbMenuEl(menu) {
@@ -4426,6 +4771,251 @@
     return null;
   }
 
+  // =========================================================================
+  // AI 面板外框：拖动 / 调整大小（改版第四轮 §1.4）
+  // -------------------------------------------------------------------------
+  // 只改宿主侧的 #ai-panel 外框，绝不触碰 HistoPilot 插件内部（插件 JS 只
+  // 显隐面板）。交互：
+  //   - 拖标题栏移动、拖右下角手柄调整大小；Pointer Events（鼠标 + 触摸）；
+  //   - 位置/大小钳回切片视框（#viewer-wrap）内；窗口缩放后自动收回框内；
+  //   - 最小 280×240；按用户写 localStorage（pt.aip.v1|<站点:账号>，与
+  //     pt.sb.v1| 同一身份口径）；双击标题栏恢复默认位置并清除偏好；
+  //   - 标题栏上的按钮照常可点（拖动只从空白处起手，按钮/输入在排除表内）；
+  //   - ≤768px 不启用（维持现有布局），断点切回桌面时恢复记忆的位置。
+  // 纯几何集中在 clampAIPanelBox(box, frame, min)，vitest 直接驱动；
+  // DOM 决策在 createAIPanelController(deps)，边界（元素/mq/storage）注入。
+  // =========================================================================
+  var AI_PANEL_MIN_W = 280;
+  var AI_PANEL_MIN_H = 240;
+  var AI_PANEL_PREF_PREFIX = "pt.aip.v1|";
+
+  function aiPanelPrefKey(scope) {
+    return AI_PANEL_PREF_PREFIX + String(scope || "anonymous");
+  }
+  // 解析存储的偏好：结构不符/非有限数一律返回 null（调用方回落默认位置）
+  function parseAIPanelPref(raw) {
+    if (raw == null) return null;
+    try {
+      var v = JSON.parse(raw);
+      if (v && typeof v === "object" &&
+          isFinite(v.left) && isFinite(v.top) && isFinite(v.width) && isFinite(v.height) &&
+          v.width > 0 && v.height > 0) {
+        return { left: v.left, top: v.top, width: v.width, height: v.height };
+      }
+    } catch (e) { /* 损坏数据视为无偏好 */ }
+    return null;
+  }
+  // 钳制：宽高先收进 [min, frame]，位置再收进 [0, frame-w/h]（frame 小于
+  // 最小尺寸时面板保持最小值、位置贴 0——绝不出框）
+  function clampAIPanelBox(box, frame, min) {
+    frame = frame || {};
+    min = min || {};
+    var minW = min.width > 0 ? min.width : 1;
+    var minH = min.height > 0 ? min.height : 1;
+    var frameW = frame.width > 0 ? frame.width : minW;
+    var frameH = frame.height > 0 ? frame.height : minH;
+    var w = Math.max(minW, Math.min(box.width, frameW));
+    var h = Math.max(minH, Math.min(box.height, frameH));
+    var left = Math.min(Math.max(box.left, 0), Math.max(0, frameW - w));
+    var top = Math.min(Math.max(box.top, 0), Math.max(0, frameH - h));
+    return { left: left, top: top, width: w, height: h };
+  }
+
+  function createAIPanelController(deps) {
+    var panel = deps.panel;
+    var header = deps.header;
+    var handle = deps.handle;
+    var frameEl = deps.frame;
+    var mq = deps.mq;
+    var storage = deps.storage;
+    var doc = deps.doc || document;
+    var win = deps.win || window;
+    var box = null;            // null = 默认 CSS 锚定（right/top/bottom/width）
+    var drag = null;           // 拖动中：{type, pointerId, px, py, startLeft, startTop, startW, startH}
+
+    function isMobile() {
+      return !!(mq && typeof mq.matches === "boolean" && mq.matches);
+    }
+    function scopeName() {
+      return (typeof deps.scope === "function") ? deps.scope() : (deps.scope || "anonymous");
+    }
+    function readPref() {
+      if (!storage || typeof storage.getItem !== "function") return null;
+      try { return parseAIPanelPref(storage.getItem(aiPanelPrefKey(scopeName()))); }
+      catch (e) { return null; }
+    }
+    function writePref(b) {
+      if (!storage || typeof storage.setItem !== "function") return;
+      try {
+        storage.setItem(aiPanelPrefKey(scopeName()), JSON.stringify({
+          left: Math.round(b.left), top: Math.round(b.top),
+          width: Math.round(b.width), height: Math.round(b.height), t: Date.now(),
+        }));
+      } catch (e) { /* 配额/隐私模式写失败：仅失去持久化 */ }
+    }
+    function clearPref() {
+      if (!storage || typeof storage.removeItem !== "function") return;
+      try { storage.removeItem(aiPanelPrefKey(scopeName())); } catch (e) {}
+    }
+    function frameSize() {
+      // 视框 = #viewer-wrap（面板 absolute 的包含块）尺寸
+      var r = null;
+      try { r = frameEl && frameEl.getBoundingClientRect ? frameEl.getBoundingClientRect() : null; } catch (e) {}
+      return {
+        width: r && isFinite(r.width) ? r.width : (win.innerWidth || 0),
+        height: r && isFinite(r.height) ? r.height : (win.innerHeight || 0),
+      };
+    }
+    function apply() {
+      if (!panel || !panel.style) return;
+      if (!box) {
+        // 恢复默认：清内联几何，交还 CSS（right/top/bottom/width 锚定）
+        panel.style.left = "";
+        panel.style.top = "";
+        panel.style.right = "";
+        panel.style.bottom = "";
+        panel.style.width = "";
+        panel.style.height = "";
+        return;
+      }
+      var c = clampAIPanelBox(box, frameSize(), { width: AI_PANEL_MIN_W, height: AI_PANEL_MIN_H });
+      box = c;
+      panel.style.left = Math.round(c.left) + "px";
+      panel.style.top = Math.round(c.top) + "px";
+      panel.style.right = "auto";
+      panel.style.bottom = "auto";
+      panel.style.width = Math.round(c.width) + "px";
+      panel.style.height = Math.round(c.height) + "px";
+    }
+
+    function dragTargetAllowed(t) {
+      // 标题栏空白才能拖动；按钮/输入等照常交互（§1.4：按钮仍可正常点击）
+      if (!t || !t.closest) return true;
+      return !t.closest("button, a, input, textarea, select, label");
+    }
+    function beginDrag(e, type) {
+      if (isMobile() || !panel || drag) return;
+      if (e && e.button != null && e.button !== 0) return;
+      if (!dragTargetAllowed(e && e.target)) return;
+      var start = box;
+      if (!start) {
+        // 默认锚定态（right/top/bottom/width）的等效 box：首次拖动以此为准
+        var f = frameSize();
+        var w = panel.offsetWidth || Math.min(340, f.width);
+        var h = panel.offsetHeight || f.height;
+        start = clampAIPanelBox(
+          { left: Math.max(0, f.width - w - 14), top: 14, width: w, height: h },
+          f, { width: AI_PANEL_MIN_W, height: AI_PANEL_MIN_H });
+      }
+      drag = {
+        type: type,
+        pointerId: e.pointerId,
+        px: e.clientX, py: e.clientY,
+        startLeft: start.left, startTop: start.top,
+        startW: start.width, startH: start.height,
+      };
+      if (panel.classList) panel.classList.add("ai-dragging");
+      try {
+        if (e.currentTarget && e.currentTarget.setPointerCapture) {
+          e.currentTarget.setPointerCapture(e.pointerId);
+        }
+      } catch (err) {}
+      if (e.cancelable && e.preventDefault) e.preventDefault();
+    }
+    function onDragMove(e) {
+      if (!drag || !e || e.pointerId !== drag.pointerId) return;
+      var f = frameSize();
+      var dx = e.clientX - drag.px;
+      var dy = e.clientY - drag.py;
+      if (drag.type === "move") {
+        box = clampAIPanelBox(
+          { left: drag.startLeft + dx, top: drag.startTop + dy,
+            width: drag.startW, height: drag.startH },
+          f, { width: AI_PANEL_MIN_W, height: AI_PANEL_MIN_H });
+      } else {
+        box = clampAIPanelBox(
+          { left: drag.startLeft, top: drag.startTop,
+            width: drag.startW + dx, height: drag.startH + dy },
+          f, { width: AI_PANEL_MIN_W, height: AI_PANEL_MIN_H });
+      }
+      apply();
+    }
+    function endDrag(e) {
+      if (!drag) return;
+      if (e && e.pointerId !== undefined && e.pointerId !== drag.pointerId) return;
+      drag = null;
+      if (panel && panel.classList) panel.classList.remove("ai-dragging");
+      if (box) writePref(box);
+    }
+
+    return {
+      init: function () {
+        if (!panel || !header) return;            // demo 面板/无壳：不启用
+        if (panel.classList) panel.classList.add("ai-drag-ok");
+        if (isMobile()) return;                    // ≤768px 维持现有布局
+        var pref = readPref();
+        if (pref) { box = pref; apply(); }
+        header.addEventListener("pointerdown", function (e) { beginDrag(e, "move"); });
+        if (handle) {
+          handle.addEventListener("pointerdown", function (e) { beginDrag(e, "resize"); });
+        }
+        doc.addEventListener("pointermove", function (e) { onDragMove(e); });
+        doc.addEventListener("pointerup", function (e) { endDrag(e); });
+        doc.addEventListener("pointercancel", function (e) { endDrag(e); });
+        // 双击标题栏空白：恢复默认位置/大小并清除偏好（§1.4）
+        header.addEventListener("dblclick", function (e) {
+          if (!dragTargetAllowed(e.target)) return;
+          box = null;
+          clearPref();
+          apply();
+        });
+        // 窗口缩放：收回视框内并持久化（§1.4）
+        win.addEventListener("resize", function () {
+          if (isMobile()) return;
+          if (box) { apply(); writePref(box); }
+        });
+      },
+      // 断点切换：进手机布局清除内联几何（面板交还 CSS）；回桌面重读偏好
+      onBreakpointChange: function () {
+        if (!panel || !header) return;
+        if (isMobile()) {
+          box = null;
+          drag = null;
+          apply();
+          return;
+        }
+        box = readPref();
+        apply();
+      },
+      isMobile: isMobile,
+      currentBox: function () { return box; },
+    };
+  }
+
+  var aiPanelCtrl = null;   // init() 里创建（initAIPanelController 装配依赖）
+
+  function initAIPanelController() {
+    var mq = window.matchMedia ? window.matchMedia(SB_MOBILE_QUERY) : null;
+    aiPanelCtrl = createAIPanelController({
+      panel: els.aiPanel,
+      header: els.aiPanelHeader,
+      handle: els.aiPanelResize,
+      frame: els.viewerWrap,
+      mq: mq,
+      storage: safeLocalStorage(),
+      scope: userScope,
+      doc: document,
+      win: window,
+    });
+    aiPanelCtrl.init();
+    if (mq) {
+      var onMqChangeAip = function () { if (aiPanelCtrl) aiPanelCtrl.onBreakpointChange(); };
+      if (typeof mq.addEventListener === "function") mq.addEventListener("change", onMqChangeAip);
+      else if (typeof mq.addListener === "function") mq.addListener(onMqChangeAip);
+    }
+  }
+
+
   var sidebarCtrl = null;   // init() 里创建（createSidebarController 装配真实依赖）
 
   // 断点判定（控制器外的兜底路径沿用同一媒体查询口径）
@@ -4453,6 +5043,8 @@
     redrawAnnoCanvas();
     updateRoiOverlay();
     syncBaseThumb();
+    // 侧栏开合改变命中区几何：抽出层立即收回（改版第四轮 §1.1）
+    fbPulloutOnLayoutChange();
   }
   function syncViewerLayoutAfterSidebar() {
     // 等一帧：flex 布局/宽度过渡先落定，再按新容器尺寸同步
@@ -7897,6 +8489,22 @@
     writeSidebarPref: writeSidebarPref,
     syncViewerLayoutNow: syncViewerLayoutNow,
   };
+  // 供测试（改版第四轮 §1.4）：AI 面板外框钳制几何与偏好存取的纯逻辑入口
+  window.HP_AI_PANEL = {
+    createAIPanelController: createAIPanelController,
+    aiPanelPrefKey: aiPanelPrefKey,
+    parseAIPanelPref: parseAIPanelPref,
+    clampAIPanelBox: clampAIPanelBox,
+  };
+  // 供测试（改版第四轮 §3）：反馈对话框逻辑入口（payload 形状 / 429 处理）
+  window.HP_FEEDBACK_UI = {
+    open: feedbackOpen,
+    close: feedbackClose,
+    submit: feedbackSubmit,
+    buildPayload: feedbackBuildPayload,
+    retryText: feedbackRetryText,
+    state: feedbackState,
+  };
 
   // ---------- 拖拽上传（阶段 1：整页拖放 + 文件夹拖入） ----------
   // document 级 dragenter/over/leave/drop（复用 #drop-overlay 与计数逻辑）：
@@ -9464,12 +10072,13 @@
 
   // 改版 2026-10-08：「搜索/分享」两个新按钮的溢出收放——不进静态档位表，
   // 每次布局后按 #toolbar 实测溢出（scrollWidth vs clientWidth）套用收放步骤。
-  // 二评修订：步骤按产品优先级——低频控件先让位（原始 RGB 标识 → mpp → 1:1 →
-  // 保存标记 → 标准/精细 → 镜像/视图组），然后 搜索/分享 收成图标（aria-label
-  // /title 保留语义），最后万不得已才折 分享、搜索。AI 与账户 chip 永不折叠。
-  // 迟滞式回退（不溢出才从最后一步起逐步复原，每步复测；applied 恒为步骤
-  // 前缀）防抖动；openSlide 成功/清理路径延时重测 + #toolbar ResizeObserver
-  // 捕捉画质/RGB/mpp 控件异步出现。
+  // 改版第四轮 §1.2：搜索/分享/矩形/箭头/描图已是常驻图标按钮（不再有
+  // 「文字→图标」过渡档，原 iconStep 移除）；实测收放只剩「折入 ⋯」，
+  // 优先级不变——低频控件先让位（原始 RGB 标识 → mpp → 1:1 → 保存标记 →
+  // 标准/精细 → 镜像/视图组），最后万不得已才折 分享、搜索。
+  // AI 与账户 chip 永不折叠。迟滞式回退（不溢出才从最后一步起逐步复原，
+  // 每步复测；applied 恒为步骤前缀）防抖动；openSlide 成功/清理路径延时
+  // 重测 + #toolbar ResizeObserver 捕捉画质/RGB/mpp 控件异步出现。
   var tbFoldSteps = null;
 
   function tbBuildFoldSteps() {
@@ -9491,22 +10100,6 @@
         },
       };
     }
-    // 搜索/分享收成图标（一对一步；title/aria-label 不变）
-    var iconStep = {
-      applied: false,
-      apply: function () {
-        ["tb-search-btn", "tb-share-btn"].forEach(function (id) {
-          var el = document.getElementById(id);
-          if (el) el.classList.add("tb-icon-only");
-        });
-      },
-      revert: function () {
-        ["tb-search-btn", "tb-share-btn"].forEach(function (id) {
-          var el = document.getElementById(id);
-          if (el) el.classList.remove("tb-icon-only");
-        });
-      },
-    };
     return (tbFoldSteps = [
       foldStep("rgb-badge"),
       foldStep("mpp-setter"),
@@ -9515,7 +10108,6 @@
       foldStep("quality-control"),
       foldStep("flip-btn"),
       foldStep("view-tools-group"),
-      iconStep,
       foldStep("tb-share-btn"),
       foldStep("tb-search-btn"),
     ]);
@@ -9884,6 +10476,9 @@
 
     // 数据共享（P2 账户设置 §3.5；与改密/改绑同级的自愿研究授权入口）
     initDataShare();
+
+    // 反馈问题对话框（改版第四轮 §3；侧栏底部 + 账户弹层双入口）
+    initFeedbackDialog();
 
     // user max_steps 只读同步（AI 预算管理 UI 已迁入 admin 插件，PR5）
     initAiMaxStepsSync();
@@ -10552,7 +11147,12 @@
     initViewer();
     initQualityControl();
     initSidebarController();
+    // AI 面板外框拖动/调整大小（改版第四轮 §1.4；demo 面板无头部 id → 不启用）
+    initAIPanelController();
     bindEvents();
+    // 抽出层跟随窗口尺寸/滚动失效（改版第四轮 §1.1；捕获式滚动含侧栏内滚）
+    window.addEventListener("resize", fbPulloutOnLayoutChange);
+    document.addEventListener("scroll", fbPulloutOnLayoutChange, true);
     // §3.3 宽度断点分组：先于首次布局执行（把折叠档的节点搬入 ⋯ 菜单）
     initToolbarTier();
     setupDragDrop();
@@ -10658,6 +11258,14 @@
         endTemporaryView: endTemporaryView,
         armTempViewTimer: armTempViewTimer,
         updateCanvasLabel: updateCanvasSlideLabel,
+        // 改版第四轮 §1.1：抽出层测试驱动面（层必须在 body，不在侧栏内）
+        pullout: {
+          show: fbPulloutShow,
+          hide: fbPulloutHide,
+          scheduleHide: fbPulloutScheduleHide,
+          current: function () { return fbPulloutEl; },
+          hit: function () { return fbPulloutHit; },
+        },
       },
       share: {
         setPending: function (refs) { sharePendingSlides = refs; },

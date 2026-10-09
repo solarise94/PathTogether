@@ -2017,11 +2017,18 @@ def share_roi_add(token):
     # note 可选（备注文本），透传给 store 校验/清洗
     note = body.get("note", "")
 
+    # §6.3 几何锁可选（草稿保存时带锁）；非布尔 → 400
+    geometry_locked = body.get("geometry_locked")
+    if geometry_locked is not None and not isinstance(geometry_locked, bool):
+        return jsonify(error="geometry_locked 需为布尔值"), 400
+
     try:
         roi = share_store.add_roi(
             token, safe, label, type=typ, note=note,
             visitor=_visitor_stored(_visitor_id()),
-            slide_id=roi_desc.slide_id, **geom
+            slide_id=roi_desc.slide_id,
+            geometry_locked=bool(geometry_locked) if geometry_locked else False,
+            **geom
         )
     except ValueError as e:
         return jsonify(error=str(e)), 400
@@ -2030,13 +2037,18 @@ def share_roi_add(token):
 
 @app.route("/s/<token>/api/roi/<int:index>", methods=["PATCH"])
 def share_roi_update(token, index):
-    """编辑本 token 的标注几何与/或备注。
+    """编辑本 token 的标注几何、备注或几何锁（§6.3）。
 
-    JSON body: {"geom": {...}, "note": "..."}（两者均可缺省）。
+    JSON body: {"geom": {...}, "note": "...", "geometry_locked": bool}
+    （均可缺省，但至少其一）。
     可选 {"expected_revision": int}（Stage 3c-1 CAS），不符 → 409 revision_conflict。
+    §6.3 几何锁：geometry_locked 与 geom 同请求 → 400 lock_with_geometry；
+    锁切换必须带 expected_revision（400 expected_revision_required）；已锁标注
+    改几何 → 409 annotation_locked（行锁内判定，优先于 revision_conflict）。
     设备归属校验：只有创建该标注的访客可编辑（_roi_owned_by）；旧数据
-    （无 visitor）按链接级共享允许编辑。越权返回 403。
-    调 update_roi；update 返回 False 时 404；成功返回更新后的 roi dict（含 index）。
+    （无 visitor）按链接级共享允许编辑。越权返回 403（只读访客不能锁/解锁）。
+    调 update_roi / set_roi_geometry_locked；update 返回 False 时 404；成功
+    返回更新后的 roi dict（含 index）。
     编辑允许自由调大小，不做 6/6.5mm 限制。
     权限三档（docs §5.4）：无 annotate 权限的 token 写标注 403（旧链接默认含 annotate）。
     """
@@ -2048,7 +2060,7 @@ def share_roi_update(token, index):
     geom = body.get("geom")
     note = body.get("note")
     expected = body.get("expected_revision")
-    if geom is None and note is None:
+    if geom is None and note is None and "geometry_locked" not in body:
         return jsonify(error="缺少 geom 或 note"), 400
     r = share_store.get_roi(token, index)
     if r is None:
@@ -2057,6 +2069,16 @@ def share_roi_update(token, index):
         return jsonify(error="只能编辑自己创建的标记"), 403
     if _reject_archived_slide(share, r.get("slide")):
         return jsonify(error="切片已归档只读"), 403
+    # §6.3 锁字段解析（权限/归属校验之后，不向越权者泄露锁语义）
+    lock_value = None
+    if "geometry_locked" in body:
+        lock_value = body.get("geometry_locked")
+        if not isinstance(lock_value, bool):
+            return jsonify(error="geometry_locked 需为布尔值"), 400
+        if geom is not None:
+            return jsonify(error="lock_with_geometry"), 400
+        if expected is None:
+            return jsonify(error="expected_revision_required"), 400
     # 升级 C（§6.4）：rect 几何编辑在服务端复核生效几何——
     #   - preset_only 分享：编辑后仍须是 roi_sizes 预设正方形（真实几何 + 可信
     #     MPP 反算，两条路径一致，不允许编辑绕过）；
@@ -2076,17 +2098,41 @@ def share_roi_update(token, index):
             safe_name, eff["x"], eff["y"], eff["w"], eff["h"])
         if msg:
             return jsonify(error=msg), 400
-    try:
-        updated = share_store.update_roi(
-            token, index, geom=geom, note=note, expected_revision=expected)
-    except share_store.RevisionConflict as e:
-        return jsonify(error="revision_conflict",
-                       current_revision=e.current_revision), 409
-    except ValueError as e:
-        return jsonify(error=str(e)), 400
-    if updated is False:
-        return jsonify(error="选区不存在"), 404
-    return jsonify(_public_roi(updated, access_token=token))
+    # §6.3 锁切换（行锁事务内 CAS；操作者只记主体种类，不落访客哈希）
+    chained_expected = expected
+    lock_result = None
+    if lock_value is not None:
+        aid = r.get("annotation_id")
+        if not aid:
+            return jsonify(error="选区不存在"), 404
+        try:
+            lock_result = share_store.set_roi_geometry_locked(
+                aid, lock_value, expected_revision=expected, actor="visitor")
+        except share_store.RevisionConflict as e:
+            return jsonify(error="revision_conflict",
+                           current_revision=e.current_revision), 409
+        if lock_result is False:
+            return jsonify(error="选区不存在"), 404
+        chained_expected = lock_result.get("revision")
+    if geom is not None or note is not None:
+        try:
+            updated = share_store.update_roi(
+                token, index, geom=geom, note=note,
+                expected_revision=chained_expected)
+        except share_store.AnnotationLocked as e:
+            return jsonify(
+                error="annotation_locked",
+                current=annotation_access.public_roi_view(
+                    e.current, access_token=token)), 409
+        except share_store.RevisionConflict as e:
+            return jsonify(error="revision_conflict",
+                           current_revision=e.current_revision), 409
+        except ValueError as e:
+            return jsonify(error=str(e)), 400
+        if updated is False:
+            return jsonify(error="选区不存在"), 404
+        return jsonify(_public_roi(updated, access_token=token))
+    return jsonify(_public_roi(lock_result, access_token=token))
 
 
 def _visitor_read_subject(token):
@@ -2159,6 +2205,7 @@ def share_roi_delete(token, index):
     设备归属校验：只有创建该标注的访客可删除（_roi_owned_by）；旧数据
     （无 visitor）按链接级共享允许删除。越权返回 403。
     可选 body {"expected_revision": int}（Stage 3c-1 CAS），不符 → 409。
+    §6.3：geometry_locked=true → 409 annotation_locked（先解锁再删）。
     权限三档（docs §5.4）：无 annotate 权限的 token 写标注 403（旧链接默认含 annotate）。
     """
     share = _require_share(token)
@@ -2176,6 +2223,11 @@ def share_roi_delete(token, index):
         return jsonify(error="切片已归档只读"), 403
     try:
         ok, _aid = share_store.delete_roi(token, index, expected_revision=expected)
+    except share_store.AnnotationLocked as e:
+        return jsonify(
+            error="annotation_locked",
+            current=annotation_access.public_roi_view(
+                e.current, access_token=token)), 409
     except share_store.RevisionConflict as e:
         return jsonify(error="revision_conflict",
                        current_revision=e.current_revision), 409

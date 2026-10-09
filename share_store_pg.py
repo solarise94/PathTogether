@@ -95,6 +95,23 @@ class RevisionConflict(Exception):
             message or "revision 冲突：标注已被他人修改，请刷新后重试")
 
 
+class AnnotationLocked(Exception):
+    """几何位置锁冲突（docs/viewer-interaction-skills-review-design-20261009
+    §6.3）：``geometry_locked=true`` 的标注拒绝几何变更与删除。
+
+    语义边界：这是**防误改位置锁**，不是权限锁——备注/元数据/审核/授权
+    变更不受限；切片删除、账号删除等生命周期清理不经本异常（统一删除编排
+    不走 delete_roi*）。在**同一事务、行锁内**抛出（与 RevisionConflict 同
+    位置）；检查先于 CAS——「已锁且改几何」与「revision 不符」同时成立时
+    返回 annotation_locked。携带 ``current``（当前 roi dict 快照，供 HTTP
+    层组装 409 current 投影，须经 public_roi_view 过滤后回传）。
+    """
+
+    def __init__(self, current, message=None):
+        self.current = current if isinstance(current, dict) else {}
+        super().__init__(message or "标注位置已锁定，请先解锁后再修改几何或删除")
+
+
 class ShareStoreCorrupt(Exception):
     """PG 后端不落 shares.json 文件；本类仅为 dispatcher 公共名对齐（json 后端
     的文件损坏语义在 PG 模式不可达）。数据级损坏由 SQL 约束/事务保证不发生。"""
@@ -185,6 +202,23 @@ def _geom_of(roi: dict) -> dict:
     return {k: roi[k] for k in _GEOM_KEYS if k in roi}
 
 
+def _check_geometry_lock(roi, changing_geometry):
+    """行锁内几何锁检查（§6.3）：已锁且本请求改几何（或删除）→ AnnotationLocked。
+
+    在 ``_check_cas`` **之前**调用——annotation_locked 优先于 revision_conflict
+    （前端按错误码区分「先解锁」与「版本冲突」两种提示）。
+    """
+    if changing_geometry and roi.get("geometry_locked"):
+        raise AnnotationLocked(roi)
+
+
+def _geometry_lock_read(roi: dict) -> dict:
+    """读侧锁状态归一：旧行无 geometry_locked 键 → 补 false（就地，仅输出副本）。"""
+    if isinstance(roi, dict) and not roi.get("deleted"):
+        roi.setdefault("geometry_locked", False)
+    return roi
+
+
 def _roi_visibility_status(roi: dict) -> str:
     """行级可见性状态列（0056）：unclaimed / granted / private。
 
@@ -247,7 +281,8 @@ def _update_roi_row(cur, rid: str, roi: dict):
 def _roi_out(roi: dict, index=None, shared=None) -> dict:
     """ROI 导出副本：统一补 index/shared/note 兼容字段（与 json 一致）。
 
-    tombstone（deleted=true）只保留最小字段；非 tombstone 补 review_status。
+    tombstone（deleted=true）只保留最小字段；非 tombstone 补 review_status 与
+    geometry_locked（旧行缺省 false，§6.3）。
     升级 C（§6.3-1）：旧 rect 只有 side_px → 读时归一 w=h=side_px（仅输出
     副本，不改存储；不批量改 annotation_id/revision/change_seq 等）。
     """
@@ -265,7 +300,7 @@ def _roi_out(roi: dict, index=None, shared=None) -> dict:
         if index is not None:
             out["index"] = index
         return out
-    out = dict(_rect_read_compat(dict(roi)))
+    out = _geometry_lock_read(dict(_rect_read_compat(dict(roi))))
     if index is not None:
         out["index"] = index
     if shared is not None:
@@ -310,9 +345,12 @@ def _check_cas(roi, expected_revision):
         raise RevisionConflict(cur)
 
 
-def _append_history(roi):
+def _append_history(roi, op=None, actor=None):
     """Stage 3c-1 修改历史：把当前快照 append 进 roi['history']，上限 20，丢最旧。
     在 update/tombstone 修改**之前**调用。pg 存 data jsonb 内（同 roi dict）。
+
+    §6.3 几何锁：快照补 geometry_locked 状态；锁/解锁（op=lock/unlock）额外
+    记录操作者（actor；user:<uid> 或 "visitor"——不含访客哈希，可直接对外）。
     """
     snap = {
         "geom": {k: roi[k] for k in _GEOM_KEYS if k in roi},
@@ -320,7 +358,12 @@ def _append_history(roi):
         "label": roi.get("label", ""),
         "revision": int(roi.get("revision") or 1),
         "ts": roi.get("ts"),
+        "geometry_locked": bool(roi.get("geometry_locked")),
     }
+    if op:
+        snap["op"] = op
+    if actor:
+        snap["actor"] = actor
     hist = roi.setdefault("history", [])
     hist.append(snap)
     if len(hist) > 20:
@@ -967,7 +1010,7 @@ def list_slide_view_grants():
 def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note="", visitor=None,
             source=None, created_by_session_id=None, _effect_key=None, owner_user_id=None,
             requester_role=None, provenance=None, client_action_id=None,
-            slide_id=None, **geom):
+            slide_id=None, geometry_locked=False, **geom):
     """为 token 的 share 添加一条标注；统一入口，支持 rect/arrow/freehand。
 
     语义与 json 完全一致（含 WAL effect_key 幂等、index 语义、source 推断）。
@@ -977,6 +1020,8 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
     P2（合同 §3.1/R-08）：``slide_id`` 显式传入（id_bundle 资产/已解析的
     调用方）或按 legacy 名解析（slides.legacy_filename 冻结映射）；解析不到
     保持 NULL = unresolved。rois/change_log 双写 slide_id + slide 快照。
+    §6.3：``geometry_locked``（可选，缺省 False）——草稿保存时带锁；AI 写
+    路径不传该参 → 恒 false。
     2026-10-08 缺陷修复（R-04）：slide ∈ share 成员判定改 share_slides
     ID 关系（slide_id 已知时；与读通道同源），仅无 ID 的历史名行回退
     shares.slides JSONB 名快照——ID-only 资产（无 legacy 名）此前被名快照
@@ -1107,6 +1152,8 @@ def add_roi(token, slide, label, type="rect", size_mm=0.0, shared=False, note=""
                     "owner_user_id": owner_user_id or _OWNER_USER_ID or None,
                     # Stage 3c-1：AI 新写入默认 pending 待审；人工标注 none
                     "review_status": "pending" if src == "ai" else "none",
+                    # §6.3 几何位置锁（缺省 false；显式带上避免读侧猜键）
+                    "geometry_locked": bool(geometry_locked),
                 }
                 if _effect_key:
                     roi["effect_key"] = _effect_key
@@ -1180,6 +1227,9 @@ def update_roi(token, index, geom=None, note=None, expected_revision=None):
                     return False
                 rid = same[index]["id"]
                 roi = dict(same[index]["data"])
+                # §6.3 几何锁检查先于 CAS（annotation_locked 优先于
+                # revision_conflict；已锁时只放行备注等非几何变更）
+                _check_geometry_lock(roi, geom is not None)
                 _check_cas(roi, expected_revision)  # CAS 在修改前校验
                 orig_type = roi.get("type", "rect")
                 _append_history(roi)  # 修改历史快照（修改前）
@@ -1258,7 +1308,7 @@ def list_rois(token=None, subject=None, access_context=None):
                 if subject is not None and not annotation_access.can_read_annotation(
                         subject, row["data"], ctx):
                     continue
-                r = _rect_read_compat(dict(row["data"]))
+                r = _geometry_lock_read(_rect_read_compat(dict(row["data"])))
                 r["index"] = i
                 r["shared"] = _roi_shared_compat(r)
                 r["note"] = r.get("note", "")
@@ -1275,7 +1325,7 @@ def list_rois(token=None, subject=None, access_context=None):
             if subject is not None and not annotation_access.can_read_annotation(
                     subject, r_raw, ctx):
                 continue
-            r = _rect_read_compat(dict(r_raw))
+            r = _geometry_lock_read(_rect_read_compat(dict(r_raw)))
             r["index"] = idx
             r["shared"] = _roi_shared_compat(r)
             r["note"] = r.get("note", "")
@@ -1298,7 +1348,7 @@ def get_roi(token, index):
                 rows = cur.fetchall()
         if index < 0 or index >= len(rows):
             return None
-        r = _rect_read_compat(dict(rows[index]["data"]))
+        r = _geometry_lock_read(_rect_read_compat(dict(rows[index]["data"])))
         r["index"] = index
         r["shared"] = _roi_shared_compat(r)
         r["visitor"] = r.get("visitor", "") or ""
@@ -1317,7 +1367,8 @@ def get_roi_by_annotation_id(annotation_id):
                 cur.execute("SELECT data FROM rois WHERE annotation_id=%s",
                             (annotation_id,))
                 row = cur.fetchone()
-        return _rect_read_compat(dict(row["data"])) if row else None
+        return _geometry_lock_read(
+            _rect_read_compat(dict(row["data"]))) if row else None
     finally:
         conn.close()
 
@@ -1389,6 +1440,9 @@ def delete_roi(token, index, expected_revision=None):
                 roi = dict(same[index]["data"])
                 if roi.get("deleted"):
                     return False, None
+                # §6.3：已锁 → 拒绝删除（annotation_locked 优先于 CAS）；
+                # 切片/账号删除等生命周期清理不走本函数，不受此限。
+                _check_geometry_lock(roi, True)
                 _check_cas(roi, expected_revision)
                 _append_history(roi)
                 roi["deleted"] = True
@@ -1422,6 +1476,8 @@ def delete_roi_by_annotation_id(annotation_id, expected_revision=None):
                     return False
                 rid = row["id"]
                 roi = dict(row["data"])
+                # §6.3：已锁 → 拒绝删除（annotation_locked 优先于 CAS）
+                _check_geometry_lock(roi, True)
                 _check_cas(roi, expected_revision)
                 _append_history(roi)
                 roi["deleted"] = True
@@ -1505,6 +1561,8 @@ def update_roi_by_annotation_id(annotation_id, geom=None, note=None,
                 rid = row["id"]
                 roi = dict(row["data"])
                 token = roi.get("token") or ""
+                # §6.3 几何锁检查先于 CAS（annotation_locked 优先）
+                _check_geometry_lock(roi, geom is not None)
                 _check_cas(roi, expected_revision)
                 orig_type = roi.get("type", "rect")
                 _append_history(roi)
@@ -1533,6 +1591,55 @@ def update_roi_by_annotation_id(annotation_id, geom=None, note=None,
                 roi["change_seq"] = _bump_change_seq(
                     cur, roi.get("slide"), token, roi.get("annotation_id"),
                     "update", slide_id=roi.get("slide_id"))
+                roi["updated_at"] = time.time()
+                _update_roi_row(cur, rid, roi)
+                out = _roi_out(roi)
+                out["shared"] = _roi_shared_compat(roi)
+                return out
+    finally:
+        conn.close()
+
+
+def set_roi_geometry_locked(annotation_id, geometry_locked,
+                            expected_revision=None, actor_user_id=None,
+                            actor=""):
+    """切换标注几何位置锁（§6.3）：同一事务、行锁内 CAS + 状态翻转。
+
+    - revision 递增（锁切换是一次可见状态变更，CAS 链保持单调）；
+    - history 记录 op=lock/unlock + 操作者（actor；调用方传 "user:<uid>" /
+      "visitor"——不含访客哈希，history 端点可直接返回）；
+    - change_log 写 op=lock/unlock（change_seq 变化流可见）；
+    - 目标不存在/已删除 → False；CAS 不符 → RevisionConflict；
+      目标已是目标状态 → 幂等翻转（仍走完整流程，与 set_roi_shared 的
+      显式写语义一致）。
+    返回更新后的 roi dict（_roi_out 投影；index 由调用方按需补）。
+    actor_user_id 仅为审计语义保留别名；不落 history。
+    """
+    if not annotation_id:
+        raise ValueError("缺少 annotation_id")
+    geometry_locked = bool(geometry_locked)
+    op = "lock" if geometry_locked else "unlock"
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT id, data FROM rois WHERE annotation_id=%s "
+                    "AND NOT deleted FOR UPDATE",
+                    (annotation_id,))
+                row = cur.fetchone()
+                if row is None:
+                    return False
+                rid = row["id"]
+                roi = dict(row["data"])
+                _check_cas(roi, expected_revision)
+                _append_history(roi, op=op, actor=actor or None)
+                roi["geometry_locked"] = geometry_locked
+                roi["revision"] = int(roi.get("revision") or 1) + 1
+                roi["change_seq"] = _bump_change_seq(
+                    cur, roi.get("slide"), roi.get("token") or "",
+                    roi.get("annotation_id"), op,
+                    slide_id=roi.get("slide_id"))
                 roi["updated_at"] = time.time()
                 _update_roi_row(cur, rid, roi)
                 out = _roi_out(roi)
@@ -2123,7 +2230,7 @@ def list_shared_rois_for_slides(slides, share_token=None):
             r = row["data"]
             if r.get("slide") not in slide_set:
                 continue
-            rr = _rect_read_compat(dict(r))
+            rr = _geometry_lock_read(_rect_read_compat(dict(r)))
             rr["index"] = idx_map.get((r.get("token"), r.get("annotation_id")), 0)
             rr["shared"] = True
             rr.setdefault("type", "rect")
@@ -2954,6 +3061,8 @@ def annotations_by_slide(subject=None, access_context=None):
                 "revision": r.get("revision", 1),
                 "review_status": r.get("review_status", "none"),
                 "visitor": (r.get("visitor") or "")[:8],
+                # §6.3：锁状态顶层布尔（旧行缺省 false）
+                "geometry_locked": bool(r.get("geometry_locked")),
             }
             for k in ("w", "h", "geometry_version", "x1", "y1", "x2", "y2", "points"):
                 if k in r:

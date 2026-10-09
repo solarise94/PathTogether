@@ -28,6 +28,7 @@ _PUBLIC_NAMES = (
     "AUDIT_MAX_EVENTS",  # 审计日志封顶条数
     # —— 异常类（CAS 与 review G1 fail-closed：损坏 / IO 不可用分流）——
     "RevisionConflict",
+    "AnnotationLocked",
     "ShareStoreCorrupt",
     "ShareStoreUnavailable",
     # —— 函数 ——
@@ -58,6 +59,7 @@ _PUBLIC_NAMES = (
     "delete_roi_by_annotation_id",
     "restore_roi",
     "update_roi_by_annotation_id",
+    "set_roi_geometry_locked",
     "upsert_ai_session_principal",
     "get_ai_session_principal",
     "list_changes",

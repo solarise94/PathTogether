@@ -22818,6 +22818,10 @@ def api_annotation_add():
     shared = bool(body.get("shared", False))
     # note 可选（备注文本），透传给 store 校验/清洗
     note = body.get("note", "")
+    # §6.3 几何锁可选（草稿保存时带锁）；创建时允许与几何字段同给
+    geometry_locked = body.get("geometry_locked")
+    if geometry_locked is not None and not isinstance(geometry_locked, bool):
+        return jsonify(error="geometry_locked 需为布尔值"), 400
 
     # 收集几何字段（透传给 add_roi 校验）。升级 C：rect 增加 w/h 成对字段
     # （width_px/height_px 为别名，统一归一成 w/h）；v2 与 side_px 冲突由
@@ -22850,19 +22854,23 @@ def api_annotation_add():
             share_store.ADMIN_TOKEN, safe, label, type=typ, shared=shared, note=note,
             owner_user_id=ident["user_id"], requester_role=ident["role"],
             client_action_id=body.get("client_action_id"),
-            slide_id=desc.slide_id, **geom
+            slide_id=desc.slide_id,
+            geometry_locked=bool(geometry_locked) if geometry_locked else False,
+            **geom
         )
     except (ValueError, PermissionError) as e:
         return jsonify(error=str(e)), 400
     _audit("annotation.add", target_type="annotation", target_id=roi.get("annotation_id"),
            slide=safe, slide_id=desc.slide_id,
-           detail={"type": typ, "source": roi.get("source", "human")})
+           detail={"type": typ, "source": roi.get("source", "human"),
+                   "geometry_locked": bool(roi.get("geometry_locked"))})
     # 0056：响应补稳定定位（annotation_id/revision）+ 作者/能力位（幂等重放
-    # 返回原行，前端可据 annotation_id 去重）。
+    # 返回原行，前端可据 annotation_id 去重）。§6.3：补锁状态。
     proj = annotation_access.author_projection(roi, label_of_user=_display_label)
     return jsonify(ok=True, index=roi["index"], shared=roi.get("shared", shared),
                    annotation_id=roi.get("annotation_id"),
                    revision=roi.get("revision"),
+                   geometry_locked=bool(roi.get("geometry_locked")),
                    author_key=proj["author_key"], author_kind=proj["author_kind"],
                    can_edit=True, can_delete=True)
 
@@ -22910,9 +22918,52 @@ def _resolve_anno_by_id(annotation_id, require_write=False, allow_deleted=False)
     return roi, None
 
 
+def _parse_geometry_lock_body(body):
+    """解析 PATCH body 的几何锁字段（§6.3；须在读写权限验证之后调用）。
+
+    返回 (lock_value, error_resp)：
+      - 未携带 geometry_locked → (None, None)（不影响旧客户端其它 PATCH）；
+      - 非布尔 → 400；与几何字段（geom）同请求 → 400 lock_with_geometry；
+      - 锁切换缺 expected_revision → 400 expected_revision_required。
+    """
+    if "geometry_locked" not in body:
+        return None, None
+    val = body.get("geometry_locked")
+    if not isinstance(val, bool):
+        return None, (jsonify(error="geometry_locked 需为布尔值"), 400)
+    if body.get("geom") is not None:
+        return None, (jsonify(error="lock_with_geometry"), 400)
+    if body.get("expected_revision") is None:
+        return None, (jsonify(error="expected_revision_required"), 400)
+    return val, None
+
+
+def _annotation_locked_response(exc, access_token=None):
+    """store 层 AnnotationLocked → 409 annotation_locked（current 为对外投影）。"""
+    return jsonify(
+        error="annotation_locked",
+        current=annotation_access.public_roi_view(exc.current,
+                                                  access_token=access_token),
+    ), 409
+
+
+def _revision_conflict_response(annotation_id=None, exc=None):
+    """RevisionConflict → 409（沿用现有形状，补 current 投影——§6.4 读回比较用）。"""
+    body = {"error": "revision_conflict"}
+    if exc is not None:
+        body["current_revision"] = exc.current_revision
+    if annotation_id:
+        body["current"] = annotation_access.public_roi_view(
+            share_store.get_roi_by_annotation_id(annotation_id) or {})
+    return jsonify(**body), 409
+
+
 @app.route("/api/annotation/id/<annotation_id>", methods=["DELETE"])
 def api_annotation_delete_by_id(annotation_id):
-    """按稳定 annotation_id 删除（CAS expected_revision）。目标不存在 → 404。"""
+    """按稳定 annotation_id 删除（CAS expected_revision）。目标不存在 → 404。
+
+    §6.3：geometry_locked=true → 409 annotation_locked（行锁内判定）。
+    """
     roi, err = _resolve_anno_by_id(annotation_id, require_write=True)
     if err:
         return err
@@ -22921,9 +22972,10 @@ def api_annotation_delete_by_id(annotation_id):
     try:
         ok = share_store.delete_roi_by_annotation_id(
             annotation_id, expected_revision=expected)
+    except share_store.AnnotationLocked as e:
+        return _annotation_locked_response(e)
     except share_store.RevisionConflict as e:
-        return jsonify(error="revision_conflict",
-                       current_revision=e.current_revision), 409
+        return _revision_conflict_response(annotation_id, e)
     if not ok:
         return jsonify(error="标注不存在"), 404
     _audit("annotation.delete", target_type="annotation", target_id=annotation_id,
@@ -22935,13 +22987,23 @@ def api_annotation_delete_by_id(annotation_id):
 
 @app.route("/api/annotation/id/<annotation_id>", methods=["PATCH"])
 def api_annotation_patch_by_id(annotation_id):
-    """按稳定 annotation_id 更新几何/备注或授权。"""
+    """按稳定 annotation_id 更新几何/备注/几何锁或授权。
+
+    §6.3：``geometry_locked: bool`` 可选——与 geom 同请求 400 lock_with_geometry；
+    切换必须带 expected_revision（400 expected_revision_required）；已锁标注改
+    几何 → 409 annotation_locked（优先于 revision_conflict），只改备注/元数据
+    照常放行。锁切换后同请求的 note 更新用链式新 revision 继续 CAS。
+    """
     roi, err = _resolve_anno_by_id(annotation_id, require_write=True)
     if err:
         return err
     body = request.get_json(silent=True) or {}
     expected = body.get("expected_revision")
     ident = current_identity()
+    # 权限验证之后才解析锁字段（无权者不获知锁语义/锁状态）
+    lock_value, lock_err = _parse_geometry_lock_body(body)
+    if lock_err is not None:
+        return lock_err
     grants_after = None
     updated = None
     if "grantee_kind" in body or "grantee_id" in body:
@@ -22963,14 +23025,29 @@ def api_annotation_patch_by_id(annotation_id):
         except ValueError as e:
             return jsonify(error=str(e)), 400
         grants_after = share_store.list_grants(annotation_id=annotation_id)
+    if lock_value is not None:
+        try:
+            updated = share_store.set_roi_geometry_locked(
+                annotation_id, lock_value, expected_revision=expected,
+                actor="user:%s" % (ident.get("user_id") or ""))
+        except share_store.RevisionConflict as e:
+            return _revision_conflict_response(annotation_id, e)
+        if updated is False:
+            return jsonify(error="标注不存在"), 404
+        _audit("annotation.lock" if lock_value else "annotation.unlock",
+               target_type="annotation", target_id=annotation_id,
+               slide=updated.get("slide"))
     if "geom" in body or "note" in body:
         try:
             updated = share_store.update_roi_by_annotation_id(
                 annotation_id, geom=body.get("geom"), note=body.get("note"),
-                expected_revision=expected)
+                # 锁切换先行 bump revision → 链式 CAS 用新 revision
+                expected_revision=(updated.get("revision")
+                                   if updated is not None else expected))
+        except share_store.AnnotationLocked as e:
+            return _annotation_locked_response(e)
         except share_store.RevisionConflict as e:
-            return jsonify(error="revision_conflict",
-                           current_revision=e.current_revision), 409
+            return _revision_conflict_response(annotation_id, e)
         except ValueError as e:
             return jsonify(error=str(e)), 400
         if updated is False:
@@ -22979,6 +23056,7 @@ def api_annotation_patch_by_id(annotation_id):
     if updated:
         out["revision"] = updated.get("revision")
         out["note"] = updated.get("note", "")
+        out["geometry_locked"] = bool(updated.get("geometry_locked"))
     if grants_after is not None:
         out["grants"] = grants_after
     return jsonify(out)
@@ -23006,7 +23084,8 @@ def api_annotation_restore(annotation_id):
     _audit("annotation.restore", target_type="annotation",
            target_id=annotation_id, slide=restored.get("slide"))
     return jsonify(ok=True, annotation_id=annotation_id,
-                   revision=restored.get("revision"))
+                   revision=restored.get("revision"),
+                   geometry_locked=bool(restored.get("geometry_locked")))
 
 
 @app.route("/api/annotation/admin/<int:index>", methods=["DELETE"])
@@ -23015,6 +23094,7 @@ def api_annotation_delete_admin(index):
 
     Stage 3a-2a：owner 任意；否则仅本人创建（owner_user_id 判定）。
     Stage 3c-1：body 可带 expected_revision（CAS），不符 → 409 revision_conflict。
+    §6.3：geometry_locked=true → 409 annotation_locked。
     """
     denied, _roi = _check_annotation_owner(share_store.ADMIN_TOKEN, index)
     if denied:
@@ -23025,6 +23105,8 @@ def api_annotation_delete_admin(index):
         # delete_roi 返回 (bool, annotation_id|None)；直接当 bool 用会让 404 分支永不触发
         ok, _aid = share_store.delete_roi(
             share_store.ADMIN_TOKEN, index, expected_revision=expected)
+    except share_store.AnnotationLocked as e:
+        return _annotation_locked_response(e)
     except share_store.RevisionConflict as e:
         return jsonify(error="revision_conflict",
                        current_revision=e.current_revision), 409
@@ -23040,6 +23122,7 @@ def api_annotation_delete(token, index):
 
     Stage 3a-2a：owner 任意；否则仅本人创建（owner_user_id 判定）。
     Stage 3c-1：body 可带 expected_revision（CAS），不符 → 409 revision_conflict。
+    §6.3：geometry_locked=true → 409 annotation_locked。
     """
     if not isinstance(token, str) or not token:
         return jsonify(error="缺少 token"), 400
@@ -23051,6 +23134,8 @@ def api_annotation_delete(token, index):
     try:
         # delete_roi 返回 (bool, annotation_id|None)，需解包
         ok, _aid = share_store.delete_roi(token, index, expected_revision=expected)
+    except share_store.AnnotationLocked as e:
+        return _annotation_locked_response(e)
     except share_store.RevisionConflict as e:
         return jsonify(error="revision_conflict",
                        current_revision=e.current_revision), 409
@@ -23062,7 +23147,7 @@ def api_annotation_delete(token, index):
 
 @app.route("/api/annotation/<token>/<int:index>", methods=["PATCH"])
 def api_annotation_set_shared(token, index):
-    """管理员策展/编辑：切换标注授权/「公开」状态，或更新几何/备注。
+    """管理员策展/编辑：切换标注授权/「公开」状态、几何锁，或更新几何/备注。
 
     JSON body 支持任意组合：
       - {"shared": bool}：走 set_roi_shared。**0056 新语义**：shared=true
@@ -23071,15 +23156,19 @@ def api_annotation_set_shared(token, index):
         下面的显式 grant 字段）；shared=false 撤销对应授权；
       - {"grantee_kind": "user"|"share_token", "grantee_id": "...",
          "can_edit"?: bool}：显式授予（0056，工单 A 的授权原语）；配合
-         {"revoke_grant": true} 撤销该授权；
+        {"revoke_grant": true} 撤销该授权；
       - {"geom": {...}}：走 update_roi 更新几何（不含 type）；
       - {"note": "..."}：走 update_roi 更新备注。
+      - {"geometry_locked": bool}（§6.3）：切换几何位置锁——与 geom 同请求
+        400 lock_with_geometry；必须带 expected_revision（400
+        expected_revision_required）；已锁改几何 → 409 annotation_locked。
       - {"expected_revision": int}（Stage 3c-1 CAS）：可选，不符 → 409。
     各部分独立处理（shared 与 geom/note 独立；expected_revision 对两者共同
-    生效，set_roi_shared 不 bump revision，故先 shared 后 update 顺序无碍）。
+    生效，set_roi_shared 不 bump revision，故先 shared 后 update 顺序无碍；
+    锁切换 bump revision 后，同请求 geom/note 用链式新 revision 继续 CAS）。
     token/index 无效（shared 或 update 侧）返回 404；
     成功返回 {"ok": true, "shared": <更新后值>, "note": <更新后值>,
-    "grants": [...]}。
+    "geometry_locked": <更新后值>, "grants": [...]}。
     Stage 3a-2a × 0056：owner 任意；否则仅本人创建或持有 can_edit 授权
     （_check_annotation_owner），无权 403。
     """
@@ -23091,10 +23180,15 @@ def api_annotation_set_shared(token, index):
     body = request.get_json(silent=True) or {}
     expected = body.get("expected_revision")
     ident = current_identity()
+    # §6.3：权限验证之后解析锁字段
+    lock_value, lock_err = _parse_geometry_lock_body(body)
+    if lock_err is not None:
+        return lock_err
 
     shared_after = None
     note_after = None
     grants_after = None
+    locked_state = None
 
     # 显式授权部分（grantee_kind/grantee_id + granted|revoke_grant）
     if "grantee_kind" in body or "grantee_id" in body:
@@ -23142,6 +23236,30 @@ def api_annotation_set_shared(token, index):
             return jsonify(error="标注不存在"), 404
         shared_after = shared_target
 
+    # 几何锁部分（§6.3）：锁切换 bump revision；后续 geom/note 链式 CAS
+    chained_expected = expected
+    lock_revision = None
+    lock_aid = None
+    if lock_value is not None:
+        aid_roi = roi or share_store.get_roi(token, index)
+        lock_aid = (aid_roi or {}).get("annotation_id")
+        if not lock_aid:
+            return jsonify(error="标注不存在"), 404
+        try:
+            locked = share_store.set_roi_geometry_locked(
+                lock_aid, lock_value, expected_revision=expected,
+                actor="user:%s" % (ident.get("user_id") or ""))
+        except share_store.RevisionConflict as e:
+            return jsonify(error="revision_conflict",
+                           current_revision=e.current_revision), 409
+        if locked is False:
+            return jsonify(error="标注不存在"), 404
+        locked_state = bool(locked.get("geometry_locked"))
+        chained_expected = locked.get("revision")
+        lock_revision = locked.get("revision")
+        _audit("annotation.lock" if lock_value else "annotation.unlock",
+               target_type="annotation", target_id=lock_aid, slide=None)
+
     # geom / note 部分
     if "geom" in body or "note" in body:
         geom = body.get("geom")
@@ -23164,7 +23282,10 @@ def api_annotation_set_shared(token, index):
                     return jsonify(error=msg), 400
         try:
             updated = share_store.update_roi(
-                token, index, geom=geom, note=note, expected_revision=expected)
+                token, index, geom=geom, note=note,
+                expected_revision=chained_expected)
+        except share_store.AnnotationLocked as e:
+            return _annotation_locked_response(e)
         except share_store.RevisionConflict as e:
             return jsonify(error="revision_conflict",
                            current_revision=e.current_revision), 409
@@ -23173,28 +23294,38 @@ def api_annotation_set_shared(token, index):
         if updated is False:
             return jsonify(error="标注不存在"), 404
         note_after = updated.get("note", "")
+        if locked_state is None:
+            locked_state = bool(updated.get("geometry_locked"))
         # 若同时没传 shared，回填当前 shared 值便于前端同步
         if shared_after is None:
             shared_after = updated.get("shared")
 
-    # 仅 shared 时回填 note（读当前值）
-    if note_after is None:
+    # 仅 shared / lock 时回填 note 与锁状态（读当前值）
+    if note_after is None or locked_state is None:
         rois = share_store.list_rois(token)
         cur = None
         for r in rois:
             if r.get("index") == index:
                 cur = r
                 break
-        note_after = cur.get("note", "") if cur else ""
+        if note_after is None:
+            note_after = cur.get("note", "") if cur else ""
+        if locked_state is None:
+            locked_state = bool(cur.get("geometry_locked")) if cur else False
 
     _audit("annotation.update", target_type="annotation", slide=None,
            detail={"shared_after": shared_after})
-    out = {"ok": True, "shared": shared_after, "note": note_after}
+    out = {"ok": True, "shared": shared_after, "note": note_after,
+           "geometry_locked": locked_state}
     if grants_after is not None:
         out["grants"] = grants_after
     if "updated" in locals() and isinstance(updated, dict) and updated.get("revision") is not None:
         out["revision"] = updated.get("revision")
         out["annotation_id"] = updated.get("annotation_id")
+    elif lock_revision is not None:
+        # 仅锁切换（无 geom/note）：响应带上新 revision
+        out["revision"] = lock_revision
+        out["annotation_id"] = lock_aid
     return jsonify(**out)
 
 

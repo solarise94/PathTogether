@@ -343,6 +343,8 @@ _PUBLIC_ROI_KEYS = (
     "revision", "change_seq", "index", "review_status", "geometry_version",
     "author_key", "author_kind", "author_label_safe", "can_edit", "can_delete",
     "deleted", "deleted_at", "created_by_session_id",
+    # §6.3 几何位置锁状态（旧行缺省 false，见 public_roi_view 归一）
+    "geometry_locked",
 )
 
 
@@ -352,6 +354,8 @@ def public_roi_view(roi, subject=None, access_token=None):
     token 仅在下列情况保留（调用方已持有该凭据，不是新的泄漏）：
       - token == ADMIN_TOKEN（工作台定位符，不是分享 bearer）；
       - token == 当前分享页的 access_token。
+    §6.3：geometry_locked 顶层布尔；旧行无该键 → 显式补 false（缺省未锁，
+    不让客户端猜缺键语义）。
     """
     if not isinstance(roi, dict):
         return {}
@@ -359,6 +363,8 @@ def public_roi_view(roi, subject=None, access_token=None):
     for k in _PUBLIC_ROI_KEYS:
         if k in roi:
             out[k] = roi[k]
+    if "geometry_locked" not in out and not out.get("deleted"):
+        out["geometry_locked"] = False
     tok = roi.get("token")
     if tok == ADMIN_TOKEN:
         out["token"] = tok

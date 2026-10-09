@@ -341,6 +341,9 @@ def test_schema_migrations_recorded(conn):
         # 表 + (user_id, created_at) 频率窗口索引 + registration_mail_jobs
         # purpose 词表扩 'user_feedback'（保留既有全部用途值）。
         "0081_user_feedback.sql",
+        # 描绘按需技能（docs/viewer-drawing-skill-contract-20261009.md §3）：
+        # run_grants 加 allow_ai_drawing / drawing_bound_at / drawing_intent。
+        "0082_run_grant_drawing_skill.sql",
     ]
 
 

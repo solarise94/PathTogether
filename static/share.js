@@ -2185,21 +2185,62 @@
     annoToolbarMenuEl = menu;
   }
 
-  // 选中对象屏幕外接框（旋转/镜像取投影 bbox）
+  // 标签屏幕区域（与 drawLabel 同款锚点/尺寸：框高 16、底边距锚 2px）。
+  // 就近工具条定位盒并入标签，避免盖住标记标签（§6.1；分享页 drawLabel
+  // 无 inside 形态，标签恒在锚点上方）。
+  function labelScreenRegion(it, typ, bb) {
+    if (!it || !it.label) return null;
+    var ax, ay;
+    if (typ === "rect") {
+      ax = bb.x; ay = bb.y;
+    } else if (typ === "arrow") {
+      var b = imgToCanvas(it.x2, it.y2);
+      ax = b.x + 6; ay = b.y - 6;
+    } else {
+      var p0 = imgToCanvas(it.points[0][0], it.points[0][1]);
+      ax = p0.x; ay = p0.y;
+    }
+    var text = String(it.label);
+    var w;
+    if (annoCtx) {
+      annoCtx.font = "600 11px " +
+        "-apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif";
+      w = annoCtx.measureText(text).width + 10;  // drawLabel padX * 2
+    } else {
+      w = text.length * 8 + 12;
+    }
+    return { x: ax - 2, y: ay - 20, w: w + 4, h: 20 };
+  }
+
+  function unionBBox(a, b) {
+    if (!a) return b;
+    if (!b) return a;
+    var x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+    var r = Math.max(a.x + a.w, b.x + b.w), bo = Math.max(a.y + a.h, b.y + b.h);
+    return { x: x, y: y, w: r - x, h: bo - y };
+  }
+
+  // 选中对象屏幕外接框（旋转/镜像取投影 bbox；含标签区域 §6.1）
   function itemScreenBBox(it) {
     var typ = it.type || "rect";
-    if (typ === "rect") return rectScreenQuad(it).bbox;
-    var pts;
-    if (typ === "arrow") {
-      var a = imgToCanvas(it.x1, it.y1), b = imgToCanvas(it.x2, it.y2);
-      pts = [[a.x, a.y], [b.x, b.y]];
+    var bb;
+    if (typ === "rect") {
+      bb = rectScreenQuad(it).bbox;
     } else {
-      pts = (it.points || []).map(function (p) {
-        var c = imgToCanvas(p[0], p[1]);
-        return [c.x, c.y];
-      });
+      var pts;
+      if (typ === "arrow") {
+        var a = imgToCanvas(it.x1, it.y1), b = imgToCanvas(it.x2, it.y2);
+        pts = [[a.x, a.y], [b.x, b.y]];
+      } else {
+        pts = (it.points || []).map(function (p) {
+          var c = imgToCanvas(p[0], p[1]);
+          return [c.x, c.y];
+        });
+      }
+      bb = AG.quadBBox(pts);
     }
-    return AG.quadBBox(pts);
+    if (!bb) return null;
+    return unionBBox(bb, labelScreenRegion(it, typ, bb));
   }
 
   // 工具条定位：对象上方，顶部放不下翻到下方/内部（§6.1 出视窗翻转）

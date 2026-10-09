@@ -80,6 +80,31 @@ describe("§6.1 统一选中视觉（share.js）", () => {
 	});
 });
 
+describe("§6.1 就近工具条避开标记标签", () => {
+	it("app：定位盒并入标签区域（labelScreenRegion 与 drawLabel 同锚点），草稿并入 DOM 标签高度", () => {
+		const fn = extractFn(appSrc, "labelScreenRegion");
+		expect(fn).toMatch(/typ === "rect"/);
+		expect(fn).toMatch(/typ === "arrow"/);
+		expect(fn).toMatch(/it\.points\[0\]/);
+		// rect 有备注时标签画在框内（inside），不占外部空间
+		expect(fn).toMatch(/it\.note/);
+		// 量宽与 drawLabel 同字体（600 11px）
+		expect(fn).toMatch(/600 11px/);
+		expect(extractFn(appSrc, "itemScreenBBox")).toMatch(/unionBBox\(bb, labelScreenRegion/);
+		// 临时框：DOM 标签 #roi-box .roi-label 在框上方 24px
+		expect(extractFn(appSrc, "updateAnnoToolbarPos")).toMatch(/bb\.y - 24/);
+	});
+
+	it("share：定位盒同样并入标签区域（分享页 drawLabel 恒在锚点上方）", () => {
+		const fn = extractFn(shareSrc, "labelScreenRegion");
+		expect(fn).toMatch(/typ === "rect"/);
+		expect(fn).toMatch(/typ === "arrow"/);
+		expect(fn).toMatch(/it\.points\[0\]/);
+		expect(fn).toMatch(/600 11px/);
+		expect(extractFn(shareSrc, "itemScreenBBox")).toMatch(/unionBBox\(bb, labelScreenRegion/);
+	});
+});
+
 describe("§6.2 选中即可拖柄（首次点击选择，下一次按住即可移动/直接拖控制点）", () => {
 	it("app：手柄显示不再以「编辑态」为前提，但锁定/只读仍无柄", () => {
 		const fn = extractFn(appSrc, "redrawAnnoCanvas");

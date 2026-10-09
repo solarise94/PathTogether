@@ -7725,6 +7725,8 @@
       var r = state.roi;
       var q = AG.rectQuad(r.x, r.y, r.w, r.h, imgToCanvas);
       bb = AG.quadBBox(q);
+      // DOM 标签 #roi-box .roi-label 位于框上方 24px，一并避开
+      if (bb) bb = { x: bb.x, y: bb.y - 24, w: bb.w, h: bb.h + 24 };
     } else {
       bb = itemScreenBBox(target);
     }
@@ -7744,24 +7746,64 @@
     annoToolbarEl.style.top = Math.round(y) + "px";
   }
 
-  // 选中对象屏幕外接框（旋转/镜像取投影 bbox；§6.2）
+  // 标签屏幕区域（与 drawLabel 同款锚点/尺寸：框高 16、底边距锚 2px）。
+  // 就近工具条定位盒并入标签，避免盖住标记左上角的黄色标签（§6.1）。
+  function labelScreenRegion(it, typ, bb) {
+    if (!it || !it.label) return null;
+    // rect 有备注时标签画在框内（drawLabel inside），不占外部空间
+    if (typ === "rect" && String(it.note || "").trim()) return null;
+    var ax, ay;
+    if (typ === "rect") {
+      ax = bb.x; ay = bb.y;
+    } else if (typ === "arrow") {
+      var b = imgToCanvas(it.x2, it.y2);
+      ax = b.x + 6; ay = b.y - 6;
+    } else {
+      var p0 = imgToCanvas(it.points[0][0], it.points[0][1]);
+      ax = p0.x; ay = p0.y;
+    }
+    var text = String(it.label);
+    var w;
+    if (annoCtx) {
+      annoCtx.font = "600 11px " +
+        "-apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif";
+      w = annoCtx.measureText(text).width + 10;  // drawLabel padX * 2
+    } else {
+      w = text.length * 8 + 12;
+    }
+    return { x: ax - 2, y: ay - 20, w: w + 4, h: 20 };
+  }
+
+  function unionBBox(a, b) {
+    if (!a) return b;
+    if (!b) return a;
+    var x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+    var r = Math.max(a.x + a.w, b.x + b.w), bo = Math.max(a.y + a.h, b.y + b.h);
+    return { x: x, y: y, w: r - x, h: bo - y };
+  }
+
+  // 选中对象屏幕外接框（旋转/镜像取投影 bbox；§6.2）。
+  // 含标签区域（§6.1：就近工具条定位需避开标签）。
   function itemScreenBBox(it) {
     var typ = it.type || "rect";
+    var bb;
     if (typ === "rect") {
-      var sq = rectScreenQuad(it);
-      return sq.bbox;
-    }
-    var pts;
-    if (typ === "arrow") {
-      var a = imgToCanvas(it.x1, it.y1), b = imgToCanvas(it.x2, it.y2);
-      pts = [[a.x, a.y], [b.x, b.y]];
+      bb = rectScreenQuad(it).bbox;
     } else {
-      pts = (it.points || []).map(function (p) {
-        var c = imgToCanvas(p[0], p[1]);
-        return [c.x, c.y];
-      });
+      var pts;
+      if (typ === "arrow") {
+        var a = imgToCanvas(it.x1, it.y1), b = imgToCanvas(it.x2, it.y2);
+        pts = [[a.x, a.y], [b.x, b.y]];
+      } else {
+        pts = (it.points || []).map(function (p) {
+          var c = imgToCanvas(p[0], p[1]);
+          return [c.x, c.y];
+        });
+      }
+      bb = AG.quadBBox(pts);
     }
-    return AG.quadBBox(pts);
+    if (!bb) return null;
+    return unionBBox(bb, labelScreenRegion(it, typ, bb));
   }
 
   // ---- 保存状态（§6.4）：saving / saved / unsaved(+重试) ----

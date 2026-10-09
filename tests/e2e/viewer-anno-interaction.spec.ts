@@ -62,17 +62,23 @@ async function wipeAnnotations(page: Page, sid: string) {
 		const aid = it.annotation_id as string;
 		const idx = it.index as number;
 		const rev = Number(it.revision) > 0 ? Number(it.revision) : null;
-		if (it.geometry_locked === true) {
-			await pageApi(page, "PATCH", `/api/annotation/admin/${idx}`,
-				rev != null ? { geometry_locked: false, expected_revision: rev }
-					: { geometry_locked: false });
+		// 按稳定 annotation_id 解锁/删除：列表 index 与 token 路由的 index
+		// 在存在 tombstone 时不一致（全量套件里前序用例会留下已删条目）
+		let curRev = rev;
+		if (aid && it.geometry_locked === true) {
+			const un = await pageApi(page, "PATCH", `/api/annotation/id/${aid}`,
+				{ geometry_locked: false, expected_revision: curRev });
+			curRev = Number((un.j as { revision?: number }).revision) || curRev;
 		}
-		// DELETE 走 token/index 路由（by-id DELETE 同样受 id_bundle 名通道缺口
-		// 影响 403；token 路由按创建者归属放行）
-		await pageApi(page, "DELETE", `/api/annotation/admin/${idx}`,
-			rev != null ? { expected_revision: rev } : undefined);
+		if (aid) {
+			await pageApi(page, "DELETE", `/api/annotation/id/${aid}`,
+				curRev != null ? { expected_revision: curRev } : undefined);
+		} else {
+			await pageApi(page, "DELETE", `/api/annotation/admin/${idx}`,
+				rev != null ? { expected_revision: rev } : undefined);
+		}
 	}
-	// 清点必须归零（删除走 token 路由；静默失败会让画布 bbox 假设失效）
+	// 清点必须归零（静默失败会让画布 bbox 假设失效）
 	await expect.poll(async () => {
 		const after = await pageApi(page, "GET",
 			`/api/annotations?slide_id=${encodeURIComponent(sid)}`);

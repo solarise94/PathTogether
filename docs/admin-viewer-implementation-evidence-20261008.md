@@ -1,6 +1,6 @@
 # 后台/注册/Viewer 改版 —— 实现与验收证据
 
-日期：2026-10-08，最后更新：2026-10-09。依据：[简化版实施设计](admin-viewer-simplified-20261008.md)。分支 `admin-viewer`，基线为生产线 `registration-antibot` @ 66cfa29c。状态：**已推送、已部署；线上代码 3b2b7fb6，最新选片动画上线见 §13；未解决的 AI 阻塞见 §11。**
+日期：2026-10-08，最后更新：2026-10-09。依据：[简化版实施设计](admin-viewer-simplified-20261008.md)。分支 `admin-viewer`，基线为生产线 `registration-antibot` @ 66cfa29c。状态：**已推送、已部署；线上代码 cad1e8df，最新抽牌开片动画上线见 §14；未解决的 AI 阻塞见 §11。**
 
 ## 1. 变更范围
 
@@ -400,3 +400,60 @@ runner 的 `effectiveConfig` 未注入它；详情响应也漏了 `d.slide_id`�
 
 本地证据在 `.gate-tmp/fan-20261009/`：`results.json`、`dogfood.log`、
 `public-check.log`、`cleanup.log`、`live-fan.png` 与发布日志。
+
+
+## 14. 抽牌、翻面与铺开开片（2026-10-09）
+
+最终运行提交：`cad1e8dfe971d26b5b3b95877c6c3a08f4dd4f81`。
+保留 §13 的连续悬停联动；点击切片时从当前浮卡位置抽出，翻过蓝色纹理背面，
+再按主视窗的实际图像尺寸铺开。采用浏览器原生 Web Animations API，无新增依赖。
+抽出/翻面 620ms，铺开 340ms，交接淡出 160ms；切片请求与动画并行，不延迟请求。
+
+交接读取 OpenSeadragon 实际图像坐标。等当前切片真正绘制出瓦片后再铺开，
+Canvas/WebGL 均通过 `tiled-image-drawn` 判断，不能只依赖 metadata 的 `open` 事件。
+快速切换保留原有请求序号规则，同时取消旧动画；装饰层不接收鼠标事件。
+请求失败、清屏、Esc、失焦和窗口变化会移除装饰层，8 秒超时也会退出装饰层。
+手机、系统减少动态效果、缩略图未就绪时直接开片。原切片菜单及键盘入口保留。
+
+线上第一轮发现一次连续点选没有生效。独立浏览器回归进一步稳定复现：鼠标按下
+原始条带，跨过 80ms 悬停延迟后弹出预览，松开落在浮层上，浏览器把 click 发给
+两者的共同祖先 body，切片按钮没有收到 click。补丁在 pointerdown 清理待显示
+的 hover 定时器，按住鼠标时也不新建预览。不能同时清除移出侧栏的关闭定时器，
+否则点击画布后预览可能滞留；最终版本保留该关闭路径。
+`press-before.log` 保存旧版失败记录，`press-after.log` 保存修复后的针对性通过记录。
+
+最终完整检查（最终运行代码上执行）：
+
+| 检查 | 结果 |
+| --- | --- |
+| Vitest | 1003 passed，2 个既有 skip |
+| Playwright | 90 passed，0 failed |
+| 代码/静态资源 | 语法和 diff 检查通过，镜像 96 个静态资源校验通过 |
+
+新增回归覆盖真实瓦片被延迟时仍保留预览、瓦片就绪后完成交接、减少动画、快速
+切换与迟到响应、无权限响应清理、鼠标按住 150ms 后松开仍正确点击，以及移出
+后点击画布关闭预览。全量运行同时修正了测试定位假设：允许首屏全是文件夹，
+先分页定位独立测试资产；外部关闭测试点击无控件的画布区域，避免固定坐标
+误点空态按钮。未降低原功能断言。本轮只涉及前端，未重跑 Python 套件。
+
+最终发布目录：`/home/solarise/releases/suite-20261009-card-deal-final`。
+已推送 `admin-viewer`，生产 APP_REVISION 为上述提交。发布前用隔离生产快照验收，
+新建备份并保留上一运行容器；无新迁移、无插件更新（仍为 0.4.17）。两域名
+`histopilot.cn` / `histopilot.com` 的主站/分享健康检查通过，JS/CSS 与提交逐字节一致。
+未切换上线的中间候选 staged 容器已移除。
+
+最终线上 dogfood 在独立新账号真实上传 3 张合成 BMP，依次验证连续联动悬停、
+三次完整抽牌/翻面/铺开/瓦片交接、跨 hover 延迟按住 150ms 后松开的连续点选、
+浮卡菜单、减少动态效果、Esc，以及独立 390×844 触控上下文直接开片。全部通过，
+无 JavaScript 错误。之前一轮 8 张切片的完整正常交互也通过。
+
+三轮共创建 3 个 Dogfood 账号、19 张合成测试切片；均已删除测试切片并禁用账号。
+每轮均用数据库复核无存活切片及有效分享，临时凭据均已删除。没有运行 AI 推理、
+发送反馈邮件或修改真实用户资料。§11 的既有 AI 后端阻塞不属于本次修复范围。
+
+证据目录 `.gate-tmp/deal-20261009/`：`unit.log`、`browser.log`、`press-before.log`、
+`press-after.log`、`final-cutover.log`、`final-public-check.log`、`results.json`、
+`dogfood.log`、`cleanup-first.log`、`cleanup-second.log`、`cleanup-final.log`。
+效果录屏 `slide-card-deal.mp4` 为线上第二轮正常交互实录，使用合成测试图像；
+最后的点击边界补丁不改变动画外观。首轮失败和第二轮通过记录分别保留在
+`first-run/`、`second-run/`，不把重试覆盖后的结果当作首次成功。

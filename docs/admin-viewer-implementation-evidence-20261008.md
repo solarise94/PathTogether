@@ -1,6 +1,6 @@
 # 后台/注册/Viewer 改版 —— 实现与验收证据
 
-日期：2026-10-08，最后更新：2026-10-09。依据：[简化版实施设计](admin-viewer-simplified-20261008.md)。分支 `admin-viewer`，基线为生产线 `registration-antibot` @ 66cfa29c。状态：**已推送、已部署；线上代码 826fc6c7，最新动画渲染优化上线见 §15；未解决的 AI 阻塞见 §11。**
+日期：2026-10-08，最后更新：2026-10-09。依据：[简化版实施设计](admin-viewer-simplified-20261008.md)。分支 `admin-viewer`，基线为生产线 `registration-antibot` @ 66cfa29c。状态：**已推送、已部署；线上代码 ef250b3c，最新主视窗拖动绘制优化上线见 §16；未解决的 AI 阻塞见 §11。**
 
 ## 1. 变更范围
 
@@ -515,3 +515,93 @@ headless 环境不代表用户的显卡或浏览器，因此未声称已消除�
 AI 推理、发送反馈邮件或修改真实用户资料。本机三个隔离测试服务也已退出并
 清理临时凭据。线上证据同目录 `results.json`、`dogfood.log`、`live-fan.png`、
 `live-video/`、`cleanup.log`、`public-check.log`、`cutover.log`。
+
+## 16. 主视窗拖动掉帧排查与绘制路径调整（2026-10-09）
+
+用户补充环境为 **Mac、Chrome、AI 面板收起**。运行提交
+`ef250b3c4fa3c9ab0160e3eff8b6520942c9b21f`。排查没有把 AI 面板作为已确认原因。
+
+确认并修复：
+
+- 应用与分享页调用了不存在的 `viewer.viewport.isAnimating()`，导致原本应在
+  拖动期间省略的标记文字/备注每帧都重画。现在使用 Viewer 的动画状态，并在
+  `animation` 回调显式传入移动标志，覆盖 OSD 尚未更新状态的第一帧。线框继续
+  跟随视野；`animation-finish` 恢复文字和备注。
+- 空标记画布也一直 clearRect。现在记录画布是否有内容，只在隐藏/清除内容时
+  清一次；尺寸只在 resize 时测量，重绘不再读取布局。分享页 resize 同时调整
+  画布背衬，避免缓存尺寸后发生错位。
+- 本地 OSD 5.0.1 默认 WebGLDrawer 经离屏 WebGL canvas 绘制后，复制到可见的
+  2D canvas。当前瓦片已在服务端完成配色，是单层二维图像；改用 OSD 自带
+  CanvasDrawer 直接绘制。主站、分享页、Demo 使用一致选择。未修改瓦片质量、
+  minPixelRatio、缩放上限、并发请求数、屏幕像素密度或已有抽牌动画节奏。
+
+上游也有相关性能反馈：[OSD #2906](https://github.com/openseadragon/openseadragon/issues/2906)、
+[#2533](https://github.com/openseadragon/openseadragon/issues/2533)。这些是问题报告，
+不是对用户 Mac 的诊断结论；本轮同时核对了仓库内 5.0.1 的绘制代码和实际 A/B。
+
+### 性能证据及边界
+
+本机 headless Chromium 使用软件 WebGL，1440×900、DPR=1、4 倍 CPU 限速。
+真实 Flask/PG、真实 BMP 与瓦片；100 个矩形标记通过真实 annotation API 创建。
+每轮先加载瓦片并放大到初始倍率的 4 倍，再以固定鼠标步骤拖动往返两次。
+每个场景独立三轮，下表为中位数。移动期间捕获到的网络请求均为 0，说明这组
+已预热场景的差异来自绘制，不是等待带宽。未模拟真实 Mac 显卡。
+
+| 场景 | 总文字测量次数 | 空层清空次数 | rAF p95 | 主线程 TaskDuration |
+| --- | ---: | ---: | ---: | ---: |
+| 旧版，100 个真实标记显示 | 14900 | — | 66.7 ms | 9.472 s |
+| 仅修标记层，仍用 WebGL，100 个标记 | 100 | — | 66.7 ms | 9.353 s |
+| Canvas + 标记修复，无标记显示 | 0 | 0 | 16.7 ms | 1.070 s |
+| Canvas + 标记修复，100 个标记 | 100 | — | 16.8 ms | 2.712 s |
+
+可见单修标记层没有解决测试环境的主要帧耗时；绘制路径变化才带来明显改善。
+不能将这个软件渲染环境的帧间隔变化直接换算成用户 Mac 的实际帧率。100 次文字
+测量均发生在结束后恢复标签，移动中为 0。最初的标记模拟数据探测保留在
+`baseline.*` / `baseline-visible.*`，未列入表格；表中旧版以 `baseline-real.*`
+为准，使用真实数据库记录。旧 JS 通过静态资源拦截固定到本轮开始版本；未 mock 业务 API。
+
+DPR=2 的 WebGL/Canvas 像素对比覆盖初始视图、放大、90° 旋转和镜像。
+画布背衬均为 2880×1680；中心 256×256 RGBA 区域平均绝对差为 0.005–0.643
+（单通道 0–255），p95 为 0–2，最大差为 11，来自不同绘制器的重采样差异。
+没有把两个绘制器说成逐像素完全一致，也没有降低输出分辨率。
+
+完整 Vitest：1003 passed、2 个既有 skip。完整 Playwright：92 passed。
+新增主站/分享页回归驱动真实 OSD 拖动，检查空层不重复清空、移动时文字不绘制、
+线框继续绘制、结束后文字恢复，以及 resize 背衬尺寸和隐藏后透明清屏。
+旧代码运行这两个回归均失败（空层各清空 25 次）。分享页测试在分享内创建真实
+箭头标记，主站创建矩形，覆盖两种实际绘制路径。全量第一次运行暴露了测试对
+“附带既有标记”的假设，修正种子建立方式后完整复跑通过；没有削弱移动断言。
+本轮只涉及前端，未重跑 Python 套件。
+
+### 排查时发现的独立待处理项
+
+ID-only 切片上，“创建分享并附带已有标记”仍有问题：隔离实例已有 100 个本人
+矩形，POST `/api/share/create` 传 `include_annotations:true` 返回
+`annotations_granted:0`，分享页读标记为 0。`check-share-copy.cjs` 与
+`share-copy.log` 保存复现。本轮没有改动后端分享/权限逻辑；分享内创建标记正常。
+
+本机证据目录 `.gate-tmp/pan-perf-20261009/`，含 `profile.cjs`、`baseline.json`、
+`baseline-real.json`、`optimized-real.json`、`canvas-real.json`、对应 trace、
+`render-comparison.json` 与截图、`before-tests.log`、`pan-tests-final.log`、
+`unit-final.log` 和 `full-e2e-final.log`。
+
+已推送并发布到 `/home/solarise/releases/suite-20261009-pan-perf`，生产
+APP_REVISION 已核对为上述运行提交。镜像 346 项文件、96 项静态资源、全部
+6 个变更运行文件一致；生产快照隔离验收通过。新备份与上一版本容器保留，
+无新迁移或插件变更。两域名主站/分享健康检查通过，app.js、share.js 和
+viewer-core.js 与提交逐字节一致（入口缓存版本 20261009i）。
+
+线上首轮两张合成 JPEG 在第一个文件即被现有“本机转换后上传”规则拦截，未
+进入渲染；数据库确认没有该账号的上传/入库任务。首轮失败截图、日志与录屏
+保留于 `first-run/`，账号已禁用。第二轮使用同样横/竖构图的标准金字塔 TIFF
+（4096×3072、3072×4096），真实上传两张后在 1440×900、DPR=2 验收：
+无标记拖动、矩形标记拖动、分享内箭头标记拖动、90° 旋转、镜像、背衬尺寸与
+可见像素、画布 PNG 导出均通过。主站/分享实际 drawer 均为 canvas，无 JavaScript
+错误。人工看过标记与旋转后的截图，未见新增错位。此处画布导出检查不是宣称
+重测了服务端 ROI 裁剪接口；后者本轮未修改。
+
+两轮共两个 Dogfood 账号，均已禁用；两张已发布测试切片已删除，测试分享已
+撤销。数据库复核无存活测试切片或有效分享，临时凭据已删除。本机所有隔离
+测试服务与临时凭据也已清理。没有运行 AI 推理或发送反馈邮件。线上证据为
+同目录 `dogfood.log`、`results.json`、`main-*.png`、`share-*.png`、`live-video/`、
+`cleanup-first.log`、`cleanup.log`、`public-check.log` 和 `cutover.log`。

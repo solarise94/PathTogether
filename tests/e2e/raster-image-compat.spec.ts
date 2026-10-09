@@ -109,7 +109,8 @@ async function canvasCenterHasPixels(page: Page, selector: string): Promise<bool
 	}, selector);
 }
 
-test("选片像扑克牌抽出翻面，等真实瓦片后铺开；减少动画时直接打开", async ({ page }) => {
+for (const slowResource of ['tiles', 'info'] as const) {
+test(`选片加载与翻牌并行：${slowResource} 未到也完成铺开，清晰图就绪后交接`, async ({ page }) => {
   const { slide_id: sid } = CREDS.rasterSlides.workbench;
   const errors: string[] = [];
   page.on("pageerror", e => errors.push(e.message));
@@ -123,9 +124,16 @@ test("选片像扑克牌抽出翻面，等真实瓦片后铺开；减少动画�
   let releaseTiles!: () => void;
   const tileGate = new Promise<void>(resolve => { releaseTiles = resolve; });
   let tileRequests = 0;
+  const infoPhases: string[] = [];
+  await page.route(`**/api/slides/${sid}/info`, async route => {
+    infoPhases.push(await page.evaluate(() =>
+      (document.querySelector('.slide-deal') as HTMLElement)?.dataset.phase || 'none'));
+    if (slowResource === 'info') await tileGate;
+    await route.continue();
+  });
   await page.route(`**/api/slides/${sid}/tiles/**`, async route => {
     tileRequests++;
-    await tileGate;
+    if (slowResource === 'tiles') await tileGate;
     await route.continue();
   });
   await expect.poll(() => hit.locator("img").evaluate((el: HTMLImageElement) => el.complete && el.naturalWidth > 0)).toBe(true);
@@ -154,8 +162,16 @@ test("选片像扑克牌抽出翻面，等真实瓦片后铺开；减少动画�
   await expect(deal).toHaveCSS('pointer-events', 'none');
   await expect(page.locator('.fb-fan-card')).toHaveCount(0);
   try {
-    await expect.poll(() => tileRequests).toBeGreaterThan(0);
-    await expect(deal).toHaveAttribute('data-phase', 'waiting');
+    // Hold the real HTTP response indefinitely: animation must finish spreading
+    // independently, even when metadata / image geometry is still unavailable.
+    await expect(deal).toHaveAttribute('data-phase', 'preview', { timeout: 4000 });
+    expect(infoPhases[0]).toBe('drawing');
+    if (slowResource === 'tiles') expect(tileRequests).toBeGreaterThan(0);
+    else expect(tileRequests).toBe(0);
+    const preview = await page.locator('.slide-deal-landing').boundingBox();
+    const viewport = await page.locator('#viewer').boundingBox();
+    expect(preview!.width).toBeGreaterThan(viewport!.width * .5);
+    expect(preview!.width / preview!.height).toBeCloseTo(BMP_W / BMP_H, 2);
     expect(await canvasCenterHasPixels(page, "#viewer .openseadragon-canvas")).toBe(false);
   } finally { releaseTiles(); }
   await expect(deal).toHaveCount(0, { timeout: 5000 });
@@ -184,6 +200,7 @@ test("选片像扑克牌抽出翻面，等真实瓦片后铺开；减少动画�
   expect(await page.evaluate(() => (window as any).__dealPhases)).toEqual([]);
   expect(errors).toEqual([]);
 });
+}
 
 test.describe("BMP 普通图片兼容（主站 + 分享页真实浏览器走查）", () => {
 

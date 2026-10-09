@@ -1547,8 +1547,11 @@
           !e.tiles || !e.tiles.length || !viewer.world ||
           e.tiledImage !== viewer.world.getItemAt(0)) return;
       slideDeal.ready = true;
-      spreadSlideDeal(slideDeal);
+      finishSlideDeal(slideDeal);
     });
+    // A laid-out preview must never cover a user's attempt to pan the viewer.
+    viewer.addHandler("canvas-press", cancelSlideDeal);
+    viewer.addHandler("canvas-scroll", cancelSlideDeal);
     // 底图随平移/缩放实时跟随（animation 每帧触发，跟随最平滑）
     viewer.addHandler("animation", function () { syncBaseThumb(); redrawAnnoCanvas(true); });
     // 动画结束补画文本（标签/气泡）：动画期间为流畅省略了文本绘制
@@ -2112,7 +2115,8 @@
     if (!rect.width || !rect.height) rect = hit.querySelector(".fb-card").getBoundingClientRect();
     if (!rect.width || !rect.height) return null;
     var label = hit.querySelector(".fb-card-name");
-    return { rect: rect, src: img.currentSrc || img.src, name: label ? (label.title || label.textContent) : hit.dataset.name };
+    return { rect: rect, src: img.currentSrc || img.src, width: img.naturalWidth, height: img.naturalHeight,
+      name: label ? (label.title || label.textContent) : hit.dataset.name };
   }
 
   function cancelSlideDeal() {
@@ -2180,7 +2184,8 @@
     document.body.appendChild(stage);
     document.body.appendChild(el);
     var deal = slideDeal = { el: el, stage: stage, card: card, front: front, image: img, label: label, seq: seq,
-      ref: String(ref), center: center, animations: [], ready: false, drawn: false, spreading: false };
+      ref: String(ref), center: center, imageWidth: source.width, imageHeight: source.height,
+      animations: [], ready: false, drawn: false, spreading: false, landed: false, finishing: false };
     // A failed/very slow DZI must never leave a decorative card over the workbench.
     deal.timeout = setTimeout(function () { if (slideDeal === deal) cancelSlideDeal(); }, 8000);
     var drawn = { left: Math.min(r.left + 110, center.left), top: Math.max(target.top + 12, r.top - 24), width: r.width, height: r.height };
@@ -2199,22 +2204,29 @@
     ], { duration: 620, easing: "cubic-bezier(.3,.05,.25,1)", fill: "both" }).then(function () {
       if (slideDeal !== deal) return;
       deal.drawn = true;
-      deal.el.dataset.phase = "waiting";
       spreadSlideDeal(deal);
     });
   }
 
   function spreadSlideDeal(deal) {
-    if (slideDeal !== deal || !deal.ready || !deal.drawn || deal.spreading) return;
-    // Use OSD's actual image bounds, including its fit/margins, for the handoff.
+    if (slideDeal !== deal || !deal.drawn || deal.spreading) return;
+    // Requests run alongside the flight. Never wait for metadata or tiles to
+    // expand the already decoded thumbnail; use OSD bounds when available and
+    // otherwise fit the thumbnail's own aspect ratio into the same viewport.
     var root = $("viewer").getBoundingClientRect();
     var rect;
-    try {
+    if (deal.opened) try {
       var tl = viewer.viewport.imageToViewerElementCoordinates(new OpenSeadragon.Point(0, 0));
       var br = viewer.viewport.imageToViewerElementCoordinates(new OpenSeadragon.Point(state.slide.width, state.slide.height));
       rect = { left: root.left + Math.min(tl.x, br.x), top: root.top + Math.min(tl.y, br.y),
         width: Math.abs(br.x - tl.x), height: Math.abs(br.y - tl.y) };
-    } catch (e) { /* A closing viewer has no landing geometry. */ }
+    } catch (e) { /* Metadata may still be in flight. */ }
+    if (!rect && deal.imageWidth > 0 && deal.imageHeight > 0) {
+      var fit = Math.min(root.width / deal.imageWidth, root.height / deal.imageHeight);
+      var w = deal.imageWidth * fit, h = deal.imageHeight * fit;
+      rect = { left: root.left + (root.width - w) / 2, top: root.top + (root.height - h) / 2,
+        width: w, height: h };
+    }
     if (!rect || !rect.width || !rect.height) { cancelSlideDeal(); return; }
     // Resizing/zooming during flight should hand control straight back to OSD.
     if (rect.width > root.width + 2 || rect.height > root.height + 2) { cancelSlideDeal(); return; }
@@ -2244,11 +2256,19 @@
       { transform: dealBoxTransform(rect, rect.width, rect.height) }
     ], { duration: 340, easing: "cubic-bezier(.2,.7,.2,1)", fill: "forwards" }).then(function () {
       if (slideDeal !== deal) return;
-      deal.el.dataset.phase = "handoff";
-      dealAnimate(deal, deal.stage, [{ opacity: 1 }, { opacity: 0 }], { duration: 160, fill: "forwards" });
-      return dealAnimate(deal, landing, [{ opacity: 1 }, { opacity: 0 }], { duration: 160, fill: "forwards" }).then(function () {
-        if (slideDeal === deal) cancelSlideDeal();
-      });
+      deal.landed = true;
+      deal.el.dataset.phase = "preview";
+      finishSlideDeal(deal);
+    });
+  }
+
+  function finishSlideDeal(deal) {
+    if (slideDeal !== deal || !deal.landed || !deal.ready || deal.finishing) return;
+    deal.finishing = true;
+    deal.el.dataset.phase = "handoff";
+    dealAnimate(deal, deal.stage, [{ opacity: 1 }, { opacity: 0 }], { duration: 160, fill: "forwards" });
+    dealAnimate(deal, deal.landing, [{ opacity: 1 }, { opacity: 0 }], { duration: 160, fill: "forwards" }).then(function () {
+      if (slideDeal === deal) cancelSlideDeal();
     });
   }
 

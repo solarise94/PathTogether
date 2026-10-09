@@ -21380,7 +21380,11 @@ def api_ai_run_grant_revoke(grant_id):
 
 @app.route("/api/ai/sessions")
 def api_ai_sessions():
-    """列出某切片的 main + 活跃 forks。?slide= 必填。代理 sidecar GET /sessions。
+    """列出某切片的 main + 活跃 forks。?slide= 为 sidecar 索引键。
+
+    与 HistoPilot 插件/sidecar 的 P2 契约一致：索引键是稳定 slide_id，
+    历史会话仍可用冻结文件名。ID 形态只按 ID 解析，未知 ID 不回退按名
+    猜测；两条路径均走资产读门禁（含临时授权到期和资产状态）。
 
     Stage 3a-2b（AI 会话归属）：认证态按 session_owner 过滤——升级 B R6 起
     认证 owner 同样注入 owner=<uid>（会话目录不因管理员角色开放他人会话，
@@ -21390,9 +21394,13 @@ def api_ai_sessions():
     slide = request.args.get("slide")
     if not slide:
         return jsonify(error="缺少 slide"), 400
-    if not can_view_slide(slide):
-        return _denied()
     user_ctx = current_identity()
+    ref = ({"slide_id": slide} if re.fullmatch(r"sld_[A-Za-z0-9_-]+", slide)
+           else {"slide": slide})
+    desc = _ai_session_slide_descriptor(ref)
+    if not _ai_session_subject_can_view(
+            user_ctx.get("role"), user_ctx.get("user_id"), desc):
+        return _denied()
     query = {"slide": slide}
     if AUTH_ENABLED and user_ctx.get("user_id"):
         query["owner"] = user_ctx["user_id"]

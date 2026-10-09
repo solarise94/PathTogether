@@ -101,6 +101,49 @@ WAYPOINTS = {
 }
 
 
+def test_sessions_list_id_only_scopes_owner_and_temporary_access(fake_sidecar):
+    """The deployed plugin sends the stable ID as the session index key."""
+    from _pt_helpers import publish_test_slide
+    from _tiff_fixtures import make_tiff_bytes
+
+    owner, usera, userb, _ = _setup()
+    sid = publish_test_slide("same-name.tif", make_tiff_bytes(),
+                             owner_user_id=usera["user_id"])
+    other = publish_test_slide("same-name.tif", make_tiff_bytes(),
+                               owner_user_id=userb["user_id"])
+    fake_sidecar.register_json("GET", "/sessions",
+                               body={"sessions": [], "conversations": []})
+    ca, cb, co = [_login(_client(), u) for u in (usera, userb, owner)]
+
+    assert ca.get("/api/ai/sessions", query_string={"slide": sid}).status_code == 200
+    assert fake_sidecar.calls[-1]["query"] == {
+        "slide": sid, "owner": usera["user_id"]}
+    before = len(fake_sidecar.calls)
+    for client, key in [(cb, sid), (ca, other), (co, sid),
+                        (ca, "sld_nonexistent")]:
+        assert client.get("/api/ai/sessions",
+                          query_string={"slide": key}).status_code == 403
+    assert len(fake_sidecar.calls) == before
+
+    share_store.start_slide_view_grant_timed(
+        owner["user_id"], sid, slide_id=sid,
+        granted_by=owner["user_id"], ttl_seconds=3600)
+    assert co.get("/api/ai/sessions", query_string={"slide": sid}).status_code == 200
+    # Admin access to a slide still does not expose its uploader's conversations.
+    assert fake_sidecar.calls[-1]["query"] == {
+        "slide": sid, "owner": owner["user_id"]}
+    share_store.end_slide_view_grant(owner["user_id"], sid, slide_id=sid)
+    before = len(fake_sidecar.calls)
+    assert co.get("/api/ai/sessions", query_string={"slide": sid}).status_code == 403
+    assert len(fake_sidecar.calls) == before
+    assert ca.get("/api/ai/sessions", query_string={"slide": sid}).status_code == 200
+    import slide_store
+    slide_store.request_delete(sid)
+    before = len(fake_sidecar.calls)
+    assert ca.get("/api/ai/sessions", query_string={"slide": sid}).status_code == 403
+    assert len(fake_sidecar.calls) == before
+
+
 # --------------------------------------------------------------------------- #
 # S5：GET /api/ai/session/<id>/path 代理
 # --------------------------------------------------------------------------- #

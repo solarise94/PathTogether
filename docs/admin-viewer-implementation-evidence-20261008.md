@@ -1,6 +1,6 @@
 # 后台/注册/Viewer 改版 —— 实现与验收证据
 
-日期：2026-10-08，最后更新：2026-10-09。依据：[简化版实施设计](admin-viewer-simplified-20261008.md)。分支 `admin-viewer`，基线为生产线 `registration-antibot` @ 66cfa29c。状态：**已推送、已部署；线上代码 d53bf495，生产 dogfood 结果见 §9。**
+日期：2026-10-08，最后更新：2026-10-09。依据：[简化版实施设计](admin-viewer-simplified-20261008.md)。分支 `admin-viewer`，基线为生产线 `registration-antibot` @ 66cfa29c。状态：**已推送、已部署；线上代码 014efdc0，最新生产 dogfood 结果及未解决的 AI 阻塞见 §11。**
 
 ## 1. 变更范围
 
@@ -185,7 +185,7 @@ BMP 变体，不把转换提示误记为上传失败。
   包含浏览器检查结果 JSON、脚本、`viewer-hover.png`、`share-annotation.png`、
   `temporary-expired.png`、`viewer-ai.png`；未将凭据、截图或数据库副本提交。
 
-## 10. 第四轮（2026-10-09，未部署）
+## 10. 第四轮（2026-10-09，初次验收时未部署；后续上线见 §11）
 
 依据 [第四轮合同](admin-viewer-round4-20261009.md)。
 
@@ -208,3 +208,78 @@ BMP 变体，不把转换提示误记为上传失败。
 - admin 插件需发布 0.4.17（0.4.16 已在生产）。
 - 反馈邮件发往 `REGISTRATION_ADMIN_EMAIL`（公开注册前置条件已要求配置）。服务端附带的应用版本读 `APP_REVISION` 环境变量，当前部署未注入，需在部署环境中加入，否则该字段为空。
 - AI 面板拖动/缩放在 E2E 环境中以注入官方面板结构验证（E2E 未启用 HistoPilot 插件），真实插件下需目视确认一次。
+
+
+## 11. AI 标题栏与移除「添加视野」上线（2026-10-09）
+
+**状态：已推送并上线；UI 与权限 dogfood 通过，真实 AI 完整对话未通过。**
+本节不把真实插件 UI 回归中的模拟 AI 响应计作生产推理成功。
+
+### 发布内容与验证
+
+- `bf5ab139`：第四轮 review 修复、AI 标题切换/新对话/折叠选项 UI。
+  Review 与原全量测试结果见 [review 记录](review-round4-ai-title-20261009.md)。
+- `5084cb38`：移除真实插件插入的 `#ai-attach-view-btn`，保留原有选区附件行为。
+  暂不在标记中增加新入口。真实插件 UI 门禁重新运行 **5 passed**。
+- `014efdc0`：生产 dogfood 发现新上传的 ID-only 切片在 run grant 复查中被
+  `creator_not_allowed` 拒绝；复查改用 grant 的稳定 slide_id。权限仍校验
+  创建者有效、资产可读/未归档、拥有或当前 annotate 协作授权，owner 临时查看
+  结束后不能继续使用。3 个新增回归在修复前失败；最终 4 个新增回归覆盖上传者
+  user/owner、同名不同资产、禁用/删除、view-only 与撤销分享、结束临时查看。
+  相关门禁先 **104 passed**，最终全部 `test_ai*.py` 与临时查看门禁 **252 passed**。
+  这次小补丁没有重跑此前已通过的完整 pytest/vitest/默认 Playwright 全量。
+- 最终生产镜像：`localhost/pathtogether-demo:suite-20261009-ai-grant`；
+  `APP_REVISION=014efdc082dd7371f0265e4d9e97860e85e1b3f2`。
+  迁移 `0081_user_feedback.sql` 已应用；admin 插件 **0.4.17**，切换后已重启。
+  HistoPilot sidecar 镜像及插件保持原版本。
+- 两次候选发布均从只读生产快照恢复到隔离数据库；全部写目录隔离、后台 worker
+  关闭，重复迁移通过。镜像逐文件 hash 匹配对应 Git 内容，96 个静态文件在隔离
+  候选服务校验通过。生产配置保留，原容器与切换前数据库备份保留以供回滚。
+- 两个公网域名 `/healthz`、`/s/healthz` 均通过；`app.js`、`style.css`、
+  `ai-panel-chrome.js`、`feedback-recorder.js` 与本地发布源的 SHA256 一致。
+  从服务器下载所有公网静态文件的检查过慢，停止该只读检查后改为关键文件校验；
+  不声称已完成两域名全部 96 个文件的公网校验。
+
+### 真实浏览器 dogfood 已通过
+
+使用新建并标记 Dogfood 的 uploader/visitor 账号和一张合成 BMP，全程未 mock
+生产 API，未修改真实用户账号或关闭注册验证。
+
+1. 真实上传、深链打开、实际画布像素和缩略图正常。
+2. 真实安装的 AI 插件使用新标题栏；「添加视野」在初始化、刷新、移动端均不存在。
+3. 新建草稿、折叠设置不启动模型；等待草稿保存完成后刷新可恢复文字。
+4. 面板拖动、调整大小、刷新恢复尺寸；390px 手机选项不越界；手机切回桌面可拖动。
+5. 普通用户不能访问后台或其他账号的切片会话。admin 0.4.17 正常握手，测试申请
+   入口已移除，Dogfood 筛选可见测试账号。
+6. 开启/结束 admin 临时查看正确改变会话列表访问权限，上传者访问保持有效。
+7. 匿名分享页面与 ID-only 切片的 annotations 读端点正常；无 JavaScript 异常。
+
+### 尚未解决的生产问题（需 HistoPilot 后端/插件后续修复）
+
+**P1 — 新切片的真实 AI 开跑仍失败，历史详情也被拒绝。**
+先修复 PT run grant 后，同一测试账号的请求成功创建了真实会话，但 SSE 随后返回
+`agent_error: 读片助手异常：切片不存在`，会话状态为 `error`，未完成模型回复。
+从内部可信接口读取该测试会话：记录的 `slide` 为显示文件名，`GET /session/:id`
+的响应没有 `slide_id`；PT 用户侧详情接口因此按安全规则返回 403。
+当前 HistoPilot 源码 `src/server.ts` 的 `handleRun` 解析了 `body.slide_id`，但传给
+runner 的 `effectiveConfig` 未注入它；详情响应也漏了 `d.slide_id`。
+这些是源码定位线索，需要在 HistoPilot 仓补齐真实跨服务回归后发布；不能通过
+放宽 PT 按文件名授权来绕过。**本轮不宣称真实回复或真实历史切换验收通过。**
+失败会话已结束，无后台测试 run 继续执行。未实际发送反馈邮件。
+
+**P2 — 输入草稿后立即刷新，最后一次输入可能丢失。**
+真实插件按 300ms debounce 保存草稿，没有刷新前同步落盘；一次快速操作重现了
+空白恢复，等待持久化完成后重复验证正常。新 UI 沿用原插件草稿状态机，本次未
+绕过它另建一套保存机制。后续应在插件生命周期中补刷新/关闭前落盘及对应回归。
+
+### 清理与证据
+
+测试分享已撤销，合成切片已删除，两名账号已禁用并保留 Dogfood 标记与审计记录；
+数据库复核无仍存活的测试切片/有效分享。失败 AI 会话保留诊断记录。
+临时登录凭据和 owner cookie 文件在检查后移除。
+
+本地证据：`.gate-tmp/deploy-ai-title-20261009/`，包括 `results.json`（明确记录
+真实 AI 失败）、`rest-results.json`（其余流程与清理）、`public-check.log`、
+`cleanup.log`、发布日志、`desktop.png`、`mobile.png`。
+服务器发布/回滚目录：`/home/solarise/releases/suite-20261009-ai-title` 与
+`/home/solarise/releases/suite-20261009-ai-grant`。私有凭据、数据库副本与截图不进 Git。

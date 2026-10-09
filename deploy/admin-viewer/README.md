@@ -1,7 +1,8 @@
 # Admin / Viewer deployment
 
 Deploy the `admin-viewer` branch from the current production lineage. This release
-requires migration `0080_admin_viewer.sql` and admin plugin **0.4.16**. Switch the
+requires migrations through `0081_user_feedback.sql` and admin plugin **0.4.17**.
+Set `APP_REVISION` to the full deployed Git revision for feedback diagnostics. Switch the
 plugin bundle while the platform is stopped, then restart with the matching source
 policy pin. Migration 0080 immediately ends old permanent admin view grants.
 

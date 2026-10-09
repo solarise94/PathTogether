@@ -88,6 +88,8 @@ Screenshots are local review artifacts in `.gate-tmp/ai-title-review/`:
 `main.png`, `history.png`, `options.png`. They show the real UI with fixture
 conversation content. Regression command logs are under `/tmp/ai-*.log`.
 
-No push or deployment is part of this round. Existing round-4 release prerequisites
-remain: migration 0081, admin plugin 0.4.17 and APP_REVISION. This UI/fix patch adds
-no migration and requires no HistoPilot plugin release.
+The initial review stopped before deployment. The user subsequently authorized
+removing the viewport attachment button and deploying. That release, the production
+dogfood findings (including unresolved live AI failures), and cleanup are recorded
+in `admin-viewer-implementation-evidence-20261008.md`, section 11. The UI adapter
+adds no migration and requires no HistoPilot plugin release.

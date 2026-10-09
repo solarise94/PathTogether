@@ -372,3 +372,20 @@ test("手机从更多启用绘制工具后，搜索和分享仍留在主栏", as
   await expect(page.locator("#tb-share-pop")).toBeVisible();
   expect(problems).toEqual([]);
 });
+
+// Exercise the real OpenSeadragon canvas as well as the DOM-only UI fixture.
+test("切片菜单在真实画布点击时关闭，空态和已打开切片均可", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const problems = attachErrorCollectors(page);
+  await login(page, CREDS.userLogin, CREDS.userPassword);
+  for (const url of ["/app", `/app?slide=${CREDS.rasterSlides.workbench.slide_id}`]) {
+    await page.goto(url);
+    await expandSidebar(page);
+    await page.locator('.fb-hit').first().hover({ position: { x: 12, y: 20 } });
+    await page.locator('.fb-pullout .fb-card-menu').click();
+    await expect(page.locator('#fb-slide-menu')).toBeVisible();
+    await page.locator('#viewer .openseadragon-canvas').click({ position: { x: 500, y: 80 } });
+    await expect(page.locator('#fb-slide-menu')).toBeHidden();
+  }
+  expect(problems).toEqual([]);
+});

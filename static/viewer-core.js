@@ -9,6 +9,9 @@
     return {
       element: element,
       showNavigationControl: false,
+      // Tiles are already rendered to RGB by the server. Canvas draws them
+      // directly, avoiding OSD 5's offscreen WebGL-to-2D copy on every pan frame.
+      drawer: "canvas",
       imageLoaderLimit: 8,
       placeholderFillStyle: null,
       compositeOperation: "source-over",

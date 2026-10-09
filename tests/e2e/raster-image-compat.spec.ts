@@ -480,3 +480,101 @@ test("切片菜单在真实画布点击时关闭，空态和已打开切片均�
   }
   expect(problems).toEqual([]);
 });
+
+// Actual OSD movement with real stored annotations; no API/drawer stubs or FPS
+// thresholds. Check the work we can control, including the first moving frame.
+for (const surface of ['app', 'share'] as const) {
+  test(`${surface}：拖动不反复画文字或清空空画布，停止后恢复标记且 resize 对齐`, async ({ page }) => {
+    const sid = CREDS.rasterSlides.workbench.slide_id;
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await login(page, CREDS.userLogin, CREDS.userPassword);
+    async function post(url: string, body: object) {
+      const result = await page.evaluate(async ({ url, body }) => {
+        const csrf = decodeURIComponent(document.cookie.split('; ').find(s => s.startsWith('csrf_token='))?.split('=').slice(1).join('=') || '');
+        const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf }, body: JSON.stringify(body) });
+        return { status: r.status, data: await r.json() };
+      }, { url, body });
+      expect(result.status, JSON.stringify(result.data)).toBe(200);
+      return result.data;
+    }
+    await post('/api/annotation', { slide_id: sid, type: 'rect', x: 140, y: 100, w: 20, h: 20, label: 'Pan regression ' + surface, note: 'Restored after moving' });
+    const url = surface === 'share'
+      ? (await post('/api/share/create', { slide_ids: [sid], permissions: ['view', 'annotate'], expires_hours: 1, include_annotations: false })).url
+      : `/app?slide=${sid}`;
+    await page.goto(url);
+    if (surface === 'share') {
+      const token = new URL(url).pathname.split('/')[2];
+      await post(`/s/${token}/api/roi`, { slide_id: sid, type: 'arrow', x1: 140, y1: 100, x2: 180, y2: 130, label: 'Pan share arrow', note: 'Restored after moving' });
+      await page.reload();
+    }
+    const toggle = page.locator('#anno-all-btn');
+    await expect(toggle).toBeEnabled();
+    await page.waitForFunction(() => { const v = (window as any).OpenSeadragon.getViewer('viewer'); return v?.world.getItemCount() && !v.isAnimating(); });
+    await page.evaluate(() => { const v = (window as any).OpenSeadragon.getViewer('viewer'); v.viewport.zoomTo(v.viewport.getHomeZoom() * 2, null, true); });
+    async function setAnnotations(on: boolean) {
+      for (let n = 0; n < 3 && (await toggle.evaluate(el => el.classList.contains('active'))) !== on; n++) {
+        // This is the same control moved into the overflow menu at narrow widths.
+        await toggle.evaluate((el: HTMLButtonElement) => el.click());
+      }
+      expect(await toggle.evaluate(el => el.classList.contains('active'))).toBe(on);
+    }
+    await setAnnotations(false);
+    await page.waitForFunction(() => !(window as any).OpenSeadragon.getViewer('viewer').isAnimating());
+    await page.evaluate(() => {
+      const v = (window as any).OpenSeadragon.getViewer('viewer');
+      const counts = (window as any).__panWork = { clear: 0, text: 0, movingText: 0, movingStroke: 0, frames: 0 };
+      let inFrame = false;
+      const raise = v.raiseEvent;
+      v.raiseEvent = function (name: string, ...args: any[]) {
+        const was = inFrame;
+        if (name === 'animation') { inFrame = true; counts.frames++; }
+        try { return raise.call(this, name, ...args); } finally { inFrame = was; }
+      };
+      const proto = CanvasRenderingContext2D.prototype;
+      for (const name of ['clearRect', 'measureText', 'strokeRect', 'stroke'] as const) {
+        const original = proto[name];
+        (proto as any)[name] = function (...args: any[]) {
+          if (this.canvas.id === 'anno-canvas') {
+            if (name === 'clearRect') counts.clear++;
+            if (name === 'measureText') { counts.text++; if (inFrame || v.isAnimating()) counts.movingText++; }
+            if ((name === 'strokeRect' || name === 'stroke') && inFrame) counts.movingStroke++;
+          }
+          return (original as any).apply(this, args);
+        };
+      }
+    });
+    async function pan() {
+      await page.evaluate(() => { for (const k in (window as any).__panWork) (window as any).__panWork[k] = 0; });
+      const box = (await page.locator('#viewer').boundingBox())!;
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+      await page.mouse.down();
+      await page.mouse.move(box.x + box.width / 2 + 70, box.y + box.height / 2 + 40, { steps: 6 });
+      await page.mouse.up();
+      await expect.poll(() => page.evaluate(() => (window as any).__panWork.frames)).toBeGreaterThan(0);
+      await page.waitForFunction(() => !(window as any).OpenSeadragon.getViewer('viewer').isAnimating());
+      return page.evaluate(() => (window as any).__panWork);
+    }
+    expect((await pan()).clear).toBe(0);
+    await setAnnotations(true);
+    const moving = await pan();
+    expect(moving.movingText).toBe(0);
+    expect(moving.movingStroke).toBeGreaterThan(0);
+    expect(moving.text).toBeGreaterThan(0); // labels/notes return after the gesture
+    await page.setViewportSize({ width: 1100, height: 760 });
+    await expect.poll(() => page.evaluate(() => {
+      const c = document.getElementById('anno-canvas') as HTMLCanvasElement;
+      const v = (window as any).OpenSeadragon.getViewer('viewer');
+      const r = v.container.getBoundingClientRect(), dpr = window.devicePixelRatio;
+      return c.width === Math.floor(r.width * dpr) && c.height === Math.floor(r.height * dpr);
+    })).toBe(true);
+    await setAnnotations(false);
+    expect(await page.evaluate(() => {
+      const c = document.getElementById('anno-canvas') as HTMLCanvasElement;
+      const pixels = c.getContext('2d')!.getImageData(0, 0, c.width, c.height).data;
+      for (let i = 3; i < pixels.length; i += 4) if (pixels[i]) return true;
+      return false;
+    })).toBe(false);
+    expect((await pan()).clear).toBe(0);
+  });
+}

@@ -1506,6 +1506,9 @@
       viewer = OpenSeadragon({
         element: $("viewer"),
         showNavigationControl: false,
+        // Tiles are already rendered to RGB by the server. Canvas draws them
+        // directly, avoiding OSD 5's offscreen WebGL-to-2D copy on every pan frame.
+        drawer: "canvas",
         imageLoaderLimit: 8,
         placeholderFillStyle: null,
         compositeOperation: "source-over",
@@ -1547,7 +1550,7 @@
       spreadSlideDeal(slideDeal);
     });
     // 底图随平移/缩放实时跟随（animation 每帧触发，跟随最平滑）
-    viewer.addHandler("animation", function () { syncBaseThumb(); redrawAnnoCanvas(); });
+    viewer.addHandler("animation", function () { syncBaseThumb(); redrawAnnoCanvas(true); });
     // 动画结束补画文本（标签/气泡）：动画期间为流畅省略了文本绘制
     viewer.addHandler("animation-finish", function () { redrawAnnoCanvas(); });
     viewer.addHandler("rotate", function () { syncBaseThumb(); redrawAnnoCanvas(); });
@@ -5515,6 +5518,8 @@
   // 标注画布层（rect/arrow/freehand 统一绘制）
   // =========================================================================
   var annoCtx = null;
+  var annoCanvasSize = { width: 0, height: 0 };
+  var annoCanvasHasContent = false;
 
   function resizeAnnoCanvas() {
     var c = els.annoCanvas;
@@ -5527,6 +5532,8 @@
     c.style.height = rect.height + "px";
     annoCtx = c.getContext("2d");
     annoCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    annoCanvasSize = { width: rect.width, height: rect.height };
+    annoCanvasHasContent = false;
   }
 
   // 把图像坐标转为画布层屏幕坐标（自带旋转支持）
@@ -5558,20 +5565,23 @@
     flatItems = out;
   }
 
-  function redrawAnnoCanvas() {
+  function redrawAnnoCanvas(viewMoving) {
     var c = els.annoCanvas;
     if (!c || !annoCtx) { if (c) resizeAnnoCanvas(); }
     if (!annoCtx) return;
-    var rect = viewer ? viewer.container.getBoundingClientRect() : { width: c.clientWidth, height: c.clientHeight };
-    annoCtx.clearRect(0, 0, rect.width, rect.height);
-    // AI overlay（青色虚线框）独立于 showAnno：agent 进行中/完成后始终画
     var hasAiOverlay = aiOverlay && aiOverlay.length > 0;
-    if (!state.showAnno && state.drawMode == null && !hasAiOverlay) return;
-    if (!state.slide) return;
-    // 性能：缩放/平移动画期间省略文本（标签/气泡）只画矢量，
-    // 动画结束（animation-finish）再补全，避免每帧逐条 measureText/fillText
-    var animating = !!(viewer && viewer.viewport &&
-      typeof viewer.viewport.isAnimating === "function" && viewer.viewport.isAnimating());
+    var hasContent = !!(state.slide && ((state.showAnno && (flatItems.length || editItem)) ||
+      (state.drawMode != null && drawPreview) || hasAiOverlay));
+    // An already-empty canvas has nothing to clear during viewport movement.
+    // Clear once when annotations/AI previews are hidden or the slide closes.
+    if (!hasContent && !annoCanvasHasContent) return;
+    annoCtx.clearRect(0, 0, annoCanvasSize.width, annoCanvasSize.height);
+    annoCanvasHasContent = hasContent;
+    if (!hasContent) return;
+    // OSD exposes isAnimating on Viewer, not Viewport. The explicit frame flag
+    // also covers the first animation event before OSD updates its public flag.
+    var animating = viewMoving === true || !!(viewer &&
+      typeof viewer.isAnimating === "function" && viewer.isAnimating());
     // 拖动编辑中只保留选中项的气泡，其余气泡暂停（视图静止时减少文本重绘）
     var dragging = !!(editDrag && editItem);
     // 已保存标注（focus 过滤：有 focusAnno 时只画它）

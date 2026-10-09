@@ -41,7 +41,7 @@
   <script src="/plugins/histopilot/ui/main.js?v=20260910a"></script>
   {% endif %}
   <script src="/static/app-mode.js?v=20260907c"></script>
-  <script src="/static/viewer-core.js?v=20260907c"></script>
+  <script src="/static/viewer-core.js?v=20261009i"></script>
   <!-- P3 人工读片行为采集（独立模块，默认不采集）：只在本正式工作台页面加载；
        服务端 capabilities.research_collection 开启且 app.js 显式装配时才工作。
        demo.html / share.html 不加载本文件，viewer-core.js 也不内置采集 -->
@@ -58,7 +58,7 @@
        （300 条 / 15 分钟），不落盘、不上传；用户主动发送反馈时才随
        POST /api/feedback 附带。隐私红线见文件头注释。 -->
   <script src="/static/feedback-recorder.js?v=20261009"></script>
-  <script src="/static/app.js?v=20261009h"></script>
+  <script src="/static/app.js?v=20261009i"></script>
   {% if histopilot_ui_enabled %}<script src="/static/ai-panel-chrome.js?v=20261009b"></script>{% endif %}
 </body>
 </html>

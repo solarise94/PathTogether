@@ -58,7 +58,10 @@
        （300 条 / 15 分钟），不落盘、不上传；用户主动发送反馈时才随
        POST /api/feedback 附带。隐私红线见文件头注释。 -->
   <script src="/static/feedback-recorder.js?v=20261009"></script>
-  <script src="/static/app.js?v=20261009j"></script>
+  <!-- 标注纯几何 helper（§5.4 polygon / §6.2 旋转投影；主站与分享页共用，
+       无 DOM/i18n 依赖；必须在 app.js 之前加载） -->
+  <script src="/static/anno-geometry.js?v=20261009a"></script>
+  <script src="/static/app.js?v=20261009k"></script>
   {% if histopilot_ui_enabled %}<script src="/static/ai-panel-chrome.js?v=20261009b"></script>{% endif %}
 </body>
 </html>

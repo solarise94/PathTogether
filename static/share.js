@@ -155,7 +155,10 @@
     flipped: false,      // 是否水平翻转（镜像）
     drawMode: null,      // null | "arrow" | "freehand"（与 roiMode 互斥）
     showAnno: true,      // 默认始终显示（用户需要看到管理员标记）
-    focusAnno: null,     // null=显示全部；否则只显示该条标注（currentRois 中的引用）
+    focusAnno: null,     // null=显示全部；否则只显示该条标注（currentRois 中的引用；
+                         // §6.1 起只由 ⋯「只看此标记」设置，选中不再隐藏其它标记）
+    roiGeometryLocked: false, // §6.3：矩形草稿位置锁（保存为标记时随 POST 带上）
+    polygonVertexEdit: null,  // §6.2：polygon「编辑轮廓点」模式的目标 item
     roiSizes: [6, 6.5],  // 本次分享允许的矩形标记尺寸（fetch config 后填充）
     // Wave 3（普通图片兼容）：当前切片无物理标尺（mpp_source="missing"）时为
     // true——毫米预设标记按钮禁用、滑块段禁用（服务端本就拒绝缺 MPP 的毫米
@@ -249,6 +252,41 @@
     return String(s == null ? "" : s)
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+
+  // 标注几何 helper（static/anno-geometry.js；主站与分享页共用，模板保证先加载）
+  var AG = window.HP_AnnoGeometry || {
+    pointsBBox: function () { return null; },
+    pointSegDist: function (px, py, x1, y1, x2, y2) { return 0; },
+    pointInPolygon: function () { return false; },
+    polygonSelfIntersects: function () { return false; },
+    translatePoints: function (pts) { return pts; },
+    scalePointsAbout: function (pts, ax, ay, s) { return pts; },
+    pointsShiftIntoRect: function () { return null; },
+    rectQuad: function () { return []; },
+    pointInQuad: function () { return false; },
+    quadBBox: function () { return null; },
+    clonePoints: function (pts) { return pts; },
+  };
+
+  // §6.1 统一选中视觉：单一蓝色轮廓；去掉旧「蓝外框 + 黄内框 + 常驻黄角点」
+  var ANNO_SELECTED_STROKE = "#007AFF";
+  var ANNO_SELECTED_FILL = "rgba(0,122,255,0.10)";
+
+  // ---- 位置锁 / 可编辑判定（§6.3；条目顶层 geometry_locked，缺省 false） ----
+  function itemGeometryLocked(it) {
+    return !!(it && (it.geometry_locked === true || it.geometry_locked === "true"));
+  }
+  // 分享端可编辑 = 本人创建（既有 source==="me" 语义）；服务端能力位优先
+  function itemCanEdit(it) {
+    if (!it) return false;
+    if (it.can_edit === false || it.can_edit === "false") return false;
+    return isEditable(it);
+  }
+  // 矩形：四顶点经 OSD 投影成屏幕四边形（§6.2 旋转/镜像正确投影）
+  function rectScreenQuad(it) {
+    var quad = AG.rectQuad(it.x, it.y, rectItemW(it), rectItemH(it), imgToCanvas);
+    return { quad: quad, bbox: AG.quadBBox(quad) };
   }
 
   // ---------- 初始化 OpenSeadragon ----------
@@ -682,6 +720,8 @@
 
   function exitRoi() {
     state.roiMode = null;
+    state.roiGeometryLocked = false;  // §6.3：草稿锁只对当前草稿有效
+    closeAnnoToolbar();
     if (roiBox && viewer && viewer.currentOverlays) {
       try { viewer.removeOverlay(roiBox); } catch (e) {}
     }
@@ -781,6 +821,8 @@
       }
       viewer.addOverlay(opts);
     }
+    // §6.1：临时框创建后出现就近工具条（[保存为标记][锁定位置][⋯]）
+    if (rectModeActive() && state.roi.side > 0) openAnnoToolbar();
   }
 
   // 用指定的图像坐标重建 ROI 框（跳转账使用）
@@ -901,6 +943,8 @@
       note: (els.roiNote ? els.roiNote.value : "") || "",
     };
     if (state.slide.id) roiBody.slide_id = state.slide.id;
+    // §6.3：草稿位置锁随保存落库（POST 可选 geometry_locked）
+    if (state.roiGeometryLocked) roiBody.geometry_locked = true;
     fetch(API + "/api/roi", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1056,8 +1100,8 @@
         drawAnnoItem(it, labelColor(it.label), selected, !animating);
       });
     }
-    // 编辑手柄（仅显式编辑态才画，纯选中不画，防误挪位置；且仅可编辑项）
-    if (editItem && state.editing && isEditable(editItem) && state.showAnno) {
+    // 编辑手柄（仅显式编辑态才画，纯选中不画，防误挪位置；锁定/只读无手柄 §6.3）
+    if (editItem && state.editing && canDragShareItem(editItem) && state.showAnno) {
       drawEditHandles(editItem);
     }
     // 绘制中预览
@@ -1078,19 +1122,28 @@
         drawNoteBubble(it, note, selected);
       });
     }
+    // §6.1：就近工具条跟随视图（隐藏时不读布局）
+    if (annoToolbarEl && !annoToolbarEl.hidden) updateAnnoToolbarPos();
   }
 
-  // 绘制编辑手柄（方块/圆点）
+  // 绘制编辑手柄（方块/圆点）；§6.1 统一蓝色控制点
   function drawEditHandles(it) {
-    var typ = it.type || "rect";
     var hs = editHandles(it);
     annoCtx.fillStyle = "#fff";
-    annoCtx.strokeStyle = "#007AFF";
+    annoCtx.strokeStyle = ANNO_SELECTED_STROKE;
     annoCtx.lineWidth = 2;
     hs.forEach(function (h) {
-      // mid 类（整体平移）用圆形，其余用方块
       var isMid = (h.id === "mid" || h.id === "fmid" || h.id === "move");
-      if (isMid) {
+      if (h.vertex) {
+        annoCtx.beginPath();
+        annoCtx.arc(h.x, h.y, 5, 0, Math.PI * 2);
+        annoCtx.fill(); annoCtx.stroke();
+      } else if (h.insertAfter != null) {
+        annoCtx.globalAlpha = 0.85;
+        annoCtx.fillRect(h.x - 4, h.y - 4, 8, 8);
+        annoCtx.strokeRect(h.x - 4, h.y - 4, 8, 8);
+        annoCtx.globalAlpha = 1;
+      } else if (isMid) {
         annoCtx.beginPath();
         annoCtx.arc(h.x, h.y, 6, 0, Math.PI * 2);
         annoCtx.fill(); annoCtx.stroke();
@@ -1116,31 +1169,40 @@
     return (isFinite(s) && s > 0) ? s : 0;
   }
 
+  // 矩形描边 + 半透明填充（quad 多边形路径）；选中叠加单层蓝轮廓。
+  // §6.1：不再画黄内框与常驻黄角点；未选中 = label 色细线（更轻）。
+  function drawRectQuad(it, color, selected) {
+    var sq = rectScreenQuad(it);
+    if (!sq.quad || sq.quad.length < 3) return;
+    annoCtx.save();
+    annoCtx.beginPath();
+    annoCtx.moveTo(sq.quad[0][0], sq.quad[0][1]);
+    for (var i = 1; i < sq.quad.length; i++) annoCtx.lineTo(sq.quad[i][0], sq.quad[i][1]);
+    annoCtx.closePath();
+    annoCtx.fillStyle = selected ? ANNO_SELECTED_FILL : (color.fill || "rgba(0,0,0,0)");
+    annoCtx.fill();
+    annoCtx.lineWidth = selected ? 3 : 2;
+    annoCtx.strokeStyle = selected ? ANNO_SELECTED_STROKE : color.stroke;
+    annoCtx.stroke();
+    annoCtx.restore();
+    return sq.bbox;
+  }
+
   function drawAnnoItem(it, color, selected, showText) {
     var typ = it.type || "rect";
-    var hlStroke = selected ? "#007AFF" : null;
+    var hlStroke = selected ? ANNO_SELECTED_STROKE : null;
     var lbl = showText ? it.label : null;
     if (typ === "rect") {
-      var tl = imgToCanvas(it.x, it.y);
-      var br = imgToCanvas(it.x + rectItemW(it), it.y + rectItemH(it));
-      var w = Math.abs(br.x - tl.x), h = Math.abs(br.y - tl.y);
-      var x = Math.min(tl.x, br.x), y = Math.min(tl.y, br.y);
-      // 选中高亮：先画一层加粗蓝边
-      if (hlStroke) {
-        annoCtx.lineWidth = 6;
-        annoCtx.strokeStyle = hlStroke;
-        annoCtx.strokeRect(x, y, w, h);
+      var bbox = drawRectQuad(it, color, selected);
+      if (lbl && bbox) {
+        drawLabel(it.label, bbox.x, bbox.y,
+          (it.size_mm > 0 && rectItemW(it) === rectItemH(it)) ? (it.size_mm + "mm") : "");
       }
-      annoCtx.lineWidth = 3;
-      annoCtx.strokeStyle = "#FFD700";
-      annoCtx.strokeRect(x, y, w, h);
-      annoCtx.fillStyle = "#FFD700";
-      [[x, y], [x + w, y], [x, y + h], [x + w, y + h]].forEach(function (p) {
-        annoCtx.beginPath(); annoCtx.arc(p[0], p[1], 3, 0, Math.PI * 2); annoCtx.fill();
-      });
-      if (lbl) drawLabel(it.label, x, y, (it.size_mm > 0 && rectItemW(it) === rectItemH(it)) ? (it.size_mm + "mm") : "");
     } else if (typ === "arrow") {
       drawArrow(it.x1, it.y1, it.x2, it.y2, hlStroke || color.stroke, lbl);
+    } else if (typ === "polygon") {
+      // §5.4：polygon 独立类型（闭合简单多边形）；绝不伪装成 freehand
+      drawPolygon(it.points, { fill: color.fill, stroke: hlStroke || color.stroke }, lbl);
     } else if (typ === "freehand") {
       drawFreehand(it.points, { fill: color.fill, stroke: hlStroke || color.stroke }, lbl);
     }
@@ -1168,6 +1230,25 @@
 
   function drawFreehand(points, color, label) {
     if (!points || points.length < 2) return;
+    annoCtx.lineWidth = 3;
+    annoCtx.strokeStyle = color.stroke;
+    annoCtx.fillStyle = color.fill || "rgba(0,0,0,0.12)";
+    annoCtx.beginPath();
+    var p0 = imgToCanvas(points[0][0], points[0][1]);
+    annoCtx.moveTo(p0.x, p0.y);
+    for (var i = 1; i < points.length; i++) {
+      var p = imgToCanvas(points[i][0], points[i][1]);
+      annoCtx.lineTo(p.x, p.y);
+    }
+    annoCtx.closePath();
+    annoCtx.fill();
+    annoCtx.stroke();
+    if (label) drawLabel(label, p0.x, p0.y, "", color.stroke);
+  }
+
+  // §5.4：polygon（简单多边形）画布呈现（闭合；类型语义保留，不降级 freehand）
+  function drawPolygon(points, color, label) {
+    if (!points || points.length < 3) return;
     annoCtx.lineWidth = 3;
     annoCtx.strokeStyle = color.stroke;
     annoCtx.fillStyle = color.fill || "rgba(0,0,0,0.12)";
@@ -1253,15 +1334,13 @@
   function annoAnchor(it) {
     var typ = it.type || "rect";
     if (typ === "rect") {
-      var tl = imgToCanvas(it.x, it.y);
-      var br = imgToCanvas(it.x + rectItemW(it), it.y + rectItemH(it));
-      var x = Math.min(tl.x, br.x), y = Math.min(tl.y, br.y);
-      var w = Math.abs(br.x - tl.x), h = Math.abs(br.y - tl.y);
-      return { x: x + w / 2, y: y, minSide: Math.min(w, h) };
+      // §6.2 旋转/镜像下取投影四边形外接框
+      var bb = (rectScreenQuad(it).bbox) || { x: 0, y: 0, w: 0, h: 0 };
+      return { x: bb.x + bb.w / 2, y: bb.y, minSide: Math.min(bb.w, bb.h) };
     } else if (typ === "arrow") {
       var a = imgToCanvas(it.x1, it.y1), b = imgToCanvas(it.x2, it.y2);
       return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, minSide: 40 };
-    } else if (typ === "freehand") {
+    } else if (typ === "freehand" || typ === "polygon") {
       var pts = (it.points || []).map(function (p) { return imgToCanvas(p[0], p[1]); });
       var xs = pts.map(function (p) { return p.x; });
       var ys = pts.map(function (p) { return p.y; });
@@ -1417,19 +1496,23 @@
       var it = currentRois[i];
       var typ = it.type || "rect";
       if (typ === "rect") {
-        var tl = imgToCanvas(it.x, it.y);
-        var br = imgToCanvas(it.x + rectItemW(it), it.y + rectItemH(it));
-        var x = Math.min(tl.x, br.x), y = Math.min(tl.y, br.y);
-        var w = Math.abs(br.x - tl.x), h = Math.abs(br.y - tl.y);
-        if (sx >= x - 6 && sx <= x + w + 6 && sy >= y - 6 && sy <= y + h + 6) return it;
+        // §6.2：旋转/镜像下命中投影四边形（内部或边线 ≤6px）
+        var sq = rectScreenQuad(it);
+        if (sq.quad && AG.pointInQuad(sx, sy, sq.quad, 6)) return it;
       } else if (typ === "arrow") {
         var a = imgToCanvas(it.x1, it.y1), b = imgToCanvas(it.x2, it.y2);
-        if (pointSegDist(sx, sy, a.x, a.y, b.x, b.y) <= 8) return it;
-      } else if (typ === "freehand") {
-        var pts = (it.points || []).map(function (p) { return imgToCanvas(p[0], p[1]); });
-        if (pts.length >= 3 && pointInPolygon(sx, sy, pts)) return it;
+        if (AG.pointSegDist(sx, sy, a.x, a.y, b.x, b.y) <= 8) return it;
+      } else if (typ === "polygon" || typ === "freehand") {
+        // 注意：必须是 [x, y] 数组（pointInPolygon 按 pts[i][0/1] 索引；
+        // 旧实现传 {x,y} 对象 → 内部命中恒假，仅边线距离可用）
+        var pts = (it.points || []).map(function (p) {
+          var c = imgToCanvas(p[0], p[1]);
+          return [c.x, c.y];
+        });
+        if (pts.length >= 3 && AG.pointInPolygon(sx, sy, pts)) return it;
         for (var k = 0; k < pts.length - 1; k++) {
-          if (pointSegDist(sx, sy, pts[k].x, pts[k].y, pts[k + 1].x, pts[k + 1].y) <= 8) return it;
+          if (AG.pointSegDist(sx, sy, pts[k].x, pts[k].y,
+                              pts[k + 1].x, pts[k + 1].y) <= 8) return it;
         }
       }
     }
@@ -1441,33 +1524,64 @@
     return it && it.source === "me";
   }
 
-  // 取编辑手柄列表（屏幕坐标）。rect：4角+4边中点；arrow：两端点；freehand：bbox 4角
-  // 返回 [{id, x, y}]；仅可编辑项返回手柄，否则空（只读选中无手柄）
+  // 取编辑手柄列表（屏幕坐标）。rect：4角+4边中点；arrow：两端点；freehand/polygon：
+  // bbox 4角+中心。polygon「编辑轮廓点」模式 → 顶点+边中点加顶点柄。
+  // 返回 [{id, x, y}]；只读/锁定项返回空（无手柄，§6.1/§6.3）
   function editHandles(it) {
-    if (!isEditable(it)) return [];
+    if (!isEditable(it) || itemGeometryLocked(it)) return [];
     var typ = it.type || "rect";
     var out = [];
     if (typ === "rect") {
-      var tl = imgToCanvas(it.x, it.y);
-      var br = imgToCanvas(it.x + rectItemW(it), it.y + rectItemH(it));
-      var x = Math.min(tl.x, br.x), y = Math.min(tl.y, br.y);
-      var w = Math.abs(br.x - tl.x), h = Math.abs(br.y - tl.y);
-      out = [
-        { id: "tl", x: x, y: y },
-        { id: "t", x: x + w / 2, y: y },
-        { id: "tr", x: x + w, y: y },
-        { id: "r", x: x + w, y: y + h / 2 },
-        { id: "br", x: x + w, y: y + h },
-        { id: "b", x: x + w / 2, y: y + h },
-        { id: "bl", x: x, y: y + h },
-        { id: "l", x: x, y: y + h / 2 },
+      // §6.2：手柄位置 = 图像坐标角/边中点逐一投影（旋转/镜像跟随真实顶点）
+      var w0 = rectItemW(it), h0 = rectItemH(it);
+      var corners = [
+        { id: "tl", ix: it.x, iy: it.y },
+        { id: "t", ix: it.x + w0 / 2, iy: it.y },
+        { id: "tr", ix: it.x + w0, iy: it.y },
+        { id: "r", ix: it.x + w0, iy: it.y + h0 / 2 },
+        { id: "br", ix: it.x + w0, iy: it.y + h0 },
+        { id: "b", ix: it.x + w0 / 2, iy: it.y + h0 },
+        { id: "bl", ix: it.x, iy: it.y + h0 },
+        { id: "l", ix: it.x, iy: it.y + h0 / 2 },
       ];
+      out = corners.map(function (c) {
+        var p = imgToCanvas(c.ix, c.iy);
+        return { id: c.id, x: p.x, y: p.y };
+      });
     } else if (typ === "arrow") {
       var a = imgToCanvas(it.x1, it.y1), b = imgToCanvas(it.x2, it.y2);
       out = [
         { id: "p1", x: a.x, y: a.y },
         { id: "p2", x: b.x, y: b.y },
         { id: "mid", x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
+      ];
+    } else if (typ === "polygon") {
+      if (state.polygonVertexEdit === it) {
+        var vp = (it.points || []).map(function (p) {
+          var c = imgToCanvas(p[0], p[1]);
+          return { x: c.x, y: c.y };
+        });
+        for (var vi = 0; vi < vp.length; vi++) {
+          out.push({ id: "v" + vi, x: vp[vi].x, y: vp[vi].y, vertex: true });
+        }
+        for (var ei = 0; ei < vp.length; ei++) {
+          var e1 = vp[ei], e2 = vp[(ei + 1) % vp.length];
+          out.push({ id: "n" + ei, x: (e1.x + e2.x) / 2, y: (e1.y + e2.y) / 2,
+                     insertAfter: ei });
+        }
+        return out;
+      }
+      var pb = AG.pointsBBox(it.points || []);
+      if (!pb) return out;
+      var ptl = imgToCanvas(pb.x, pb.y), pbr = imgToCanvas(pb.x + pb.w, pb.y + pb.h);
+      var px = Math.min(ptl.x, pbr.x), py = Math.min(ptl.y, pbr.y);
+      var pw = Math.abs(pbr.x - ptl.x), ph = Math.abs(pbr.y - ptl.y);
+      out = [
+        { id: "ftl", x: px, y: py },
+        { id: "ftr", x: px + pw, y: py },
+        { id: "fbr", x: px + pw, y: py + ph },
+        { id: "fbl", x: px, y: py + ph },
+        { id: "fmid", x: px + pw / 2, y: py + ph / 2 },
       ];
     } else if (typ === "freehand") {
       var xs = it.points.map(function (p) { return p[0]; });
@@ -1488,34 +1602,47 @@
     return out;
   }
 
-  // 命中手柄：返回 handle id 或 null（容差 8px）
+  // 手柄命中容差（CSS px）：视觉柄可小，命中范围桌面 ≈16px、触摸 ≈28px（§6.1）
+  function handleHitTolerance() {
+    var coarse = false;
+    try {
+      coarse = !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
+    } catch (e) {}
+    return coarse ? 14 : 8;
+  }
+
+  // 命中手柄：返回柄对象（含 id/insertAfter）或 null
   function hitHandle(sx, sy, it) {
     var hs = editHandles(it);
+    var tol = handleHitTolerance();
     for (var i = 0; i < hs.length; i++) {
-      if (Math.hypot(sx - hs[i].x, sy - hs[i].y) <= 8) return hs[i].id;
+      if (Math.hypot(sx - hs[i].x, sy - hs[i].y) <= tol) return hs[i];
     }
     return null;
   }
 
-  // 选中标注：设置 editItem，打开编辑卡（可编辑时），重绘。
-  // 选中只是"查看"（高亮+气泡+编辑卡），不画手柄、不进入可拖动编辑态；
-  // 要移动/缩放必须先点编辑卡上的「✎ 编辑」。
+  // 选中标注：设置 editItem，打开就近工具条（可编辑时），重绘。
+  // §6.1：选中只是"查看"（高亮），不再隐藏其它标记；无可拖手柄；
+  // 要移动/缩放必须先点「✎ 编辑」（或对未锁可编辑对象直接拖动——§6.2 路由）。
   function selectEditItem(it) {
     editItem = it;
-    state.focusAnno = it; // 选中某条 → 只显示它（focus 可见性）
     state.editing = false;
+    state.polygonVertexEdit = null;
     redrawAnnoCanvas();
     if (isEditable(it)) {
+      openAnnoToolbar();
       openEditCard(it);
     } else {
+      openAnnoToolbar();  // 只读：给一枚说明态徽章（为什么没有手柄）
       closeEditCard();
     }
   }
 
   function clearEditItem() {
     editItem = null;
-    state.focusAnno = null; // 取消选中 → 恢复显示全部
     state.editing = false;
+    state.polygonVertexEdit = null;
+    closeAnnoToolbar();
     closeEditCard();
     redrawAnnoCanvas();
   }
@@ -1532,7 +1659,11 @@
     }
     if (!els.panelEdit) return;
     var typ = it.type || "rect";
-    var titleText = typ === "arrow" ? t("edit.title.arrow") : (typ === "freehand" ? t("edit.title.free") : t("edit.title.rect"));
+    var titleText =
+      typ === "arrow" ? t("edit.title.arrow") :
+      typ === "polygon" ? t("edit.title.polygon") :
+      (typ === "freehand" ? t("edit.title.free") : t("edit.title.rect"));
+    if (itemGeometryLocked(it)) titleText += " 🔒";
     els.panelEdit.innerHTML = "";
     var card = document.createElement("div");
     card.className = "anno-edit-card";
@@ -1587,6 +1718,7 @@
 
       editB.addEventListener("click", function () {
         state.editing = true;
+        it.__editStartGeom = snapshotGeom(it);  // §6.3 差量比较基准
         redrawAnnoCanvas();
         openEditCard(it);
       });
@@ -1606,6 +1738,7 @@
   }
 
   // 收集编辑后几何（图片坐标，round 整数，clamp ≥0）
+  // §5.4：polygon 保留原类型（points 序列化），不改写成 freehand
   function buildEditGeom(it) {
     var typ = it.type || "rect";
     var g = {};
@@ -1620,7 +1753,7 @@
       g.y1 = Math.max(0, Math.round(it.y1));
       g.x2 = Math.max(0, Math.round(it.x2));
       g.y2 = Math.max(0, Math.round(it.y2));
-    } else if (typ === "freehand") {
+    } else if (typ === "freehand" || typ === "polygon") {
       g.points = (it.points || []).map(function (p) {
         return [Math.max(0, Math.round(p[0])), Math.max(0, Math.round(p[1]))];
       });
@@ -1628,16 +1761,40 @@
     return g;
   }
 
-  // 提交编辑：PATCH geom + note
+  // 几何差量比较（§6.3：备注更新不夹带 geom，否则锁定后改备注会被当成移动拒绝）
+  function normalizeGeomForCompare(g) {
+    if (!g) return {};
+    var out = {};
+    if (g.points) {
+      out.points = g.points.map(function (p) {
+        return [Math.round(Number(p[0]) || 0), Math.round(Number(p[1]) || 0)];
+      });
+      return out;
+    }
+    ["x", "y", "w", "h", "x1", "y1", "x2", "y2"].forEach(function (k) {
+      if (g[k] != null) out[k] = Math.round(Number(g[k]) || 0);
+    });
+    return out;
+  }
+  function geomEqual(a, b) {
+    return JSON.stringify(normalizeGeomForCompare(a)) ===
+           JSON.stringify(normalizeGeomForCompare(b));
+  }
+
+  // 提交编辑：差量 PATCH（几何没变只发 note）+ expected_revision。
+  // 409 按错误码区分：annotation_locked ≠ revision_conflict（§6.4）。
   function commitEdit(it, noteVal) {
     var geom = buildEditGeom(it);
-    var body = { geom: geom, note: noteVal };
+    var before = it.__editStartGeom || null;
+    var geomChanged = !before || !geomEqual(before, geom);
+    var body = { note: noteVal };
+    if (geomChanged) body.geom = geom;
+    if (Number(it.revision) > 0) body.expected_revision = Number(it.revision);
     // rect 的 size_mm 前端重算（仅真正方形的兼容展示字段）
-    if ((it.type || "rect") === "rect" && geom.w === geom.h && state.mppX && state.mppX > 0) {
+    if (geomChanged && (it.type || "rect") === "rect" && geom.w === geom.h &&
+        state.mppX && state.mppX > 0) {
       body.geom.size_mm = Math.round(geom.w * state.mppX / 1000 * 100) / 100;
     }
-    // 升级 C（§6.1）：编辑已保存矩形遵守 revision/CAS；冲突显示当前版本
-    if (Number(it.revision) > 0) body.expected_revision = Number(it.revision);
     fetch(API + "/api/roi/" + it.index, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
@@ -1645,13 +1802,28 @@
     })
       .then(function (r) {
         if (r.status === 409) {
-          // CAS 冲突：重新拉取服务端当前版本，不静默覆盖
-          return r.json().then(function (j) {
-            toast(t("edit.conflict", { rev: j && j.current_revision != null ? j.current_revision : "?" }), "error");
-            editItem = null;
-            state.editing = false;
-            closeEditCard();
-            refreshRoisOnce();
+          // CAS 冲突按错误码区分（§6.4）：他人锁定 → 结束编辑说明原因；
+          // 版本冲突 → 保留本地草稿 + 读回服务端版本（refreshRoisOnce）供比较
+          return r.json().catch(function () { return {}; }).then(function (j) {
+            if (j.error === "annotation_locked") {
+              toast(t("anno.error.locked", {
+                rev: j.current && j.current.revision != null ? j.current.revision : "?",
+              }), "error");
+              editItem = null;
+              state.editing = false;
+              state.polygonVertexEdit = null;
+              closeAnnoToolbar();
+              closeEditCard();
+              refreshRoisOnce();
+            } else {
+              var serverRev = (j.current && j.current.revision != null)
+                ? j.current.revision : j.current_revision;
+              if (serverRev != null) it.revision = serverRev;
+              toast(t("edit.conflict.keep", {
+                rev: serverRev != null ? serverRev : "?",
+              }), "error");
+              // 保留本地草稿与编辑卡（不覆盖远端；用户可基于最新版本重试保存）
+            }
             return { conflict: true };
           });
         }
@@ -1663,6 +1835,8 @@
         toast(t("edit.saved"), "success");
         editItem = null;
         state.editing = false;
+        state.polygonVertexEdit = null;
+        closeAnnoToolbar();
         closeEditCard();
         refreshRoisOnce();
       })
@@ -1676,6 +1850,427 @@
     state.editing = false;
     closeEditCard();
     loadCurrentRois();
+  }
+
+  // =========================================================================
+  // §6.1/§6.2/§6.3 对象交互核心（分享页）：
+  //   - viewer 容器捕获阶段路由（一次 pointer 会话只交给一个处理器）
+  //   - 就近工具条（可编辑/只读两形态；出视窗翻转）
+  //   - geometry_locked 锁定/解锁（单独请求；PATCH /s/<token>/api/roi/<index>）
+  //   - polygon 编辑轮廓点（⋯ 入口；完成时校验非自交）
+  // =========================================================================
+  var viewerSpacePan = false;
+  var pendingAnnoSelect = null;
+  var SHARE_EDIT_CLICK_SLOP_PX = 6;
+
+  function canDragShareItem(it) {
+    return !!it && itemCanEdit(it) && !itemGeometryLocked(it);
+  }
+
+  // 矩形草稿工具是否激活（与 arrow/freehand 互斥）
+  function rectModeActive() {
+    return state.roiMode != null;
+  }
+
+  function consumePointer(e) {
+    if (e && e.preventDefault) e.preventDefault();
+    if (e && e.stopPropagation) e.stopPropagation();
+  }
+
+  function isViewerSurfaceTarget(e) {
+    var t = e && e.target;
+    if (!t || !t.closest) return true;
+    if (t.closest(".anno-ui-layer")) return false;
+    if (t.closest("#roi-box")) return false;
+    if (t.closest(".channel-panel")) return false;
+    return true;
+  }
+
+  function routeObjectPointerDown(e) {
+    if (!state.slide || !viewer) return;
+    if (e && e.button === 2) return;
+    if (!isViewerSurfaceTarget(e)) return;
+    if (viewerSpacePan) return;                      // §6.2：Space 平移 > 显式绘制
+    if (rectModeActive() || state.drawMode) return;  // 显式绘制：画布层自有路径
+    if (!state.showAnno) return;
+    var sp = screenPt(e);
+    // 1) 已选中 + 显式编辑态：控制点命中 → 调整
+    if (editItem && state.editing && canDragShareItem(editItem)) {
+      var hd = hitHandle(sp.x, sp.y, editItem);
+      if (hd) {
+        consumePointer(e);
+        startEditDrag(e, editItem, hd, viewer.container);
+        return;
+      }
+    }
+    var hit = hitAnno(sp.x, sp.y);
+    // 2) 已选中、未锁、可编辑本体 → 移动整个对象（消费）
+    if (hit && hit === editItem && canDragShareItem(hit)) {
+      consumePointer(e);
+      startEditDrag(e, hit, "move", viewer.container);
+      updateAnnoToolbarPos();
+      return;
+    }
+    // 3) 其它：不消费——拖动=平移切片；单击=选择/锁定态/取消选择
+    pendingAnnoSelect = { hit: hit, sx: e.clientX, sy: e.clientY, id: e.pointerId };
+  }
+
+  function routeObjectPointerMove(e) {
+    if (pendingAnnoSelect && e.pointerId === pendingAnnoSelect.id &&
+        Math.hypot(e.clientX - pendingAnnoSelect.sx,
+                   e.clientY - pendingAnnoSelect.sy) > SHARE_EDIT_CLICK_SLOP_PX) {
+      pendingAnnoSelect = null;
+    }
+    if (!editDrag || editDrag.captureEl !== viewer.container) return;
+    consumePointer(e);
+    applyEditDrag(e);
+    updateAnnoToolbarPos();
+  }
+
+  function routeObjectPointerUp(e) {
+    if (editDrag && editDrag.captureEl === viewer.container) {
+      consumePointer(e);
+      endEditDrag(e);
+      return;
+    }
+    if (pendingAnnoSelect && e.pointerId === pendingAnnoSelect.id) {
+      var sel = pendingAnnoSelect;
+      pendingAnnoSelect = null;
+      if (Math.hypot(e.clientX - sel.sx, e.clientY - sel.sy) > SHARE_EDIT_CLICK_SLOP_PX) return;
+      if (sel.hit) {
+        if (sel.hit !== editItem) selectEditItem(sel.hit);
+        else openAnnoToolbar();
+      } else {
+        clearEditItem();
+      }
+    }
+  }
+
+  function routeObjectPointerCancel(e) {
+    pendingAnnoSelect = null;
+    if (editDrag && editDrag.captureEl === viewer.container) {
+      cancelEditDragRestore();
+    }
+  }
+
+  // polygon 编辑轮廓点：双击顶点删除（保持 ≥3 点）
+  function routeObjectDblClick(e) {
+    if (!state.polygonVertexEdit || !editItem) return;
+    var sp = screenPt(e);
+    var hd = hitHandle(sp.x, sp.y, editItem);
+    if (!hd || hd.id.charAt(0) !== "v") return;
+    var vi = parseInt(hd.id.slice(1), 10) || 0;
+    if (!editItem.points || editItem.points.length <= 3) {
+      toast(t("anno.polygon.minpoints"), "info");
+      return;
+    }
+    editItem.points.splice(vi, 1);
+    consumePointer(e);
+    redrawAnnoCanvas();
+  }
+
+  function onSpaceKeyForPan(e) {
+    var tgt = e.target;
+    var tag = tgt && tgt.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" ||
+        (tgt && tgt.isContentEditable)) return;
+    if (e.key !== " ") return;
+    if (e.type === "keydown" && !e.repeat) viewerSpacePan = true;
+    else if (e.type === "keyup") viewerSpacePan = false;
+  }
+
+  function togglePolygonVertexEdit(it) {
+    if (!it || (it.type || "rect") !== "polygon" || !canDragShareItem(it)) {
+      if (it) toast(t("anno.polygon.readonly"), "info");
+      return;
+    }
+    if (state.polygonVertexEdit === it) { finishPolygonVertexEdit(it); return; }
+    state.polygonVertexEdit = it;
+    it.__vertexEditStart = snapshotGeom(it);
+    state.editing = true;
+    closeAnnoToolbarMenu();
+    renderAnnoToolbar();
+    redrawAnnoCanvas();
+    toast(t("anno.polygon.editpoints.tip"), "info");
+  }
+
+  function finishPolygonVertexEdit(it) {
+    var pts = (it.points || []).map(function (p) {
+      return [Math.max(0, Math.round(p[0])), Math.max(0, Math.round(p[1]))];
+    });
+    if (pts.length < 3) { toast(t("anno.polygon.minpoints"), "error"); return; }
+    if (AG.polygonSelfIntersects(pts)) {
+      // §6.2：完成时校验非自交——不通过留在编辑模式（不静默修正/提交）
+      toast(t("anno.polygon.selfintersects"), "error");
+      return;
+    }
+    state.polygonVertexEdit = null;
+    it.__vertexEditStart = null;
+    renderAnnoToolbar();
+    redrawAnnoCanvas();
+    toast(t("edit.need.save"), "info");  // 分享端显式保存（编辑卡「保存」提交）
+  }
+
+  // ---- 就近工具条（§6.1；分享页形态：已存标记 / 锁定对象 / 只读） ----
+  var annoToolbarEl = null;
+  var annoToolbarMenuEl = null;
+  var annoToolbarRenderKey = null;
+
+  function ensureAnnoToolbar() {
+    if (annoToolbarEl && annoToolbarEl.parentNode) return annoToolbarEl;
+    annoToolbarEl = document.createElement("div");
+    annoToolbarEl.id = "anno-obj-toolbar";
+    annoToolbarEl.className = "anno-ui-layer";
+    annoToolbarEl.hidden = true;
+    annoToolbarEl.addEventListener("pointerdown", function (e) {
+      e.stopPropagation();
+    });
+    if (viewer && viewer.container) viewer.container.appendChild(annoToolbarEl);
+    return annoToolbarEl;
+  }
+
+  function openAnnoToolbar(force) {
+    var el = ensureAnnoToolbar();
+    if (!el) return;
+    var it = editItem;
+    var key;
+    if (it) {
+      key = "item:" + it.index + "|" + (it.type || "rect") + "|" + Number(it.ts || 0);
+    } else if (rectModeActive() && state.roi.side > 0) {
+      key = "draft";
+    } else {
+      key = null;
+    }
+    if (!force && key !== null && key === annoToolbarRenderKey && el.childNodes.length) {
+      el.hidden = false;
+      updateAnnoToolbarPos();
+      return;
+    }
+    annoToolbarRenderKey = key;
+    renderAnnoToolbar();
+    el.hidden = !key;
+    updateAnnoToolbarPos();
+  }
+
+  function closeAnnoToolbar() {
+    annoToolbarRenderKey = null;
+    if (annoToolbarEl) annoToolbarEl.hidden = true;
+    closeAnnoToolbarMenu();
+  }
+
+  function closeAnnoToolbarMenu() {
+    if (annoToolbarMenuEl) { annoToolbarMenuEl.remove(); annoToolbarMenuEl = null; }
+  }
+
+  function annoToolbarButton(cls, text, title, onClick, disabled) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.className = "aot-btn " + cls;
+    b.textContent = text;
+    if (title) b.title = title;
+    if (disabled) b.disabled = true;
+    if (onClick && !disabled) b.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      closeAnnoToolbarMenu();
+      onClick();
+    });
+    return b;
+  }
+
+  function renderAnnoToolbar() {
+    var el = ensureAnnoToolbar();
+    if (!el) return;
+    closeAnnoToolbarMenu();
+    el.innerHTML = "";
+    // §6.1 临时框形态：无选中且矩形草稿存在 → [保存为标记] [锁定位置] [⋯]
+    if (!editItem) {
+      if (rectModeActive() && state.roi.side > 0) {
+        el.appendChild(annoToolbarButton("aot-save", t("anno.toolbar.save"),
+          t("anno.toolbar.save.tip"), function () { saveRoi(); },
+          els.saveRoiBtn && els.saveRoiBtn.disabled));
+        el.appendChild(annoToolbarButton(
+          "aot-lock" + (state.roiGeometryLocked ? " on" : ""),
+          state.roiGeometryLocked ? "🔒 " + t("anno.lock.locked.short")
+                                  : "🔒 " + t("anno.lock.lock"),
+          state.roiGeometryLocked ? t("anno.lock.unlock") : t("anno.lock.lock.tip"),
+          function () { toggleDraftGeometryLocked(); }));
+        el.appendChild(annoToolbarButton("aot-more", "⋯", t("anno.toolbar.more"),
+          function () { openAnnoToolbarMenu("draft"); }));
+      } else {
+        el.hidden = true;
+      }
+      return;
+    }
+    var it = editItem;
+    el.hidden = false;
+    var editable = itemCanEdit(it);
+    var locked = itemGeometryLocked(it);
+    if (!editable) {
+      // 只读：无可拖手柄；徽章说明原因（§6.1/§6.3）
+      el.appendChild(annoToolbarButton("aot-readonly", "🔒 " + t("anno.lock.readonly"),
+        t("anno.lock.readonly.tip"), null, true));
+      el.appendChild(annoToolbarButton("aot-more", "⋯", t("anno.toolbar.more"),
+        function () { openAnnoToolbarMenu(it); }));
+      return;
+    }
+    el.appendChild(annoToolbarButton("aot-note", "✎ " + t("anno.toolbar.note"),
+      t("anno.toolbar.note.tip"), function () {
+        state.editing = true;
+        it.__editStartGeom = snapshotGeom(it);
+        openEditCard(it);
+        redrawAnnoCanvas();
+      }));
+    el.appendChild(annoToolbarButton(
+      "aot-lock" + (locked ? " on" : ""),
+      locked ? "🔓 " + t("anno.lock.unlock") : "🔒 " + t("anno.lock.lock"),
+      locked ? t("anno.lock.unlock.tip") : t("anno.lock.lock.tip"),
+      function () { toggleItemGeometryLocked(it, !locked); }));
+    el.appendChild(annoToolbarButton("aot-more", "⋯", t("anno.toolbar.more"),
+      function () { openAnnoToolbarMenu(it); }));
+  }
+
+  // 临时框草稿位置锁（§6.3：draft.geometryLocked 只对当前草稿有效；
+  // saveRoi 的 POST 随之带上，保存成标记后不因刷新意外解锁）
+  function toggleDraftGeometryLocked() {
+    state.roiGeometryLocked = !state.roiGeometryLocked;
+    renderAnnoToolbar();
+    toast(state.roiGeometryLocked ? t("anno.lock.locked") : t("anno.lock.unlocked"),
+          "info");
+  }
+
+  function openAnnoToolbarMenu(target) {
+    closeAnnoToolbarMenu();
+    var el = ensureAnnoToolbar();
+    if (!el) return;
+    var menu = document.createElement("div");
+    menu.className = "aot-menu";
+    function addItem(label, title, onClick, disabled) {
+      menu.appendChild(annoToolbarButton("aot-menu-item", label, title, onClick, disabled));
+    }
+    if (target === "draft") {
+      addItem(t("anno.solo.off"), "", function () {
+        state.focusAnno = null;
+        redrawAnnoCanvas();
+      }, !state.focusAnno);
+      el.appendChild(menu);
+      annoToolbarMenuEl = menu;
+      return;
+    }
+    var it = target;
+    var solo = (state.focusAnno === it);
+    addItem(solo ? "👁 " + t("anno.solo.off") : "👁 " + t("anno.solo"),
+      t("anno.solo.tip"), function () {
+        state.focusAnno = solo ? null : it;
+        redrawAnnoCanvas();
+        renderAnnoToolbar();
+      });
+    if ((it.type || "rect") === "polygon" && canDragShareItem(it)) {
+      var inEdit = (state.polygonVertexEdit === it);
+      addItem(inEdit ? "✓ " + t("anno.polygon.finish") : "⬡ " + t("anno.polygon.editpoints"),
+        t("anno.polygon.editpoints.tip"), function () {
+          if (inEdit) finishPolygonVertexEdit(it);
+          else togglePolygonVertexEdit(it);
+          renderAnnoToolbar();
+        });
+    }
+    var delDisabled = itemGeometryLocked(it);
+    addItem("🗑 " + t("edit.del"),
+      delDisabled ? t("anno.lock.delete.denied") : t("edit.del"),
+      function () { deleteRoi(it.index); },
+      delDisabled || !itemCanEdit(it));
+    el.appendChild(menu);
+    annoToolbarMenuEl = menu;
+  }
+
+  // 选中对象屏幕外接框（旋转/镜像取投影 bbox）
+  function itemScreenBBox(it) {
+    var typ = it.type || "rect";
+    if (typ === "rect") return rectScreenQuad(it).bbox;
+    var pts;
+    if (typ === "arrow") {
+      var a = imgToCanvas(it.x1, it.y1), b = imgToCanvas(it.x2, it.y2);
+      pts = [[a.x, a.y], [b.x, b.y]];
+    } else {
+      pts = (it.points || []).map(function (p) {
+        var c = imgToCanvas(p[0], p[1]);
+        return [c.x, c.y];
+      });
+    }
+    return AG.quadBBox(pts);
+  }
+
+  // 工具条定位：对象上方，顶部放不下翻到下方/内部（§6.1 出视窗翻转）
+  function updateAnnoToolbarPos() {
+    if (!annoToolbarEl || annoToolbarEl.hidden || !viewer) return;
+    var bb;
+    if (editItem) {
+      bb = itemScreenBBox(editItem);
+    } else if (rectModeActive() && state.roi.side > 0) {
+      var q = AG.rectQuad(state.roi.x, state.roi.y, state.roi.side, state.roi.side,
+                          imgToCanvas);
+      bb = AG.quadBBox(q);
+    } else {
+      return;
+    }
+    if (!bb) { annoToolbarEl.hidden = true; return; }
+    var tw = annoToolbarEl.offsetWidth, th = annoToolbarEl.offsetHeight;
+    if (!tw) {
+      annoToolbarEl.style.visibility = "hidden";
+      tw = annoToolbarEl.offsetWidth; th = annoToolbarEl.offsetHeight;
+      annoToolbarEl.style.visibility = "";
+    }
+    var vw = viewer.container.clientWidth, vh = viewer.container.clientHeight;
+    var x = clamp(bb.x, 8, Math.max(8, vw - tw - 8));
+    var y = bb.y - th - 8;
+    if (y < 8) y = bb.y + bb.h + 8;
+    if (y + th > vh - 8) y = clamp(bb.y + 8, 8, Math.max(8, vh - th - 8));
+    annoToolbarEl.style.left = Math.round(x) + "px";
+    annoToolbarEl.style.top = Math.round(y) + "px";
+  }
+
+  // ---- geometry_locked 切换（§6.3）：单独请求，绝不夹带 geom ----
+  function toggleItemGeometryLocked(it, lockTarget) {
+    if (!it || it.index == null) return;
+    if (!itemCanEdit(it)) {
+      toast(t("anno.lock.readonly.tip"), "info");
+      return;
+    }
+    var body = { geometry_locked: !!lockTarget };
+    if (Number(it.revision) > 0) body.expected_revision = Number(it.revision);
+    fetch(API + "/api/roi/" + it.index, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) {
+        return { ok: r.ok, status: r.status, j: j };
+      });
+    }).then(function (res) {
+      if (res.ok) {
+        it.geometry_locked = !!lockTarget;
+        if (res.j && res.j.revision != null) it.revision = res.j.revision;
+        toast(lockTarget ? t("anno.lock.locked") : t("anno.lock.unlocked"), "success");
+        renderAnnoToolbar();
+        renderRoiPanel(currentRois);
+        redrawAnnoCanvas();
+        return;
+      }
+      var j = res.j || {};
+      if (res.status === 409 && j.error === "annotation_locked") {
+        toast(t("anno.error.locked", {
+          rev: j.current && j.current.revision != null ? j.current.revision : "?",
+        }), "error");
+      } else if (res.status === 409) {
+        toast(t("edit.conflict", {
+          rev: (j.current && j.current.revision) || j.current_revision || "?",
+        }), "error");
+      } else {
+        toast(t("anno.update.fail3", { e: j.error || res.status }), "error");
+      }
+      refreshRoisOnce();
+    }).catch(function (e) {
+      toast(t("anno.update.fail3", { e: (e && e.message) || e }), "error");
+    });
   }
 
   // ---------- 绘制工具（arrow / freehand） ----------
@@ -1733,15 +2328,16 @@
       redrawAnnoCanvas();
       return;
     }
-    // 非绘制模式：编辑/选中
+    // 非绘制模式：编辑/选中（普通对象编辑走 viewer 容器捕获路由
+    // routeObjectPointerDown；本画布路径只在 drawing 态可达）
     if (!state.showAnno) return;
     e.preventDefault(); e.stopPropagation();
     var sp = screenPt(e);
     // 显式编辑态且点中手柄 → 拖动手柄（平移/缩放必须先进入编辑态）
-    if (editItem && state.editing) {
-      var handleId = hitHandle(sp.x, sp.y, editItem);
-      if (handleId) {
-        startEditDrag(e, editItem, handleId);
+    if (editItem && state.editing && canDragShareItem(editItem)) {
+      var hd = hitHandle(sp.x, sp.y, editItem);
+      if (hd) {
+        startEditDrag(e, editItem, hd);
         return;
       }
     }
@@ -1823,12 +2419,14 @@
   }
 
   // ---------- 编辑拖动会话 ----------
-  function startEditDrag(e, it, handleId) {
-    var c = els.annoCanvas;
+  function startEditDrag(e, it, handle, el) {
+    var c = el || els.annoCanvas;
     try { c.setPointerCapture(e.pointerId); } catch (err) {}
     editDrag = {
       pointerId: e.pointerId,
-      handle: handleId,
+      captureEl: c,
+      handle: handle && typeof handle === "object" ? handle.id : handle,
+      insertAfter: handle && typeof handle === "object" ? handle.insertAfter : null,
       // 快照起始几何（图片坐标）+ 起始指针图像坐标
       item: it,
       start: snapshotGeom(it),
@@ -1843,7 +2441,7 @@
       return { x: it.x, y: it.y, w: rectItemW(it), h: rectItemH(it) };
     } else if (typ === "arrow") {
       return { x1: it.x1, y1: it.y1, x2: it.x2, y2: it.y2 };
-    } else if (typ === "freehand") {
+    } else if (typ === "freehand" || typ === "polygon") {
       return {
         points: (it.points || []).map(function (p) { return [p[0], p[1]]; }),
       };
@@ -1903,16 +2501,36 @@
         var n2y = Math.max(0, Math.round(s.y2 + dy));
         it.x1 = n1x; it.y1 = n1y; it.x2 = n2x; it.y2 = n2y;
       }
-    } else if (typ === "freehand") {
-      if (d.handle === "fmid") {
-        // 整体平移：所有点平移，且 ≥0
-        var minPx = Math.min.apply(null, s.points.map(function (p) { return p[0]; }));
-        var minPy = Math.min.apply(null, s.points.map(function (p) { return p[1]; }));
-        it.points = s.points.map(function (p) {
-          return [Math.max(0, Math.round(p[0] + dx)), Math.max(0, Math.round(p[1] + dy))];
-        });
+    } else if (typ === "freehand" || typ === "polygon") {
+      if (d.handle === "fmid" || d.handle === "move") {
+        // 整体平移（§6.2）；越界整体收回边界（保持形状）
+        var moved = AG.translatePoints(s.points, Math.round(dx), Math.round(dy));
+        var shift = AG.pointsShiftIntoRect(moved, state.slide.width, state.slide.height);
+        if (shift) moved = AG.translatePoints(moved, shift.dx, shift.dy);
+        it.points = moved;
+      } else if (d.handle && d.handle.charAt(0) === "v") {
+        // polygon 编辑轮廓点：拖单个顶点
+        var vi = parseInt(d.handle.slice(1), 10) || 0;
+        var vpts = AG.clonePoints(s.points);
+        if (vi < vpts.length) {
+          vpts[vi] = [Math.max(0, Math.round(s.points[vi][0] + dx)),
+                      Math.max(0, Math.round(s.points[vi][1] + dy))];
+          it.points = vpts;
+        }
+      } else if (d.handle && d.handle.charAt(0) === "n" && d.insertAfter != null) {
+        // polygon 加顶点（工作副本，不污染 start 快照）
+        if (!d.inserted) {
+          var base = AG.clonePoints(d.dragPoints || s.points);
+          base.splice(d.insertAfter + 1, 0, [Math.round(cur.x), Math.round(cur.y)]);
+          d.inserted = true;
+          d.dragPoints = base;
+        }
+        var npts = AG.clonePoints(d.dragPoints);
+        npts[d.insertAfter + 1] = [Math.max(0, Math.round(cur.x)), Math.max(0, Math.round(cur.y))];
+        d.dragPoints = npts;
+        it.points = npts;
       } else {
-        // 角手柄：等比缩放（以对角为锚）
+        // 角手柄：等比缩放（以对角为锚）——freehand 与 polygon 同形
         var pts = s.points;
         var xs0 = pts.map(function (p) { return p[0]; });
         var ys0 = pts.map(function (p) { return p[1]; });
@@ -1929,34 +2547,32 @@
         var newW = Math.max(2, Math.abs(cur.x - aX));
         var newH = Math.max(2, Math.abs(cur.y - aY));
         var scale = Math.max(newW / w0, newH / h0);
-        var newPts = pts.map(function (p) {
-          return [Math.round(aX + (p[0] - aX) * scale), Math.round(aY + (p[1] - aY) * scale)];
+        var newPts = AG.scalePointsAbout(pts, aX, aY, scale).map(function (p) {
+          return [Math.round(p[0]), Math.round(p[1])];
         });
-        // clamp 所有点 ≥0
-        var nminx = Math.min.apply(null, newPts.map(function (p) { return p[0]; }));
-        var nminy = Math.min.apply(null, newPts.map(function (p) { return p[1]; }));
-        var offX = nminx < 0 ? -nminx : 0;
-        var offY = nminy < 0 ? -nminy : 0;
-        it.points = newPts.map(function (p) { return [p[0] + offX, p[1] + offY]; });
+        var shift2 = AG.pointsShiftIntoRect(newPts, state.slide.width, state.slide.height);
+        if (shift2) newPts = AG.translatePoints(newPts, shift2.dx, shift2.dy);
+        it.points = newPts;
       }
     }
     redrawAnnoCanvas();
   }
 
   function endEditDrag(e) {
-    var c = els.annoCanvas;
-    if (editDrag) {
-      try { c.releasePointerCapture(editDrag.pointerId); } catch (err) {}
+    var d = editDrag;
+    var c = d ? (d.captureEl || els.annoCanvas) : els.annoCanvas;
+    if (d) {
+      try { c.releasePointerCapture(d.pointerId); } catch (err) {}
     }
     editDrag = null;
     if (viewer) viewer.setMouseNavEnabled(true);
-    // 拖完不立即保存，等用户点"保存"
+    // 分享端契约保持「拖完不立即保存，等用户点保存」（编辑卡保存按钮提交）
   }
 
   // 工单 D：编辑拖拽被打断 → 恢复拖前几何（本地快照），不保留半截修改
   function cancelEditDragRestore() {
-    var c = els.annoCanvas;
     var d = editDrag;
+    var c = d ? (d.captureEl || els.annoCanvas) : els.annoCanvas;
     if (d) { try { c.releasePointerCapture(d.pointerId); } catch (err) {} }
     editDrag = null;
     if (d && d.item && d.start) {
@@ -1966,12 +2582,13 @@
         it.x = s.x; it.y = s.y; it.w = s.w; it.h = s.h;
       } else if (typ === "arrow") {
         it.x1 = s.x1; it.y1 = s.y1; it.x2 = s.x2; it.y2 = s.y2;
-      } else if (typ === "freehand") {
+      } else if (typ === "freehand" || typ === "polygon") {
         it.points = s.points;
       }
     }
     if (viewer) viewer.setMouseNavEnabled(true);
     redrawAnnoCanvas();
+    updateAnnoToolbarPos();
   }
 
   function finishDraw() {
@@ -2154,7 +2771,7 @@
       var isAdmin = (r.source === "admin");
       var isShared = (r.source === "shared");
       var isMe = (r.source === "me");
-      var icon = typ === "arrow" ? "↗" : (typ === "freehand" ? "〰" : "▭");
+      var icon = typ === "arrow" ? "↗" : (typ === "polygon" ? "⬠" : (typ === "freehand" ? "〰" : "▭"));
 
       // 类型图标
       var iconEl = document.createElement("div");
@@ -2177,6 +2794,14 @@
       else if (typ === "arrow") szEl.textContent = " · (" + r.x1 + "," + r.y1 + ")";
       else szEl.textContent = " · " + t("anno.free.points", { n: (r.points ? r.points.length : 0) });
       title.appendChild(szEl);
+      // §6.3：锁定标记给锁徽章
+      if (itemGeometryLocked(r)) {
+        var lk = document.createElement("span");
+        lk.className = "rpi-badge locked";
+        lk.textContent = "🔒";
+        lk.title = t("anno.lock.badge.tip");
+        title.appendChild(lk);
+      }
       if (isAdmin) {
         var badge = document.createElement("span");
         badge.className = "rpi-badge";
@@ -2232,13 +2857,19 @@
     fetch(API + "/api/roi/" + index, { method: "DELETE" })
       .then(function (r) {
         if (!r.ok) {
-          return r.json().then(function (j) {
+          return r.json().catch(function () { return {}; }).then(function (j) {
+            // §6.3：锁定对象 DELETE → 409 annotation_locked（不当幂等成功）
+            if (r.status === 409 && j.error === "annotation_locked") {
+              toast(t("anno.lock.delete.denied"), "error");
+              return { blocked: true };
+            }
             throw new Error(j.error || t("del.fail"));
           });
         }
         return r.json();
       })
-      .then(function () {
+      .then(function (out) {
+        if (out && out.blocked) { refreshRoisOnce(); return; }
         // ---- 乐观更新（同步执行，立即反馈）----
         // 从 currentRois 移除该项（仅本人 source==="me" 的可删；
         // 按 source 限定避免与 admin/shared 条目的 index 数值冲突误删）
@@ -2267,17 +2898,18 @@
   // P2：优先按 roi 的 slide_id 定位操作键；无 id 历史行按名称快照
   function jumpToRoi(r) {
     var needSwitch = !roiMatchesCurrentSlide(r);
-    // 跳转后聚焦该标注（focusAnno = 该条引用），让画布只显示它
+    // §6.1：定位 = 选中高亮（不再隐藏其它标记；「只看这条」在 ⋯ 内）
     var focusAfter = function () {
       var match = null;
       for (var i = 0; i < currentRois.length; i++) {
         var it = currentRois[i];
         if (it.index === r.index && it.token === r.token) { match = it; break; }
       }
-      state.focusAnno = match || null;
       editItem = match || null;
       state.editing = false;
+      state.polygonVertexEdit = null;
       closeEditCard();
+      openAnnoToolbar();
       redrawAnnoCanvas();
     };
     if (needSwitch) {
@@ -2329,7 +2961,7 @@
     if (typ === "arrow") {
       x = Math.min(r.x1, r.x2); y = Math.min(r.y1, r.y2);
       side = Math.max(Math.abs(r.x2 - r.x1), Math.abs(r.y2 - r.y1));
-    } else if (typ === "freehand") {
+    } else if (typ === "freehand" || typ === "polygon") {
       var xs = r.points.map(function (p) { return p[0]; });
       var ys = r.points.map(function (p) { return p[1]; });
       x = Math.min.apply(null, xs); y = Math.min.apply(null, ys);
@@ -2413,6 +3045,19 @@
     c.addEventListener("pointerup", onAnnoPointerUp);
     // 工单 D：pointercancel ≠ pointerup——取消恢复，绝不触发完成/保存
     c.addEventListener("pointercancel", onAnnoPointerCancel);
+    // §6.2：viewer 容器「捕获阶段」对象路由——只在确认对象编辑时消费事件，
+    // 其余交给 OSD 平移（不给透明画布开常驻 pointer-events:auto）
+    if (viewer && viewer.container) {
+      var vc = viewer.container;
+      vc.addEventListener("pointerdown", routeObjectPointerDown, true);
+      vc.addEventListener("pointermove", routeObjectPointerMove, true);
+      vc.addEventListener("pointerup", routeObjectPointerUp, true);
+      vc.addEventListener("pointercancel", routeObjectPointerCancel, true);
+      vc.addEventListener("dblclick", routeObjectDblClick, true);
+    }
+    // §6.2：Space 平移（输入框外）优先于对象编辑
+    window.addEventListener("keydown", onSpaceKeyForPan, true);
+    window.addEventListener("keyup", onSpaceKeyForPan, true);
     window.addEventListener("resize", function () { resizeAnnoCanvas(); redrawAnnoCanvas(); });
 
     // 选区面板开关（底部抽屉 + 遮罩）

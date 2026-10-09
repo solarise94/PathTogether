@@ -5230,3 +5230,102 @@ body.app-mode-official { overflow: clip; }
   background: repeating-linear-gradient(45deg, #ffffff0a 0 1px, transparent 1px 10px),
     repeating-linear-gradient(-45deg, #ffffff0a 0 1px, transparent 1px 10px), #244d82; }
 @media (prefers-reduced-motion: reduce), (max-width: 768px) { .slide-deal, .slide-deal-stage, .slide-deal-landing { display: none; } }
+
+/* =========================================================================
+   §6.1/§6.2/§6.3 对象交互 UI：就近工具条 + 保存状态 + 锁徽章
+   （分享页 share.css 有一份同形副本，改动请两处同步）
+   ========================================================================= */
+#anno-obj-toolbar {
+  position: absolute;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  background: rgba(255, 255, 255, 0.96);
+  border: 0.5px solid rgba(0, 0, 0, 0.12);
+  border-radius: 10px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+  pointer-events: auto;
+  user-select: none;
+}
+#anno-obj-toolbar .aot-btn {
+  appearance: none;
+  border: 0.5px solid rgba(0, 0, 0, 0.10);
+  background: #fff;
+  color: #1d1d1f;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  min-height: 38px;          /* §6.1：常用按钮桌面 ≥36–40px */
+  min-width: 38px;
+  padding: 0 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+#anno-obj-toolbar .aot-btn:hover { background: #f0f0f2; }
+#anno-obj-toolbar .aot-btn:active { background: #e4e6ea; }
+#anno-obj-toolbar .aot-btn:disabled { opacity: 0.5; cursor: default; }
+#anno-obj-toolbar .aot-btn.aot-lock.on {
+  background: #fff7e0;
+  border-color: rgba(255, 170, 0, 0.5);
+}
+#anno-obj-toolbar .aot-btn.aot-accept { color: #1d8a3c; font-weight: 600; }
+#anno-obj-toolbar .aot-btn.aot-save { color: #0a60ff; font-weight: 600; }
+#anno-obj-toolbar .aot-btn.aot-readonly { font-weight: 600; }
+#anno-obj-toolbar .aot-btn.aot-more {
+  min-width: 38px;
+  padding: 0 8px;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+/* 触摸端：44px 目标（§6.1） */
+@media (pointer: coarse) {
+  #anno-obj-toolbar .aot-btn { min-height: 44px; min-width: 44px; }
+}
+/* ⋯ 菜单（低频动作收纳：定位/只看/编辑轮廓点/驳回/删除） */
+#anno-obj-toolbar .aot-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 148px;
+  padding: 4px;
+  background: rgba(255, 255, 255, 0.98);
+  border: 0.5px solid rgba(0, 0, 0, 0.12);
+  border-radius: 10px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.2);
+}
+#anno-obj-toolbar .aot-menu .aot-menu-item {
+  text-align: left;
+  border: none;
+  background: transparent;
+  min-height: 36px;
+}
+/* 保存状态（§6.4）：保存中 / 已保存 / 未保存（点击重试） */
+.anno-save-status {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 31;
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  background: rgba(28, 30, 34, 0.86);
+  color: #fff;
+  pointer-events: auto;
+  user-select: none;
+}
+.anno-save-status.saving { color: #cfd4da; }
+.anno-save-status.saved { color: #7ee2a0; }
+.anno-save-status.unsaved {
+  color: #ffd60a;
+  cursor: pointer;
+  font-weight: 600;
+}
+/* 面板行内锁徽章（§6.3） */
+.anno-lock-badge { font-size: 11px; margin: 0 2px; }

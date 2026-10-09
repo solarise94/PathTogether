@@ -244,3 +244,124 @@ def test_account_kind_endpoint_permission_audit_and_semantics():
     r = c.post("/api/admin/v1/users/usr_nope/account-kind",
                json={"account_kind": "real"})
     assert r.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# 2026-10-09 §2（round4）：概览只计正式用户（+dogfood 计数）与用户表
+# 研究授权列（批量单查询装配）
+# --------------------------------------------------------------------------- #
+def test_overview_counts_real_only_and_reports_dogfood():
+    """users.total/active/disabled/ai_access 只计 account_kind='real'；
+    dogfood 单独计数（含禁用与 AI 权限的 dogfood 不进正式口径）。"""
+    owner = user_store.create_user("owner@x.com", "ownerpass12345678",
+                                   role="owner")
+    real1 = user_store.create_user("r1@x.com", "userpass12345678")
+    real2 = user_store.create_user("r2@x.com", "userpass12345678")
+    dog1 = user_store.create_user("d1@x.com", "userpass12345678")
+    dog2 = user_store.create_user("d2@x.com", "userpass12345678")
+    user_store.set_user_account_kind(dog1["user_id"], "dogfood")
+    user_store.set_user_account_kind(dog2["user_id"], "dogfood")
+    # real2 禁用；real1 开 AI（owner/real2 关闭）；dogfood 一个开 AI 一个
+    # 禁用（都不进正式口径——建号缺省 ai_access=True，先显式收口）
+    user_store.set_user_disabled(real2["user_id"], True)
+    _sql("UPDATE users SET ai_access=FALSE WHERE user_id IN (%s, %s)",
+         (owner["user_id"], real2["user_id"]))
+    _sql("UPDATE users SET ai_access=TRUE WHERE user_id=%s",
+         (real1["user_id"],))
+    _sql("UPDATE users SET ai_access=TRUE WHERE user_id=%s",
+         (dog1["user_id"],))
+    user_store.set_user_disabled(dog2["user_id"], True)
+
+    c = _login(_client(), owner)
+    r = c.get("/api/admin/v1/overview")
+    assert r.status_code == 200, r.get_data(as_text=True)
+    users = r.get_json()["users"]
+    # 正式口径：owner + real1 + real2（dogfood 两号不计）
+    assert users["total"] == 3
+    assert users["active"] == 2      # real2 禁用
+    assert users["disabled"] == 1    # 只计 real2；dog2 不进
+    assert users["ai_access"] == 1   # real1；dog1 的 AI 权限不进
+    assert users["dogfood"] == 2
+
+
+def _insert_consent(user_id, state):
+    """直插 user_research_consents 行（users 列表只读 state；grant/withdraw
+    全链路见 test_research_consent.py）。"""
+    _sql(
+        "INSERT INTO user_research_consents (user_id, state, scope_version, "
+        "document_version, document_sha256, epoch, granted_at, withdrawn_at, "
+        "updated_at) VALUES (%s,%s,'v1','v1',%s,1,"
+        "CASE WHEN %s='granted' THEN now() ELSE NULL END,"
+        "CASE WHEN %s='withdrawn' THEN now() ELSE NULL END, now())",
+        (user_id, state, "0" * 64, state, state))
+
+
+def test_users_list_research_field_states_and_single_query(monkeypatch):
+    """research 字段：granted / withdrawn / None（declined 与无行同「未授权」
+    展示）；装配只允许**单条**批量查询（不逐行 N+1）。"""
+    import research_consent_store
+
+    owner = user_store.create_user("owner@x.com", "ownerpass12345678",
+                                   role="owner")
+    granted = user_store.create_user("granted@x.com", "userpass12345678")
+    withdrawn = user_store.create_user("withdrawn@x.com", "userpass12345678")
+    declined = user_store.create_user("declined@x.com", "userpass12345678")
+    plain = user_store.create_user("plain@x.com", "userpass12345678")
+    _insert_consent(granted["user_id"], "granted")
+    _insert_consent(withdrawn["user_id"], "withdrawn")
+    _insert_consent(declined["user_id"], "declined")
+
+    # 查询计数代理：记录触达 user_research_consents 的 SELECT 条数
+    consent_queries = []
+    orig_connect = research_consent_store._connect
+
+    class _CurProxy:
+        def __init__(self, base):
+            self._base = base
+
+        def execute(self, sql, *a, **kw):
+            if "user_research_consents" in str(sql):
+                consent_queries.append(str(sql))
+            return self._base.execute(sql, *a, **kw)
+
+        def __enter__(self):
+            self._base.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self._base.__exit__(*exc)
+
+        def __getattr__(self, name):
+            return getattr(self._base, name)
+
+    class _ConnProxy:
+        def __init__(self, base):
+            self._base = base
+
+        def cursor(self, *a, **kw):
+            return _CurProxy(self._base.cursor(*a, **kw))
+
+        def __getattr__(self, name):
+            return getattr(self._base, name)
+
+    def _counting_connect():
+        return _ConnProxy(orig_connect())
+
+    monkeypatch.setattr(research_consent_store, "_connect", _counting_connect)
+    c = _login(_client(), owner)
+    r = c.get("/api/admin/v1/users?limit=100&kind=all")
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert len(consent_queries) == 1, \
+        "research 列必须单条批量查询装配（实际 %d 条）" % len(consent_queries)
+
+    by_id = {i["user_id"]: i for i in r.get_json()["items"]}
+    assert by_id[granted["user_id"]]["research"] == \
+        {"state": "granted", "granted": True}
+    assert by_id[withdrawn["user_id"]]["research"] == \
+        {"state": "withdrawn", "granted": False}
+    # declined 与无行同「未授权」展示（state 词表只出 granted/withdrawn/null）
+    assert by_id[declined["user_id"]]["research"] == \
+        {"state": None, "granted": False}
+    assert by_id[plain["user_id"]]["research"] == \
+        {"state": None, "granted": False}
+    assert by_id[owner["user_id"]]["research"]["granted"] is False

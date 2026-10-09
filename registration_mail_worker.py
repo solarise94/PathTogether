@@ -161,8 +161,8 @@ def public_base_url(environ=None):
 
     与 registration_store 的前置检查同口径读 ``PUBLIC_BASE_URL``；只负责
     取出规范形式，**不**做 https 强制（强校验在 registration_store 前置闸与
-    app 层 CSP 装配）。供 test_application_store 等需要构造管理/登录链接的
-    调用方复用，避免各处重复 env 读取。
+    app 层 CSP 装配）。供需要构造管理/登录链接的调用方（如 feedback_store）
+    复用，避免各处重复 env 读取。
     """
     env = os.environ if environ is None else environ
     return (env.get("PUBLIC_BASE_URL") or "").strip().rstrip("/")

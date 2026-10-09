@@ -81,6 +81,9 @@ function fakeEl(tag?: string) {
 					el.className.split(/\s+/).filter(Boolean).includes(n),
 			};
 		},
+		get children() {
+			return children.filter((child) => "tagName" in child);
+		},
 		get textContent() {
 			let out = ownText;
 			for (const c of children) out += (c && c.textContent) || "";

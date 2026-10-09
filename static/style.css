@@ -16,8 +16,8 @@
   --sidebar-bg: rgba(242, 242, 247, 0.85);
   --toolbar-bg: rgba(255, 255, 255, 0.85);
   --text: #1d1d1f;
-  --text-2: #86868b;
-  --text-3: #a1a1a6;
+  --text-2: #62626a;
+  --text-3: #707078;
   --separator: rgba(0, 0, 0, 0.08);
   --separator-strong: rgba(0, 0, 0, 0.12);
   --hover: rgba(0, 0, 0, 0.05);
@@ -603,9 +603,8 @@ button {
 
 /* ---------- 左侧边栏：Finder 源列表风 ---------- */
 #sidebar {
-  /* 改版 2026-10-08（§5.1）：左栏=文件夹/切片浏览器，宽约 160px 档
-     （176px 兼顾中文文件夹名与露出条带；桌面可折叠，手机抽屉另行加宽） */
-  width: 176px;
+  /* 留出可读的文件名和独立操作区；桌面可折叠，手机使用抽屉。 */
+  width: 224px;
   background: var(--sidebar-bg);
   backdrop-filter: blur(20px) saturate(180%);
   -webkit-backdrop-filter: blur(20px) saturate(180%);
@@ -4708,7 +4707,7 @@ button {
   position: absolute;
   left: 0;
   width: 100%;
-  height: 56px;
+  height: 64px;
   display: flex;
   align-items: center;
   justify-content: flex-start;
@@ -4772,7 +4771,7 @@ button {
   cursor: pointer;
   outline-offset: 2px;
 }
-.fb-hit.fb-hit-last { height: 104px; }
+.fb-hit.fb-hit-last { height: 128px; }
 
 /* 完整卡片（叠放时只露出名称条 + 一段缩略图；悬停/聚焦向右滑出预览） */
 .fb-card {
@@ -4780,7 +4779,7 @@ button {
   top: 0;
   left: 0;
   width: 100%;
-  height: 104px;
+  height: 128px;
   display: flex;
   flex-direction: column;
   border: 1px solid var(--separator);
@@ -4796,8 +4795,8 @@ button {
 .fb-hit.extracted { z-index: 40 !important; }
 .fb-hit.extracted .fb-card {
   pointer-events: auto;
-  width: 180px;
-  transform: translate(53px, -7px) rotate(-3deg);
+  width: 240px;
+  transform: translate(40px, -7px) rotate(-3deg);
   box-shadow: 0 8px 20px rgba(0, 0, 0, 0.18);
   border-color: var(--accent);
 }
@@ -4891,7 +4890,7 @@ button {
 
 /* 窄侧栏（手机抽屉 ≤768px）：滑出幅度收窄，避免横向越界 */
 @media (max-width: 768px) {
-  .fb-hit.extracted .fb-card { width: 150px; transform: translate(38px, -7px) rotate(-3deg); }
+  .fb-hit.extracted .fb-card { width: calc(100% - 38px); transform: translate(32px, -4px); }
   .fb-stack { margin: 0 8px; }
   .tb-search-pop,
   .tb-share-pop {
@@ -4907,3 +4906,75 @@ button {
   .fb-card { transition: none !important; }
   .fb-hit.extracted .fb-card { transform: translateX(32px) !important; }
 }
+
+
+/* 2026-10-09：舒适密度。单行工具栏继续由实测宽度折叠；不缩小命中区来挤按钮。
+   切片 128px / 44px 露出条带、文件夹 64px 与 app.js 的分页预算同步。 */
+:root { --control-h: 40px; }
+html, body { font-size: 14px; }
+#app-header { height: 60px; gap: 12px; }
+.icon-btn { width: var(--control-h); height: var(--control-h); font-size: 18px; flex-shrink: 0; }
+.btn, .tool-btn, .btn.small { min-height: var(--control-h); padding: 8px 14px; font-size: 14px; }
+#toolbar .tool-btn, #toolbar .tbb-more .tool-btn { min-height: var(--control-h); height: var(--control-h); font-size: 14px; line-height: 1; }
+#toolbar .icon-btn { width: var(--control-h); height: var(--control-h); }
+#toolbar .btn-group { gap: 4px; }
+#toolbar .tool-btn.tb-icon-only { min-width: var(--control-h); }
+.lang-toggle, .acct-btn, #toolbar .acct-btn { height: var(--control-h); font-size: 14px; padding: 0 12px; }
+.lang-toggle { min-width: var(--control-h); }
+.seg-control .seg, .viewer-quality-btn { min-height: 36px; font-size: 14px; }
+.zoom-badge, .header-zoom-badge { font-size: 14px; padding: 7px 10px; }
+.toolbar-pop { padding: 14px; }
+.toolbar-pop input:not([type=checkbox]):not([type=radio]),
+.toolbar-pop select, .slide-search, .changepw-field input,
+.pcd-field input, .pcd-field select { min-height: var(--control-h); font-size: 14px; }
+.toolbar-pop input[type=checkbox], .toolbar-pop input[type=radio] { width: 18px; height: 18px; }
+.acct-pop, .acct-pop-detail, .acct-pop-balance-head,
+.tb-share-target, .tsr-sub, .fb-count, .fb-folder-count, .fb-page-info { font-size: 13px; }
+.acct-settings, .fb-menu-item { min-height: var(--control-h); font-size: 14px; padding: 9px 12px; }
+.tb-search-title, .tb-share-title { font-size: 16px; }
+.tb-search-pop { width: 360px; }
+.tb-search-result { min-height: 56px; padding: 8px; }
+.tsr-name, .fb-location, .fb-folder-name { font-size: 14px; }
+.fb-head { gap: 4px; padding: 8px; flex-shrink: 0; }
+.fb-up, .fb-plus, .fb-folder-btn, .fb-page-btn { width: var(--control-h); height: var(--control-h); font-size: 18px; }
+.fb-hit { height: 44px; }
+.fb-card-label { height: 44px; padding: 0 46px 0 10px; font-size: 14px; gap: 4px; }
+.fb-card-menu { top: 0; right: 0; width: 44px; height: 44px; font-size: 18px; }
+.fb-card-badge, .fb-card-temp, .fb-temp-tag { font-size: 12px; }
+.fb-pager { flex-shrink: 0; padding: 6px 10px; }
+.sidebar-bottom { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; padding: 8px; flex-shrink: 0; }
+.sidebar-bottom .logout-link { display: flex; align-items: center; min-height: var(--control-h); padding: 6px; margin: 0; text-align: left; font-size: 13px; border-radius: 6px; overflow-wrap: anywhere; }
+.sidebar-bottom .logout-link:hover { background: var(--hover); }
+.sidebar-bottom .logout-link[hidden] { display: none; }
+.ai-plus-btn, .ai-send-btn { width: var(--control-h); height: var(--control-h); }
+.ai-send-btn svg { width: 20px; height: 20px; }
+.ai-task { font-size: 15px; min-height: 44px; padding: 10px 12px; }
+.ai-session-select { font-size: 14px; min-height: var(--control-h); }
+.ai-suggest-chip, .link-btn { font-size: 14px; min-height: var(--control-h); }
+.ai-trace .ai-msg { font-size: 15px; line-height: 1.6; }
+.ai-empty-sub, .ai-source-card-title { font-size: 14px; line-height: 1.6; }
+.ai-session-bar-label, .hp-drawing-toggle .hp-switch-label { font-size: 13px; }
+.hp-drawing-toggle { min-height: var(--control-h); }
+button:focus-visible, a:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+@media (max-width: 768px) {
+  :root { --control-h: 44px; --tbb-bar-h: 60px; }
+  #app-header { height: auto; min-height: 60px; padding-left: 8px; padding-right: 8px; gap: 6px; }
+  #toolbar { gap: 4px; padding-left: 8px; padding-right: 8px; }
+  #toolbar .tool-btn, #toolbar .anno-tools .tool-btn { min-width: 44px; padding: 0 10px; }
+  #toolbar .acct-btn { max-width: 104px; padding: 0 10px; }
+  #toolbar .roi-slider { height: 48px; }
+  #toolbar .roi-slider-seg { height: 44px; min-width: 44px; font-size: 14px; }
+  .toolbar-pop input:not([type=checkbox]):not([type=radio]), .toolbar-pop select,
+  .dialog-mask input, .dialog-mask select, .picker-mask input, .ai-task,
+  .ai-session-select { font-size: 16px; }
+  .tb-search-pop { width: calc(100vw - 16px); }
+}
+
+@media (min-width: 769px) {
+  /* backdrop-filter 形成侧栏层叠上下文，显式抬到画布之上让抽出的卡片完整可见。 */
+  #sidebar { position: relative; z-index: 9; }
+}
+
+#toolbar .tool-btn > span[aria-hidden="true"] { font-size: 20px; vertical-align: middle; }

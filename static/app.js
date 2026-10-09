@@ -2777,11 +2777,11 @@
   // =========================================================================
   var FB_TEMP_KEY = "__temp__";   // 「临时查看」虚拟文件夹键（不对应项目）
   var FB_MAX_PAGE = 8;            // 每叠最多 8 张（§5.2）
-  var FB_GAP = 36;                // 堆叠露出条带的偏好高度（名称条+一段缩略图）
-  var FB_MIN_GAP = 28;            // 条带下限（页容量按最紧条带计，保证放得下）
-  var FB_MAX_GAP = 104;           // 条带上限 = 整卡高（短叠铺开时不再过度拉伸）
-  var FB_CARD_H = 104;            // 完整卡片高度
-  var FB_FOLDER_H = 56;           // 文件夹卡高度
+  var FB_GAP = 44;                // 堆叠露出条带的偏好高度（名称条+一段缩略图）
+  var FB_MIN_GAP = 44;            // 条带下限（页容量按最紧条带计，保证放得下）
+  var FB_MAX_GAP = 128;           // 条带上限 = 整卡高（短叠铺开时不再过度拉伸）
+  var FB_CARD_H = 128;            // 完整卡片高度
+  var FB_FOLDER_H = 64;           // 文件夹卡高度
   var FB_FOLDER_GAP = 8;          // 文件夹卡间距
   var FB_STACK_FALLBACK_H = 396;  // 无布局环境（测试/首帧）时的可用高度兜底
 
@@ -2814,8 +2814,8 @@
     }));
   }
 
-  // 叠页装箱（§5.2）：按**本页实际条目**的真实高度装箱——文件夹卡 56+8、
-  // 切片卡首张即整卡 104、之后每张再占一条露出条带（下限 28，最挤也放得下）。
+  // 叠页装箱（§5.2）：按**本页实际条目**的真实高度装箱——文件夹卡 64+8、
+  // 切片卡首张即整卡 128、之后每张再占一条露出条带（下限 44，最挤也放得下）。
   // 只计本页条目：不在本页的文件夹绝不摊派到每一页的预算（修「目录里 N 个
   // 文件夹把页容量压到 1 张」）。每页 ≤8、下限 1。返回页数组（渲染与搜索
   // 定位共用同一函数，页码/页内容恒一致）。
@@ -3052,7 +3052,7 @@
     }
     var availH = fbStackAvailH();
     // 与搜索定位共用同一有序条目 + 装箱函数（§5.2）：页按本页条目真实高度
-    // 装箱（文件夹卡 56+8、切片卡整卡/露出条带），≤8 张/页，下限 1。
+    // 装箱（文件夹卡 64+8、切片卡整卡/露出条带），≤8 张/页，下限 1。
     var ordered = fbOrderedEntries(fbState.folder);
     var pages = fbPackPages(ordered, availH);
     var totalItems = ordered.length;
@@ -4594,6 +4594,8 @@
       els.tbbMore.classList.remove("open");
       if (mask) mask.classList.remove("open");
       els.tbbMoreBtn.setAttribute("aria-expanded", "false");
+      // 菜单关闭后再按主行宽度收放，浮层不参与主行溢出预算。
+      applyToolbarTier();
     }
     function openMore() {
       // 同一时间至多一个工具栏浮层：打开 ⋯ 前收起其它浮层
@@ -9410,19 +9412,19 @@
   // ---------- 宽度断点分组（§3.3） ----------
   // >=1440 全展开；1024–1439 折「视图」组（旋转/镜像/画质/通道）与「标注」组；
   // <1024 只留当前工具、AI、倍率、账户，其余入 ⋯。<=768 交还既有移动端布局
-  //（底栏/上下文条 CSS 自管）。搬移真实 DOM 节点（监听器/状态机不复制），
+  //（底栏/上下文条 CSS 定位，低频组同样折叠）。搬移真实 DOM 节点（监听器/状态机不复制），
   // 折叠目标统一是现有 #tbb-more 菜单。
   var TB_FOLD_SPECS = [
-    { id: "view-tools-group", tiers: ["mid", "narrow"] },
-    { id: "quality-control", tiers: ["mid", "narrow"] },
-    { id: "channel-btn", tiers: ["mid", "narrow"] },
-    { id: "anno-tools-group", tiers: ["mid", "narrow"] },
-    { id: "anno-btn", tiers: ["mid", "narrow"] },
-    { id: "save-anno-btn", tiers: ["mid", "narrow"] },
-    { id: "zoom-group", tiers: ["narrow"] },
-    { id: "save-btn", tiers: ["narrow"] },
-    { id: "mpp-setter", tiers: ["narrow"] },
-    { id: "zoom-native", tiers: ["narrow"] },
+    { id: "view-tools-group", tiers: ["mid", "narrow", "mobile"] },
+    { id: "quality-control", tiers: ["mid", "narrow", "mobile"] },
+    { id: "channel-btn", tiers: ["mid", "narrow", "mobile"] },
+    { id: "anno-tools-group", tiers: ["mid", "narrow", "mobile"] },
+    { id: "anno-btn", tiers: ["mid", "narrow", "mobile"] },
+    { id: "save-anno-btn", tiers: ["mid", "narrow", "mobile"] },
+    { id: "zoom-group", tiers: ["narrow", "mobile"] },
+    { id: "save-btn", tiers: ["narrow", "mobile"] },
+    { id: "mpp-setter", tiers: ["narrow", "mobile"] },
+    { id: "zoom-native", tiers: ["narrow", "mobile"] },
   ];
 
   function tbTierForWidth() {
@@ -9441,7 +9443,7 @@
 
   // narrow 档「只留当前工具」：绘制工具激活时其所在组保留在主行
   function tbSpecPinned(id) {
-    if (id === "anno-tools-group" && state.drawMode) return true;
+    if (id === "anno-tools-group" && state.drawMode && window.innerWidth > 768) return true;
     return false;
   }
 
@@ -9521,7 +9523,7 @@
 
   function tbApplyOverflowFold() {
     var more = els.tbbMore;
-    if (!more) return;
+    if (!more || more.classList.contains("open")) return;
     var steps = tbBuildFoldSteps();
     var toolbar = more.parentNode;
     if (!toolbar || !toolbar.clientWidth || !toolbar.scrollWidth) return;
@@ -9554,7 +9556,7 @@
     var more = els.tbbMore;
     if (!more) return;
     var tier = tbTierForWidth();
-    // <=768：既有移动端布局（底栏/上下文条）全权接管，节点全部归位
+    // <=768：底栏使用 44px 命中区，低频组收进更多菜单，搜索/分享/账户优先保留
     try {
       if (window.matchMedia && window.matchMedia(SB_MOBILE_QUERY).matches) tier = "mobile";
     } catch (e) {}

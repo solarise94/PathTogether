@@ -815,13 +815,54 @@ test.describe("宽度断点分组（§3.3）", () => {
 		expect(ids).not.toContain("ai-btn");
 	});
 
-	test("<=768 交还移动端布局：节点全部归位（分组不搬移）", async ({ page }) => {
+	test("<=768：低频组进更多，常用入口保持可见且有足够触控区域", async ({ page }) => {
 		await page.setViewportSize({ width: 390, height: 844 });
 		await serveFixture(page);
 		await page.goto(FIXTURE_HOST + "/fixture");
 		const ids = await foldedIds(page);
-		expect(ids).not.toContain("view-tools-group");
-		expect(ids).not.toContain("zoom-group");
-		expect(ids).not.toContain("anno-tools-group");
+		expect(ids).toContain("view-tools-group");
+		expect(ids).toContain("zoom-group");
+		expect(ids).toContain("anno-tools-group");
+		for (const id of ["tb-search-btn", "tb-share-btn", "acct-btn", "tbb-more-btn"]) {
+			const btn = page.locator("#" + id);
+			await expect(btn).toBeVisible();
+			const box = (await btn.boundingBox())!;
+			expect(box.height).toBeGreaterThanOrEqual(44);
+			expect(box.width).toBeGreaterThanOrEqual(44);
+			expect(box.x).toBeGreaterThanOrEqual(0);
+			expect(box.x + box.width).toBeLessThanOrEqual(390);
+		}
+		await page.locator("#tbb-more-btn").click();
+		await expect(page.locator("#anno-arrow-btn")).toBeVisible();
 	});
+});
+
+
+test("舒适密度：堆叠卡片不越过翻页栏，滑出预览在画布之上", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 720 });
+  await serveFixture(page);
+  await mockOwnerWithSlides(page, Array.from({ length: 24 }, (_, i) => ({
+    name: `density-${i}.svs`, alias: `Slide ${i}`,
+  })));
+  await page.goto(FIXTURE_HOST + "/fixture");
+  await expandSidebar(page, "24");
+  await expect(page.locator("#sidebar")).toHaveCSS("width", "224px");
+  await expect(page.locator("#fb-location")).toBeVisible();
+  const stack = page.locator("#fb-stack");
+  const cards = page.locator(".fb-hit");
+  const stackBox = (await stack.boundingBox())!;
+  for (const card of await cards.all()) {
+    const box = (await card.boundingBox())!;
+    expect(box.height).toBeGreaterThanOrEqual(44);
+    expect(box.y + box.height).toBeLessThanOrEqual(stackBox.y + stackBox.height + 1);
+  }
+  await cards.first().hover();
+  await expect(cards.first()).toHaveClass(/extracted/);
+  await expect.poll(() => cards.first().evaluate(el => {
+    const preview = el.querySelector(".fb-card")!;
+    const r = preview.getBoundingClientRect();
+    const edge = document.querySelector("#sidebar")!.getBoundingClientRect().right;
+    const hit = document.elementFromPoint(Math.min(r.right - 12, edge + 12), r.top + r.height / 2);
+    return !!hit && preview.contains(hit);
+  })).toBe(true);
 });

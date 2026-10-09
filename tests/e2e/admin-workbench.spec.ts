@@ -983,6 +983,11 @@ test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
     }
     // 4 列布局：可见单元格恰为 4（用户/加入时间/最近登录/分类）
     expect(geo.visibleCells, "390px users table shows exactly 4 columns").toBe(4);
+    // 放大字号后，时间仍须横向可读，不能靠逐字折行伪装成无溢出。
+    expect(geo.joined!.width).toBeGreaterThanOrEqual(120);
+    expect(geo.lastLogin!.width).toBeGreaterThanOrEqual(120);
+    const detailBox = await row.locator("button", { hasText: "详情" }).boundingBox();
+    expect(detailBox!.height).toBeGreaterThanOrEqual(44);
     // R6：创建用户表单已整体退役（无折叠入口可展开）
     await expect(frame.locator("#adm-users-create-box")).toHaveCount(0);
     await assertNoHorizontalOverflow(page, "users-390");

@@ -351,3 +351,24 @@ test("分享选择器确认后保持分享浮层打开", async ({ page }) => {
 	await expect(page.locator("#slide-picker-mask")).toBeHidden();
 	await expect(page.locator("#tb-share-pop")).toBeVisible({ timeout: 1000 });
 });
+
+test("手机从更多启用绘制工具后，搜索和分享仍留在主栏", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const problems = attachErrorCollectors(page);
+  await login(page, CREDS.userLogin, CREDS.userPassword);
+  await page.goto(`/app?slide=${CREDS.rasterSlides.workbench.slide_id}`);
+  await expect(page.locator("#anno-arrow-btn")).toBeEnabled();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect.poll(() => page.locator("#anno-tools-group")
+    .evaluate(el => el.parentElement?.id)).toBe("tbb-more");
+  await page.locator("#tbb-more-btn").click();
+  await page.locator("#anno-arrow-btn").click();
+  await expect(page.locator("#anno-arrow-btn")).toHaveClass(/active/);
+  await expect(page.locator("#tbb-more")).not.toHaveClass(/open/);
+  await page.locator("#tb-search-btn").click();
+  await expect(page.locator("#tb-search-pop")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await page.locator("#tb-share-btn").click();
+  await expect(page.locator("#tb-share-pop")).toBeVisible();
+  expect(problems).toEqual([]);
+});

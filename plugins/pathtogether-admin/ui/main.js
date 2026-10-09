@@ -1277,6 +1277,13 @@
   // 最近登录 / 分类。额度、启用状态、掩码登录账号等低频字段收进「详情」
   // 抽屉；行内动作 = 分类切换（标为 Dogfood/改为正式）+ 详情。
   // ------------------------------------------------------------------
+  // 窄屏卡片沿用原表格数据与操作，标签来自同一组列标题。
+  function labelResponsiveCells(row, labels) {
+    Array.prototype.forEach.call(row.children, function (cell, i) {
+      cell.setAttribute("data-label", labels[i] || "");
+    });
+  }
+
   function renderUsers(items, append) {
     var tbody = $("adm-users-tbody");
     if (!tbody) return;
@@ -1317,6 +1324,7 @@
       kindActions.appendChild(detailBtn);
       kindCell.appendChild(kindActions);
       tr.appendChild(kindCell);
+      labelResponsiveCells(tr, ["用户", "加入时间", "最近登录", "分类"]);
       tbody.appendChild(tr);
     });
   }
@@ -3358,6 +3366,7 @@
     tr.appendChild(td(fmtTs(item.created_at), "adm-cell-time"));
     tr.appendChild(tempStatusCell(item));
     tr.appendChild(slideActionsCell(item));
+    labelResponsiveCells(tr, ["切片 / 上传者", "加入时间", "管理员临时查看", "操作"]);
     tbody.appendChild(tr);
   }
 

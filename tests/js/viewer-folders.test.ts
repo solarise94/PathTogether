@@ -314,16 +314,16 @@ function seedNone(s: Seedable) {
 afterEach(teardown);
 
 describe("叠页大小与露出条带（§5.2 纯函数）", () => {
-	it("页容量：上限 8；按最紧露出条带（28px）计保证放得下；文件夹卡占用同一预算；下限 1", () => {
+	it("页容量：上限 8；按最紧露出条带（44px）计保证放得下；文件夹卡占用同一预算；下限 1", () => {
 		bootApp();
 		const UI = (globalThis as { window?: { HP_PROJECT_UI?: { fb: FbUI } } }).window?.HP_PROJECT_UI!;
 		const ps = UI.fb.pageSize;
 		expect(ps(10000, 0)).toBe(8);
-		// 无文件夹：1 张完整卡 + (n-1)*28 ≤ avail
-		expect(ps(28 * 7 + 104, 0)).toBe(8);
-		expect(ps(28 * 7 + 104 - 1, 0)).toBe(7);
-		expect(ps(104, 0)).toBe(1);
-		// 文件夹卡占用同一预算（每张 56+8）
+		// 无文件夹：1 张完整卡 + (n-1)*44 ≤ avail
+		expect(ps(44 * 7 + 128, 0)).toBe(8);
+		expect(ps(44 * 7 + 128 - 1, 0)).toBe(7);
+		expect(ps(128, 0)).toBe(1);
+		// 文件夹卡占用同一预算（每张 64+8）
 		expect(ps(10000, 2)).toBe(8);
 		// 极小可用高度：钳到 1（不出现 0/负数叠）
 		expect(ps(0, 5)).toBe(1);
@@ -342,16 +342,16 @@ describe("叠页大小与露出条带（§5.2 纯函数）", () => {
 		expect(fbFolders(h).length + fbHits(h).length).toBeGreaterThan(1);
 	});
 
-	it("露出条带：短叠铺满可用高度、上限=整卡高、下限=28px；单张不铺开", () => {
+	it("露出条带：短叠铺满可用高度、上限=整卡高、下限=44px；单张不铺开", () => {
 		bootApp();
 		const UI = (globalThis as { window?: { HP_PROJECT_UI?: { fb: FbUI } } }).window?.HP_PROJECT_UI!;
 		const gap = UI.fb.bandGap!;
-		expect(gap(600, 0, 1)).toBe(36);          // 单张：无铺开语义，用偏好值
-		expect(gap(600, 0, 8)).toBe(70);          // 8 张：496/7=70（贴合 600）
-		expect(gap(1000, 0, 2)).toBe(104);        // 2 张大空间：钳到整卡高
-		expect(gap(300, 0, 8)).toBe(28);          // 紧：钳到下限
-		expect(gap(100, 0, 8)).toBe(28);          // 极小：不出负数/0
-		expect(gap(600, 2, 8)).toBe(52);          // 2 张文件夹卡占 128：(600-128-104)/7=52
+		expect(gap(600, 0, 1)).toBe(44);          // 单张：无铺开语义，用偏好值
+		expect(gap(600, 0, 8)).toBe(67);          // 8 张：472/7=67（贴合 600）
+		expect(gap(1000, 0, 2)).toBe(128);        // 2 张大空间：钳到整卡高
+		expect(gap(300, 0, 8)).toBe(44);          // 紧：钳到下限
+		expect(gap(100, 0, 8)).toBe(44);          // 极小：不出负数/0
+		expect(gap(600, 2, 8)).toBe(46);          // 2 张文件夹卡占 144：(600-144-128)/7=46
 	});
 });
 

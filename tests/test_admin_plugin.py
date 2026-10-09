@@ -964,7 +964,8 @@ def test_admin_manifest_plugin_version_bumped_with_hashes():
     # 四列改版（分类/最近登录/setAccountKind）+ 切片页临时查看改版
     #（start/endTemporaryView + viewer.open 宿主开新标签）+ 邀请页退役
     #（admin.invites.* 桥方法删除）+ 注册模式收敛 closed/public，hashes/pin 同步
-    assert data["pluginVersion"] == "0.4.16"  # hashes/pin 同步
+    # 2026-10-09 0.4.17：舒适密度与移动端记录排布，hashes/pin 同步。
+    assert data["pluginVersion"] == "0.4.17"  # hashes/pin 同步
     assert "admin:settings:read" in data["adminPermissions"]
     assert "admin:settings:write" in data["adminPermissions"]
     assert "admin:slides:read" in data["adminPermissions"]

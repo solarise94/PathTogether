@@ -184,3 +184,27 @@ BMP 变体，不把转换提示误记为上传失败。
 - 工作站证据目录：`PathTogether/.gate-tmp/av-wt/.gate-tmp/deploy-admin-viewer-20261009/`。
   包含浏览器检查结果 JSON、脚本、`viewer-hover.png`、`share-annotation.png`、
   `temporary-expired.png`、`viewer-ai.png`；未将凭据、截图或数据库副本提交。
+
+## 10. 第四轮（2026-10-09，未部署）
+
+依据 [第四轮合同](admin-viewer-round4-20261009.md)。
+
+| 项 | 结果 |
+| --- | --- |
+| 抽出卡片被画布遮住 | 抽出层改为挂在 body 上的固定定位层，浮在画布之前，命中区不变 |
+| 顶栏按钮太小 | 搜索、分享（三节点图标）、矩形、箭头、描图改为 34px 大图标按钮，无文字，悬停提示与无障碍名称保留 |
+| 「⋯」菜单被 AI 面板压住 | 顶栏层级高于 AI 面板；菜单改为不透明 |
+| AI 面板 | 标题栏拖动、右下角缩放，限制在切片视框内，按用户记住，双击标题栏复位；≤768px 不可拖 |
+| 概览用户数 | 用户总数与 AI access 只计正式用户 |
+| 用户表 | 恢复余额列，新增研究数据（已授权/未授权/已撤回） |
+| 测试申请 | 后台页面、桥方法、服务端路由下线（410），`test_application_store.py` 删除，表保留 |
+| 用户反馈 | 账户弹层与侧栏「反馈问题」；客户端记录最近 300 条/15 分钟操作；`POST /api/feedback` 落库并入队邮件给管理员通知邮箱；迁移 0081 |
+
+门禁（admin-viewer 合并头，主代理执行）：pytest 全量（不忽略任何文件）2938 passed / 0 failed；vitest 1000 passed；Playwright 83 passed（含新增 `user-feedback.spec.ts`：真实后端 202，附带记录无查询串、无输入内容）。0081 在生产 schema 副本上演练两次通过，邮件 purpose 约束保留全部旧值。
+
+附带修复：生产热修 d53bf495 后 `test_ai_credentials::test_no_auth_full_compat` 失败——夹具只放文件不登记资产；补登记切片行（会话列表按资产走读门禁是正确行为）。
+
+上线前注意：
+- admin 插件需发布 0.4.17（0.4.16 已在生产）。
+- 反馈邮件发往 `REGISTRATION_ADMIN_EMAIL`（公开注册前置条件已要求配置）。服务端附带的应用版本读 `APP_REVISION` 环境变量，当前部署未注入，需在部署环境中加入，否则该字段为空。
+- AI 面板拖动/缩放在 E2E 环境中以注入官方面板结构验证（E2E 未启用 HistoPilot 插件），真实插件下需目视确认一次。

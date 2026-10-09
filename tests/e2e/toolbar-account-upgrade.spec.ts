@@ -1055,3 +1055,44 @@ test("抽牌开片：后一次点击接管动画，迟到响应与失败都不�
   await expect(page.locator('.slide-deal, .slide-deal-stage')).toHaveCount(0);
   await expect(page).toHaveTitle(/Specimen 1/);
 });
+
+
+test("鼠标快速连续点选不会被待弹出的预览吞掉", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await serveFixture(page);
+  await mockOwnerWithSlides(page, FOUR_SLIDES);
+  const mockup = readFileSync(resolve(here, '../../docs/design-assets/admin-viewer-20261008/viewer-folders.html'), 'utf8');
+  const data = mockup.match(/data:image\/webp;base64,([A-Za-z0-9+/=]+)/)![1];
+  await page.route('**/*thumbnail*', r => r.fulfill({ contentType: 'image/webp', body: Buffer.from(data, 'base64') }));
+  await page.goto(FIXTURE_HOST + '/fixture');
+  await expandSidebar(page);
+  await expect(page.locator('#sidebar')).toHaveCSS('width', '224px');
+  const rows = await page.locator('.fb-hit').evaluateAll(ns => ns.map(n => {
+    const r = n.getBoundingClientRect(); return { x: r.left + r.width * .65, y: r.top + 22 };
+  }));
+  const requests: string[] = [];
+  page.on('request', r => { if (r.url().endsWith('/info') && r.url().includes('/api/slide/')) requests.push(r.url()); });
+  await page.mouse.move(rows[2].x, rows[2].y);
+  await expect(page.locator('.fb-pullout')).toBeVisible();
+  await page.mouse.click(rows[2].x, rows[2].y);
+  await expect(page).toHaveTitle(/Specimen 2/);
+  for (const i of [0,1]) {
+    await page.mouse.move(rows[i].x,rows[i].y,{steps:2});
+    await page.mouse.click(rows[i].x,rows[i].y);
+  }
+  await expect(page).toHaveTitle(/Specimen 1/);
+  await page.mouse.move(700, 220);
+  await expect(page.locator('.fb-fan-card')).toHaveCount(0);
+  await page.mouse.move(rows[0].x, rows[0].y);
+  await page.mouse.down();
+  // A normal held press can cross the hover delay. It must still produce one
+  // click for the original row when released, even if a preview would appear.
+  await page.waitForTimeout(150);
+  await page.mouse.up();
+  await expect.poll(() => requests.length).toBe(4);
+  expect(requests.map(url => new URL(url).pathname)).toEqual([
+    '/api/slide/sample-2.svs/info', '/api/slide/sample-0.svs/info',
+    '/api/slide/sample-1.svs/info', '/api/slide/sample-0.svs/info'
+  ]);
+  await expect(page).toHaveTitle(/Specimen 0/);
+});

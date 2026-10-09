@@ -3636,7 +3636,7 @@
 
     // The first hover opens the fan; moving within it has no per-card delay.
     hit.addEventListener("pointerenter", function (e) {
-      if (e && e.pointerType === "touch") return;
+      if (e && (e.pointerType === "touch" || e.buttons)) return;
       if (fbFanDismissedAt && e && Math.abs(e.clientX - fbFanDismissedAt.x) < 2 && Math.abs(e.clientY - fbFanDismissedAt.y) < 2) return;
       if (fbFan) { fbFanMove(e); return; }
       if (fbPulloutShowTimer) clearTimeout(fbPulloutShowTimer);
@@ -11411,6 +11411,12 @@
     document.addEventListener("pointermove", function (e) {
       if (fbFanDismissedAt && (Math.abs(e.clientX - fbFanDismissedAt.x) >= 2 || Math.abs(e.clientY - fbFanDismissedAt.y) >= 2)) fbFanDismissedAt = null;
       fbFanMove(e);
+    }, true);
+    document.addEventListener("pointerdown", function () {
+      // Do not insert a portal between pointerdown and pointerup: the browser
+      // would dispatch click to their common ancestor (body), losing the row.
+      if (fbPulloutShowTimer) { clearTimeout(fbPulloutShowTimer); fbPulloutShowTimer = null; }
+      fbPulloutKeep();
     }, true);
     document.addEventListener("keydown", function (e) { if (e.key === "Escape") { fbPulloutHide(); cancelSlideDeal(); } });
     window.addEventListener("blur", fbPulloutHide);

@@ -5053,47 +5053,49 @@ button {
   .fb-hit.extracted .fb-card { transform: translateX(32px) !important; }
 }
 
-/* ---------- 悬停抽出层（改版第四轮 §1.1） ----------
-   抽出呈现改为 body 直挂的固定定位浮层：位置由 JS 按命中区
-   getBoundingClientRect 计算（含越界钳回），不再受侧栏 overflow /
-   backdrop-filter / 收起过渡 / 层叠上下文影响——任何断点都完整浮在画布
-   之上。层级 515：高于 AI 面板（56）与顶栏（60），低于工具栏浮层（520）
-   与卡片 ⋯ 菜单（620）。 */
+/* 从原叠中浮起，浮层挂 body 以跨过侧栏裁切。左侧留连续划选命中带。 */
 .fb-pullout {
   position: fixed;
   z-index: 515;
   width: 240px;
+  max-width: calc(100vw - 32px);
   margin: 0;
   padding: 0;
   border: 0;
   background: transparent;
   cursor: pointer;
+  transform: rotate(-3deg);
+  transform-origin: left center;
+  animation: fb-card-lift 180ms ease-out;
 }
 .fb-pullout .fb-pullout-card {
   position: static;
   width: 100%;
-  height: 128px;
+  height: 160px;
   transform: none;
-  cursor: pointer;
   pointer-events: auto;
   border-color: var(--accent);
-  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.18);
-  transition: opacity 120ms ease;
+  background: var(--bg-panel-solid, #fff);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, .22);
 }
-@media (prefers-reduced-motion: reduce) {
-  .fb-pullout .fb-pullout-card { transition: none !important; }
-}
-/* 浮层接管抽出呈现期间：命中区内原位卡保持静止原样（避免双重绘制/位移）。
-   需压过上方 prefers-reduced-motion 的 !important 位移。 */
-body.fb-pullout-on .fb-hit.extracted .fb-card {
+.fb-pullout .fb-card-label { background: transparent; }
+.fb-pullout .fb-card-menu { color: var(--text-2); }
+.fb-card, .fb-folder { background: var(--bg-panel-solid, #fff); }
+/* 只保留一张可见卡，原位置继续承担键盘焦点和划选命中。 */
+body.fb-pullout-on .fb-hit.fb-preview-source .fb-card {
+  opacity: 0;
+  width: 100%;
   transform: none !important;
   transition: none !important;
-  width: 100%;
   pointer-events: none;
-  border-color: var(--separator);
-  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.08);
 }
-
+@keyframes fb-card-lift {
+  from { transform: translate(-32px, 7px) rotate(0); opacity: .65; }
+  to { transform: rotate(-3deg); opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fb-pullout { animation: none; transform: none; }
+}
 
 /* 2026-10-09：舒适密度。单行工具栏继续由实测宽度折叠；不缩小命中区来挤按钮。
    切片 128px / 44px 露出条带、文件夹 64px 与 app.js 的分页预算同步。 */
@@ -5200,3 +5202,30 @@ button:focus-visible, a:focus-visible, select:focus-visible, textarea:focus-visi
 .ai-title-layout .ai-setup-notice { flex-shrink: 0; min-height: 40px; margin: 4px 12px; border: 0; border-radius: 8px; padding: 8px 10px; color: var(--accent); background: var(--accent-fill); text-align: left; cursor: pointer; }
 .ai-title-layout .ai-setup-notice[hidden] { display: none; }
 .ai-title-layout .ai-menu-row[hidden] { display: none; }
+
+/* Desktop and phone keep separate control layouts, rather than squeezing labels. */
+@media (min-width: 769px) {
+  #toolbar #zoom-native { width: auto; min-width: 64px; height: 40px; padding: 0 14px; font: 600 16px var(--mono); border-radius: 10px; white-space: nowrap; }
+  #toolbar .zoom-badge { flex: 0 0 auto; min-width: 64px; min-height: 40px; display: inline-flex; align-items: center; justify-content: center; }
+}
+/* Page controls and footer actions must read as buttons at rest, not plain links. */
+.fb-pager { gap: 10px; padding: 12px 10px; }
+.fb-page-btn { border: 1px solid var(--separator-strong); border-radius: 10px; background: var(--bg-panel-solid, #fff); box-shadow: var(--shadow-sm); }
+.fb-page-btn:disabled { opacity: .45; box-shadow: none; }
+.fb-page-btn:not(:disabled):hover { border-color: var(--accent); color: var(--accent); background: var(--accent-fill); }
+.fb-page-info { color: var(--text-2); font-size: 14px; }
+.sidebar-bottom { gap: 6px; padding: 10px; border-top: 1px solid var(--separator); }
+.sidebar-bottom .logout-link { gap: 6px; justify-content: flex-start; min-height: 42px; padding: 8px 7px; border: 1px solid var(--separator); border-radius: 9px; background: var(--bg-panel-solid, #fff); color: var(--text-2); line-height: 1.35; text-decoration: none; transition: border-color 140ms, background 140ms; }
+.sidebar-bottom .logout-link svg { width: 16px; height: 16px; flex: 0 0 16px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.sidebar-bottom .logout-link span { min-width: 0; }
+.sidebar-bottom .logout-link:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-fill); }
+.sidebar-bottom #feedback-btn { color: var(--accent); background: var(--accent-fill); }
+.sidebar-bottom #logout-btn:hover { color: #b42318; border-color: currentColor; }
+@media (max-width: 768px) {
+  .sidebar-bottom .logout-link { min-height: 44px; }
+  #toolbar #zoom-native { width: auto; min-width: 64px; padding: 0 12px; font-size: 16px; }
+}
+
+/* The application viewport never scrolls; scrollable dialogs own their overflow.
+   Unlike hidden, clip also prevents focus/scrollIntoView from shifting the shell. */
+body.app-mode-official { overflow: clip; }

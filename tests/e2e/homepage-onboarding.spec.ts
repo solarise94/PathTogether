@@ -162,12 +162,12 @@ test("signed-in homepage: workbench entries, account panel summary, POST logout 
   await expect(page.locator("#login-dialog")).toHaveCount(0);
 });
 
-test("workbench empty state (H3): first-slide upload reuses the import drawer", async ({ page }) => {
+test("workbench empty state (H3): upload reuses the import drawer", async ({ page }) => {
   await login(page, CREDS.userLogin, CREDS.userPassword);
   await page.goto("/app");
   const empty = page.locator("#viewer-empty");
   await expect(empty).toBeVisible();
-  await expect(empty.locator("#viewer-empty-upload")).toHaveText("上传你的第一张切片");
+  await expect(empty.locator("#viewer-empty-upload")).toHaveText("上传切片");
   await expect(empty.locator('a[href="/demo"]')).toHaveText("查看示例");
   await expect(empty.locator("#viewer-empty-pick")).toBeVisible();
   // 复用既有导入抽屉（不另做上传实现）

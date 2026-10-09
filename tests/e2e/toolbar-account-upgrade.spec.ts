@@ -873,3 +873,56 @@ test("舒适密度：堆叠卡片不越过翻页栏，滑出预览在画布之�
     return !!at && !!pop && pop.contains(at) && pop.parentElement === document.body;
   })).toBe(true);
 });
+
+
+test("草案一致：卡片从原叠中浮起，桌面比例按钮与页脚有明确命中区", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await serveFixture(page);
+  await mockOwnerWithSlides(page, Array.from({ length: 12 }, (_, i) => ({ name: `review-${i}.svs`, alias: `样例切片 ${i + 1}` })));
+  if (process.env.REVIEW_SHOTS) {
+    // Reuse the original approved mockup's tissue image only for review captures.
+    const mockup = readFileSync(resolve(here, "../../docs/design-assets/admin-viewer-20261008/viewer-folders.html"), "utf8");
+    const image = mockup.match(/data:image\/webp;base64,([A-Za-z0-9+/=]+)/)![1];
+    await page.route("**/*thumbnail*", route => route.fulfill({ contentType: "image/webp", body: Buffer.from(image, "base64") }));
+  }
+  await page.goto(FIXTURE_HOST + "/fixture");
+  await expandSidebar(page, "12");
+  await expect(page.locator("#viewer-empty-upload")).toHaveText("上传切片");
+  const native = (await page.locator("#zoom-native").boundingBox())!;
+  expect(native.width).toBeGreaterThanOrEqual(64);
+  expect(native.height).toBeGreaterThanOrEqual(40);
+  for (const button of await page.locator(".sidebar-bottom .logout-link:visible").all()) {
+    expect((await button.boundingBox())!.height).toBeGreaterThanOrEqual(42);
+    await expect(button).toHaveCSS("border-top-style", "solid");
+    await expect(button.locator("svg")).toBeVisible();
+  }
+  const first = page.locator(".fb-hit").first();
+  await first.hover({ position: { x: 12, y: 20 } });
+  const pop = page.locator(".fb-pullout");
+  await expect(pop).toBeVisible();
+  await expect(first.locator(".fb-card")).toHaveCSS("opacity", "0");
+  await expect.poll(async () => {
+    const b = (await pop.boundingBox())!, source = (await first.boundingBox())!;
+    return b.x > source.x && b.x < source.x + source.width / 2;
+  }).toBe(true);
+  await expect(pop).not.toHaveCSS("transform", "none");
+  expect(await page.evaluate(() => document.body.scrollLeft)).toBe(0);
+  // 右侧菜单仍然可达；不可让浮卡的打开行为吞掉 ⋯ 点击。
+  await pop.locator(".fb-card-menu").click();
+  await expect(page.locator("#fb-slide-menu")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await first.hover({ position: { x: 12, y: 20 } });
+  await expect(pop).toBeVisible();
+  if (process.env.REVIEW_SHOTS) await page.screenshot({ path: join(process.env.REVIEW_SHOTS, "desktop.png"), animations: "disabled" });
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await expect(pop).toHaveCSS("animation-name", "none");
+  await expect(pop).toHaveCSS("transform", "none");
+  await page.mouse.move(700, 450);
+  await expect(pop).toHaveCount(0);
+  await expect(first.locator(".fb-card")).toHaveCSS("opacity", "1");
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.locator("#tbb-more-btn")).toBeVisible();
+  await page.locator("#menu-btn").click();
+  await expect(page.locator("#sidebar")).toHaveClass(/open/);
+  if (process.env.REVIEW_SHOTS) await page.screenshot({ path: join(process.env.REVIEW_SHOTS, "mobile.png"), animations: "disabled" });
+});

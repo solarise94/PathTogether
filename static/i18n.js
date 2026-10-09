@@ -86,7 +86,7 @@
       "tb.rotate": "顺时针旋转 90°",
       "tb.flip": "水平翻转（镜像）",
       "tb.reset": "复位",
-      "tb.reset.label": "Reset",
+      "tb.reset.label": "重置视图",
       "tb.roi.6": "ROI 6mm",
       "tb.roi.6.5": "ROI 6.5mm",
       "tb.roi.group": "ROI 分段",
@@ -252,7 +252,7 @@
       "viewer.empty.sub": "从左侧选择或上传一张切片开始读片",
       "viewer.empty.pick": "选择切片",
       // 主页升级 H3：正式版空态首用引导（Demo 模式不渲染）
-      "viewer.empty.upload": "上传你的第一张切片",
+      "viewer.empty.upload": "上传切片",
       "viewer.empty.demo": "查看示例",
       "preview.stop": "退出预览",
       "preview.banner": "正在预览 {user}（{role}）的身份，只读 · 剩余约 {mins} 分钟",
@@ -261,6 +261,12 @@
 
       // ---- 修改我的密码（owner/user 通用；账户系统批次 A docs §7.1/§8.1） ----
       "acct.adminconsole": "管理工作台",
+      "sidebar.admin": "管理后台",
+      "sidebar.password": "修改密码",
+      "sidebar.email": "更换邮箱",
+      "sidebar.data": "数据共享",
+      "sidebar.feedback": "反馈问题",
+      "sidebar.logout": "退出登录",
       "acct.changepw": "修改我的密码",
       "acct.changepw.title": "修改我的密码",
       "acct.changepw.current": "当前密码",
@@ -1794,7 +1800,7 @@
       "viewer.empty.sub": "Pick or upload a slide on the left to start reading",
       "viewer.empty.pick": "Choose a slide",
       // Homepage upgrade H3: first-use entry points (app mode only)
-      "viewer.empty.upload": "Upload your first slide",
+      "viewer.empty.upload": "Upload slides",
       "viewer.empty.demo": "See an example",
       "preview.stop": "Exit preview",
       "preview.banner": "Previewing {user} ({role}), read-only · ~{mins} min left",
@@ -1803,6 +1809,12 @@
 
       // ---- Change my password (owner/user; account batch A docs §7.1/§8.1) ----
       "acct.adminconsole": "Admin console",
+      "sidebar.admin": "Admin",
+      "sidebar.password": "Password",
+      "sidebar.email": "Email",
+      "sidebar.data": "Data sharing",
+      "sidebar.feedback": "Feedback",
+      "sidebar.logout": "Sign out",
       "acct.changepw": "Change my password",
       "acct.changepw.title": "Change my password",
       "acct.changepw.current": "Current password",

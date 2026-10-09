@@ -4,7 +4,7 @@
  * 加载真实 static/app.js（假 DOM harness），经 __PT_TEST_HOOKS 的
  * HP_PROJECT_UI.fb.pullout 驱动，锁定：
  *   - 抽出层挂在 document.body（侧栏裁剪容器之外），绝不挂在 #sidebar 内；
- *   - 层内是克隆的 .fb-pullout-card；位置自命中区 rect 计算（+34/-7）并钳回视口；
+ *   - 层内是克隆的 .fb-pullout-card；位置自命中区 rect 计算（+40/-7）并钳回视口；
  *   - 命中区 → 浮层离开走延迟收回（防闪烁）；hide 立即移除；
  *   - 触屏 pointerenter 不滑出（沿用 §5.2 契约，另见 viewer-folders.test.ts）。
  */
@@ -220,31 +220,31 @@ describe("悬停抽出层（§1.1）", () => {
 		expect(h.body.children.includes(pop!)).toBe(false);
 	});
 
-	it("位置自命中区右缘起算（零重叠，-7 上移），越界钳回视口", () => {
+	it("位置从原卡右移 40px，预留倾斜边界并钳回视口", () => {
 		const h = bootApp({ vw: 1000, vh: 900 });
-		// 正常位置：left = 命中区右缘 224；top = 100 - 7 = 93
+		// 正常位置：left = 0 + 40；top = 100 - 7 = 93
 		const hit1 = makeHit(h.els, { left: 0, top: 100, width: 224, height: 44 });
 		h.UI.fb.pullout.show(hit1);
 		let pop = h.UI.fb.pullout.current();
-		expect(pop!.style.left).toBe("224px");
+		expect(pop!.style.left).toBe("40px");
 		expect(pop!.style.top).toBe("93px");
 		h.UI.fb.pullout.hide();
 
-		// 底部越界：卡片 128 高 → top = 900 - 8 - 128 = 764
+		// 底部越界：浮卡 160 高，留 16px 倾斜边界 → top = 724
 		const hit2 = makeHit(h.els, { left: 0, top: 850, width: 224, height: 44 });
 		h.UI.fb.pullout.show(hit2);
 		pop = h.UI.fb.pullout.current();
-		expect(pop!.style.top).toBe("764px");
+		expect(pop!.style.top).toBe("724px");
 		h.UI.fb.pullout.hide();
 
-		// 右缘越界（窄视口）：left = 1000 - 8 - 240 = 752
+		// 右缘越界（窄视口）：left = 1000 - 16 - 240 = 744
 		const hit3 = makeHit(h.els, { left: 900, top: 100, width: 100, height: 44 });
 		h.UI.fb.pullout.show(hit3);
 		pop = h.UI.fb.pullout.current();
-		expect(pop!.style.left).toBe("752px");
+		expect(pop!.style.left).toBe("744px");
 	});
 
-	it("指针离开命中区：延迟收回（防闪烁）；进入浮层取消；浮层离开立即收", () => {
+	it("指针离开命中区：延迟收回（防闪烁）；进入浮层取消；浮层离开延迟收", () => {
 		vi.useFakeTimers();
 		const h = bootApp();
 		const hit = makeHit(h.els, { left: 0, top: 100, width: 224, height: 44 });
@@ -258,8 +258,13 @@ describe("悬停抽出层（§1.1）", () => {
 		vi.advanceTimersByTime(200);
 		expect(h.UI.fb.pullout.current()).toBe(pop); // 已取消
 
-		// 浮层 pointerleave → 立即移除
+		// 浮层返回原命中带不会反复重建；最终离开后收起
 		pop.dispatch("pointerleave");
+		h.UI.fb.pullout.show(hit);
+		vi.advanceTimersByTime(200);
+		expect(h.UI.fb.pullout.current()).toBe(pop);
+		pop.dispatch("pointerleave");
+		vi.advanceTimersByTime(100);
 		expect(h.UI.fb.pullout.current()).toBeNull();
 	});
 

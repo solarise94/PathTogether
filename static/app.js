@@ -264,7 +264,9 @@
     if (els.logoutBtn) {
       var label = t("toast.logout");
       if (actorName) { label += " (" + actorName + ")"; }
-      els.logoutBtn.textContent = label;
+      // Keep the compact label/icon; full identity stays in the tooltip.
+      els.logoutBtn.title = label;
+      els.logoutBtn.setAttribute("aria-label", label);
       els.logoutBtn.hidden = !!previewState;
     }
     if (els.changepwBtn) { els.changepwBtn.hidden = !!previewState; }
@@ -3478,19 +3480,21 @@
     // 命中区 z 抬升语义（浮层接管期间原位卡的 transform 由 CSS 抑制）。
     hit.addEventListener("pointerenter", function (e) {
       if (e && e.pointerType === "touch") return;
-      hit.classList.add("extracted");
-      fbPulloutShow(hit);
+      if (fbPulloutShowTimer) clearTimeout(fbPulloutShowTimer);
+      // Give a direct click time to land before the preview crosses its target.
+      fbPulloutShowTimer = setTimeout(function () {
+        fbPulloutShowTimer = null;
+        fbPulloutShow(hit);
+      }, 80);
     });
     hit.addEventListener("pointerleave", function () {
-      hit.classList.remove("extracted");
+      if (fbPulloutShowTimer) { clearTimeout(fbPulloutShowTimer); fbPulloutShowTimer = null; }
       fbPulloutScheduleHide();
     });
     hit.addEventListener("focus", function () {
-      hit.classList.add("extracted");
-      fbPulloutShow(hit);
+      if (hit.matches && hit.matches(":focus-visible")) fbPulloutShow(hit);
     });
     hit.addEventListener("blur", function () {
-      hit.classList.remove("extracted");
       fbPulloutScheduleHide();
     });
     hit.addEventListener("click", function () { openSlide(sid); });
@@ -3516,16 +3520,16 @@
   // 固定定位浮层（.fb-pullout，z 515：高于 AI 面板 56 / 顶栏 60，低于工具栏
   // 浮层 520 与卡片 ⋯ 菜单 620），位置自命中区 getBoundingClientRect 计算
   // 并钳回视口——不再受任何祖先裁剪/层叠影响。
-  // 命中区（.fb-hit 条带）布局与命中完全不变：浮层左缘 = 命中区右缘（零重
-  // 叠，命中区上任何点击都落在命中区自身）；触屏不走悬停（点击直接打开）；
-  // 键盘聚焦同样滑出。防闪烁：命中区与浮层边缘相接（无缝隙），指针离开命
-  // 中区时延迟收回，进入浮层即取消。
+  // 浮卡从原位置右移 40px 并轻微倾斜；原位卡隐去，保留左侧稳定命中带。
+  // 浮层仍挂 body，避免裁切。相邻卡的左侧命中区不被浮卡覆盖，可连续划选。
   var FB_PULLOUT_W = 240;
   var fbPulloutEl = null;
   var fbPulloutHit = null;
   var fbPulloutHideTimer = null;
+  var fbPulloutShowTimer = null;
 
   function fbPulloutHide() {
+    if (fbPulloutShowTimer) { clearTimeout(fbPulloutShowTimer); fbPulloutShowTimer = null; }
     if (fbPulloutHideTimer) {
       clearTimeout(fbPulloutHideTimer);
       fbPulloutHideTimer = null;
@@ -3533,6 +3537,7 @@
     if (fbPulloutEl && fbPulloutEl.parentNode && fbPulloutEl.parentNode.removeChild) {
       try { fbPulloutEl.parentNode.removeChild(fbPulloutEl); } catch (e) {}
     }
+    if (fbPulloutHit) fbPulloutHit.classList.remove("extracted", "fb-preview-source");
     fbPulloutEl = null;
     fbPulloutHit = null;
     try { document.body.classList.remove("fb-pullout-on"); } catch (e) {}
@@ -3550,7 +3555,12 @@
   function fbPulloutShow(hit) {
     var card = hit && hit.querySelector ? hit.querySelector(".fb-card") : null;
     if (!card) return;
+    if (hit === fbPulloutHit && fbPulloutEl) {
+      if (fbPulloutHideTimer) { clearTimeout(fbPulloutHideTimer); fbPulloutHideTimer = null; }
+      return;
+    }
     fbPulloutHide();
+    hit.classList.add("extracted", "fb-preview-source");
     var pop = document.createElement("div");
     pop.className = "fb-pullout";
     pop.setAttribute("aria-hidden", "true");
@@ -3558,23 +3568,35 @@
     if (!clone) return;
     clone.className = "fb-card fb-pullout-card";
     pop.appendChild(clone);
+    var sourceMenu = hit.querySelector(".fb-card-menu");
+    if (sourceMenu && sourceMenu.cloneNode) {
+      var floatingMenu = sourceMenu.cloneNode(true);
+      floatingMenu.tabIndex = -1; // 原卡仍是唯一键盘/读屏入口
+      floatingMenu.addEventListener("click", function (e) {
+        e.stopPropagation();
+        sourceMenu.click();
+        fbPulloutHide();
+      });
+      pop.appendChild(floatingMenu);
+    }
     try { document.body.appendChild(pop); } catch (e) { return; }
     var r = null;
     try { r = hit.getBoundingClientRect ? hit.getBoundingClientRect() : null; } catch (e) {}
     var vw = window.innerWidth || 1024;
     var vh = window.innerHeight || 768;
     var w = FB_PULLOUT_W;
-    var h = FB_CARD_H;
+    var h = 160;
     try {
       if (pop.offsetWidth) w = pop.offsetWidth;
       if (pop.offsetHeight) h = pop.offsetHeight;
     } catch (e) {}
-    var left = r && isFinite(r.right) ? r.right : 0;
+    var left = (r && isFinite(r.left) ? r.left : 0) + 40;
     var top = (r && isFinite(r.top) ? r.top : 0) - 7;
-    if (left + w > vw - 8) left = vw - 8 - w;
-    if (left < 8) left = 8;
-    if (top + h > vh - 8) top = vh - 8 - h;
-    if (top < 8) top = 8;
+    // 留出倾斜后的外接边界，避免靠近视口时切角。
+    if (left + w > vw - 16) left = vw - 16 - w;
+    if (left < 16) left = 16;
+    if (top + h > vh - 16) top = vh - 16 - h;
+    if (top < 16) top = 16;
     pop.style.left = Math.round(left) + "px";
     pop.style.top = Math.round(top) + "px";
     fbPulloutEl = pop;
@@ -3590,7 +3612,7 @@
     pop.addEventListener("pointerenter", function () {
       if (fbPulloutHideTimer) { clearTimeout(fbPulloutHideTimer); fbPulloutHideTimer = null; }
     });
-    pop.addEventListener("pointerleave", function () { fbPulloutHide(); });
+    pop.addEventListener("pointerleave", fbPulloutScheduleHide);
   }
 
   // 布局变化时抽层必须收回（命中区已移动/消失，浮层位置失真）
@@ -10321,7 +10343,7 @@
         sidebarCtrl.expandAndFocusSearch();
       });
     }
-    // 主页升级 H3：空态「上传你的第一张切片」复用既有导入抽屉（同一上传管线
+    // 主页升级 H3：空态「上传切片」复用既有导入抽屉（同一上传管线
     // 与能力判定，不在空态另做第二套上传或权限判断）
     if (els.viewerEmptyUpload) {
       els.viewerEmptyUpload.addEventListener("click", function () {
@@ -11157,7 +11179,11 @@
     bindEvents();
     // 抽出层跟随窗口尺寸/滚动失效（改版第四轮 §1.1；捕获式滚动含侧栏内滚）
     window.addEventListener("resize", fbPulloutOnLayoutChange);
-    document.addEventListener("scroll", fbPulloutOnLayoutChange, true);
+    document.addEventListener("scroll", function () {
+      // A pending hover measures its anchor after scrolling; only an already
+      // placed preview has stale coordinates. Do not eat the first hover.
+      if (fbPulloutEl) fbPulloutHide();
+    }, true);
     // §3.3 宽度断点分组：先于首次布局执行（把折叠档的节点搬入 ⋯ 菜单）
     initToolbarTier();
     setupDragDrop();

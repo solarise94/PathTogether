@@ -44,6 +44,9 @@ interface BootEl extends Record<string, unknown> {
 	dispatch(type: string, evt?: unknown): void;
 	focus(): void;
 	appendChild(c: unknown): void;
+	removeChild(c: BootEl): void;
+	querySelector(selector: string): BootEl | null;
+	cloneNode(deep?: boolean): BootEl;
 	getBoundingClientRect(): { left: number; top: number; right: number; bottom: number; width: number; height: number };
 }
 
@@ -94,6 +97,13 @@ function bootEl(id = ""): BootEl {
 				child.parentNode = el;
 				children.push(child);
 			}
+		},
+		removeChild(c) { const i = children.indexOf(c); if (i >= 0) children.splice(i, 1); c.parentNode = undefined; },
+		querySelector(selector) { return children.find(c => c.classList.contains(selector.replace(/^\./, ""))) || null; },
+		cloneNode(deep) {
+			const copy = bootEl(id); copy.className = el.className;
+			if (deep) children.forEach(c => copy.appendChild(c.cloneNode(true)));
+			return copy;
 		},
 		getBoundingClientRect: () => ({ left: 10, top: 20, right: 40, bottom: 48, width: 30, height: 28 }),
 		getContext: () => new Proxy({}, { get: (t, k) => (k in t ? (t as Record<string, unknown>)[k] : () => undefined) }),
@@ -428,13 +438,15 @@ describe("根目录结构与文件夹导航（§5.1/§5.3）", () => {
 });
 
 describe("悬停只预览（§5.2）", () => {
-	it("pointerenter 加 .extracted（滑出预览）但不调用 openSlide/info；pointerleave 收回", async () => {
+	it("悬停预览延迟出现、离开收回，全程不调用 openSlide/info", async () => {
+		vi.useFakeTimers();
 		const h = bootApp((s) => { seedStd(s); });
 		await flush();
 		const infoCalls = () => h.calls.filter((c) => /\/api\/slides?\/[^/]+\/info$/.test(c.url)).length;
 		expect(infoCalls()).toBe(0);
 		const card = fbHits(h)[0];
 		card.dispatch("pointerenter", { pointerType: "mouse" });
+		await vi.advanceTimersByTimeAsync(80);
 		expect(card.classList.contains("extracted")).toBe(true);
 		expect(infoCalls()).toBe(0);
 		expect(h.opens.length).toBe(0);
@@ -443,6 +455,7 @@ describe("悬停只预览（§5.2）", () => {
 		card2.dispatch("pointerenter", { pointerType: "touch" });
 		expect(card2.classList.contains("extracted")).toBe(false);
 		card.dispatch("pointerleave");
+		await vi.advanceTimersByTimeAsync(90);
 		expect(card.classList.contains("extracted")).toBe(false);
 		expect(infoCalls()).toBe(0);
 	});

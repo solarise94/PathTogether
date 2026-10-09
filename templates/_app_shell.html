@@ -322,23 +322,23 @@
         <!-- 管理工作台入口：仅 owner 可见（PR5 后 /admin 的唯一 UI 入口；
              服务端 /admin 仍独立 owner 鉴权，此链接只是可发现性） -->
         <a href="/admin" id="admin-entry-link" class="logout-link"
-           data-i18n="acct.adminconsole" hidden>管理工作台</a>
+           data-i18n-aria="acct.adminconsole" aria-label="管理工作台" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg><span data-i18n="sidebar.admin">管理后台</span></a>
         <!-- 修改我的密码（owner/user 均可见；账户系统批次 A docs §8.1） -->
         <button type="button" id="changepw-btn" class="logout-link changepw-link"
-                data-i18n="acct.changepw" hidden>修改我的密码</button>
+                data-i18n-aria="acct.changepw" aria-label="修改我的密码" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></svg><span data-i18n="sidebar.password">修改密码</span></button>
         <!-- 更换邮箱（owner/user 均可见；P1-3 身份收口 review-2026-09-08 P2-2：
              预览态/未登录态隐藏——与改密/登出同级，applyAuthInfo 统一控制） -->
         <button type="button" id="changeemail-btn" class="logout-link changepw-link"
-                data-i18n="acct.changeemail" hidden>更换邮箱</button>
+                data-i18n-aria="acct.changeemail" aria-label="更换邮箱" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 6 9 7 9-7"/></svg><span data-i18n="sidebar.email">更换邮箱</span></button>
         <!-- 数据共享（P2 账户设置 §3.5）：自愿研究授权的查看/同意/撤回/申请删除
              入口；预览态隐藏（服务端 actor 解析同样拒绝预览态），demo 无登录态不渲染 -->
         <button type="button" id="datashare-btn" class="logout-link changepw-link"
-                data-i18n="acct.datashare" hidden>数据共享</button>
+                data-i18n-aria="acct.datashare" aria-label="数据共享" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4 6v6c0 5 8 9 8 9s8-4 8-9V6zM8 12l3 3 5-6"/></svg><span data-i18n="sidebar.data">数据共享</span></button>
         <!-- 反馈问题（改版第四轮 §3）：登录用户可见（applyAuthInfo 解锁；
              demo 壳走另一分支不渲染）。对话框见本模板底部 #feedback-mask -->
         <button type="button" id="feedback-btn" class="logout-link changepw-link"
-                data-i18n="fbk.entry" hidden>反馈问题</button>
-        <button type="button" id="logout-btn" class="logout-link" data-i18n="toast.logout" hidden>退出登录</button>
+                data-i18n-aria="fbk.entry" aria-label="反馈问题" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 11a8 8 0 0 1-8 8H6l-4 3V11a8 8 0 0 1 8-8h3a8 8 0 0 1 8 8Z"/><path d="M7 10h9M7 14h6"/></svg><span data-i18n="sidebar.feedback">反馈问题</span></button>
+        <button type="button" id="logout-btn" class="logout-link" data-i18n-aria="toast.logout" aria-label="退出登录" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4H4v16h5M10 12h11m-4-4 4 4-4 4"/></svg><span data-i18n="sidebar.logout">退出登录</span></button>
       </div>
       {% endif %}
     </aside>
@@ -350,7 +350,7 @@
       <div id="canvas-slide-label" class="canvas-slide-label" hidden></div>
       {# 升级 A + 主页升级 H3：无切片空态（正式版与 Demo 共用）。侧栏默认收起后
          这里保留明显的「选择切片」入口；app.js/demo.js 在切片打开后隐藏、未打开
-         时显示。正式版（H3 注册→上传闭环）：加「上传你的第一张切片」（复用既有
+         时显示。正式版（H3 注册→上传闭环）：加「上传切片」（复用既有
          导入抽屉，不另做上传实现）与「查看示例」（/demo 只读体验）；上传能力/
          权限的实际状态由导入抽屉按服务端权威展示，空态不做第二套判断。 #}
       <div id="viewer-empty" class="viewer-empty">
@@ -359,7 +359,7 @@
           <p class="viewer-empty-sub" data-i18n="viewer.empty.sub">从左侧选择或上传一张切片开始读片</p>
           <div class="viewer-empty-actions">
             {% if mode != 'demo' %}
-            <button type="button" id="viewer-empty-upload" class="btn primary" data-i18n="viewer.empty.upload">上传你的第一张切片</button>
+            <button type="button" id="viewer-empty-upload" class="btn primary" data-i18n="viewer.empty.upload">上传切片</button>
             <a class="btn secondary" href="/demo" data-i18n="viewer.empty.demo">查看示例</a>
             <button type="button" id="viewer-empty-pick" class="btn secondary" data-i18n="viewer.empty.pick">选择切片</button>
             {% else %}

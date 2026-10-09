@@ -1,9 +1,35 @@
-# AI 描绘改按需技能：跨仓服务端契约（提案）
+# AI 描绘改按需技能：跨仓服务端契约（已批准 + 主代理裁决修订）
 
-日期：2026-10-09。状态：**契约提案，待主代理批准；未实施**。
+日期：2026-10-09。状态：**契约 d19e6a9e 已批准；本文含主代理裁决修订（§0.4），
+实施中**。
 上游设计：`docs/viewer-interaction-skills-review-design-20261009.md` §5 / R6 / §7-E、F。
 基线：PathTogether `5328fefc`（vi-skill）；HistoPilot `23e89fa`（release/hp-0.3.5）。
 行号对应该两基线，实施后以函数名定位。
+
+## 0.4 主代理裁决（2026-10-09，对 d19e6a9e 的修订）
+
+1. **判定位置：HP，同意；本轮判定为纯本地确定性规则，不做模型结构化判定
+   调用**（零成本、可单测、无预算/计费交互）。规则全文见 §2.3 修订；判定
+   模块设计为纯函数，未来可插模型判定但本轮不接。目标指代含糊的追问交给
+   模型在已授权 run 内按系统提示处理（提示写明：目标范围不明确时先追问，
+   不要猜）。
+2. **internal 通道**：按 session+slide 查活跃且 allow_ai_drawing=true 的 grant，
+   同意（§4.2）。
+3. **取消过渡 OR 窗口**：PT 与 HP 同 suite 镜像一起部署，部署重启本就中断
+   在途 run。写入口切换后只认 grant 列；`ai_session_drawing_flags` 表与
+   `/api/ai/session/<sid>/drawing` 端点保留但**不再参与新写入授权**（选择：
+   端点保持可写、镜像随 HP 权威值更新——generation/CAS 机制与其测试原样
+   保留，授权语义只挂 grant 列；不返回 410，避免旧 HP + 新 PT 窗口内无谓
+   错误弹窗）。兼容矩阵更新：旧 HP + 新 PT = 描绘不可用（fail-closed），
+   可接受。
+4. **execute 期复查**：本地 run 级字段 + 写端 403 软拒绝，同意（§4.1）。
+5. **`/skills` 独立端点、只 false→true**，同意；**追加**：置位在同一事务内
+   （行锁）重新复查 grant 创建者对该切片的当前写权限（`_run_grant_creator_allowed`
+   同口径，含临时查看到期、只读分享/fork 不可），grant 必须未撤销/未过期/
+   已绑定同 session；全部失败路径无副作用（§3.2）。
+6. continue 新 grant 重新判定、断线重连同 run 不新建 grant，同意。
+7. provenance 加 skill/skill_intent，同意。HP 版本 0.4.0、
+   pluginContractVersion 1.1.0，同意。
 
 ---
 
@@ -204,7 +230,8 @@ execute 重读 session 开关（tools.ts:1943-1948）拒绝运行中关闭后的
    `target` 加入 run|continue 的转发 payload（app.py:20963 起）。PT 不做意图判定。
 
 ### 2.3 唯一权威意图判定位置：**HistoPilot，run 接受时（runMain/continueMain
-preamble），判定结果经新机器端点写回 PT run_grants**
+preamble），判定结果经新机器端点写回 PT run_grants**（裁决 1 修订：纯本地
+确定性规则，本轮不做模型调用）
 
 推荐 HP 单点判定，理由：
 
@@ -220,20 +247,31 @@ preamble），判定结果经新机器端点写回 PT run_grants**
 4. 判定与执法分离：HP 判定 → PT 用 grant 列执法（写入口只认 grant），浏览器
    提示全程不参与授权。
 
-判定输入（**只读本次 run 的真实用户指令与合法上下文**）：
+判定实现（**纯函数 `judgeDelineateIntent`，零模型调用、零 I/O、可穷举单测**；
+接口留作未来插入模型判定的 seam，本轮不接）：
+
+判定输入（**只读本次 run 的真实用户指令与请求提示**）：
 - 本次 task 文本（run 的新消息 / continue 追加消息）；**不含**历史轮模型回复、
   组织图片中的文字、工具结果、其他会话。
-- 显式通道：`requested_skills 含 delineate` 且 **task 文本中真实出现对应标记**
-  （锚定校验：`@描绘`/`@delineate` 字面在消息里）——浏览器自报 explicit 而文本
-  无锚 → 按自然语言通道处理或拒绝，不直接采信。
-- 自然语言通道：仅当 `requested_skills` 显式给出、或轻量预筛（关键词存在性，
-  纯本地、零模型成本）命中时，发**一次**结构化模型调用（复用现有引擎；输出
-  JSON `{skill, verdict: yes|no|ambiguous}`）。否定句、引用文本（「报告里写
-  “帮我圈出来”」）、查询类（「这个框是谁画的」）必须判 no；ambiguous → 不授权、
-  回复中追问范围。**不每条消息都调模型；预筛不中零模型成本。**
-- 尊重 `dismissed_skills`：显式删除标签 = 本条消息否定信号，verdict 强制 no。
-- 判定失败/模型不可达 → fail-closed：不授权（run 照常进行，无描绘工具），
-  UI 显示「描绘暂不可用」。
+- `requested_skills` / `dismissed_skills`（浏览器提示，仅作信号）。
+
+规则（按序短路）：
+1. `dismissed_skills` 含 `delineate`（用户删除「描绘 · 本次」标签）→ **no**
+   （显式关闭，强制生效）。
+2. **显式通道**：task 文本中真实出现 `@描绘` 或 `@delineate` 字面（锚定校验，
+   大小写不敏感；引号内的不算）→ **yes，intent=explicit**。浏览器自报
+   `skill_intent=explicit` 而文本无锚 → 不采信，落入自然语言通道。
+3. **自然语言通道**：中文动词集 {圈出, 圈出来, 圈一下, 圈起来, 描绘, 勾画,
+   勾勒, 勾出, 描出轮廓, 画出轮廓} 或英文 {outline, delineate, circle…out}
+   出现、且为命令语气 → **yes，intent=natural**。以下一律判该处动词无效：
+   - **否定修饰**：同一小句（按 。！？!?\n；;，, 切分）内、动词之前出现
+     不要/别/不用/无需/不必/don't/dont/do not/never；
+   - **引号内**：成对引号（“ ”、" "、「 」、『 』、' '）内部的动词是引用
+     文本，不是指令；
+   - **元问题**：小句含「是什么意思」「什么意思」「谁画的」「谁标」「什么是」
+     「是什么」等——查询/解释类不算指令。
+4. 无法判断 → **no**（不授权；不追问权限——目标指代含糊的追问交给模型在
+   已授权 run 内处理，系统提示写明「目标范围不明确时先追问，不要猜」）。
 
 判定成立后的动作（HP → PT）：调用新机器端点（见 §3.2）把 grant 的
 `allow_ai_drawing` 置 true；失败 → 本 run 不装配描绘工具 + UI「描绘暂不可用」
@@ -269,13 +307,23 @@ COMMENT ON COLUMN run_grants.allow_ai_drawing IS
 （Bearer plugin JWT，scope `annotation:write`）：
 
 - body：`{"session_id": "...", "skills": ["delineate"], "intent": "explicit|natural"}`。
-- 校验：installation 匹配 grant（同 bind 端点 app.py:19332 口径）；grant 存在、
-  未撤、未过期；**已绑定到同一 session**（bind 先于 skills 置位——与既有顺序
-  一致：runMain preamble 中 bindRunGrantToSession :1146 在前）；skills 白名单。
-- 语义：只允许 false→true，幂等（重复置 true 返回 200 + 当前值）；**不提供
-  false 通道**——收回靠既有 revoke/expiry（避免「判定层撤权」与「平台撤权」
-  双写竞争）。置位同时写 `drawing_bound_at` / `drawing_intent`，并审计
-  `run_grant.skill_grant`。
+- 校验（裁决 5：**同一事务内、行锁 FOR UPDATE 下**依次）：
+  1. grant 存在（否则 grant_not_found → 404）；
+  2. installation 匹配 grant（installation_mismatch → 403）；未撤销
+     （grant_revoked → 403）；未过期（grant_expired → 403）；
+  3. **已绑定到同一 session**（bind 先于 skills 置位——与既有顺序一致：
+     runMain preamble 中 bindRunGrantToSession 在前；未绑定 grant_unbound /
+     绑定到其它 session session_mismatch → 403）；
+  4. **创建者写权限复查**：事务内回调 `_run_grant_creator_allowed(grant)`
+     同口径（账号禁用/删除、协作 share 撤销/过期、切片归档、owner 收录关系
+     移除、临时查看到期 → creator_not_allowed → 403；回调异常按不允许
+     fail-closed）；
+  5. skills 白名单（仅 `delineate`，畸形 → 400 invalid_request）；
+     intent ∈ {explicit, natural}（畸形 → 400）。
+- 语义：只允许 false→true，幂等（已 true 时 no-op 返回 200 + 当前值）；**不
+  提供 false 通道**——收回靠既有 revoke/expiry（避免「判定层撤权」与「平台
+  撤权」双写竞争）。置位同时写 `drawing_bound_at` / `drawing_intent`，并审计
+  `run_grant.skill_grant`。全部失败路径无副作用（事务回滚，列值不变）。
 - 旧 PT 不存在该端点 → HP 得 404 → 本 run 无描绘（§5 兼容矩阵）。
 
 ### 3.3 绑定与不继承
@@ -329,17 +377,17 @@ COMMENT ON COLUMN run_grants.allow_ai_drawing IS
   幂等重放：同 effect_key 重放返回既有结果（add_roi 现状），授权失效后新写入
   拒绝但重放读不破坏。
 
-### 4.3 过渡兼容（ai_session_drawing_flags）
+### 4.3 旧开关的处置（裁决 3：无过渡 OR 窗口）
 
-- 表、`/api/ai/session/<sid>/drawing` 端点、HP session 字段全部保留（过渡 +
-  历史）；不删数据。
-- 写入口过渡窗口（PT 新版上线起 ≤ 一个 grant TTL=1800s + 缓冲，随下次 PT
-  release 移除）：polygon/freehand 闸门 = `grant.allow_ai_drawing`
-  **OR** `镜像 flag == true（且 session 绑定的 grant 为旧版签发，即
-  drawing_bound_at IS NULL）`。OR 两支缺省均 false，默认拒绝不变；窗口只让
-  **部署切换时已在途**的旧 run 按旧语义收尾（设计 §7「旧进行中 run 按既有
-  有效 grant/停止策略收尾」）。
-- 窗口结束后：写入口只认 grant 列；镜像表转纯历史（新 UI 不再写）。
+- **写入口只认 grant 列**，自切换提交起生效。PT 与 HP 同 suite 镜像一起部署、
+  部署重启本就中断在途 run，故不设 OR 过渡支路。
+- `ai_session_drawing_flags` 表**保留不删**（历史数据 + 过渡兼容）；`/api/ai/
+  session/<sid>/drawing` 端点与 PT 代理**保持可写**：HP session 字段与 PT 镜像
+  照旧随权威值更新（generation/CAS 机制与其既有测试原样保留），但**不再参与
+  新写入授权**——镜像 true ≠ 可写，授权只看本次 run 的 grant 列。不返回 410：
+  端点仍承担旧 UI 的开关持久化语义，硬 410 只会在旧 HP + 新 PT 窗口内制造
+  无谓错误弹窗，而授权已由 grant 列 fail-closed 把守。
+- session detail 的 `drawing_mirror` 回填保留（信息性对照）。
 
 ---
 
@@ -354,22 +402,22 @@ COMMENT ON COLUMN run_grants.allow_ai_drawing IS
 - **PT 感知 HP 支持**：旧 HP 忽略 body 新键（白名单透传对旧 HP 是未知字段，
   现有 server 边界对未知 body 键宽容）→ 无判定 → grant 列恒 false → 闸门关。
   PT 不需要主动探测；写入口 fail-closed 即正确行为。
-- **兼容矩阵**：
+- **兼容矩阵**（裁决 3：无过渡窗口；旧 HP + 新 PT = 描绘不可用，可接受）：
 
 | 组合 | 行为 |
 | --- | --- |
 | 新 PT + 新 HP | 完整技能链：@ / 自然语言 → 判定 → grant 置位 → 装配 → 写入口放行 |
-| 旧 HP + 新 PT | HP 不判定不置位 → grant 列 false → 描绘不可用（过渡窗口内旧 session 开关仍收尾在途 run）；矩形标注照常 |
+| 旧 HP + 新 PT | HP 不判定不置位 → grant 列恒 false → 描绘不可用（fail-closed，可接受）；矩形标注照常 |
 | 新 HP + 旧 PT | HP 收不到技能键（旧 PT 不透传）或 /skills 404 → 不装配、不判定回退；旧 PT 镜像闸门仍在，但新 HP 不再走 /drawing，不产生新 true |
 | 旧 PT + 旧 HP | 现状不变（checkbox + 镜像开关） |
-| 回滚 HP（新→旧） | 旧 HP 走镜像开关；过渡窗口内 OR 逻辑使其可用，窗口后仅不可用——任何组合都**不会**永久开启 |
+| 回滚 HP（新→旧） | 旧 HP 走镜像开关、新 PT 写入口只认 grant 列 → 描绘不可用（fail-closed）——任何组合都**不会**永久开启 |
 | 回滚 PT（新→旧） | 旧 PT 无 grant 列逻辑 → 回到镜像闸门；新 HP 判定端点 404 → 不装配；行为 = 旧 PT + 新 HP 行 |
 
-- **部署顺序**（设计 §7 兼容顺序的具体化）：
-  1. PT 发布：0082 迁移 + /skills 端点 + 写入口 OR 过渡闸门 + run|continue
-     透传新键（对旧 HP 全部 no-op，可先上线）。
-  2. HP 发布 0.4.0：技能定义 + 判定 + run 级装配 + 新 UI（移除 checkbox）。
-  3. 观察一个 TTL 窗口后，PT 下一版移除镜像 OR 支路（保留表与端点）。
+- **部署顺序**（裁决 3：同 suite 镜像一起部署，无需分步等待）：
+  1. PT：0082 迁移 + /skills 端点 + 写入口切 grant 列 + run|continue 透传新键
+     （对旧 HP 全部 no-op）。
+  2. HP 0.4.0：判定模块 + run 级装配 + /skills 置位 + 新 UI（E3，另行实施）。
+  两仓同 suite 镜像一起发布；部署重启本就中断在途 run，无需过渡窗口。
   回滚按上表；任何一步回滚不需要数据修复（grant 列缺省 false 安全）。
 
 ---
@@ -422,9 +470,9 @@ COMMENT ON COLUMN run_grants.allow_ai_drawing IS
 | 身份隔离（grant session CAS、creator 复查、attestation sid 归属 gate :788） | /skills 端点：installation 不符 403；未 bind session 403；跨 session attestation 拒绝（沿用）；grant.created_by_user_id 复查沿用 |
 | 首发创建参数/开关 UI（ui-drawing-toggle 全部） | 替换为 composer 测试：@ 候选、标签删除 → dismissed_skills、状态文案、暂不可用态；首发 body 断言改为 requested_skills/target/skill_intent 形态 |
 | HP 装配/纵深（ai-drawing :145-:200） | 装配键改为 run 级判定字段；session 旧 true 不再装配新 run（反例：历史会话开关不继承） |
-| 跨仓 contract（ai-drawing-contract.integration） | 扩展：真实 PT 起 Flask+pg，/skills 置位 → 真实 HP 客户端 polygon 落库 + provenance.skill；未置位 403；判定模块以注入桩替代模型（不调付费 AI），断言 wire 契约与闸门 |
+| 跨仓 contract（ai-drawing-contract.integration） | 扩展：真实 PT 起 Flask+pg，/skills 置位 → 真实 HP 客户端 polygon 落库 + provenance.skill；未置位 403；判定为纯函数直跑（不调付费 AI），断言 wire 契约与闸门 |
 
-意图判定单测（HP，纯函数 + 桩模型）：设计 §5.2 全表正反例——@显式、自然语言
+意图判定单测（HP，纯函数、零模型）：设计 §5.2 全表正反例——@显式、自然语言
 肯定、否定句、引用文本、查询类、下一轮不继承、删除标签、无权限/只读、跨片
 target、过期 asset_revision 409、模糊追问。
 
@@ -437,13 +485,13 @@ target、过期 asset_revision 409、模糊追问。
 | E1a | PT | 0082 迁移 + `_GRANT_SEL` 三列 + store 读写（get/create 带 allow_ai_drawing） | `python -m pytest tests/test_plugin_api.py tests/test_ai_integrity.py -q`（迁移由 conftest pgserver 全量跑） |
 | E1b | PT | `/skills` 机器端点（校验链 + 幂等 + 审计） | `tests/test_plugin_api.py` 新增：installation 不符/未 bind/过期/撤销/白名单/幂等重放 |
 | E1c | PT | run\|continue 校验并透传 requested_skills/skill_intent/dismissed_skills/target（含 target.asset_revision 409、annotation kind 校验） | `tests/test_ai_proxy.py` + `tests/test_ai_fixes.py` 扩展；`tests/test_annotation_bounds.py` 回归 |
-| E1d | PT | 两写路径闸门切 grant 列 + internal 按 session 查活跃 grant + 过渡 OR 支路 | `tests/test_ai_drawing_gate.py` 改造迁移（§8 表）；`tests/test_ai_drawing_geom.py`/`tests/test_rect_annotations.py` 回归 |
-| E2a | HP | 技能定义文件（delineate：描述/意图示例/范围规则）+ 判定模块（锚定 + 预筛 + 一次结构化调用 + dismissed 强制 no + fail-closed） | `npx vitest run --project unit test/skill-intent.test.ts`（§5.2 表全例，桩模型） |
+| E1d | PT | 两写路径闸门切 grant 列（无过渡支路）+ internal 按 session 查活跃 grant；镜像闸门退役（表/端点保留无授权效力） | `tests/test_ai_drawing_gate.py` 改造迁移（§8 表）；`tests/test_ai_drawing_geom.py`/`tests/test_rect_annotations.py` 回归 |
+| E2a | HP | 判定模块 `src/skill-intent.ts`（纯函数：显式锚定 + 动词集 + 否定/引号/元问题 + dismissed 强制 no + 无法判断 no） | `npx vitest run --project unit test/skill-intent.test.ts`（§2.3 规则 + 设计 §5.2 表全例） |
 | E2b | HP | runMain/continueMain preamble 判定 → /skills 置位 → RunConfig.skill_delineate 注入；装配与 execute 改 run 级；移除 session 字段对新 run 的装配效力 | `npx vitest run --project unit test/ai-drawing.test.ts test/agent-runner.test.ts`（改造）+ `test/continue-session-binding.test.ts` 回归 |
 | E2c | HP | provenance.skill/skill_intent 下发（additive） | `test/ai-drawing-provenance.test.ts` 扩展 |
 | E3 | HP | UI：移除 checkbox 全链 + @ 候选 + 标签 + 状态文案 + 暂不可用 | 替换 `test/ui-drawing-toggle.test.ts` → `test/ui-skill-composer.test.ts`；`tests/js/ai-panel-dock.test.ts`（PT 侧）不受影响 |
 | F1 | 跨仓 | contract 集成扩展（§8 末行）；manifest 1.1.0 | PT 仓：`PATHTOGETHER_REPO=<vi-skill-wt> npx vitest run --project contract`（在 hp-skill-wt 内，指向 PT checkout）；PT 侧 `python -m pytest tests/test_ai_drawing_gate.py tests/test_plugin_manifest.py -q` |
-| F2 | 两仓 | 发布：PT 先（E1 全量）→ HP 0.4.0（E2/E3）→ TTL 窗口后 PT 移除 OR 支路 | 全量：PT `python -m pytest tests/ -q`（或按门禁子集）；HP `npm test` + `npm run test:contract`；真实 bundle 验收（设计 §8「真实插件」行，非 mock 面板） |
+| F2 | 两仓 | 发布：PT + HP 0.4.0 同 suite 镜像一起部署（E3 UI 由前端代理另行实施） | 全量：PT `python -m pytest tests/ -q`（或按门禁子集）；HP `npm test` + `npm run test:contract`；真实 bundle 验收（设计 §8「真实插件」行，非 mock 面板） |
 
 PT pytest 子集（每步最小回归）：
 `tests/test_ai_drawing_gate.py tests/test_ai_drawing_geom.py tests/test_plugin_api.py
@@ -456,16 +504,14 @@ HP 命令：`npm test`（= `vitest run --project '!contract'`）；
 
 ---
 
-## 10. 待主代理拍板的决策点
+## 10. 决策点（已由主代理裁决，见 §0.4）
 
-1. **判定位置**（§2.3）：推荐 HP（理由如上）。备选 PT 判定（原子发放但需在 PT
-   新建模型调用栈 + 规则与技能定义分居两仓）。
-2. **internal 通道**（§4.2）：推荐按 session 查活跃 grant（legacy 无 grant 部署
-   不再可描绘）。备选：要求 internal 也带 X-Run-Grant 头（wire 改动更大）。
-3. **过渡 OR 窗口**（§4.3）：推荐有窗口（一个 TTL）保在途 run 收尾。备选：
-   切换即只认 grant 列（在途描绘 run 立即中断，更干净但影响少量在线用户）。
-4. **execute 期复查**（§4.1）：推荐本地 run 级字段 + 写端 403 软拒绝（零新增
-   网络跳）。备选：execute 前调 verify 端点（多一跳、更早反馈）。
-5. **/skills 端点形态**（§3.2）：推荐独立 POST 端点、只 false→true。备选：
-   扩展 bind body 一次带 skills（少一跳，但把「绑定」与「授权」耦合，回滚语义
-   复杂）。
+1. 判定位置：HP，纯本地确定性规则（本轮不做模型调用）。→ 已裁决。
+2. internal 通道：按 session+slide 查活跃且 allow_ai_drawing=true 的 grant。→
+   已裁决。
+3. 过渡 OR 窗口：**不设**（同 suite 镜像一起部署）；镜像表/端点保留、不再
+   参与新写入授权（端点保持可写而非 410——generation/CAS 机制与既有测试
+   原样保留，授权只挂 grant 列）。→ 已裁决。
+4. execute 期复查：本地 run 级字段 + 写端 403 软拒绝。→ 已裁决。
+5. /skills 端点：独立 POST、只 false→true；置位事务内复查创建者写权限。→
+   已裁决。

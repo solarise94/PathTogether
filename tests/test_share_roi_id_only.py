@@ -20,6 +20,9 @@ slide_id) ID 关系（与读通道 _require_slide* 同一授权来源）；仅�
 """
 import os
 import sys
+import importlib
+from pathlib import Path
+import re
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -64,7 +67,14 @@ def _client(user):
 
 def _share_client():
     share_srv.app.config["TESTING"] = True
-    return share_srv.app.test_client()
+    # Exercise the WSGI target actually shipped by the platform container.
+    # Calling share_srv.app directly hid a production outage: docker_entry.sh
+    # served only app:app, so every /s/* URL missed the share application.
+    from werkzeug.test import Client
+    from werkzeug.wrappers import Response
+    entry = (Path(__file__).resolve().parents[1] / "docker_entry.sh").read_text()
+    module, name = re.search(r"^exec gunicorn ([\w.]+):([\w]+)", entry, re.M).groups()
+    return Client(getattr(importlib.import_module(module), name), Response)
 
 
 ARROW = {"type": "arrow", "x1": 1, "y1": 1, "x2": 9, "y2": 9}
@@ -88,6 +98,10 @@ def test_id_only_share_roi_add_and_non_member_rejected():
     token = r.get_json()["token"]
 
     sc = _share_client()
+    assert sc.get("/s/healthz").get_json() == {"status": "ok"}
+    assert sc.get("/s/%s" % token).status_code == 200
+    # Serving public shares must not expose the uploader's authenticated API.
+    assert sc.get("/api/slides").status_code == 401
     # 分享页保存标注：只带 slide_id（ID-only 无 legacy 名可带）→ 200
     r2 = sc.post("/s/%s/api/roi" % token,
                  json=dict({"slide_id": sid, "label": "L1"}, **ARROW))

@@ -219,7 +219,9 @@ case "$_bd_worker" in
     ;;
 esac
 
-exec gunicorn app:app \
+# Serve public /s/* links and the authenticated workbench on the same origin.
+# The combined application keeps share-token checks separate from account auth.
+exec gunicorn share_server:combined_app \
   -b "0.0.0.0:${PORT:-8000}" \
   -w "${GUNICORN_WORKERS:-2}" \
   --threads "${GUNICORN_THREADS:-8}"

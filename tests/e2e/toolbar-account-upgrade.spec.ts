@@ -987,7 +987,7 @@ test("连续选片：穿过浮卡覆盖区仍逐张命中，相邻卡联动且�
   expect(await page.evaluate(() => (window as any).__fanNodes.every((node: Element, i: number) => document.querySelectorAll('.fb-fan-card')[i] === node))).toBe(true);
   for (const i of [2, 4]) {
     const neighbour = page.locator(`.fb-fan-card[data-slide-id="${boxes[i].id}"]`);
-    expect(await neighbour.evaluate(el => parseFloat((el as HTMLElement).style.left))).toBeGreaterThan(boxes[i].x + 6);
+    await expect.poll(() => neighbour.evaluate(el => el.getBoundingClientRect().left)).toBeGreaterThan(boxes[i].x + 6);
   }
   await expect(page.locator('#viewer-empty')).toBeVisible(); // Hover must never open slides.
   if (process.env.REVIEW_SHOTS) await page.screenshot({ path: join(process.env.REVIEW_SHOTS, 'fan-desktop.png') });

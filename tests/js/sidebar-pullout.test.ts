@@ -231,11 +231,12 @@ describe("悬停抽出层（§1.1）", () => {
 		expect(parseFloat(pop!.style.top)).toBe(72);
 		h.UI.fb.pullout.hide();
 
-		// 底部越界：浮卡 160 高，留 16px 倾斜边界 → top = 724
+		// 底部越界：等比放大至 240 宽，保持原卡宽高比，留 16px 边界。
 		const hit2 = makeHit(h.els, { left: 0, top: 850, width: 224, height: 44 });
 		h.UI.fb.pullout.show(hit2);
 		pop = h.UI.fb.pullout.current();
-		expect(parseFloat(pop!.style.top)).toBe(724);
+		expect(parseFloat(pop!.style.top) + parseFloat(pop!.style.height)).toBeCloseTo(884, 1);
+		expect(parseFloat(pop!.style.width) / parseFloat(pop!.style.height)).toBeCloseTo(224 / 128, 2);
 		h.UI.fb.pullout.hide();
 
 		// 右缘越界（窄视口）：left = 1000 - 16 - 240 = 744

@@ -132,9 +132,19 @@ test("选片像扑克牌抽出翻面，等真实瓦片后铺开；减少动画�
   // Observe actual phases, including the short handoff, without timing-sensitive sleeps.
   await page.evaluate(() => {
     (window as any).__dealPhases = [];
+    (window as any).__dealLandingRects = [];
+    let sampling = false;
+    function sampleLanding() {
+      const el = document.querySelector('.slide-deal-landing');
+      if (!el) { sampling = false; return; }
+      const rect = el.getBoundingClientRect();
+      (window as any).__dealLandingRects.push({ width: rect.width, height: rect.height });
+      requestAnimationFrame(sampleLanding);
+    }
     new MutationObserver(() => {
       const phase = (document.querySelector('.slide-deal') as HTMLElement)?.dataset.phase;
       if (phase) (window as any).__dealPhases.push(phase);
+      if (phase === 'spreading' && !sampling) { sampling = true; sampleLanding(); }
     }).observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['data-phase'] });
   });
   await hit.focus();
@@ -149,10 +159,21 @@ test("选片像扑克牌抽出翻面，等真实瓦片后铺开；减少动画�
     expect(await canvasCenterHasPixels(page, "#viewer .openseadragon-canvas")).toBe(false);
   } finally { releaseTiles(); }
   await expect(deal).toHaveCount(0, { timeout: 5000 });
-  await expect(page.locator('.slide-deal-stage')).toHaveCount(0);
+  await expect(page.locator('.slide-deal-stage, .slide-deal-landing')).toHaveCount(0);
+  const rects = await page.evaluate(() => (window as any).__dealLandingRects) as { width: number; height: number }[];
+  expect(rects.length).toBeGreaterThan(2);
+  // The thumbnail grows into the real viewport without stretching its tissue.
+  expect(rects.at(-1)!.width).toBeGreaterThan(rects[0].width * 1.2);
+  for (const rect of rects) expect(rect.width / rect.height).toBeCloseTo(BMP_W / BMP_H, 2);
   expect(await page.evaluate(() => (window as any).__dealPhases)).toEqual(expect.arrayContaining(['drawing', 'spreading', 'handoff']));
   await expect.poll(() => canvasCenterHasPixels(page, "#viewer .openseadragon-canvas")).toBe(true);
   await expect(hit).toHaveAttribute('aria-pressed', 'true');
+  // Cancel while the image is expanding: no detached landing layer may remain.
+  await hit.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('.slide-deal-landing')).toHaveCount(1);
+  await page.keyboard.press('Escape');
+  await expect(page.locator('.slide-deal, .slide-deal-stage, .slide-deal-landing')).toHaveCount(0);
   await page.emulateMedia({ reducedMotion: "reduce" });
   await page.evaluate(() => { (window as any).__dealPhases = []; });
   const response = page.waitForResponse(r => r.url().includes(`/slides/${sid}/info`));

@@ -2120,6 +2120,7 @@
     deal.animations.forEach(function (animation) { animation.cancel(); });
     if (deal.el.parentNode) deal.el.parentNode.removeChild(deal.el);
     if (deal.stage.parentNode) deal.stage.parentNode.removeChild(deal.stage);
+    if (deal.landing && deal.landing.parentNode) deal.landing.parentNode.removeChild(deal.landing);
   }
 
   function dealAnimate(deal, el, frames, options) {
@@ -2127,6 +2128,11 @@
     deal.animations.push(animation);
     // Cancellation is normal when a second selection supersedes this one.
     return animation.finished.catch(function () {});
+  }
+
+  function dealBoxTransform(rect, width, height) {
+    return "translate3d(" + rect.left + "px," + rect.top + "px,0) scale(" +
+      (rect.width / width) + "," + (rect.height / height) + ")";
   }
 
   function startSlideDeal(ref, seq, source) {
@@ -2162,20 +2168,25 @@
     var center = { left: target.left + (target.width - width) / 2,
       top: target.top + (target.height - height) / 2, width: width, height: height };
     function box(rect) { return { left: rect.left + "px", top: rect.top + "px", width: rect.width + "px", height: rect.height + "px" }; }
-    Object.assign(el.style, box(center));
+    Object.assign(el.style, { left: "0px", top: "0px", width: width + "px", height: height + "px" });
+    el.style.transform = dealBoxTransform(center, width, height);
     var stage = document.createElement("div");
     stage.className = "slide-deal-stage";
     stage.setAttribute("aria-hidden", "true");
     Object.assign(stage.style, box(target));
     document.body.appendChild(stage);
     document.body.appendChild(el);
-    var deal = slideDeal = { el: el, stage: stage, card: card, front: front, label: label, seq: seq,
+    var deal = slideDeal = { el: el, stage: stage, card: card, front: front, image: img, label: label, seq: seq,
       ref: String(ref), center: center, animations: [], ready: false, drawn: false, spreading: false };
     // A failed/very slow DZI must never leave a decorative card over the workbench.
     deal.timeout = setTimeout(function () { if (slideDeal === deal) cancelSlideDeal(); }, 8000);
     var drawn = { left: Math.min(r.left + 110, center.left), top: Math.max(target.top + 12, r.top - 24), width: r.width, height: r.height };
-    dealAnimate(deal, el, [Object.assign(box(r), { offset: 0 }),
-      Object.assign(box(drawn), { offset: .26 }), box(center)],
+    // Geometry is fixed once. Motion stays in transform instead of forcing
+    // layout and repaint on every frame of the flight.
+    dealAnimate(deal, el, [
+      { transform: dealBoxTransform(r, width, height), offset: 0 },
+      { transform: dealBoxTransform(drawn, width, height), offset: .26 },
+      { transform: dealBoxTransform(center, width, height) }],
       { duration: 620, easing: "cubic-bezier(.22,.7,.2,1)", fill: "both" });
     dealAnimate(deal, card, [
       { transform: "rotateY(0deg) rotateZ(-3deg)", offset: 0 },
@@ -2207,19 +2218,32 @@
     deal.spreading = true;
     deal.el.dataset.phase = "spreading";
     var c = deal.center;
-    dealAnimate(deal, deal.label, [{ opacity: 1 }, { opacity: 0 }], { duration: 160, fill: "both" });
-    dealAnimate(deal, deal.front, [
-      { borderRadius: "14px", boxShadow: "0 24px 64px #0005" },
-      { borderRadius: "0px", boxShadow: "0 0 0 #0000" }
-    ], { duration: 340, fill: "both" });
-    dealAnimate(deal, deal.el, [
-      { left: c.left + "px", top: c.top + "px", width: c.width + "px", height: c.height + "px" },
-      { left: rect.left + "px", top: rect.top + "px", width: rect.width + "px", height: rect.height + "px" }
+    // Rasterize the landing image at its final size once, then scale it
+    // uniformly. Stretching the whole card would distort panoramic/portrait
+    // slides; resizing its width/height would repaint the image every frame.
+    var landing = document.createElement("div");
+    landing.className = "slide-deal-landing";
+    landing.setAttribute("aria-hidden", "true");
+    landing.style.width = rect.width + "px";
+    landing.style.height = rect.height + "px";
+    landing.style.transform = dealBoxTransform(rect, rect.width, rect.height);
+    // Reuse the decoded thumbnail: moving it adds no image request or decode.
+    landing.appendChild(deal.image);
+    document.body.appendChild(landing);
+    deal.landing = landing;
+    var scale = Math.min(c.width / rect.width, c.height / rect.height);
+    var inset = { left: c.left + (c.width - rect.width * scale) / 2,
+      top: c.top + (c.height - rect.height * scale) / 2,
+      width: rect.width * scale, height: rect.height * scale };
+    dealAnimate(deal, deal.el, [{ opacity: 1 }, { opacity: 0 }], { duration: 160, fill: "forwards" });
+    dealAnimate(deal, landing, [
+      { transform: dealBoxTransform(inset, rect.width, rect.height) },
+      { transform: dealBoxTransform(rect, rect.width, rect.height) }
     ], { duration: 340, easing: "cubic-bezier(.2,.7,.2,1)", fill: "forwards" }).then(function () {
       if (slideDeal !== deal) return;
       deal.el.dataset.phase = "handoff";
       dealAnimate(deal, deal.stage, [{ opacity: 1 }, { opacity: 0 }], { duration: 160, fill: "forwards" });
-      return dealAnimate(deal, deal.el, [{ opacity: 1 }, { opacity: 0 }], { duration: 160, fill: "forwards" }).then(function () {
+      return dealAnimate(deal, landing, [{ opacity: 1 }, { opacity: 0 }], { duration: 160, fill: "forwards" }).then(function () {
         if (slideDeal === deal) cancelSlideDeal();
       });
     });
@@ -3731,18 +3755,23 @@
       // A smooth bell reaches both immediate neighbours, with no discontinuity
       // when crossing a band boundary. Transitions interpolate from current CSS.
       var weight = Math.pow(Math.max(0, Math.cos(Math.min(Math.abs(distance) / 2, 1) * Math.PI / 2)), 2);
-      var width = item.rect.width + (240 - item.rect.width) * weight;
-      var height = Math.min(FB_CARD_H + 32 * weight, fan.bottom - fan.top);
+      var scale = Math.min(1 + (240 / item.rect.width - 1) * weight,
+        (fan.bottom - fan.top) / FB_CARD_H);
+      var width = item.rect.width * scale, height = FB_CARD_H * scale;
       var left = Math.max(16, Math.min(item.rect.left + 40 * weight, fan.right - width));
       var top = item.rect.top - 28 * weight + Math.sin(distance * Math.PI / 2) * 32 * weight;
       top = Math.max(fan.top, Math.min(top, fan.bottom - height));
-      item.pop.style.left = left.toFixed(2) + "px";
-      item.pop.style.top = top.toFixed(2) + "px";
-      item.pop.style.width = width.toFixed(2) + "px";
-      item.pop.style.height = height.toFixed(2) + "px";
-      item.pop.style.transform = reduced ? "none" : "rotate(" + (-3 * weight).toFixed(2) + "deg)";
-      item.pop.style.zIndex = String(item.hit === fbPulloutHit ? 515 : 505 + Math.round(weight * 8));
-      item.pop.style.setProperty("--fan-weight", weight.toFixed(3));
+      // Reduced motion retains the static layout. Normal hover moves/scales a
+      // fixed-size layer, keeping text/image proportions and stable hit bands.
+      item.pop.style.left = (reduced ? left : item.rect.left).toFixed(2) + "px";
+      item.pop.style.top = (reduced ? top : item.rect.top).toFixed(2) + "px";
+      item.pop.style.width = (reduced ? width : item.rect.width).toFixed(2) + "px";
+      item.pop.style.height = (reduced ? height : FB_CARD_H).toFixed(2) + "px";
+      item.pop.style.transform = reduced ? "none" :
+        "translate3d(" + (left - item.rect.left).toFixed(2) + "px," +
+        (top - item.rect.top).toFixed(2) + "px,0) scale(" + scale.toFixed(4) +
+        ") rotate(" + (-3 * weight).toFixed(2) + "deg)";
+      item.pop.style.zIndex = String(item.hit === fbPulloutHit ? 515 : 505 + i);
     });
   }
 

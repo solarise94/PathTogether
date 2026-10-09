@@ -515,10 +515,11 @@ def test_legacy_true_not_authoritative_via_http():
     assert legacy["historical_only"] is True
     assert legacy["share_research_data"] is True
     assert legacy["historical_consent_version"] == "research-data-20260916-v1"
-    # 旧申请查询端点也带 historical 标记
-    tap = c.get("/api/account/test-application").get_json()
-    assert tap["share_research_data"] is True
-    assert tap["share_research_data_historical"] is True
+    # 旧申请查询端点已随通道退役（2026-10-09 §2）：410 endpoint_retired，
+    # 历史证明唯一出口是上面的 agreements 视图兼容层
+    tap = c.get("/api/account/test-application")
+    assert tap.status_code == 410
+    assert tap.get_json()["code"] == "endpoint_retired"
     # 授权只经新服务：PUT 后才有 granted
     assert c.put("/api/account/research-consent", json={
         "enabled": True, "document_version": d["version"],

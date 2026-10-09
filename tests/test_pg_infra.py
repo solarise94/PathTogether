@@ -337,6 +337,10 @@ def test_schema_migrations_recorded(conn):
         # registration_submissions（submission_id 幂等 + 匿名 receipt）。
         "0079_registration_antibot_redelivery.sql",
         "0080_admin_viewer.sql",
+        # 用户反馈（docs/admin-viewer-round4-20261009.md §3）：user_feedback
+        # 表 + (user_id, created_at) 频率窗口索引 + registration_mail_jobs
+        # purpose 词表扩 'user_feedback'（保留既有全部用途值）。
+        "0081_user_feedback.sql",
     ]
 
 

@@ -1,48 +1,32 @@
 # -*- coding: utf-8 -*-
-"""SER-8（wip/ser8-dev）测试申请 API 测试：用户侧 + 管理侧路由层。
+"""测试申请通道退役测试（2026-10-09 §2「删除测试申请」，R8）。
 
-覆盖（tests/conftest.py 起内嵌 PG 并在 import 期跑 pg_store.ensure_schema，
-0054_test_applications.sql 随文件名序自动应用——test_applications 表与
-registration_mail_jobs 的 test_application/test_decision purpose 扩展即来自
-该迁移，本文件全部用例都隐式验证了「ensure_schema 自动拾取新迁移」）：
+通道下线后的稳定行为（docs/admin-viewer-round4-20261009.md §2 接口变更）：
 
-  - 用户侧 POST /api/account/test-application：匿名 401；enrollment 受限
-    会话提交成功 + 幂等（重复提交不重复发管理员邮件）；方向/数据分享形状
-    非法 400；管理员通知邮箱未配置 503 admin_email_unconfigured；已激活
-    用户提交 409 invalid_state；
-  - 用户侧 GET /api/account/test-application：none → pending → approved
-    状态流转（enrollment 会话与正式 session 双通道）；
-  - verify 接线：POST /api/registration/verify 带 research_direction/
-    share_research_data 建号后 best-effort 提交申请（application_submitted
-    响应字段）；形状非法 400 且 **不消费 token**（先校验形状再消费）；缺
-    字段兼容老前端（application_submitted=false）；
-  - 管理侧 GET /api/admin/v1/test-applications：匿名 401 / 非 owner 403 /
-    owner 200（status/direction 内存过滤、字段白名单、next_cursor=None）；
-  - 管理侧 POST .../review：**真实 review 路径**（未 monkeypatch——
-    conftest 每用例 TRUNCATE 后重播 ai_spend_total_defaults 基线行 20 CNY，
-    默认额度 provisioning 基建现成，走真路径比替身更可信）：approve 原子
-    激活 + 建总额度 + test_decision 通知邮件 + 幂等 409 already_reviewed；
-    缺默认行 409 default_allowance_unconfigured；reject 终态且不改激活态；
-    非 owner 触发仓储层 PermissionError → 403；
-  - R7（2026-09-19）邀请码激活收口：申请→邀请码激活同事务推进显式终态
-    activated_by_invite（reviewed_by 保持 NULL、不伪造人工审批）；管理列表
-    status 过滤与 activation_source 字段；审批对已收口申请 409
-    already_reviewed；拒绝历史不被邀请激活改写；缺默认额度/邮件入队失败/
-    禁用用户整体回滚；管理员审批与邀请激活并发、双审批并发、同用户双邀请
-    并发（真线程 + provisioning advisory 锁串行）唯一终态、只发一次额度；
-    真实 public_base_url（不打桩）生成申请/审批邮件链接；pending 不能触达
-    工作台与 AI；
-  - R7 历史修复工具（scripts/repair_invite_activated_applications.py）的
-    dry-run/apply/重复 apply 数量核对见
-    tests/test_repair_invite_activated_applications.py。
+  - 用户侧 GET/POST /api/account/test-application：匿名 401（认证闸先于
+    退役分支）；任何已登录调用方（含 enrollment 受限会话）410
+    endpoint_retired（扁平信封），不读不写 test_applications；
+  - 管理侧 GET /api/admin/v1/test-applications 与 POST .../review：
+    已登录一律 410 endpoint_retired（admin v1 信封 {error:{code,message}}）；
+  - 宿主页 /admin/test-applications：302 → /admin（通知邮件里的历史链接
+    仍可点，/admin 自身完成登录/owner 门控）；
+  - ``test_application_store`` 模块已删除（Containerfile COPY 同步移除）；
+  - ``test_applications`` 表保留为历史数据：research_consent_store.
+    legacy_test_application_signal 直接读表的兼容层照常工作（历史证明
+    historical_only，不构成当前研究授权）。
+
+历史行为（提交/审批/邀请码收口/修复工具）的既有覆盖：
+  - 邀请码激活滞留申请的修复工具见
+    tests/test_repair_invite_activated_applications.py；
+  - 研究授权权威与旧选项兼容层见 tests/test_research_consent.py /
+    tests/test_user_agreements.py。
 
 运行：cd 项目根 && .venv/bin/python -m pytest tests/test_test_application_api.py -q
 """
+import os
 import sys
-import threading
 
-sys.path.insert(0, __import__("os").path.dirname(
-    __import__("os").path.dirname(__import__("os").path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import _bootstrap  # noqa: E402,F401  # session 目录 + openslide stub
 SHARE_DATA_DIR = _bootstrap.SHARE_DATA_DIR
@@ -51,18 +35,18 @@ import pytest  # noqa: E402
 
 import app as app_mod  # noqa: E402
 import pg_store  # noqa: E402
-import registration_store  # noqa: E402
-import registration_mail_worker  # noqa: E402
-import settings_store  # noqa: E402
-import test_application_store  # noqa: E402
+import research_consent_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import (
-    isolate_app,
-    make_client,
-)  # noqa: E402
+from _pt_helpers import isolate_app, make_client  # noqa: E402
 
-BASE = "https://path.example.com"
 PASSWORD = "longpassword123"
+
+
+@pytest.fixture(autouse=True)
+def _isolate(monkeypatch):
+    isolate_app(monkeypatch, SHARE_DATA_DIR, clear_stores=True)
+    monkeypatch.setattr(app_mod, "AUTH_ENABLED", True)
+    yield
 
 
 def _pg():
@@ -71,54 +55,74 @@ def _pg():
     return conn
 
 
-@pytest.fixture(autouse=True)
-def _isolate(monkeypatch):
-    """每用例：隔离 + 邮件环境复位（fake 发送器 + 禁用异步排水，时序确定）。"""
-    from _pt_helpers import isolate_app
-    import _billing_helpers as bh
-    isolate_app(monkeypatch, SHARE_DATA_DIR, clear_stores=True)
-    monkeypatch.setattr(app_mod, "_registration_gate_warned", {"flag": False})
-    bh.seed_spend_settings()  # 含 0029 键（维护闸缺键按 False 的生产口径）
-    for name in ("REGISTRATION_MAIL_SENDER", "REGISTRATION_AGENT_MAIL_CLI",
-                 "REGISTRATION_AGENT_MAIL_FROM", "PUBLIC_BASE_URL",
-                 "ADMIN_SESSION_COOKIE_SECURE", "REGISTRATION_MAIL_PAYLOAD_KEY",
-                 "REGISTRATION_VERIFY_HASH_SALT", "SECRET_KEY",
-                 "TEST_APPLICATION_ADMIN_EMAIL",
-                 "FORMAT_REQUEST_ADMIN_EMAIL"):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("REGISTRATION_MAIL_SENDER", "fake")
-    monkeypatch.setattr(app_mod.registration_mail_worker, "drain_async",
-                        lambda: None)
-    # R7 复核（2026-09-19）：此前这里曾以「store 调用的 public_base_url 不
-    # 存在」为由注入替身——该前提已失效：registration_mail_worker.py:156
-    # 早有 public_base_url()（PUBLIC_BASE_URL 缺省返回 ""，链接退化为站内
-    # 相对路径，不抛错）。替身已删除；真实 URL 生成由
-    # test_submit_and_review_real_public_base_url_urls 不打桩覆盖。
-    fake = registration_mail_worker.install_fake_sender()
-    fake.clear()
-    yield
-    fake.clear()
+def _client():
+    return make_client(auth=True)
 
 
-def _client(auth=True):
-    return make_client(auth=auth)
+def _login(client, user):
+    with client.session_transaction() as s:
+        s.update({"auth_user": user.get("login_id") or "u",
+                  "user_id": user["user_id"],
+                  "role": user.get("role") or "user",
+                  "auth_version": user.get("auth_version", 1)})
+    return client
 
 
-def _admin_email(monkeypatch, value="admin-notifications@x.com"):
-    """配置测试申请通知邮箱（store 只在调用时读 env，monkeypatch 即生效）。"""
-    monkeypatch.setenv("TEST_APPLICATION_ADMIN_EMAIL", value)
+def _count(sql, params=()):
+    conn = _pg()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return int(cur.fetchone()["count"])
+    finally:
+        conn.close()
 
 
-def _pending_user(email, application=None, monkeypatch=None):
-    """直插 pending_activation 用户（存量 email_verify 形态；2026-10-08 §4：
-    verify 建号与 enrollment 会话退役，模块服务历史 pending 行）。
+def _store_module_gone():
+    """test_application_store 模块随通道退役删除（文件不存在）。"""
+    return not os.path.exists(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "test_application_store.py"))
 
-    application 给出时经 store 提交申请（与历史真实链路同库层语义）。
-    返回 (user dict, None)。"""
+
+# --------------------------------------------------------------------------- #
+# 1. 用户侧端点：匿名 401 / 已登录 410，零副作用
+# --------------------------------------------------------------------------- #
+def test_account_endpoints_retired_410():
+    owner = user_store.create_user("owner@x.com", "ownerpass123456",
+                                   role="owner")
+    usera = user_store.create_user("u1@x.com", "userpass12345678")
+
+    # 匿名：认证闸先于退役分支 → 401 auth_required
+    for method in ("get", "post"):
+        r = getattr(_client(), method)("/api/account/test-application")
+        assert r.status_code == 401
+        assert r.get_json()["code"] == "auth_required"
+
+    # 已登录普通用户 / owner：GET/POST 一律 410 endpoint_retired（扁平信封）
+    for login in (usera, owner):
+        c = _login(_client(), login)
+        r = c.get("/api/account/test-application")
+        assert r.status_code == 410
+        assert r.get_json()["code"] == "endpoint_retired"
+        r = c.post("/api/account/test-application",
+                   json={"research_direction": "other",
+                         "share_research_data": True})
+        assert r.status_code == 410
+        assert r.get_json()["code"] == "endpoint_retired"
+
+    # 零副作用：无申请行、无通知邮件、无新审计
+    assert _count("SELECT count(*) AS count FROM test_applications") == 0
+    assert _count("SELECT count(*) AS count FROM registration_mail_jobs "
+                  "WHERE purpose IN ('test_application','test_decision')") == 0
+    assert _count("SELECT count(*) AS count FROM audit_events "
+                  "WHERE action LIKE 'test_application%%'") == 0
+
+
+def test_enrollment_session_gets_retired_410():
+    """enrollment 受限会话（白名单内路径）也收到权威 410，而不是 401。"""
     import secrets
     from werkzeug.security import generate_password_hash
-    email = email.lower()
-    uid = "usr_" + secrets.token_urlsafe(8)
     conn = _pg()
     try:
         with conn.cursor() as cur:
@@ -129,524 +133,94 @@ def _pending_user(email, application=None, monkeypatch=None):
                 "activation_updated_at, email, email_normalized, "
                 "email_verified_at) VALUES (%s,%s,%s,%s,'user', now(), FALSE, "
                 "'{}'::jsonb, FALSE, 'pending_activation', "
-                "'invite_activation', now(), %s, %s, now()) "
-                "RETURNING user_id, auth_version",
-                (uid, email, email, generate_password_hash(PASSWORD),
-                 email, email))
-            row = cur.fetchone()
+                "'email_verification', now(), %s, %s, now()) RETURNING user_id",
+                ("usr_" + secrets.token_urlsafe(8), "pend@x.com", "pend@x.com",
+                 generate_password_hash(PASSWORD), "pend@x.com", "pend@x.com"))
+            uid = cur.fetchone()["user_id"]
         conn.commit()
     finally:
         conn.close()
-    user = user_store.get_user(row["user_id"])
-    assert user["activation_state"] == "pending_activation"
-    if application is not None:
-        submitted = test_application_store.submit(
-            uid, application["research_direction"],
-            application["share_research_data"])
-        assert submitted is True
-    return user, None
-
-
-def _owner():
-    return user_store.create_user("app-owner@x.com", "ownerpass12345678",
-                                  role="owner")
-
-
-def _session_as(client, user, role):
-    """伪造普通 session（_require_auth 口径：auth_user/user_id/role/version）。"""
-    with client.session_transaction() as s:
-        s.update({"auth_user": user.get("email_normalized")
-                  or user.get("login_id") or "u",
-                  "user_id": user["user_id"], "role": role,
-                  "auth_version": user.get("auth_version", 1)})
-
-
-def _mail_job_count(purpose):
-    conn = _pg()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT count(*)::int AS n FROM registration_mail_jobs "
-                        "WHERE purpose=%s", (purpose,))
-            return cur.fetchone()["n"]
-    finally:
-        conn.close()
+    c = _client()
+    with c.session_transaction() as s:
+        s.update({app_mod.ENROLLMENT_SESSION_KEY: {
+            "user_id": uid, "email": "pend@x.com", "purpose": "activation",
+            "issued_at": 1.0, "auth_version": 1}})
+    r = c.get("/api/account/test-application")
+    assert r.status_code == 410
+    assert r.get_json()["code"] == "endpoint_retired"
 
 
 # --------------------------------------------------------------------------- #
-# 用户侧：POST /api/account/test-application
+# 2. 管理侧端点：已登录一律 410（admin v1 信封），零副作用
 # --------------------------------------------------------------------------- #
-def test_submit_anonymous_unauthorized():
-    """匿名 POST：_require_auth 权威 401（中文 error + code=auth_required）。"""
-    client = _client(auth=True)
-    r = client.post("/api/account/test-application",
-                    json={"research_direction": "model_plant",
-                          "share_research_data": True})
+def test_admin_v1_endpoints_retired_410():
+    owner = user_store.create_user("owner@x.com", "ownerpass123456",
+                                   role="owner")
+    usera = user_store.create_user("u1@x.com", "userpass12345678")
+
+    # 匿名 401（认证闸）
+    r = _client().get("/api/admin/v1/test-applications")
     assert r.status_code == 401
-    body = r.get_json()
-    assert body["code"] == "auth_required"
-    assert "重新登录" in body["error"]
+    # owner（真实审核载荷）与普通用户：列表/审核一律 410，不激活不发邮件
+    for login in (owner, usera):
+        c = _login(_client(), login)
+        r = c.get("/api/admin/v1/test-applications")
+        assert r.status_code == 410
+        assert r.get_json()["error"]["code"] == "endpoint_retired"
+        r = c.post("/api/admin/v1/test-applications/%s/review"
+                   % usera["user_id"], json={"decision": "approved"})
+        assert r.status_code == 410
+        assert r.get_json()["error"]["code"] == "endpoint_retired"
 
-
-def test_pending_submit_unreachable_and_active_get_reads_history(monkeypatch):
-    """2026-10-08 §4：enrollment 会话不再签发——pending 用户即使拿到普通
-    session 形态也被 I-R4 拒（403 account_pending）；store 层提交/幂等由
-    _pending_user 的直接 submit 承担；激活后 GET 回读历史申请。"""
-    _admin_email(monkeypatch)
-    user, _ = _pending_user("apply@x.com",
-                            application={"research_direction": "model_plant",
-                                         "share_research_data": True})
-    client = _client()
-    _session_as(client, user, "user")
-    r0 = client.get("/api/account/test-application")
-    assert r0.status_code == 403
-    assert r0.get_json()["error"] == "account_pending"
-    # 首次挑战清 session；重伪造（并刷新 CSRF cookie）后 POST 同样被 I-R4 拒
-    _session_as(client, user, "user")
-    client._base.get("/login")  # 重新下发 csrf_token cookie
-    r1 = client.post("/api/account/test-application",
-                     json={"research_direction": "model_plant",
-                           "share_research_data": True})
-    assert r1.status_code == 403
-    assert r1.get_json()["error"] == "account_pending"
-    # store 层幂等（历史链路同库层语义）：重复提交 duplicate、邮件唯一
-    assert test_application_store.submit(
-        user["user_id"], "model_plant", True) is False  # duplicate
-    assert _mail_job_count("test_application") == 1
-    # 管理员审批激活后：GET（正式 session）回读历史申请
-    owner = _owner()
-    _session_as(client, owner, "owner")
-    client._base.get("/login")  # 换 owner 身份后刷新 csrf_token cookie
-    r = client.post("/api/admin/v1/test-applications/%s/review"
-                    % user["user_id"], json={"decision": "approved"})
-    assert r.status_code == 200, r.get_data(as_text=True)
-    _session_as(client, user_store.get_user(user["user_id"]), "user")
-    r3 = client.get("/api/account/test-application")
-    assert r3.status_code == 200
-    got = r3.get_json()
-    assert got["state"] == "approved"
-    assert got["research_direction"] == "model_plant"
-    assert got["share_research_data"] is True
-    assert got["consent_version"] == test_application_store.CONSENT_VERSION
-
-
-def test_submit_invalid_shape_400(monkeypatch):
-    """方向非法 / share 非 bool / 缺字段 → 400 invalid_request（本地形状错误，
-    先于任何状态/通知检查；以 active 用户正式 session 触达）。"""
-    _admin_email(monkeypatch)
-    active = user_store.create_user("shape@x.com", PASSWORD, role="user")
-    client = _client()
-    _session_as(client, active, "user")
-    for payload in ({"research_direction": "bogus", "share_research_data": True},
-                    {"research_direction": "model_plant",
-                     "share_research_data": "yes"},
-                    {"research_direction": "model_animal"},
-                    {}):
-        r = client.post("/api/account/test-application", json=payload)
-        assert r.status_code == 400, payload
-        assert r.get_json()["code"] == "invalid_request"
-    # 非法请求不产生申请记录、不发邮件
-    assert _mail_job_count("test_application") == 0
-    assert test_application_store.get(active["user_id"]) is None
-
-
-def test_submit_admin_email_unconfigured_503(monkeypatch):
-    """通知邮箱未配置：503 admin_email_unconfigured（fail-closed 不吞申请）。
-
-    路由层测试（任务允许的 monkeypatch 口径）：store 的 admin_email() 在
-    本分支被并行改动为带硬编码兜底收件人，env 已无法模拟「未配置」——
-    先替换 store.admin_email 返回 None 锁定路由 503 契约，再还原原函数
-    验证同一请求成功（全程不动 fixture 其它替身）。"""
-    active = user_store.create_user("nomail@x.com", PASSWORD, role="user")
-    client = _client()
-    _session_as(client, active, "user")
-    original_admin_email = test_application_store.admin_email
-    monkeypatch.setattr(test_application_store, "admin_email",
-                        lambda: None)
-    r = client.post("/api/account/test-application",
-                    json={"research_direction": "other",
-                          "share_research_data": False})
-    assert r.status_code == 503
-    body = r.get_json()
-    assert body["code"] == "admin_email_unconfigured"
-    assert "暂不可用" in body["error"]
-    # 失败请求未产生申请记录、未发邮件
-    assert _mail_job_count("test_application") == 0
-    # 还原真实 admin_email（带兜底实现）→ 请求通过邮箱检查进入 store
-    # 状态校验：active 用户提交 → 409 invalid_state（不再 503）
-    monkeypatch.setattr(test_application_store, "admin_email",
-                        original_admin_email)
-    r2 = client.post("/api/account/test-application",
-                     json={"research_direction": "other",
-                           "share_research_data": False})
-    assert r2.status_code == 409
-    assert r2.get_json()["code"] == "invalid_state"
-
-
-def test_active_user_submit_conflict_409(monkeypatch):
-    """已激活用户（正式 session）提交 → 409 invalid_state（状态不符）。"""
-    _admin_email(monkeypatch)
-    user, _ = _pending_user("active@x.com",
-                            application={"research_direction": "other",
-                                         "share_research_data": False})
-    owner = _owner()
-    # 真实审核通过 → 用户 active
-    client = _client()
-    _session_as(client, owner, "owner")
-    r = client.post("/api/admin/v1/test-applications/%s/review" % user["user_id"],
-                    json={"decision": "approved"})
-    assert r.status_code == 200
-    # active 后正式 session 提交：仓储层状态校验 → 409 invalid_state
-    _session_as(client, user_store.get_user(user["user_id"]), "user")
-    r2 = client.post("/api/account/test-application",
-                     json={"research_direction": "other",
-                           "share_research_data": False})
-    assert r2.status_code == 409
-    body = r2.get_json()
-    assert body["code"] == "invalid_state"
-    assert "待激活" in body["error"]
-    assert owner is not None  # owner 仅用于审核会话
+    # 零副作用：无审核邮件、无审批审计；用户建号自带 1 行额度，无第二行
+    assert _count("SELECT count(*) AS count FROM registration_mail_jobs "
+                  "WHERE purpose='test_decision'") == 0
+    assert _count("SELECT count(*) AS count FROM audit_events "
+                  "WHERE action='test_application.review'") == 0
+    assert _count("SELECT count(*) AS count FROM ai_spend_total_allowances "
+                  "WHERE subject_id=%s", (usera["user_id"],)) == 1
 
 
 # --------------------------------------------------------------------------- #
-# verify 接线（建号 + best-effort 申请提交）
+# 3. 宿主页重定向 /admin
 # --------------------------------------------------------------------------- #
+def test_admin_host_page_redirects_to_admin():
+    owner = user_store.create_user("owner@x.com", "ownerpass123456",
+                                   role="owner")
+    c = _login(_client(), owner)
+    r = c.get("/admin/test-applications")
+    assert r.status_code == 302
+    assert r.headers["Location"].endswith("/admin")
+    # 非 owner 同样只做重定向（/admin 页自身 403，不在链接层复制门控）
+    usera = user_store.create_user("u1@x.com", "userpass12345678")
+    r = _login(_client(), usera).get("/admin/test-applications")
+    assert r.status_code == 302
+    assert r.headers["Location"].endswith("/admin")
+
+
 # --------------------------------------------------------------------------- #
-# 管理侧：GET /api/admin/v1/test-applications + review
+# 4. 存量数据兼容：表保留 + 研究授权兼容层直接读表
 # --------------------------------------------------------------------------- #
-def test_application_email_link_preserves_login_and_owner_gate():
-    client = _client()
-    response = client.get("/admin/test-applications")
-    assert response.status_code == 302
-    from urllib.parse import urlsplit, parse_qs
-    location = urlsplit(response.headers["Location"])
-    assert location.path == "/login"
-    assert parse_qs(location.query)["next"] == ["/admin/test-applications"]
-
-    user = user_store.create_user("link-user@x.com", "userpass12345678",
-                                  role="user")
-    _session_as(client, user, "user")
-    assert client.get("/admin/test-applications").status_code == 403
-
-    _session_as(client, _owner(), "owner")
-    response = client.get("/admin/test-applications")
-    assert response.status_code == 302
-    assert response.headers["Location"] == "/admin#test-applications"
-
-
-def test_admin_list_owner_gate_and_filters(monkeypatch):
-    """列表：匿名 401 / 非 owner 403 / owner 200（status/direction 过滤 +
-    字段白名单 + next_cursor=None）。"""
-    _admin_email(monkeypatch)
-    user, _ = _pending_user("list@x.com",
-                            application={"research_direction": "model_plant",
-                                         "share_research_data": True})
-    client = _client()
-    # 匿名 → 401（auth_required）
-    assert client.get("/api/admin/v1/test-applications").status_code == 401
-    # 非 owner → 403（_require_owner_admin_v1）
-    _session_as(client, user, "user")
-    r_user = client.get("/api/admin/v1/test-applications")
-    assert r_user.status_code == 403
-    # owner：命中 + 过滤 + 白名单字段
-    _session_as(client, _owner(), "owner")
-    r = client.get("/api/admin/v1/test-applications")
-    assert r.status_code == 200
-    payload = r.get_json()
-    assert payload["next_cursor"] is None
-    items = [it for it in payload["items"] if it["user_id"] == user["user_id"]]
-    assert len(items) == 1
-    item = items[0]
-    assert item["email_normalized"] == "list@x.com"
-    assert item["research_direction"] == "model_plant"
-    assert item["share_research_data"] is True
-    assert item["status"] == "pending"
-    assert item["activation_state"] == "pending_activation"
-    assert item["created_at"] and item["reviewed_at"] is None
-    # status / direction 内存过滤：命中与不命中各验一次
-    assert client.get("/api/admin/v1/test-applications?status=pending"
-                      ).status_code == 200
-    r_empty = client.get("/api/admin/v1/test-applications?status=approved")
-    assert r_empty.get_json()["items"] == []
-    r_dir = client.get("/api/admin/v1/test-applications?direction=other")
-    assert r_dir.get_json()["items"] == []
-    # 非法参数 → 400 invalid_request
-    assert client.get("/api/admin/v1/test-applications?direction=bogus"
-                      ).status_code == 400
-    assert client.get("/api/admin/v1/test-applications?status=bogus"
-                      ).status_code == 400
-
-
-def test_review_approve_activates_and_is_idempotent(monkeypatch):
-    """真实 review 路径：approve 原子激活 + 按默认行建一次性总额度 +
-    test_decision 邮件；重复审批 409 already_reviewed；GET 状态流转到
-    approved（正式 session 通道）。"""
-    _admin_email(monkeypatch)
-    user, _ = _pending_user("approve@x.com",
-                            application={"research_direction": "model_animal",
-                                         "share_research_data": True})
-    owner = _owner()
-    client = _client()
-    _session_as(client, owner, "owner")
-    r = client.post("/api/admin/v1/test-applications/%s/review"
-                    % user["user_id"], json={"decision": "approved",
-                                             "ai_access": True})
-    assert r.status_code == 200, r.get_data(as_text=True)
-    assert r.get_json() == {"ok": True, "user_id": user["user_id"],
-                            "status": "approved"}
-    after = user_store.get_user(user["user_id"])
-    assert after["activation_state"] == "active"
-    assert after["ai_access"] is True
-    # 默认额度 provisioning：conftest 基线行 20 CNY → 20e9 nano
+def test_store_module_removed_and_table_kept_for_legacy_view():
+    assert _store_module_gone(), "test_application_store.py 应随通道退役删除"
+    # 旧表保留为历史：兼容层直接读表（historical_only 历史证明）
+    usera = user_store.create_user("legacy@x.com", "userpass12345678")
     conn = _pg()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT limit_nano_cny FROM ai_spend_total_allowances "
-                        "WHERE subject_id=%s", (user["user_id"],))
-            row = cur.fetchone()
-            assert row is not None and row["limit_nano_cny"] == 20 * 10 ** 9
-    finally:
-        conn.close()
-    assert _mail_job_count("test_decision") == 1
-    # 重复审批 → 409 already_reviewed（不重复发邮件/额度）
-    r2 = client.post("/api/admin/v1/test-applications/%s/review"
-                     % user["user_id"], json={"decision": "approved"})
-    assert r2.status_code == 409
-    assert r2.get_json()["error"]["code"] == "already_reviewed"
-    assert _mail_job_count("test_decision") == 1
-    # GET 状态流转：active 用户正式 session → approved
-    user_client = _client()
-    _session_as(user_client, after, "user")
-    r3 = user_client.get("/api/account/test-application")
-    assert r3.status_code == 200
-    got = r3.get_json()
-    assert got["state"] == "approved"
-    assert got["research_direction"] == "model_animal"
-
-
-def test_review_reject_and_default_allowance_unconfigured(monkeypatch):
-    """缺默认总额度行 → approve 409 default_allowance_unconfigured（用户
-    仍 pending、不发额度）；reject 终态（不改激活态、发结果邮件）。"""
-    _admin_email(monkeypatch)
-    user, _ = _pending_user("reject@x.com",
-                            application={"research_direction": "other",
-                                         "share_research_data": False})
-    client = _client()
-    _session_as(client, _owner(), "owner")
-    # 删掉全局默认行（conftest 基线种下 20 CNY）→ provisioning 无默认可解析
-    conn = _pg()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM ai_spend_total_defaults")
+            cur.execute(
+                "INSERT INTO test_applications (user_id, research_direction, "
+                "share_research_data, consent_version) VALUES (%s,'other',"
+                "TRUE,'research-data-20260916-v1')", (usera["user_id"],))
         conn.commit()
     finally:
         conn.close()
-    r = client.post("/api/admin/v1/test-applications/%s/review"
-                    % user["user_id"], json={"decision": "approved"})
-    assert r.status_code == 409
-    body = r.get_json()
-    assert body["error"]["code"] == "default_allowance_unconfigured"
-    assert "默认总额度" in body["error"]["message"]
-    assert user_store.get_user(user["user_id"])[
-        "activation_state"] == "pending_activation"
-    # reject：终态通过、激活态不动、结果邮件照发
-    r2 = client.post("/api/admin/v1/test-applications/%s/review"
-                     % user["user_id"], json={"decision": "rejected"})
-    assert r2.status_code == 200
-    assert r2.get_json()["status"] == "rejected"
-    assert user_store.get_user(user["user_id"])[
-        "activation_state"] == "pending_activation"
-    assert _mail_job_count("test_decision") == 1
-    # 已处理后再审 → 409 already_reviewed
-    r3 = client.post("/api/admin/v1/test-applications/%s/review"
-                     % user["user_id"], json={"decision": "approved"})
-    assert r3.status_code == 409
-    assert r3.get_json()["error"]["code"] == "already_reviewed"
-
-
-def test_review_non_owner_forbidden_and_bad_params(monkeypatch):
-    """非 owner 调 review：路由守卫 403；伪造绕过时仓储层 PermissionError
-    兜底同样 403。decision 非法 → 400。"""
-    _admin_email(monkeypatch)
-    user, _ = _pending_user("perm@x.com",
-                            application={"research_direction": "other",
-                                         "share_research_data": True})
-    stranger = user_store.create_user("stranger@x.com", "strangerpass123456",
-                                      role="user")
-    client = _client()
-    _session_as(client, stranger, "user")
-    # 路由守卫（_require_owner_admin_v1）先拦
-    r = client.post("/api/admin/v1/test-applications/%s/review"
-                    % user["user_id"], json={"decision": "approved"})
-    assert r.status_code == 403
-    # decision 形状非法（owner 会话）→ 400 invalid_request
-    _session_as(client, _owner(), "owner")
-    r_bad = client.post("/api/admin/v1/test-applications/%s/review"
-                        % user["user_id"], json={"decision": "maybe"})
-    assert r_bad.status_code == 400
-    assert r_bad.get_json()["error"]["code"] == "invalid_request"
-    # ai_access 非 bool → 400
-    r_ai = client.post("/api/admin/v1/test-applications/%s/review"
-                       % user["user_id"],
-                       json={"decision": "approved", "ai_access": "yes"})
-    assert r_ai.status_code == 400
-    # 用户仍 pending、申请仍 pending（以上全部被拒，无副作用）
-    assert user_store.get_user(user["user_id"])[
-        "activation_state"] == "pending_activation"
-    assert test_application_store.get(user["user_id"])["status"] == "pending"
-
-
-# --------------------------------------------------------------------------- #
-# R7（2026-09-19）：真实 public_base_url（不打桩）生成申请/审批邮件链接
-# --------------------------------------------------------------------------- #
-def _mail_payloads(purpose):
-    """读取指定 purpose 的队列邮件并解密正文（payload Fernet 冻结体）。"""
-    conn = _pg()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT payload_enc FROM registration_mail_jobs "
-                        "WHERE purpose=%s", (purpose,))
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-    return [registration_mail_worker.decrypt_payload(r["payload_enc"])
-            for r in rows]
-
-
-def _allowances(user_id):
-    conn = _pg()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT limit_nano_cny, source "
-                        "FROM ai_spend_total_allowances WHERE subject_id=%s",
-                        (user_id,))
-            return cur.fetchall()
-    finally:
-        conn.close()
-
-
-def test_submit_and_review_real_public_base_url_urls(monkeypatch):
-    """删除陈旧替身后走真路径：PUBLIC_BASE_URL 配置下，申请通知与审核结果
-    邮件的正文链接由 registration_mail_worker.public_base_url **真实生成**
-   （全程不打桩）。"""
-    monkeypatch.setenv("PUBLIC_BASE_URL", BASE)
-    _admin_email(monkeypatch)
-    user, _ = _pending_user(
-        "realurl@x.com",
-        application={"research_direction": "other",
-                     "share_research_data": False})
-    payloads = _mail_payloads("test_application")
-    assert len(payloads) == 1
-    assert ("%s/admin/test-applications" % BASE) in payloads[0]["body"]
-    # 真实审批路径同样不打桩：结果邮件链接 = PUBLIC_BASE_URL + /login
-    owner = _owner()
-    client = _client()
-    _session_as(client, owner, "owner")
-    r = client.post("/api/admin/v1/test-applications/%s/review"
-                    % user["user_id"], json={"decision": "approved"})
-    assert r.status_code == 200, r.get_data(as_text=True)
-    decisions = _mail_payloads("test_decision")
-    assert len(decisions) == 1
-    assert ("%s/login" % BASE) in decisions[0]["body"]
-
-
-# --------------------------------------------------------------------------- #
-# R7：申请 → 邀请码激活收口（activated_by_invite 显式终态）
-# --------------------------------------------------------------------------- #
-# --------------------------------------------------------------------------- #
-# R7：失败回滚（缺默认额度 / 禁用用户 / 邮件入队失败）
-# --------------------------------------------------------------------------- #
-def test_review_rolls_back_on_mail_enqueue_failure(monkeypatch):
-    """审批通过但结果邮件入队失败 → 现有事务语义整体回滚：用户仍 pending、
-    申请仍 pending、不建额度（UI 侧不得显示「已通过」）。"""
-    _admin_email(monkeypatch)
-    user, _ = _pending_user(
-        "mailfail@x.com",
-        application={"research_direction": "other",
-                     "share_research_data": False})
-    owner = _owner()
-    client = _client()
-    _session_as(client, owner, "owner")
-
-    def _boom(payload):
-        raise RuntimeError("payload encrypt failed (test)")
-
-    monkeypatch.setattr(registration_mail_worker, "encrypt_payload", _boom)
-    r = client.post("/api/admin/v1/test-applications/%s/review"
-                    % user["user_id"], json={"decision": "approved"})
-    assert r.status_code == 503  # 通用异常映射：不显示已通过
-    assert user_store.get_user(user["user_id"])[
-        "activation_state"] == "pending_activation"
-    assert test_application_store.get(user["user_id"])["status"] == "pending"
-    assert _allowances(user["user_id"]) == []
-    assert _mail_job_count("test_decision") == 0
-
-
-# --------------------------------------------------------------------------- #
-# R7：pending 不能访问工作台与 AI；enrollment 会话不能审核
-# --------------------------------------------------------------------------- #
-def test_pending_cannot_reach_workspace_or_ai_or_review(monkeypatch):
-    _admin_email(monkeypatch)
-    user, _ = _pending_user(
-        "gate@x.com",
-        application={"research_direction": "other",
-                     "share_research_data": False})
-    _owner()
-    client = _client()
-    # pending 账号即使伪造普通 session 形态（I-R4）也全拒
-    _session_as(client, user, "user")
-    r = client.get("/app")
-    assert r.status_code == 302
-    assert r.headers["Location"].endswith("/login")
-    _session_as(client, user, "user")
-    r_ai = client.get("/api/ai/config")
-    assert r_ai.status_code == 403
-    assert r_ai.get_json()["error"] == "account_pending"
-    _session_as(client, user, "user")
-    r_rev = client.post("/api/admin/v1/test-applications/%s/review"
-                        % user["user_id"], json={"decision": "approved"})
-    assert r_rev.status_code == 403
-    assert r_rev.get_json()["error"] == "account_pending"
-
-
-# --------------------------------------------------------------------------- #
-# R7：并发语义（真线程；两路都先取 provisioning advisory 锁 → 串行、无死锁）
-# --------------------------------------------------------------------------- #
-def _run_threads(targets, timeout=60):
-    threads = [threading.Thread(target=fn) for fn in targets]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout)
-    assert not any(t.is_alive() for t in threads), "并发线程超时（疑似死锁）"
-
-
-def test_concurrent_double_review_single_provisioning(monkeypatch):
-    """双审批并发：恰好一次生效（另一路 409 语义 False）；只激活一次、
-    只发一次额度、只发一封结果邮件。"""
-    _admin_email(monkeypatch)
-    user, _ = _pending_user(
-        "doublerev@x.com",
-        application={"research_direction": "other",
-                     "share_research_data": False})
-    owner = _owner()
-    barrier = threading.Barrier(2, timeout=30)
-    results = []
-
-    def _review():
-        try:
-            barrier.wait()
-            results.append(("ok", test_application_store.review(
-                user["user_id"], owner["user_id"], "approved")))
-        except Exception as exc:  # noqa: BLE001
-            results.append(("error", exc))
-
-    _run_threads([_review, _review])
-    assert sorted(k for k, _ in results) == ["ok", "ok"]
-    assert sorted(v for _, v in results) == [False, True]
-    assert user_store.get_user(user["user_id"])["activation_state"] == "active"
-    rows = _allowances(user["user_id"])
-    assert len(rows) == 1 and rows[0]["source"] == "admin_create"
-    assert _mail_job_count("test_decision") == 1
-    assert test_application_store.get(user["user_id"])["status"] == "approved"
-
-
+    legacy = research_consent_store.legacy_test_application_signal(
+        usera["user_id"])
+    assert legacy is not None
+    assert legacy["historical_only"] is True
+    assert legacy["share_research_data"] is True
+    # 无记录用户返回 None（表为空历史，不再有写入方）
+    userb = user_store.create_user("nocache@x.com", "userpass12345678")
+    assert research_consent_store.legacy_test_application_signal(
+        userb["user_id"]) is None

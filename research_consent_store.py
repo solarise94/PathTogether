@@ -179,6 +179,34 @@ def get_consent(user_id) -> dict | None:
         conn.close()
 
 
+def consent_states_map(user_ids) -> dict:
+    """批量 user_id → ``{"state", "granted"}``（**单条** SELECT；缺行不进 map）。
+
+    供 admin v1 用户列表的 research 列批量装配（2026-10-09 §2：不逐行 N+1）。
+    state 出线收窄为 ``granted`` / ``withdrawn`` / None——declined /
+    reconsent_required 对后台展示口径等同「未授权」（授权权威判定只认
+    granted，见 :func:`is_granted`）；``granted`` 仅在 state=granted 时 True。
+    """
+    wanted = [str(u) for u in user_ids if u]
+    if not wanted:
+        return {}
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT user_id, state FROM user_research_consents "
+                "WHERE user_id = ANY(%s)", (wanted,))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    out = {}
+    for row in rows:
+        state = row["state"] if row["state"] in ("granted", "withdrawn") \
+            else None
+        out[str(row["user_id"])] = {"state": state, "granted": state == "granted"}
+    return out
+
+
 def is_granted(user_id) -> bool:
     """当前是否有有效研究授权（缺行/异常 = False；不读旧 test_applications）。"""
     try:

@@ -19,7 +19,9 @@
     schema_migrations / audit_events；monkeypatch 探针断言两条路径都不
     调用 pg_store.ensure_schema。
 
-场景全部用真实 store 链路构造（verify 建号 / 真实 review / 真实邀请激活），
+场景数据全部用直接 SQL 构造（2026-10-09 §2 测试申请通道退役后，
+test_application_store 与审核端点已删除——本工具修的是**历史数据**，
+装置按修复前的真实数据形状直插 users/test_applications 行；
 唯一例外是「滞留行」本身——修复后正常激活已会即时收口，故用一条显式
 UPDATE 把状态回拨为 pending 来模拟修复前的历史数据（仅测试装置，不掩饰
 工具行为）。
@@ -44,11 +46,8 @@ import pytest  # noqa: E402
 import app as app_mod  # noqa: E402
 import pg_store  # noqa: E402
 import registration_mail_worker  # noqa: E402
-import registration_store  # noqa: E402
-import settings_store  # noqa: E402
-import test_application_store  # noqa: E402
 import user_store  # noqa: E402
-from _pt_helpers import csrf_client, isolate_app  # noqa: E402
+from _pt_helpers import isolate_app  # noqa: E402
 
 _SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / \
     "repair_invite_activated_applications.py"
@@ -93,9 +92,23 @@ def _pg():
     return conn
 
 
+def _insert_application(user_id, direction="other", share=False):
+    """直插历史申请行（修复前的真实数据形状；通道退役后无写入端点）。"""
+    conn = _pg()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO test_applications (user_id, research_direction, "
+                "share_research_data, consent_version) VALUES (%s,%s,%s,"
+                "'research-data-20260916-v1')", (user_id, direction, share))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _pending_user(email, direction="other", share=False):
     """直插 pending_activation 用户（存量 email_verify 形态；2026-10-08 §4：
-    verify 建号退役）并提交申请。"""
+    verify 建号退役）并附一条历史申请行。"""
     import secrets
     from werkzeug.security import generate_password_hash
     email = email.lower()
@@ -117,9 +130,8 @@ def _pending_user(email, direction="other", share=False):
         conn.commit()
     finally:
         conn.close()
-    user = user_store.get_user(uid)
-    test_application_store.submit(uid, direction, share)
-    return user
+    _insert_application(uid, direction, share)
+    return user_store.get_user(uid)
 
 
 def _owner():
@@ -140,8 +152,37 @@ def _rewind_to_pending(user_id):
         conn.close()
 
 
+def _mark_reviewed(user_id, reviewer_id, decision, *, activate):
+    """测试装置：直插修复前 review 的终态数据形状（approved+激活 /
+    rejected+保持 pending；2026-10-09 §2 审核端点退役后无真实入口，
+    只构造工具实际读取的数据形状）。"""
+    conn = _pg()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE test_applications SET status=%s, reviewed_at=now(), "
+                "reviewed_by=%s WHERE user_id=%s",
+                (decision, reviewer_id, user_id))
+            if activate:
+                cur.execute(
+                    "UPDATE users SET activation_state='active', "
+                    "activation_source='admin', activation_updated_at=now(), "
+                    "ai_access=TRUE WHERE user_id=%s", (user_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _app_status(user_id):
-    return test_application_store.get(user_id)["status"]
+    conn = _pg()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT status FROM test_applications "
+                        "WHERE user_id=%s", (user_id,))
+            row = cur.fetchone()
+            return row["status"] if row else None
+    finally:
+        conn.close()
 
 
 def _counts():
@@ -195,24 +236,17 @@ def _build_scenarios():
         finally:
             conn.close()
         _rewind_to_pending(u["user_id"])
-    client = csrf_client(app_mod.app.test_client())
-    app_mod.app.config["TESTING"] = True
-    app_mod.AUTH_ENABLED = True
-    with client.session_transaction() as s:
-        s.update({"auth_user": "o", "user_id": owner["user_id"],
-                  "role": "owner",
-                  "auth_version": owner.get("auth_version", 1)})
-    r = client.post("/api/admin/v1/test-applications/%s/review"
-                    % user_c["user_id"], json={"decision": "approved"})
-    assert r.status_code == 200, r.get_data(as_text=True)
-    r2 = client.post("/api/admin/v1/test-applications/%s/review"
-                     % user_d["user_id"], json={"decision": "rejected"})
-    assert r2.status_code == 200, r2.get_data(as_text=True)
+    # C：管理员审批通过的历史形态（active + admin + approved）——直接构造
+    # （2026-10-09 §2 审核端点退役；等价于修复前 review 留下的数据形状）
+    _mark_reviewed(user_c["user_id"], owner["user_id"], "approved",
+                   activate=True)
+    # D：拒绝历史（用户保持 pending_activation + rejected）
+    _mark_reviewed(user_d["user_id"], owner["user_id"], "rejected",
+                   activate=False)
     # E：审批通过（active+admin+approved）后回拨为 pending——「其他
     # active+pending」报告桶（来源非 invite，工具绝不改写）
-    r3 = client.post("/api/admin/v1/test-applications/%s/review"
-                     % user_e["user_id"], json={"decision": "approved"})
-    assert r3.status_code == 200, r3.get_data(as_text=True)
+    _mark_reviewed(user_e["user_id"], owner["user_id"], "approved",
+                   activate=True)
     assert user_store.get_user(user_e["user_id"])[
         "activation_state"] == "active"
     _rewind_to_pending(user_e["user_id"])

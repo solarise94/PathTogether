@@ -147,12 +147,11 @@ import cos_config
 import cos_pool_store
 import ingestion_store
 import producer_import_store
-# SER-8 测试申请（wip/ser8-dev）：已验证待激活用户申请测试资格 + owner 审核
-# 原子激活（含默认额度 provisioning）。test_application_store 提供
-# submit/get/list_applications/review 原语（PostgreSQL 唯一后端，0054；
-# 通知邮件复用 registration_mail_jobs 的 test_application/test_decision
-# purpose）。verify 路径的申请提交是 best-effort——失败不阻断建号。
-import test_application_store
+# SER-8 测试申请：通道已于 2026-10-09 §2 整体退役——test_application_store
+# 删除，/api/account/test-application 与 /api/admin/v1/test-applications*
+# 一律 410 endpoint_retired；test_applications 表保留为历史数据（研究授权
+# 兼容层 research_consent_store.legacy_test_application_signal 直接读表）。
+import feedback_store
 # P0 协议与迁移底座（docs/agent-plan-20260921-registration-consent-research.md
 # §3）：协议文档注册表（legal_docs/ 版本化文稿 + agreement_documents 登记）、
 # 研究授权 consent 服务（user_research_consents 当前状态 + 不可变历史；
@@ -1008,9 +1007,10 @@ _ENROLLMENT_ALLOWED_PATHS = frozenset({
     "/activate",
     "/api/account/enrollment",
     "/api/account/activate",
-    # SER-8 测试申请：激活页（enrollment scope）内可直接提交/查询测试申请
-    # （verify 建号时申请提交失败的前端兜底路径）。匹配按 path 不按
-    # method——GET 查询与 POST 提交一条白名单同时覆盖。
+    # SER-8 测试申请：R8（2026-10-09 §2）通道已退役——端点保留路由但稳定
+    # 410 endpoint_retired；白名单条目保留使 enrollment 会话能收到权威的
+    # 退役响应（而不是被白名单闸误报 401 auth_required）。匹配按 path 不
+    # 按 method——GET/POST 一条白名单同时覆盖。
     "/api/account/test-application",
     "/api/registration/resend",
     "/logout",
@@ -3833,12 +3833,12 @@ ADMIN_BOOTSTRAP_SCHEMA_VERSION = 1
 
 @app.route("/admin/test-applications")
 def admin_test_applications_link():
-    """Keep application notification links working with hash-based admin navigation."""
-    if actor_identity()["role"] != user_store.ROLE_OWNER:
-        return _admin_host_response("forbidden", status=403)
-    if AUTH_ENABLED and _preview_active():
-        return _admin_host_response("forbidden", status=403)
-    return redirect("/admin#test-applications")
+    """R8 退役（2026-10-09 §2）：测试申请页下线，历史邮件链接重定向 /admin。
+
+    通知邮件里的审核链接仍可点——统一落到 /admin 宿主页（该页自身完成
+    登录/owner 门控：匿名 302 /login，非 owner/预览态 403）。
+    """
+    return redirect("/admin")
 
 
 @app.route("/admin")
@@ -5591,118 +5591,95 @@ def api_account_activate():
 
 
 # =========================================================================== #
-# SER-8 测试申请（wip/ser8-dev）：已验证待激活用户申请测试资格 + 状态查询。
+# SER-8 测试申请：**通道已退役**（2026-10-09 §2「删除测试申请」）。
 #
-# 身份规则：enrollment 受限会话（激活页 scope）或正式 session 均可，身份只
-# 从 session 推导，绝不信请求体身份字段。注意 I-R4 硬闸下正式 session 的
-# pending 用户本就到不了这里（403 account_pending 且会话即清）——实际可达
-# 主体是 enrollment 会话（提交/查询）与已激活用户（查询；提交会被仓储层
-# 状态校验拒绝 → 409 invalid_state）。白名单：本路径已加入
-# _ENROLLMENT_ALLOWED_PATHS（匹配按 path 不按 method，GET/POST 一条覆盖）；
-# CSRF 照走全局闸（POST /api/* 只认 X-CSRF-Token 头）。
+# 用户侧 GET/POST /api/account/test-application 对任何已登录调用方（含
+# enrollment 受限会话）稳定 410 endpoint_retired，视图内不读不写任何数据；
+# 匿名请求照常在 before_request 认证闸 401。``test_applications`` 表保留为
+# 历史数据（research_consent_store.legacy_test_application_signal 仍直接读
+# 表提供历史证明）；管理侧 /api/admin/v1/test-applications* 同批 410（见
+# admin v1 区段），宿主页 /admin/test-applications 重定向 /admin。
 # =========================================================================== #
-def _test_application_actor():
-    """测试申请身份解析：enrollment 会话优先，其次正式 session user_id。
-
-    返回 user_id 或 None（无任何可识别身份）；401 响应由调用方统一给出
-    （与激活面同口径的中文 auth_required 文案）。
-    """
-    enr = _enrollment_session_valid()
-    if enr is not None:
-        return enr.get("user_id")
-    return session.get("user_id") or None
-
-
 @app.route("/api/account/test-application", methods=["GET"])
 def api_account_test_application_get():
-    """查询本人测试申请状态。
+    """R8 退役（2026-10-09 §2）：测试申请状态查询下线。
 
-    返回 {state: "none"|"pending"|"approved"|"rejected"|
-    "activated_by_invite", research_direction?, share_research_data?,
-    consent_version?, share_research_data_historical?}；无记录 → state="none"
-    （响应保持仅 state 字段）。activated_by_invite（R7 2026-09-19）= 用户已凭
-    邀请码激活、申请同事务自动收口（非人工审批）；等待页据此显示「已通过
-    邀请码激活」并引导重新登录，不混同 approved。
-
-    P2（§3.5）：``share_research_data`` 是旧申请的**历史记录字段**，不是当前
-    研究授权——有记录时附 ``share_research_data_historical=true`` 标记；当前
-    研究授权唯一权威是 user_research_consents（GET /api/account/agreements）。
+    已登录调用方一律 410 endpoint_retired（不再读 test_applications）；
+    当前研究授权唯一权威视图是 GET /api/account/agreements。
     """
-    if not AUTH_ENABLED:
-        return jsonify(error="测试申请需要启用认证"), 400
-    user_id = _test_application_actor()
-    if not user_id:
-        return jsonify(error="登录状态已失效，请重新登录后再试",
-                       code="auth_required"), 401
-    try:
-        record = test_application_store.get(user_id)
-    except Exception:
-        app.logger.exception("测试申请状态读取失败")
-        return jsonify(error="暂无法读取申请状态，请稍后重试",
-                       code="storage_unavailable"), 503
-    if record is None:
-        return jsonify(state="none")
-    return jsonify(state=record.get("status") or "none",
-                   research_direction=record.get("research_direction"),
-                   share_research_data=record.get("share_research_data"),
-                   consent_version=record.get("consent_version"),
-                   # 旧选项仅历史证明：不是当前研究采集权威（§3.5/§1）
-                   share_research_data_historical=True)
+    return jsonify(error="测试申请通道已下线；如需查看研究数据授权，"
+                         "请前往账户设置",
+                   code="endpoint_retired"), 410
 
 
 @app.route("/api/account/test-application", methods=["POST"])
 def api_account_test_application_submit():
-    """提交测试申请（幂等）。body: {research_direction, share_research_data}。
+    """R8 退役（2026-10-09 §2）：测试申请提交下线（不建行、不发通知邮件）。"""
+    return jsonify(error="测试申请通道已下线，账号开通请联系管理员",
+                   code="endpoint_retired"), 410
 
-    - 方向非法 / share 非 bool → 400 invalid_request（本地形状错误）；
-    - 管理员通知邮箱未配置 → 503 admin_email_unconfigured（fail-closed，
-      不静默吞申请）；
-    - 状态不符（已激活/禁用/邮箱未验证）→ 409 invalid_state（含中文原因）；
-    - 成功 {ok:true, state:"pending"}；重复提交 submit 返回 False →
-      {ok:true, state:"pending", duplicate:true}（幂等，不再重复通知）。
 
-    P2（§3.5）：``share_research_data`` 随申请保存为**旧选项历史记录**，
-    不构成当前研究授权、也不触发任何研究采集——当前授权唯一写入路径是
-    PUT /api/account/research-consent（CAS + 版本校验），本端点不会替用户
-    grant，避免出现两份互不一致的「当前同意」。
-    """
+# =========================================================================== #
+# 用户反馈（2026-10-09 §3，docs/admin-viewer-round4-20261009.md）。
+#
+#   - POST /api/feedback，登录用户 + CSRF（全局闸：/api/* 只认 X-CSRF-Token
+#     头）。body ``{"description": str(10..4000 字), "client": object}``；
+#   - 202 ``{"feedback_id", "mailed"}``；401 未登录（demo/匿名无 session，
+#     在 before_request 认证闸照常 401）；400 描述长度不符或 client 非对象；
+#     413 序列化后超 256 KB；429 频率超限（每小时 5 次/每天 20 次，带
+#     retry_after）；
+#   - 记录先落库（user_feedback），邮件复用注册邮件队列（purpose=
+#     'user_feedback'，收件人=现有管理员通知邮箱配置）；未配置管理员邮箱
+#     时仍保存记录、mailed=false。owner 预览态由全局 _preview_write_guard
+#     统一拒绝写（403 preview_readonly），不在此重复判定。
+# =========================================================================== #
+@app.route("/api/feedback", methods=["POST"])
+def api_feedback_submit():
+    """提交用户反馈（问题描述 + 客户端环形缓冲记录）。"""
     if not AUTH_ENABLED:
-        return jsonify(error="测试申请需要启用认证"), 400
-    user_id = _test_application_actor()
+        return jsonify(error="提交反馈需要启用认证"), 400
+    user_id = session.get("user_id") or None
     if not user_id:
         return jsonify(error="登录状态已失效，请重新登录后再试",
                        code="auth_required"), 401
-    if request.is_json:
-        body = request.get_json(silent=True) or {}
-    else:
-        body = request.form
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify(error="请求体需为 JSON 对象", code="invalid_request"), 400
+    client = body.get("client")
+    if not isinstance(client, dict):
+        return jsonify(error="client 需为 JSON 对象", code="invalid_request"), 400
+    serialized = json.dumps(client, ensure_ascii=False, separators=(",", ":"))
+    if len(serialized.encode("utf-8")) > feedback_store.CLIENT_MAX_BYTES:
+        return jsonify(error="客户端记录超过 256 KB 上限",
+                       code="payload_too_large"), 413
     try:
-        data = test_application_store.validate(
-            body.get("research_direction"),
-            body.get("share_research_data"))
-    except ValueError as exc:
-        return jsonify(error=str(exc), code="invalid_request"), 400
-    # 通知邮箱未配置：入口 fail-closed 503（与 submit_tx 内同源判定，双保险）
-    if test_application_store.admin_email() is None:
-        return jsonify(error="申请通道暂不可用，请稍后重试",
-                       code="admin_email_unconfigured"), 503
+        description = feedback_store.validate_description(
+            body.get("description"))
+    except feedback_store.FeedbackError as exc:
+        return jsonify(error=str(exc), code=exc.code), 400
+    user = user_store.get_user(user_id)
+    if user is None or user.get("disabled"):
+        return jsonify(error="登录状态已失效，请重新登录后再试",
+                       code="auth_required"), 401
+    server = feedback_store.build_server_context(user)
     try:
-        submitted = test_application_store.submit(
-            user_id, data["research_direction"],
-            data["share_research_data"])
-    except ValueError as exc:
-        message = str(exc)
-        if "尚未配置" in message:
-            return jsonify(error="申请通道暂不可用，请稍后重试",
-                           code="admin_email_unconfigured"), 503
-        return jsonify(error=message, code="invalid_state"), 409
+        result = feedback_store.submit(
+            user, description, client, server,
+            recipient=feedback_store.admin_recipient())
+    except feedback_store.FeedbackRateLimitedError as exc:
+        resp = jsonify(error="反馈提交过于频繁，请稍后再试",
+                       code="rate_limited", retry_after=exc.retry_after)
+        resp.status_code = 429
+        resp.headers["Retry-After"] = str(exc.retry_after)
+        return resp
     except Exception:
-        app.logger.exception("测试申请提交异常")
-        return jsonify(error="申请暂不可用，请稍后重试",
+        app.logger.exception("用户反馈提交失败")
+        return jsonify(error="反馈暂不可用，请稍后重试",
                        code="storage_unavailable"), 503
-    if not submitted:
-        return jsonify(ok=True, state="pending", duplicate=True)
-    return jsonify(ok=True, state="pending")
+    # best-effort 即时排水（失败留 queued，worker 循环是权威发送方）
+    registration_mail_worker.drain_async()
+    return jsonify(feedback_id=result["feedback_id"],
+                   mailed=result["mailed"]), 202
 
 
 # =========================================================================== #
@@ -8941,11 +8918,18 @@ def admin_v1_overview():
     if auth:
         return auth
     users = user_store.list_users()
+    # 2026-10-09 §2：total/active/disabled/ai_access 只计正式用户
+    # （account_kind='real'），dogfood 单独计数（界面可不展示）——避免
+    # 「AI access 用户数 > 用户总数」的口径错位。
+    real_users = [u for u in users
+                  if (u.get("account_kind") or "real") == "real"]
     users_section = {
-        "total": len(users),
-        "active": sum(1 for u in users if not u.get("disabled")),
-        "disabled": sum(1 for u in users if u.get("disabled")),
-        "ai_access": sum(1 for u in users if u.get("ai_access")),
+        "total": len(real_users),
+        "active": sum(1 for u in real_users if not u.get("disabled")),
+        "disabled": sum(1 for u in real_users if u.get("disabled")),
+        "ai_access": sum(1 for u in real_users if u.get("ai_access")),
+        "dogfood": sum(1 for u in users
+                       if (u.get("account_kind") or "real") == "dogfood"),
     }
 
     try:
@@ -9017,7 +9001,9 @@ def admin_v1_users():
     每行：display name、login ID 掩码、role、enabled、ai_access、创建时间、
     注册方式、``account_kind``（real|dogfood）、``last_login_at``（格式与
     created_at 相同的 epoch 秒；未登录过 null）、金额余额/caps（未开户
-    null；json 后端 null）、最近 AI 调用时间（json 后端 null）。
+    null；json 后端 null）、最近 AI 调用时间（json 后端 null）、
+    ``research``（2026-10-09 §2：``{state: "granted"|"withdrawn"|null,
+    granted: bool}``，user_research_consents 单条批量查询装配）。
 
     - ``kind=real|dogfood|all``（默认 real）：按 users.account_kind 筛选
       （all = 不筛选）；
@@ -9096,6 +9082,15 @@ def admin_v1_users():
 
     accounts = last_calls = {}
     reg_methods = _admin_v1_registration_methods(user_ids)
+    # 2026-10-09 §2：研究数据授权列（granted/withdrawn/None）——单条批量
+    # SELECT 装配（research_consent_store.consent_states_map），不逐行 N+1；
+    # 查询失败按「未授权」降级展示（只读展示列，不 fail-closed 整页）。
+    research_by_user = {}
+    try:
+        research_by_user = research_consent_store.consent_states_map(user_ids)
+    except Exception:
+        app.logger.warning("admin v1 users 研究授权批量查询失败（按未授权展示）",
+                           exc_info=True)
     # 批次 D（§6.2）→ Batch B wave 2：每用户 spend 投影（owner/user 按
     # target 互斥形态；单事务批量解析）。PR4 的 user_acquisition 归因查询
     # 已随批次 D1 删除（用户列表不再触达归因表）。
@@ -9153,6 +9148,10 @@ def admin_v1_users():
             "billing": _admin_v1_nano_out(accounts.get(uid)),
             # Batch B wave 2：按角色/target 互斥的金额投影
             "spend": spend,
+            # 2026-10-09 §2：研究数据授权（已授权 granted / 已撤回 withdrawn /
+            # 未授权 None；declined/reconsent_required 展示口径同未授权）
+            "research": research_by_user.get(uid) or {"state": None,
+                                                      "granted": False},
             "last_ai_call_at": last_calls.get(uid),
         })
     next_cursor = None
@@ -11435,13 +11434,16 @@ def admin_v1_format_request_sample(request_id):
 
 
 # --------------------------------------------------------------------------- #
-# SER-8 测试申请管理面（owner-only；wip/ser8-dev）
+# SER-8 测试申请管理面：**端点已退役**（2026-10-09 §2「删除测试申请」）。
 #
-# 守卫与错误信封同 format-requests admin API（_require_owner_admin_v1 +
-# _admin_v1_error 的 {error:{code,message}} 信封——宿主桥 backendError 据此
-# 还原 err.code）。审核写路径（原子激活 + 默认额度 provisioning + 通知邮件
-# + 审计）全部在 test_application_store.review 单事务内；路由只做 owner 门
-# 控、参数形状与错误码映射，不重复写审计。
+# R8 退役口径（同 R6）：对任何已登录调用方（owner/普通用户/预览态）稳定
+# 410 endpoint_retired，视图内不读不写任何数据（不列 test_applications、
+# 不审批激活、不发通知邮件、不写审计）；匿名请求在 before_request 认证闸
+# 照常 401。test_applications 表保留为历史数据——
+# research_consent_store.legacy_test_application_signal 兼容层仍直接读表
+# 提供历史证明；宿主桥 admin.testApplications.* 方法由后台插件侧同批删除
+# （unknown_method），通知邮件里的 /admin/test-applications 链接重定向
+# /admin。_test_app_rfc3339 保留（研究删除任务端点复用）。
 # --------------------------------------------------------------------------- #
 def _test_app_rfc3339(value):
     """timestamptz → RFC3339（UTC，Z 后缀；None 透传）——同 _hold_rfc3339。"""
@@ -11452,99 +11454,15 @@ def _test_app_rfc3339(value):
 
 @app.route("/api/admin/v1/test-applications", methods=["GET"])
 def admin_v1_test_applications():
-    """测试申请列表（owner-only）。?direction=&status=。
-
-    list_applications 单查即全量（ORDER BY pending 优先 + created_at 降序，
-    上限 500 行），cursor 参数预留不启用（next_cursor 恒 None）；status 为
-    服务端内存过滤；方向只回机器值（中文映射在插件前端做）。
-    """
-    auth = _require_owner_admin_v1()
-    if auth:
-        return auth
-    direction = (request.args.get("direction") or "").strip() or None
-    status = (request.args.get("status") or "").strip() or None
-    if direction is not None and \
-            direction not in test_application_store.DIRECTIONS:
-        return _admin_v1_error(400, "invalid_request", "研究方向无效")
-    if status is not None and status not in (
-            "pending", "approved", "rejected", "activated_by_invite"):
-        # activated_by_invite（R7 2026-09-19）：邀请码激活同事务收口的显式
-        # 终态；管理员不再能对其审批（review 对非 pending 返回 409）。
-        return _admin_v1_error(400, "invalid_request", "状态无效")
-    try:
-        rows = test_application_store.list_applications(direction)
-    except Exception:
-        app.logger.exception("测试申请列表读取失败")
-        return _admin_v1_error(503, "storage_unavailable",
-                               "存储暂不可用，请稍后重试")
-    if status is not None:
-        rows = [row for row in rows if row.get("status") == status]
-    # 字段白名单出线（store 行含 consent_updated_at 等内部列，不进 wire）
-    items = [{
-        "user_id": row.get("user_id"),
-        "email_normalized": row.get("email_normalized"),
-        "display_name": row.get("display_name"),
-        "research_direction": row.get("research_direction"),
-        "share_research_data": bool(row.get("share_research_data")),
-        # P2（§3.5/§8）：旧申请选项只读标记「历史版本，未授权当前研究采集」；
-        # 当前授权状态走 research_consent_store（另一只读视图）。
-        "share_research_data_historical": True,
-        "status": row.get("status"),
-        "created_at": _test_app_rfc3339(row.get("created_at")),
-        "reviewed_at": _test_app_rfc3339(row.get("reviewed_at")),
-        "reviewed_by": row.get("reviewed_by"),
-        "activation_state": row.get("activation_state"),
-        # 激活来源（R7）：admin=管理员审批通过 / invite=邀请码激活；列表据
-        # 此显示来源，approved 与 activated_by_invite 不再混淆。
-        "activation_source": row.get("activation_source"),
-    } for row in rows]
-    return jsonify(items=items, next_cursor=None)
+    """R8 退役：测试申请列表只读端点下线（410，零副作用）。"""
+    return _admin_v1_retired("测试申请列表（通道已下线）")
 
 
 @app.route("/api/admin/v1/test-applications/<user_id>/review",
            methods=["POST"])
 def admin_v1_test_application_review(user_id):
-    """测试申请审核（owner-only）。body: {decision, ai_access?}。
-
-    decision ∈ approved|rejected；ai_access 缺省 true（仅 approved 生效，
-    与页面「开通 AI 权限」默认勾一致）。错误映射：
-      403 permission_denied              —— 非真实 owner（仓储层复核兜底）；
-      409 default_allowance_unconfigured —— 新用户默认总额度未配置（提示
-                                              先去管理工作台设置）；
-      409 already_reviewed               —— 重复审批（review 返回 False，
-                                              不重复发额度/邮件）；
-      400 invalid_request                —— 参数形状 / 其余状态类 ValueError。
-    """
-    auth = _require_owner_admin_v1()
-    if auth:
-        return auth
-    body = request.get_json(silent=True) or {}
-    decision = body.get("decision")
-    ai_access = body.get("ai_access")
-    if ai_access is None:
-        ai_access = True  # 缺省开通；显式 false 才关闭
-    if decision not in ("approved", "rejected") or \
-            not isinstance(ai_access, bool):
-        return _admin_v1_error(400, "invalid_request", "审核参数无效")
-    try:
-        applied = test_application_store.review(
-            user_id, actor_identity().get("user_id"), decision,
-            ai_access=ai_access)
-    except PermissionError:
-        return _admin_v1_error(403, "permission_denied", "仅管理员可审核")
-    except ValueError as exc:
-        message = str(exc)
-        if message == "请先在管理工作台设置新用户默认总额度":
-            return _admin_v1_error(409, "default_allowance_unconfigured",
-                                   message)
-        return _admin_v1_error(400, "invalid_request", message)
-    except Exception:
-        app.logger.exception("测试申请审核异常")
-        return _admin_v1_error(503, "storage_unavailable",
-                               "存储暂不可用，请稍后重试")
-    if not applied:
-        return _admin_v1_error(409, "already_reviewed", "该申请已处理")
-    return jsonify(ok=True, user_id=user_id, status=decision)
+    """R8 退役：测试申请审核端点下线（410；不激活、不发额度/邮件）。"""
+    return _admin_v1_retired("测试申请审核（通道已下线）")
 
 
 # --------------------------------------------------------------------------- #

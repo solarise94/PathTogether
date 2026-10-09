@@ -211,6 +211,9 @@ _BUSINESS_TABLES = (
     # registration_mail_jobs CASCADE 已覆盖，显式列出防跨用例残留配额占用）
     "registration_mail_redeliveries",
     "registration_submissions",
+    # 0081 起：用户反馈（users 外键 CASCADE 已覆盖，显式列出防跨用例
+    # 残留反馈行干扰频率限制的滚动窗口计数）
+    "user_feedback",
     # 0062 起：P2 研究副本删除任务（users 外键 CASCADE 已覆盖，显式列出
     # 防跨用例残留删除任务/幂等占用唯一 active 槽）
     "research_data_deletion_jobs",

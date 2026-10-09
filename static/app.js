@@ -11416,7 +11416,6 @@
       // Do not insert a portal between pointerdown and pointerup: the browser
       // would dispatch click to their common ancestor (body), losing the row.
       if (fbPulloutShowTimer) { clearTimeout(fbPulloutShowTimer); fbPulloutShowTimer = null; }
-      fbPulloutKeep();
     }, true);
     document.addEventListener("keydown", function (e) { if (e.key === "Escape") { fbPulloutHide(); cancelSlideDeal(); } });
     window.addEventListener("blur", fbPulloutHide);

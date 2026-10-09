@@ -1095,4 +1095,10 @@ test("鼠标快速连续点选不会被待弹出的预览吞掉", async ({ page 
     '/api/slide/sample-1.svs/info', '/api/slide/sample-0.svs/info'
   ]);
   await expect(page).toHaveTitle(/Specimen 0/);
+  await page.evaluate(() => (document.activeElement as HTMLElement)?.blur());
+  await page.mouse.move(rows[1].x, rows[1].y);
+  await expect(page.locator('.fb-pullout')).toBeVisible();
+  await page.mouse.move(700, 180);
+  await page.mouse.click(700, 180);
+  await expect(page.locator('.fb-fan-card')).toHaveCount(0);
 });

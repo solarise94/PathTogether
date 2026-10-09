@@ -17783,21 +17783,25 @@ def _validate_ai_skill_request(body, slide, slide_id=None):
             return None, (jsonify(error="target.slide_id 必填",
                                   code="invalid_argument"), 400)
         # 目标切片必须与本次 run 指向同一资产（跨切片草稿不携带旧几何）。
-        try:
-            t_desc = slide_store.resolve_slide_id(t_slide_id)
-        except Exception:
-            app.logger.warning("target.slide_id 解析失败（fail-closed）：%s",
-                               t_slide_id, exc_info=True)
-            t_desc = None
-        if t_desc is None:
-            return None, (jsonify(error="target.slide_id 不存在",
-                                  code="slide_not_found"), 404)
+        # 修复4（主代理 review）：run 已知 slide_id 时**先比较后解析**——不符
+        # 直接 400 slide_ref_conflict，不解析外部 id（不向任意 slide_id 暴露
+        # 存在性：404 与 400 不再可区分）。仅名通道（run 无 slide_id）才需要
+        # 解析 target.slide_id 以取得可比对的名。
         if slide_id is not None:
             if t_slide_id != slide_id:
                 return None, (jsonify(
                     error="target.slide_id 与本次对话切片不符",
                     code="slide_ref_conflict"), 400)
         else:
+            try:
+                t_desc = slide_store.resolve_slide_id(t_slide_id)
+            except Exception:
+                app.logger.warning("target.slide_id 解析失败（fail-closed）：%s",
+                                   t_slide_id, exc_info=True)
+                t_desc = None
+            if t_desc is None:
+                return None, (jsonify(error="target.slide_id 不存在",
+                                      code="slide_not_found"), 404)
             t_name = (getattr(t_desc, "legacy_filename", None)
                       or getattr(t_desc, "original_filename", None) or "")
             if slide is not None and t_name and t_name != slide:
@@ -17838,9 +17842,20 @@ def _validate_ai_skill_request(body, slide, slide_id=None):
             if roi is None or roi.get("deleted"):
                 return None, (jsonify(error="标注不存在",
                                       code="annotation_not_found"), 404)
-            if roi.get("slide") and roi.get("slide") != slide:
-                return None, (jsonify(error="标注不属于当前切片",
-                                      code="forbidden"), 403)
+            # 修复5（主代理 review）：归属比较 slide_id 优先——ID-only/迁移
+            # 资产的 roi.slide 名可能为空或旧别名（生产曾因名比较误拒 400）。
+            # 双方都有 slide_id → 只比 ID；任一侧缺 ID → 回退名比较；名也
+            # 缺失时不在此处拦截（存在性/可见性仍有 can_read 兜底）。
+            roi_sid = roi.get("slide_id") or None
+            if slide_id is not None and roi_sid is not None:
+                if roi_sid != slide_id:
+                    return None, (jsonify(error="标注不属于当前切片",
+                                          code="forbidden"), 403)
+            else:
+                roi_name = roi.get("slide") or ""
+                if roi_name and slide and roi_name != slide:
+                    return None, (jsonify(error="标注不属于当前切片",
+                                          code="forbidden"), 403)
             subject = annotation_access.subject_from_request()
             if not annotation_access.can_read_annotation(subject, roi):
                 return None, (jsonify(error="标注不存在",

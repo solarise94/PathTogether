@@ -1542,3 +1542,84 @@ def test_continue_forwards_skill_request(monkeypatch):
     assert sent["requested_skills"] == ["delineate"]
     assert sent["skill_intent"] == "natural"
     assert sent["target"]["kind"] == "roi"
+
+
+# =========================================================================== #
+# 主代理 review 修复4/5：target 校验顺序（不泄露外部 slide_id 存在性）与
+# annotation 归属的 slide_id 优先比较（ID-only 资产名可能为空/别名不同）
+# =========================================================================== #
+def test_target_unknown_slide_id_no_existence_leak(monkeypatch):
+    """修复4：run 已知 slide_id 时先比较——target.slide_id 指向不存在资产
+    也返回 400 slide_ref_conflict（不解析、不泄露存在性 404）。"""
+    fake = _setup_run_env(monkeypatch)
+    _touch()
+    sid = share_store.get_slide_id("demo.svs")
+    c = _browser_client(app_mod.app)
+    r = c.post("/api/ai/run?fresh=1", json={
+        "slide_id": sid, "task": "圈出",
+        "target": {"slide_id": "sld_does_not_exist", "kind": "viewport",
+                   "bbox": {"x": 0, "y": 0, "w": 10, "h": 10}}})
+    assert r.status_code == 400
+    assert r.get_json()["code"] == "slide_ref_conflict"
+    assert fake.calls == []
+
+
+def test_target_other_slide_id_conflict_not_404(monkeypatch):
+    """修复4：target.slide_id 指向另一切片（存在）→ 400 slide_ref_conflict
+    （与 404 存在性泄露区分；两路径同码，存在性不再可区分）。"""
+    fake = _setup_run_env(monkeypatch)
+    _touch("demo.svs")
+    _touch("other.svs")
+    demo_sid = share_store.get_slide_id("demo.svs")
+    other_sid = share_store.get_slide_id("other.svs")
+    c = _browser_client(app_mod.app)
+    r = c.post("/api/ai/run?fresh=1", json={
+        "slide_id": demo_sid, "task": "圈出",
+        "target": {"slide_id": other_sid, "kind": "viewport",
+                   "bbox": {"x": 0, "y": 0, "w": 10, "h": 10}}})
+    assert r.status_code == 400
+    assert r.get_json()["code"] == "slide_ref_conflict"
+    assert fake.calls == []
+
+
+def test_target_annotation_id_only_asset_by_slide_id(monkeypatch):
+    """修复5：roi.slide_id 与本 run slide_id 一致、slide 名为旧别名/空 →
+    通过（ID-only/迁移资产不因名不同被误拒）。"""
+    fake = _setup_run_env(monkeypatch)
+    _touch()
+    sid = share_store.get_slide_id("demo.svs")
+    roi_dict = {"annotation_id": "ann_idonly", "slide": "legacy-alias.svs",
+                "slide_id": sid, "revision": 2, "deleted": False}
+    monkeypatch.setattr(app_mod.share_store, "get_roi_by_annotation_id",
+                        lambda aid: dict(roi_dict) if aid == "ann_idonly" else None)
+    monkeypatch.setattr(app_mod.annotation_access, "can_read_annotation",
+                        lambda subject, roi: True)
+    c = _browser_client(app_mod.app)
+    _register_run_sse(fake, "sess-fix5-ok")
+    r = c.post("/api/ai/run?fresh=1", json={
+        "slide_id": sid, "task": "圈出这个标记附近",
+        "target": {"slide_id": sid, "kind": "annotation",
+                   "annotation_id": "ann_idonly", "annotation_revision": 2}})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    sent = fake.calls[-1]["body"]["target"]
+    assert sent["annotation_id"] == "ann_idonly"
+
+
+def test_target_annotation_slide_id_mismatch_rejected(monkeypatch):
+    """修复5 反例：roi.slide_id 与 run slide_id 不符 → 403（ID 优先判定，
+    即便 roi.slide 名恰好等于 run 名也不放行）。"""
+    fake = _setup_run_env(monkeypatch)
+    _touch()
+    sid = share_store.get_slide_id("demo.svs")
+    other_sid = share_store.get_slide_id("demo.svs") + "x"
+    roi_dict = {"annotation_id": "ann_other", "slide": "demo.svs",
+                "slide_id": other_sid, "revision": 1, "deleted": False}
+    monkeypatch.setattr(app_mod.share_store, "get_roi_by_annotation_id",
+                        lambda aid: dict(roi_dict) if aid == "ann_other" else None)
+    c = _browser_client(app_mod.app)
+    r = c.post("/api/ai/run?fresh=1", json={
+        "slide_id": sid, "task": "圈出这个",
+        "target": {"slide_id": sid, "kind": "annotation",
+                   "annotation_id": "ann_other", "annotation_revision": 1}})
+    assert r.status_code == 403
+    assert fake.calls == []

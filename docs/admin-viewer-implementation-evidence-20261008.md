@@ -1,6 +1,6 @@
 # 后台/注册/Viewer 改版 —— 实现与验收证据
 
-日期：2026-10-08，最后更新：2026-10-09。依据：[简化版实施设计](admin-viewer-simplified-20261008.md)。分支 `admin-viewer`，基线为生产线 `registration-antibot` @ 66cfa29c。状态：**已推送、已部署；线上代码 ef250b3c，最新主视窗拖动绘制优化上线见 §16；未解决的 AI 阻塞见 §11。**
+日期：2026-10-08，最后更新：2026-10-09。依据：[简化版实施设计](admin-viewer-simplified-20261008.md)。分支 `admin-viewer`，基线为生产线 `registration-antibot` @ 66cfa29c。状态：**已推送、已部署；线上代码 5b87fb90，最新翻牌/网络并行上线见 §17；主视窗拖动绘制优化见 §16；未解决的 AI 阻塞见 §11。**
 
 ## 1. 变更范围
 
@@ -605,3 +605,54 @@ viewer-core.js 与提交逐字节一致（入口缓存版本 20261009i）。
 测试服务与临时凭据也已清理。没有运行 AI 推理或发送反馈邮件。线上证据为
 同目录 `dogfood.log`、`results.json`、`main-*.png`、`share-*.png`、`live-video/`、
 `cleanup-first.log`、`cleanup.log`、`public-check.log` 和 `cutover.log`。
+
+
+## 17. 翻牌与切片加载并行（2026-10-09）
+
+运行改动提交 `5b87fb90`。用户希望用翻牌时间覆盖网络加载时间。原实现的
+`openSlide` 已在启动动画后立即请求 info，拿到信息就启动 OSD 瓦片管线；实际
+串行等待发生在视觉状态机：`spreadSlideDeal` 必须等 `ready`（首块瓦片已绘制）
+才允许铺开，所以弱网时会停在翻牌之后的中央小卡片。
+
+现在翻牌 620ms 后直接用已加载缩略图完成 340ms 铺开，不等待 info、DZI 或瓦片。
+OSD 已打开时使用实际图像边界；信息尚未返回时按缩略图原始宽高比等比适配
+主视窗。铺开结束后，若瓦片尚未绘制，保留完整预览；首块瓦片绘制后用 160ms
+淡出交接。瓦片提前就绪也会等铺开自然结束再交接。只分离等待条件，没有新增
+预取 API、重复瓦片请求、第三方动画库，或延长翻牌/铺开时间。动画继续只使用
+transform/opacity。鼠标按下拖动或滚轮操作立即让出画布；快速换片、失败、Esc、
+resize、blur 和 8 秒装饰层清理上限仍生效。手机与减少动画偏好不启用该动画。
+
+验证：
+
+- 原真实 Flask/PG 开片回归改为两种延迟场景：扣住 tiles 响应、扣住 info 响应。
+  两者都要求响应放行前已经完整铺开，预览保持原始比例，OSD 尚无瓦片像素。
+  info 请求在 drawing 阶段已经开始；放行后出现真实瓦片且装饰层全部清理。
+- 旧代码运行 tiles 回归失败：期望 `preview`，实际一直是 `waiting`。修改后
+  两个场景通过，继续检查减少动画偏好、Esc 清理和图片等比铺开。
+- Vitest：1003 passed，2 个原有 skipped。完整 Playwright：93 passed，0 failed。
+  前端改动未重跑 Python 套件。初次定向运行的监测器使用 locator 等待一个在
+  reduced-motion 场景不会出现的元素，已中止并改为同步 DOM 查询；最终定向与
+  全量运行通过，没有放松业务断言。
+
+证据目录 `.gate-tmp/deal-parallel-20261009/`：`before-tests.log`、
+`after-tests-final.log`、`unit.log`、`full-e2e.log`。上线验收记录见下。
+
+已推送并发布运行提交 `5b87fb9036ba661b570c633118f3302d88c8e66e`，发布目录
+`/home/solarise/releases/suite-20261009-deal-parallel`。346 项镜像文件、96 项静态
+资源和两个变更运行文件校验一致；生产数据库快照的隔离验收通过。生产迁移、
+插件与部署配置不变（APP_REVISION 除外）。切换前队列为空，备份及旧容器保留。
+主站和分享的两个域名健康检查通过；公网 app.js、share.js、viewer-core.js 与
+本地逐字节一致，主站 app.js 缓存版本更新为 `20261009j`。
+
+线上 Dogfood 使用专用账号，实际上传两张标准金字塔 TIFF（4096×3072 和
+3072×4096），Chromium 1440×900、DPR=2、AI 收起。竖图扣住瓦片响应，横图
+扣住 info 响应，两者均先铺开完整预览。记录中 info 请求在 drawing 开始后
+约 2ms 发出；正常 info 返回后的首批瓦片请求也处于 drawing 阶段。两次预览
+在约 1.03/1.04 秒完成铺开，响应仍未放行。放行后真实图像可见且装饰层归零，
+无 JavaScript 错误。预览截图人工检查保持宽高比，未停在中央小卡片。
+这些时间来自本次自动化浏览器走查，不代表用户 Mac 的硬件帧率测量。
+
+测试切片已删除、账号已禁用；数据库复核无存活切片或有效分享，临时凭据已
+删除。未运行 AI 推理或发送反馈邮件。证据同目录 `dogfood.cjs`、`results.json`、
+`dogfood.log`、`*-pending-preview.png`、`*-loaded.png`、`live-video/`、
+`cleanup.log`、`public-check.log` 和 `cutover.log`。

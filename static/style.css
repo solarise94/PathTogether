@@ -356,8 +356,10 @@ button {
     display: inline-flex;
     flex-shrink: 0;
   }
-  /* macOS 菜单样式：半透明模糊底、圆角浮层、整行菜单项。
-     绝对定位于 header 正下方右侧；#toolbar 非定位元素，不会裁剪 */
+  /* macOS 菜单样式：白底不透明（评审 P1：半透明 toolbar-bg + blur 会透出
+     下层内容——round4 复查：AI 面板文字透过 ⋯ 菜单显示、顶行发白），材质与
+     工具栏浮层（.toolbar-pop / .tb-search-pop）一致：白底 + 0.5px 边框 +
+     float 阴影。绝对定位于 header 正下方右侧；#toolbar 非定位元素，不会裁剪 */
   #toolbar .tbb-more {
     position: absolute;
     top: calc(100% + 6px);
@@ -367,9 +369,7 @@ button {
     gap: 1px;
     min-width: 168px;
     padding: 5px;
-    background: var(--toolbar-bg);
-    backdrop-filter: blur(20px) saturate(180%);
-    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    background: #fff;
     border: 0.5px solid var(--separator);
     border-radius: 10px;
     box-shadow: var(--shadow-float);
@@ -2371,7 +2371,7 @@ button {
   /* §3.5：账户 chip 在窄屏底栏保持在最右（⋯ 之后），浮层向上弹出 */
   #toolbar .acct-wrap { order: 100; }
   #toolbar .acct-btn { height: 32px; max-width: 120px; }
-  /* ⋯ 溢出面板：底栏上方弹出的紧凑行 */
+  /* ⋯ 溢出面板：底栏上方弹出的紧凑行（白底不透明，与工具栏浮层同材质） */
   #toolbar .tbb-more {
     display: none;
     position: fixed;
@@ -2380,9 +2380,7 @@ button {
     align-items: center;
     gap: 8px;
     padding: 8px 10px;
-    background: var(--toolbar-bg);
-    backdrop-filter: blur(20px) saturate(180%);
-    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    background: #fff;
     border: 0.5px solid var(--separator);
     border-radius: 12px;
     box-shadow: var(--shadow-float);

@@ -97,6 +97,10 @@
       }
     }
     function sync() {
+      // Viewport attachment belongs with annotation tools, not the chat composer.
+      // Older installed plugins still create this button during their init.
+      var attachView = $('ai-attach-view-btn');
+      if (attachView) attachView.remove();
       var selected = select.selectedOptions[0];
       var s = state();
       setup.hidden = !s.aiConfig || !window.HistoPilot.aiChannelConfigured || window.HistoPilot.aiChannelConfigured();

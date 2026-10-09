@@ -33,6 +33,7 @@ async function boot(page: Page, owner = false) {
   else { await page.locator('#tbb-more-btn').click(); await page.locator('#tbb-more-ai').click(); }
   await expect(page.locator('#ai-panel')).toBeVisible();
   await expect(page.locator('#ai-panel')).toHaveClass(/ai-title-layout/);
+  await expect(page.locator('#ai-attach-view-btn')).toHaveCount(0);
 }
 
 test('real plugin: search, branch/history switching, new draft preservation and folded settings', async ({ page }) => {

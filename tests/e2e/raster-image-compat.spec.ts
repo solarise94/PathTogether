@@ -69,6 +69,20 @@ async function expandSidebar(page: Page) {
 	await expect(marker).toBeVisible({ timeout: 5_000 });
 }
 
+// Folder-only pages are valid. Locate the independently seeded asset without
+// assuming it is on page 1 or opening it just to move the sidebar to its page.
+async function locateSidebarSlide(page: Page, sid: string) {
+  const hit = page.locator(`.fb-hit[data-slide-id="${sid}"]`);
+  await expect(page.locator('.fb-folder, .fb-hit').first()).toBeVisible();
+  for (let n = 0; n < 20 && !await hit.count(); n++) {
+    const next = page.locator('#fb-next-btn');
+    if (await next.isDisabled()) break;
+    await next.click();
+  }
+  await expect(hit).toBeVisible();
+  return hit;
+}
+
 /** 画布（或画布容器内第一个 canvas）中心 64×64 区域是否已有非透明像素。
  * 仅同源画布（无跨域污染），getImageData 可用。 */
 async function canvasCenterHasPixels(page: Page, selector: string): Promise<boolean> {
@@ -104,12 +118,8 @@ test("选片像扑克牌抽出翻面，等真实瓦片后铺开；减少动画�
   await login(page, CREDS.userLogin, CREDS.userPassword);
   await page.goto('/app');
   await expandSidebar(page);
-  const hit = page.locator(`.fb-hit[data-slide-id="${sid}"]`);
-  await expect(page.locator('.fb-hit').first()).toBeVisible();
-  // Earlier full-suite tests may add slides. Find this asset without opening it
-  // first, so the actual image cache is cold for the slow-tile regression.
-  for (let n = 0; n < 20 && !await hit.count(); n++) await page.locator('#fb-next-btn').click();
-  await expect(hit).toBeVisible();
+  // Keep the image cache cold for the slow-tile regression.
+  const hit = await locateSidebarSlide(page, sid);
   let releaseTiles!: () => void;
   const tileGate = new Promise<void>(resolve => { releaseTiles = resolve; });
   let tileRequests = 0;
@@ -440,7 +450,8 @@ test("切片菜单在真实画布点击时关闭，空态和已打开切片均�
   for (const url of ["/app", `/app?slide=${CREDS.rasterSlides.workbench.slide_id}`]) {
     await page.goto(url);
     await expandSidebar(page);
-    await page.locator('.fb-hit').first().hover({ position: { x: 12, y: 20 } });
+    const hit = await locateSidebarSlide(page, CREDS.rasterSlides.workbench.slide_id);
+    await hit.hover({ position: { x: 12, y: 20 } });
     await page.locator('.fb-pullout .fb-card-menu').click();
     await expect(page.locator('#fb-slide-menu')).toBeVisible();
     await page.locator('#viewer .openseadragon-canvas').click({ position: { x: 500, y: 80 } });

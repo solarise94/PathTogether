@@ -912,7 +912,9 @@ test("草案一致：卡片从原叠中浮起，桌面比例按钮与页脚有�
   // 右侧菜单仍然可达；不可让浮卡的打开行为吞掉 ⋯ 点击。
   await pop.locator(".fb-card-menu").click();
   await expect(page.locator("#fb-slide-menu")).toBeVisible();
-  await page.mouse.click(700, 450);
+  // A fixed viewport coordinate can land on an empty-state CTA, which owns
+  // its click. Target the unobstructed viewer area for the outside-click check.
+  await page.locator("#viewer").click({ position: { x: 300, y: 80 } });
   await expect(page.locator("#fb-slide-menu")).toBeHidden();
   expect(errors).toEqual([]);
   await first.hover({ position: { x: 12, y: 20 } });

@@ -18453,6 +18453,23 @@ def _run_grant_creator_allowed(grant):
         return False
     if u.get("disabled"):
         return False
+    if grant_sid:
+        # ID-backed grants must recheck the same asset. New uploads have no
+        # legacy alias; their display filename is not an authorization key.
+        try:
+            desc = slide_store.resolve_slide_id(grant_sid)
+            if desc is None or _slide_id_archived(grant_sid):
+                return False
+            role = u.get("role") or ""
+            if not _ai_session_subject_can_view(role, creator, desc):
+                return False
+            if role == user_store.ROLE_OWNER or desc.owner_user_id == creator:
+                return True
+            return slide_store.has_share_permission(
+                creator, grant_sid, share_store.PERMISSION_ANNOTATE)
+        except Exception:
+            app.logger.warning("run grant ID 权限复查失败（按无权限处理）", exc_info=True)
+            return False
     # 升级 B R6：owner/user 统一按收录集合（归档只读对所有身份生效）
     return _subject_can_annotate_slide(u.get("role") or "", creator, slide)
 

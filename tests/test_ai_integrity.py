@@ -510,3 +510,80 @@ def test_session_archive_revokes_grants(fake_sidecar):
     client = _client()
     assert client.post("/api/ai/session/sess-arch/archive", json={}).status_code == 200
     assert share_store.get_run_grant(grant["grant_id"])["revoked"] is True
+
+@pytest.mark.parametrize('uploader_role', ['user', 'owner'])
+def test_id_only_run_grant_rechecks_stable_asset_and_creator(uploader_role):
+    """Real run preflight must allow an ID-only uploader, never its namesake."""
+    from _pt_helpers import publish_test_slide
+    from _tiff_fixtures import make_tiff_bytes
+    import slide_store
+
+    owner, usera, userb = _setup_users()
+    uploader = owner if uploader_role == 'owner' else usera
+    sid = publish_test_slide('same-name.tif', make_tiff_bytes(),
+                             owner_user_id=uploader['user_id'])
+    other = publish_test_slide('same-name.tif', make_tiff_bytes(),
+                               owner_user_id=userb['user_id'])
+    inst = _bootstrap_plugin()
+    token = _token_for(inst)
+    client = _client(auth_enabled=True)
+    grant = share_store.create_run_grant(
+        installation_id=inst['installation_id'], slide='same-name.tif',
+        slide_id=sid, created_by_user_id=uploader['user_id'])
+
+    def verify(asset=sid):
+        r = client.post('/api/plugin/v1/run-grants/verify', headers=_bearer(token),
+                        json={'grant_id': grant['grant_id'], 'slide_id': asset})
+        assert r.status_code == 200, r.get_json()
+        return r.get_json()
+
+    assert verify() == {'valid': True, 'reason': ''}
+    assert verify(other) == {'valid': False, 'reason': 'slide_mismatch'}
+    user_store.set_user_disabled(uploader['user_id'], True)
+    assert verify()['reason'] == 'creator_not_allowed'
+    user_store.set_user_disabled(uploader['user_id'], False)
+    assert verify()['valid'] is True
+    slide_store.request_delete(sid)
+    assert verify()['valid'] is False
+
+
+def test_id_only_run_grant_requires_current_annotate_share():
+    from _pt_helpers import publish_test_slide
+    from _tiff_fixtures import make_tiff_bytes
+
+    _, usera, userb = _setup_users()
+    sid = publish_test_slide('shared.tif', make_tiff_bytes(),
+                             owner_user_id=usera['user_id'])
+    inst = _bootstrap_plugin()
+    grant = share_store.create_run_grant(
+        installation_id=inst['installation_id'], slide='shared.tif',
+        slide_id=sid, created_by_user_id=userb['user_id'])
+    assert app_mod._run_grant_creator_allowed(grant) is False
+    view = share_store.create_share(['shared.tif'], 24, slide_ids=[sid], permissions=['view'])
+    share_store.claim_share(view['token'], userb['user_id'])
+    assert app_mod._run_grant_creator_allowed(grant) is False
+    writable = share_store.create_share(['shared.tif'], 24, slide_ids=[sid], permissions=['view', 'annotate'])
+    share_store.claim_share(writable['token'], userb['user_id'])
+    assert app_mod._run_grant_creator_allowed(grant) is True
+    share_store.revoke_share(writable['token'])
+    assert app_mod._run_grant_creator_allowed(grant) is False
+
+
+def test_id_only_admin_run_grant_ends_with_temporary_access():
+    from _pt_helpers import publish_test_slide
+    from _tiff_fixtures import make_tiff_bytes
+
+    owner, uploader, _ = _setup_users()
+    sid = publish_test_slide('temporary.tif', make_tiff_bytes(),
+                             owner_user_id=uploader['user_id'])
+    inst = _bootstrap_plugin()
+    grant = share_store.create_run_grant(
+        installation_id=inst['installation_id'], slide='temporary.tif',
+        slide_id=sid, created_by_user_id=owner['user_id'])
+    assert app_mod._run_grant_creator_allowed(grant) is False
+    share_store.start_slide_view_grant_timed(
+        owner['user_id'], sid, slide_id=sid,
+        granted_by=owner['user_id'], ttl_seconds=3600)
+    assert app_mod._run_grant_creator_allowed(grant) is True
+    share_store.end_slide_view_grant(owner['user_id'], sid, slide_id=sid)
+    assert app_mod._run_grant_creator_allowed(grant) is False

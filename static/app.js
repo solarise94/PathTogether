@@ -417,6 +417,7 @@
 
   function changepwOpen() {
     if (!els.changepwMask) return;
+    closeSidebarDrawerUnderOverlay();
     changepwShowError("");
     els.changepwCurrent.value = "";
     els.changepwNew.value = "";
@@ -505,6 +506,7 @@
 
   function changeemailOpen() {
     if (!els.changeemailMask) return;
+    closeSidebarDrawerUnderOverlay();
     changeemailShowError("");
     els.changeemailNew.value = "";
     els.changeemailMask.style.display = "";
@@ -630,6 +632,7 @@
 
   function feedbackOpen() {
     if (!els.feedbackMask) return;
+    closeSidebarDrawerUnderOverlay();
     if (feedbackState.doneTimer) { clearTimeout(feedbackState.doneTimer); feedbackState.doneTimer = null; }
     feedbackShowError("");
     if (els.feedbackSuccess) els.feedbackSuccess.hidden = true;
@@ -862,6 +865,7 @@
 
   function datashareOpen() {
     if (!els.datashareMask) return;
+    closeSidebarDrawerUnderOverlay();
     datashareShowError("");
     datashareState = null;
     els.datashareMask.style.display = "";
@@ -3643,7 +3647,8 @@
     menu.classList.add("open");
     function onDocClick(ev) {
       var tgt = ev.target;
-      if (tgt && tgt.closest && (tgt.closest("#" + menu.id) || tgt.closest("#" + anchor.id))) return;
+      // Card menu anchors have no id; containment also handles their SVG children.
+      if (tgt && (menu.contains(tgt) || anchor.contains(tgt))) return;
       closeFbMenu();
     }
     function onKey(ev) { if (ev.key === "Escape") closeFbMenu(); }

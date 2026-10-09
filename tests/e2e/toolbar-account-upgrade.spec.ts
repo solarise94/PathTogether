@@ -876,6 +876,8 @@ test("舒适密度：堆叠卡片不越过翻页栏，滑出预览在画布之�
 
 
 test("草案一致：卡片从原叠中浮起，桌面比例按钮与页脚有明确命中区", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", error => errors.push(error.message));
   await page.setViewportSize({ width: 1440, height: 900 });
   await serveFixture(page);
   await mockOwnerWithSlides(page, Array.from({ length: 12 }, (_, i) => ({ name: `review-${i}.svs`, alias: `样例切片 ${i + 1}` })));
@@ -910,7 +912,9 @@ test("草案一致：卡片从原叠中浮起，桌面比例按钮与页脚有�
   // 右侧菜单仍然可达；不可让浮卡的打开行为吞掉 ⋯ 点击。
   await pop.locator(".fb-card-menu").click();
   await expect(page.locator("#fb-slide-menu")).toBeVisible();
-  await page.keyboard.press("Escape");
+  await page.mouse.click(700, 450);
+  await expect(page.locator("#fb-slide-menu")).toBeHidden();
+  expect(errors).toEqual([]);
   await first.hover({ position: { x: 12, y: 20 } });
   await expect(pop).toBeVisible();
   if (process.env.REVIEW_SHOTS) await page.screenshot({ path: join(process.env.REVIEW_SHOTS, "desktop.png"), animations: "disabled" });
@@ -925,4 +929,22 @@ test("草案一致：卡片从原叠中浮起，桌面比例按钮与页脚有�
   await page.locator("#menu-btn").click();
   await expect(page.locator("#sidebar")).toHaveClass(/open/);
   if (process.env.REVIEW_SHOTS) await page.screenshot({ path: join(process.env.REVIEW_SHOTS, "mobile.png"), animations: "disabled" });
+});
+
+
+test("手机页脚弹窗收起侧栏，不让抽屉遮罩拦截关闭按钮", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await serveFixture(page);
+  await mockOwnerWithSlides(page, []);
+  await page.goto(FIXTURE_HOST + "/fixture");
+  for (const name of ["feedback", "changepw", "changeemail", "datashare"]) {
+    await expect(page.locator("#menu-btn")).toHaveAttribute("aria-expanded", "false");
+    await page.locator("#menu-btn").click();
+    await expect(page.locator("#sidebar")).toHaveClass(/open/);
+    await page.locator(`#${name}-btn`).click();
+    await expect(page.locator(`#${name}-mask`)).toBeVisible();
+    await expect(page.locator("#sidebar-mask")).toBeHidden();
+    await page.locator(`#${name}-close`).click();
+    await expect(page.locator(`#${name}-mask`)).toBeHidden();
+  }
 });

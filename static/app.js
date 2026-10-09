@@ -2295,8 +2295,12 @@
     if (!rect.width || !rect.height) rect = hit.querySelector(".fb-card").getBoundingClientRect();
     if (!rect.width || !rect.height) return null;
     var label = hit.querySelector(".fb-card-name");
+    // The flight starts as an exact copy of the card the user pulled out.
+    var face = (card.classList && card.classList.contains("fb-card") ? card
+      : card.querySelector(".fb-card")) || null;
     return { rect: rect, src: img.currentSrc || img.src, width: img.naturalWidth, height: img.naturalHeight,
-      name: label ? (label.title || label.textContent) : hit.dataset.name };
+      name: label ? (label.title || label.textContent) : hit.dataset.name,
+      face: face ? face.cloneNode(true) : null };
   }
 
   function cancelSlideDeal() {
@@ -2333,32 +2337,44 @@
     el.setAttribute("aria-hidden", "true");
     var card = document.createElement("div");
     card.className = "slide-deal-card";
+    var r = source.rect;
+    var width = Math.min(320, target.width * .45), height = width * r.height / r.width;
+    var center = { left: target.left + (target.width - width) / 2,
+      top: target.top + (target.height - height) / 2, width: width, height: height };
+    // Front: the file card itself, laid out at its sidebar size and scaled to
+    // the flight box so it is pixel-identical at the start of the pull.
+    // Back: the slide preview, which is what the card turns over to reveal and
+    // what then spreads into the viewer.
     var front = document.createElement("div");
     front.className = "slide-deal-face slide-deal-front";
+    var face = source.face;
+    if (face) {
+      face.className = "fb-card slide-deal-filecard";
+      face.removeAttribute("id");
+      face.style.width = r.width + "px";
+      face.style.height = r.height + "px";
+      face.style.transform = "scale(" + (width / r.width) + ")";
+    } else {
+      face = document.createElement("div");
+      face.className = "slide-deal-label";
+      face.textContent = source.name || "";
+    }
+    front.appendChild(face);
+    var back = document.createElement("div");
+    back.className = "slide-deal-face slide-deal-back";
     var img = document.createElement("img");
     img.src = source.src;
     img.alt = "";
-    var label = document.createElement("div");
-    label.className = "slide-deal-label";
-    label.textContent = source.name || "";
-    front.appendChild(img);
-    front.appendChild(label);
-    var back = document.createElement("div");
-    back.className = "slide-deal-face slide-deal-back";
-    back.textContent = "HistoPilot";
+    back.appendChild(img);
     card.appendChild(front);
     card.appendChild(back);
     el.appendChild(card);
-    var r = source.rect;
-    var width = Math.min(300, target.width * .45), height = width * r.height / r.width;
-    var center = { left: target.left + (target.width - width) / 2,
-      top: target.top + (target.height - height) / 2, width: width, height: height };
     Object.assign(el.style, { left: "0px", top: "0px", width: width + "px", height: height + "px" });
     el.style.transform = dealBoxTransform(center, width, height);
     // 无黑幕（§4.2.1）：不再追加不透明 .slide-deal-stage 全视窗遮罩——旧切片
     // 内容/空态保持可见，背景连续性由桥接层负责，飞牌只是装饰层。
     document.body.appendChild(el);
-    var deal = slideDeal = { el: el, card: card, front: front, image: img, label: label, seq: seq,
+    var deal = slideDeal = { el: el, card: card, front: front, image: img, seq: seq,
       ref: String(ref), center: center, imageWidth: source.width, imageHeight: source.height,
       thumbSrc: img.src, animations: [], drawn: false, spreading: false,
       landed: false, finishing: false, tilesCovered: false, rect: null, opened: false };
@@ -2382,20 +2398,28 @@
       }
       cancelSlideDeal();
     }, 8000);
-    var drawn = { left: Math.min(r.left + 110, center.left), top: Math.max(target.top + 12, r.top - 24), width: r.width, height: r.height };
+    // 1) Pull: slide straight out of the stack at the card's own size until it
+    //    clears the sidebar edge. 2) Turn: move to the viewer centre while the
+    //    card turns over around its vertical axis to show the slide.
+    //    The spread (spreadSlideDeal) then grows that face into the viewer.
     // Geometry is fixed once. Motion stays in transform instead of forcing
     // layout and repaint on every frame of the flight.
+    var pulledLeft = Math.max(r.left + r.width * .6, target.left + 18);
+    pulledLeft = Math.min(pulledLeft, window.innerWidth - r.width - 8);
+    var pulled = { left: Math.max(r.left, pulledLeft), top: r.top, width: r.width, height: r.height };
+    var DEAL_MS = 700, PULL_END = .34;
     dealAnimate(deal, el, [
-      { transform: dealBoxTransform(r, width, height), offset: 0 },
-      { transform: dealBoxTransform(drawn, width, height), offset: .26 },
+      { transform: dealBoxTransform(r, width, height), offset: 0, easing: "cubic-bezier(.5,0,.3,1)" },
+      { transform: dealBoxTransform(pulled, width, height), offset: PULL_END, easing: "cubic-bezier(.35,.1,.2,1)" },
       { transform: dealBoxTransform(center, width, height) }],
-      { duration: 620, easing: "cubic-bezier(.22,.7,.2,1)", fill: "both" });
+      { duration: DEAL_MS, easing: "linear", fill: "both" });
     dealAnimate(deal, card, [
-      { transform: "rotateY(0deg) rotateZ(-3deg)", offset: 0 },
-      { transform: "rotateY(-22deg) rotateZ(-9deg)", offset: .24 },
-      { transform: "rotateY(180deg) rotateZ(5deg)", offset: .62 },
-      { transform: "rotateY(360deg) rotateZ(0deg)" }
-    ], { duration: 620, easing: "cubic-bezier(.3,.05,.25,1)", fill: "both" }).then(function () {
+      { transform: "rotateY(0deg) rotateZ(0deg)", offset: 0 },
+      { transform: "rotateY(0deg) rotateZ(-1.5deg)", offset: PULL_END },
+      { transform: "rotateY(0deg) rotateZ(-1.5deg)", offset: .4, easing: "cubic-bezier(.45,0,.25,1)" },
+      { transform: "rotateY(180deg) rotateZ(0deg)", offset: .92 },
+      { transform: "rotateY(180deg) rotateZ(0deg)" }
+    ], { duration: DEAL_MS, easing: "linear", fill: "both" }).then(function () {
       if (slideDeal !== deal) return;
       deal.drawn = true;
       spreadSlideDeal(deal);
@@ -3513,6 +3537,7 @@
   var FB_MIN_GAP = 44;            // 条带下限（页容量按最紧条带计，保证放得下）
   var FB_MAX_GAP = 128;           // 条带上限 = 整卡高（短叠铺开时不再过度拉伸）
   var FB_CARD_H = 128;            // 完整卡片高度
+  var FB_PULL_PX = 72;            // 悬停时卡片从叠中横向抽出的距离
   var FB_FOLDER_H = 64;           // 文件夹卡高度
   var FB_FOLDER_GAP = 8;          // 文件夹卡间距
   var FB_STACK_FALLBACK_H = 396;  // 无布局环境（测试/首帧）时的可用高度兜底
@@ -4050,25 +4075,20 @@
     var reduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     fan.items.forEach(function (item, i) {
       var distance = i - fan.position;
-      // A smooth bell reaches both immediate neighbours, with no discontinuity
-      // when crossing a band boundary. Transitions interpolate from current CSS.
-      var weight = Math.pow(Math.max(0, Math.cos(Math.min(Math.abs(distance) / 2, 1) * Math.PI / 2)), 2);
-      var scale = Math.min(1 + (240 / item.rect.width - 1) * weight,
-        (fan.bottom - fan.top) / FB_CARD_H);
-      var width = item.rect.width * scale, height = FB_CARD_H * scale;
-      var left = Math.max(16, Math.min(item.rect.left + 40 * weight, fan.right - width));
-      var top = item.rect.top - 28 * weight + Math.sin(distance * Math.PI / 2) * 32 * weight;
-      top = Math.max(fan.top, Math.min(top, fan.bottom - height));
-      // Reduced motion retains the static layout. Normal hover moves/scales a
-      // fixed-size layer, keeping text/image proportions and stable hit bands.
-      item.pop.style.left = (reduced ? left : item.rect.left).toFixed(2) + "px";
-      item.pop.style.top = (reduced ? top : item.rect.top).toFixed(2) + "px";
-      item.pop.style.width = (reduced ? width : item.rect.width).toFixed(2) + "px";
-      item.pop.style.height = (reduced ? height : FB_CARD_H).toFixed(2) + "px";
+      // File-pocket metaphor: the card under the pointer slides sideways out of
+      // the stack at its own size; neighbours follow a little. No lift, scale
+      // or tilt, so the stack reads as paper in a folder, not floating tiles.
+      // The gaussian keeps motion continuous across band boundaries.
+      var dx = Math.min(FB_PULL_PX * Math.exp(-Math.pow(distance / .75, 2)),
+        Math.max(0, fan.right - item.rect.right));
+      // Only clamp vertically so a card near the bottom stays on screen.
+      var dy = Math.max(fan.top, Math.min(item.rect.top, fan.bottom - FB_CARD_H)) - item.rect.top;
+      item.pop.style.left = (reduced ? item.rect.left + dx : item.rect.left).toFixed(2) + "px";
+      item.pop.style.top = (reduced ? item.rect.top + dy : item.rect.top).toFixed(2) + "px";
+      item.pop.style.width = item.rect.width.toFixed(2) + "px";
+      item.pop.style.height = FB_CARD_H + "px";
       item.pop.style.transform = reduced ? "none" :
-        "translate3d(" + (left - item.rect.left).toFixed(2) + "px," +
-        (top - item.rect.top).toFixed(2) + "px,0) scale(" + scale.toFixed(4) +
-        ") rotate(" + (-3 * weight).toFixed(2) + "deg)";
+        "translate3d(" + dx.toFixed(2) + "px," + dy.toFixed(2) + "px,0)";
       item.pop.style.zIndex = String(item.hit === fbPulloutHit ? 515 : 505 + i);
     });
   }

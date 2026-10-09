@@ -5065,7 +5065,7 @@ button {
   background: transparent;
   pointer-events: none;
   transform-origin: left top;
-  transition: transform 100ms ease-out;
+  transition: transform 170ms cubic-bezier(.25, .8, .25, 1);
 }
 .fb-fan-card.fb-pullout { pointer-events: auto; cursor: pointer; }
 .fb-fan-card .fb-pullout-card {
@@ -5077,7 +5077,7 @@ button {
   background: var(--bg-panel-solid, #fff);
   box-shadow: 0 8px 20px rgba(0, 0, 0, .14);
 }
-.fb-fan-card.fb-pullout .fb-pullout-card { border-color: var(--accent); }
+.fb-fan-card.fb-pullout .fb-pullout-card { border-color: var(--accent); box-shadow: -1px 6px 18px rgba(0, 0, 0, .18); }
 .fb-fan-card .fb-card-menu[hidden] { display: none; }
 .fb-fan-card .fb-card-label { background: transparent; }
 .fb-card, .fb-folder { background: var(--bg-panel-solid, #fff); }
@@ -5231,18 +5231,18 @@ body.app-mode-official { overflow: clip; }
    so switching slides never passes through a full-viewport dark curtain. */
 .slide-deal { position: fixed; z-index: 518; pointer-events: none; perspective: 1100px; transform-origin: 0 0; }
 .slide-deal-card { position: relative; width: 100%; height: 100%; transform-style: preserve-3d; }
-.slide-deal-face { position: absolute; inset: 0; border-radius: 14px; backface-visibility: hidden;
-  overflow: hidden; box-shadow: 0 24px 64px #0005; background: #fff; }
-.slide-deal-front { border: 1px solid #007aff55; }
+.slide-deal-face { position: absolute; inset: 0; backface-visibility: hidden; -webkit-backface-visibility: hidden; }
+/* 正面：侧栏文件卡原样（按侧栏尺寸排版后整体缩放到飞行框） */
+.slide-deal-front { overflow: visible; }
+.slide-deal-filecard { position: absolute; top: 0; left: 0; transform-origin: 0 0; transition: none;
+  pointer-events: none; border-color: var(--accent); box-shadow: 0 10px 26px rgba(0, 0, 0, .16); }
+.slide-deal-label { position: absolute; inset: 0; padding: 12px 14px; border-radius: 8px; color: #252a32;
+  background: #fff; border: 1px solid var(--accent); font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 背面：翻过来就是切片本身，随后铺开到视窗 */
+.slide-deal-back { transform: rotateY(180deg); overflow: hidden; border-radius: 10px; background: #fff;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, .22); }
 .slide-deal-landing { position: fixed; left: 0; top: 0; z-index: 518; pointer-events: none; transform-origin: 0 0; background: #fff; }
-.slide-deal-front img, .slide-deal-landing img { width: 100%; height: 100%; object-fit: contain; display: block; }
-.slide-deal-label { position: absolute; inset: 0 0 auto; padding: 12px 14px; color: #252a32;
-  background: #fffffff2; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.slide-deal-back { transform: rotateY(180deg); display: grid; place-items: center;
-  color: #fff; font-size: 18px; font-weight: 650; letter-spacing: .04em;
-  border: 7px solid #fff; outline: 1px solid #dbe6f5;
-  background: repeating-linear-gradient(45deg, #ffffff0a 0 1px, transparent 1px 10px),
-    repeating-linear-gradient(-45deg, #ffffff0a 0 1px, transparent 1px 10px), #244d82; }
+.slide-deal-back img, .slide-deal-landing img { width: 100%; height: 100%; object-fit: contain; display: block; }
 /* 桥接层标记类：与 .osd-base-thumb 同层同样式（它本来就是上一刻的预览
    节点原样冻结），仅作身份标识与测试探针 */
 .osd-base-thumb-bridge { pointer-events: none; }

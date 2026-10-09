@@ -1039,20 +1039,20 @@ test("抽牌开片：后一次点击接管动画，迟到响应与失败都不�
   await rows.nth(1).focus();
   await page.keyboard.press('Enter');
   await expect(page.locator('.slide-deal')).toHaveAttribute('data-slide-id', 'sample-1.svs');
-  await expect(page.locator('.slide-deal-stage')).toHaveCount(1);
+  await expect(page.locator('.slide-deal')).toHaveCount(1);
   const oldResponse = page.waitForResponse('**/api/slide/sample-0.svs/info');
   release();
   await oldResponse;
   await expect(page).toHaveTitle(/Specimen 1/);
   await expect(page.locator('.slide-deal')).toHaveAttribute('data-slide-id', 'sample-1.svs');
   await page.keyboard.press('Escape');
-  await expect(page.locator('.slide-deal, .slide-deal-stage')).toHaveCount(0);
+  await expect(page.locator('.slide-deal')).toHaveCount(0);
   await page.route('**/api/slide/sample-2.svs/info', r => r.fulfill({ status: 403, json: { error: 'no access' } }));
   const denied = page.waitForResponse('**/api/slide/sample-2.svs/info');
   await rows.nth(2).focus();
   await page.keyboard.press('Enter');
   await denied;
-  await expect(page.locator('.slide-deal, .slide-deal-stage')).toHaveCount(0);
+  await expect(page.locator('.slide-deal')).toHaveCount(0);
   await expect(page).toHaveTitle(/Specimen 1/);
 });
 

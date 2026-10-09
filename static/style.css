@@ -2598,19 +2598,28 @@ button {
   gap: 2px;
 }
 
-/* ---------- AI 面板外框拖动/调整大小（改版第四轮 §1.4） ----------
-   交互全部在宿主侧：标题栏空白拖动、右下角手柄缩放（app.js
-   createAIPanelController，Pointer Events）。≤768px 不启用：手柄隐藏、
-   光标回默认，面板维持现有布局（贴底栏之上）。 */
+/* ---------- AI 面板外框拖动/调整大小（改版第四轮 §1.4；交互升级 §3） ----------
+   交互全部在宿主侧：整条标题栏（标题/箭头/新对话/⋯/关闭）都是起拖区
+   （app.js createAIPanelController 手势仲裁：≥6px 才算拖，阈值内是普通
+   点击），右下角手柄缩放。≤768px 不启用：手柄隐藏、光标回默认、面板
+   维持现有布局（贴底栏之上）、无「重置面板位置」入口。 */
 .ai-panel.ai-drag-ok .ai-panel-header {
   cursor: grab;
   touch-action: none; /* 触摸拖动不滚动页面 */
 }
+/* 整条 header 可起拖：按钮也以 grab 示意，功能仍由 tooltip 与点击表达 */
+.ai-panel.ai-drag-ok .ai-panel-header .ai-conversation-toggle,
+.ai-panel.ai-drag-ok .ai-panel-header .icon-btn {
+  cursor: grab;
+}
 .ai-panel.ai-dragging {
   user-select: none;
   -webkit-user-select: none;
+  will-change: transform; /* 拖动中只走合成器 transform（§3.2.4） */
 }
-.ai-panel.ai-dragging .ai-panel-header { cursor: grabbing; }
+.ai-panel.ai-dragging .ai-panel-header,
+.ai-panel.ai-dragging .ai-panel-header .ai-conversation-toggle,
+.ai-panel.ai-dragging .ai-panel-header .icon-btn { cursor: grabbing; }
 .ai-panel-resize {
   position: absolute;
   right: 0;
@@ -2631,7 +2640,10 @@ button {
 }
 @media (max-width: 768px) {
   .ai-panel-resize { display: none; }
-  .ai-panel.ai-drag-ok .ai-panel-header { cursor: default; touch-action: auto; }
+  #ai-reset-position { display: none; }
+  .ai-panel.ai-drag-ok .ai-panel-header,
+  .ai-panel.ai-drag-ok .ai-panel-header .ai-conversation-toggle,
+  .ai-panel.ai-drag-ok .ai-panel-header .icon-btn { cursor: default; touch-action: auto; }
   /* 维持现有布局：面板底缘收在底栏之上（此前由 z 56 > 顶栏 10 的旧层叠
      顺序隐式保证；顶栏抬到 60 后由几何显式保证，底栏恢复可点） */
   .ai-panel {
@@ -5213,8 +5225,10 @@ button:focus-visible, a:focus-visible, select:focus-visible, textarea:focus-visi
 body.app-mode-official { overflow: clip; }
 
 /* A selected slide is dealt from the fan into the workbench. The flight is
-   presentation-only; all pointer/keyboard interaction stays with the app. */
-.slide-deal-stage { position: fixed; z-index: 45; pointer-events: none; background: #262a30; }
+   presentation-only; all pointer/keyboard interaction stays with the app.
+   No opaque backdrop layer (§4.2.1): background continuity comes from the
+   frozen previous preview (.osd-base-thumb-bridge) instead of a solid color,
+   so switching slides never passes through a full-viewport dark curtain. */
 .slide-deal { position: fixed; z-index: 518; pointer-events: none; perspective: 1100px; transform-origin: 0 0; }
 .slide-deal-card { position: relative; width: 100%; height: 100%; transform-style: preserve-3d; }
 .slide-deal-face { position: absolute; inset: 0; border-radius: 14px; backface-visibility: hidden;
@@ -5229,4 +5243,7 @@ body.app-mode-official { overflow: clip; }
   border: 7px solid #fff; outline: 1px solid #dbe6f5;
   background: repeating-linear-gradient(45deg, #ffffff0a 0 1px, transparent 1px 10px),
     repeating-linear-gradient(-45deg, #ffffff0a 0 1px, transparent 1px 10px), #244d82; }
-@media (prefers-reduced-motion: reduce), (max-width: 768px) { .slide-deal, .slide-deal-stage, .slide-deal-landing { display: none; } }
+/* 桥接层标记类：与 .osd-base-thumb 同层同样式（它本来就是上一刻的预览
+   节点原样冻结），仅作身份标识与测试探针 */
+.osd-base-thumb-bridge { pointer-events: none; }
+@media (prefers-reduced-motion: reduce), (max-width: 768px) { .slide-deal, .slide-deal-landing { display: none; } }

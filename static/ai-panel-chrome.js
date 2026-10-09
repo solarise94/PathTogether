@@ -13,6 +13,7 @@
     var more = $('ai-options-toggle'), create = $('ai-new-conversation');
     var list = $('ai-conversation-list'), search = $('ai-conversation-search');
     var all = $('ai-conversation-all'), title = $('ai-panel-title');
+    var reset = $('ai-reset-position');
     var config = $('ai-config-wrap'), collapsed = $('ai-config-collapsed');
     var settings = $('ai-service-settings'), settingsContent = $('ai-service-settings-content');
     var bar = $('ai-session-bar'), openPanel = null, opener = null, showAll = false;
@@ -115,6 +116,7 @@
       text(options.querySelector('.ai-popover-heading'), more.title);
       text(settings.querySelector('summary'), label('AI 服务设置', 'AI service settings'));
       text(all, label('全部对话', 'All conversations'));
+      if (reset) text(reset, label('重置面板位置', 'Reset panel position'));
       search.placeholder = label('搜索对话', 'Search conversations'); search.setAttribute('aria-label', search.placeholder);
       // Hiding legacy new-conversation leaves aux empty in idle/running states.
       var cont = $('ai-continue-btn');
@@ -126,6 +128,11 @@
     more.addEventListener('click', function () { open(options, more); });
     create.addEventListener('click', function () { fresh.click(); close(false); sync(); $('ai-task').focus(); });
     all.addEventListener('click', function () { showAll = true; renderList(); search.focus(); });
+    // 重置面板位置的几何归 app.js 的面板控制器负责；这里只收起弹层。
+    if (reset) reset.addEventListener('click', function () { close(false); });
+    // 从标题栏起拖（跨过位移阈值）时收起弹层：拖动不应带着打开的会话列表
+    // 或选项菜单移动（§3.2.2）。事件由宿主控制器在进入拖动态时派发。
+    panel.addEventListener('ai-panel-dragstart', function () { if (openPanel) close(false); });
     search.addEventListener('input', renderList);
     select.addEventListener('change', sync);
     // Read-only observers bridge independent plugin updates (load, language,

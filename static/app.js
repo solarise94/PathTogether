@@ -1208,6 +1208,7 @@
     aiPanel: $("ai-panel"),
     aiPanelHeader: $("ai-panel-header"),
     aiPanelResize: $("ai-panel-resize"),
+    aiResetPosition: $("ai-reset-position"),
     annoAllToggle: $("anno-all-toggle"),
     // 手机端侧栏抽屉
     menuBtn: $("menu-btn"),
@@ -1326,6 +1327,14 @@
   var dragInfo = null;
   // 底图缩略图层：铺在瓦片层后面的模糊预览，慢网下避免瓦片未到区域变白
   var baseThumbEl = null;
+  // 背景桥接层（§4.2.1）：切片时上一张「已解码预览」的原 DOM 节点（不复制
+  // 画布、不同步读回像素），在新预览 decode 完成前保持画面连续，杜绝黑闪
+  var bridgeThumbEl = null;
+  // 正在进行的 viewer.open（= openSlideSeq）：OSD 的 viewer.open() 会先同步
+  // 触发一次 close 事件（见 openseadragon open→this.close()），该 close 属于
+  // 换片流程、不得清掉刚建好的新预览/桥接层；显式清屏（无切片态/到期）先把
+  // 本标记置 0，close 处理器才执行清理。
+  var slideOpenActive = 0;
 
   // 多通道通道着色控制器（Batch 4；channel-controls.js 三页面共用，本页只接
   // adapter/权限。RGB 或 flag 关时 handleInfo 返回 legacy，行为与旧版一致）
@@ -1539,14 +1548,24 @@
     }
     viewer.addHandler("zoom", function () { updateZoomBadge(); syncBaseThumb(); });
     viewer.addHandler("open", onViewerOpen);
-    viewer.addHandler("open-failed", cancelSlideDeal);
+    // 打开失败=明确失败（§4.2.7）：飞牌、桥接层与旧预览一并退场，不把旧图
+    // 留在屏上冒充新切片
+    viewer.addHandler("open-failed", function () {
+      slideOpenActive = 0;
+      cancelSlideDeal();
+      clearBaseThumb();
+      clearBridgeThumb();
+    });
     // Works for both Canvas and WebGL drawers. An open event only means the
     // tile source is known; do not uncover an empty canvas on a slow connection.
+    // 就绪判定（§4.2.5）：不能只凭 e.tiles.length>0——可见图像区域须被本帧
+    // 已绘制且完成必要混合的瓦片覆盖；有完整已解码底图时无须等高清瓦片
+    //（见 finishSlideDeal / dealHandoffReady）。
     viewer.addHandler("tiled-image-drawn", function (e) {
       if (!slideDeal || !slideDeal.opened || slideDeal.seq !== openSlideSeq ||
           !e.tiles || !e.tiles.length || !viewer.world ||
           e.tiledImage !== viewer.world.getItemAt(0)) return;
-      slideDeal.ready = true;
+      if (tilesCoverVisibleViewport(e.tiledImage, e.tiles)) slideDeal.tilesCovered = true;
       finishSlideDeal(slideDeal);
     });
     // A laid-out preview must never cover a user's attempt to pan the viewer.
@@ -1571,9 +1590,15 @@
       resizeAnnoCanvas();
       redrawAnnoCanvas();
     });
-    // 切片关闭时清理旧底图；P3：同时结束研究读片会话、清旧缓冲
+    // 切片关闭时清理旧底图；P3：同时结束研究读片会话、清旧缓冲。
+    // 注意 viewer.open() 自己会先同步 close 一次（换片流程）：那一步的旧
+    // 预览/桥接层正是新切片的背景连续性（§4.2.1），只有显式清屏
+    // （slideOpenActive 已复位为 0 的无切片态/到期/失败）才真正清理。
     viewer.addHandler("close", function () {
-      clearBaseThumb();
+      if (slideOpenActive !== openSlideSeq) {
+        clearBaseThumb();
+        clearBridgeThumb();
+      }
       if (researchTelemetry) researchTelemetry.endSlide();
     });
   }
@@ -1627,6 +1652,7 @@
       state.channelReopening = false;
       updateZoomBadge();
       syncBaseThumb();
+      maybeRetireBridgeThumb();
       if (slideDeal) spreadSlideDeal(slideDeal);
       emitSlideOpened();
       return;
@@ -1634,6 +1660,8 @@
     updateZoomBadge();
     // 打开后把底图缩略图对齐到当前视口
     syncBaseThumb();
+    // viewer 已 open 到本切片：新预览若已 decode，桥接层即可退场（§4.2.3）
+    maybeRetireBridgeThumb();
     if (slideDeal) spreadSlideDeal(slideDeal);
     // 打开新切片：退出绘制模式、清面板、重置标注画布尺寸
     exitDrawMode();
@@ -1727,12 +1755,133 @@
     baseThumbEl.style.transform = state.flipped ? "scaleX(-1)" : "";
   }
 
+  function thumbDecoded(el) {
+    return !!(el && el.complete && el.naturalWidth > 0);
+  }
+
+  // img 的 decode 门控（§4.2.3）：绝不以「src 已赋值」代替
+  // complete/naturalWidth 检查；已解码立即兑现，否则等 load/error。
+  function whenThumbDecoded(el) {
+    return new Promise(function (resolve) {
+      if (!el) { resolve(false); return; }
+      if (thumbDecoded(el)) { resolve(true); return; }
+      var settled = false;
+      function done(ok) {
+        if (settled) return;
+        settled = true;
+        el.removeEventListener("load", onLoad);
+        el.removeEventListener("error", onError);
+        resolve(ok);
+      }
+      var onLoad = function () { done(true); };
+      var onError = function () { done(false); };
+      el.addEventListener("load", onLoad);
+      el.addEventListener("error", onError);
+    });
+  }
+
+  function clearBridgeThumb() {
+    if (bridgeThumbEl) {
+      if (bridgeThumbEl.parentNode) bridgeThumbEl.parentNode.removeChild(bridgeThumbEl);
+      bridgeThumbEl = null;
+    }
+  }
+
+  // 桥接层退场：新预览已解码并在位后才允许（§4.2.3）。淡出只作用在这一个
+  // 待退场图层上，不同步降任何别的 alpha（§4.2.6）。
+  function retireBridgeThumb() {
+    if (!bridgeThumbEl) return;
+    var el = bridgeThumbEl;
+    bridgeThumbEl = null;
+    if (!el.parentNode) return;
+    if (typeof el.animate !== "function") { el.parentNode.removeChild(el); return; }
+    try {
+      var anim = el.animate([{ opacity: 0.9 }, { opacity: 0 }],
+        { duration: 180, fill: "forwards" });
+      var drop = function () { if (el.parentNode) el.parentNode.removeChild(el); };
+      anim.finished.then(drop, drop);
+    } catch (e) {
+      if (el.parentNode) el.parentNode.removeChild(el);
+    }
+  }
+
+  // 退场条件：新切片的底图预览已解码，且（无翻牌流程或 viewer 已 open 到
+  // 该切片）。两个事件源（预览 decode / viewer open）谁后到谁触发。
+  function maybeRetireBridgeThumb() {
+    if (!bridgeThumbEl) return;
+    var opened = !slideDeal || slideDeal.opened;
+    if (thumbDecoded(baseThumbEl) && opened) retireBridgeThumb();
+  }
+
+  // 换片前的背景桥接（§4.2.1/§4.2.2）：在 clearBaseThumb/viewer.open 清理
+  // 之前，把上一张已解码预览的原 DOM 冻结为桥接层。
+  // 优先级 1：翻牌层里已解码的缩略图（此时它才是用户眼前的那张图，冻结
+  // 其当前动画位置）；优先级 2：底图预览节点本身（几何已由 syncBaseThumb
+  // 维护）。两者都复用现有节点，不 toDataURL、不 getImageData、不复制画布。
+  function promoteSlideDealPreviewToBridge() {
+    var deal = slideDeal;
+    if (!deal || !deal.image || !viewer || !viewer.container) return false;
+    var img = deal.image;
+    if (!thumbDecoded(img)) return false;
+    var landingRect = deal.landing
+      ? deal.landing.getBoundingClientRect()
+      : (img.parentNode && img.parentNode.getBoundingClientRect ? img.parentNode.getBoundingClientRect() : null);
+    var containerRect = viewer.container.getBoundingClientRect();
+    if (!landingRect || !landingRect.width || !landingRect.height || !containerRect) return false;
+    bridgeThumbEl = img;
+    img.className = "osd-base-thumb osd-base-thumb-bridge";
+    img.style.left = (landingRect.left - containerRect.left) + "px";
+    img.style.top = (landingRect.top - containerRect.top) + "px";
+    img.style.width = landingRect.width + "px";
+    img.style.height = landingRect.height + "px";
+    img.style.transform = "none";
+    viewer.container.insertBefore(img, viewer.canvas);
+    return true;
+  }
+
+  function promoteBaseThumbToBridge() {
+    if (!baseThumbEl) return false;
+    if (!thumbDecoded(baseThumbEl) || !baseThumbEl.parentNode) {
+      // 从未解码的预览不可见，无桥接价值
+      if (baseThumbEl.parentNode) baseThumbEl.parentNode.removeChild(baseThumbEl);
+      baseThumbEl = null;
+      return false;
+    }
+    bridgeThumbEl = baseThumbEl;
+    bridgeThumbEl.classList.add("osd-base-thumb-bridge");
+    baseThumbEl = null;   // 几何内联值原样冻结；syncBaseThumb 不再改写它
+    return true;
+  }
+
+  function promotePreviousPreview() {
+    clearBridgeThumb();
+    if (!promoteSlideDealPreviewToBridge()) promoteBaseThumbToBridge();
+  }
 
   function clearBaseThumb() {
     if (baseThumbEl) {
       if (baseThumbEl.parentNode) baseThumbEl.parentNode.removeChild(baseThumbEl);
       baseThumbEl = null;
     }
+  }
+
+  // 新底图预览 decode 完成（§4.2.3）：对齐几何 → 具备条件即让桥接层退场，
+  // 并推动翻牌交接判定。迟到的 decode（seq 已过期）不触碰任何图层。
+  function onBaseThumbDecoded(seq) {
+    if (seq !== openSlideSeq) return;
+    syncBaseThumb();
+    maybeRetireBridgeThumb();
+    if (slideDeal) finishSlideDeal(slideDeal);
+  }
+
+  // 给 baseThumbEl 挂 decode 监听（src 可能在挂监听后才被设置，如通道控制
+  // 器 setThumbnail），decode 完成走 onBaseThumbDecoded
+  function armBaseThumbDecodeWatch(seq) {
+    if (!baseThumbEl) return;
+    whenThumbDecoded(baseThumbEl).then(function (ok) {
+      if (!ok || seq !== openSlideSeq) return;
+      onBaseThumbDecoded(seq);
+    });
   }
 
   function syncBaseThumb() {
@@ -1782,7 +1931,8 @@
       open: function (plan) {
         if (viewer && plan && plan.tileSource) viewer.open(plan.tileSource);
       },
-      // 底图缩略图与屏幕瓦片同 token（§4.4）；viewer.close 清掉后这里重建
+      // 底图缩略图与屏幕瓦片同 token（§4.4）；viewer.close 清掉后这里重建。
+      // 重建后重新挂 decode 门控：decode 完成才让桥接层退场/推动交接
       setThumbnail: function (url) {
         if (!url) return;
         if (!baseThumbEl && viewer && viewer.container) {
@@ -1792,7 +1942,10 @@
           viewer.container.insertBefore(baseThumbEl, viewer.canvas);
           applyBaseThumbFlip();
         }
-        if (baseThumbEl) baseThumbEl.src = url;
+        if (baseThumbEl) {
+          baseThumbEl.src = url;
+          armBaseThumbDecodeWatch(openSlideSeq);
+        }
       },
       // 409 slide_revision_conflict：只刷新 info 并重建一次（§6.3）。
       // slide ID 化（P2）：按当前切片操作键（id 优先；旧后端回落 name）刷新
@@ -1968,10 +2121,14 @@
   var openSlideSeq = 0;
 
   function openSlide(ref, cardSource) {
+    // 背景桥接（§4.2.1）：清理之前先冻结上一张已解码预览（翻牌层里的
+    // 缩略图优先——它才是此刻用户眼前的图；否则冻结底图预览节点），
+    // 换片全程画面不经过纯深色中间帧
+    promotePreviousPreview();
     cancelSlideDeal();
-    // 切换切片前移除旧底图
     clearBaseThumb();
     var seq = ++openSlideSeq;
+    slideOpenActive = seq;   // viewer.open 的同步 close 属于换片：保留连续图层
     if (cardSource) startSlideDeal(ref, seq, cardSource);
     apiFetch(slideInfoUrl(ref))
       .then(function (r) {
@@ -1998,7 +2155,15 @@
           return;
         }
         var info = res.info;
-        if (info.error) { cancelSlideDeal(); toast(t("open.fail", { e: info.error }), "error"); return; }
+        if (info.error) {
+          // info 失败要明确失败（§4.2.7）：桥接层退场，不把旧图留在屏上
+          // 冒充新图；旧切片瓦片仍在 viewer 里，由 toast 说明状态
+          slideOpenActive = 0;
+          cancelSlideDeal();
+          clearBridgeThumb();
+          toast(t("open.fail", { e: info.error }), "error");
+          return;
+        }
         state.slide = {
           // slide ID 化（P2 合同 §5.1）：id = slide_id 唯一操作键；name 保持
           // legacy 文件名（显示/快照）；旧后端 DTO 无 slide_id → id 为 null，
@@ -2038,12 +2203,16 @@
         // 先填写虚假标尺；显式 setMpp 后由 syncUnitAvailability 重新放开。
         syncUnitAvailability();
         // 创建底图缩略图层：铺在瓦片 canvas 之前（下层），慢网下透出模糊预览
-        // （src 由通道控制器 setThumbnail 或 legacy 路径填充）
+        // （src 由通道控制器 setThumbnail 或 legacy 路径填充）。src 优先复用
+        // 飞牌手里已解码的同一张缩略图（同 URL → 缓存直接命中，§4.2.2），
+        // decode 完成前桥接层保持在场。
         baseThumbEl = document.createElement("img");
         baseThumbEl.className = "osd-base-thumb";
         baseThumbEl.alt = "";
         viewer.container.insertBefore(baseThumbEl, viewer.canvas);
         applyBaseThumbFlip();
+        var dealThumbSrc = (slideDeal && slideDeal.seq === seq && slideDeal.image && slideDeal.image.src)
+          ? slideDeal.image.src : null;
         // 多通道通道着色：共用组件按 info 决定 inline custom TileSource（携带
         // render token）或原 DZI 路径；RGB / flag 关返回 legacy，行为不变。
         // render 计划的 viewer.open 由控制器经 opts.open 完成（409 刷新等
@@ -2058,13 +2227,16 @@
           });
         }
         if (!plan || plan.kind !== "render") {
-          baseThumbEl.src = slideThumbnailUrl(ref);
+          baseThumbEl.src = dealThumbSrc || slideThumbnailUrl(ref);
           viewer.open(slideDziUrl(ref));
-        } else if (plan.thumbnailUrl && baseThumbEl && !baseThumbEl.src) {
+        } else if (plan.thumbnailUrl) {
           // render 计划首开（多通道 / RGB 画质路径）：底图预览由计划提供
-          // （缩略图与瓦片同 context；仅当未设置过 src 时补设）
+          // （缩略图与瓦片同 context）
           baseThumbEl.src = plan.thumbnailUrl;
+        } else if (dealThumbSrc) {
+          baseThumbEl.src = dealThumbSrc;
         }
+        armBaseThumbDecodeWatch(seq);
         // 高亮列表项（未归类与项目切片行）：按 data-slide-id（= slide_id；
         // 旧后端列表无 slide_id 时 dataset 键回落 name，P6 拆 name 回落）
         var activeRef = String(ref);
@@ -2093,7 +2265,9 @@
       })
       .catch(function (e) {
         if (seq === openSlideSeq) {
+          slideOpenActive = 0;
           cancelSlideDeal();
+          clearBridgeThumb();
           toast(t("open.info.fail", { e: e }), "error");
         }
       });
@@ -2125,8 +2299,7 @@
     slideDeal = null; // Invalidate all animation/promise callbacks first.
     clearTimeout(deal.timeout);
     deal.animations.forEach(function (animation) { animation.cancel(); });
-    if (deal.el.parentNode) deal.el.parentNode.removeChild(deal.el);
-    if (deal.stage.parentNode) deal.stage.parentNode.removeChild(deal.stage);
+    if (deal.el && deal.el.parentNode) deal.el.parentNode.removeChild(deal.el);
     if (deal.landing && deal.landing.parentNode) deal.landing.parentNode.removeChild(deal.landing);
   }
 
@@ -2174,20 +2347,35 @@
     var width = Math.min(300, target.width * .45), height = width * r.height / r.width;
     var center = { left: target.left + (target.width - width) / 2,
       top: target.top + (target.height - height) / 2, width: width, height: height };
-    function box(rect) { return { left: rect.left + "px", top: rect.top + "px", width: rect.width + "px", height: rect.height + "px" }; }
     Object.assign(el.style, { left: "0px", top: "0px", width: width + "px", height: height + "px" });
     el.style.transform = dealBoxTransform(center, width, height);
-    var stage = document.createElement("div");
-    stage.className = "slide-deal-stage";
-    stage.setAttribute("aria-hidden", "true");
-    Object.assign(stage.style, box(target));
-    document.body.appendChild(stage);
+    // 无黑幕（§4.2.1）：不再追加不透明 .slide-deal-stage 全视窗遮罩——旧切片
+    // 内容/空态保持可见，背景连续性由桥接层负责，飞牌只是装饰层。
     document.body.appendChild(el);
-    var deal = slideDeal = { el: el, stage: stage, card: card, front: front, image: img, label: label, seq: seq,
+    var deal = slideDeal = { el: el, card: card, front: front, image: img, label: label, seq: seq,
       ref: String(ref), center: center, imageWidth: source.width, imageHeight: source.height,
-      animations: [], ready: false, drawn: false, spreading: false, landed: false, finishing: false };
+      thumbSrc: img.src, animations: [], drawn: false, spreading: false,
+      landed: false, finishing: false, tilesCovered: false, rect: null, opened: false };
     // A failed/very slow DZI must never leave a decorative card over the workbench.
-    deal.timeout = setTimeout(function () { if (slideDeal === deal) cancelSlideDeal(); }, 8000);
+    // 8 秒仍加载中（§4.2.7）：先把完整预览移交底图再退出装饰，不重新露出黑屏。
+    deal.timeout = setTimeout(function () {
+      if (slideDeal !== deal) return;
+      if (deal.landed && deal.landing) {
+        deal.finishing = true;
+        handoffPreviewToBase(deal);
+        toast(t("open.slow"), "info");
+        dealAnimate(deal, deal.el, [{ opacity: 1 }, { opacity: 0 }], { duration: 160, fill: "forwards" });
+        whenThumbDecoded(baseThumbEl).then(function () {
+          if (slideDeal !== deal) return;
+          dealAnimate(deal, deal.landing, [{ opacity: 1 }, { opacity: 0 }],
+            { duration: 160, fill: "forwards" }).then(function () {
+              if (slideDeal === deal) cancelSlideDeal();
+            });
+        });
+        return;
+      }
+      cancelSlideDeal();
+    }, 8000);
     var drawn = { left: Math.min(r.left + 110, center.left), top: Math.max(target.top + 12, r.top - 24), width: r.width, height: r.height };
     // Geometry is fixed once. Motion stays in transform instead of forcing
     // layout and repaint on every frame of the flight.
@@ -2232,6 +2420,7 @@
     if (rect.width > root.width + 2 || rect.height > root.height + 2) { cancelSlideDeal(); return; }
     deal.spreading = true;
     deal.el.dataset.phase = "spreading";
+    deal.rect = rect;   // 目标几何（§4.2.5 可交接定义的输入之一）
     var c = deal.center;
     // Rasterize the landing image at its final size once, then scale it
     // uniformly. Stretching the whole card would distort panoramic/portrait
@@ -2258,18 +2447,90 @@
       if (slideDeal !== deal) return;
       deal.landed = true;
       deal.el.dataset.phase = "preview";
+      // 铺开完成即具备桥接退场的一半条件（viewer 已 open）——若新预览也已
+      // decode，就让桥接层退场，避免双份旧图长驻
+      maybeRetireBridgeThumb();
       finishSlideDeal(deal);
     });
   }
 
+  // 「可交接」（§4.2.5）：selection generation 匹配（seq/opened 由前置守卫保
+  // 证）+ 目标几何有效 + 完整底图已解码可见，或目标可见图像区域已被已绘制
+  // 且完成必要混合的瓦片覆盖（tilesCovered 只能由 tiled-image-drawn 的逐帧
+  // 覆盖判定置位，不能只凭 e.tiles.length>0）。
+  function dealHandoffReady(deal) {
+    if (slideDeal !== deal || !deal.landed || deal.finishing) return false;
+    if (!deal.rect || !(deal.rect.width > 0) || !(deal.rect.height > 0)) return false;
+    if (deal.seq !== openSlideSeq || !deal.opened) return false;
+    if (thumbDecoded(baseThumbEl)) return true;
+    return !!deal.tilesCovered;
+  }
+
   function finishSlideDeal(deal) {
-    if (slideDeal !== deal || !deal.landed || !deal.ready || deal.finishing) return;
+    if (!dealHandoffReady(deal)) return;
     deal.finishing = true;
     deal.el.dataset.phase = "handoff";
-    dealAnimate(deal, deal.stage, [{ opacity: 1 }, { opacity: 0 }], { duration: 160, fill: "forwards" });
-    dealAnimate(deal, deal.landing, [{ opacity: 1 }, { opacity: 0 }], { duration: 160, fill: "forwards" }).then(function () {
+    // 交接顺序（§4.2.4）：先把完整预览交给 viewer 底图层（OSD 透明区域下方
+    // 已是同一张已解码预览，对齐几何），再淡出飞牌副本——不存在两处都空的帧。
+    syncBaseThumb();
+    dealAnimate(deal, deal.landing, [{ opacity: 1 }, { opacity: 0 }], { duration: 180, fill: "forwards" });
+    // 桥接层（若还在）与飞牌副本同时退场：新预览已在它们下方完成交接
+    retireBridgeThumb();
+    dealAnimate(deal, deal.el, [{ opacity: 1 }, { opacity: 0 }], { duration: 160, fill: "forwards" }).then(function () {
       if (slideDeal === deal) cancelSlideDeal();
     });
+  }
+
+  // 8 秒超时的预览移交（§4.2.7）：把飞牌里已解码的完整预览写回底图层并
+  // 对位；底图 decode 兑现前飞牌保持可见，不一次移除所有可见预览。
+  function handoffPreviewToBase(deal) {
+    if (!viewer || !viewer.container) return;
+    if (!baseThumbEl) {
+      baseThumbEl = document.createElement("img");
+      baseThumbEl.className = "osd-base-thumb";
+      baseThumbEl.alt = "";
+      viewer.container.insertBefore(baseThumbEl, viewer.canvas);
+      applyBaseThumbFlip();
+    }
+    if (!thumbDecoded(baseThumbEl) && thumbDecoded(deal.image) && deal.image.src) {
+      baseThumbEl.src = deal.image.src;   // 同 URL → 缓存直接命中
+    }
+    if (deal.rect) {
+      baseThumbEl.style.left = deal.rect.left + "px";
+      baseThumbEl.style.top = deal.rect.top + "px";
+      baseThumbEl.style.width = deal.rect.width + "px";
+      baseThumbEl.style.height = deal.rect.height + "px";
+      baseThumbEl.style.display = "block";
+    }
+  }
+
+  // 可见图像区域的瓦片覆盖判定（§4.2.5）：e.tiles 是本帧实际绘制完成并
+  // 混合的瓦片（图像坐标 bounds），对当前 viewport 在该图层上的可见矩形
+  // 做网格采样近似并集覆盖率。
+  function tilesCoverVisibleViewport(tiledImage, tiles) {
+    try {
+      if (!tiledImage || !tiles || !tiles.length || !viewer || !viewer.viewport) return false;
+      var vis = tiledImage.viewportToImageRectangle(viewer.viewport.getBounds(true));
+      var dim = tiledImage.getContentSize ? tiledImage.getContentSize() : tiledImage.source.dimensions;
+      var x0 = Math.max(0, vis.x), y0 = Math.max(0, vis.y);
+      var x1 = Math.min(dim.x, vis.x + vis.width), y1 = Math.min(dim.y, vis.y + vis.height);
+      var vw = x1 - x0, vh = y1 - y0;
+      if (!(vw > 0) || !(vh > 0)) return false;
+      var N = 20, hit = 0;
+      for (var i = 0; i < N; i++) {
+        for (var j = 0; j < N; j++) {
+          var px = x0 + vw * (i + .5) / N, py = y0 + vh * (j + .5) / N;
+          for (var k = 0; k < tiles.length; k++) {
+            var b = tiles[k] && tiles[k].bounds;
+            if (b && px >= b.x && px <= b.x + b.width && py >= b.y && py <= b.y + b.height) {
+              hit++;
+              break;
+            }
+          }
+        }
+      }
+      return hit / (N * N) >= 0.98;
+    } catch (e) { return false; }
   }
 
   // ---------- 临时查看到期（§5.5） ----------
@@ -2338,11 +2599,15 @@
     state.mppX = null;
     state.roiMode = null;
     clearTempViewTimer();
+    // 复位换片标记：随后的 viewer.close 是显式清屏，close 处理器会连桥接
+    // 层一起清理（临时查看到期必须同时清掉保留的背景/预览，§4.2.8）
+    slideOpenActive = 0;
     updateDocTitle(null);
     updateMppSetterVisibility();
     if (roiBox) exitRoi();
     if (viewer) viewer.close();
     clearBaseThumb();
+    clearBridgeThumb();
     updateCanvasSlideLabel();
     updateViewerEmptyState();
     // 反馈记录器（§3）：清屏（临时查看到期等）记入 nav 事件
@@ -5088,14 +5353,27 @@
   //   - 拖标题栏移动、拖右下角手柄调整大小；Pointer Events（鼠标 + 触摸）；
   //   - 位置/大小钳回切片视框（#viewer-wrap）内；窗口缩放后自动收回框内；
   //   - 最小 280×240；按用户写 localStorage（pt.aip.v1|<站点:账号>，与
-  //     pt.sb.v1| 同一身份口径）；双击标题栏恢复默认位置并清除偏好；
-  //   - 标题栏上的按钮照常可点（拖动只从空白处起手，按钮/输入在排除表内）；
+  //     pt.sb.v1| 同一身份口径）；恢复默认位置走 ⋯ 菜单「重置面板位置」，
+  //     不再占用标题双击（Viewer 交互升级 §3.1）；
+  //   - 整条标题栏都是起拖区（标题/下拉箭头/新对话/⋯/关闭按钮均可起手，
+  //     §3.1）：pointerdown 只记候选手势（不 preventDefault、不抢按钮焦点、
+  //     不写 localStorage），位移超过约 6 CSS px 才转入拖动态——捕获指针、
+  //     关闭标题弹层，并只抑制本次手势产生的那个 click（一次性捕获监听，
+  //     用完即拆；绝不用全局时间窗禁点，§3.2.2/3.2.3）。阈值以下松手 =
+  //     普通点击，按钮动作照常；Enter/Space 键激活不经过指针手势；
+  //   - 拖动中 rAF 合并、只写 transform（合成器路径，不逐帧读写布局），
+  //     pointerup 一次提交 left/top 并持久化一次（§3.2.4）；
+  //   - pointercancel / Esc / 窗口失焦取消：清 transform 回到起点、释放
+  //     捕获与光标，不提交任何几何（§3.2.5）；
+  //   - 首次起拖的真实位置从 DOM 读一次（getBoundingClientRect 相对
+  //     #viewer-wrap），不凭默认 right/top 常量推算（§3.2.6）；
   //   - ≤768px 不启用（维持现有布局），断点切回桌面时恢复记忆的位置。
   // 纯几何集中在 clampAIPanelBox(box, frame, min)，vitest 直接驱动；
   // DOM 决策在 createAIPanelController(deps)，边界（元素/mq/storage）注入。
   // =========================================================================
   var AI_PANEL_MIN_W = 280;
   var AI_PANEL_MIN_H = 240;
+  var AI_PANEL_DRAG_THRESHOLD_PX = 6;
   var AI_PANEL_PREF_PREFIX = "pt.aip.v1|";
 
   function aiPanelPrefKey(scope) {
@@ -5139,8 +5417,10 @@
     var storage = deps.storage;
     var doc = deps.doc || document;
     var win = deps.win || window;
-    var box = null;            // null = 默认 CSS 锚定（right/top/bottom/width）
-    var drag = null;           // 拖动中：{type, pointerId, px, py, startLeft, startTop, startW, startH}
+    var box = null;         // null = 默认 CSS 锚定（right/top/bottom/width）
+    var gesture = null;     // 候选/拖动中手势（同一时刻最多一个指针）
+    var gestureRaf = 0;     // 拖动 transform 合并用的待执行 rAF
+    var clickGuard = null;  // 本次拖动手势的一次性 click 抑制器
 
     function isMobile() {
       return !!(mq && typeof mq.matches === "boolean" && mq.matches);
@@ -5177,6 +5457,8 @@
     }
     function apply() {
       if (!panel || !panel.style) return;
+      // 几何提交接管位移：清掉拖动中的 transform（不提交则由取消路径清）
+      if (panel.style.transform) panel.style.transform = "";
       if (!box) {
         // 恢复默认：清内联几何，交还 CSS（right/top/bottom/width 锚定）
         panel.style.left = "";
@@ -5197,64 +5479,168 @@
       panel.style.height = Math.round(c.height) + "px";
     }
 
-    function dragTargetAllowed(t) {
-      // 标题栏空白才能拖动；按钮/输入等照常交互（§1.4：按钮仍可正常点击）
-      if (!t || !t.closest) return true;
-      return !t.closest("button, a, input, textarea, select, label");
+    // 首次起拖的真实位置：从 DOM 读一次面板相对视框的位移，不凭默认
+    // right/top 常量推算（§3.2.6）。仅在手势开始时调用（每手势一次布局读）。
+    function readPanelBoxFromDom() {
+      var f = frameSize();
+      var w = panel.offsetWidth || Math.min(340, f.width);
+      var h = panel.offsetHeight || f.height;
+      var left = 0, top = 0;
+      try {
+        var pr = panel.getBoundingClientRect();
+        var fr = frameEl && frameEl.getBoundingClientRect ? frameEl.getBoundingClientRect() : null;
+        if (pr && fr && isFinite(pr.left) && isFinite(fr.left)) {
+          left = pr.left - fr.left;
+          top = pr.top - fr.top;
+        }
+      } catch (e) { /* 保持 0：下一帧仍会被钳制收回框内 */ }
+      return clampAIPanelBox(
+        { left: left, top: top, width: w, height: h },
+        f, { width: AI_PANEL_MIN_W, height: AI_PANEL_MIN_H });
     }
-    function beginDrag(e, type) {
-      if (isMobile() || !panel || drag) return;
+
+    // ---- 手势仲裁（§3.2）：候选 → 超阈值进入拖动 → 提交/取消 ----
+    function setPointerCapture(el, pointerId) {
+      try {
+        if (el && typeof el.setPointerCapture === "function") el.setPointerCapture(pointerId);
+      } catch (e) { /* 指针已失效：doc 级监听仍能收到剩余事件 */ }
+    }
+    function releasePointerCapture(el, pointerId) {
+      try {
+        if (el && typeof el.releasePointerCapture === "function") el.releasePointerCapture(pointerId);
+      } catch (e) { /* 未捕获/已释放：忽略 */ }
+    }
+    // 抑制范围绑定本次手势：一次性 doc 捕获监听，拦下它生成的那个 click
+    // 即自拆（§3.2.3）。不用「接下来 N ms 全局禁点」。pointerup 后浏览器
+    // 同步派发 click，兜底定时器只负责「手势取消/无 click」时的清理。
+    function installClickGuard() {
+      if (clickGuard) return;
+      clickGuard = function (ev) {
+        removeClickGuard();
+        if (ev) {
+          if (ev.preventDefault) ev.preventDefault();
+          if (ev.stopPropagation) ev.stopPropagation();
+          if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
+        }
+      };
+      doc.addEventListener("click", clickGuard, true);
+    }
+    function removeClickGuard() {
+      if (!clickGuard) return;
+      try { doc.removeEventListener("click", clickGuard, true); } catch (e) {}
+      clickGuard = null;
+    }
+    function beginGesture(e, type) {
+      if (isMobile() || !panel || gesture) return;   // ≤768px 固定面板；单指针
       if (e && e.button != null && e.button !== 0) return;
-      if (!dragTargetAllowed(e && e.target)) return;
-      var start = box;
-      if (!start) {
-        // 默认锚定态（right/top/bottom/width）的等效 box：首次拖动以此为准
-        var f = frameSize();
-        var w = panel.offsetWidth || Math.min(340, f.width);
-        var h = panel.offsetHeight || f.height;
-        start = clampAIPanelBox(
-          { left: Math.max(0, f.width - w - 14), top: 14, width: w, height: h },
-          f, { width: AI_PANEL_MIN_W, height: AI_PANEL_MIN_H });
-      }
-      drag = {
-        type: type,
+      gesture = {
+        type: type,                                  // "move" | "resize"
         pointerId: e.pointerId,
         px: e.clientX, py: e.clientY,
-        startLeft: start.left, startTop: start.top,
-        startW: start.width, startH: start.height,
+        startBox: box || readPanelBoxFromDom(),
+        captureEl: e.currentTarget || null,
+        dragging: false,
+        lastX: e.clientX, lastY: e.clientY,
+        frame: null,
       };
-      if (panel.classList) panel.classList.add("ai-dragging");
-      try {
-        if (e.currentTarget && e.currentTarget.setPointerCapture) {
-          e.currentTarget.setPointerCapture(e.pointerId);
-        }
-      } catch (err) {}
-      if (e.cancelable && e.preventDefault) e.preventDefault();
+      // 候选阶段：不 preventDefault、不捕获、不写 localStorage（§3.2.1），
+      // 按钮焦点与 hover tooltip 保持原状。
     }
-    function onDragMove(e) {
-      if (!drag || !e || e.pointerId !== drag.pointerId) return;
-      var f = frameSize();
-      var dx = e.clientX - drag.px;
-      var dy = e.clientY - drag.py;
-      if (drag.type === "move") {
-        box = clampAIPanelBox(
-          { left: drag.startLeft + dx, top: drag.startTop + dy,
-            width: drag.startW, height: drag.startH },
-          f, { width: AI_PANEL_MIN_W, height: AI_PANEL_MIN_H });
-      } else {
-        box = clampAIPanelBox(
-          { left: drag.startLeft, top: drag.startTop,
-            width: drag.startW + dx, height: drag.startH + dy },
-          f, { width: AI_PANEL_MIN_W, height: AI_PANEL_MIN_H });
+    function clampedDragBox(g) {
+      var dx = g.lastX - g.px, dy = g.lastY - g.py;
+      var f = g.frame || (g.frame = frameSize());
+      var min = { width: AI_PANEL_MIN_W, height: AI_PANEL_MIN_H };
+      if (g.type === "move") {
+        return { dx: dx, dy: dy, box: clampAIPanelBox(
+          { left: g.startBox.left + dx, top: g.startBox.top + dy,
+            width: g.startBox.width, height: g.startBox.height }, f, min) };
       }
-      apply();
+      return { dx: dx, dy: dy, box: clampAIPanelBox(
+        { left: g.startBox.left, top: g.startBox.top,
+          width: g.startBox.width + dx, height: g.startBox.height + dy }, f, min) };
     }
-    function endDrag(e) {
-      if (!drag) return;
-      if (e && e.pointerId !== undefined && e.pointerId !== drag.pointerId) return;
-      drag = null;
+    // 拖动中 rAF 合并：move 只写 transform（合成器路径，不逐帧读写布局）；
+    // resize 的宽高变化无法用 transform 等价合成，同样合并到每帧至多一次
+    // 布局写（视框几何在手势开始时已冻结，循环内只写不读）
+    function paintGestureTransform(g) {
+      gestureRaf = 0;
+      if (!gesture || gesture !== g || !g.dragging || !panel || !panel.style) return;
+      if (g.type !== "move") {
+        box = clampedDragBox(g).box;
+        apply();
+        return;
+      }
+      var c = clampedDragBox(g);
+      var dx = c.box.left - g.startBox.left, dy = c.box.top - g.startBox.top;
+      panel.style.transform =
+        "translate(" + Math.round(dx) + "px," + Math.round(dy) + "px)";
+    }
+    function scheduleGesturePaint(g) {
+      if (gestureRaf) return;
+      if (typeof win.requestAnimationFrame === "function") {
+        gestureRaf = win.requestAnimationFrame(function () { paintGestureTransform(g); });
+      } else {
+        gestureRaf = 1;
+        paintGestureTransform(g);
+      }
+    }
+    function engageDrag(g) {
+      g.dragging = true;
+      g.frame = frameSize();     // 拖动期间冻结视框几何，move 循环不再读布局
+      if (panel && panel.classList) panel.classList.add("ai-dragging");
+      setPointerCapture(g.captureEl, g.pointerId);
+      // 起拖即关闭标题弹层（会话列表/对话选项）；chrome 侧监听同事件。
+      try {
+        panel.dispatchEvent(new win.CustomEvent("ai-panel-dragstart", { bubbles: true }));
+      } catch (e) { /* 环境无 CustomEvent：跳过弹层联动 */ }
+      installClickGuard();
+      scheduleGesturePaint(g);
+    }
+    function onGestureMove(e) {
+      if (!gesture || !e || e.pointerId !== gesture.pointerId) return;
+      gesture.lastX = e.clientX;
+      gesture.lastY = e.clientY;
+      if (!gesture.dragging) {
+        // 位移达到约 6 CSS px 才转入拖动态；阈值以下仍是普通点击（§3.2.2）
+        var dx = gesture.lastX - gesture.px, dy = gesture.lastY - gesture.py;
+        if ((dx * dx + dy * dy) < AI_PANEL_DRAG_THRESHOLD_PX * AI_PANEL_DRAG_THRESHOLD_PX) return;
+        engageDrag(gesture);
+        return;
+      }
+      scheduleGesturePaint(gesture);
+    }
+    // 提交：left/top 一次写入并持久化一次（§3.2.4）
+    function commitDrag(g) {
+      var c = clampedDragBox(g);
+      box = c.box;
+      apply();
+      writePref(box);
+    }
+    function endGesture(e) {
+      var g = gesture;
+      if (!g || (e && e.pointerId !== undefined && e.pointerId !== g.pointerId)) return;
+      gesture = null;
+      if (gestureRaf) { win.cancelAnimationFrame ? win.cancelAnimationFrame(gestureRaf) : clearTimeout(gestureRaf); gestureRaf = 0; }
+      if (e && typeof e.clientX === "number") { g.lastX = e.clientX; g.lastY = e.clientY; }
+      if (!g.dragging) return;              // 阈值以下松手：普通 click 照常
+      releasePointerCapture(g.captureEl, g.pointerId);
       if (panel && panel.classList) panel.classList.remove("ai-dragging");
-      if (box) writePref(box);
+      commitDrag(g);
+      // click 紧随 pointerup 同步派发：guard 拦下即自拆；无 click（如拖出
+      // 窗口松手）由兜底清理收尾，都不是全局时间窗（§3.2.3）
+      win.setTimeout(removeClickGuard, 0);
+    }
+    // 取消：恢复起点，不提交几何、不写偏好（§3.2.5）
+    function cancelGesture() {
+      var g = gesture;
+      if (!g) { removeClickGuard(); return; }
+      gesture = null;
+      if (gestureRaf) { win.cancelAnimationFrame ? win.cancelAnimationFrame(gestureRaf) : clearTimeout(gestureRaf); gestureRaf = 0; }
+      removeClickGuard();
+      if (!g.dragging) return;
+      releasePointerCapture(g.captureEl, g.pointerId);
+      if (panel && panel.classList) panel.classList.remove("ai-dragging");
+      if (panel && panel.style) panel.style.transform = "";
     }
 
     return {
@@ -5264,20 +5650,19 @@
         // Bind once on mobile too: a later desktop breakpoint enables dragging.
         var pref = isMobile() ? null : readPref();
         if (pref) { box = pref; apply(); }
-        header.addEventListener("pointerdown", function (e) { beginDrag(e, "move"); });
+        // 整条标题栏（含标题按钮/箭头/三个按钮）都是起拖候选区（§3.1）
+        header.addEventListener("pointerdown", function (e) { beginGesture(e, "move"); });
         if (handle) {
-          handle.addEventListener("pointerdown", function (e) { beginDrag(e, "resize"); });
+          handle.addEventListener("pointerdown", function (e) { beginGesture(e, "resize"); });
         }
-        doc.addEventListener("pointermove", function (e) { onDragMove(e); });
-        doc.addEventListener("pointerup", function (e) { endDrag(e); });
-        doc.addEventListener("pointercancel", function (e) { endDrag(e); });
-        // 双击标题栏空白：恢复默认位置/大小并清除偏好（§1.4）
-        header.addEventListener("dblclick", function (e) {
-          if (!dragTargetAllowed(e.target)) return;
-          box = null;
-          clearPref();
-          apply();
+        doc.addEventListener("pointermove", function (e) { onGestureMove(e); });
+        doc.addEventListener("pointerup", function (e) { endGesture(e); });
+        doc.addEventListener("pointercancel", function () { cancelGesture(); });
+        // Esc 取消进行中的拖动；键盘 Enter/Space 激活按钮不走拖动逻辑（§3.2.2）
+        doc.addEventListener("keydown", function (e) {
+          if (e && e.key === "Escape") cancelGesture();
         });
+        win.addEventListener("blur", function () { cancelGesture(); });
         // 窗口缩放：收回视框内并持久化（§1.4）
         win.addEventListener("resize", function () {
           if (isMobile()) return;
@@ -5288,12 +5673,18 @@
       onBreakpointChange: function () {
         if (!panel || !header) return;
         if (isMobile()) {
+          cancelGesture();
           box = null;
-          drag = null;
           apply();
           return;
         }
         box = readPref();
+        apply();
+      },
+      // ⋯ 菜单「重置面板位置」：清偏好、恢复默认锚定（§3.1）
+      resetPosition: function () {
+        box = null;
+        clearPref();
         apply();
       },
       isMobile: isMobile,
@@ -5317,6 +5708,13 @@
       win: window,
     });
     aiPanelCtrl.init();
+    // ⋯ 菜单「重置面板位置」（§3.1）：恢复默认锚定并清除偏好（弹层关闭由
+    // ai-panel-chrome.js 处理）
+    if (els.aiResetPosition) {
+      els.aiResetPosition.addEventListener("click", function () {
+        aiPanelCtrl.resetPosition();
+      });
+    }
     if (mq) {
       var onMqChangeAip = function () { if (aiPanelCtrl) aiPanelCtrl.onBreakpointChange(); };
       if (typeof mq.addEventListener === "function") mq.addEventListener("change", onMqChangeAip);

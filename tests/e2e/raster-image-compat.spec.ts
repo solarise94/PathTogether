@@ -164,18 +164,34 @@ test(`选片加载与翻牌并行：${slowResource} 未到也完成铺开，清�
   try {
     // Hold the real HTTP response indefinitely: animation must finish spreading
     // independently, even when metadata / image geometry is still unavailable.
-    await expect(deal).toHaveAttribute('data-phase', 'preview', { timeout: 4000 });
     expect(infoPhases[0]).toBe('drawing');
-    if (slowResource === 'tiles') expect(tileRequests).toBeGreaterThan(0);
-    else expect(tileRequests).toBe(0);
-    const preview = await page.locator('.slide-deal-landing').boundingBox();
-    const viewport = await page.locator('#viewer').boundingBox();
-    expect(preview!.width).toBeGreaterThan(viewport!.width * .5);
-    expect(preview!.width / preview!.height).toBeCloseTo(BMP_W / BMP_H, 2);
-    expect(await canvasCenterHasPixels(page, "#viewer .openseadragon-canvas")).toBe(false);
+    if (slowResource === 'tiles') {
+      // Tile requests go out right after open (and are held by the route).
+      await expect.poll(() => tileRequests, { timeout: 10_000 }).toBeGreaterThan(0);
+    } else {
+      expect(tileRequests).toBe(0);
+    }
+    if (slowResource === 'tiles') {
+      // §4.2.5: a fully decoded base preview hands off without waiting for HD
+      // tiles — the deal retires while tiles are still held, the viewer base
+      // layer keeps showing the full preview, and the canvas stays tile-less.
+      await expect(deal).toHaveCount(0, { timeout: 5000 });
+      expect(await canvasCenterHasPixels(page, "#viewer .openseadragon-canvas")).toBe(false);
+      await expect.poll(() => page.evaluate(() => {
+        const t = document.querySelector('#viewer .osd-base-thumb') as HTMLImageElement | null;
+        return !!t && t.complete && t.naturalWidth > 0 && t.getBoundingClientRect().width > 100;
+      })).toBe(true);
+    } else {
+      await expect(deal).toHaveAttribute('data-phase', 'preview', { timeout: 4000 });
+      const preview = await page.locator('.slide-deal-landing').boundingBox();
+      const viewport = await page.locator('#viewer').boundingBox();
+      expect(preview!.width).toBeGreaterThan(viewport!.width * .5);
+      expect(preview!.width / preview!.height).toBeCloseTo(BMP_W / BMP_H, 2);
+      expect(await canvasCenterHasPixels(page, "#viewer .openseadragon-canvas")).toBe(false);
+    }
   } finally { releaseTiles(); }
   await expect(deal).toHaveCount(0, { timeout: 5000 });
-  await expect(page.locator('.slide-deal-stage, .slide-deal-landing')).toHaveCount(0);
+  await expect(page.locator('.slide-deal-landing')).toHaveCount(0);
   const rects = await page.evaluate(() => (window as any).__dealLandingRects) as { width: number; height: number }[];
   expect(rects.length).toBeGreaterThan(2);
   // The thumbnail grows into the real viewport without stretching its tissue.
@@ -189,7 +205,7 @@ test(`选片加载与翻牌并行：${slowResource} 未到也完成铺开，清�
   await page.keyboard.press('Enter');
   await expect(page.locator('.slide-deal-landing')).toHaveCount(1);
   await page.keyboard.press('Escape');
-  await expect(page.locator('.slide-deal, .slide-deal-stage, .slide-deal-landing')).toHaveCount(0);
+  await expect(page.locator('.slide-deal, .slide-deal-landing')).toHaveCount(0);
   await page.emulateMedia({ reducedMotion: "reduce" });
   await page.evaluate(() => { (window as any).__dealPhases = []; });
   const response = page.waitForResponse(r => r.url().includes(`/slides/${sid}/info`));

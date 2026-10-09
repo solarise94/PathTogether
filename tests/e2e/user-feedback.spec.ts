@@ -29,6 +29,13 @@ test("账户弹层提交反馈：真实后端受理，附带记录不含查询�
 	await page.goto("/app");
 	// 产生一条带查询串的接口调用，供记录器记录
 	await page.evaluate(() => fetch("/api/slides?secret_probe=1"));
+	await page.evaluate(() => {
+		console.warn("PRIVATE-FEEDBACK-PROBE", { password: "PRIVATE-FEEDBACK-PROBE" });
+		window.dispatchEvent(new ErrorEvent("error", {
+			message: "PRIVATE-FEEDBACK-PROBE",
+			filename: location.origin + "/static/app.js?token=PRIVATE-FEEDBACK-PROBE",
+		}));
+	});
 
 	await page.locator("#acct-btn").click();
 	await page.locator("#acct-feedback-btn").click();
@@ -54,6 +61,7 @@ test("账户弹层提交反馈：真实后端受理，附带记录不含查询�
 	const serialized = JSON.stringify(body.client);
 	expect(serialized).not.toContain("secret_probe");
 	expect(serialized).not.toContain(text);
+	expect(serialized).not.toContain("PRIVATE-FEEDBACK-PROBE");
 	expect(body.client.events.some((e) => e.kind === "api" && String(e.path) === "/api/slides"))
 		.toBe(true);
 });

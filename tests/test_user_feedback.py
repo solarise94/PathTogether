@@ -412,3 +412,16 @@ def test_server_context_contains_audit_events_and_recent_jobs():
     # 金额投影（role=user → total 形态）
     assert "total" in server["allowance"]
     assert server["allowance"]["total"]["remaining_nano"] >= 0
+
+
+def test_feedback_audit_does_not_forward_share_credentials_or_detail():
+    user = _user()
+    import share_store
+    share_store.record_audit(
+        action="share.create", actor_user_id=user["user_id"], actor_role="user",
+        target_type="share", target_id="PRIVATE-SHARE-TOKEN",
+        detail={"note": "PRIVATE-TYPED-CONTENT"})
+    server = feedback_store.build_server_context(user)
+    serialized = json.dumps(server)
+    assert "share.create" in serialized
+    assert "PRIVATE-" not in serialized

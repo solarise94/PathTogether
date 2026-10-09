@@ -593,12 +593,13 @@ def test_hold_target_matrix_user_total_demo_owner_window():
     assert orow["spend_total_allowance_id"] is None
 
 
-def _settle_allowance_flow(user, est):
+def _settle_allowance_flow(user, est, *, now=None):
     """authorize → settle 真实 usage：spent=actual、reserved=0。"""
     body = _bound_user_hold(user)
-    hold = _authorize(body, now=datetime.now(UTC))
+    now = now or datetime.now(UTC)
+    hold = _authorize(body, now=now)
     assert hold["status"] == "open"
-    occurred = datetime.now(UTC)
+    occurred = now
     event = _usage_event(body["call_id"], body["session_id"], "user",
                          user["user_id"], occurred=occurred,
                          user_id=user["user_id"])
@@ -620,24 +621,27 @@ def test_settle_release_expire_projection_accurate():
         conn.commit()
     finally:
         conn.close()
-    est = _expected_estimate(datetime.now(UTC))
+    # Shanghai Friday 13:55 -> 14:05: deliberately cross off-peak -> peak.
+    # Keep this scenario independent of the wall clock used to launch pytest.
+    now = datetime(2026, 10, 9, 5, 55, tzinfo=UTC)
+    est = _expected_estimate(now)
     # release：reserved 归还
     body = _bound_user_hold(user)
-    hold = _authorize(body)
+    hold = _authorize(body, now=now)
     assert int(_allowance_row(user["user_id"])["reserved_nano_cny"]) == est
-    released = _settle(hold["hold_id"], None)
+    released = _settle(hold["hold_id"], None, now=now)
     assert released["status"] == "released"
     row = _allowance_row(user["user_id"])
     assert int(row["reserved_nano_cny"]) == 0
     assert int(row["spent_nano_cny"]) == 0
     # settle：actual 记 spent（含 actual>estimated overage）
-    out, event = _settle_allowance_flow(user, est)
+    out, event = _settle_allowance_flow(user, est, now=now)
     actual = out["actual_nano_cny"]
     row = _allowance_row(user["user_id"])
     assert int(row["spent_nano_cny"]) == actual
     assert int(row["reserved_nano_cny"]) == 0
     # settle 重放幂等：spent 不变
-    _settle(out["hold_id"], {"usage_event": event})
+    _settle(out["hold_id"], {"usage_event": event}, now=now + timedelta(seconds=5))
     assert int(_allowance_row(user["user_id"])["spent_nano_cny"]) == actual
     # expire：TTL 过期后下一次 authorize 惰性回收并归还 reserved
     t_call, t_sess, t_req = _ids()
@@ -645,13 +649,15 @@ def test_settle_release_expire_projection_accurate():
     trigger = _hold_body("user", user["user_id"], session_id=t_sess,
                          request_id=t_req, call_id=t_call)
     body2 = _bound_user_hold(user)
-    hold2 = _authorize(body2, now=datetime.now(UTC))
+    hold2 = _authorize(body2, now=now)
     assert int(_allowance_row(user["user_id"])["reserved_nano_cny"]) == est
-    later = datetime.now(UTC) + timedelta(seconds=600)
+    later = now + timedelta(seconds=600)
     _authorize(trigger, now=later)  # 触发惰性回收
     assert _hold_row(hold_id=hold2["hold_id"])["status"] == "expired"
-    # 过期 hold 的 reserved 已归还；trigger 自身的新预占仍在（est）
-    assert int(_allowance_row(user["user_id"])["reserved_nano_cny"]) == est
+    # 旧预占已归还；新预占按 later 的时段计价，不能沿用旧 est。
+    trigger_est = _expected_estimate(later)
+    assert trigger_est != est  # 此固定场景确实跨过计价边界
+    assert int(_allowance_row(user["user_id"])["reserved_nano_cny"]) == trigger_est
     # 迟到的合法 usage（expired hold）：真实成本仍记 spent
     event2 = _usage_event(body2["call_id"], body2["session_id"], "user",
                           user["user_id"], occurred=later,

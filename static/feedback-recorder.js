@@ -31,7 +31,7 @@
 
   var MAX_EVENTS = 300;          // 环形缓冲条数上限
   var MAX_AGE_MS = 15 * 60 * 1000; // 15 分钟
-  var MAX_TEXT = 500;            // error/console 文本截断
+  var MAX_TEXT = 500;            // 路径长度上限
   var MEDIA_PATH_RE =
     /(\/tiles(\/|$)|\/dzi(\/|$)|\.dzi$|\/thumbnail(\/|$)|\/region(\/|$)|\/render(\/|$)|\/output(\/|$)|\/static\/|\/plugins\/|\/shared\/)/;
 
@@ -54,6 +54,8 @@
     // /s/<token> 分享令牌是凭证：路径中任何一段 /s/<seg> 都掩码为首段 ***
     //（/s/<token> 页面入口与 /api/.../s/<token> 形态的资源路径同口径）
     p = p.replace(/\/s\/([^/?#]+)/g, "/s/***");
+    p = p.replace(/(\/api\/share\/)[^/]+(\/claim(?:\/|$))/, "$1***$2");
+    p = p.replace(/(\/api\/annotation\/)[^/]+(\/\d+(?:\/|$))/, "$1***$2");
     return p;
   }
 
@@ -134,7 +136,7 @@
       }, function (err) {
         push({ kind: "api", method: String(meta.method || "GET").toUpperCase(),
                path: path, status: 0, ms: now() - started,
-               error: trunc(String((err && err.message) || "network error")) });
+               error: "network_error" });
         throw err;
       });
     };
@@ -148,43 +150,42 @@
     return s.length > MAX_TEXT ? s.slice(0, MAX_TEXT) : s;
   }
 
+  // Exception messages and console arguments are arbitrary application data.
+  // Record only a closed set of categories and a sanitized script location.
+  function errorType(err) {
+    var name = err && err.name;
+    return ["Error", "TypeError", "ReferenceError", "SyntaxError", "RangeError",
+      "URIError", "EvalError", "AbortError"].indexOf(name) >= 0 ? name : "Error";
+  }
+  function sourcePath(raw) {
+    try {
+      var u = new URL(raw, window.location.href);
+      return u.origin === window.location.origin ? trunc(maskPath(u.pathname)) : "external_script";
+    } catch (e) { return ""; }
+  }
   function wrapErrors() {
     window.addEventListener("error", function (e) {
       try {
-        push({ kind: "error", message: trunc(e && e.message),
-               source: trunc((e && (e.filename || (e.target && e.target.src))) || "") });
+        push({ kind: "error", message: errorType(e && e.error),
+          source: sourcePath((e && e.filename) || ""),
+          line: Number(e && e.lineno) || 0, column: Number(e && e.colno) || 0 });
       } catch (err) {}
     });
     window.addEventListener("unhandledrejection", function (e) {
-      try {
-        var r = e && e.reason;
-        push({ kind: "error", rejection: true,
-               message: trunc((r && (r.message || r)) || "unhandled rejection") });
-      } catch (err) {}
+      try { push({ kind: "error", rejection: true, message: errorType(e && e.reason) }); }
+      catch (err) {}
     });
   }
-
   function wrapConsole() {
     if (!window.console) return;
     ["error", "warn"].forEach(function (level) {
       var orig = window.console[level];
       if (typeof orig !== "function" || orig.__hpFeedbackWrapped) return;
       var wrapped = function () {
-        try {
-          var parts = [];
-          for (var i = 0; i < arguments.length && i < 4; i++) {
-            var a = arguments[i];
-            // 字符串化但不展开可能含敏感内容的深层对象：Error 取 message，
-            // 其余对象只记安全序列化尝试的前 500 字
-            if (a instanceof Error) parts.push(String(a.message || a));
-            else if (typeof a === "string") parts.push(a);
-            else { try { parts.push(JSON.stringify(a)); } catch (e) { parts.push("[object]"); } }
-          }
-          push({ kind: "console", level: level, message: trunc(parts.join(" ")) });
-        } catch (e) {}
+        try { push({ kind: "console", level: level }); } catch (e) {}
         return orig.apply(this, arguments);
       };
-      try { wrapped.__hpFeedbackWrapped = true; } catch (e) {}
+      wrapped.__hpFeedbackWrapped = true;
       window.console[level] = wrapped;
     });
   }

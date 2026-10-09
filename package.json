@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "test:js": "vitest run",
-    "test:e2e:admin": "playwright test"
+    "test:e2e:admin": "playwright test",
+    "test:e2e:ai": "playwright test -c playwright.ai.config.ts"
   },
   "devDependencies": {
     "vitest": "^3.2.7",

@@ -125,6 +125,7 @@
     "fbk.desc.ph": { zh: "请描述遇到的问题或建议（10–4000 字）", en: "Describe the problem or suggestion (10–4000 characters)" },
     "fbk.privacy.hint": { zh: "将附带最近的操作摘要（页面路径、点击的控件、接口状态码、报错）；不含输入内容、密码、切片图像、Cookie 或查询串。",
                           en: "Attaches a summary of recent activity (page paths, control clicks, API status codes, errors); never your typed input, passwords, slide images, cookies, or query strings." },
+    "fbk.server.hint": { zh: "服务端还会附带账号、额度、应用版本、最近 24 小时的审计摘要和任务状态，供管理员排查。", en: "The server also attaches your account, allowance, app version, audit summaries from the last 24 hours and recent task statuses for admin diagnostics." },
     "fbk.preview.toggle": { zh: "查看将附带的信息", en: "See what will be attached" },
     "fbk.send": { zh: "发送", en: "Send" },
     "fbk.sending": { zh: "发送中…", en: "Sending…" },
@@ -249,12 +250,16 @@
 
   function applyAuthInfo(info) {
     if (!info || !info.auth_enabled) return info;
+    var previousScope = userScope();
     var actor = info.actor || {};
     previewState = info.preview || null;
     currentRole = info.role || null;
     currentUserId = info.user_id || null;
     actorRole = actor.role || info.role || null;
     actorUserId = actor.user_id || info.user_id || null;
+    // Dock initializes before /api/auth/info resolves; restore the authenticated
+    // user preference as soon as identity becomes known.
+    if (aiPanelCtrl && previousScope !== userScope()) aiPanelCtrl.onBreakpointChange();
     var actorName = actor.username || info.username;
     if (els.logoutBtn) {
       var label = t("toast.logout");
@@ -4806,7 +4811,7 @@
     return null;
   }
   // 钳制：宽高先收进 [min, frame]，位置再收进 [0, frame-w/h]（frame 小于
-  // 最小尺寸时面板保持最小值、位置贴 0——绝不出框）
+  // 最小尺寸时优先缩进视框、位置贴 0）
   function clampAIPanelBox(box, frame, min) {
     frame = frame || {};
     min = min || {};
@@ -4814,8 +4819,8 @@
     var minH = min.height > 0 ? min.height : 1;
     var frameW = frame.width > 0 ? frame.width : minW;
     var frameH = frame.height > 0 ? frame.height : minH;
-    var w = Math.max(minW, Math.min(box.width, frameW));
-    var h = Math.max(minH, Math.min(box.height, frameH));
+    var w = Math.min(frameW, Math.max(minW, box.width));
+    var h = Math.min(frameH, Math.max(minH, box.height));
     var left = Math.min(Math.max(box.left, 0), Math.max(0, frameW - w));
     var top = Math.min(Math.max(box.top, 0), Math.max(0, frameH - h));
     return { left: left, top: top, width: w, height: h };
@@ -4952,8 +4957,8 @@
       init: function () {
         if (!panel || !header) return;            // demo 面板/无壳：不启用
         if (panel.classList) panel.classList.add("ai-drag-ok");
-        if (isMobile()) return;                    // ≤768px 维持现有布局
-        var pref = readPref();
+        // Bind once on mobile too: a later desktop breakpoint enables dragging.
+        var pref = isMobile() ? null : readPref();
         if (pref) { box = pref; apply(); }
         header.addEventListener("pointerdown", function (e) { beginDrag(e, "move"); });
         if (handle) {

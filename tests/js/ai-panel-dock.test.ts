@@ -179,13 +179,13 @@ describe("clampAIPanelBox（纯几何）", () => {
 			.toEqual({ left: 0, top: 0, width: 1000, height: 800 });
 	});
 
-	it("框小于最小值：面板保持最小尺寸、位置贴 0（绝不出框）", () => {
+	it("框小于最小值：尺寸缩进视框、位置贴 0", () => {
 		const HP = bootModule();
 		const out = HP.clampAIPanelBox(
 			{ left: 40, top: 40, width: 340, height: 500 },
 			{ width: 200, height: 100 },
 			{ width: 280, height: 240 });
-		expect(out).toEqual({ left: 0, top: 0, width: 280, height: 240 });
+		expect(out).toEqual({ left: 0, top: 0, width: 200, height: 100 });
 	});
 });
 
@@ -272,7 +272,7 @@ describe("createAIPanelController（假元素驱动）", () => {
 		(docListeners.pointerup || []).forEach((cb) => cb(pointerEvt({ x: 440, y: 200 })));
 		expect(storage._map.get("pt.aip.v1|official:u1")).toContain('"width":280');
 
-		// 窗口缩放：视框变小 → re-clamp 收进框内（保持最小 280×240，位置贴 0）
+		// 窗口缩放：视框变小 → re-clamp 收进框内（最小高度让位于视框，位置贴 0）
 		const frameSmall = fakeEl({ rect: { width: 300, height: 200 } });
 		const deps3 = makeDeps({
 			storage,
@@ -285,12 +285,12 @@ describe("createAIPanelController（假元素驱动）", () => {
 		});
 		const ctrl3 = HP.createAIPanelController(deps3 as unknown as Record<string, unknown>);
 		ctrl3.init();
-		// 存的是 (500,100,280,240) — 视框 300×200 → 宽高保持最小，位置收进框内
+		// 存的是 (500,100,280,240) — 视框 300×200 → 高度缩至 200，位置收进框内
 		// （left ≤ 300-280=20，top ≤ max(0, 200-240)=0）
 		expect(deps3.panel.style.left).toBe("20px");
 		expect(deps3.panel.style.top).toBe("0px");
 		expect(deps3.panel.style.width).toBe("280px");
-		expect(deps3.panel.style.height).toBe("240px");
+		expect(deps3.panel.style.height).toBe("200px");
 		// resize 事件：同样 re-clamp（钳制是幂等的）
 		(winListeners.resize || []).forEach((cb) => cb({}));
 		expect(deps3.panel.style.left).toBe("20px");
@@ -309,6 +309,23 @@ describe("createAIPanelController（假元素驱动）", () => {
 		deps.mq.matches = false;
 		ctrl.onBreakpointChange();
 		expect(deps.panel.style.left).toBe("5px");
+	});
+
+	it("mobile-first load installs handlers for a later desktop breakpoint", () => {
+		const HP = bootModule();
+		const listeners: Record<string, Array<(e?: unknown) => void>> = {};
+		const deps = makeDeps({ mq: { matches: true }, doc: { addEventListener: (t, cb) => void (listeners[t] ||= []).push(cb) } });
+		const ctrl = HP.createAIPanelController(deps as unknown as Record<string, unknown>);
+		ctrl.init(); deps.mq.matches = false; ctrl.onBreakpointChange();
+		deps.header.dispatch("pointerdown", pointerEvt({ x: 800, y: 30, currentTarget: deps.header }));
+		(listeners.pointermove || []).forEach(cb => cb(pointerEvt({ x: 700, y: 80 })));
+		expect(ctrl.currentBox()).not.toBeNull();
+	});
+
+	it("short viewports take priority over preferred minimum size", () => {
+		const HP = bootModule();
+		const result = HP.clampAIPanelBox({ left: 50, top: 40, width: 340, height: 500 }, { width: 230, height: 180 }, { width: 280, height: 240 });
+		expect(result).toEqual({ left: 0, top: 0, width: 230, height: 180 });
 	});
 
 	it("标题栏按钮（closest 命中 button）pointerdown 不拖动", () => {

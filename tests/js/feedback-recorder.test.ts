@@ -7,7 +7,7 @@
  *   - 高频媒体端点（瓦片/DZI/缩略图/region/渲染输出）与非 /api/ 路径不记录；
  *   - action 事件：只记控件标识（id/data-action/data-i18n/role/tag:type），
  *     输入框内容（value）绝不落事件；
- *   - error / console.error / console.warn：前 500 字截断；console 原样透传；
+ *   - error / console.error / console.warn：只记类型与位置；console 原样透传；
  *   - 环形缓冲：>300 条丢最旧；
  *   - snapshot 形状：{captured_at, url_path, lang, viewport, user_agent,
  *     current_slide_id, events}；fetch 包装透明（原响应原样返回、失败原样抛）。
@@ -141,6 +141,9 @@ describe("HP_FEEDBACK.maskPath（路径规整纯逻辑）", () => {
 		expect(h.HP.maskPath("/s/AbC123")).toBe("/s/***");
 		expect(h.HP.maskPath("/s/AbC123/")).toBe("/s/***/");
 		expect(h.HP.maskPath("/api/x")).toBe("/api/x");
+		expect(h.HP.maskPath("/api/share/secret-token/claim")).toBe("/api/share/***/claim");
+		expect(h.HP.maskPath("/api/annotation/secret-token/2/comments")).toBe("/api/annotation/***/2/comments");
+		expect(h.HP.maskPath("/api/share/create")).toBe("/api/share/create");
 	});
 });
 
@@ -179,7 +182,7 @@ describe("HP_FEEDBACK api 事件（fetch 包装）", () => {
 		await microtasks();
 		const api = lastEvent(h, "api");
 		expect(api!.status).toBe(0);
-		expect(api!.error).toBe("boom-net");
+		expect(api!.error).toBe("network_error");
 	});
 
 	it("查询串剥除 + /s/<token> 掩码；瓦片/DZI/缩略图/静态资源/非 /api/ 不记录", async () => {
@@ -237,17 +240,17 @@ describe("HP_FEEDBACK action 事件（点击控件标识，绝不记输入内容
 });
 
 describe("HP_FEEDBACK error / console / nav", () => {
-	it("window error 与 unhandledrejection 记录（500 字截断）", () => {
+	it("window error 与 unhandledrejection 只记录类型", () => {
 		const h = bootRecorder();
 		const long = "x".repeat(900);
 		h.emitError({ message: long, filename: "/static/app.js" });
 		const evt = lastEvent(h, "error");
-		expect(String(evt!.message).length).toBe(500);
+		expect(evt!.message).toBe("Error");
 		expect(evt!.source).toBe("/static/app.js");
 		h.emitRejection({ reason: new Error("rej-msg") });
 		const rej = lastEvent(h, "error");
 		expect(rej!.rejection).toBe(true);
-		expect(rej!.message).toBe("rej-msg");
+		expect(rej!.message).toBe("Error");
 	});
 
 	it("console.error/warn 记录且原样透传", () => {
@@ -256,9 +259,20 @@ describe("HP_FEEDBACK error / console / nav", () => {
 		h.win.console.warn("careful");
 		const err = h.HP.events().filter((e) => e.kind === "console" && e.level === "error")[0];
 		const warn = h.HP.events().filter((e) => e.kind === "console" && e.level === "warn")[0];
-		expect(String(err.message)).toContain("boom");
-		expect(warn.message).toBe("careful");
+		expect(err.message).toBeUndefined();
+		expect(warn.message).toBeUndefined();
 		expect(h.consoleCalls.length).toBe(2); // 原实现仍被调用
+	});
+
+	it("diagnostics never copy console arguments, rejection text or source query strings", async () => {
+		const h = bootRecorder({ fetchOutcome: () => ({ status: 0, throwErr: new Error("PRIVATE-TYPED-TEXT") }) });
+		h.win.console.error("PRIVATE-TYPED-TEXT", { password: "PRIVATE-PASSWORD" });
+		h.emitError({ message: "PRIVATE-TYPED-TEXT", filename: "http://local/static/app.js?key=PRIVATE-QUERY", error: new TypeError("PRIVATE-TYPED-TEXT"), lineno: 42 });
+		h.emitRejection({ reason: new Error("PRIVATE-REJECTION") });
+		await h.win.fetch("/api/slides").catch(() => {});
+		expect(JSON.stringify(h.HP.snapshot())).not.toContain("PRIVATE-");
+		expect(lastEvent(h, "error")!.rejection).toBe(true);
+		expect(h.consoleCalls[0].args[0]).toBe("PRIVATE-TYPED-TEXT");
 	});
 
 	it("nav：load 时记页面路径（无查询串）；setCurrentSlide 进快照", () => {

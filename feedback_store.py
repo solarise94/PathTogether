@@ -22,8 +22,8 @@ user_feedback 行计数）。计数与插入在同一事务内、且先锁 users
 的竞态窗口。
 
 正文红线：客户端记录不含输入内容/密码/请求响应正文/Cookie/查询串/图像
-数据（记录器侧约束）；服务端附带的审计 detail 是平台自身审计行（写入时
-已过敏感键脱敏）。正文超过 300 KB 时从最旧事件开始截断并注明。
+数据（记录器侧约束）；服务端附带的审计仅含事件索引，不转发可能含分享凭证
+或业务输入的 target_id/detail。正文超过 300 KB 时从最旧事件开始截断并注明。
 """
 
 import json
@@ -162,14 +162,15 @@ def build_server_context(user, environ=None) -> dict:
 
 
 def _recent_audit_events(user_id) -> list:
-    """该用户最近 24 小时的审计事件（新→旧，≤100；查询异常降级为 error 段）。"""
+    """该用户最近 24 小时的审计摘要。仅带事件 ID 供后台定位；
+    target_id 可能是分享凭证，detail 可能含业务输入，均不进入反馈/邮件。"""
     try:
         conn = _connect()
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT extract(epoch from ts)::float8 AS ts, "
-                    "actor_role, action, target_type, target_id, detail "
+                    "event_id, actor_role, action, target_type "
                     "FROM audit_events WHERE actor_user_id=%s "
                     "AND ts >= now() - interval '24 hours' "
                     "ORDER BY ts DESC LIMIT %s",

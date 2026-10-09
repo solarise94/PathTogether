@@ -3544,6 +3544,9 @@ def set_installation_approved_scopes(installation_id, approved_scopes):
 _GRANT_SEL = (
     "SELECT grant_id, installation_id, slide, session_id, created_by_user_id, "
     " slide_id, "
+    " allow_ai_drawing, "
+    " extract(epoch from drawing_bound_at)::float8 AS drawing_bound_at, "
+    " drawing_intent, "
     " extract(epoch from created_at)::float8 AS created_at, "
     " extract(epoch from expires_at)::float8 AS expires_at, revoked, "
     " extract(epoch from revoked_at)::float8 AS revoked_at "
@@ -3641,7 +3644,7 @@ def bind_run_grant_session(grant_id, session_id):
 
     UPDATE ... WHERE grant_id=%s AND (session_id='' OR session_id IS NULL) 的
    原子 CAS；返回绑定后的 grant dict；不存在返回 None；已绑定到其它 session
-    → ValueError("session_mismatch")；同一 session 重复绑定幂等。
+   → ValueError("session_mismatch")；同一 session 重复绑定幂等。
     """
     if not isinstance(grant_id, str) or not grant_id:
         raise ValueError("grant_id 不能为空")
@@ -3664,6 +3667,80 @@ def bind_run_grant_session(grant_id, session_id):
                         raise ValueError("session_mismatch")
                     return row  # 幂等：已绑定到同一 session
                 return _fetch_grant(cur, grant_id)
+    finally:
+        conn.close()
+
+
+def set_run_grant_skill_delineate(grant_id, session_id, intent,
+                                  installation_id=None, creator_allowed=None):
+    """描绘技能置位（0082 / 契约 §3.2，裁决 5）：run grant 的
+    allow_ai_drawing 仅 false→true 的 CAS，幂等；收回只靠 revoke/expiry。
+
+    同一事务内（SELECT ... FOR UPDATE 行锁）依次复查：
+      1. grant 存在（grant_not_found）；
+      2. installation 匹配（installation_id 给出且不符 → installation_mismatch）；
+      3. 未撤销（grant_revoked）、未过期（grant_expired）；
+      4. 已绑定到 session_id 同一 session（grant_unbound / session_mismatch——
+         bind 端点先于本置位，与 runMain preamble 顺序一致）；
+      5. creator_allowed(grant) 创建者写权限复查（app 层注入
+         _run_grant_creator_allowed 同口径；回调抛异常按不允许 fail-closed →
+         creator_not_allowed）。
+    全部通过且当前 false → UPDATE true + drawing_bound_at + drawing_intent；
+    已 true → no-op（幂等返回当前行）。任何失败路径零副作用（事务内无写）。
+
+    返回 (ok, reason)：ok=True 表示已置位/已为 true；reason 为稳定码
+    （grant_not_found/installation_mismatch/grant_revoked/grant_expired/
+    grant_unbound/session_mismatch/creator_not_allowed），端点据此映射 HTTP。
+    intent 形态由调用方（端点）校验；这里再守一层白名单。
+    """
+    if not isinstance(grant_id, str) or not grant_id:
+        raise ValueError("grant_id 不能为空")
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("session_id 不能为空")
+    if intent not in ("explicit", "natural"):
+        raise ValueError("intent 需为 explicit|natural")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(_GRANT_SEL + "FROM run_grants "
+                            "WHERE grant_id=%s FOR UPDATE", (grant_id,))
+                row = cur.fetchone()
+                if row is None:
+                    return False, "grant_not_found"
+                grant = dict(row)
+                if installation_id and grant.get("installation_id") \
+                        != installation_id:
+                    return False, "installation_mismatch"
+                if grant.get("revoked"):
+                    return False, "grant_revoked"
+                try:
+                    expired = float(grant.get("expires_at") or 0) <= time.time()
+                except (TypeError, ValueError):
+                    expired = True
+                if expired:
+                    return False, "grant_expired"
+                bound = grant.get("session_id") or ""
+                if not bound:
+                    return False, "grant_unbound"
+                if bound != session_id:
+                    return False, "session_mismatch"
+                if creator_allowed is not None:
+                    try:
+                        allowed = bool(creator_allowed(grant))
+                    except Exception:
+                        _LOG.warning("run grant 技能置位的创建者复查失败"
+                                     "（按不允许处理）", exc_info=True)
+                        allowed = False
+                    if not allowed:
+                        return False, "creator_not_allowed"
+                if grant.get("allow_ai_drawing") is True:
+                    return True, ""  # 幂等：已置位
+                cur.execute(
+                    "UPDATE run_grants SET allow_ai_drawing=TRUE, "
+                    "drawing_bound_at=now(), drawing_intent=%s "
+                    "WHERE grant_id=%s", (intent, grant_id))
+                return True, ""
     finally:
         conn.close()
 

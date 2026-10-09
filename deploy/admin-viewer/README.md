@@ -33,6 +33,9 @@ After switching, check both public domains:
   explicit end, server expiry, and uploader access preservation.
 - Actual uploads, thumbnails, nested folders, search/deep-link location and
   bounded sidebar pagination.
+- The real AI plugin's `/api/ai/sessions?slide=sld_…` request succeeds for the
+  uploader, remains scoped to that user's conversations, and denies unrelated
+  users, expired admin views and deleted assets.
 
 Use dedicated Dogfood accounts and synthetic images. Revoke shares, delete test
 assets/folders, and disable those accounts when finished. Do not reset the real

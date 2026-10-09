@@ -579,13 +579,13 @@ body {
   .adm-nav-btn[data-page="users"]::before { content: "户"; }
   .adm-nav-btn[data-page="slides"]::before { content: "片"; }
   .adm-nav-btn[data-page="format-requests"]::before { content: "格"; }
-  .adm-nav-btn[data-page="test-applications"]::before { content: "测"; }
   .adm-nav-btn[data-page="research-deletion"]::before { content: "删"; }
   .adm-nav-btn[data-page="settings"]::before { content: "设"; }
   .adm-nav-btn[data-page="billing"]::before { content: "账"; }
   .adm-nav-btn[data-page="plugins"]::before { content: "件"; }
   .adm-nav-btn[data-page="audit"]::before { content: "审"; }
-  /* 2026-10-08：invites/identity 图标规则随页面退役移除；10 页各有图标 */
+  /* 2026-10-08：invites 图标规则随页面退役移除；2026-10-09：test-applications
+     同规则移除（round4 §2.3）；9 页各有图标 */
 }
 @media (max-width: 767px) {
   .adm-nav-toggle { display: inline-block; }
@@ -600,12 +600,12 @@ body {
   /* 平板图标字符规则带 [data-page]（特异性 0,2,1），通用 ::before 复位
      （0,1,1）压不过它——390px 同时命中两个媒体查询时必须按同特异性逐页
      复位，否则出现「概概览/户用户」首字符重复（P0-1 回归）。
-     2026-10-08：全 10 页逐一复位（invites/identity 随页面退役移除）。 */
+     2026-10-08：全页逐一复位；2026-10-09（round4 §2.3）test-applications
+     随页面退役移除（invites 亦已移除）。 */
   .adm-nav-btn[data-page="overview"]::before,
   .adm-nav-btn[data-page="users"]::before,
   .adm-nav-btn[data-page="slides"]::before,
   .adm-nav-btn[data-page="format-requests"]::before,
-  .adm-nav-btn[data-page="test-applications"]::before,
   .adm-nav-btn[data-page="research-deletion"]::before,
   .adm-nav-btn[data-page="settings"]::before,
   .adm-nav-btn[data-page="billing"]::before,

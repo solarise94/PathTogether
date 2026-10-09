@@ -147,10 +147,13 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 		await frame.locator('.adm-nav-btn[data-page="users"]').click();
 		await expect(frame.locator("#adm-users-tbody")).toContainText(
 			"e2e-user@pt.test", { timeout: 10_000 });
-		// 2026-10-08 §2：主表四列（用户/加入时间/最近登录/分类）——分类默认
-		// 正式用户；掩码登录账号/额度/启停收进抽屉（§4.3 + 2026-10-08）
+		// 2026-10-08 §2 + 2026-10-09 round4 §2.2：主表六列（用户/加入时间/
+		// 最近登录/余额/研究数据/分类）——分类默认正式用户；掩码登录账号/
+		// 启停收进抽屉（§4.3 + 2026-10-08）
 		await expect(frame.locator("#adm-users-table")).toContainText("加入时间");
 		await expect(frame.locator("#adm-users-table")).toContainText("最近登录");
+		await expect(frame.locator("#adm-users-table")).toContainText("余额");
+		await expect(frame.locator("#adm-users-table")).toContainText("研究数据");
 		await expect(frame.locator("#adm-users-table")).toContainText("分类");
 		await expect(frame.locator("#adm-users-tbody")).toContainText("正式用户");
 		// 抽屉主视图仍是总额度字段（r3-wave2 单轨）
@@ -167,7 +170,7 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 		await expect(frame.locator("#adm-user-drawer")).toBeHidden();
 	});
 
-	test("7. invites page is retired: no nav entry, deep links fall back (2026-10-08 §4)", async ({ page }) => {
+	test("7. invites & test-applications pages are retired: no nav entry, deep links fall back (2026-10-08 §4; 2026-10-09 round4 §2.3)", async ({ page }) => {
 		await login(page, CREDS.ownerLogin, CREDS.ownerPassword);
 		await page.goto("/admin");
 		await expect(hostStatus(page)).toHaveAttribute(
@@ -178,8 +181,17 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 		await expect(frame.locator("#adm-page-invites")).toHaveCount(0);
 		await expect(frame.locator("#adm-invite-create-box")).toHaveCount(0);
 		await expect(frame.locator("#adm-invites-table")).toHaveCount(0);
+		// round4 §2.3：「测试申请」页同样退役——无导航入口、无页面骨架
+		await expect(frame.locator('.adm-nav-btn[data-page="test-applications"]')).toHaveCount(0);
+		await expect(frame.locator("#adm-page-test-applications")).toHaveCount(0);
+		await expect(frame.locator("#adm-test-table")).toHaveCount(0);
 		// 旧 /admin#invites 深链回概览（不空屏、不报错）
 		await page.goto("/admin#invites");
+		await expect(hostStatus(page)).toHaveAttribute(
+			"data-admin-host-state", "ready", { timeout: 5000 });
+		await expect(frame.locator("#adm-page-overview")).toBeVisible();
+		// 旧 /admin#test-applications 深链与 #invites 同规则归一回概览
+		await page.goto("/admin#test-applications");
 		await expect(hostStatus(page)).toHaveAttribute(
 			"data-admin-host-state", "ready", { timeout: 5000 });
 		await expect(frame.locator("#adm-page-overview")).toBeVisible();
@@ -634,7 +646,7 @@ test.describe("UI 升级 2026-09-01 — 桌面 1440×900（批次 E）", () => {
 		await shot(page, "after-1440-overview.png");
 	});
 
-	test("13. users: 四列表头（用户/加入时间/最近登录/分类）+ 分类筛选；限额户详情抽屉见已用尽", async ({ page }) => {
+	test("13. users: 六列表头（用户/加入时间/最近登录/余额/研究数据/分类）+ 分类筛选；限额户详情抽屉见已用尽", async ({ page }) => {
 		await gotoAdminReady(page);
 		const frame = page.frameLocator("#admin-plugin-frame");
 		await frame.locator('.adm-nav-btn[data-page="users"]').click();
@@ -643,10 +655,12 @@ test.describe("UI 升级 2026-09-01 — 桌面 1440×900（批次 E）", () => {
 			.poll(async () => frame.locator("#adm-state-users").getAttribute("data-page-state"))
 			.toBe("ready", { timeout: 10_000 });
 		const table = frame.locator("#adm-users-table");
-		// 2026-10-08 §2：主表四列
+		// 2026-10-08 §2 + 2026-10-09 round4 §2.2：主表六列
 		await expect(table).toContainText("用户");
 		await expect(table).toContainText("加入时间");
 		await expect(table).toContainText("最近登录");
+		await expect(table).toContainText("余额");
+		await expect(table).toContainText("研究数据");
 		await expect(table).toContainText("分类");
 		await expect(table).not.toContainText("额度剩余");
 		await expect(table).not.toContainText("本月用量");
@@ -655,7 +669,9 @@ test.describe("UI 升级 2026-09-01 — 桌面 1440×900（批次 E）", () => {
 		// 分类筛选：默认正式用户（aria-pressed）
 		await expect(frame.locator('.adm-kind-btn[data-kind="real"]'))
 			.toHaveAttribute("aria-pressed", "true");
-		// 每行 4 个单元格；额度语义在抽屉里（10e 已把限额户总额度存 0 → 已用尽）
+		// 每行 6 个单元格；余额语义沿旧表口径（剩余 X CNY/已用尽/…），
+		// 研究数据三态；用量 meter 不回归（wave 2 §4.3；10e 已把限额户
+		// 总额度存 0 → 余额列「已用尽」）
 		const rows = await frame.locator("#adm-users-tbody").evaluate((tbody) =>
 			Array.from(tbody.querySelectorAll("tr")).map((tr) => ({
 				text: tr.textContent || "",
@@ -664,7 +680,7 @@ test.describe("UI 升级 2026-09-01 — 桌面 1440×900（批次 E）", () => {
 			})));
 		expect(rows.length).toBeGreaterThan(0);
 		for (const row of rows) {
-			expect(row.cells, "desktop users table has exactly 4 columns").toBe(4);
+			expect(row.cells, "desktop users table has exactly 6 columns").toBe(6);
 			expect(row.meters, "no usage meter in simplified table").toBe(0);
 			expect(row.text).not.toContain("已消费");
 			expect(row.text).not.toContain("预占");
@@ -915,9 +931,10 @@ test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
     await expect(frame.locator("#adm-nav.adm-nav--open")).toBeVisible();
     // P0-1：每个导航按钮 innerText 是完整标签（概览/用户/…，wave 2
     // 改名后无首字符重复），且 ::before 内容已按同特异性复位。
-    // R6（2026-09-19）身份冲突退役 + 2026-10-08 邀请退役——导航 10 页
-    //（概览/用户/切片/格式申请/测试申请/研究删除/设置/费用/插件/审计）。
-    const labels = ["概览", "用户", "切片", "格式申请", "测试申请", "研究删除", "设置", "费用", "插件", "审计"];
+    // R6（2026-09-19）身份冲突退役 + 2026-10-08 邀请退役 + 2026-10-09
+    // 测试申请退役（round4 §2.3）——导航 9 页
+    //（概览/用户/切片/格式申请/研究删除/设置/费用/插件/审计）。
+    const labels = ["概览", "用户", "切片", "格式申请", "研究删除", "设置", "费用", "插件", "审计"];
     const navBtns = frame.locator(".adm-nav-btn");
     expect(await navBtns.count()).toBe(labels.length);
     for (let i = 0; i < labels.length; i++) {
@@ -934,7 +951,7 @@ test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
     await expect(frame.locator("#adm-page-users")).toBeVisible();
   });
 
-  test("21. 390 users: 4 列布局（用户/加入时间/最近登录/分类）、无水平溢出", async ({ page }) => {
+  test("21. 390 users: 6 列卡片布局（用户/加入时间/最近登录/余额/研究数据/分类）、无水平溢出", async ({ page }) => {
     await gotoAdminReady(page);
     const frame = page.frameLocator("#admin-plugin-frame");
     await frame.locator('#adm-nav-toggle').click();
@@ -944,14 +961,15 @@ test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
       .toBe("ready", { timeout: 10_000 });
     const row = frame.locator("#adm-users-tbody tr", { hasText: "e2e-user@pt.test" });
     await expect(row).toBeVisible();
-    // 2026-10-08 §2：关键信息在行内可见——分类标签与详情操作
+    // 2026-10-08 §2 + round4 §2.2：关键信息在行内可见——分类标签与详情操作
     await expect(row).toContainText(/正式用户|Dogfood/);
     await expect(row.locator("button", { hasText: "详情" })).toBeVisible();
     // 分类筛选在窄屏可见
     await expect(frame.locator('.adm-kind-btn[data-kind="real"]')).toBeVisible();
     // P0-2：几何断言（iframe 文档视口）——toBeVisible 不足以防截断。
-    // DOM 列序固定：td[0]=用户 td[1]=加入时间 td[2]=最近登录 td[3]=分类；
-    // 关键单元格 right 边必须落在视口内。
+    // DOM 列序固定：td[0]=用户 td[1]=加入时间 td[2]=最近登录 td[3]=余额
+    // td[4]=研究数据 td[5]=分类；窄屏为每行 2 列卡片网格（首末单元格跨双列），
+    // 全部单元格 right 边必须落在视口内。
     const geo = await row.evaluate((tr) => {
       const vw = document.documentElement.clientWidth;
       const box = (el: Element | null | undefined) => {
@@ -967,7 +985,9 @@ test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
         name: box(tds[0]),
         joined: box(tds[1]),
         lastLogin: box(tds[2]),
-        kind: box(tds[3]),
+        balance: box(tds[3]),
+        research: box(tds[4]),
+        kind: box(tds[5]),
         detail: box(Array.from(tr.querySelectorAll("button"))
           .find((b) => (b.textContent || "").includes("详情"))),
         visibleCells: tds.filter((td) => td.getBoundingClientRect().width > 0).length,
@@ -975,14 +995,15 @@ test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
     });
     expect(geo.iframeOverflow, "users-390 iframe overflow").toBeLessThanOrEqual(1);
     for (const [key, b] of [["name", geo.name], ["joined", geo.joined],
-      ["lastLogin", geo.lastLogin], ["kind", geo.kind],
+      ["lastLogin", geo.lastLogin], ["balance", geo.balance],
+      ["research", geo.research], ["kind", geo.kind],
       ["detail", geo.detail]] as const) {
       expect(b && b.width, `${key} cell rendered`).toBeGreaterThan(0);
       expect(b && b.right !== undefined && b.right <= geo.vw + 1,
         `${key} cell right edge within iframe viewport`).toBe(true);
     }
-    // 4 列布局：可见单元格恰为 4（用户/加入时间/最近登录/分类）
-    expect(geo.visibleCells, "390px users table shows exactly 4 columns").toBe(4);
+    // 6 列布局：可见单元格恰为 6（用户/加入时间/最近登录/余额/研究数据/分类）
+    expect(geo.visibleCells, "390px users table shows exactly 6 columns").toBe(6);
     // 放大字号后，时间仍须横向可读，不能靠逐字折行伪装成无溢出。
     expect(geo.joined!.width).toBeGreaterThanOrEqual(120);
     expect(geo.lastLogin!.width).toBeGreaterThanOrEqual(120);

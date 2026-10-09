@@ -508,6 +508,73 @@ describe("2026-10-08 — 邀请页退役（§4）", () => {
 
 
 // --------------------------------------------------------------------------- //
+// 2026-10-09（round4 §2.3，docs/admin-viewer-round4-20261009.md）：测试申请页
+// 整体退役——导航/页面/筛选/确认条/表格/监听全部不存在；admin.testApplications.*
+// 桥方法已删（宿主稳定 unknown_method），深链 #test-applications 与 #invites
+// 同规则归一回概览而不是空屏。
+// --------------------------------------------------------------------------- //
+describe("2026-10-09 — 测试申请页退役（round4 §2.3）", () => {
+	const NONCE = "e4".repeat(32);
+
+	function boot(bus: ReturnType<typeof loadPluginUiWithBus>) {
+		bus.dispatch(bus.parent, {
+			kind: "init", bridge: "admin", protocolVersion: "1.0.0",
+			nonce: NONCE, adminPermissions: ["admin:overview:read"],
+		});
+	}
+
+	it("HTML/JS/CSS：无测试申请导航/section/筛选/表格/确认条/监听，深链白名单无 test-applications", () => {
+		expect(htmlSrc).not.toContain('id="adm-page-test-applications"');
+		expect(htmlSrc).not.toContain('data-page="test-applications"');
+		for (const gone of [
+			"adm-test-filters", "adm-test-status", "adm-test-direction",
+			"adm-test-search-btn", "adm-test-refresh-btn", "adm-test-table",
+			"adm-test-tbody", "adm-test-confirm", "adm-test-list-status",
+		]) {
+			expect(htmlSrc, gone).not.toContain(gone);
+		}
+		// 导航按钮总数回落到 9 页（round4：概览/用户/切片/格式申请/研究删除/
+		// 设置/费用/插件/审计）
+		const navCount = (htmlSrc.match(/class="adm-nav-btn"/g) || []).length;
+		expect(navCount).toBe(9);
+		// 桥方法不再作为请求发出；函数/监听/schema 残留清零（注释除外）
+		expect(src).not.toContain('request("admin.testApplications.');
+		expect(src).not.toContain("loadTestApplications");
+		expect(src).not.toContain("renderTestAppRow");
+		expect(src).not.toContain("askTestAppApprove");
+		expect(src).not.toContain("reviewTestApplication");
+		expect(src).not.toContain("TEST_APP_STATUS_LABELS");
+		expect(src).not.toContain('onClick("adm-test-search-btn"');
+		expect(src).not.toContain('onClick("adm-test-refresh-btn"');
+		expect(src).not.toMatch(/var pages = \[[^\]]*"test-applications"/);
+		expect(src).not.toMatch(/"test-applications": \$\("adm-page-test-applications"\)/);
+		expect(src).not.toMatch(/name === "test-applications"/);
+		expect(cssSrc).not.toContain('data-page="test-applications"');
+	});
+
+	it("深链 #test-applications 归一回概览：发概览首屏请求，绝不发 admin.testApplications.*", async () => {
+		const bus = loadPluginUiWithBus("#test-applications");
+		boot(bus);
+		// 深链落到的页面即概览（initialPageFromHash 白名单不含该 slug）
+		expect(bus.els["adm-page-overview"].hidden).toBe(false);
+		bus.client!.showPage("test-applications");
+		await ticks(4);
+		const requested = bus.parentPosted
+			.filter((p) => p.env.kind === "request")
+			.map((p) => String(p.env.method));
+		expect(requested).toContain("admin.overview.get");
+		expect(requested.every((m) => !m.startsWith("admin.testApplications.")))
+			.toBe(true);
+		expect(requested.every((m) => m !== "admin.testApplications.list"))
+			.toBe(true);
+		// 概览 section 可见（不是所有页面都隐藏的空屏），页标题归一为「概览」
+		expect(bus.els["adm-page-users"].hidden).toBe(true);
+		expect(bus.els["adm-page-title"].textContent).toBe("概览");
+	});
+});
+
+
+// --------------------------------------------------------------------------- //
 // wave 2（§4.2）：概览 = 精简 KPI + 供应商余额/调用缓存 + 条件告警 +
 // 站点访问卡（降级隐藏）。
 // --------------------------------------------------------------------------- //
@@ -532,7 +599,9 @@ describe("wave 2 — 概览页收敛 + 站点访问卡（§4.2 / D2-3）", () =>
 		replyMethod(bus, NONCE, "admin.overview.get", {
 			ok: true,
 			result: {
-				users: { total: 9, active: 8, disabled: 1, ai_access: 5 },
+				// 2026-10-09（round4 §2.1）：total/active/disabled/ai_access 只计
+				// 正式用户（account_kind='real'）；dogfood 单独下发但界面不展示
+				users: { total: 9, active: 8, disabled: 1, ai_access: 5, dogfood: 3 },
 				billing: {
 					available: true, model_calls_period: 42, model_calls_today: 3,
 					cache_hit_ratio: 0.5, cache_hit_input_tokens: 100,
@@ -544,9 +613,16 @@ describe("wave 2 — 概览页收敛 + 站点访问卡（§4.2 / D2-3）", () =>
 			},
 		});
 		await ticks(6);
+		const kpiTexts = bus.els["adm-ov-kpis"].textContent;
 		const texts = Object.values(bus.els).map((el) => el.textContent).join("\n");
-		expect(texts).toContain("用户总数");
-		expect(texts).toContain("AI access 用户");
+		// round4 §2.1：口径标注「（正式用户）」，副行启用/禁用同口径
+		expect(kpiTexts).toContain("用户总数（正式用户）");
+		expect(kpiTexts).toContain("启用 8 · 禁用 1");
+		expect(kpiTexts).toContain("AI access 用户（正式用户）");
+		expect(kpiTexts).toContain("9");
+		expect(kpiTexts).toContain("5");
+		// dogfood 数（3）不展示——卡片口径只有正式用户
+		expect(kpiTexts).not.toContain("Dogfood");
 		expect(texts).toContain("模型调用（本周期）");
 		expect(texts).toContain("缓存命中率");
 		expect(texts).toContain("User 累计已用");
@@ -778,7 +854,7 @@ describe("pathtogether-admin plugin UI — workbench KPI + drawer (§9, 包 E)",
 		});
 	}
 
-	it("users table: 四列（用户/加入时间/最近登录/分类）+ 行内分类切换与详情抽屉（2026-10-08 §2）", async () => {
+	it("users table: 六列（用户/加入时间/最近登录/余额/研究数据/分类）+ 行内分类切换与详情抽屉（2026-10-08 §2；2026-10-09 round4 §2.2）", async () => {
 		const bus = loadPluginUiWithBus();
 		bootWithOverview(bus);
 		bus.client!.showPage("users");
@@ -800,6 +876,8 @@ describe("pathtogether-admin plugin UI — workbench KPI + drawer (§9, 包 E)",
 						user_id: "u1", display_name: "张三", identity: "zhang@x.com",
 						role: "user", enabled: true, ai_access: true, account_kind: "real",
 						created_at: 1700000000, last_login_at: 1700000100,
+						// round4 §2.2：研究授权三态之一——已授权
+						research: { state: "granted", granted: true },
 						spend: {
 							total: {
 								allowance_id: "alw_1", total_limit_nano_cny: "20000000000",
@@ -814,34 +892,59 @@ describe("pathtogether-admin plugin UI — workbench KPI + drawer (§9, 包 E)",
 						role: "user", enabled: true, ai_access: false,
 						account_kind: "dogfood",
 						created_at: 1700000000, last_login_at: null,
+						// 已撤回：state=withdrawn（granted=false）
+						research: { state: "withdrawn", granted: false },
+					},
+					{
+						user_id: "u3", identity: "wang@x.com", display_name: "王五",
+						role: "user", enabled: true, ai_access: false,
+						account_kind: "real",
+						created_at: 1700000000, last_login_at: null,
+						// 未授权：state=null / granted=false
+						research: { state: null, granted: false },
 					},
 				],
 				next_cursor: null,
 			},
 		});
 		await ticks(4);
-		const tbody = bus.els["adm-users-tbody"].textContent;
+		const tbodyEl = bus.els["adm-users-tbody"];
+		const tbody = tbodyEl.textContent;
 		// 用户列 = 显示名 + 邮箱（sub 行）；加入时间/最近登录（上海时间，GMT+8）；
 		// 分类列 = 标签（正式用户/Dogfood）+ 标为 Dogfood/改为正式 + 详情
 		expect(tbody).toContain("张三");
 		expect(tbody).toContain("zhang@x.com");
 		expect(tbody).toContain("2023-11-15 06:13:20 GMT+8");
-		expect(tbody).toContain("暂无记录"); // u2 从未登录（last_login_at null）
+		expect(tbody).toContain("暂无记录"); // u2/u3 从未登录（last_login_at null）
 		expect(tbody).toContain("正式用户");
 		expect(tbody).toContain("Dogfood");
 		expect(tbody).toContain("标为 Dogfood");
 		expect(tbody).toContain("改为正式");
 		expect(tbody).toContain("详情");
-		// 低频字段不进表格行（额度/启用状态/掩码账号只在抽屉里出现）
+		// round4 §2.2：余额列恢复——与抽屉同一 remainingInfo 短文案
+		expect(tbody).toContain("剩余 16.08 CNY");
+		// round4 §2.2：研究数据三态
+		expect(tbody).toContain("已授权");
+		expect(tbody).toContain("已撤回");
+		expect(tbody).toContain("未授权");
+		// 每行 6 个单元格（六列），窄屏 data-label 与表头同源
+		const rows = tbodyEl.children;
+		expect(rows.length).toBe(3);
+		for (const row of rows) {
+			expect(row.children.length).toBe(6);
+		}
+		const balanceCell = bus.created.find((el) =>
+			String(el.className).includes("adm-cell-remaining"));
+		expect(balanceCell && balanceCell.textContent).toBe("剩余 16.08 CNY");
+		// 低频字段仍不进表格行（掩码账号只在抽屉里出现）
 		expect(tbody).not.toContain("z***@x.com");
-		expect(tbody).not.toContain("剩余 16.08 CNY");
 		const kindTags = bus.created.filter((el) =>
 			String(el.className).includes("adm-kind-tag"));
-		expect(kindTags.length).toBe(2);
+		expect(kindTags.length).toBe(3);
 		const detailBtns = bus.created.filter((el) => el.textContent === "详情" &&
 			el._listeners && el._listeners.click);
-		expect(detailBtns.length).toBe(2);
-		// 详情抽屉保留额度主视图 + 分类/最近登录（主表四列不再显示额度）
+		expect(detailBtns.length).toBe(3);
+		// 详情抽屉保留额度主视图 + 分类/最近登录
 		detailBtns[0]!._fire("click", {});
 		expect(bus.els["adm-user-drawer"].hidden).toBe(false);
 		const body = bus.els["adm-drawer-body"].textContent;
@@ -849,6 +952,62 @@ describe("pathtogether-admin plugin UI — workbench KPI + drawer (§9, 包 E)",
 		expect(body).toContain("最近登录");
 		expect(body).toContain("总额度");
 		expect(body).toContain("剩余 16.08 CNY");
+	});
+
+	it("users table: 余额四态（剩余/已用尽/超支/不可用）与研究数据字段缺失回退未授权", async () => {
+		const bus = loadPluginUiWithBus();
+		bootWithOverview(bus);
+		bus.client!.showPage("users");
+		await ticks(4);
+		const req = bus.parentPosted
+			.filter((p) => p.env.kind === "request" && p.env.method === "admin.users.list")
+			.at(-1);
+		bus.dispatch(bus.parent, {
+			kind: "response", bridge: "admin", nonce: NONCE,
+			requestId: req!.env.requestId, ok: true,
+			result: {
+				items: [
+					{ // 已用尽（remaining=0）
+						user_id: "u_empty", identity: "empty@x.com", role: "user",
+						enabled: true, account_kind: "real", created_at: 1700000000,
+						last_login_at: null, research: { state: "granted", granted: true },
+						spend: { total: {
+							allowance_id: "a1", total_limit_nano_cny: "1000000000",
+							spent_nano_cny: "1000000000", reserved_nano_cny: "0",
+							remaining_nano: "0", overage_nano: "0",
+							source: "default", version: 1, cutover_at: 1700000000,
+						} },
+					},
+					{ // 超支（overage>0，danger）
+						user_id: "u_over", identity: "over@x.com", role: "user",
+						enabled: true, account_kind: "real", created_at: 1700000000,
+						last_login_at: null, research: { state: "withdrawn", granted: false },
+						spend: { total: {
+							allowance_id: "a2", total_limit_nano_cny: "1000000000",
+							spent_nano_cny: "1500000000", reserved_nano_cny: "0",
+							remaining_nano: "0", overage_nano: "500000000",
+							source: "default", version: 2, cutover_at: 1700000000,
+						} },
+					},
+					{ // 不可用（spend 缺失）+ research 字段整体缺失 → 未授权
+						user_id: "u_none", identity: "none@x.com", role: "user",
+						enabled: true, account_kind: "real", created_at: 1700000000,
+						last_login_at: null,
+					},
+				],
+				next_cursor: null,
+			},
+		});
+		await ticks(4);
+		const tbody = bus.els["adm-users-tbody"].textContent;
+		expect(tbody).toContain("已用尽");
+		expect(tbody).toContain("超支 0.50 CNY");
+		expect(tbody).toContain("不可用");
+		// research 字段缺失绝不伪造「已授权」
+		expect(tbody).toContain("未授权");
+		const overCell = bus.created.find((el) =>
+			String(el.className).includes("adm-usage-overage"));
+		expect(overCell && overCell.textContent).toBe("超支 0.50 CNY");
 	});
 
 	it("行内分类切换：real→dogfood 走 admin.users.setAccountKind 并刷新列表", async () => {
@@ -1106,11 +1265,15 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 			},
 		});
 		await ticks(4);
-		// 主表四列不再显示额度/状态/角色——额度语义整体收进「详情」抽屉
+		// round4 §2.2：余额列恢复——主表与抽屉同一 remainingInfo 短文案；
+		// 状态/角色等其余低频字段仍只在「详情」抽屉
 		const tbody = bus.els["adm-users-tbody"].textContent;
-		expect(tbody).not.toContain("剩余 16.08 CNY");
-		expect(tbody).not.toContain("已用尽");
-		// 7 行各有 详情（四列主表的行内动作）
+		expect(tbody).toContain("剩余 16.08 CNY");
+		expect(tbody).toContain("已用尽");
+		expect(tbody).toContain("超支 2.50 CNY");
+		expect(tbody).toContain("剩余 0.00 CNY");
+		expect(tbody).not.toContain("z***@x.com");
+		// 7 行各有 详情（六列主表的行内动作）
 		const detailBtns = bus.created.filter((el) => el.textContent === "详情" &&
 			el._listeners && el._listeners.click);
 		expect(detailBtns.length).toBe(7);
@@ -1509,14 +1672,16 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 		expect(htmlSrc).toMatch(/id="adm-balance-refresh-btn"[^>]*class=["'][^"']*adm-btn-secondary/);
 	});
 
-	// §2/§4.8 390px 列适配（CSS 断言；2026-10-08 四列主表）
-	it("批次A-8: 用户表四列表头（用户/加入时间/最近登录/分类）、分类组件、日期不 break-all", () => {
+	// §2/§4.8 390px 列适配（CSS 断言；2026-10-08 四列 → 2026-10-09 round4 §2.2 六列）
+	it("批次A-8: 用户表六列表头（用户/加入时间/最近登录/余额/研究数据/分类）、分类组件、日期不 break-all", () => {
 		const usersPage = htmlSrc.slice(htmlSrc.indexOf('id="adm-page-users"'),
 			htmlSrc.indexOf('id="adm-page-slides"'));
-		// 四列主表：无次要列/无旧角色·状态·额度列
+		// 六列主表：无次要列/无旧角色·状态列
 		expect(usersPage).toContain("<th>用户</th>");
 		expect(usersPage).toContain("<th>加入时间</th>");
 		expect(usersPage).toContain("<th>最近登录</th>");
+		expect(usersPage).toContain("<th>余额</th>");
+		expect(usersPage).toContain("<th>研究数据</th>");
 		expect(usersPage).toContain("<th>分类</th>");
 		expect(usersPage).not.toMatch(/<th[^>]*adm-col-secondary[^>]*>角色</);
 		expect(usersPage).not.toMatch(/<th[^>]*>登录账号</);
@@ -1537,8 +1702,10 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 		expect(cssSrc).toMatch(/\.adm-kind-btn\[aria-pressed="true"\]/);
 		// 次要列机制保留给其它列表（390px 隐藏）
 		expect(cssSrc).toMatch(/@media \(max-width:\s*767px\)[\s\S]*\.adm-col-secondary\s*{[^}]*display:\s*none/);
-		// 日期整词换行 + 抽屉技术细节 + 立即调整折叠样式不变
+		// 日期整词换行 + 抽屉技术细节 + 立即调整折叠样式不变；
+		// 余额/超支色（round4 §2.2 恢复余额列沿用）
 		expect(cssSrc).toMatch(/\.adm-cell-time\s*{[^}]*word-break:\s*normal/);
+		expect(cssSrc).toMatch(/\.adm-usage-overage\s*{/);
 		expect(cssSrc).toMatch(/\.adm-drawer-tech\s*{/);
 		expect(cssSrc).toMatch(/\.adm-win-adjust\s*{/);
 	});
@@ -1547,15 +1714,17 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 	it("批次A-13: 移动端导航 ::before 按同特异性逐页复位", () => {
 		const mobileBlock = cssSrc.slice(cssSrc.indexOf("@media (max-width: 767px)"));
 		expect(mobileBlock).toContain("adm-nav-btn { font-size: 14px");
-		// 2026-10-08：10 页逐一复位（invites 退役；slides/format-requests/
-		// test-applications/research-deletion 图标规则统一覆盖）
+		// 2026-10-09：9 页逐一复位（invites/test-applications 随页面退役移除；
+		// slides/format-requests/research-deletion 图标规则统一覆盖）
 		for (const p of ["overview", "users", "slides", "format-requests",
-			"test-applications", "research-deletion", "settings",
+			"research-deletion", "settings",
 			"billing", "plugins", "audit"]) {
 			expect(mobileBlock,
 				`mobile ::before reset for ${p}`).toMatch(
 				new RegExp(`\\.adm-nav-btn\\[data-page="${p}"\\]::before[\\s\\S]{0,600}?content:\\s*none`));
 		}
+		// test-applications 图标规则随页面退役移除（平板与手机两端都不再有）
+		expect(cssSrc).not.toContain('data-page="test-applications"');
 	});
 
 	// §4.9 紧凑握手

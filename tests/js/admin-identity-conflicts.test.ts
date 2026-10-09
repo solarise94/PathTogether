@@ -251,9 +251,13 @@ describe("插件 UI — R6 退役残留清零", () => {
 		expect(pluginSrc).not.toContain('onClick("adm-identity-refresh-btn"');
 	});
 
-	it("R7 交付保持：测试申请页与 activated_by_invite 终态不受 R6 影响", () => {
-		expect(htmlSrc).toContain('data-page="test-applications"');
-		expect(htmlSrc).toContain("已通过邀请码激活");
-		expect(pluginSrc).toContain('"test-applications"');
+	it("R7 遗留状态已被 round4 §2.3 取代：测试申请页整体退役（2026-10-09）", () => {
+		// R7 曾交付「测试申请」页与 activated_by_invite 终态；2026-10-09
+		//（round4 §2.3）该页与 admin.testApplications.* 桥方法整体退役
+		//（宿主稳定 unknown_method、服务端 410），test_applications 表保留
+		// 为历史。此处锁定退役不回潮（替代原「R7 交付保持」断言）。
+		expect(htmlSrc).not.toContain('data-page="test-applications"');
+		expect(htmlSrc).not.toContain('id="adm-page-test-applications"');
+		expect(pluginSrc).not.toMatch(/var pages = \[[^\]]*"test-applications"/);
 	});
 });

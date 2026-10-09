@@ -47,12 +47,10 @@
    list/get（users:read）+ patch（users:write，CAS 状态机 + admin_note），
    复用 users 权限域不扩域；样本只呈现元数据（样本下载走宿主鉴权接口，
    本页不内嵌文件）；渲染字段白名单化，内部字段绝不进 DOM。
-  SER-8（wip/ser8-dev）：新增「测试申请」页——admin.testApplications.list
+   SER-8（wip/ser8-dev）：曾新增「测试申请」页——admin.testApplications.list
    （users:read）+ review（users:write，POST .../review，body {decision,
-   ai_access}）。approved = 原子激活 + 默认额度 provisioning + 结果邮件
-   （终态不可撤销），页内确认条 +「开通 AI 权限」默认勾；
-   409 default_allowance_unconfigured 提示先去设置页配置默认总额度。
-   渲染只用 textContent / createElement（不拼 HTML，插件数据永不进标记）。
+   ai_access}）。2026-10-09（round4 §2.3）整页退役：页面与桥方法已删
+   （宿主稳定 unknown_method、服务端 410），见下方退役说明。
    2026-09-21：新增「研究删除」页（管理员最小处置入口）——admin.
    researchDeletionJobs.list（users:read）+ retry（users:write，POST
    .../research-deletion-jobs/<job_id>/retry）。唯一动作 = 把**终态 failed**
@@ -76,6 +74,14 @@
        (expires_at - server_now)/60) 并按响应到达后的本地流逝时间修正，
        每分钟刷新，归零显示「已结束」并重取清单；
      - 渲染纪律不变：一律 textContent/createElement，响应未知字段绝不进 DOM。
+   2026-10-09（round4 §2，docs/admin-viewer-round4-20261009.md）：
+     - 概览「用户总数」改「用户总数（正式用户）」（account_kind='real'
+       口径；副行启用/禁用同口径），「AI access 用户」同口径加注
+       （正式用户）；users.dogfood 不展示；
+     - 用户主表恢复「余额」列（remainingInfo 短文案，同抽屉口径）并新增
+       「研究数据」列（research: {state, granted} → 已授权/已撤回/未授权），
+       四列扩为六列，行内分类切换与详情动作不变；
+     - 「测试申请」页整体退役（见下方退役说明）。
  ========================================================================= */
 (function () {
   "use strict";
@@ -98,10 +104,9 @@
     listSeq: 0,
     // 分页游标（每列表独立；仅内存）
     cursors: { users: null, usage: null, unpriced: null, ledger: null,
-               audit: null, slides: null, formatRequests: null,
-               testApplications: null },
+               audit: null, slides: null, formatRequests: null },
     filters: { users: { kind: "real", sort: "joined_desc" }, usage: {},
-               audit: {}, format: {}, testApp: {}, rdel: {} },
+               audit: {}, format: {}, rdel: {} },
     // 切片页临时查看倒计时基准（2026-10-08 §3.4）：清单响应的 server_now +
     // 到达时刻的本地时钟——剩余分钟 = ceil((expires_at - (server_now +
     // 本地流逝))/60)，修正宿主与响应之间的时钟偏移；仅内存。
@@ -144,9 +149,11 @@
   // 自身 URL；只接受已知页面 slug，其余回概览。
   // 2026-10-08：invites 已从白名单移除（邀请页退役，旧 /admin#invites 深链
   // 回概览而不是报错）。
+  // 2026-10-09（round4 §2.3）：test-applications 同规则退役——旧
+  // /admin#test-applications 深链回概览。
   function initialPageFromHash() {
     var pages = ["overview", "users", "slides", "format-requests",
-                 "test-applications", "research-deletion",
+                 "research-deletion",
                  "settings", "billing", "plugins", "audit"];
     var hash = "";
     try { hash = window.location.hash || ""; } catch (e) { hash = ""; }
@@ -161,7 +168,7 @@
   //（临时查看取代旧 workspace 收录模型）。
   var PAGE_TITLES = {
     overview: "概览", users: "用户", slides: "切片",
-    "format-requests": "格式申请", "test-applications": "测试申请",
+    "format-requests": "格式申请",
     "research-deletion": "研究删除", settings: "设置",
     billing: "费用", plugins: "插件", audit: "审计",
   };
@@ -180,7 +187,6 @@
       users: $("adm-page-users"),
       slides: $("adm-page-slides"),
       "format-requests": $("adm-page-format-requests"),
-      "test-applications": $("adm-page-test-applications"),
       "research-deletion": $("adm-page-research-deletion"),
       settings: $("adm-page-settings"),
       billing: $("adm-page-billing"),
@@ -758,9 +764,13 @@
     wrap.textContent = "";
     var u = ov.users || {};
     var b = ov.billing || {};
-    wrap.appendChild(kpiCard("用户总数", fmtNum(u.total),
+    // 2026-10-09（round4 §2.1）：概览用户口径收敛为正式用户
+    //（account_kind='real'）——total/active/disabled/ai_access 服务端已只计
+    // 正式用户，副行启用/禁用同口径；避免 AI 用户数大于用户总数的错觉。
+    // 新增的 users.dogfood（Dogfood 账号数）界面不展示。
+    wrap.appendChild(kpiCard("用户总数（正式用户）", fmtNum(u.total),
       "启用 " + fmtNum(u.active) + " · 禁用 " + fmtNum(u.disabled)));
-    wrap.appendChild(kpiCard("AI access 用户", fmtNum(u.ai_access)));
+    wrap.appendChild(kpiCard("AI access 用户（正式用户）", fmtNum(u.ai_access)));
     if (b.available !== false) {
       wrap.appendChild(kpiCard("模型调用（本周期）", fmtNum(b.model_calls_period),
         "今日 " + fmtNum(b.model_calls_today)));
@@ -1079,20 +1089,18 @@
   function resetLists() {
     state.cursors = { users: null, usage: null, unpriced: null, ledger: null,
                       audit: null, slides: null,
-                      formatRequests: null, testApplications: null };
+                      formatRequests: null };
     state.slidesCache = null;
     ["adm-users-tbody", "adm-usage-tbody", "adm-unpriced-tbody",
      "adm-ledger-tbody", "adm-audit-tbody",
      "adm-plugins-tbody", "adm-slides-tbody",
-     "adm-format-tbody", "adm-test-tbody", "adm-rdel-tbody"].forEach(
+     "adm-format-tbody", "adm-rdel-tbody"].forEach(
     function (id) {
       var el = $(id);
       if (el) el.textContent = "";
     });
     var frDetail = $("adm-format-detail");
     if (frDetail) frDetail.textContent = "";
-    var testConfirm = $("adm-test-confirm");
-    if (testConfirm) { testConfirm.hidden = true; testConfirm.textContent = ""; }
     var rdelConfirm = $("adm-rdel-confirm");
     if (rdelConfirm) { rdelConfirm.hidden = true; rdelConfirm.textContent = ""; }
   }
@@ -1272,10 +1280,35 @@
     return "";
   }
 
+  // 研究数据授权列（2026-10-09 round4 §2.2）：服务端批量下发的
+  // research = {state: "granted"|"withdrawn"|null, granted: bool}。
+  // granted → 已授权；state=withdrawn → 已撤回；其余（含字段缺失）→ 未授权。
+  // 字段缺失不报错（旧响应兼容），绝不伪造「已授权」。
+  function researchLabel(u) {
+    var r = u && u.research;
+    if (r && r.granted) return "已授权";
+    if (r && r.state === "withdrawn") return "已撤回";
+    return "未授权";
+  }
+
+  // 余额单元格（2026-10-09 round4 §2.2 恢复）：沿用旧表/抽屉同一
+  // remainingInfo 短文案（剩余 X CNY / 已用尽 / 超支 X CNY / 不可用），
+  // 超支 danger 色（颜色判断按原始 nano）。
+  function renderRemainCell(u) {
+    var info = remainingInfo(u);
+    var cell = document.createElement("td");
+    cell.className = "adm-cell-remaining" +
+      (info.danger ? " adm-usage-overage" : "");
+    cell.textContent = info.text;
+    return cell;
+  }
+
   // ------------------------------------------------------------------
-  // 用户主表（2026-10-08 §2）：四列 = 用户（显示名+邮箱）/ 加入时间 /
-  // 最近登录 / 分类。额度、启用状态、掩码登录账号等低频字段收进「详情」
-  // 抽屉；行内动作 = 分类切换（标为 Dogfood/改为正式）+ 详情。
+  // 用户主表（2026-10-08 §2；2026-10-09 round4 §2.2 六列）：用户（显示名+
+  // 邮箱）/ 加入时间 / 最近登录 / 余额（remainingInfo 短文案）/ 研究数据
+  //（research.state/granted） / 分类。行内动作 = 分类切换（标为
+  // Dogfood/改为正式）+ 详情；启用状态、掩码登录账号等低频字段仍在「详情」
+  // 抽屉。
   // ------------------------------------------------------------------
   // 窄屏卡片沿用原表格数据与操作，标签来自同一组列标题。
   function labelResponsiveCells(row, labels) {
@@ -1307,6 +1340,10 @@
       // §2：从未登录（last_login_at null）→「暂无记录」；时间 Asia/Shanghai。
       tr.appendChild(td(u.last_login_at === null || u.last_login_at === undefined
         ? "暂无记录" : fmtTs(u.last_login_at), "adm-cell-time"));
+      // round4 §2.2：余额（剩余额度，与抽屉同一 remainingInfo 口径）
+      tr.appendChild(renderRemainCell(u));
+      // round4 §2.2：研究数据授权（已授权/已撤回/未授权）
+      tr.appendChild(td(researchLabel(u), "adm-cell-research"));
       var kindCell = document.createElement("td");
       var tag = document.createElement("span");
       tag.className = "adm-kind-tag" +
@@ -1324,7 +1361,8 @@
       kindActions.appendChild(detailBtn);
       kindCell.appendChild(kindActions);
       tr.appendChild(kindCell);
-      labelResponsiveCells(tr, ["用户", "加入时间", "最近登录", "分类"]);
+      labelResponsiveCells(tr,
+        ["用户", "加入时间", "最近登录", "余额", "研究数据", "分类"]);
       tbody.appendChild(tr);
     });
   }
@@ -3720,218 +3758,14 @@
   }
 
   // ------------------------------------------------------------------
-  // 测试申请审核（SER-8，wip/ser8-dev）：
-  //   - admin.testApplications.list：GET /api/admin/v1/test-applications
-  //     （direction/status 服务端过滤；单查即全量、上限 500 行，无游标）；
-  //   - admin.testApplications.review：POST .../<user_id>/review，body
-  //     {decision, ai_access}；
-  //   - approved = 原子激活 + 默认额度 provisioning + 结果邮件，终态不可
-  //     撤销 → 页内确认条（sandbox 无 allow-modals，原生 confirm 被吞）
-  //     +「开通 AI 权限」勾选（默认勾）；rejected 亦终态（页内确认条）；
-  //   - activated_by_invite（R7 2026-09-19）：用户凭邀请码激活时服务端已
-  //     同事务收口的显式终态——从待审任务移除（无通过/拒绝按钮），状态列
-  //     显示「已通过邀请码激活」+ 激活来源；对它审批服务端一律 409
-  //     already_reviewed；
-  //   - 409 default_allowance_unconfigured → 提示先去设置页配置新用户默认
-  //     总额度（fail-closed，绝不无额度激活）；409 already_reviewed →
-  //     提示并刷新（他人先行处理/邀请码已收口）；
-  //   - 渲染白名单字段 textContent（同格式申请页纪律），方向中文映射在本
-  //     前端做（API 只回机器值）。
-  // ------------------------------------------------------------------
-  var TEST_APP_STATUS_LABELS = {
-    pending: "待审核", approved: "已通过", rejected: "已拒绝",
-    activated_by_invite: "已通过邀请码激活",
-  };
-  var TEST_APP_SOURCE_LABELS = {
-    admin: "管理员审批", invite: "邀请码",
-  };
-  var TEST_APP_DIRECTIONS = {
-    model_plant: "模式植物", model_animal: "模式动物",
-    clinical_pathology: "临床病理", other: "其他",
-  };
-
-  function testAppStatusLabel(status) {
-    return TEST_APP_STATUS_LABELS[status] || String(status || "—");
-  }
-
-  function testAppDirectionLabel(direction) {
-    return TEST_APP_DIRECTIONS[direction] || String(direction || "—");
-  }
-
-  // 激活来源（R7）：仅已激活账号显示；服务端 activation_source 权威，
-  // 前端只做中文映射，未知来源原样回显机器值不猜。
-  function testAppSourceLabel(item) {
-    if (item.activation_state !== "active" || !item.activation_source) {
-      return null;
-    }
-    var known = TEST_APP_SOURCE_LABELS[item.activation_source];
-    return "激活来源：" + (known || String(item.activation_source));
-  }
-
-  function loadTestApplications() {
-    var seq = state.listSeq;
-    var f = state.filters.testApp || {};
-    var payload = {};
-    if (f.status) payload.status = f.status;
-    if (f.direction) payload.direction = f.direction;
-    var status = $("adm-test-list-status");
-    setPageState("test-applications", "loading");
-    request("admin.testApplications.list", payload).then(function (res) {
-      if (seq !== state.listSeq) return; // 页面已切换：晚到响应丢弃
-      hideError();
-      var items = (res && res.items) || [];
-      var tbody = $("adm-test-tbody");
-      if (tbody) tbody.textContent = "";
-      items.forEach(function (item) { renderTestAppRow(item); });
-      if (!items.length) {
-        setPageState("test-applications", "empty", {
-          message: (f.status || f.direction)
-            ? "没有匹配筛选条件的测试申请；切换筛选可查看全部。"
-            : "暂无测试申请。用户完成邮箱验证并提交申请后会出现在此。",
-        });
-      } else {
-        setPageState("test-applications", "ready", {
-          message: "已更新（" + nowText() + "）",
-        });
-      }
-    }).catch(function (err) {
-      if (seq !== state.listSeq) return;
-      handleErr(err, status);
-      setPageState("test-applications", "error", {
-        code: err && err.code, message: err && err.message,
-        retry: function () { loadTestApplications(); },
-      });
-    });
-  }
-
-  function renderTestAppRow(item) {
-    var tbody = $("adm-test-tbody");
-    if (!tbody) return;
-    var tr = document.createElement("tr");
-    tr.appendChild(td(item.email_normalized || "—"));
-    tr.appendChild(td(item.display_name, "adm-col-secondary"));
-    tr.appendChild(td(testAppDirectionLabel(item.research_direction)));
-    tr.appendChild(td(item.share_research_data ? "同意" : "未同意",
-                     "adm-col-secondary"));
-    tr.appendChild(td(fmtTs(item.created_at), "adm-cell-time"));
-    var statusCell = document.createElement("td");
-    statusCell.textContent = testAppStatusLabel(item.status);
-    if (item.status === "activated_by_invite") {
-      // 邀请码激活收口（R7）：非人工审批（reviewed_by 恒空），状态列附
-      // 激活来源；操作列不提供任何审核动作（待审任务已移除）。
-      var source = testAppSourceLabel(item);
-      if (source) {
-        statusCell.appendChild(document.createElement("br"));
-        var inviteMeta = document.createElement("span");
-        inviteMeta.className = "adm-user-meta";
-        inviteMeta.textContent = source;
-        statusCell.appendChild(inviteMeta);
-      }
-    } else if (item.status !== "pending" && item.reviewed_at) {
-      // 已处理行：状态列附审核时间（操作列不再提供动作）
-      statusCell.appendChild(document.createElement("br"));
-      var meta = document.createElement("span");
-      meta.className = "adm-user-meta";
-      meta.textContent = fmtTs(item.reviewed_at);
-      statusCell.appendChild(meta);
-      // 管理员审批通过行同样标注激活来源（区分两条激活路径）
-      var src = testAppSourceLabel(item);
-      if (src) {
-        meta.appendChild(document.createElement("br"));
-        meta.appendChild(document.createTextNode(src));
-      }
-    }
-    tr.appendChild(statusCell);
-    var cell = document.createElement("td");
-    cell.className = "adm-actions-cell";
-    if (item.status === "pending" && item.user_id) {
-      cell.appendChild(actionBtn("通过", function () {
-        askTestAppApprove(item);
-      }, "primary"));
-      cell.appendChild(actionBtn("拒绝", function () {
-        askConfirm($("adm-test-confirm"),
-          "确认拒绝 " + (item.email_normalized || item.user_id) +
-          " 的测试申请？该结果是终态，用户将收到结果邮件。",
-          function () { reviewTestApplication(item, "rejected", false); });
-      }, "danger-outline"));
-    }
-    tr.appendChild(cell);
-    tbody.appendChild(tr);
-  }
-
-  // 通过确认条（§3.3 页内二次确认；含「开通 AI 权限」勾选，默认勾）——
-  // askConfirm 只支持纯文案，这里按同一 DOM 纪律手搭：文案 + checkbox +
-  // 确认/取消按钮，确认按钮落焦点（新交互内容可达）。
-  function askTestAppApprove(item) {
-    var box = $("adm-test-confirm");
-    if (!box) return;
-    box.hidden = false;
-    box.textContent = "";
-    var msg = document.createElement("span");
-    msg.className = "adm-confirm-text";
-    msg.textContent = "确认通过 " + (item.email_normalized || item.user_id) +
-      " 的测试申请？账号将立即激活并按新用户默认总额度发放额度" +
-      "（终态，不可撤销）";
-    var check = document.createElement("label");
-    check.className = "adm-check";
-    var input = document.createElement("input");
-    input.type = "checkbox";
-    input.checked = true;
-    check.appendChild(input);
-    check.appendChild(document.createTextNode("开通 AI 权限"));
-    var ok = document.createElement("button");
-    ok.type = "button";
-    ok.className = "adm-btn-primary";
-    ok.textContent = "确认通过";
-    var cancel = document.createElement("button");
-    cancel.type = "button";
-    cancel.className = "adm-btn-secondary";
-    cancel.textContent = "取消";
-    ok.addEventListener("click", function () {
-      var aiAccess = input.checked;
-      clearConfirm(box);
-      reviewTestApplication(item, "approved", aiAccess);
-    });
-    cancel.addEventListener("click", function () { clearConfirm(box); });
-    box.appendChild(msg);
-    box.appendChild(check);
-    box.appendChild(ok);
-    box.appendChild(cancel);
-    if (ok.focus) ok.focus();
-  }
-
-  function reviewTestApplication(item, decision, aiAccess) {
-    var status = $("adm-test-list-status");
-    setStatus("adm-test-list-status", "提交中…");
-    request("admin.testApplications.review", {
-      user_id: item.user_id,
-      decision: decision,
-      ai_access: !!aiAccess,
-    }).then(function () {
-      hideError();
-      var who = item.email_normalized || item.user_id || "";
-      setStatus("adm-test-list-status", decision === "approved"
-        ? "已通过 " + who + " 的申请，账号已激活"
-        : "已拒绝 " + who + " 的申请");
-      loadTestApplications();
-    }).catch(function (err) {
-      if (err && err.code === "default_allowance_unconfigured") {
-        // 前置条件缺失：去设置页配置新用户默认总额度后再通过（服务端
-        // fail-closed，绝不无额度激活）
-        setStatus("adm-test-list-status",
-          "无法通过：请先在「设置」页配置新用户默认总额度，再执行通过操作");
-        return;
-      }
-      if (err && err.code === "already_reviewed") {
-        setStatus("adm-test-list-status",
-          "该申请已被处理（409），已刷新列表");
-        loadTestApplications();
-        return;
-      }
-      handleErr(err, status);
-    });
-  }
-
+  // 「测试申请」页整体退役（2026-10-09 round4 §2.3，docs/
+  // admin-viewer-round4-20261009.md）：SER-8（wip/ser8-dev）引入的
+  // admin.testApplications.list / review 桥方法不再使用——宿主桥三张表
+  // （权限/参数 schema/后端映射）已整行删除，请求按既有语义稳定回
+  // unknown_method；服务端 /api/admin/v1/test-applications* 410
+  // endpoint_retired。test_applications 表保留为历史（研究授权视图仍读取
+  // 其历史标记）；导航/页面/筛选/确认条/清单渲染/审核函数与监听已全部
+  // 移除，深链 #test-applications 归一回概览。
   // ------------------------------------------------------------------
   // 研究删除任务处置（2026-09-21，管理员最小处置入口）：
   //   - admin.researchDeletionJobs.list：GET /api/admin/v1/research-deletion-jobs
@@ -4196,7 +4030,6 @@
     else if (name === "users") loadUsers(false);
     else if (name === "slides") loadSlides(false);
     else if (name === "format-requests") loadFormatRequests(false);
-    else if (name === "test-applications") loadTestApplications();
     else if (name === "research-deletion") loadResearchDeletionJobs();
     else if (name === "settings") loadSettingsPage();
     else if (name === "billing") loadBillingPage();
@@ -4389,16 +4222,8 @@
       loadFormatRequests(false);
     });
     onClick("adm-format-more-btn", function () { loadFormatRequests(true); });
-    // 测试申请页（SER-8）：状态/方向过滤 + 刷新（审核动作在行内）
-    onClick("adm-test-search-btn", function () {
-      state.filters.testApp = {
-        status: $("adm-test-status") ? $("adm-test-status").value : "",
-        direction: $("adm-test-direction") ? $("adm-test-direction").value : "",
-      };
-      state.listSeq++;
-      loadTestApplications(false);
-    });
-    onClick("adm-test-refresh-btn", function () { loadTestApplications(false); });
+    // 2026-10-09（round4 §2.3）：测试申请页监听（adm-test-search-btn /
+    // adm-test-refresh-btn）已随页面退役整体移除。
     // 研究删除任务页（2026-09-21）：状态过滤 + 刷新（重新执行动作在行内）
     onClick("adm-rdel-search-btn", function () {
       state.filters.rdel = {

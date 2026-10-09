@@ -425,9 +425,10 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 			// 2026-09-14（W2 admin UI）：新增 formatRequests.list/get（格式申请
 			// 工单只读，users:read）与 formatRequests.patch（CAS 状态机写，
 			// users:write）——复用 users 权限域不扩域，33 → 36
-			// SER-8（wip/ser8-dev）：新增 testApplications.list（待激活申请
+			// SER-8（wip/ser8-dev）：曾新增 testApplications.list（待激活申请
 			// 只读，users:read）与 testApplications.review（审批写，原子激活
-			// + 额度 provisioning，users:write）——同域不扩域，36 → 38
+			// + 额度 provisioning，users:write）36 → 38；2026-10-09（round4
+			// §2.3）「测试申请」页退役——两方法整行删除，38 → 36
 			// 2026-09-19（R6，service-review-fix-plan-20260919.md §8）：手动建号
 			// 与身份冲突功能退役——users.create / users.identityConflicts /
 			// users.discardPending 整行删除，38 → 35
@@ -440,12 +441,12 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 			// setVisibility + invites.list/create/revoke）、增 4（users.
 			// setAccountKind、slides.startTemporaryView/endTemporaryView、
 			// viewer.open 只读宿主方法）——37 → 37
-			expect(Object.keys(table)).toHaveLength(37);
+			// 2026-10-09（round4 §2.3）：删 2（testApplications.list/review，
+			// 「测试申请」页退役）——37 → 35
+			expect(Object.keys(table)).toHaveLength(35);
 			expect(table["admin.formatRequests.list"]).toBe("admin:users:read");
 			expect(table["admin.formatRequests.get"]).toBe("admin:users:read");
 			expect(table["admin.formatRequests.patch"]).toBe("admin:users:write");
-			expect(table["admin.testApplications.list"]).toBe("admin:users:read");
-			expect(table["admin.testApplications.review"]).toBe("admin:users:write");
 			expect(table["admin.researchDeletionJobs.list"]).toBe("admin:users:read");
 			expect(table["admin.researchDeletionJobs.retry"]).toBe("admin:users:write");
 			expect(table["admin.settings.model"]).toBe("admin:settings:read");
@@ -505,6 +506,9 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 			expect(table["admin.invites.list"]).toBeUndefined();
 			expect(table["admin.invites.create"]).toBeUndefined();
 			expect(table["admin.invites.revoke"]).toBeUndefined();
+			// 2026-10-09（round4 §2.3）退役方法：「测试申请」两方法 → unknown_method
+			expect(table["admin.testApplications.list"]).toBeUndefined();
+			expect(table["admin.testApplications.review"]).toBeUndefined();
 		});
 
 	it("declares param schemas for every read method (whitelist + types)", () => {
@@ -530,8 +534,8 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 			"admin.settings.runtime.update",
 			// W2（2026-09-14）：格式申请工单（游标/页大小/状态枚举过滤）
 			"admin.formatRequests.list",
-			// SER-8：测试申请工单（状态/方向枚举过滤，均可空）
-			"admin.testApplications.list",
+			// 2026-10-09（round4 §2.3）：testApplications.list 的 schema 已随
+			//「测试申请」页退役删除（方法整体 unknown_method，无 schema 门）
 			// 2026-09-21：研究删除任务（状态枚举过滤 + 页大小，均可空）
 			"admin.researchDeletionJobs.list",
 		]) {

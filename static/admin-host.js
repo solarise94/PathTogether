@@ -51,6 +51,11 @@
    2026-09-14（W2 admin UI）：格式支持申请工单上桥——admin.formatRequests.
    list/get（users:read）与 patch（users:write，CAS 状态机），复用 users
    权限域不扩域；样本文件下载不经桥（iframe 消费不了 blob）。
+   2026-10-09（round4 §2.3，docs/admin-viewer-round4-20261009.md）：
+   admin.testApplications.list / review 整行删除（「测试申请」页退役，
+   同 R6/邀请退役语义）——已删方法按既有语义稳定回 unknown_method；
+   服务端 /api/admin/v1/test-applications* 410 endpoint_retired，
+   test_applications 表保留为历史。
    2026-09-19（R6，service-review-fix-plan-20260919.md §8）：手动建号与
    身份冲突功能整体退役——admin.users.create / admin.users.identityConflicts /
    admin.users.discardPending 三个方法整行删除（权限映射/参数 schema/
@@ -182,14 +187,12 @@
     "admin.formatRequests.list": "admin:users:read",
     "admin.formatRequests.get": "admin:users:read",
     "admin.formatRequests.patch": "admin:users:write",
-    // SER-8：测试申请工单（待激活用户审批）。list 只读 → admin:users:read；
-    // review 是状态机写（原子激活/拒绝 + 额度 provisioning + 结果邮件）→
-    // admin:users:write，与 formatRequests.patch 同域。
-    "admin.testApplications.list": "admin:users:read",
-    "admin.testApplications.review": "admin:users:write",
+    // 2026-10-09（round4 §2.3）：admin.testApplications.list / review 整行
+    // 删除（「测试申请」页退役）——已删方法不在本表 → 稳定 unknown_method；
+    // 研究授权视图仍读取 test_applications 历史标记，但不再有桥方法。
     // 研究删除任务管理员最小处置入口（终态 failed 的人工处置）：list 只读 →
     // admin:users:read；retry 是「复活为 pending 交 research_deletion_worker
-    // 真实清理」的写 → admin:users:write（同 testApplications 域不扩域）。
+    // 真实清理」的写 → admin:users:write（同域不扩域）。
     // 服务端**没有**也不允许有直接置 completed 的入口（completed 只能由
     // worker 清理成功产生）。
     "admin.researchDeletionJobs.list": "admin:users:read",
@@ -486,32 +489,8 @@
       required: ["request_id", "business_status", "expected_version"],
       additionalProperties: false,
     },
-    // SER-8：测试申请。list 过滤项均可空（空=全部）；review 必填
-    // user_id+decision，ai_access 缺省由服务端按 true 处理。
-    "admin.testApplications.list": {
-      properties: {
-        status: {
-          type: "string",
-          enum: ["pending", "approved", "rejected"],
-          nullable: true,
-        },
-        direction: {
-          type: "string",
-          enum: ["model_plant", "model_animal", "clinical_pathology", "other"],
-          nullable: true,
-        },
-      },
-      additionalProperties: false,
-    },
-    "admin.testApplications.review": {
-      properties: {
-        user_id: _userIdSpec,
-        decision: { type: "string", enum: ["approved", "rejected"] },
-        ai_access: { type: "boolean", nullable: true },
-      },
-      required: ["user_id", "decision"],
-      additionalProperties: false,
-    },
+    // 2026-10-09（round4 §2.3）：admin.testApplications.list / review 的
+    // schema 已随「测试申请」页退役删除（方法整体 unknown_method）。
     // 研究删除任务：status 枚举过滤可空（空=全部）；retry 必填 job_id
     // （pathId 防路径拼接，与 request_id 同规格）。
     "admin.researchDeletionJobs.list": {
@@ -1211,27 +1190,9 @@
       return jsonWrite(url, "PATCH", body)(ctx);
     },
 
-    // SER-8：测试申请工单。错误信封 {error:{code,message}} 由 backendError
-    // 原样透传（前端按 code 分流 default_allowance_unconfigured 等）。
-    "admin.testApplications.list": function (ctx, payload) {
-      var url = "/api/admin/v1/test-applications" + buildQuery({
-        status: payload.status, direction: payload.direction,
-      });
-      return ctx.fetchJson(url).then(function (res) {
-        if (!res.ok) throw backendError(url, res);
-        return res.body;
-      });
-    },
-
-    "admin.testApplications.review": function (ctx, payload) {
-      var url = "/api/admin/v1/test-applications/" +
-          pathId(payload.user_id, "user_id") + "/review";
-      var body = { decision: payload.decision };
-      if (payload.ai_access !== undefined && payload.ai_access !== null) {
-        body.ai_access = payload.ai_access;
-      }
-      return jsonWrite(url, "POST", body)(ctx);
-    },
+    // 2026-10-09（round4 §2.3）：admin.testApplications.list / review 的
+    // 后端映射已随「测试申请」页退役删除（服务端 /api/admin/v1/
+    // test-applications* 410 endpoint_retired；已删方法稳定 unknown_method）。
 
     // 研究删除任务处置（owner-only）。错误信封 {error:{code,message}} 由
     // backendError 透传（前端按 409 deletion_job_not_terminal 刷新列表）。

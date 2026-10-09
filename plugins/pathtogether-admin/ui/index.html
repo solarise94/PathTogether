@@ -52,8 +52,11 @@
     「格式申请」（2026-09-14 W2）= 格式支持申请工单：清单 + 状态机处置
     （submitted → reviewing → supported|declined，CAS 迁移 + admin_note）；
     样本只呈现元数据，不内嵌文件内容。
-    页面（10 页 IA）：概览 / 用户 / 切片 / 格式申请 / 测试申请 /
+    页面（9 页 IA）：概览 / 用户 / 切片 / 格式申请 /
     研究删除 / 设置 / 费用 / 插件 / 审计。
+    「测试申请」页已整体退役（2026-10-09 round4 §2.3）：admin.testApplications.*
+    桥方法删除（unknown_method），服务端路由 410；test_applications 表保留
+    为历史。
     「研究删除」（2026-09-21）= 研究副本删除任务的最小人工处置入口：
     终态 failed（重试耗尽）任务的清单 + 唯一动作「重新执行删除」（复活为
     pending 交 worker 真实清理；completed 只能由清理成功产生，绝无
@@ -63,10 +66,12 @@
       - 「邀请」页整体退役（注册只剩 closed/public；admin.invites.* 桥方法
         已删，服务端 /api/admin/v1/invites* 410）；注册模式只在设置页
         closed/public 两种可选；
-      - 用户页主表四列：用户（显示名+邮箱）/ 加入时间 / 最近登录 / 分类；
-        上方分类筛选（正式用户/Dogfood/全部，默认正式）与排序下拉；行内
-        「标为 Dogfood/改为正式」（admin.users.setAccountKind）+「详情」抽屉
-        （启停、AI 权限、密码重置、总额度、预览等现有操作全部收在抽屉）；
+      - 用户页主表六列（2026-10-09 round4 §2.2）：用户（显示名+邮箱）/
+        加入时间 / 最近登录 / 余额（剩余额度，同抽屉口径）/ 研究数据
+        （已授权/已撤回/未授权）/ 分类；上方分类筛选（正式用户/Dogfood/
+        全部，默认正式）与排序下拉；行内「标为 Dogfood/改为正式」
+        （admin.users.setAccountKind）+「详情」抽屉（启停、AI 权限、
+        密码重置、总额度、预览等现有操作全部收在抽屉）；
         未登录过显示「暂无记录」；
       - 切片页改为「用户上传的切片」：列 = 切片/上传者、加入时间、管理员
         临时查看、操作；临时查看五态（未开启/已结束/可查看·剩余 N 分钟/
@@ -99,7 +104,6 @@
         <button type="button" class="adm-nav-btn" data-page="users">用户</button>
         <button type="button" class="adm-nav-btn" data-page="slides">切片</button>
         <button type="button" class="adm-nav-btn" data-page="format-requests">格式申请</button>
-        <button type="button" class="adm-nav-btn" data-page="test-applications">测试申请</button>
         <button type="button" class="adm-nav-btn" data-page="research-deletion">研究删除</button>
         <button type="button" class="adm-nav-btn" data-page="settings">设置</button>
         <button type="button" class="adm-nav-btn" data-page="billing">费用</button>
@@ -194,15 +198,16 @@
           </section>
         </section>
 
-        <!-- 用户（2026-10-08 §2）：主表四列（显示名+邮箱 / 加入时间 /
-             最近登录 / 分类）+ 分类筛选（默认正式用户）与排序下拉；行内
-             「标为 Dogfood / 改为正式」；启停、AI 权限、密码重置、身份预览、
-             总额度等现有操作全部保留在「详情」抽屉 -->
+        <!-- 用户（2026-10-08 §2；2026-10-09 round4 §2.2）：主表六列
+             （显示名+邮箱 / 加入时间 / 最近登录 / 余额 / 研究数据 / 分类）+
+             分类筛选（默认正式用户）与排序下拉；行内「标为 Dogfood / 改为
+             正式」；启停、AI 权限、密码重置、身份预览、总额度等现有操作
+             全部保留在「详情」抽屉 -->
         <section class="adm-page" id="adm-page-users" hidden>
           <div class="adm-state" id="adm-state-users" data-page-state="idle" role="status" aria-live="polite"></div>
           <section class="adm-card">
             <h2>用户</h2>
-            <p class="adm-note">分类用于区分正式用户与内部测试（Dogfood）账号：标记不影响账号数据、额度与权限，随时可改回。启停、AI 权限、重置密码、身份预览与额度调整在「详情」抽屉。时间均为北京时间（GMT+8）；从未登录过的账号「最近登录」显示暂无记录。</p>
+            <p class="adm-note">分类用于区分正式用户与内部测试（Dogfood）账号：标记不影响账号数据、额度与权限，随时可改回。启停、AI 权限、重置密码、身份预览与额度调整在「详情」抽屉。时间均为北京时间（GMT+8）；从未登录过的账号「最近登录」显示暂无记录。「研究数据」列是该用户研究授权的当前状态：已授权 / 已撤回 / 未授权。</p>
             <div class="adm-filters" id="adm-users-filters">
               <div class="adm-kind-seg" id="adm-users-kind-seg" role="group" aria-label="分类筛选">
                 <button type="button" class="adm-kind-btn" data-kind="real" aria-pressed="true">正式用户</button>
@@ -225,6 +230,8 @@
                     <th>用户</th>
                     <th>加入时间</th>
                     <th>最近登录</th>
+                    <th>余额</th>
+                    <th>研究数据</th>
                     <th>分类</th>
                   </tr>
                 </thead>
@@ -330,67 +337,13 @@
           </section>
         </section>
 
-        <!-- 测试申请审核（SER-8，wip/ser8-dev）：已验证用户申请测试资格的
-             清单 + owner 审核。approved = 原子激活 + 默认额度 provisioning +
-             结果邮件（终态，不可撤销），走页内确认条（sandbox 无 allow-modals，
-             原生 confirm 被吞）+「开通 AI 权限」默认勾选；rejected 亦终态。
-             409 default_allowance_unconfigured 提示先去设置页配置新用户默认
-             总额度。activated_by_invite（R7）= 邀请码激活同事务收口的终态，
-             从待审任务移除、仅显示激活来源。渲染字段白名单 textContent
-             （同格式申请页纪律）。 -->
-        <section class="adm-page" id="adm-page-test-applications" hidden>
-          <div class="adm-state" id="adm-state-test-applications" data-page-state="idle" role="status" aria-live="polite"></div>
-          <section class="adm-card">
-            <h2>测试申请</h2>
-            <p class="adm-note">已验证邮箱的待激活用户在此申请测试资格：研究方向与自愿数据分享选择（分享与否不影响审批）。通过即激活账号并按新用户默认总额度发放额度（终态，不可撤销）；拒绝同样终态并邮件通知用户。通过前请先确认「设置」页已配置新用户默认总额度，否则无法发放。用户若凭邀请码直接激活，其申请会自动收口为「已通过邀请码激活」（非人工审批，无法再审核）。</p>
-            <div class="adm-filters" id="adm-test-filters">
-              <div class="adm-field">
-                <label class="adm-field-label" for="adm-test-status">状态</label>
-                <select id="adm-test-status">
-                  <option value="">全部</option>
-                  <option value="pending">待审核</option>
-                  <option value="approved">已通过</option>
-                  <option value="rejected">已拒绝</option>
-                  <option value="activated_by_invite">已通过邀请码激活</option>
-                </select>
-              </div>
-              <div class="adm-field">
-                <label class="adm-field-label" for="adm-test-direction">研究方向</label>
-                <select id="adm-test-direction">
-                  <option value="">全部</option>
-                  <option value="model_plant">模式植物</option>
-                  <option value="model_animal">模式动物</option>
-                  <option value="clinical_pathology">临床病理</option>
-                  <option value="other">其他</option>
-                </select>
-              </div>
-              <div class="adm-field adm-field--actions">
-                <button type="button" id="adm-test-search-btn" class="adm-btn-secondary">筛选</button>
-                <button type="button" id="adm-test-refresh-btn" class="adm-btn-secondary">刷新</button>
-              </div>
-            </div>
-            <div class="adm-table-wrap">
-              <table class="adm-table" id="adm-test-table">
-                <thead>
-                  <tr>
-                    <th>邮箱</th>
-                    <th class="adm-col-secondary">显示名</th>
-                    <th>研究方向</th>
-                    <th class="adm-col-secondary">数据分享</th>
-                    <th>申请时间</th>
-                    <th>状态</th>
-                    <th>操作</th>
-                  </tr>
-                </thead>
-                <tbody id="adm-test-tbody"></tbody>
-              </table>
-            </div>
-            <div class="adm-confirm" id="adm-test-confirm" hidden></div>
-            <div class="adm-pager">
-              <span id="adm-test-list-status" class="adm-status"></span>
-            </div>
-          </section>
-        </section>
+        <!-- 「测试申请」审核页已整体退役（2026-10-09 round4 §2.3，docs/
+             admin-viewer-round4-20261009.md）：admin.testApplications.list/
+             review 桥方法已删（宿主稳定 unknown_method），服务端
+             /api/admin/v1/test-applications* 410 endpoint_retired、
+             /admin/test-applications 宿主页重定向 /admin。
+             test_applications 表保留为历史（研究授权视图仍读取其历史标记）。
+             旧 /admin#test-applications 深链与 #invites 同规则归一回概览。 -->
 
         <!-- 研究删除任务处置（管理员最小处置入口）：终态 failed（重试耗尽、
              worker 停止自动重试）的研究副本删除任务的人工处置。唯一动作 =
@@ -399,7 +352,7 @@
              worker 清理成功产生，本页**没有**（也不允许有）「直接置
              completed」的操作。处置期间研究侧持续阻断（deletion_pending），
              与用户正常读片无关；本页不触碰研究数据本身。
-             渲染字段白名单 textContent（同格式申请/测试申请页纪律）。 -->
+             渲染字段白名单 textContent（同格式申请页纪律）。 -->
         <section class="adm-page" id="adm-page-research-deletion" hidden>
           <div class="adm-state" id="adm-state-research-deletion" data-page-state="idle" role="status" aria-live="polite"></div>
           <section class="adm-card">

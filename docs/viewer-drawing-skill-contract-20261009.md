@@ -458,11 +458,34 @@ COMMENT ON COLUMN run_grants.allow_ai_drawing IS
 新增（UI→后端字段即 §2.1）：
 - `@` 候选菜单：输入 `@` 弹出「描绘——圈出指定组织区域，生成待复核标记」；
   选中变可删除小标签；直接发送 `@描绘` 文本也合法（锚定在文本里）。
+  **UI 序列化约定（第 6 项）**：用户选中 @描绘 标签后，UI 把它序列化为 task
+  文本前缀 `@描绘 `（与 HP 显式锚定规则一致，判定无需特判标签字段）。
+- **skill_status SSE 事件（第 6 项，主代理追加；帧格式与 UI 实现
+  hp-skill-ui 548ed86 对齐）**：HP 在 runMain/continueMain preamble 判定后、
+  driveMain 开始前，经既有事件路径（bus.emit → events.jsonl → SSE 帧，与
+  tool_started/annotation_created 同一发送方式与字段命名风格）向该 session
+  事件流发出。**帧格式**：事件名在 `event:` 行、payload 为 `data:` JSON，
+  `type` 键**不进** data；走既有 `id:`/Last-Event-ID 游标（断线重放可见）；
+  **非终态事件**（后随 run 的正常事件照常）：
+  ```
+  event: skill_status
+  data: {"skill":"delineate","state":"assembled","intent":"explicit"}
+  ```
+  - 判定成立且 /skills 置位成功：`payload = {skill, state:"assembled",
+    intent:"explicit"|"natural"}`。
+  - 判定成立但不可用：`payload = {skill, state:"unavailable",
+    reason:"<稳定码>", message:"<中文简述>"}`，reason ∈ `readonly_profile`
+    （只读 profile，含 demo）| `platform_unsupported`（旧平台无 /skills）|
+    `skill_grant_failed`（置位失败）| `no_run_grant`（无 run grant）。
+    稳定码供 UI 分支；message 仅供展示。
+  - 判定 no（普通消息/否定/引用/元问题/dismissed）：**不发**。
+  - retry/dedup/resume 恢复路径不重判 → 不发新事件。
 - 发送前命中明确意图显示「描绘 · 本次」小标签，可删除；删除 → 本条消息
   `dismissed_skills=["delineate"]`（显式关闭记录，判定层强制 no）。
-- 状态文案：技能判定成立且装配后显示「正在描绘……」；完成显示
-  「已生成 N 个待复核标记」+ 定位入口（复用 `annotation_created` 事件的
-  annotation_id/geometry，tools.ts:2084）。
+- 状态文案：收到 `skill_status{state:"assembled"}` 且描绘工具执行中显示
+  「正在描绘……」；完成显示「已生成 N 个待复核标记」+ 定位入口（复用
+  `annotation_created` 事件的 annotation_id/geometry，tools.ts:2084）；
+  `state:"unavailable"` → 入口标注「暂不可用」并以 message 简述。
 - 不可用态：兼容矩阵任一不支持组合 → 候选菜单条目标注「暂不可用」并说明，
   不出现永久开启路径。
 - 模糊指代（多个框时「圈出这个」）：判定 ambiguous → 对话内追问目标范围，

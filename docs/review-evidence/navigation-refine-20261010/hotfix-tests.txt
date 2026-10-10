@@ -1,0 +1,10 @@
+
+ RUN  v3.2.7 /home/solarise/ZCodeProject/histopilot-suite/PathTogether/.gate-tmp/hp-hotfix-wt
+
+ ✓ |unit| test/http-client.test.ts (57 tests) 39ms
+ ✓ |unit| test/ai-drawing.test.ts (17 tests) 45ms
+
+ Test Files  2 passed (2)
+      Tests  74 passed (74)
+   Start at  16:53:57
+   Duration  752ms (transform 364ms, setup 0ms, collect 615ms, tests 84ms, environment 0ms, prepare 129ms)

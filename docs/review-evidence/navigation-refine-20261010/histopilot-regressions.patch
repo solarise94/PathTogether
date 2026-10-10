@@ -1,0 +1,55 @@
+diff --git a/test/ai-drawing-refine.test.ts b/test/ai-drawing-refine.test.ts
+index 9b45690..4fb9bcf 100644
+--- a/test/ai-drawing-refine.test.ts
++++ b/test/ai-drawing-refine.test.ts
+@@ -331,0 +332,27 @@ describe("draw_suspicious_region 的轮廓精修（viewer-skills）", () => {
++  it("Codex review: cancellation after refine resolves must still prevent annotate", async () => {
++    const h = await makeHarness(rootTmp);
++    const ac = new AbortController();
++    h.refine.abortOnCall = ac;
++    await snap(h);
++    await tool(h, "draw_suspicious_region").execute("cancel-resolved", {
++      label:"L", geometry:{type:"polygon",points:MODEL_TRIANGLE},
++    }, ac.signal).catch(() => {});
++    expect(h.annotateRequests).toHaveLength(0);
++  });
++
++  it("Codex review: refinement must use the snapshot rendering or skip unsupported context", async () => {
++    const h = await makeHarness(rootTmp);
++    h.ctx.renderContext = {
++      version:"multichannel-v1", assetRevision:slideInfo.fingerprint,
++      plane:{t:0,z:0}, activeChannels:[{index:0,color:"#00FFFF",alpha:1,black:0,white:100,gamma:1}],
++      fingerprint:"c".repeat(64),
++    };
++    await snap(h);
++    await tool(h, "draw_suspicious_region").execute("render-refine", {
++      label:"L", geometry:{type:"polygon",points:MODEL_TRIANGLE},
++    });
++    const forwarded = h.refine.calls[0]?.request as unknown as {renderContext?:{fingerprint:string}} | undefined;
++    expect(h.refine.calls.length === 0 || forwarded?.renderContext?.fingerprint === "c".repeat(64),
++      "do not silently refine a multichannel snapshot using the default image").toBe(true);
++  });
++
+diff --git a/test/tools.test.ts b/test/tools.test.ts
+index d9d45b7..35edcad 100644
+--- a/test/tools.test.ts
++++ b/test/tools.test.ts
+@@ -1145,0 +1146,18 @@ describe("G2 — snapshot 捕获通道语义快照", () => {
++
++
++describe("Codex review: current snapshot identity across runs", () => {
++  it("refreshes a same-position goto when the channel context changes", async () => {
++    const h = await makeHarness();
++    const before = {
++      version: "multichannel-v1" as const, assetRevision: FINGERPRINT,
++      plane: {t:0,z:0}, activeChannels: [{index:0,color:"#00FFFF",alpha:1,black:0,white:100,gamma:1}],
++      fingerprint: "c".repeat(64),
++    };
++    h.ctx.renderContext = before;
++    await tool(h, "goto").execute("old-context", {x:5000,y:4000,level:1});
++    h.ctx.renderContext = {...before, fingerprint:"d".repeat(64), activeChannels:[{...before.activeChannels[0],color:"#FF0000"}]};
++    const r = await tool(h, "goto").execute("new-context", {x:5000,y:4000,level:1});
++    expect(r.content.some(c => c.type === "image"), "new channel rendering needs a new snapshot").toBe(true);
++    expect((await h.store.readSession(h.sessionId))?.pending_snapshot_review?.image_ref.render_context?.fingerprint).toBe("d".repeat(64));
++  });
++});

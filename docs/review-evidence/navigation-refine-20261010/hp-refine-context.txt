@@ -1,0 +1,42 @@
+
+ RUN  v3.2.7 /home/solarise/ZCodeProject/histopilot-suite/PathTogether/.gate-tmp/hp-codex-refine-review-wt
+
+ ❯ |unit| test/ai-drawing-refine.test.ts (10 tests | 1 failed | 9 skipped) 17ms
+   ↓ draw_suspicious_region 的轮廓精修（viewer-skills） > refined 且点列合法 → 写精修点列 + contour_refine 溯源（含 original_points）+ 文案说明细化
+   ↓ draw_suspicious_region 的轮廓精修（viewer-skills） > refined:false → 保留模型点列；溯源无 original_points；文案带未采纳短语（边界不清晰）
+   ↓ draw_suspicious_region 的轮廓精修（viewer-skills） > 细化服务未启用（unavailable）→ 写模型点列，溯源照记，文案不提细化
+   ↓ draw_suspicious_region 的轮廓精修（viewer-skills） > refine 意外抛错 → 保留模型点列，写入照常发生（reason=service_error）
+   ↓ draw_suspicious_region 的轮廓精修（viewer-skills） > 精修点列越出当前快照 → 回退模型点列（reason=refined_invalid）
+   ↓ draw_suspicious_region 的轮廓精修（viewer-skills） > 客户端无 refineContour → 无 contour_refine 溯源键，行为与从前完全一致
+   ↓ draw_suspicious_region 的轮廓精修（viewer-skills） > refine 期间 run 取消（loopSignal abort）→ 重抛且不写
+   ↓ draw_suspicious_region 的轮廓精修（viewer-skills） > contourRefineNotAppliedPhrase：平台原因词表映射
+   ↓ draw_suspicious_region 的轮廓精修（viewer-skills） > Codex review: cancellation after refine resolves must still prevent annotate
+   × draw_suspicious_region 的轮廓精修（viewer-skills） > Codex review: refinement must use the snapshot rendering or skip unsupported context 15ms
+     → do not silently refine a multichannel snapshot using the default image: expected false to be true // Object.is equality
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |unit| test/ai-drawing-refine.test.ts > draw_suspicious_region 的轮廓精修（viewer-skills） > Codex review: refinement must use the snapshot rendering or skip unsupported context
+AssertionError: do not silently refine a multichannel snapshot using the default image: expected false to be true // Object.is equality
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ test/ai-drawing-refine.test.ts:356:81
+    354|     const forwarded = h.refine.calls[0]?.request as unknown as {render…
+    355|     expect(h.refine.calls.length === 0 || forwarded?.renderContext?.fi…
+    356|       "do not silently refine a multichannel snapshot using the defaul…
+       |                                                                                 ^
+    357|   });
+    358|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 9 skipped (10)
+   Start at  16:54:19
+   Duration  671ms (transform 269ms, setup 0ms, collect 444ms, tests 17ms, environment 0ms, prepare 57ms)

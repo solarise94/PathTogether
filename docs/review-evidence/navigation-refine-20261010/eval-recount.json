@@ -1,0 +1,46 @@
+[
+  {
+    "run": "out-r3",
+    "recorded_at": "2026-10-10T03:46:47.688Z",
+    "cases": 14,
+    "passed": 14,
+    "model_calls": 465,
+    "model_calls_median": 34.0,
+    "tools": 471,
+    "tools_median": 34.0,
+    "tokens": 2313431,
+    "seconds_median": 108.0,
+    "nonfinished_cases": [
+      "draw-ducts",
+      "draw-identify",
+      "no-dont",
+      "no-selection-question"
+    ]
+  },
+  {
+    "run": "out-a1",
+    "recorded_at": "2026-10-10T06:08:32.823Z",
+    "cases": 14,
+    "passed": 13,
+    "model_calls": 196,
+    "model_calls_median": 10.5,
+    "tools": 222,
+    "tools_median": 12.0,
+    "tokens": 1925991,
+    "seconds_median": 69.0,
+    "nonfinished_cases": []
+  },
+  {
+    "run": "out-b1",
+    "recorded_at": "2026-10-10T06:49:31.105Z",
+    "cases": 14,
+    "passed": 14,
+    "model_calls": 172,
+    "model_calls_median": 9.5,
+    "tools": 190,
+    "tools_median": 10.5,
+    "tokens": 1694583,
+    "seconds_median": 78.5,
+    "nonfinished_cases": []
+  }
+]

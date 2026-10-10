@@ -1334,6 +1334,154 @@ def test_skill_provenance_accepts_model_intent():
         {"skill": "delineate", "skill_intent": "vibes"})
     assert err
 
+
+# =========================================================================== #
+# viewer-skills：轮廓精修溯源（contour_refine，仅 polygon/freehand 路径）
+# =========================================================================== #
+def _contour_refine(**overrides):
+    """合法 contour_refine（refined=true 全字段；overrides 直接覆盖键）。"""
+    obj = {
+        "refined": True,
+        "model": "sam2.1",
+        "score": 0.92,
+        "area_ratio": 0.81,
+        "reason": None,
+        "original_points": TRIANGLE,
+    }
+    obj.update(overrides)
+    return obj
+
+
+def test_contour_refine_parser_shapes():
+    """解析器直测：合法形状清洗 + 每类畸形（含 iff 双向与 bool 坐标拒绝）。"""
+    prov, err = app_mod._parse_contour_refine_provenance(
+        {"contour_refine": _contour_refine()})
+    assert err is None
+    assert prov == {"refined": True, "model": "sam2.1", "score": 0.92,
+                    "area_ratio": 0.81, "reason": None,
+                    "original_points": TRIANGLE}
+    # 缺省（不携带）→ 空 dict；显式 null 值键原样保留（缺省键不持久化）。
+    prov, err = app_mod._parse_contour_refine_provenance({})
+    assert err is None and prov == {}
+    prov, err = app_mod._parse_contour_refine_provenance(
+        {"contour_refine": _contour_refine(score=None, area_ratio=None,
+                                           model=None, reason=None)})
+    assert err is None and prov == {"refined": True, "model": None,
+                                    "score": None, "area_ratio": None,
+                                    "reason": None,
+                                    "original_points": TRIANGLE}
+    # 畸形清单（一律 err）。
+    bad = [
+        {"contour_refine": [1, 2]},                              # 非对象
+        {"contour_refine": {"model": "sam2.1"}},                 # 缺 refined
+        {"contour_refine": {"refined": "true"}},                 # 非 bool
+        {"contour_refine": _contour_refine(extra=1)},            # 未知键
+        {"contour_refine": _contour_refine(model="m" * 65)},     # model >64
+        {"contour_refine": _contour_refine(model=7)},            # model 非 str
+        {"contour_refine": _contour_refine(score=True)},         # score bool
+        {"contour_refine": _contour_refine(score="0.9")},        # score str
+        {"contour_refine": _contour_refine(area_ratio=float("nan"))},   # NaN
+        {"contour_refine": _contour_refine(area_ratio=float("inf"))},   # Inf
+        {"contour_refine": _contour_refine(reason="r" * 33)},    # reason >32
+        {"contour_refine": {k: v for k, v in _contour_refine().items()
+                            if k != "original_points"}},         # refined 缺原点列
+        {"contour_refine": _contour_refine(original_points=[[1, 1], [2, 2]])},  # <3 点
+        {"contour_refine": _contour_refine(
+            original_points=[[1, 1], [2, "x"], [3, 3]])},        # 字符串坐标
+        {"contour_refine": _contour_refine(
+            original_points=[[1, True], [2, 2], [3, 3]])},       # bool 坐标
+        {"contour_refine": {"refined": False,
+                            "original_points": TRIANGLE}},       # iff 反向
+    ]
+    for body in bad:
+        _, err = app_mod._parse_contour_refine_provenance(body)
+        assert err, body
+
+
+def test_contour_refine_provenance_persisted(monkeypatch):
+    """refined=true：清洗后逐键持久化进 ROI provenance（original_points 对照审计）。"""
+    _touch()
+    _mock_plugin_channel(monkeypatch, valid=True)
+    c = app_mod.app.test_client()
+    r = _post_polygon(c, **_snap_prov(), contour_refine=_contour_refine())
+    assert r.status_code == 200, r.get_data(as_text=True)
+    prov = r.get_json()["provenance"]
+    assert prov["contour_refine"] == {
+        "refined": True, "model": "sam2.1", "score": 0.92,
+        "area_ratio": 0.81, "reason": None, "original_points": TRIANGLE,
+    }
+    stored = share_store.get_roi(share_store.ADMIN_TOKEN, 0)
+    assert stored["provenance"]["contour_refine"]["original_points"] == TRIANGLE
+
+
+def test_contour_refine_provenance_not_refined_persisted(monkeypatch):
+    """refined=false：无 original_points；model/score/reason 仍持久化。"""
+    _touch()
+    _mock_plugin_channel(monkeypatch, valid=True)
+    c = app_mod.app.test_client()
+    r = _post_polygon(c, **_snap_prov(), contour_refine={
+        "refined": False, "model": "sam2.1", "score": 0.21,
+        "area_ratio": None, "reason": "low_score",
+    })
+    assert r.status_code == 200, r.get_data(as_text=True)
+    prov = r.get_json()["provenance"]["contour_refine"]
+    assert prov == {"refined": False, "model": "sam2.1", "score": 0.21,
+                    "area_ratio": None, "reason": "low_score"}
+    assert "original_points" not in prov  # iff：refined=false 不携带原点列
+
+
+def test_contour_refine_malformed_rejected_400(monkeypatch):
+    """端到端：畸形 contour_refine → 400 invalid_request，不落库。"""
+    _touch()
+    _mock_plugin_channel(monkeypatch, valid=True)
+    c = app_mod.app.test_client()
+    cases = [
+        {"refined": True},                                    # 缺 original_points
+        {"refined": True, "original_points": [[1, 1], [2, 2]]},  # 点数不足
+        {"refined": "yes"},                                   # 非 bool
+        {"refined": False, "original_points": TRIANGLE},      # iff 反向
+        {"refined": True, "original_points": TRIANGLE, "extra": 1},  # 未知键
+        {"refined": True, "original_points": TRIANGLE, "score": "high"},  # str
+    ]
+    for i, cr in enumerate(cases):
+        r = _post_polygon(c, **_snap_prov(), contour_refine=cr,
+                          effect_key="ek-crefine-bad-%d" % i)
+        assert r.status_code == 400, (cr, r.get_data(as_text=True))
+        assert r.get_json()["error"]["code"] == "invalid_request"
+        assert "contour_refine" in r.get_json()["error"]["message"]
+    assert _no_rois()
+
+
+def test_contour_refine_ignored_on_rect_path(monkeypatch):
+    """矩形路径与 skill 字段同待遇：contour_refine 不解析、静默忽略（200，
+    不持久化该键——矩形描绘不经精修）。"""
+    _touch()
+    _mock_plugin_channel(monkeypatch, valid=True)
+    c = app_mod.app.test_client()
+    r = c.post("/api/plugin/v1/slides/demo.svs/annotations", json={
+        "label": "AI-rect", "x": 5, "y": 5, "width_px": 220, "height_px": 90,
+        "effect_key": "ek-rect-crefine", "session_id": "sess1",
+        "contour_refine": _contour_refine(),
+    }, headers={"X-Run-Grant": "g1"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert "contour_refine" not in r.get_json()["provenance"]
+
+
+def test_internal_channel_contour_refine(monkeypatch):
+    """legacy internal 通道同解析器：合法持久化；畸形 400 不落库。"""
+    _touch()
+    _mock_internal_channel(monkeypatch)
+    _make_internal_drawing_grant("sess-int-1", flagged=True)
+    c = app_mod.app.test_client()
+    r = _post_internal_polygon(c, effect_key="ek-int-crefine-1",
+                               contour_refine=_contour_refine())
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert r.get_json()["provenance"]["contour_refine"]["refined"] is True
+    r2 = _post_internal_polygon(c, effect_key="ek-int-crefine-2",
+                                contour_refine={"refined": True})
+    assert r2.status_code == 400
+    assert "contour_refine" in r2.get_json()["error"]
+
 def test_skills_endpoint_installation_mismatch(monkeypatch):
     """身份隔离：installation 不符 → 403，列保持 false（零副作用）。"""
     _touch()

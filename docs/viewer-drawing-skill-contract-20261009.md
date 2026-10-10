@@ -1,10 +1,35 @@
 # AI 描绘改按需技能：跨仓服务端契约（已批准 + 主代理裁决修订）
 
 日期：2026-10-09（2026-10-10 两次修订）。状态：**契约 d19e6a9e 已批准；本文含主代理裁决修订（§0.4）
-与 2026-10-10 修订（§0.5、§0.6，§0.6 最优先）**。
+与 2026-10-10 修订（§0.5–§0.7，编号越大越优先）**。
 上游设计：`docs/viewer-interaction-skills-review-design-20261009.md` §5 / R6 / §7-E、F。
 基线：PathTogether `5328fefc`（vi-skill）；HistoPilot `23e89fa`（release/hp-0.3.5）。
 行号对应该两基线，实施后以函数名定位。
+
+## 0.7 修订（2026-10-10 第三次）：goto 即取景；描绘轮廓经 SAM2 细化
+
+用户批准按真实模型评测的两条构架建议实施，并提出「移动和获取快照合并，快照是移动的反馈」。
+
+1. **goto 移动并回传该视野快照**，取代 goto → snapshot → complete_snapshot_review 三步。模型工具集：
+   可写 run = goto / mark_observation / create_annotation /（可写时）draw_suspicious_region / finish；
+   只读 Demo = goto / mark_observation / finish。`snapshot`、`complete_snapshot_review` 不再提供，名字保留
+   不许 extra tools 占用。会话字段 `pending_snapshot_review` 形状不变，含义改为「当前快照」= 最近一次
+   goto 的取景；新取景先发 `snapshot_reviewed{disposition:"auto", auto:true}` 关闭旧快照（UI 不出卡片），
+   当前快照跨轮保留。描绘/矩形/观察仍以当前快照校验，§4 写入口执法不变。
+2. **轮廓细化端点** `POST /api/plugin/v1/slides/{by-id/<slide_id>|<slide>}/contours/refine`：与 `/regions`
+   同 scope（`region:read`）与 run grant 闸。body `{points: level-0 [[x,y]…] 3–500, expected_fingerprint?}`。
+   PT 读外扩 crop（长边 ≤1024，PNG），调 `CONTOUR_REFINE_URL/v1/refine`（可选 `CONTOUR_REFINE_TOKEN`，
+   超时 `CONTOUR_REFINE_TIMEOUT_S` 默认 8 s），回 `{refined, points|null, score, area_ratio, model, reason,
+   seconds}`；服务未配置、出错、超时一律 200 `refined:false`（reason `unavailable` / `service_error`），
+   请求非法 400，指纹不符 409。
+3. **细化服务** `services/contour-refine`（SAM2.1 hiera-b+，GPU 优先）：以模型多边形外接框提示，掩膜限制在
+   模型多边形外扩约 10% 的范围内，取最大连通域；score ≥ 0.75 且面积比 0.3–1.3 才采纳，否则
+   `low_score` / `area_ratio` / `empty_mask` / `too_few_points`。权重挂载，不打进镜像。
+4. **HP 描绘写入**：模型点列过全部校验后调细化；细化点列须再过同一套校验（点数、简单多边形、切片与当前
+   快照范围）才写入，否则写模型点列（`refined_invalid`）。取消照常中止且不写。
+5. **溯源**：点列写入可带 `contour_refine`：`{refined, model, score, area_ratio, reason, original_points}`，
+   `original_points` 当且仅当 refined=true 时必带；未知键、畸形一律 400 不落库；矩形路径忽略该字段。
+6. **兼容**：旧 PT（无端点）→ HP 视为 `unavailable`，照写模型点列；旧 HP + 新 PT 不受影响。
 
 ## 0.6 修订（2026-10-10 第二次）：描绘随 run grant 默认发放；坐标改 level-0；真实模型验收
 
@@ -23,7 +48,8 @@
 4. **工具说明**只写环境事实：结果写入这张切片的标注库、所有能看这张切片的人可见、是待复核标记、
    写入不再经用户确认；用户只问怎么圈或假设性提问时文字回答即可。系统提示去掉「确认并标注」的主动落标诱导，
    改为「看哪里、看多细由用户的问题决定」。
-5. **来源**：`drawing_intent` / provenance `skill_intent` 取值 `default | explicit | model | natural`。
+5. **来源**：`run_grants.drawing_intent` 取值 `default | explicit | model | natural`；描绘写入的 provenance
+   `skill_intent` 仍只接受 `explicit | model`（兼容 `natural`）。
 6. **真实模型验收**（DeepSeek-V4.1-Flash，2026-10-10；真实 PT + PostgreSQL 副本 + 真实切片 + 真实
    AgentRunner；结果与叠加图见实现证据文档 §8）：最终版本 14/14 单次通过；提问类「如何圈出腺体？」重复
    4 次 2 次仍会「演示性」描绘，未承诺消除。

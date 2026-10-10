@@ -2630,6 +2630,76 @@ def _parse_skill_provenance(body):
     return out, None
 
 
+def _parse_contour_refine_provenance(body):
+    """描绘写请求的轮廓精修溯源字段（viewer-skills，可选 additive）。
+
+    ``contour_refine``：本次描绘写入前调用过 contours/refine 时携带（HP 侧
+    draw_suspicious_region 注入）。矩形 create_annotation 不携带——与 skill
+    字段同待遇：矩形路径不解析本字段，静默忽略（不拒绝）。给出即校验形态
+    （畸形 → err，调用方一律 400 invalid_request，不落库不把垃圾持久化）：
+
+      - ``refined``：bool 必填（写入点列是否为精修结果）；
+      - ``model``：str ≤64 或 null（显式 null 原样持久化；缺省键不持久化）；
+      - ``score`` / ``area_ratio``：有限数值或 null（bool 拒绝）；
+      - ``reason``：str ≤32 或 null；
+      - ``original_points``：**当且仅当** refined=true 时必填——3..500 个
+        [x,y] 有限数值点（bool 拒绝；模型原始轮廓，对照审计用）；
+      - 未知键一律拒绝。
+
+    授权不依赖本字段（run grant / allow_ai_drawing 闸门不变）；它只标注
+    「写入轮廓经过了精修」。返回 (dict, err)：dict 为清洗后的
+    provenance["contour_refine"] 值（缺省 {} = 不持久化该键；显式给出的
+    null 值键保留——HP 发送侧五键恒发，持久化形状稳定可审计）。
+    """
+    raw = body.get("contour_refine")
+    if raw is None:
+        return {}, None
+    if not isinstance(raw, dict):
+        return None, "contour_refine 需为对象"
+    unknown = set(raw) - {"refined", "model", "score", "area_ratio",
+                          "reason", "original_points"}
+    if unknown:
+        return None, "contour_refine 含未知键：%s" % ",".join(sorted(unknown))
+    refined = raw.get("refined")
+    if not isinstance(refined, bool):
+        return None, "contour_refine.refined 需为布尔（必填）"
+    out = {"refined": refined}
+    if "model" in raw:
+        model = raw["model"]
+        if model is not None and (not isinstance(model, str) or not model
+                                  or len(model) > 64):
+            return None, "contour_refine.model 需为 ≤64 字符的非空字符串或 null"
+        out["model"] = model
+    for key in ("score", "area_ratio"):
+        if key not in raw:
+            continue
+        v = raw[key]
+        if v is not None:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(v):
+                return None, "contour_refine.%s 需为有限数值或 null" % key
+            v = float(v)
+        out[key] = v
+    if "reason" in raw:
+        reason = raw["reason"]
+        if reason is not None and (not isinstance(reason, str) or not reason
+                                   or len(reason) > 32):
+            return None, "contour_refine.reason 需为 ≤32 字符的非空字符串或 null"
+        out["reason"] = reason
+    original = raw.get("original_points")
+    if refined:
+        if original is None:
+            return None, ("contour_refine.refined=true 必须携带 original_points"
+                          "（模型原始轮廓，对照审计）")
+        points_err = _plugin_validate_level0_points(original)
+        if points_err is not None:
+            return None, "contour_refine.original_points 非法：%s" % points_err
+        out["original_points"] = [list(p) for p in original]
+    elif original is not None:
+        return None, "contour_refine.refined=false 不得携带 original_points"
+    return out, None
+
+
 # --------------------------------------------------------------------------- #
 # P1-3（二轮 review）：来源快照 provenance 权威归属验证
 # --------------------------------------------------------------------------- #
@@ -18266,6 +18336,7 @@ def internal_ai_annotate():
     points_norm = None
     snap_prov = {}
     skill_prov = {}
+    refine_prov = {}
     if body_type in ("polygon", "freehand"):
         # 描绘技能闸门（0082 / 契约 §4.2，裁决 2/3）：legacy internal 通道同
         # 样以 run grant 复查——按 session+slide 查活跃（未撤/未过期）且
@@ -18305,6 +18376,11 @@ def internal_ai_annotate():
         skill_prov, skill_perr = _parse_skill_provenance(body)
         if skill_perr is not None:
             return jsonify(error=skill_perr, code="invalid_request"), 400
+        # viewer-skills（轮廓精修溯源）：可选 additive，仅点列路径（矩形路径
+        # 与 skill 字段同待遇——不解析、静默忽略）。
+        refine_prov, refine_perr = _parse_contour_refine_provenance(body)
+        if refine_perr is not None:
+            return jsonify(error=refine_perr, code="invalid_request"), 400
 
     if points_norm is None:
         x = _parse_num("x")
@@ -18359,6 +18435,9 @@ def internal_ai_annotate():
         provenance.update(prov_persist)
     if skill_prov:
         provenance.update(skill_prov)
+    # viewer-skills：轮廓精修溯源以嵌套对象整体持久化（不摊平）。
+    if refine_prov:
+        provenance["contour_refine"] = refine_prov
     try:
         if points_norm is not None:
             # H（AI 描绘）点列落库：source="ai" → review_status 默认 pending
@@ -19689,6 +19768,7 @@ def plugin_v1_annotate(slide, _by_id=False):
     # run grant（绑定 session）+ grant 的 allow_ai_drawing 列（0082）双重把关。
     points_norm = None
     skill_prov = {}
+    refine_prov = {}
     if body_type in ("polygon", "freehand"):
         # P1-5（review-2026-09-07）：来源快照溯源。描绘必须可追溯到模型看到
         # 的那张快照——polygon 缺 snapshot_id 直接 400（不落库，不给静默降级）；
@@ -19715,6 +19795,11 @@ def plugin_v1_annotate(slide, _by_id=False):
         skill_prov, skill_perr = _parse_skill_provenance(body)
         if skill_perr is not None:
             return _plugin_error(400, "invalid_request", skill_perr)
+        # viewer-skills（轮廓精修溯源）：可选 additive，仅点列路径（矩形路径与
+        # skill 字段同待遇——不解析、静默忽略）。
+        refine_prov, refine_perr = _parse_contour_refine_provenance(body)
+        if refine_perr is not None:
+            return _plugin_error(400, "invalid_request", refine_perr)
     else:
         snap_prov = {}
 
@@ -19776,6 +19861,10 @@ def plugin_v1_annotate(slide, _by_id=False):
         provenance.update(prov_persist)
     if skill_prov:
         provenance.update(skill_prov)
+    # viewer-skills：轮廓精修溯源以嵌套对象整体持久化（不摊平——refined/
+    # model 等键名与顶层 provenance 语义冲突）。
+    if refine_prov:
+        provenance["contour_refine"] = refine_prov
     try:
         if points_norm is not None:
             # H（AI 描绘）点列落库：source="ai" → review_status 默认 pending

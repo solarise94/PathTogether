@@ -197,7 +197,7 @@ PT 子分支：`vi-chrome` 8d46e7c8（A 标题整栏拖动 + B 无黑幕交接�
 只告诉我这是什么组织」这样的简单问题）。每看一眼视野要 goto + snapshot + complete_snapshot_review 三次调用，
 合计占全部工具调用的 77%（其中 complete_snapshot_review 单独占 23%）。
 
-### 8.5 构架建议（未实施，供决策）
+### 8.5 构架建议（已获批，实施见 §9）
 
 1. **成本优先于描绘本身**：读片协议的「每张快照必须 complete_snapshot_review 关闭」使每次观察多一轮调用，
    简单问题也会走满 50 步。建议把关闭动作并进下一次 goto/snapshot（或允许 snapshot 带处置参数），并让模型
@@ -222,3 +222,56 @@ PT 子分支：`vi-chrome` 8d46e7c8（A 标题整栏拖动 + B 无黑幕交接�
 | PT 全量 pytest（TMPDIR 指大盘，plugins/ 无 HP bundle） | 2988 passed / 113 skipped（33 分钟；收尾时测试用 PostgreSQL 关闭超时被强杀，非用例失败） |
 
 PT 前端与 Playwright 本轮未重跑：本轮 PT 改动只在 `share_store_pg.py`、0082 迁移注释/默认值与测试，没有前端改动。
+
+## 9. 构架优化：goto 即取景 + SAM2 轮廓细化（2026-10-10，子代理实现、主代理审查）
+
+契约见 `viewer-drawing-skill-contract-20261009.md` §0.7。提交：HP `cceaa7a`（goto 即取景）、`906e35f`（描绘细化接线）；
+PT `22869591`（细化服务与端点）及本节所在提交（溯源字段）。
+
+### 9.1 离线原型：选哪种分割模型
+
+在 r2/r3 真实模型画出的 35 处区域上，用模型多边形外接框提示三种模型（CPU）：
+
+| 模型 | 单次耗时（CPU） | 结果 |
+| --- | --- | --- |
+| SAM2.1 hiera-b+ | ≈1.8 s | 导管沿上皮外缘贴合；矩形提示也能收成准确轮廓；肌束沿边界 |
+| SAM ViT-B | ≈4.4 s | 导管同样准确，肌束只取一部分 |
+| MedSAM ViT-B | ≈3.3 s | 常只分割上皮、不含管腔，肌束失败——不适合「圈出导管」 |
+
+选 SAM2。纯靠 SAM2 时，没有清晰结构的弥漫区域（间质框）会给出乱绕的形状，因此加门控：掩膜限制在模型多边形
+外扩约 10% 内，score ≥ 0.75 且面积比 0.3–1.3 才采纳。35 处中采纳 28 处；未采纳的 7 处为弥漫区域和一处
+SAM2 置信偏低的导管，均保留模型原轮廓。
+
+### 9.2 真实模型对比（DeepSeek-V4.1-Flash，同一 14 例，独占切片副本）
+
+| 版本 | 通过 | 工具调用合计 | 中位调用/例 | 触 50 步上限 | token 合计 |
+| --- | --- | --- | --- | --- | --- |
+| r3：三步导航 | 14/14 | 465 | 38 | 4 | 2.31M |
+| a1：goto 即取景 | 13/14 | 196 | 11 | 0 | 1.93M |
+| b1：goto 即取景 + SAM2 细化（本地 CPU 服务） | 14/14 | 172 | 11 | 0 | 1.69M |
+
+- token 只降约 17–27%：看图次数没减，每次 goto 仍带一张图；省下的是 snapshot 与关闭步骤的调用和往返。
+- a1 的唯一失败是「这里是什么组织」时模型主动给一处结构落了待复核矩形（系统提示允许主动落标）；r3 同例走满
+  50 步暂停，没走到落标那一步。b1 同例未落标。属模型自主行为的方差，不是描绘意图判断问题。
+- b1 的 10 个多边形全部被细化采纳。叠加图：两处导管贴上皮外缘；肌束沿边界；上方一处导管因模型给的粗轮廓
+  偏大，细化结果带进了旁边一块间质（仍在门控范围内）。矩形标注不细化。
+- b1 中位耗时比 a1 长（107 s vs 78 s），主要是本地 CPU 推理每处约 2–4 s 与运行方差；生产 GPU 上单次推理
+  预计在 0.2 s 内（未实测）。
+
+### 9.3 上线所需（未做，需用户批准）
+
+- homepc 已具备 RTX 2080 Ti（22 GB）与 podman NVIDIA CDI。需：构建 `services/contour-refine` 镜像（Containerfile
+  未实际构建过）、放置权重 `sam2.1_hiera_base_plus.pt`（约 309 MB）并只读挂载、`--device nvidia.com/gpu=all`
+  启动、PT 配 `CONTOUR_REFINE_URL`（建议同时配 `CONTOUR_REFINE_TOKEN`）。
+- 不配 `CONTOUR_REFINE_URL` 时功能自动关闭，描绘照旧写模型轮廓，可先随 PT/HP 上线再单独开。
+- 细化端点未加 `/regions` 那样的像素预算/并发 429 闸；crop 长边结构上 ≤1024，服务侧推理串行。
+
+### 9.4 门禁（2026-10-10）
+
+| 门禁 | 结果 |
+| --- | --- |
+| HP `npm test` | 80 files / 1529 passed |
+| HP `tsc -p tsconfig.build.json --noEmit` | 通过 |
+| HP `npm run test:contract`（真实 PT；含 refine 端点与 contour_refine 落库） | 51 passed |
+| 细化服务 `services/contour-refine/tests`（seg-venv，含真实 SAM2 冒烟） | 16 passed |
+| PT 全量 pytest（plugins/ 无 HP bundle） | 3020 passed / 113 skipped（30 分钟；收尾 PostgreSQL 关闭超时被强杀，非用例失败） |

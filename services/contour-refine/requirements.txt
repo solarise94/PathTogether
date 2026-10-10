@@ -1,0 +1,8 @@
+# torch / torchvision 由容器基础镜像（pytorch/pytorch:*-cuda*-runtime）提供，
+# 不要在此固定版本（避免在镜像内重装覆盖 CUDA 构建）。CPU 本地运行自行安装。
+flask>=3.0,<4
+gunicorn>=21.2,<24
+numpy>=1.26
+opencv-python-headless>=4.9
+pillow>=10.0
+sam2 @ git+https://github.com/facebookresearch/sam2.git

@@ -72,6 +72,9 @@ PathTogether 容器只运行平台。HistoPilot 使用自己的镜像、进程�
 | `BOOTSTRAP_OWNER_PASSWORD_FILE` | — | 空库首建 owner 的 secret 文件路径 |
 | `HISTOPILOT_URL` | `http://127.0.0.1:8055` | HistoPilot 兼容网关目标；仅安装插件时需要 |
 | `HISTOPILOT_INTERNAL_TOKEN` | 自动生成 | PathTogether 与 HistoPilot 的服务间令牌 |
+| `CONTOUR_REFINE_URL` | 未设置 | contour-refine 服务地址（`services/contour-refine`，SAM2 轮廓精修）；未设置时插件端点 `/contours/refine` 返回 `refined:false, reason:"unavailable"` |
+| `CONTOUR_REFINE_TOKEN` | 未设置 | contour-refine 服务共享密钥（设置后以 `X-Refine-Token` 头调用） |
+| `CONTOUR_REFINE_TIMEOUT_S` | `8` | 调用 contour-refine 服务的超时（秒）；超时/错误返回 `refined:false, reason:"service_error"` |
 
 注册模式（closed / invite_only）由 owner 后台的 `platform_settings.registration_mode` 运行时管理，不再有环境变量开关。
 

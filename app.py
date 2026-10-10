@@ -13420,6 +13420,25 @@ AI_SIDECAR_URL = (
 _AI_SIDECAR_TIMEOUT = 30.0
 _AI_SIDECAR_SSE_READ_TIMEOUT = 31536000.0  # 一年：等价于不限制 SSE 读
 
+# contour-refine 服务（SAM2.1 box-prompted 轮廓精修；services/contour-refine）。
+# 供插件通道 POST /api/plugin/v1/slides/<slide>/contours/refine 调用：
+#   - CONTOUR_REFINE_URL 未设置 → 端点返回 {refined:false, reason:"unavailable"}
+#     （调用方保留 LLM 原轮廓，不报错）；
+#   - 设置后按 CONTOUR_REFINE_TIMEOUT_S（缺省 8s）限时调用 /v1/refine；
+#     服务错误/超时/坏响应 → {refined:false, reason:"service_error"}（只告警
+#     不向客户端透栈）；
+#   - CONTOUR_REFINE_TOKEN 设置时以 X-Refine-Token 头带给服务（共享密钥）。
+CONTOUR_REFINE_URL = (os.environ.get("CONTOUR_REFINE_URL") or "").rstrip("/")
+CONTOUR_REFINE_TOKEN = os.environ.get("CONTOUR_REFINE_TOKEN") or ""
+try:
+    _CONTOUR_REFINE_TIMEOUT_S = float(os.environ.get("CONTOUR_REFINE_TIMEOUT_S") or 8)
+except ValueError:
+    _CONTOUR_REFINE_TIMEOUT_S = 8.0
+# 服务调用异常基类在 import 期绑定（真 requests 的类）——except 元组是异常
+# 发生时才求值，若运行期引用 requests.RequestException 会读被测试替换过的
+# app.requests 假件（无该属性）。
+_CONTOUR_REFINE_REQUEST_EXC = requests.RequestException
+
 # AI 配置文件：与 flask_secret 同目录（SHARE_DATA_DIR），0600 权限
 def _ai_config_path() -> Path:
     return _data_dir_for_secret() / "ai_config.json"
@@ -17877,26 +17896,22 @@ def _validate_ai_skill_request(body, slide, slide_id=None):
     return out, None
 
 
-def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
-                     max_long_edge=None, jpeg_quality=DERIVATIVE_JPEG_QUALITY,
-                     render_context=None, render_fingerprint=None,
-                     expected_revision=None):
-    """实际读 region → JPEG base64（与 /region 端点逻辑一致，供 AI 进程内调用）。
+def _read_region_pil(entry, x, y, w, h, out_w, out_h, safe, mpp,
+                     max_long_edge=None, render_context=None,
+                     render_fingerprint=None, expected_revision=None):
+    """借句柄读 region → ``(PIL RGB image, meta)``（region 读取公共核心）。
 
-    输出尺寸规则（§6.1）：
-      - max_long_edge 非空时：按 bbox 原始宽高比计算 out_w/out_h，最长边 =
-        max_long_edge（保持比例，限制 [1,4096]），忽略显式 out_w/out_h。
-      - 否则：用显式 out_w/out_h（仍 clamp 到 [1,4096]），保持旧契约。
-    LANCZOS resize 保持不变；JPEG 质量 jpeg_quality 默认 DERIVATIVE_JPEG_QUALITY(85)，
-    多通道 context 时 subsampling=0（4:4:4）。选层与 /region 端点共用
-    choose_read_level；返回 dict 另含 upsampled（out 是否超过源像素）、
-    image_mode/subsampling（本次编码的实际身份，additive——subsampling 为
-    "4:4:4"/"4:2:0" 契约标签，取自 encode_display_jpeg 回传的实际参数）。
-    Batch 3（§6.3）：render_context 非 None 时为 wire 请求体形态（plugin v1 /
-    internal 通道），在本函数内借句柄后、**解码前** canonicalize + revision
-    绑定（稳定码拒绝）；成功按该 context 合成并在结果 dict 带
-    ``render_fingerprint``。渲染失败抛 SlideRenderError / RenderRequestError，
-    由调用方映射稳定错误信封。
+    ``_read_region_b64`` 的解码/选层部分抽出（contours/refine 的 PNG crop 与
+    JPEG 派生图共用同一条读取路径——存储布局/渲染 context/夹取语义完全一致，
+    不另写第二套读取器）：
+      - 夹取到 slide 边界（与 /region 端点同式）；
+      - 输出尺寸：max_long_edge 优先（保宽高比），否则显式 out_w/out_h
+        （clamp [1,4096]）；
+      - F1 choose_read_level 选层 + LANCZOS resize；
+      - render_context 非 None 时解码前 canonicalize + revision 绑定，按该
+        context 合成（失败抛 SlideRenderError / RenderRequestError）。
+    meta: ``{src, magnification, read_level, upsampled, render_fingerprint,
+    image_mode}``。编码（JPEG+刻度尺 / PNG）由调用方决定。
     """
     with slide_cache.borrow_pair(entry) as pair:
         osr = pair["osr"]
@@ -17936,14 +17951,52 @@ def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
         if mpp and mpp > 0:
             base = 10.0 / mpp
             mag = base / ds_lvl if ds_lvl > 0 else base
-    # AI 快照图像画 level-0 坐标刻度尺（视觉尺子，失败不影响出图）
-    _overlay_coord_ticks(region, x2, y2, w2, h2)
-    # F2：多通道 context 派生图 4:4:4（subsampling=0），quality 仍走调用方
-    # jpeg_quality；native 显式 4:2:0（与旧 Pillow 默认一致）
     image_mode = "multichannel" \
         if render_context is not None \
         and render_context.get("version") \
         == slide_render.CONTEXT_VERSION_MULTICHANNEL else "native_rgb"
+    return region, {
+        "src": {"x": x2, "y": y2, "w": w2, "h": h2},
+        "magnification": mag,
+        "read_level": int(lvl),
+        "upsampled": bool(upsampled),
+        "render_fingerprint": render_fingerprint,
+        "image_mode": image_mode,
+    }
+
+
+def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
+                     max_long_edge=None, jpeg_quality=DERIVATIVE_JPEG_QUALITY,
+                     render_context=None, render_fingerprint=None,
+                     expected_revision=None):
+    """实际读 region → JPEG base64（与 /region 端点逻辑一致，供 AI 进程内调用）。
+
+    输出尺寸规则（§6.1）：
+      - max_long_edge 非空时：按 bbox 原始宽高比计算 out_w/out_h，最长边 =
+        max_long_edge（保持比例，限制 [1,4096]），忽略显式 out_w/out_h。
+      - 否则：用显式 out_w/out_h（仍 clamp 到 [1,4096]），保持旧契约。
+    LANCZOS resize 保持不变；JPEG 质量 jpeg_quality 默认 DERIVATIVE_JPEG_QUALITY(85)，
+    多通道 context 时 subsampling=0（4:4:4）。选层与 /region 端点共用
+    choose_read_level；返回 dict 另含 upsampled（out 是否超过源像素）、
+    image_mode/subsampling（本次编码的实际身份，additive——subsampling 为
+    "4:4:4"/"4:2:0" 契约标签，取自 encode_display_jpeg 回传的实际参数）。
+    Batch 3（§6.3）：render_context 非 None 时为 wire 请求体形态（plugin v1 /
+    internal 通道），解码前 canonicalize + revision 绑定（稳定码拒绝）；成功按
+    该 context 合成并在结果 dict 带 ``render_fingerprint``。渲染失败抛
+    SlideRenderError / RenderRequestError，由调用方映射稳定错误信封。
+    读取/选层/夹取由 _read_region_pil 承担（与 contours/refine 的 PNG crop
+    共用同一条读取路径）。
+    """
+    region, m = _read_region_pil(
+        entry, x, y, w, h, out_w, out_h, safe, mpp,
+        max_long_edge=max_long_edge, render_context=render_context,
+        render_fingerprint=render_fingerprint, expected_revision=expected_revision)
+    # AI 快照图像画 level-0 坐标刻度尺（视觉尺子，失败不影响出图）
+    _overlay_coord_ticks(region, m["src"]["x"], m["src"]["y"],
+                         m["src"]["w"], m["src"]["h"])
+    image_mode = m["image_mode"]
+    # F2：多通道 context 派生图 4:4:4（subsampling=0），quality 仍走调用方
+    # jpeg_quality；native 显式 4:2:0（与旧 Pillow 默认一致）
     jpeg_bytes, enc_params = slide_render.encode_display_jpeg(
         region, image_mode=image_mode, quality=int(jpeg_quality))
     img_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
@@ -17952,15 +18005,15 @@ def _read_region_b64(entry, x, y, w, h, out_w, out_h, safe, mpp,
         "mime": "image/jpeg",
         # 诚实尺寸：等于编码后 JPEG 实际像素
         "width": region.size[0], "height": region.size[1],
-        "src": {"x": x2, "y": y2, "w": w2, "h": h2},
-        "magnification": mag,
+        "src": m["src"],
+        "magnification": m["magnification"],
         # W0 跨仓契约（HistoPilot whole-slide-snapshot-fix-plan）：实际解码层
         # （choose_read_level 选出的金字塔层，非语义 state_level），向后兼容
         # 新增字段，供 snapshot_captured 事件标注 read_level。
-        "read_level": int(lvl),
-        "upsampled": bool(upsampled),
+        "read_level": m["read_level"],
+        "upsampled": m["upsampled"],
         # §6.3 additive：render_context 生效时的 fingerprint（RGB legacy 为 None）
-        "render_fingerprint": render_fingerprint,
+        "render_fingerprint": m["render_fingerprint"],
         # P1-2（2026-09-05）additive：本次响应**实际**的编码身份（不凭
         # render_context 二次猜测）——subsampling 标签单一来源是
         # encode_display_jpeg 回传的实际参数；随 encoder info 透出后供
@@ -19290,6 +19343,205 @@ def _plugin_region_body(claims, safe, gate, sid, _region_path, body):
         return resp
     finally:
         _PLUGIN_REGION_CONCURRENCY_SEM.release()
+
+
+# --------------------------------------------------------------------------- #
+# 插件通道 LLM 轮廓精修（contour refine；对应 services/contour-refine 服务）。
+#
+# HistoPilot 侧 LLM 画的多边形定位准但轮廓粗：本端点读 points 周边 crop
+# （长边 ≤1024，走与 regions 同一条 _read_region_pil 读取路径）→ POST 给
+# contour-refine 服务（SAM2.1 box-prompted + 分数/面积比闸门）→ 接受则回精修
+# 后的 level-0 轮廓点，拒绝/不可用则 refined:false（调用方保留 LLM 原轮廓）。
+# 鉴权/收录复核与 regions 完全同链（_require_plugin_token("region:read") +
+# _plugin_resolve_slide_ref + _plugin_slide_run_grant_gate，不弱化）；只读，
+# 不落标注、不写审计之外的状态。
+# --------------------------------------------------------------------------- #
+#: refine crop 长边上限（与离线原型一致；服务侧入参上限 2048 的子集）
+_PLUGIN_CONTOUR_REFINE_MAX_CROP_EDGE = 1024
+#: points 数量契约（与 contour-refine 服务 polygon 上限一致）
+_PLUGIN_CONTOUR_REFINE_MAX_POINTS = 500
+
+
+def _plugin_validate_level0_points(points):
+    """contours/refine 的 points 校验（level-0 坐标）→ 错误消息或 None。
+
+    3..500 个 [x, y] 点，坐标须为有限数字（bool/字符串/NaN/Inf 拒绝）。
+    """
+    if not isinstance(points, (list, tuple)):
+        return "points 需为 [[x,y],...] 数组（level-0 像素坐标）"
+    if not (3 <= len(points) <= _PLUGIN_CONTOUR_REFINE_MAX_POINTS):
+        return ("points 需要 3..%d 个点（当前 %d）"
+                % (_PLUGIN_CONTOUR_REFINE_MAX_POINTS, len(points)))
+    for point in points:
+        if not isinstance(point, (list, tuple)) or len(point) != 2:
+            return "每个点需为 [x, y] 数值对"
+        for value in point:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return "点坐标需为数字"
+            if not math.isfinite(value):
+                return "点坐标需为有限值"
+    return None
+
+
+def _plugin_contour_refine_unavailable(reason, **extra):
+    """refine 端点的服务侧结果统一信封（HTTP 200，refined:false）。"""
+    payload = {
+        "refined": False,
+        "points": None,
+        "score": None,
+        "area_ratio": None,
+        "model": None,
+        "reason": reason,
+        "seconds": None,
+    }
+    payload.update(extra)
+    return jsonify(payload)
+
+
+def _plugin_contour_refine_body(safe, gate, sid):
+    """contours/refine 端点主体（名/by-id 路由共用；鉴权/复核已在前置完成）。"""
+    body = request.get_json(silent=True) or {}
+    points = body.get("points")
+    points_err = _plugin_validate_level0_points(points)
+    if points_err is not None:
+        return _plugin_error(400, "invalid_request", points_err)
+
+    # 指纹 CAS（与 regions 同语义）：expected_fingerprint 不符 → 409
+    _region_path = _desc_path(gate) if gate is not None else (UPLOAD_DIR / safe)
+    expected_fp = body.get("expected_fingerprint") or body.get("expectedAssetRevision")
+    if isinstance(expected_fp, str) and expected_fp:
+        fp = _slide_fingerprint(_region_path)
+        if fp != expected_fp:
+            return _plugin_error(409, "slide_revision_conflict", "切片指纹不匹配（文件已变更）",
+                                 details={"expected": expected_fp, "actual": fp})
+
+    # crop 几何：bbox 外扩 pad = 0.25*max(w,h)+40（原型同式），夹取到切片边界
+    xs = [float(p[0]) for p in points]
+    ys = [float(p[1]) for p in points]
+    x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+    pad = 0.25 * max(x1 - x0, y1 - y0) + 40
+    cx0 = int(math.floor(x0 - pad))
+    cy0 = int(math.floor(y0 - pad))
+    cw = int(math.ceil(x1 + pad)) - cx0
+    ch = int(math.ceil(y1 + pad)) - cy0
+
+    # 越界校验（合法性校验先于服务可用性判断，不随服务配置改变 400 语义）
+    entry = _get_slide(gate if gate is not None else safe)
+    with slide_cache.borrow_pair(entry) as pair:
+        width, height = pair["osr"].dimensions
+    if x1 < 0 or y1 < 0 or x0 >= width or y0 >= height:
+        return _plugin_error(400, "invalid_request",
+                             "points 完全位于切片范围外（%dx%d）" % (width, height))
+
+    if not CONTOUR_REFINE_URL:
+        return _plugin_contour_refine_unavailable("unavailable")
+
+    # 读 crop（PNG 无损、无刻度尺叠加）：与 regions 同一条 _read_region_pil
+    # 路径（存储布局/选层/夹取一致）；长边 ≤1024 由 max_long_edge 保证。
+    try:
+        region, rmeta = _read_region_pil(
+            entry, cx0, cy0, cw, ch, 1, 1, safe, None,
+            max_long_edge=_PLUGIN_CONTOUR_REFINE_MAX_CROP_EDGE)
+    except (slide_render.RenderRequestError,
+            slide_io.SlideRenderError) as e:
+        status = getattr(e, "status", None) \
+            or slide_render.RENDER_ERROR_HTTP.get(getattr(e, "code", ""), 400)
+        return _plugin_error(status, getattr(e, "code",
+                                             "invalid_render_context"),
+                             str(e))
+    buf = io.BytesIO()
+    region.save(buf, format="PNG")
+    png_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+    # level-0 → crop 像素映射（crop 实际起点/尺寸以夹取后的 src 为准）
+    src = rmeta["src"]
+    sx = float(region.size[0]) / max(1.0, float(src["w"]))
+    sy = float(region.size[1]) / max(1.0, float(src["h"]))
+    crop_polygon = [[(float(px) - src["x"]) * sx, (float(py) - src["y"]) * sy]
+                    for px, py in points]
+
+    headers = {"X-Refine-Token": CONTOUR_REFINE_TOKEN} if CONTOUR_REFINE_TOKEN else {}
+    try:
+        r = requests.post(
+            CONTOUR_REFINE_URL + "/v1/refine",
+            json={"image_png_b64": png_b64, "polygon": crop_polygon},
+            timeout=_CONTOUR_REFINE_TIMEOUT_S, headers=headers)
+        if r.status_code != 200:
+            raise ValueError("contour-refine HTTP %d" % r.status_code)
+        svc = r.json()
+        if not isinstance(svc, dict) or not isinstance(svc.get("accepted"), bool):
+            raise ValueError("contour-refine 响应形状异常")
+    except (_CONTOUR_REFINE_REQUEST_EXC, ValueError) as e:
+        # 服务错误/超时/坏 JSON：告警不透栈，客户端保留 LLM 原轮廓
+        app.logger.warning("contour-refine 服务调用失败（slide=%s）：%s", safe, e)
+        return _plugin_contour_refine_unavailable("service_error")
+
+    if not svc.get("accepted"):
+        return _plugin_contour_refine_unavailable(
+            svc.get("reason") or "rejected",
+            score=svc.get("score"), area_ratio=svc.get("area_ratio"),
+            model=svc.get("model"), seconds=svc.get("seconds"))
+
+    svc_points = svc.get("points")
+    if not isinstance(svc_points, (list, tuple)) \
+            or not all(isinstance(p, (list, tuple)) and len(p) == 2
+                       and all(isinstance(v, (int, float))
+                               and math.isfinite(v) for v in p)
+                       for p in svc_points):
+        app.logger.warning("contour-refine 服务返回的点列形状异常（slide=%s）", safe)
+        return _plugin_contour_refine_unavailable("service_error")
+    level0_points = [[int(round(float(px) / sx + src["x"])),
+                      int(round(float(py) / sy + src["y"]))]
+                     for px, py in svc_points]
+    return jsonify({
+        "refined": True,
+        "points": level0_points,
+        "score": svc.get("score"),
+        "area_ratio": svc.get("area_ratio"),
+        "model": svc.get("model"),
+        "reason": None,
+        "seconds": svc.get("seconds"),
+    })
+
+
+@app.route("/api/plugin/v1/slides/by-id/<slide_id>/contours/refine", methods=["POST"])
+def plugin_v1_contour_refine_by_id(slide_id):
+    """contours/refine 的 slide_id 路由（P2；同一实现，收录复核按 ID）。"""
+    return plugin_v1_contour_refine_impl(slide_id=slide_id)
+
+
+def plugin_v1_contour_refine_impl(slide=None, slide_id=None):
+    """contours/refine 主体（by-id 路由与名路由共用）。"""
+    claims, err = _require_plugin_token("region:read")
+    if err is not None:
+        return err
+    safe, gate, sid, serr = _plugin_resolve_slide_ref(slide, slide_id)
+    if serr is not None:
+        return serr
+    gerr = _plugin_slide_run_grant_gate(safe, claims, slide_id=sid)
+    if gerr is not None:
+        return gerr
+    return _plugin_contour_refine_body(safe, gate, sid)
+
+
+@app.route("/api/plugin/v1/slides/<slide>/contours/refine", methods=["POST"])
+def plugin_v1_contour_refine(slide):
+    """LLM 轮廓 SAM2 精修（读 crop 调 contour-refine 服务）。scope: region:read。
+
+    body：{points: [[x,y],...]（level-0 像素，3..500 个有限数值点），
+    expected_fingerprint?（与 regions 同语义，不符 → 409 slide_revision_conflict）}。
+    读取与 regions 同一条 _read_region_pil 路径（存储布局/选层/夹取一致），
+    crop = bbox 外扩 0.25*max(w,h)+40、长边 ≤1024、PNG 无损；映射到 crop 像素
+    调 CONTOUR_REFINE_URL/v1/refine，接受则回 level-0 整数点。
+
+    响应（服务侧结果一律 200）：``{refined, points|None, score, area_ratio,
+    model, reason, seconds}``；CONTOUR_REFINE_URL 未配置 →
+    ``{refined:false, reason:"unavailable"}``；服务错误/超时/坏响应 →
+    ``{refined:false, reason:"service_error"}``（客户端保留 LLM 原轮廓）。
+    校验失败 → 400 invalid_request（统一错误信封）。只读端点：不落标注、
+    不写任何存储。
+    """
+    return plugin_v1_contour_refine_impl(slide=slide)
 
 
 
@@ -20894,7 +21146,7 @@ def plugin_v1_billing_hold_settle(hold_id):
 # --------------------------------------------------------------------------- #
 _PLUGIN_CAPABILITIES = [
     "slide:metadata:read",   # GET /slides/{slide_id}
-    "slide:region:read",     # POST /slides/{slide_id}/regions
+    "slide:region:read",     # POST /slides/{slide_id}/regions；POST /slides/{slide_id}/contours/refine（轮廓精修，同权限域）
     "annotation:read",       # GET /slides/{slide_id}/changes（增量读标注）
     "annotation:write",      # POST /slides/{slide_id}/annotations（+X-Run-Grant）
     "viewer:navigate",       # HostBridge viewer.navigate / selection.getBbox / viewer.getViewport

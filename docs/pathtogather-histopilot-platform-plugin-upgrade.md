@@ -557,6 +557,7 @@ experiment_profile?
 |---|---|---|
 | GET | `/slides/{slide_id}` | 尺寸、mpp、levels、asset revision |
 | POST | `/slides/{slide_id}/regions` | 按 level-0 bbox 读取派生图 |
+| POST | `/slides/{slide_id}/contours/refine` | LLM 轮廓 SAM2 精修（level-0 points → 精修后 points；`refined:false` 时保留原轮廓，权限域同 regions） |
 | GET | `/slides/{slide_id}/annotations?after=` | 全量或增量读取标注 |
 | POST | `/slides/{slide_id}/annotations` | 幂等创建标注 |
 | PATCH | `/annotations/{annotation_id}` | 带 revision 的 CAS 更新 |

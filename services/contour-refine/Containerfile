@@ -1,0 +1,22 @@
+# contour-refine 服务镜像：SAM2.1 hiera base+ box-prompted 轮廓精修。
+#
+# 权重不进镜像：运行时只读挂载到 /models（见 README.md）。
+# sam2 源码安装且 SAM2_BUILD_CUDA=0（不编译自定义 CUDA 算子；GPU 推理走
+# PyTorch 原生算子，对 box-prompt 精修场景已足够且免 nvcc 构建依赖）。
+FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
+
+ENV SAM2_BUILD_CUDA=0 \
+    SAM2_CHECKPOINT=/models/sam2.1_hiera_base_plus.pt \
+    SAM2_CONFIG=configs/sam2.1/sam2.1_hiera_b+.yaml \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /srv/contour-refine
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY refine.py app.py ./
+
+EXPOSE 8970
+# 单 worker（单模型实例，进程内互斥锁串行推理）+ 2 线程（IO 重叠）；
+# --preload 使模型在 master import 阶段加载一次。
+CMD ["gunicorn", "--workers", "1", "--threads", "2", "--preload", \
+     "--timeout", "120", "--bind", "0.0.0.0:8970", "app:app"]

@@ -33,8 +33,8 @@ MVP 约 3-5 天，完整版 2-3 周。风险主要在安全语义（prompt-injec
 
 - 插件后端用 installation secret 换 scoped JWT（`app.py` `/api/plugin/v1/auth/token`
   ：3927；scope 固定 5 项 `slide:read region:read annotation:write session:write
-  audit:write`，`app.py:3541`），只能调平台固定端点（slides/regions/changes/
-  annotations/run-grants/capabilities）。
+  audit:write`，`app.py:3541`），只能调平台固定端点（slides/regions/
+  contours:refine/changes/annotations/run-grants/capabilities）。
 - `/api/plugin/v1/capabilities`（`app.py:6478`）是**平台向插件公告**自身能力并做
   contract 版本协商——不是插件能力的注册表，方向相反。
 - manifest `permissions` 枚举（5 项，`plugins/manifest.schema.json`）只表达

@@ -1,0 +1,129 @@
+
+ RUN  v3.2.7 /home/solarise/ZCodeProject/histopilot-suite/PathTogether/.gate-tmp/hp-codex-refine-review-wt
+
+ ❯ |unit| test/ai-drawing-refine.test.ts (9 tests | 1 failed | 8 skipped) 14ms
+   ↓ draw_suspicious_region 的轮廓精修（viewer-skills） > refined 且点列合法 → 写精修点列 + contour_refine 溯源（含 original_points）+ 文案说明细化
+   ↓ draw_suspicious_region 的轮廓精修（viewer-skills） > refined:false → 保留模型点列；溯源无 original_points；文案带未采纳短语（边界不清晰）
+   ↓ draw_suspicious_region 的轮廓精修（viewer-skills） > 细化服务未启用（unavailable）→ 写模型点列，溯源照记，文案不提细化
+   ↓ draw_suspicious_region 的轮廓精修（viewer-skills） > refine 意外抛错 → 保留模型点列，写入照常发生（reason=service_error）
+   ↓ draw_suspicious_region 的轮廓精修（viewer-skills） > 精修点列越出当前快照 → 回退模型点列（reason=refined_invalid）
+   ↓ draw_suspicious_region 的轮廓精修（viewer-skills） > 客户端无 refineContour → 无 contour_refine 溯源键，行为与从前完全一致
+   ↓ draw_suspicious_region 的轮廓精修（viewer-skills） > refine 期间 run 取消（loopSignal abort）→ 重抛且不写
+   ↓ draw_suspicious_region 的轮廓精修（viewer-skills） > contourRefineNotAppliedPhrase：平台原因词表映射
+   × draw_suspicious_region 的轮廓精修（viewer-skills） > Codex review: cancellation after refine resolves must still prevent annotate 12ms
+     → expected [ { slide: { …(2) }, …(16) } ] to have a length of +0 but got 1
+ ❯ |unit| test/tools.test.ts (67 tests | 1 failed | 66 skipped) 14ms
+   ↓ AgentState helpers (port from ai_agent.py) > viewportBbox scales the covered span by the level's downsample
+   ↓ AgentState helpers (port from ai_agent.py) > viewportBbox clamps the box into bounds when slideDims is given
+   ↓ AgentState helpers (port from ai_agent.py) > effectiveLevel clamps out-of-range levels
+   ↓ AgentState helpers (port from ai_agent.py) > magnificationLabel uses base=10/mpp and tiers
+   ↓ AgentState helpers (port from ai_agent.py) > magnificationLabel falls back to a level label when mpp is unknown
+   ↓ AgentState helpers (port from ai_agent.py) > pickOverviewLevel 命中档返回首个 95% 覆盖长边的层；耗尽时回退末层（名实相符）
+   ↓ AgentState helpers (port from ai_agent.py) > magnificationGuide emits the per-level table
+   ↓ AgentState helpers (port from ai_agent.py) > magnificationGuide：mpp 未知 → 「光学倍率未校准」，只按相对分辨率描述层级（反馈 §3.3）
+   ↓ AgentState helpers (port from ai_agent.py) > magnificationGuide：单层 + mpp 未知 → 单层事实，无更高放大层级（反馈 §3.3）
+   ↓ AgentState helpers (port from ai_agent.py) > magnificationGuide：单层 + mpp 已知 → 仍按已知 mpp 出表（行为不变）
+   ↓ AgentState helpers (port from ai_agent.py) > toDict/fromDict round-trips
+   ↓ coverageHint 取景档文案（反馈 §3.3） > 档位只描述取景范围，不含冒充光学倍率的字样
+   ↓ coverageHint 取景档文案（反馈 §3.3） > 多层图像：保留降层/升层导航建议（层级真实存在）
+   ↓ coverageHint 取景档文案（反馈 §3.3） > 单层图像：任何档位无变层建议，并声明「已是原图最高分辨率」
+   ↓ coverageHint 取景档文案（反馈 §3.3） > 普通/只读变体的工具引导词口径不变（普通 create_annotation；只读 mark_observation）
+   ↓ goto（2026-10 合并取景：移动 + 快照一次完成） > moves, emits tool_started then snapshot_captured, returns text+image+details
+   ↓ goto（2026-10 合并取景：移动 + 快照一次完成） > clamps ±2 levels per goto and tells the model
+   ↓ goto（2026-10 合并取景：移动 + 快照一次完成） > clamps both step and range when request is wildly out of range
+   ↓ goto（2026-10 合并取景：移动 + 快照一次完成） > detects no-op: same position+level with the current snapshot → no re-capture
+   ↓ goto（2026-10 合并取景：移动 + 快照一次完成） > same position+level WITHOUT a current snapshot for that view → captures in place
+   ↓ goto（2026-10 合并取景：移动 + 快照一次完成） > no pending guard: goto after goto captures again (old current snapshot auto-closed first)
+   ↓ goto（2026-10 合并取景：移动 + 快照一次完成） > auto-close summary falls back to the latest observation note/label for that snapshot
+   ↓ goto（2026-10 合并取景：移动 + 快照一次完成） > capture failure: the move stands, text-only result, previous current snapshot untouched
+   ↓ goto 取景半程（原 snapshot 工具行为并入 goto） > goto 描述说明一次调用完成移动+取景；schema 不暴露尺寸参数
+   ↓ goto 取景半程（原 snapshot 工具行为并入 goto） > output sizing: viewportPx square clamped to the detail-tier cap
+   ↓ goto 取景半程（原 snapshot 工具行为并入 goto） > passes expected_fingerprint from slideInfo to flask.region
+   ↓ goto 取景半程（原 snapshot 工具行为并入 goto） > W0 upsampled：软件放大 true → 文本标注+payload/details 写入；false 只写不加噪；缺省两者皆无
+   ↓ goto 取景半程（原 snapshot 工具行为并入 goto） > on 409 fingerprint mismatch clears caches via onFingerprintMismatch
+   ↓ goto 取景半程（原 snapshot 工具行为并入 goto） > deferPublish 不写 session、不发事件，仍返回 lastView/eventPayload
+   ↓ goto 取景半程（原 snapshot 工具行为并入 goto） > persists last_snapshot_view before emitting snapshot_captured
+   ↓ goto 取景半程（原 snapshot 工具行为并入 goto） > 批次 A §5.1：snapshot_captured 携带 bbox_level0/level/captured_at（保留旧 bboxLevel0）
+   ↓ goto 取景半程（原 snapshot 工具行为并入 goto） > 批次 A §6.2：pending_snapshot_review（=当前快照）持久化 level/magnification/out_w/out_h
+   ↓ goto 取景半程（原 snapshot 工具行为并入 goto） > 批次 A §5.1：last_snapshot_view 快照成功后持久化，失败快照不覆盖旧值
+   ↓ goto 取景半程（原 snapshot 工具行为并入 goto） > viewport 快照文本：scope+倍率正交，无覆盖率百分比、无「全片概览」字样（W3）
+   ↓ goto 取景半程（原 snapshot 工具行为并入 goto） > 单层切片：取景回喂提示声明原图最高分辨率且无变层建议（反馈 §3.3）
+   ↓ mark_observation (ai_agent.py L877-904；批次 A scope 契约) > refuses when no snapshot is pending
+   ↓ mark_observation (ai_agent.py L877-904；批次 A scope 契约) > refuses an invalid scope
+   ↓ mark_observation (ai_agent.py L877-904；批次 A scope 契约) > scope=viewport auto-binds the pending snapshot bbox/snapshot_id (§4.2)
+   ↓ mark_observation (ai_agent.py L877-904；批次 A scope 契约) > scope=viewport rejects model-supplied geometry
+   ↓ mark_observation (ai_agent.py L877-904；批次 A scope 契约) > scope=region writes an observation and emits the observation event
+   ↓ mark_observation region 几何校验（fix-plan §6） > rejects region missing any geometry field
+   ↓ mark_observation region 几何校验（fix-plan §6） > rejects NaN / Infinity coordinates
+   ↓ mark_observation region 几何校验（fix-plan §6） > rejects zero / negative width or height
+   ↓ mark_observation region 几何校验（fix-plan §6） > rejects a region outside the slide (left/top/right/bottom, §6.1)
+   ↓ mark_observation region 几何校验（fix-plan §6） > rejects a region outside the pending snapshot beyond the tolerance (§6.2)
+   ↓ mark_observation region 几何校验（fix-plan §6） > dynamic tolerance: exactly 1 output px per axis passes, 2 is rejected (X/Y independent)
+   ↓ mark_observation region 几何校验（fix-plan §6） > legacy pending without out_w/out_h → tolerance 0 (strict containment, fail closed)
+   ↓ mark_observation region 几何校验（fix-plan §6） > 非法输出尺寸（out_w=0）同样按容差 0 处理，不猜测固定大容差
+   ↓ create_annotation (ai_agent.py L906-934) > is omitted from the tool set in fork sessions
+   ↓ create_annotation (ai_agent.py L906-934) > the fork guard refuses if invoked directly with kind=fork
+   ↓ create_annotation (ai_agent.py L906-934) > refuses when no snapshot is pending
+   ↓ create_annotation (ai_agent.py L906-934) > passes a deterministic effect_key to flask.annotate and emits annotation_created
+   ↓ create_annotation (ai_agent.py L906-934) > rejects side_px outside 1..40000 without touching the platform (批次 A：不静默夹取)
+   ↓ create_annotation 几何校验（fix-plan §4.3/§6） > rejects an annotation beyond the slide right/bottom edge without touching the platform
+   ↓ create_annotation 几何校验（fix-plan §4.3/§6） > rejects an annotation outside the pending snapshot beyond the tolerance
+   ↓ create_annotation 几何校验（fix-plan §4.3/§6） > dynamic tolerance applies to annotations too (1 output px per axis)
+   ↓ create_annotation 几何校验（fix-plan §4.3/§6） > pending 的 bbox 与 image_ref.src 均非法时 fail closed：拒绝落标注且 annotate 从未被调用
+   ↓ create_annotation 几何校验（fix-plan §4.3/§6） > 旧 pending（bbox 缺失、仅存 snapshot_id）同样 fail closed 拒绝
+   ↓ finish (ai_agent.py L750-751) > returns terminate and 已结束
+   ↓ tool set composition (three-kind: main / branch / fork) > main sessions: writable 5-tool set（goto 已合并取景，无 snapshot / complete_snapshot_review）
+   ↓ tool set composition (three-kind: main / branch / fork) > skill_delineate adds draw_suspicious_region（仅可写 run）
+   ↓ tool set composition (three-kind: main / branch / fork) > branch sessions include the full toolset (same as main, incl create_annotation)
+   ↓ tool set composition (three-kind: main / branch / fork) > fork sessions register NO tools (lite Q&A)
+   ↓ G2 — snapshot 捕获通道语义快照 > multichannel run：image_ref 与 details 带快照时的通道语义（名称来自 slideInfo.channels）
+   ↓ G2 — snapshot 捕获通道语义快照 > legacy（无 render context）：不伪造 channel_semantics
+   ↓ G2 — snapshot 捕获通道语义快照 > native-rgb（空 activeChannels）：不写 channel_semantics
+   × Codex review: current snapshot identity across runs > refreshes a same-position goto when the channel context changes 12ms
+     → new channel rendering needs a new snapshot: expected false to be true // Object.is equality
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |unit| test/ai-drawing-refine.test.ts > draw_suspicious_region 的轮廓精修（viewer-skills） > Codex review: cancellation after refine resolves must still prevent annotate
+AssertionError: expected [ { slide: { …(2) }, …(16) } ] to have a length of +0 but got 1
+
+- Expected
++ Received
+
+- 0
++ 1
+
+ ❯ test/ai-drawing-refine.test.ts:340:32
+    338|       label:"L", geometry:{type:"polygon",points:MODEL_TRIANGLE},
+    339|     }, ac.signal).catch(() => {});
+    340|     expect(h.annotateRequests).toHaveLength(0);
+       |                                ^
+    341|   });
+    342|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  |unit| test/tools.test.ts > Codex review: current snapshot identity across runs > refreshes a same-position goto when the channel context changes
+AssertionError: new channel rendering needs a new snapshot: expected false to be true // Object.is equality
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ test/tools.test.ts:1160:99
+    1158|     h.ctx.renderContext = {...before, fingerprint:"d".repeat(64), acti…
+    1159|     const r = await tool(h, "goto").execute("new-context", {x:5000,y:4…
+    1160|     expect(r.content.some(c => c.type === "image"), "new channel rende…
+       |                                                                                                   ^
+    1161|     expect((await h.store.readSession(h.sessionId))?.pending_snapshot_…
+    1162|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+ Test Files  2 failed (2)
+      Tests  2 failed | 74 skipped (76)
+   Start at  16:52:55
+   Duration  715ms (transform 310ms, setup 0ms, collect 958ms, tests 27ms, environment 0ms, prepare 130ms)

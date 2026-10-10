@@ -1,0 +1,36 @@
+<frozen site>:107: RuntimeWarning: Unexpected value in sys.prefix, expected /home/solarise/ZCodeProject/histopilot-suite/PathTogether/.gate-tmp/vs-integ-wt/.venv, got /home/solarise/ZCodeProject/histopilot-suite/PathTogether/.gate-tmp/codex-refine-review-wt/../vs-integ-wt/.venv
+<frozen site>:107: RuntimeWarning: Unexpected value in sys.exec_prefix, expected /home/solarise/ZCodeProject/histopilot-suite/PathTogether/.gate-tmp/vs-integ-wt/.venv, got /home/solarise/ZCodeProject/histopilot-suite/PathTogether/.gate-tmp/codex-refine-review-wt/../vs-integ-wt/.venv
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_____________ test_review_refine_bounds_decoded_pixels_before_read _____________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x77b1dd0156e0>
+
+    def test_review_refine_bounds_decoded_pixels_before_read(monkeypatch):
+        inst = _bootstrap_installation()
+        token = _token_for(inst)
+        slide = _touch_slide()
+        class RecordingOnlyOsr(_FakeOsr):
+            def read_region(self, location, level, size):
+                self.read_region_calls.append((location, level, size))
+                # Deliberately do not allocate the requested raster in this probe.
+                return Image.new("RGB", (1, 1), "white")
+        osr = RecordingOnlyOsr(dimensions=(80000, 80000), level_downsamples=(1.0,))
+        monkeypatch.setattr(app_mod, "CONTOUR_REFINE_URL", "http://refine.test")
+        _fake_service(svc_body=_SVC_ACCEPT)
+        p1, p2 = _slide_read_mocks(osr)
+        with p1, p2:
+            r = _client().post(_refine_path(slide), headers=_bearer(token), json={
+                "points": [[1,1],[79999,1],[79999,79999],[1,79999]]})
+        attempted = max((size[0]*size[1] for _, _, size in osr.read_region_calls), default=0)
+>       assert attempted <= app_mod._PLUGIN_REGION_MAX_PIXELS, (r.status_code, osr.read_region_calls, attempted)
+E       AssertionError: (200, [((0, 0), 0, (80000, 80000))], 6400000000)
+E       assert 6400000000 <= 16777216
+E        +  where 16777216 = app_mod._PLUGIN_REGION_MAX_PIXELS
+
+tests/test_plugin_contour_refine.py:494: AssertionError
+------------------------------ Captured log call -------------------------------
+WARNING  svs.site_stats:site_stats_store.py:287 site_stats: SITE_STATS_ENTRY_HOSTS 未配置或含非法项，停止站点访问采集（页面服务不受影响）
+=========================== short test summary info ============================
+FAILED tests/test_plugin_contour_refine.py::test_review_refine_bounds_decoded_pixels_before_read
+1 failed, 26 deselected in 1.02s

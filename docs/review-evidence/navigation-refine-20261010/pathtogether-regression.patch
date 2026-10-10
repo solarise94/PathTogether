@@ -1,0 +1,25 @@
+diff --git a/tests/test_plugin_contour_refine.py b/tests/test_plugin_contour_refine.py
+index 2b251971..0b87b68b 100644
+--- a/tests/test_plugin_contour_refine.py
++++ b/tests/test_plugin_contour_refine.py
+@@ -474,0 +475,20 @@ def test_service_accepted_but_bad_points_service_error(monkeypatch):
++
++
++def test_review_refine_bounds_decoded_pixels_before_read(monkeypatch):
++    inst = _bootstrap_installation()
++    token = _token_for(inst)
++    slide = _touch_slide()
++    class RecordingOnlyOsr(_FakeOsr):
++        def read_region(self, location, level, size):
++            self.read_region_calls.append((location, level, size))
++            # Deliberately do not allocate the requested raster in this probe.
++            return Image.new("RGB", (1, 1), "white")
++    osr = RecordingOnlyOsr(dimensions=(80000, 80000), level_downsamples=(1.0,))
++    monkeypatch.setattr(app_mod, "CONTOUR_REFINE_URL", "http://refine.test")
++    _fake_service(svc_body=_SVC_ACCEPT)
++    p1, p2 = _slide_read_mocks(osr)
++    with p1, p2:
++        r = _client().post(_refine_path(slide), headers=_bearer(token), json={
++            "points": [[1,1],[79999,1],[79999,79999],[1,79999]]})
++    attempted = max((size[0]*size[1] for _, _, size in osr.read_region_calls), default=0)
++    assert attempted <= app_mod._PLUGIN_REGION_MAX_PIXELS, (r.status_code, osr.read_region_calls, attempted)

@@ -936,12 +936,28 @@ def _mock_internal_channel(monkeypatch):
                         lambda gate, safe: "rev0")
 
 
+def _disable_grant_drawing(grant_id):
+    """把 grant 的描绘列关掉（新 grant 默认开启；此状态目前只在测试中构造）。"""
+    import share_store_pg
+    conn = share_store_pg._connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE run_grants SET allow_ai_drawing = FALSE, "
+                        "drawing_bound_at = NULL, drawing_intent = '' "
+                        "WHERE grant_id = %s", (grant_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _make_internal_drawing_grant(session_id="sess-int-1", flagged=True):
-    """真实 store 造一条绑定 session 的 run grant（flagged=True 时置位技能列）。"""
+    """真实 store 造一条绑定 session 的 run grant（flagged=False 时关掉描绘列）。"""
     g = share_store.create_run_grant("inst1", "demo.svs", session_id="",
                                      created_by_user_id=None)
     share_store.bind_run_grant_session(g["grant_id"], session_id)
-    if flagged:
+    if not flagged:
+        _disable_grant_drawing(g["grant_id"])
+    else:
         ok, reason = share_store.set_run_grant_skill_delineate(
             g["grant_id"], session_id, "explicit",
             creator_allowed=lambda gr: True)
@@ -1256,11 +1272,24 @@ def _post_skills(c, grant_id, session_id="sess1", intent="explicit",
 
 
 def _make_bound_grant(session_id="sess1", installation_id="inst1"):
+    """/skills 用例：从描绘关闭的 grant 出发（新 grant 默认开启）。"""
     g = share_store.create_run_grant(installation_id, "demo.svs",
                                      session_id="",
                                      created_by_user_id=None)
     share_store.bind_run_grant_session(g["grant_id"], session_id)
+    _disable_grant_drawing(g["grant_id"])
     return g
+
+
+def test_new_run_grant_allows_drawing_by_default():
+    """描绘随 grant 默认发放；是否画由模型决定，写权限由 annotate 路径检查。"""
+    _touch()
+    g = share_store.create_run_grant("inst1", "demo.svs", session_id="",
+                                     created_by_user_id=None)
+    stored = share_store.get_run_grant(g["grant_id"])
+    assert stored["allow_ai_drawing"] is True
+    assert stored["drawing_intent"] == "default"
+    assert stored["drawing_bound_at"]
 
 
 def test_skills_endpoint_sets_flag_idempotently(monkeypatch):

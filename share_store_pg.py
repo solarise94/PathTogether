@@ -3694,14 +3694,18 @@ def create_run_grant(installation_id, slide, session_id="",
             with c.cursor() as cur:
                 if slide_id is None:
                     slide_id = _slide_id_of_name(cur, slide)
+                # 描绘默认随 grant 发放（是否画由模型按本轮消息决定）；写权限
+                # 仍由 annotate 路径按 grant 与创建者当前权限检查。
                 cur.execute(
                     "INSERT INTO run_grants "
                     "(grant_id, installation_id, slide, session_id, "
-                    " created_by_user_id, slide_id, created_at, expires_at) "
-                    "VALUES (%s,%s,%s,%s,%s,%s, to_timestamp(%s), to_timestamp(%s))",
+                    " created_by_user_id, slide_id, created_at, expires_at, "
+                    " allow_ai_drawing, drawing_bound_at, drawing_intent) "
+                    "VALUES (%s,%s,%s,%s,%s,%s, to_timestamp(%s), to_timestamp(%s), "
+                    " TRUE, to_timestamp(%s), 'default')",
                     (grant_id, installation_id, slide, session_id or "",
                      created_by_user_id or None, slide_id or None,
-                     now, now + ttl))
+                     now, now + ttl, now))
                 return _fetch_grant(cur, grant_id)
     finally:
         conn.close()
@@ -3780,7 +3784,7 @@ def bind_run_grant_session(grant_id, session_id):
         conn.close()
 
 
-_DRAWING_INTENTS = ("explicit", "model", "natural")
+_DRAWING_INTENTS = ("explicit", "model", "natural", "default")
 
 
 def set_run_grant_skill_delineate(grant_id, session_id, intent,

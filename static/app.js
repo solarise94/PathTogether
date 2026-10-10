@@ -2212,10 +2212,14 @@
         // （src 由通道控制器 setThumbnail 或 legacy 路径填充）。src 优先复用
         // 飞牌手里已解码的同一张缩略图（同 URL → 缓存直接命中，§4.2.2），
         // decode 完成前桥接层保持在场。
-        baseThumbEl = document.createElement("img");
-        baseThumbEl.className = "osd-base-thumb";
-        baseThumbEl.alt = "";
-        viewer.container.insertBefore(baseThumbEl, viewer.canvas);
+        // Slow metadata may arrive after the 8s fallback created this layer.
+        // Reuse it: overwriting the reference would orphan the visible preview.
+        if (!baseThumbEl) {
+          baseThumbEl = document.createElement("img");
+          baseThumbEl.className = "osd-base-thumb";
+          baseThumbEl.alt = "";
+          viewer.container.insertBefore(baseThumbEl, viewer.canvas);
+        }
         applyBaseThumbFlip();
         var dealThumbSrc = (slideDeal && slideDeal.seq === seq && slideDeal.image && slideDeal.image.src)
           ? slideDeal.image.src : null;
@@ -2407,7 +2411,7 @@
     var pulledLeft = Math.max(r.left + r.width * .6, target.left + 18);
     pulledLeft = Math.min(pulledLeft, window.innerWidth - r.width - 8);
     var pulled = { left: Math.max(r.left, pulledLeft), top: r.top, width: r.width, height: r.height };
-    var DEAL_MS = 700, PULL_END = .34;
+    var DEAL_MS = 620, PULL_END = .30;
     dealAnimate(deal, el, [
       { transform: dealBoxTransform(r, width, height), offset: 0, easing: "cubic-bezier(.5,0,.3,1)" },
       { transform: dealBoxTransform(pulled, width, height), offset: PULL_END, easing: "cubic-bezier(.35,.1,.2,1)" },
@@ -2415,9 +2419,9 @@
       { duration: DEAL_MS, easing: "linear", fill: "both" });
     dealAnimate(deal, card, [
       { transform: "rotateY(0deg) rotateZ(0deg)", offset: 0 },
-      { transform: "rotateY(0deg) rotateZ(-1.5deg)", offset: PULL_END },
-      { transform: "rotateY(0deg) rotateZ(-1.5deg)", offset: .4, easing: "cubic-bezier(.45,0,.25,1)" },
-      { transform: "rotateY(180deg) rotateZ(0deg)", offset: .92 },
+      // Start turning as the card clears the stack; finish at the instant
+      // spreading starts, without a motionless face-up beat in the centre.
+      { transform: "rotateY(0deg) rotateZ(-1.5deg)", offset: PULL_END, easing: "cubic-bezier(.45,0,.25,1)" },
       { transform: "rotateY(180deg) rotateZ(0deg)" }
     ], { duration: DEAL_MS, easing: "linear", fill: "both" }).then(function () {
       if (slideDeal !== deal) return;
@@ -2503,10 +2507,11 @@
     // 交接顺序（§4.2.4）：先把完整预览交给 viewer 底图层（OSD 透明区域下方
     // 已是同一张已解码预览，对齐几何），再淡出飞牌副本——不存在两处都空的帧。
     syncBaseThumb();
-    dealAnimate(deal, deal.landing, [{ opacity: 1 }, { opacity: 0 }], { duration: 180, fill: "forwards" });
+    var landingFade = dealAnimate(deal, deal.landing, [{ opacity: 1 }, { opacity: 0 }], { duration: 180, fill: "forwards" });
     // 桥接层（若还在）与飞牌副本同时退场：新预览已在它们下方完成交接
     retireBridgeThumb();
-    dealAnimate(deal, deal.el, [{ opacity: 1 }, { opacity: 0 }], { duration: 160, fill: "forwards" }).then(function () {
+    var cardFade = dealAnimate(deal, deal.el, [{ opacity: 1 }, { opacity: 0 }], { duration: 160, fill: "forwards" });
+    Promise.all([landingFade, cardFade]).then(function () {
       if (slideDeal === deal) cancelSlideDeal();
     });
   }
@@ -2526,8 +2531,9 @@
       baseThumbEl.src = deal.image.src;   // 同 URL → 缓存直接命中
     }
     if (deal.rect) {
-      baseThumbEl.style.left = deal.rect.left + "px";
-      baseThumbEl.style.top = deal.rect.top + "px";
+      var containerRect = viewer.container.getBoundingClientRect();
+      baseThumbEl.style.left = (deal.rect.left - containerRect.left) + "px";
+      baseThumbEl.style.top = (deal.rect.top - containerRect.top) + "px";
       baseThumbEl.style.width = deal.rect.width + "px";
       baseThumbEl.style.height = deal.rect.height + "px";
       baseThumbEl.style.display = "block";

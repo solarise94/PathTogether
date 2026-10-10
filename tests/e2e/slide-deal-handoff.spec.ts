@@ -143,7 +143,7 @@ async function scoreFrames(page: Page, frames: CapturedFrame[]) {
 		const s = Math.min(v.width / imgW, v.height / imgH);
 		const w = imgW * s, h = imgH * s;
 		const left = v.left + (v.width - w) / 2, top = v.top + (v.height - h) / 2;
-		return { left: left + w * 0.25, top: top + h * 0.25, width: w * 0.5, height: h * 0.5, cssW: v.width };
+		return { left: left + w * 0.25, top: top + h * 0.25, width: w * 0.5, height: h * 0.5, cssW: window.innerWidth };
 	}, { imgW: IMG_W, imgH: IMG_H });
 	const scores: FrameScore[] = [];
 	const BATCH = 24;
@@ -249,6 +249,20 @@ test.describe("翻牌交接逐帧黑闪检测（§4）", () => {
 	const A = CREDS.rasterSlides.workbench.slide_id;
 	const B = CREDS.rasterSlides.share.slide_id;
 
+	test("黑帧采样校准：侧栏存在时仍采到指定的白色组织区", async ({ page }) => {
+		await page.setViewportSize({ width: 1440, height: 900 });
+		// Known geometry: viewer=(224,60,1216,840), fitted image=(272,60,1120,840).
+		// Its central half is exactly (552,270,560,420). Everything else is dark.
+		await page.setContent(`<style>body { margin:0; background:#262a30 }
+			#viewer { position:fixed; left:224px; top:60px; width:1216px; height:840px }
+			#sample { position:fixed; left:552px; top:270px; width:560px; height:420px; background:white }
+			</style><div id="viewer"></div><div id="sample"></div>`);
+		const png = await page.screenshot();
+		const scores = await scoreFrames(page, [{ data: png.toString("base64"), w: 1440, h: 900, ts: Date.now() }]);
+		expect(scores[0].bgFraction).toBe(0);
+		expect(scores[0].meanLum).toBeCloseTo(255, 1);
+	});
+
 	test("暖缓存重开：已有切片保持可见，全程无组织区黑帧", async ({ page }) => {
 		await login(page);
 		await gotoAppAndExpand(page);
@@ -291,6 +305,34 @@ test.describe("翻牌交接逐帧黑闪检测（§4）", () => {
 			expect(report.frameCount).toBeGreaterThan(5);
 			expect(report.darkFrames, `黑帧: ${JSON.stringify(report.darkFrames)}`).toHaveLength(0);
 		}
+	});
+
+	test("info 超过 8 秒：退出装饰后预览不偏移，迟到响应不留下重复底图", async ({ page }) => {
+		await login(page);
+		let release!: () => void;
+		const gate = new Promise<void>(resolve => { release = resolve; });
+		await page.route(`**/api/slides/${A}/info`, async route => {
+			await gate;
+			await route.continue();
+		});
+		try {
+			await gotoAppAndExpand(page);
+			const row = await slideRow(page, A);
+			await expect.poll(() => row.locator("img").evaluate((e: HTMLImageElement) => e.complete && e.naturalWidth > 0)).toBe(true);
+			await row.focus();
+			await page.keyboard.press("Enter");
+			await expect(page.locator('.slide-deal[data-phase="preview"]')).toBeAttached();
+			const landing = await page.locator(".slide-deal-landing").boundingBox();
+			await expect(page.locator(".slide-deal")).toHaveCount(0, { timeout: 12_000 });
+			const base = page.locator("#viewer .osd-base-thumb");
+			await expect(base).toHaveCount(1);
+			const actual = await base.boundingBox();
+			expect(Math.abs(actual!.x - landing!.x), "timeout must preserve page-space X").toBeLessThan(2);
+			expect(Math.abs(actual!.y - landing!.y), "timeout must preserve page-space Y").toBeLessThan(2);
+			release();
+			await expect.poll(() => canvasCenterHasPixels(page)).toBe(true);
+			await expect(base).toHaveCount(1);
+		} finally { release(); }
 	});
 
 	test("扣住首瓦片 1.5s：已解码预览保持，无组织区黑帧", async ({ page }) => {

@@ -1,0 +1,124 @@
+{
+  "gunicorn": "23.0.0",
+  "threads": 2,
+  "lock_wait_seconds": 2,
+  "client_timeout_seconds": 8,
+  "clients": [
+    {
+      "id": "first",
+      "status": "client_timeout",
+      "elapsed": 8.009
+    },
+    {
+      "id": "0",
+      "status": 503,
+      "elapsed": 2.002
+    },
+    {
+      "id": "1",
+      "status": 503,
+      "elapsed": 4.003
+    },
+    {
+      "id": "2",
+      "status": 503,
+      "elapsed": 6.005
+    },
+    {
+      "id": "3",
+      "status": 503,
+      "elapsed": 8.006
+    },
+    {
+      "id": "4",
+      "status": "client_timeout",
+      "elapsed": 8.009
+    },
+    {
+      "id": "5",
+      "status": "client_timeout",
+      "elapsed": 8.01
+    },
+    {
+      "id": "6",
+      "status": "client_timeout",
+      "elapsed": 8.01
+    },
+    {
+      "id": "7",
+      "status": "client_timeout",
+      "elapsed": 8.009
+    },
+    {
+      "id": "8",
+      "status": "client_timeout",
+      "elapsed": 8.01
+    },
+    {
+      "id": "9",
+      "status": "client_timeout",
+      "elapsed": 8.009
+    },
+    {
+      "id": "10",
+      "status": "client_timeout",
+      "elapsed": 8.009
+    }
+  ],
+  "inference_starts": [
+    {
+      "id": "first",
+      "started": 0.009
+    },
+    {
+      "id": "6",
+      "started": 12.013
+    },
+    {
+      "id": "5",
+      "started": 12.034
+    },
+    {
+      "id": "7",
+      "started": 12.056
+    },
+    {
+      "id": "8",
+      "started": 12.078
+    },
+    {
+      "id": "9",
+      "started": 12.101
+    },
+    {
+      "id": "10",
+      "started": 12.124
+    }
+  ],
+  "late_inference": [
+    {
+      "id": "6",
+      "started": 12.013
+    },
+    {
+      "id": "5",
+      "started": 12.034
+    },
+    {
+      "id": "7",
+      "started": 12.056
+    },
+    {
+      "id": "8",
+      "started": 12.078
+    },
+    {
+      "id": "9",
+      "started": 12.101
+    },
+    {
+      "id": "10",
+      "started": 12.124
+    }
+  ]
+}

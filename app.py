@@ -19204,6 +19204,83 @@ def plugin_v1_region(slide):
     """
     return plugin_v1_region_impl(slide=slide)
 
+def _plugin_render_cost_estimate(w, h, wire_ctx=None, max_long_edge=None,
+                                 out_w=None, out_h=None,
+                                 decode_long_edge=1568,
+                                 level_downsamples=None):
+    """单请求像素成本估算（regions 与 contours/refine 共用；纯算术、零解码）。
+
+    返回 ``(pixels, out_pixels, est_decode_pixels, n_channels)``：
+
+      - 输出像素：``max_long_edge`` 给定时保宽高比（与 _read_region_pil 同式），
+        否则显式 ``out_w/out_h``（缺省 1568，clamp 4096）；
+      - 解码估算：``level_downsamples`` 给出时**精确镜像** choose_read_level
+        的选层取数（round(w/ds_lvl)×round(h/ds_lvl)）——调用方已借到句柄时用
+        （contours/refine；单层大切片即使输出 ≤1024 也是全量解码，只有镜像
+        真实金字塔才能拦住）；缺省沿用 1568 长边整数分式算术（regions 闸门在
+        借句柄前，保持零磁盘）；
+      - 多通道按 wire context 声明通道数放大（未校验前即按声明数计，宁多勿少，
+        上限 MAX_ACTIVE_CHANNELS=8；native-rgb-v1 恒为 1）；
+      - ``pixels = max(out_pixels, est_decode_pixels * n_channels)``（计费口径
+        = 本次请求的真实成本）。
+    """
+    if max_long_edge is not None and max_long_edge > 0:
+        est_ow, est_oh = _aspect_fit_size(w, h, max_long_edge)
+    else:
+        est_ow = max(1, min(int(out_w or 1568), 4096))
+        est_oh = max(1, min(int(out_h or 1568), 4096))
+    out_pixels = int(est_ow) * int(est_oh)
+    if level_downsamples is not None:
+        # 与 _read_region_pil 完全同式：先合法 out，再 choose_read_level 选层
+        _, ds_lvl, _ = slide_render.choose_read_level(
+            level_downsamples, w, h, est_ow, est_oh)
+        est_dec_w = max(1, int(round(w / ds_lvl)))
+        est_dec_h = max(1, int(round(h / ds_lvl)))
+    else:
+        # ds = max(w,h)/1568（max>1568 时，否则 1）；整数分式 w*1568/L 精确求
+        # ceil，等价于 w/ds 且无浮点整除边界噪声。
+        _long_edge = max(int(w), int(h))
+        if _long_edge > decode_long_edge:
+            est_dec_w = (int(w) * decode_long_edge + _long_edge - 1) // _long_edge
+            est_dec_h = (int(h) * decode_long_edge + _long_edge - 1) // _long_edge
+        else:
+            est_dec_w, est_dec_h = int(w), int(h)
+    est_decode_pixels = est_dec_w * est_dec_h
+    _n_channels = 1
+    if isinstance(wire_ctx, dict) \
+            and wire_ctx.get("version") != slide_render.CONTEXT_VERSION_NATIVE_RGB:
+        _declared = wire_ctx.get("active_channels")
+        if isinstance(_declared, list) and _declared:
+            _n_channels = max(1, min(len(_declared),
+                                     slide_render.MAX_ACTIVE_CHANNELS))
+    pixels = max(out_pixels, est_decode_pixels * _n_channels)
+    return pixels, out_pixels, est_decode_pixels, _n_channels
+
+
+def _plugin_admit_region_pixels(installation_id, pixels):
+    """并发闸 + 滑窗像素预算的共享准入（regions 与 contours/refine 共用）。
+
+    返回 ``(err, retry_after)``：
+
+      - ``err=None``：并发槽已占用且像素已计入滑窗。调用方必须在读盘/解码
+        完成后 ``_PLUGIN_REGION_CONCURRENCY_SEM.release()``（try/finally）。
+      - ``err="concurrency"``：并发槽满（非阻塞 acquire 失败，未占资源）。
+      - ``err="pixel_budget"``：滑窗预算不足（并发槽已在本次调用内回退）。
+    """
+    acquired = _PLUGIN_REGION_CONCURRENCY_SEM.acquire(blocking=False)
+    if not acquired:
+        return "concurrency", 1
+    try:
+        ok, retry = _PLUGIN_PIXEL_WINDOW.admit(installation_id, pixels)
+    except BaseException:
+        _PLUGIN_REGION_CONCURRENCY_SEM.release()
+        raise
+    if not ok:
+        _PLUGIN_REGION_CONCURRENCY_SEM.release()
+        return "pixel_budget", retry
+    return None, 0
+
+
 def _plugin_region_body(claims, safe, gate, sid, _region_path, body):
     """region 端点主体（P2 抽出：名/by-id 路由共用；收录复核已在前置完成）。"""
     # bbox 契约形态 → 平铺（两者同给时以平铺为准，与 internal 端点语义对齐）
@@ -19251,37 +19328,17 @@ def _plugin_region_body(claims, safe, gate, sid, _region_path, body):
 
     # ---- 像素预算闸 1：单请求上限（纯算术，零磁盘；必须在读盘/解码前拒绝）---- #
     # 计费口径 = 本次请求的真实成本：max(输出像素, 估算解码像素 × 启用通道数)。
-    # §7.4：多通道真实解码成本随通道数线性增长——**8 通道不能当 1 通道计费**；
-    # 通道数取自请求 context（未校验前即按声明数计费，宁多勿少），上限 8。
-    # 输出像素 = est_ow*est_oh（max_long_edge 给定时按保宽高比估算；否则用显式
-    # out_w/out_h，缺省 1568，clamp 4096）。解码估算与 _read_region_b64 的选层
-    # 取数同式（零磁盘 IO 的纯算术）：ds = max(w,h)/1568（max>1568 时，否则 1），
-    # est_decode = ceil(w/ds)*ceil(h/ds)（≈从金字塔层解码的 rw*rh 量级，长边
-    # ≤1568；用整数分式 w*1568/L 精确求 ceil，等价于 w/ds 且无浮点整除边界噪声）。
+    # §7.4：多通道真实解码成本随通道数线性增长——**8 通道不能当 1 通道计费**。
+    # 估算/通道数取 _plugin_render_cost_estimate（与 contours/refine 共用；
+    # 此处不传 level_downsamples，闸门保持在借句柄前、零磁盘 IO 的纯算术——
+    # 解码估算与 _read_region_b64 的选层取数同式：约 1568 长边量级）。
     # 注意：**不按 level-0 bbox 面积 w*h 计费**——低放大层级的大视野小输出取景
     # （bbox 可达 8192²+，真实解码仅 ≈1568 长边）会被误杀；而输出被 clamp 4096，
     # 真正巨大的输出请求仍会被本闸拦下。
-    if max_long_edge is not None and max_long_edge > 0:
-        est_ow, est_oh = _aspect_fit_size(w, h, max_long_edge)
-    else:
-        est_ow = max(1, min(int(out_w or 1568), 4096))
-        est_oh = max(1, min(int(out_h or 1568), 4096))
-    _long_edge = max(int(w), int(h))
-    if _long_edge > 1568:
-        est_dec_w = (int(w) * 1568 + _long_edge - 1) // _long_edge  # ceil(w/ds)
-        est_dec_h = (int(h) * 1568 + _long_edge - 1) // _long_edge  # ceil(h/ds)
-    else:
-        est_dec_w, est_dec_h = int(w), int(h)
-    est_decode_pixels = est_dec_w * est_dec_h
-    out_pixels = int(est_ow) * int(est_oh)
-    _n_channels = 1
-    if isinstance(wire_ctx, dict) \
-            and wire_ctx.get("version") != slide_render.CONTEXT_VERSION_NATIVE_RGB:
-        _declared = wire_ctx.get("active_channels")
-        if isinstance(_declared, list) and _declared:
-            _n_channels = max(1, min(len(_declared),
-                                     slide_render.MAX_ACTIVE_CHANNELS))
-    pixels = max(out_pixels, est_decode_pixels * _n_channels)
+    pixels, out_pixels, est_decode_pixels, _n_channels = \
+        _plugin_render_cost_estimate(w, h, wire_ctx,
+                                     max_long_edge=max_long_edge,
+                                     out_w=out_w, out_h=out_h)
     if pixels > _PLUGIN_REGION_MAX_PIXELS:
         # 文案按实际触发项区分（out_pixels >= est_decode_pixels 时输出为主因）：
         # 输出超限 → 引导缩输出尺寸；解码量超限（仅在 PLUGIN_REGION_MAX_PIXELS
@@ -19320,23 +19377,23 @@ def _plugin_region_body(claims, safe, gate, sid, _region_path, body):
             return _plugin_error(409, "slide_revision_conflict", "切片指纹不匹配（文件已变更）",
                                  details={"expected": expected_fp, "actual": fp})
 
-    # ---- 并发闸：进程级信号量（非阻塞；仅保护插件 region 通道）---- #
+    # ---- 并发闸 + 像素预算闸 2：共享准入（与 contours/refine 同一闸门）---- #
     installation_id = claims.get("sub") or ""
-    acquired = _PLUGIN_REGION_CONCURRENCY_SEM.acquire(blocking=False)
-    if not acquired:
+    admission_err, admission_retry = _plugin_admit_region_pixels(
+        installation_id, pixels)
+    if admission_err == "concurrency":
         return _plugin_rate_limited_response(
             "region 并发已达上限（%d），请稍后重试" % _PLUGIN_REGION_MAX_CONCURRENT, 1,
             details={"max_concurrent": _PLUGIN_REGION_MAX_CONCURRENT,
                      "reason": "concurrency"})
+    if admission_err == "pixel_budget":
+        return _plugin_rate_limited_response(
+            "region 像素预算耗尽（每分钟 %d 像素），请稍后重试"
+            % _PLUGIN_REGION_PIXEL_BUDGET_PER_MIN, admission_retry,
+            details={"pixels": pixels, "budget_per_min": _PLUGIN_REGION_PIXEL_BUDGET_PER_MIN,
+                     "reason": "pixel_budget"})
     try:
-        # ---- 像素预算闸 2：滑窗预算（拿到并发槽后、读盘前计入；超限零磁盘）---- #
-        ok, retry = _PLUGIN_PIXEL_WINDOW.admit(installation_id, pixels)
-        if not ok:
-            return _plugin_rate_limited_response(
-                "region 像素预算耗尽（每分钟 %d 像素），请稍后重试"
-                % _PLUGIN_REGION_PIXEL_BUDGET_PER_MIN, retry,
-                details={"pixels": pixels, "budget_per_min": _PLUGIN_REGION_PIXEL_BUDGET_PER_MIN,
-                         "reason": "pixel_budget"})
+        # （并发槽已占用、像素已计入滑窗；_plugin_admit_region_pixels 契约）
         entry = _get_slide(gate if gate is not None else safe)
         with slide_cache.borrow_pair(entry) as pair:
             osr = pair["osr"]
@@ -19434,6 +19491,11 @@ def _plugin_region_body(claims, safe, gate, sid, _region_path, body):
 # 鉴权/收录复核与 regions 完全同链（_require_plugin_token("region:read") +
 # _plugin_resolve_slide_ref + _plugin_slide_run_grant_gate，不弱化）；只读，
 # 不落标注、不写审计之外的状态。
+#
+# 2026-10-10 复核 R2/R4：读盘前过与 regions 共用的解码预算闸
+# （_plugin_render_cost_estimate 精确镜像选层 + 滑窗/并发准入——单层大切片
+# 全量解码、多通道成本不再漏计）；body 可带 render_context（/regions 同
+# wire 形态），crop 按该 context 渲染并回 canonical fingerprint。
 # --------------------------------------------------------------------------- #
 #: refine crop 长边上限（与离线原型一致；服务侧入参上限 2048 的子集）
 _PLUGIN_CONTOUR_REFINE_MAX_CROP_EDGE = 1024
@@ -19462,8 +19524,20 @@ def _plugin_validate_level0_points(points):
     return None
 
 
-def _plugin_contour_refine_unavailable(reason, **extra):
-    """refine 端点的服务侧结果统一信封（HTTP 200，refined:false）。"""
+#: refine 信封 render_context_fingerprint 的「不回显」哨兵（unavailable 路径
+#: 保持旧 7 键契约，兼容既有调用方/测试）
+_PLUGIN_REFINE_FP_OMIT = object()
+
+
+def _plugin_contour_refine_unavailable(reason,
+                                       render_fingerprint=_PLUGIN_REFINE_FP_OMIT,
+                                       **extra):
+    """refine 端点的服务侧结果统一信封（HTTP 200，refined:false）。
+
+    ``render_fingerprint``：回显本次 crop 实际使用的 canonical render
+    fingerprint（默认渲染为 None）。仅 ``unavailable``（未读盘、无指纹可回显）
+    省略该键；其余路径显式传值（含 None）。
+    """
     payload = {
         "refined": False,
         "points": None,
@@ -19473,17 +19547,28 @@ def _plugin_contour_refine_unavailable(reason, **extra):
         "reason": reason,
         "seconds": None,
     }
+    if render_fingerprint is not _PLUGIN_REFINE_FP_OMIT:
+        payload["render_context_fingerprint"] = render_fingerprint
     payload.update(extra)
     return jsonify(payload)
 
 
-def _plugin_contour_refine_body(safe, gate, sid):
+def _plugin_contour_refine_body(claims, safe, gate, sid):
     """contours/refine 端点主体（名/by-id 路由共用；鉴权/复核已在前置完成）。"""
     body = request.get_json(silent=True) or {}
     points = body.get("points")
     points_err = _plugin_validate_level0_points(points)
     if points_err is not None:
         return _plugin_error(400, "invalid_request", points_err)
+
+    # wire render_context（snake / camel 容错，与 _plugin_region_body 同式）：
+    # 非对象是请求形状错误 → 400；其余 context 校验发生在读取期，refine 尽力
+    # 而为 → 200 refined:false reason render_context（调用方保留模型轮廓）。
+    wire_ctx = body.get("render_context")
+    if wire_ctx is None:
+        wire_ctx = body.get("renderContext")
+    if wire_ctx is not None and not isinstance(wire_ctx, dict):
+        return _plugin_error(400, "invalid_request", "render_context 必须是对象")
 
     # 指纹 CAS（与 regions 同语义）：expected_fingerprint 不符 → 409
     _region_path = _desc_path(gate) if gate is not None else (UPLOAD_DIR / safe)
@@ -19504,10 +19589,13 @@ def _plugin_contour_refine_body(safe, gate, sid):
     cw = int(math.ceil(x1 + pad)) - cx0
     ch = int(math.ceil(y1 + pad)) - cy0
 
-    # 越界校验（合法性校验先于服务可用性判断，不随服务配置改变 400 语义）
+    # 越界校验（合法性校验先于服务可用性判断，不随服务配置改变 400 语义）；
+    # 顺带取金字塔层信息（R2 解码估算要精确镜像选层）
     entry = _get_slide(gate if gate is not None else safe)
     with slide_cache.borrow_pair(entry) as pair:
-        width, height = pair["osr"].dimensions
+        osr = pair["osr"]
+        width, height = osr.dimensions
+        level_downsamples = osr.level_downsamples
     if x1 < 0 or y1 < 0 or x0 >= width or y0 >= height:
         return _plugin_error(400, "invalid_request",
                              "points 完全位于切片范围外（%dx%d）" % (width, height))
@@ -19515,72 +19603,126 @@ def _plugin_contour_refine_body(safe, gate, sid):
     if not CONTOUR_REFINE_URL:
         return _plugin_contour_refine_unavailable("unavailable")
 
-    # 读 crop（PNG 无损、无刻度尺叠加）：与 regions 同一条 _read_region_pil
-    # 路径（存储布局/选层/夹取一致）；长边 ≤1024 由 max_long_edge 保证。
+    # ---- R2 解码预算闸（任何 read_region 之前；与 regions 共用估算/准入）---- #
+    # 估算镜像 _read_region_pil 的夹取 + 选层（level_downsamples 精确镜像
+    # choose_read_level：单层大切片即使输出 ≤1024 也是全量解码，输出上限挡
+    # 不住原始解码量）；多通道按声明通道数放大。超单请求上限 → too_large，
+    # 不读盘（refine 尽力而为，调用方保留模型轮廓）。
+    x2 = max(0, min(cx0, max(0, width - 1)))
+    y2 = max(0, min(cy0, max(0, height - 1)))
+    w2 = max(0, min(cw, max(0, width - x2)))
+    h2 = max(0, min(ch, max(0, height - y2)))
+    if w2 <= 0 or h2 <= 0:
+        w2, h2 = 1, 1
+    pixels, _out_pixels, _est_decode, _n_channels = \
+        _plugin_render_cost_estimate(
+            w2, h2, wire_ctx,
+            max_long_edge=_PLUGIN_CONTOUR_REFINE_MAX_CROP_EDGE,
+            level_downsamples=level_downsamples)
+    if pixels > _PLUGIN_REGION_MAX_PIXELS:
+        app.logger.info(
+            "contours/refine 解码预算超限（slide=%s pixels=%d > %d）→ too_large",
+            safe, pixels, _PLUGIN_REGION_MAX_PIXELS)
+        return _plugin_contour_refine_unavailable("too_large",
+                                                  render_fingerprint=None)
+
+    # 滑窗/并发准入与 regions 同一闸门、同窗口计入；拒绝 → busy
+    installation_id = claims.get("sub") or ""
+    admission_err, _retry = _plugin_admit_region_pixels(installation_id, pixels)
+    if admission_err is not None:
+        return _plugin_contour_refine_unavailable("busy",
+                                                  render_fingerprint=None)
+
     try:
-        region, rmeta = _read_region_pil(
-            entry, cx0, cy0, cw, ch, 1, 1, safe, None,
-            max_long_edge=_PLUGIN_CONTOUR_REFINE_MAX_CROP_EDGE)
-    except (slide_render.RenderRequestError,
-            slide_io.SlideRenderError) as e:
-        status = getattr(e, "status", None) \
-            or slide_render.RENDER_ERROR_HTTP.get(getattr(e, "code", ""), 400)
-        return _plugin_error(status, getattr(e, "code",
-                                             "invalid_render_context"),
-                             str(e))
-    buf = io.BytesIO()
-    region.save(buf, format="PNG")
-    png_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        # 读 crop（PNG 无损、无刻度尺叠加）：与 regions 同一条 _read_region_pil
+        # 路径（存储布局/选层/夹取/render context 校验一致）；长边 ≤1024 由
+        # max_long_edge 保证。context 无效/过期（稳定码与 regions 同源，如
+        # invalid_render_context / slide_revision_conflict）→ 尽力而为回
+        # reason render_context，不升格 4xx/409。
+        try:
+            region, rmeta = _read_region_pil(
+                entry, cx0, cy0, cw, ch, 1, 1, safe, None,
+                max_long_edge=_PLUGIN_CONTOUR_REFINE_MAX_CROP_EDGE,
+                render_context=wire_ctx,
+                expected_revision=_slide_revision(gate))
+        except (slide_render.RenderRequestError,
+                slide_io.SlideRenderError) as e:
+            app.logger.info(
+                "contours/refine render_context 校验失败（slide=%s）：%s", safe, e)
+            return _plugin_contour_refine_unavailable(
+                "render_context", render_fingerprint=None)
+        render_fp = rmeta.get("render_fingerprint")
+        buf = io.BytesIO()
+        region.save(buf, format="PNG")
+        png_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
 
-    # level-0 → crop 像素映射（crop 实际起点/尺寸以夹取后的 src 为准）
-    src = rmeta["src"]
-    sx = float(region.size[0]) / max(1.0, float(src["w"]))
-    sy = float(region.size[1]) / max(1.0, float(src["h"]))
-    crop_polygon = [[(float(px) - src["x"]) * sx, (float(py) - src["y"]) * sy]
-                    for px, py in points]
+        # level-0 → crop 像素映射（crop 实际起点/尺寸以夹取后的 src 为准）
+        src = rmeta["src"]
+        sx = float(region.size[0]) / max(1.0, float(src["w"]))
+        sy = float(region.size[1]) / max(1.0, float(src["h"]))
+        crop_polygon = [[(float(px) - src["x"]) * sx, (float(py) - src["y"]) * sy]
+                        for px, py in points]
 
-    headers = {"X-Refine-Token": CONTOUR_REFINE_TOKEN} if CONTOUR_REFINE_TOKEN else {}
-    try:
-        r = requests.post(
-            CONTOUR_REFINE_URL + "/v1/refine",
-            json={"image_png_b64": png_b64, "polygon": crop_polygon},
-            timeout=_CONTOUR_REFINE_TIMEOUT_S, headers=headers)
-        if r.status_code != 200:
-            raise ValueError("contour-refine HTTP %d" % r.status_code)
-        svc = r.json()
-        if not isinstance(svc, dict) or not isinstance(svc.get("accepted"), bool):
-            raise ValueError("contour-refine 响应形状异常")
-    except (_CONTOUR_REFINE_REQUEST_EXC, ValueError) as e:
-        # 服务错误/超时/坏 JSON：告警不透栈，客户端保留 LLM 原轮廓
-        app.logger.warning("contour-refine 服务调用失败（slide=%s）：%s", safe, e)
-        return _plugin_contour_refine_unavailable("service_error")
+        headers = {"X-Refine-Token": CONTOUR_REFINE_TOKEN} if CONTOUR_REFINE_TOKEN else {}
+        try:
+            r = requests.post(
+                CONTOUR_REFINE_URL + "/v1/refine",
+                json={"image_png_b64": png_b64, "polygon": crop_polygon},
+                timeout=_CONTOUR_REFINE_TIMEOUT_S, headers=headers)
+            if r.status_code == 503:
+                # 服务忙（推理串行、排队等待超 CONTOUR_REFINE_QUEUE_WAIT_S）：
+                # 尽力而为回 busy，不让已超时的客户端在后台继续堆积计算
+                try:
+                    svc_body = r.json()
+                except ValueError:
+                    svc_body = None
+                if isinstance(svc_body, dict) and svc_body.get("error") == "busy":
+                    return _plugin_contour_refine_unavailable(
+                        "busy", render_fingerprint=render_fp)
+            if r.status_code != 200:
+                raise ValueError("contour-refine HTTP %d" % r.status_code)
+            svc = r.json()
+            if not isinstance(svc, dict) or not isinstance(svc.get("accepted"), bool):
+                raise ValueError("contour-refine 响应形状异常")
+        except (_CONTOUR_REFINE_REQUEST_EXC, ValueError) as e:
+            # 服务错误/超时/坏 JSON：告警不透栈，客户端保留 LLM 原轮廓
+            app.logger.warning("contour-refine 服务调用失败（slide=%s）：%s", safe, e)
+            return _plugin_contour_refine_unavailable(
+                "service_error", render_fingerprint=render_fp)
 
-    if not svc.get("accepted"):
-        return _plugin_contour_refine_unavailable(
-            svc.get("reason") or "rejected",
-            score=svc.get("score"), area_ratio=svc.get("area_ratio"),
-            model=svc.get("model"), seconds=svc.get("seconds"))
+        if not svc.get("accepted"):
+            return _plugin_contour_refine_unavailable(
+                svc.get("reason") or "rejected",
+                score=svc.get("score"), area_ratio=svc.get("area_ratio"),
+                model=svc.get("model"), seconds=svc.get("seconds"),
+                render_fingerprint=render_fp)
 
-    svc_points = svc.get("points")
-    if not isinstance(svc_points, (list, tuple)) \
-            or not all(isinstance(p, (list, tuple)) and len(p) == 2
-                       and all(isinstance(v, (int, float))
-                               and math.isfinite(v) for v in p)
-                       for p in svc_points):
-        app.logger.warning("contour-refine 服务返回的点列形状异常（slide=%s）", safe)
-        return _plugin_contour_refine_unavailable("service_error")
-    level0_points = [[int(round(float(px) / sx + src["x"])),
-                      int(round(float(py) / sy + src["y"]))]
-                     for px, py in svc_points]
-    return jsonify({
-        "refined": True,
-        "points": level0_points,
-        "score": svc.get("score"),
-        "area_ratio": svc.get("area_ratio"),
-        "model": svc.get("model"),
-        "reason": None,
-        "seconds": svc.get("seconds"),
-    })
+        svc_points = svc.get("points")
+        if not isinstance(svc_points, (list, tuple)) \
+                or not all(isinstance(p, (list, tuple)) and len(p) == 2
+                           and all(isinstance(v, (int, float))
+                                   and math.isfinite(v) for v in p)
+                           for p in svc_points):
+            app.logger.warning("contour-refine 服务返回的点列形状异常（slide=%s）", safe)
+            return _plugin_contour_refine_unavailable(
+                "service_error", render_fingerprint=render_fp)
+        level0_points = [[int(round(float(px) / sx + src["x"])),
+                          int(round(float(py) / sy + src["y"]))]
+                         for px, py in svc_points]
+        return jsonify({
+            "refined": True,
+            "points": level0_points,
+            "score": svc.get("score"),
+            "area_ratio": svc.get("area_ratio"),
+            "model": svc.get("model"),
+            "reason": None,
+            "seconds": svc.get("seconds"),
+            # §0.7 R4：回显本次 crop 的 canonical render fingerprint
+            # （默认渲染为 null；与 /regions 的 render_context_fingerprint 同名）
+            "render_context_fingerprint": render_fp,
+        })
+    finally:
+        _PLUGIN_REGION_CONCURRENCY_SEM.release()
 
 
 @app.route("/api/plugin/v1/slides/by-id/<slide_id>/contours/refine", methods=["POST"])
@@ -19600,7 +19742,7 @@ def plugin_v1_contour_refine_impl(slide=None, slide_id=None):
     gerr = _plugin_slide_run_grant_gate(safe, claims, slide_id=sid)
     if gerr is not None:
         return gerr
-    return _plugin_contour_refine_body(safe, gate, sid)
+    return _plugin_contour_refine_body(claims, safe, gate, sid)
 
 
 @app.route("/api/plugin/v1/slides/<slide>/contours/refine", methods=["POST"])
@@ -19608,15 +19750,22 @@ def plugin_v1_contour_refine(slide):
     """LLM 轮廓 SAM2 精修（读 crop 调 contour-refine 服务）。scope: region:read。
 
     body：{points: [[x,y],...]（level-0 像素，3..500 个有限数值点），
-    expected_fingerprint?（与 regions 同语义，不符 → 409 slide_revision_conflict）}。
-    读取与 regions 同一条 _read_region_pil 路径（存储布局/选层/夹取一致），
-    crop = bbox 外扩 0.25*max(w,h)+40、长边 ≤1024、PNG 无损；映射到 crop 像素
-    调 CONTOUR_REFINE_URL/v1/refine，接受则回 level-0 整数点。
+    expected_fingerprint?（与 regions 同语义，不符 → 409 slide_revision_conflict），
+    render_context?（与 /regions 同 wire 形态，camelCase renderContext 容错；
+    非对象 400 invalid_request）}。
+    读取与 regions 同一条 _read_region_pil 路径（存储布局/选层/夹取/render
+    context 校验一致），crop = bbox 外扩 0.25*max(w,h)+40、长边 ≤1024、PNG
+    无损；映射到 crop 像素调 CONTOUR_REFINE_URL/v1/refine，接受则回 level-0
+    整数点。
 
     响应（服务侧结果一律 200）：``{refined, points|None, score, area_ratio,
-    model, reason, seconds}``；CONTOUR_REFINE_URL 未配置 →
-    ``{refined:false, reason:"unavailable"}``；服务错误/超时/坏响应 →
-    ``{refined:false, reason:"service_error"}``（客户端保留 LLM 原轮廓）。
+    model, reason, seconds, render_context_fingerprint}``（fingerprint 为本次
+    crop 的 canonical render fingerprint，默认渲染为 null；unavailable 路径
+    无该键）。refined:false 的 reason 除 unavailable / service_error / 服务自身
+    拒绝码外，新增：``too_large``（解码预算超单请求上限，未读盘）、``busy``
+    （像素滑窗/并发准入拒绝，或服务推理排队超限回 503 busy）、
+    ``render_context``（读取期 context 校验失败/revision 过期——尽力而为，
+    不升格 4xx/409；调用方一律保留 LLM 原轮廓）。
     校验失败 → 400 invalid_request（统一错误信封）。只读端点：不落标注、
     不写任何存储。
     """

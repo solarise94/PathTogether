@@ -14,10 +14,12 @@ PathTogether 平台侧入口：`POST /api/plugin/v1/slides/<slide>/contours/refi
 ### `GET /healthz`
 
 ```json
-{"ok": true, "device": "cuda", "model": "sam2.1-hiera-b+"}
+{"ok": true, "device": "cuda", "model": "sam2.1-hiera-b+", "pid": 7}
 ```
 
-模型加载失败时 `ok=false` 且 HTTP 503。
+只读本 **worker 进程**的就绪状态（不触发加载）：模型未加载/加载失败 →
+`ok=false` 且 HTTP 503。`pid` + `device` 用于确认模型确实加载在本 worker
+（见下「模型加载与 fork」），不能证明 master 或其它进程的 GPU 推理可用。
 
 ### `POST /v1/refine`
 
@@ -51,7 +53,11 @@ PathTogether 平台侧入口：`POST /api/plugin/v1/slides/<slide>/contours/refi
 
 - `points`：crop 像素整数点（拒绝时为 `null`，调用方保留 LLM 原轮廓）；
 - `reason`（拒绝时）：`low_score` / `area_ratio` / `empty_mask` /
-  `too_few_points`。
+  `too_few_points`；
+- 排队上界：单模型实例推理串行（进程内互斥锁）；另一推理进行中时最多等
+  `CONTOUR_REFINE_QUEUE_WAIT_S`（默认 2 s），超时 → **HTTP 503
+  `{"error": "busy"}`**（调用方 PT 映射为 `refined:false` reason `busy`，
+  不无限排队——PT 客户端 8 s 超时，已放弃的请求不能在后台继续堆积计算）。
 
 算法（`refine.py`，纯逻辑、可脱离 torch 单测）：
 
@@ -80,6 +86,26 @@ podman run -d --name contour-refine \
 - 需要 NVIDIA CDI（`nvidia-ctk cdi generate`）；无 GPU 时自动回落 CPU
   （单次推理显著变慢，冒烟可用）。
 
+### 模型加载与 fork（勿回退 --preload）
+
+镜像命令 `gunicorn --config gunicorn.conf.py app:app` **不用 `--preload`**
+（`gunicorn.conf.py` 显式 `preload_app = False`）：app 导入与 SAM2/CUDA 初始化
+都发生在 fork 之后的 worker 进程内（import 期 eager load +
+`post_worker_init` 幂等 warm-up，`CONTOUR_REFINE_EAGER_LOAD=0` 部署下也保证
+worker 启动即加载）。CUDA 上下文在 gunicorn master 创建后被 fork 继承违反
+PyTorch 的 poison-fork 约束（GPU 模式下必须避免）。单 worker 不变；`python
+app.py` 直跑（开发）行为不变。
+
+**GPU 验收**（只看 `/healthz` 不足，需真实推理）：
+
+1. 在 GPU 机器上用最终镜像运行（如上），`curl /healthz` 确认
+   `"ok": true` 且 `"device": "cuda"`、`pid` 为 worker 进程；
+2. 真实 `POST /v1/refine`（curl 自检的 req.json）返回 `accepted` 结果、
+   `seconds` 量级正常（GPU 单次 ≪1 s）；
+3. 超时回退：把 PT 侧 `CONTOUR_REFINE_TIMEOUT_S` 临时调小（或停服务）发起
+   细化，确认 PT 回 `refined:false`（`service_error` / `busy`）且保留模型
+   原轮廓，服务端无请求堆积。
+
 curl 自检：
 
 ```bash
@@ -103,7 +129,8 @@ curl -s -X POST http://127.0.0.1:8970/v1/refine \
 | `SAM2_CHECKPOINT` | `/models/sam2.1_hiera_base_plus.pt` | 权重路径（挂载点内） |
 | `SAM2_CONFIG` | `configs/sam2.1/sam2.1_hiera_b+.yaml` | SAM2 模型配置名 |
 | `CONTOUR_REFINE_TOKEN` | 未设置 | 设置后强制 `X-Refine-Token` 共享密钥 |
-| `CONTOUR_REFINE_EAGER_LOAD` | `1` | 启动即加载模型（测试置 0 改惰性） |
+| `CONTOUR_REFINE_QUEUE_WAIT_S` | `2` | 推理排队等待上界（秒）；超时 503 `busy` |
+| `CONTOUR_REFINE_EAGER_LOAD` | `1` | 启动即加载模型（worker 内；测试置 0 改惰性） |
 | `CONTOUR_REFINE_MAX_IMAGE_EDGE` | `2048` | 入参图像长边上限（px） |
 | `CONTOUR_REFINE_MAX_BODY_BYTES` | `8388608` | 请求体上限（字节） |
 | `CONTOUR_REFINE_SCORE_MIN` | `0.75` | 接受分数下限 |

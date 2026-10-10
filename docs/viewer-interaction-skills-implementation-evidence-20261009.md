@@ -157,9 +157,9 @@ PT 子分支：`vi-chrome` 8d46e7c8（A 标题整栏拖动 + B 无黑幕交接�
 
 ### 8.2 实测中发现的两处既有缺陷（与本轮设计无关，已修）
 
-1. **生产 AI 读片自 2026-10-01 起全部失败「切片不存在」**：HP 把 slide_id 拼到按文件名的路由
-   `/api/plugin/v1/slides/<id>`，应为 `/slides/by-id/<id>`。生产会话 10-06 ×3、10-09 均为 agent_error，
-   最后一次成功是 09-29。修复：HP `e698fce`（集成分支）；另在 `hotfix/hp-0.3.6-slide-routes`（基于生产
+1. **生产 AI 读片报「切片不存在」**：HP 把 slide_id 拼到按文件名的路由
+   `/api/plugin/v1/slides/<id>`，应为 `/slides/by-id/<id>`。已查到的生产事件：10-06 ×3、10-09 ×1 agent_error，
+   最后一次成功是 09-29；未逐笔核对 10-01 起每次请求，不能断言期间全部失败。修复：HP `e698fce`（集成分支）；另在 `hotfix/hp-0.3.6-slide-routes`（基于生产
    HP 0.3.5 `23e89fa`）上 `09d52d9` + `64a0396`（含下条修复，package 0.3.6），HP npm test 1489 通过。
    **未部署，需用户批准。**
 2. **DeepSeek 拒绝描绘工具 schema**：tuple 形 `items` 使整次请求 400（「Invalid schema for function
@@ -242,21 +242,30 @@ PT `22869591`（细化服务与端点）及本节所在提交（溯源字段）�
 外扩约 10% 内，score ≥ 0.75 且面积比 0.3–1.3 才采纳。35 处中采纳 28 处；未采纳的 7 处为弥漫区域和一处
 SAM2 置信偏低的导管，均保留模型原轮廓。
 
-### 9.2 真实模型对比（DeepSeek-V4.1-Flash，同一 14 例，独占切片副本）
+### 9.2 真实模型对比（DeepSeek-V4.1-Flash，同一 14 例，独占切片副本，各跑一次）
 
-| 版本 | 通过 | 工具调用合计 | 中位调用/例 | 触 50 步上限 | token 合计 |
-| --- | --- | --- | --- | --- | --- |
-| r3：三步导航 | 14/14 | 465 | 38 | 4 | 2.31M |
-| a1：goto 即取景 | 13/14 | 196 | 11 | 0 | 1.93M |
-| b1：goto 即取景 + SAM2 细化（本地 CPU 服务） | 14/14 | 172 | 11 | 0 | 1.69M |
+2026-10-10 复核（`navigation-refine-review-20261010.md`）指出初版本表把模型请求数标成工具调用数、并取了上中位数；
+下表按三份 `results.json` 重算，与复核的 `eval-recount.json` 一致。
 
-- token 只降约 17–27%：看图次数没减，每次 goto 仍带一张图；省下的是 snapshot 与关闭步骤的调用和往返。
+| 指标 | r3：三步导航 | a1：goto 即取景 | b1：+ SAM2 细化（本地 CPU） |
+| --- | ---: | ---: | ---: |
+| 原 evaluator pass | 14/14 | 13/14 | 14/14 |
+| 模型请求合计 / 每例中位 | 465 / 34 | 196 / 10.5 | 172 / 9.5 |
+| 工具调用合计 / 每例中位 | 471 / 34 | 222 / 12 | 190 / 10.5 |
+| 结束时未 finished（触 50 步） | 4 | 0 | 0 |
+| 每例耗时中位（秒） | 108 | 69 | 78.5 |
+| token 合计 | 2.31M | 1.93M（−16.7%） | 1.69M（−26.7%） |
+
+口径限制：pass 只检查最后一轮是否调用描绘/矩形、应画时是否至少写入一次，不要求 finished、答复完整、目标召回或
+轮廓质量；r3 的 4 个暂停用例仍记为 pass。单张切片、14 个语义用例、各一次随机运行，不能推广到其他组织/染色/尺度；
+SAM2 置信分与面积比不等于病理轮廓准确率。
+
+- token 降幅小于请求数降幅：看图次数没减，每次 goto 仍带一张图；省下的是 snapshot 与关闭步骤的往返。
 - a1 的唯一失败是「这里是什么组织」时模型主动给一处结构落了待复核矩形（系统提示允许主动落标）；r3 同例走满
-  50 步暂停，没走到落标那一步。b1 同例未落标。属模型自主行为的方差，不是描绘意图判断问题。
-- b1 的 10 个多边形全部被细化采纳。叠加图：两处导管贴上皮外缘；肌束沿边界；上方一处导管因模型给的粗轮廓
-  偏大，细化结果带进了旁边一块间质（仍在门控范围内）。矩形标注不细化。
-- b1 中位耗时比 a1 长（107 s vs 78 s），主要是本地 CPU 推理每处约 2–4 s 与运行方差；生产 GPU 上单次推理
-  预计在 0.2 s 内（未实测）。
+  50 步暂停，没走到落标那一步；b1 同例未落标。属模型自主行为的方差。
+- b1 的 10 个多边形全部被细化采纳。叠加图：两处导管贴上皮外缘；肌束沿边界；上方一处导管因模型给的粗轮廓偏大，
+  细化结果带进旁边一块间质（仍在门控范围内）。矩形标注不细化。
+- b1 中位耗时略高于 a1（78.5 s vs 69 s），含本地 CPU 推理每处约 2–4 s 与运行方差。GPU 推理耗时**未实测**。
 
 ### 9.3 上线所需（未做，需用户批准）
 
@@ -275,3 +284,35 @@ SAM2 置信偏低的导管，均保留模型原轮廓。
 | HP `npm run test:contract`（真实 PT；含 refine 端点与 contour_refine 落库） | 51 passed |
 | 细化服务 `services/contour-refine/tests`（seg-venv，含真实 SAM2 冒烟） | 16 passed |
 | PT 全量 pytest（plugins/ 无 HP bundle） | 3020 passed / 113 skipped（30 分钟；收尾 PostgreSQL 关闭超时被强杀，非用例失败） |
+
+## 10. 复核修复（2026-10-10，`navigation-refine-review-20261010.md`，子代理实现、主代理审查）
+
+复核方的 4 条失败回归原样入仓（未改断言），修复后全部通过。
+
+| 项 | 修复 |
+| --- | --- |
+| R1 P1 GPU 启动 | 去掉 `--preload`，`gunicorn.conf.py` 显式 `preload_app=False`，模型在 worker 进程内加载并在 `post_worker_init` 预热；`/healthz` 报本进程 `pid`/`device`，本进程模型未就绪即 503；推理排队超过 `CONTOUR_REFINE_QUEUE_WAIT_S`（默认 2 s）回 503 `busy`，不在客户端超时后继续堆积 |
+| R2 P1 解码量 | 抽出与 `/regions` 共用的成本估算 `_plugin_render_cost_estimate` 与准入 `_plugin_admit_region_pixels`；refine 按真实金字塔层估算解码像素（含多通道倍数），任何 `read_region` 之前超单请求上限 → `refined:false, reason:"too_large"`，滑窗/并发不准入 → `busy`，计入与 regions 同一像素窗口。`/regions` 行为与错误信封不变 |
+| R3 P2 旧快照 | 同位置 goto 仅在资产 revision 与 render fingerprint 都一致时复用当前快照，否则重新取景；描绘、矩形、region 观察遇到身份不一致的当前快照拒绝写入并请模型重新 goto |
+| R4 P2 显示上下文 | HP 以当前快照自身的 render context 与 revision 调细化；PT 走与 regions 相同的校验后读图，回显 `render_context_fingerprint`；context 无效/过期 → `refined:false, reason:"render_context"`；快照 context 无法上线（legacy）时 HP 跳过细化 |
+| R5 P2 取消 | 细化正常返回后、写请求前各检查一次取消；annotate 支持并传入取消信号 |
+
+另：§9.2 评测口径已按复核重算；§8.2 生产事故措辞改为已查到的事件，不再断言 10-01 起全部失败。
+
+真实模型复测（c1，同 14 例，SAM2 本地 CPU）：14/14；模型请求 214（中位 12.5）、工具调用 230（中位 14.5）、
+未 finished 0、token 2.16M；多边形 10/10 细化采纳；身份闸门误拦 0 次、写入失败 0 次。请求数高于 b1（172），
+单次运行方差，不作结论。
+
+遗留：矩形 `create_annotation` 执行签名不带取消信号（无细化步骤，窗口只有会话 I/O），未改；GPU 镜像仍未实际构建和
+在 2080 Ti 上跑真实 `/v1/refine`，README 已写为上线验收步骤。
+
+门禁（2026-10-10）：
+
+| 门禁 | 结果 |
+| --- | --- |
+| HP `npm test` | 80 files / 1543 passed |
+| HP `tsc -p tsconfig.build.json --noEmit` | 通过 |
+| HP `npm run test:contract`（真实 PT） | 51 passed（契约夹具的假切片句柄补 `level_downsamples`） |
+| 细化服务测试（含真实 SAM2 CPU 冒烟） | 20 passed |
+| PT 子集（refine/regions/render context/描绘闸门等） | 231 passed |
+| PT 全量 pytest（plugins/ 无 HP bundle） | 3033 passed / 113 skipped（29 分钟） |

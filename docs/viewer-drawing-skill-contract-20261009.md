@@ -17,14 +17,24 @@
    goto 的取景；新取景先发 `snapshot_reviewed{disposition:"auto", auto:true}` 关闭旧快照（UI 不出卡片），
    当前快照跨轮保留。描绘/矩形/观察仍以当前快照校验，§4 写入口执法不变。
 2. **轮廓细化端点** `POST /api/plugin/v1/slides/{by-id/<slide_id>|<slide>}/contours/refine`：与 `/regions`
-   同 scope（`region:read`）与 run grant 闸。body `{points: level-0 [[x,y]…] 3–500, expected_fingerprint?}`。
-   PT 读外扩 crop（长边 ≤1024，PNG），调 `CONTOUR_REFINE_URL/v1/refine`（可选 `CONTOUR_REFINE_TOKEN`，
-   超时 `CONTOUR_REFINE_TIMEOUT_S` 默认 8 s），回 `{refined, points|null, score, area_ratio, model, reason,
-   seconds}`；服务未配置、出错、超时一律 200 `refined:false`（reason `unavailable` / `service_error`），
-   请求非法 400，指纹不符 409。
+   同 scope（`region:read`）与 run grant 闸。body `{points: level-0 [[x,y]…] 3–500, expected_fingerprint?,
+   render_context?}`（render_context 与 `/regions` 同 wire 形态，camelCase `renderContext` 同样容错；
+   非对象 400）。PT 读外扩 crop（长边 ≤1024，PNG；带 render_context 时按该 context 渲染并同链
+   校验/规范化，revision 参数与 `/regions` 同源），调 `CONTOUR_REFINE_URL/v1/refine`（可选
+   `CONTOUR_REFINE_TOKEN`，超时 `CONTOUR_REFINE_TIMEOUT_S` 默认 8 s），回 `{refined, points|null, score,
+   area_ratio, model, reason, seconds, render_context_fingerprint}`（fingerprint 为本次 crop 的 canonical
+   render fingerprint，默认渲染为 null）。服务未配置、出错、超时一律 200 `refined:false`（reason
+   `unavailable` / `service_error`）；新增尽力而为 reason：`too_large`（读盘前解码预算超单请求上限——
+   与 `/regions` 共用估算/滑窗/并发闸，多通道按声明通道数计入）、`busy`（滑窗/并发准入拒绝，或细化服务
+   排队超限回 503 busy）、`render_context`（读取期 context 校验失败/revision 过期，不升格 4xx/409）。
+   请求非法 400，expected_fingerprint 不符 409。
 3. **细化服务** `services/contour-refine`（SAM2.1 hiera-b+，GPU 优先）：以模型多边形外接框提示，掩膜限制在
    模型多边形外扩约 10% 的范围内，取最大连通域；score ≥ 0.75 且面积比 0.3–1.3 才采纳，否则
-   `low_score` / `area_ratio` / `empty_mask` / `too_few_points`。权重挂载，不打进镜像。
+   `low_score` / `area_ratio` / `empty_mask` / `too_few_points`。权重挂载，不打进镜像。模型在
+   **worker 进程内**加载（gunicorn 无 `--preload`，`gunicorn.conf.py` post_worker_init 幂等 warm-up；
+   CUDA 上下文不得在 master fork 前创建）；`GET /healthz` 回 `{ok, device, model, pid}`，本 worker
+   未就绪即 503。推理串行，另一推理进行中时排队等待超过 `CONTOUR_REFINE_QUEUE_WAIT_S`（默认 2 s）回
+   503 `{error:"busy"}`（PT 映射为 reason `busy`，不无限排队——客户端 8 s 超时后不应在后台堆积计算）。
 4. **HP 描绘写入**：模型点列过全部校验后调细化；细化点列须再过同一套校验（点数、简单多边形、切片与当前
    快照范围）才写入，否则写模型点列（`refined_invalid`）。取消照常中止且不写。
 5. **溯源**：点列写入可带 `contour_refine`：`{refined, model, score, area_ratio, reason, original_points}`，

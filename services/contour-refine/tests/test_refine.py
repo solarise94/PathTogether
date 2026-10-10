@@ -3,7 +3,8 @@
 
 覆盖 refine.py 纯逻辑（accept / low_score / area_ratio 大小两侧 / empty_mask /
 泄漏被膨胀裁剪 / >500 点简化收敛 / too_few_points）与 app.py HTTP 契约
-（healthz / 校验 400 / token 401 / 假 predictor 注入的成功路径）。
+（healthz（含加载前 503、worker pid）/ 校验 400 / token 401 / 推理排队超限
+503 busy / 假 predictor 注入的成功路径 / 无 --preload 的静态部署检查）。
 
 运行：cd services/contour-refine && <seg-venv>/bin/python -m pytest -q tests
 opt-in 真实模型冒烟：SAM2_CHECKPOINT=<weights> 同上（见文件末尾）。
@@ -229,7 +230,72 @@ def test_healthz_with_injected_predictor(client):
     r = client.get("/healthz")
     assert r.status_code == 200
     body = r.get_json()
-    assert body == {"ok": True, "device": "injected", "model": "sam2.1-hiera-b+"}
+    assert body == {"ok": True, "device": "injected", "model": "sam2.1-hiera-b+",
+                    "pid": os.getpid()}
+
+
+def test_healthz_503_before_model_load_and_does_not_trigger_load(
+        client, monkeypatch):
+    """R1：healthz 只读本 worker 就绪状态——加载前 503，且不触发加载。"""
+    def _no_load():
+        raise AssertionError("healthz must not trigger model loading")
+    monkeypatch.setattr(service_app._MODEL, "ensure", _no_load)
+    r = client.get("/healthz")
+    assert r.status_code == 503
+    body = r.get_json()
+    assert body["ok"] is False
+    assert body["pid"] == os.getpid()
+    assert body["model"] == "sam2.1-hiera-b+"
+    assert service_app._MODEL.device is None  # 未加载、未尝试加载
+
+
+def test_healthz_503_when_inherited_from_foreign_pid(client, monkeypatch):
+    """R1：fork 继承的 holder（pid 不匹配）不算本 worker 就绪。"""
+    service_app._MODEL.inject(lambda img, box: (np.zeros(img.shape[:2], bool), 0.0))
+    monkeypatch.setattr(service_app._MODEL, "_pid", service_app._MODEL._pid + 1)
+    r = client.get("/healthz")
+    assert r.status_code == 503
+    assert r.get_json()["ok"] is False
+
+
+def test_busy_503_when_inference_in_flight(client, monkeypatch):
+    """R1：另一推理占锁时，排队等待超过 QUEUE_WAIT_S → 503 busy，predict 不被调用。"""
+    monkeypatch.setattr(service_app, "QUEUE_WAIT_S", 0.0)
+    img = _synth_img((64, 64))
+    poly = _rect_polygon(10, 10, 50, 50)
+    calls = []
+
+    def fake_predict(im, box):
+        calls.append((im.shape, box))
+        return np.zeros(im.shape[:2], bool), 0.9
+
+    service_app._MODEL.inject(fake_predict)
+    assert service_app._INFERENCE_LOCK.acquire(timeout=1)
+    try:
+        r = _post_refine(client, _png_b64(img), poly)
+    finally:
+        service_app._INFERENCE_LOCK.release()
+    assert r.status_code == 503
+    assert r.get_json() == {"error": "busy"}
+    assert calls == []  # 排队被拒，未进入推理
+
+
+def test_gunicorn_post_fork_loading_static_check():
+    """R1 静态检查：镜像/配置无 --preload，模型在 worker 内 post-fork 加载。"""
+    service_dir = os.path.dirname(os.path.abspath(service_app.__file__))
+    containerfile = os.path.join(service_dir, "Containerfile")
+    gunicorn_conf = os.path.join(service_dir, "gunicorn.conf.py")
+    with open(containerfile, encoding="utf-8") as fh:
+        cf_text = fh.read()
+    with open(gunicorn_conf, encoding="utf-8") as fh:
+        conf_text = fh.read()
+    # CMD 是 JSON 数组形态：真正的 preload 开关会以带引号的 "--preload" 出现
+    # （注释里的说明文字不带引号，不参与判定）
+    assert '"--preload"' not in cf_text
+    assert "--config" in cf_text
+    assert "preload_app = False" in conf_text
+    assert "post_worker_init" in conf_text
+    assert "gunicorn.conf.py" in cf_text  # CMD 走该配置
 
 
 def test_endpoint_accept_path(client):

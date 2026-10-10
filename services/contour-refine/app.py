@@ -2,13 +2,19 @@
 """contour-refine HTTP 服务：SAM2.1（hiera base+）box-prompted 轮廓精修。
 
 端点：
-  GET  /healthz   → ``{ok, device, model}``（模型加载失败 → 503 ``{ok:false, ...}``）
+  GET  /healthz   → ``{ok, device, model, pid}``
+     （**不触发加载**：本 worker 进程内模型未就绪/加载失败 → 503 ``{ok:false, ...}``）
   POST /v1/refine → ``{image_png_b64, polygon}``（polygon 为 crop 像素坐标）→
-     ``{accepted, reason, score, area_ratio, points, model, seconds}``
+     ``{accepted, reason, score, area_ratio, points, model, seconds}``；
+     另一推理进行中且排队等待超过 CONTOUR_REFINE_QUEUE_WAIT_S → 503 ``{error:"busy"}``
 
 要点：
-  - 单模型实例、启动加载一次（CONTOUR_REFINE_EAGER_LOAD=0 可改为惰性，测试用）；
-  - 推理互斥锁串行化（单实例 SAM2ImagePredictor 的 set_image+predict 不并发）；
+  - 模型在 **worker 进程内**加载（gunicorn 不用 --preload；gunicorn.conf.py 的
+    post_worker_init 幂等 warm-up，python app.py 直跑时 import 期加载不变；
+    CONTOUR_REFINE_EAGER_LOAD=0 可改为惰性，测试用）——CUDA 上下文绝不能在
+    master 创建后被 fork 继承（PyTorch poison-fork 约束）；
+  - 推理互斥锁串行化（单实例 SAM2ImagePredictor 的 set_image+predict 不并发），
+    且排队等待有上界（见上 busy）——调用方 8 s 超时后的计算不应在后台堆积；
   - 权重路径 SAM2_CHECKPOINT（缺省 /models/sam2.1_hiera_base_plus.pt）、配置
     SAM2_CONFIG（缺省 configs/sam2.1/sam2.1_hiera_b+.yaml）；
   - 可选共享密钥：设置 CONTOUR_REFINE_TOKEN 后请求须带 X-Refine-Token 头
@@ -39,20 +45,29 @@ MAX_IMAGE_EDGE = int(os.environ.get("CONTOUR_REFINE_MAX_IMAGE_EDGE") or 2048)
 MAX_BODY_BYTES = int(os.environ.get("CONTOUR_REFINE_MAX_BODY_BYTES") or 8 * 1024 * 1024)
 MIN_POLYGON_POINTS = 3
 MAX_POLYGON_POINTS = 500
+try:
+    QUEUE_WAIT_S = float(os.environ.get("CONTOUR_REFINE_QUEUE_WAIT_S") or 2)
+except (TypeError, ValueError):
+    QUEUE_WAIT_S = 2.0
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_BODY_BYTES
 
-# 推理互斥锁：单模型实例（gunicorn 单 worker 多线程时保护 set_image+predict 成对执行）
+# 推理互斥锁：单模型实例（gunicorn 单 worker 多线程时保护 set_image+predict
+# 成对执行）。/v1/refine 以 acquire(timeout=QUEUE_WAIT_S) 获取——排队等待超过
+# 上界即 503 busy，不无限排队（调用方 8 s 超时后不应在后台继续堆积计算）。
 _INFERENCE_LOCK = threading.Lock()
 
 
 class _ModelHolder:
-    """单 SAM2 predictor 持有者：惰性/启动加载一次 + 测试注入口。
+    """单 SAM2 predictor 持有者：worker 内加载一次 + 测试注入口。
 
     持有的是 ``predict(img, box) -> (mask_bool, score)`` 回调（真实路径闭包
-    包住 SAM2ImagePredictor 与推理锁），device 随加载确定（cuda 可用即 cuda，
-    否则 cpu）。加载失败记忆错误（稳定 503，不反复重试砸日志）。
+    包住 SAM2ImagePredictor；推理串行由 /v1/refine 持 _INFERENCE_LOCK 保证，
+    回调本身不再加锁——直接调 refine.refine_crop 的离线路径不受影响）。
+    device 随加载确定（cuda 可用即 cuda，否则 cpu）；记录加载进程 pid，
+    ``ready`` 只在本进程内已加载时为 True（fork 继承的 holder 不可信）。
+    加载失败记忆错误（稳定 503，不反复重试砸日志）。
     """
 
     def __init__(self):
@@ -60,6 +75,7 @@ class _ModelHolder:
         self._predict = None
         self._device = None
         self._error = None
+        self._pid = None
 
     def inject(self, predict, device="injected"):
         """测试注入口：以假 predict 替换真实模型（不加载权重）。"""
@@ -67,12 +83,14 @@ class _ModelHolder:
             self._predict = predict
             self._device = device
             self._error = None
+            self._pid = os.getpid()
 
     def reset(self):
         with self._lock:
             self._predict = None
             self._device = None
             self._error = None
+            self._pid = None
 
     def ensure(self):
         """返回 predict 回调；首次调用时加载 SAM2（进程内只加载一次）。"""
@@ -91,7 +109,7 @@ class _ModelHolder:
                     build_sam2(SAM2_CONFIG, SAM2_CHECKPOINT, device=device))
 
                 def _predict(img, box):
-                    with _INFERENCE_LOCK, torch.inference_mode():
+                    with torch.inference_mode():
                         predictor.set_image(img)
                         masks, scores, _ = predictor.predict(
                             box=np.asarray(box, dtype=np.float32),
@@ -100,8 +118,10 @@ class _ModelHolder:
 
                 self._predict = _predict
                 self._device = device
-                app.logger.info("SAM2 loaded: device=%s checkpoint=%s config=%s",
-                                device, SAM2_CHECKPOINT, SAM2_CONFIG)
+                self._pid = os.getpid()
+                app.logger.info("SAM2 loaded: pid=%d device=%s checkpoint=%s "
+                                "config=%s",
+                                os.getpid(), device, SAM2_CHECKPOINT, SAM2_CONFIG)
                 return _predict
             except Exception:  # noqa: BLE001 — 记忆失败，healthz/refine 稳定 503
                 self._error = "SAM2 load failed (checkpoint=%s)" % SAM2_CHECKPOINT
@@ -111,6 +131,11 @@ class _ModelHolder:
     @property
     def device(self):
         return self._device
+
+    @property
+    def ready(self):
+        """本进程内模型是否已加载（不触发加载；fork 继承的实例不算就绪）。"""
+        return self._predict is not None and self._pid == os.getpid()
 
 
 _MODEL = _ModelHolder()
@@ -158,12 +183,19 @@ def _request_too_large(_exc):
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
-    try:
-        _MODEL.ensure()
-    except Exception:  # noqa: BLE001
-        return jsonify({"ok": False, "device": _MODEL.device, "model": MODEL_ID,
-                        "error": "model load failed (see server logs)"}), 503
-    return jsonify({"ok": True, "device": _MODEL.device, "model": MODEL_ID})
+    """只读本 worker 进程的就绪状态（不触发加载）。
+
+    pid + device 让健康检查能区分「本 worker 已就绪」与「fork 继承的旧
+    holder」；模型未加载/加载失败均 503（加载由 post_worker_init warm-up
+    或首个 /v1/refine 惰性完成）。
+    """
+    ready = _MODEL.ready
+    payload = {"ok": ready, "device": _MODEL.device, "model": MODEL_ID,
+               "pid": os.getpid()}
+    if not ready:
+        payload["error"] = "model not ready in this worker (loading or failed)"
+        return jsonify(payload), 503
+    return jsonify(payload)
 
 
 @app.route("/v1/refine", methods=["POST"])
@@ -201,6 +233,10 @@ def v1_refine():
     except Exception:  # noqa: BLE001
         return jsonify({"error": "model not ready (see server logs)"}), 503
 
+    # 排队上界：另一推理进行中时最多等 QUEUE_WAIT_S，超时 503 busy——
+    # 调用方（PT，8 s 超时）不应让已放弃的请求在后台继续排队计算。
+    if not _INFERENCE_LOCK.acquire(timeout=QUEUE_WAIT_S):
+        return jsonify({"error": "busy"}), 503
     img = np.asarray(image.convert("RGB"), dtype=np.uint8)
     started = time.monotonic()
     try:
@@ -210,6 +246,8 @@ def v1_refine():
     except Exception:  # noqa: BLE001
         app.logger.exception("refine failed unexpectedly")
         return jsonify({"error": "internal error"}), 500
+    finally:
+        _INFERENCE_LOCK.release()
     seconds = round(time.monotonic() - started, 4)
 
     out = dict(result)
@@ -218,7 +256,9 @@ def v1_refine():
     return jsonify(out)
 
 
-# 启动即加载一次（gunicorn import 本模块时执行；测试用 EAGER_LOAD=0 关闭）
+# 启动即加载一次（python app.py 直跑在 import 期执行；gunicorn 无 --preload，
+# import 发生在 worker 进程内 → 即 worker 内加载；测试用 EAGER_LOAD=0 关闭。
+# gunicorn.conf.py 的 post_worker_init 会再做一次幂等 warm-up。）
 if os.environ.get("CONTOUR_REFINE_EAGER_LOAD", "1") != "0":
     try:
         _MODEL.ensure()

@@ -12,7 +12,14 @@
   - 服务拒绝（accepted:false）→ 透传 reason/score/area_ratio；
   - 服务超时/错误/坏 JSON/非 200 → {refined:false, reason:"service_error"}；
   - expected_fingerprint 不符 → 409 slide_revision_conflict（与 regions 同语义）；
-  - CONTOUR_REFINE_TOKEN 设置时以 X-Refine-Token 头转发。
+  - CONTOUR_REFINE_TOKEN 设置时以 X-Refine-Token 头转发；
+  - R2（2026-10-10 复核）：读盘前过与 regions 共用的解码预算闸——单层大切片
+    估算超限 → {refined:false, reason:"too_large"}（零 read_region）；多通道按
+    声明通道数计入；滑窗/并发准入拒绝 → reason "busy"；服务 503 busy → busy；
+  - R4（2026-10-10 复核）：body 可带 render_context（camelCase renderContext
+    容错）；非对象 400；原样进入 _read_region_pil（revision 参数与 regions 同
+    源）；过期/非法 context → reason "render_context"；响应回显
+    render_context_fingerprint（默认渲染 null）。
 
 运行：cd 项目根 && TMPDIR=/home/solarise/pytest-tmp .venv/bin/python -m pytest
 tests/test_plugin_contour_refine.py -q
@@ -22,6 +29,7 @@ import io
 import json
 import os
 import sys
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
@@ -32,6 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import _bootstrap  # noqa: E402,F401  # session 目录+openslide stub（conftest 先行）
 import app as app_mod  # noqa: E402
+import slide_render  # noqa: E402
 from _pt_helpers import (
     FakeRequests,
     FakeResponse,
@@ -59,6 +68,15 @@ def _isolated(tmp_path, monkeypatch):
     # 缺省不配服务地址（unavailable 分支）；需要服务路径的用例自行 setattr
     monkeypatch.setattr(app_mod, "CONTOUR_REFINE_URL", "")
     monkeypatch.setattr(app_mod, "CONTOUR_REFINE_TOKEN", "")
+    # 解码预算闸（R2）与 regions 同闸：每用例重置滑窗/并发闸/单请求上限，
+    # 避免跨用例窗口污染（也保证 reviewer 回归不因前置用例耗尽预算而空转）
+    monkeypatch.setattr(app_mod, "_PLUGIN_PIXEL_WINDOW",
+                        app_mod._SlidingPixelWindow(
+                            app_mod._PLUGIN_REGION_PIXEL_BUDGET_PER_MIN))
+    monkeypatch.setattr(app_mod, "_PLUGIN_REGION_CONCURRENCY_SEM",
+                        threading.BoundedSemaphore(
+                            app_mod._PLUGIN_REGION_MAX_CONCURRENT))
+    monkeypatch.setattr(app_mod, "_PLUGIN_REGION_MAX_PIXELS", 4096 ** 2)
     yield
 
 
@@ -431,9 +449,11 @@ def _post_with_service(monkeypatch, svc_body=None, raw=None, status=200,
 
 def _assert_service_error(r):
     assert r.status_code == 200
+    # render_context_fingerprint 为 additive 字段（crop 已读、无 context → null）
     assert r.get_json() == {"refined": False, "points": None, "score": None,
                             "area_ratio": None, "model": None,
-                            "reason": "service_error", "seconds": None}
+                            "reason": "service_error", "seconds": None,
+                            "render_context_fingerprint": None}
 
 
 def test_service_timeout_service_error(monkeypatch):
@@ -472,3 +492,257 @@ def test_service_accepted_but_bad_points_service_error(monkeypatch):
                                      "model": "sam2.1-hiera-b+", "seconds": 0.1,
                                      "reason": None})
     _assert_service_error(r)
+
+
+def test_review_refine_bounds_decoded_pixels_before_read(monkeypatch):
+    inst = _bootstrap_installation()
+    token = _token_for(inst)
+    slide = _touch_slide()
+    class RecordingOnlyOsr(_FakeOsr):
+        def read_region(self, location, level, size):
+            self.read_region_calls.append((location, level, size))
+            # Deliberately do not allocate the requested raster in this probe.
+            return Image.new("RGB", (1, 1), "white")
+    osr = RecordingOnlyOsr(dimensions=(80000, 80000), level_downsamples=(1.0,))
+    monkeypatch.setattr(app_mod, "CONTOUR_REFINE_URL", "http://refine.test")
+    _fake_service(svc_body=_SVC_ACCEPT)
+    p1, p2 = _slide_read_mocks(osr)
+    with p1, p2:
+        r = _client().post(_refine_path(slide), headers=_bearer(token), json={
+            "points": [[1,1],[79999,1],[79999,79999],[1,79999]]})
+    attempted = max((size[0]*size[1] for _, _, size in osr.read_region_calls), default=0)
+    assert attempted <= app_mod._PLUGIN_REGION_MAX_PIXELS, (r.status_code, osr.read_region_calls, attempted)
+
+
+# --------------------------------------------------------------------------- #
+# 6. R2（2026-10-10 复核）：解码预算闸与 regions 同闸（读 read_region 前拒绝）
+# --------------------------------------------------------------------------- #
+def test_too_large_returns_reason_without_read(monkeypatch):
+    """单层大切片：估算解码像素超单请求上限 → 200 too_large，零 read_region。"""
+    inst = _bootstrap_installation()
+    token = _token_for(inst)
+    slide = _touch_slide()
+    osr = _FakeOsr(dimensions=(80000, 80000), level_downsamples=(1.0,))
+    monkeypatch.setattr(app_mod, "CONTOUR_REFINE_URL", "http://refine.test")
+    _, responses = _fake_service(svc_body=_SVC_ACCEPT)
+    m1, m2 = _slide_read_mocks(osr)
+    with m1, m2:
+        r = _client().post(_refine_path(slide), headers=_bearer(token), json={
+            "points": [[1, 1], [79999, 1], [79999, 79999], [1, 79999]]})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["refined"] is False and body["reason"] == "too_large"
+    assert body["render_context_fingerprint"] is None
+    assert osr.read_region_calls == []
+    assert responses == []
+
+
+def test_multichannel_channels_counted_in_decode_budget(monkeypatch):
+    """8 通道按声明数计入解码预算：单通道放行、8 通道 too_large（读盘前）。"""
+    inst = _bootstrap_installation()
+    token = _token_for(inst)
+    slide = _touch_slide()
+    ctx8 = {"version": "multichannel-additive-v1",
+            "active_channels": [{"index": i} for i in range(8)]}
+    osr = _FakeOsr(dimensions=(4000, 4000), level_downsamples=(1.0,))
+    monkeypatch.setattr(app_mod, "CONTOUR_REFINE_URL", "http://refine.test")
+    _fake_service(svc_body=_SVC_ACCEPT)
+    pts = [[10, 10], [3990, 10], [3990, 3990], [10, 3990]]
+    m1, m2 = _slide_read_mocks(osr)
+    with m1, m2:
+        r1 = _client().post(_refine_path(slide), headers=_bearer(token),
+                            json={"points": pts})
+        reads_after_single = list(osr.read_region_calls)
+        r8 = _client().post(_refine_path(slide), headers=_bearer(token),
+                            json={"points": pts, "render_context": ctx8})
+    # 4000² = 16M ≤ 4096²：单通道（默认渲染）放行，走正常读/服务路径
+    assert r1.status_code == 200 and r1.get_json()["refined"] is True
+    assert reads_after_single
+    # ×8 = 128M > 4096² → too_large，且没有再触碰 read_region
+    assert r8.status_code == 200
+    body8 = r8.get_json()
+    assert body8["refined"] is False and body8["reason"] == "too_large"
+    assert osr.read_region_calls == reads_after_single
+
+
+def test_pixel_window_exhaustion_returns_busy(monkeypatch):
+    """滑窗像素预算耗尽（per installation）→ 200 busy，不读盘不调服务。"""
+    inst = _bootstrap_installation()
+    token = _token_for(inst)
+    slide = _touch_slide()
+    osr = _FakeOsr()
+    monkeypatch.setattr(app_mod, "CONTOUR_REFINE_URL", "http://refine.test")
+    monkeypatch.setattr(app_mod, "_PLUGIN_PIXEL_WINDOW",
+                        app_mod._SlidingPixelWindow(1))  # 预算 1 像素
+    _, responses = _fake_service(svc_body=_SVC_ACCEPT)
+    m1, m2 = _slide_read_mocks(osr)
+    with m1, m2:
+        r = _client().post(_refine_path(slide), headers=_bearer(token),
+                           json={"points": _SQUARE_POINTS})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["refined"] is False and body["reason"] == "busy"
+    assert osr.read_region_calls == []
+    assert responses == []
+
+
+def test_concurrency_admission_rejection_returns_busy(monkeypatch):
+    """regions 并发闸占满 → refine 准入同样拒绝 → 200 busy。"""
+    inst = _bootstrap_installation()
+    token = _token_for(inst)
+    slide = _touch_slide()
+    osr = _FakeOsr()
+    monkeypatch.setattr(app_mod, "CONTOUR_REFINE_URL", "http://refine.test")
+    _fake_service(svc_body=_SVC_ACCEPT)
+    taken = 0
+    while app_mod._PLUGIN_REGION_CONCURRENCY_SEM.acquire(blocking=False):
+        taken += 1
+    try:
+        m1, m2 = _slide_read_mocks(osr)
+        with m1, m2:
+            r = _client().post(_refine_path(slide), headers=_bearer(token),
+                               json={"points": _SQUARE_POINTS})
+    finally:
+        for _ in range(taken):
+            app_mod._PLUGIN_REGION_CONCURRENCY_SEM.release()
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["refined"] is False and body["reason"] == "busy"
+    assert osr.read_region_calls == []
+
+
+def test_service_503_busy_maps_to_busy(monkeypatch):
+    """服务推理排队超限回 503 {error:"busy"} → reason busy（非 service_error）。"""
+    inst = _bootstrap_installation()
+    token = _token_for(inst)
+    slide = _touch_slide()
+    osr = _FakeOsr()
+    monkeypatch.setattr(app_mod, "CONTOUR_REFINE_URL", "http://refine.test")
+    _fake_service(status=503, svc_body={"error": "busy"})
+    m1, m2 = _slide_read_mocks(osr)
+    with m1, m2:
+        r = _client().post(_refine_path(slide), headers=_bearer(token),
+                           json={"points": _SQUARE_POINTS})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["refined"] is False and body["reason"] == "busy"
+    assert body["render_context_fingerprint"] is None  # 默认渲染 → null
+    assert osr.read_region_calls  # crop 已读（与准入拒绝不同）
+
+
+def test_service_503_non_busy_still_service_error(monkeypatch):
+    """503 但非 busy 载荷 → 维持 service_error（不吞掉真实故障）。"""
+    r = _post_with_service(monkeypatch, status=503,
+                           svc_body={"error": "model not ready"})
+    _assert_service_error(r)
+
+
+# --------------------------------------------------------------------------- #
+# 7. R4（2026-10-10 复核）：来源快照 render_context 的透传 / 回显 / 容错
+# --------------------------------------------------------------------------- #
+_NATIVE_CTX = {"version": "native-rgb-v1", "plane": {"t": 0, "z": 0},
+               "active_channels": []}
+
+
+def test_render_context_forwarded_to_reader(monkeypatch):
+    """context 原样进入 _read_region_pil，revision 参数与 regions 路径同源。"""
+    inst = _bootstrap_installation()
+    token = _token_for(inst)
+    slide = _touch_slide()
+    osr = _FakeOsr()
+    monkeypatch.setattr(app_mod, "CONTOUR_REFINE_URL", "http://refine.test")
+    _fake_service(svc_body=_SVC_ACCEPT)
+    _safe, gate, _serr = app_mod._plugin_resolve_slide(slide)
+    assert gate is not None
+    expected_revision = app_mod._slide_revision(gate)
+    m1, m2 = _slide_read_mocks(osr)
+    with m1, m2, mock.patch.object(
+            app_mod, "_read_region_pil",
+            wraps=app_mod._read_region_pil) as rr:
+        r = _client().post(_refine_path(slide), headers=_bearer(token),
+                           json={"points": _SQUARE_POINTS,
+                                 "render_context": _NATIVE_CTX})
+    assert r.status_code == 200 and r.get_json()["refined"] is True
+    assert rr.call_count == 1
+    kwargs = rr.call_args.kwargs
+    assert kwargs["render_context"] == _NATIVE_CTX
+    assert kwargs["expected_revision"] == expected_revision
+    assert kwargs["max_long_edge"] == app_mod._PLUGIN_CONTOUR_REFINE_MAX_CROP_EDGE
+
+
+def test_render_context_fingerprint_echoed_camel_case(monkeypatch):
+    """camelCase renderContext 容错；成功响应回显 canonical fingerprint。"""
+    inst = _bootstrap_installation()
+    token = _token_for(inst)
+    slide = _touch_slide()
+    osr = _FakeOsr()
+    monkeypatch.setattr(app_mod, "CONTOUR_REFINE_URL", "http://refine.test")
+    _fake_service(svc_body=_SVC_ACCEPT)
+    m1, m2 = _slide_read_mocks(osr)
+    with m1, m2:
+        r = _client().post(_refine_path(slide), headers=_bearer(token),
+                           json={"points": _SQUARE_POINTS,
+                                 "renderContext": _NATIVE_CTX})
+    assert r.status_code == 200 and r.get_json()["refined"] is True
+    assert r.get_json()["render_context_fingerprint"] == \
+        slide_render.NATIVE_RGB_FINGERPRINT
+
+
+@pytest.mark.parametrize("key", ["render_context", "renderContext"])
+def test_render_context_non_object_400(monkeypatch, key):
+    """请求形状错误：context 非对象 → 400 invalid_request（与 regions 同式）。"""
+    inst = _bootstrap_installation()
+    token = _token_for(inst)
+    slide = _touch_slide()
+    osr = _FakeOsr()
+    monkeypatch.setattr(app_mod, "CONTOUR_REFINE_URL", "http://refine.test")
+    _fake_service(svc_body=_SVC_ACCEPT)
+    m1, m2 = _slide_read_mocks(osr)
+    with m1, m2:
+        r = _client().post(_refine_path(slide), headers=_bearer(token),
+                           json={"points": _SQUARE_POINTS, key: "nope"})
+    _assert_envelope(r, 400, "invalid_request")
+    assert osr.read_region_calls == []
+
+
+def test_stale_render_context_revision_refined_false(monkeypatch):
+    """asset_revision 过期（regions 会 409 的码）→ 尽力而为 reason
+    render_context，不升格 4xx；读/服务零调用。"""
+    inst = _bootstrap_installation()
+    token = _token_for(inst)
+    slide = _touch_slide()
+    osr = _FakeOsr()
+    monkeypatch.setattr(app_mod, "CONTOUR_REFINE_URL", "http://refine.test")
+    _, responses = _fake_service(svc_body=_SVC_ACCEPT)
+    stale = dict(_NATIVE_CTX, asset_revision="stale-revision-000")
+    m1, m2 = _slide_read_mocks(osr)
+    with m1, m2:
+        r = _client().post(_refine_path(slide), headers=_bearer(token),
+                           json={"points": _SQUARE_POINTS,
+                                 "render_context": stale})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["refined"] is False and body["reason"] == "render_context"
+    assert body["render_context_fingerprint"] is None
+    assert osr.read_region_calls == []  # 解码前校验失败
+    assert responses == []              # 服务未被调用
+
+
+def test_invalid_render_context_refined_false(monkeypatch):
+    """未知 context 版本（invalid_render_context）→ reason render_context。"""
+    inst = _bootstrap_installation()
+    token = _token_for(inst)
+    slide = _touch_slide()
+    osr = _FakeOsr()
+    monkeypatch.setattr(app_mod, "CONTOUR_REFINE_URL", "http://refine.test")
+    _fake_service(svc_body=_SVC_ACCEPT)
+    bad = dict(_NATIVE_CTX, version="bogus-v1")
+    m1, m2 = _slide_read_mocks(osr)
+    with m1, m2:
+        r = _client().post(_refine_path(slide), headers=_bearer(token),
+                           json={"points": _SQUARE_POINTS,
+                                 "render_context": bad})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["refined"] is False and body["reason"] == "render_context"
+    assert osr.read_region_calls == []

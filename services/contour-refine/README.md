@@ -54,10 +54,10 @@ PathTogether 平台侧入口：`POST /api/plugin/v1/slides/<slide>/contours/refi
 - `points`：crop 像素整数点（拒绝时为 `null`，调用方保留 LLM 原轮廓）；
 - `reason`（拒绝时）：`low_score` / `area_ratio` / `empty_mask` /
   `too_few_points`；
-- 排队上界：单模型实例推理串行（进程内互斥锁）；另一推理进行中时最多等
-  `CONTOUR_REFINE_QUEUE_WAIT_S`（默认 2 s），超时 → **HTTP 503
-  `{"error": "busy"}`**（调用方 PT 映射为 `refined:false` reason `busy`，
-  不无限排队——PT 客户端 8 s 超时，已放弃的请求不能在后台继续堆积计算）。
+- 不排队：单模型实例推理串行（进程内互斥锁）；另一推理进行中时**立即**回
+  **HTTP 503 `{"error": "busy"}`**（调用方 PT 映射为 `refined:false` reason
+  `busy`，保留模型轮廓）。不在锁上等待：等待会占住 gunicorn 线程，后续请求在线程池
+  里排到 PT 8 s 超时之后才开始推理。
 
 算法（`refine.py`，纯逻辑、可脱离 torch 单测）：
 
@@ -129,7 +129,6 @@ curl -s -X POST http://127.0.0.1:8970/v1/refine \
 | `SAM2_CHECKPOINT` | `/models/sam2.1_hiera_base_plus.pt` | 权重路径（挂载点内） |
 | `SAM2_CONFIG` | `configs/sam2.1/sam2.1_hiera_b+.yaml` | SAM2 模型配置名 |
 | `CONTOUR_REFINE_TOKEN` | 未设置 | 设置后强制 `X-Refine-Token` 共享密钥 |
-| `CONTOUR_REFINE_QUEUE_WAIT_S` | `2` | 推理排队等待上界（秒）；超时 503 `busy` |
 | `CONTOUR_REFINE_EAGER_LOAD` | `1` | 启动即加载模型（worker 内；测试置 0 改惰性） |
 | `CONTOUR_REFINE_MAX_IMAGE_EDGE` | `2048` | 入参图像长边上限（px） |
 | `CONTOUR_REFINE_MAX_BODY_BYTES` | `8388608` | 请求体上限（字节） |

@@ -259,8 +259,7 @@ def test_healthz_503_when_inherited_from_foreign_pid(client, monkeypatch):
 
 
 def test_busy_503_when_inference_in_flight(client, monkeypatch):
-    """R1：另一推理占锁时，排队等待超过 QUEUE_WAIT_S → 503 busy，predict 不被调用。"""
-    monkeypatch.setattr(service_app, "QUEUE_WAIT_S", 0.0)
+    """另一推理占锁时立即 503 busy（不等待），predict 不被调用。"""
     img = _synth_img((64, 64))
     poly = _rect_polygon(10, 10, 50, 50)
     calls = []

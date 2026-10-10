@@ -33,8 +33,8 @@
    `low_score` / `area_ratio` / `empty_mask` / `too_few_points`。权重挂载，不打进镜像。模型在
    **worker 进程内**加载（gunicorn 无 `--preload`，`gunicorn.conf.py` post_worker_init 幂等 warm-up；
    CUDA 上下文不得在 master fork 前创建）；`GET /healthz` 回 `{ok, device, model, pid}`，本 worker
-   未就绪即 503。推理串行，另一推理进行中时排队等待超过 `CONTOUR_REFINE_QUEUE_WAIT_S`（默认 2 s）回
-   503 `{error:"busy"}`（PT 映射为 reason `busy`，不无限排队——客户端 8 s 超时后不应在后台堆积计算）。
+   未就绪即 503。推理串行且不排队：另一推理进行中时立即回 503 `{error:"busy"}`（PT 映射为 reason
+   `busy`）。在锁上等待会占住 gunicorn 线程，后续请求排到 PT 8 s 超时之后仍会开始推理。
 4. **HP 描绘写入**：模型点列过全部校验后调细化；细化点列须再过同一套校验（点数、简单多边形、切片与当前
    快照范围）才写入，否则写模型点列（`refined_invalid`）。取消照常中止且不写。
 5. **溯源**：点列写入可带 `contour_refine`：`{refined, model, score, area_ratio, reason, original_points}`，

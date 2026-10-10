@@ -291,7 +291,7 @@ SAM2 置信分与面积比不等于病理轮廓准确率。
 
 | 项 | 修复 |
 | --- | --- |
-| R1 P1 GPU 启动 | 去掉 `--preload`，`gunicorn.conf.py` 显式 `preload_app=False`，模型在 worker 进程内加载并在 `post_worker_init` 预热；`/healthz` 报本进程 `pid`/`device`，本进程模型未就绪即 503；推理排队超过 `CONTOUR_REFINE_QUEUE_WAIT_S`（默认 2 s）回 503 `busy`，不在客户端超时后继续堆积 |
+| R1 P1 GPU 启动 | 去掉 `--preload`，`gunicorn.conf.py` 显式 `preload_app=False`，模型在 worker 进程内加载并在 `post_worker_init` 预热；`/healthz` 报本进程 `pid`/`device`，本进程模型未就绪即 503；推理忙时回 503 `busy`（二轮复核后改为不排队，见 §11） |
 | R2 P1 解码量 | 抽出与 `/regions` 共用的成本估算 `_plugin_render_cost_estimate` 与准入 `_plugin_admit_region_pixels`；refine 按真实金字塔层估算解码像素（含多通道倍数），任何 `read_region` 之前超单请求上限 → `refined:false, reason:"too_large"`，滑窗/并发不准入 → `busy`，计入与 regions 同一像素窗口。`/regions` 行为与错误信封不变 |
 | R3 P2 旧快照 | 同位置 goto 仅在资产 revision 与 render fingerprint 都一致时复用当前快照，否则重新取景；描绘、矩形、region 观察遇到身份不一致的当前快照拒绝写入并请模型重新 goto |
 | R4 P2 显示上下文 | HP 以当前快照自身的 render context 与 revision 调细化；PT 走与 regions 相同的校验后读图，回显 `render_context_fingerprint`；context 无效/过期 → `refined:false, reason:"render_context"`；快照 context 无法上线（legacy）时 HP 跳过细化 |
@@ -316,3 +316,17 @@ SAM2 置信分与面积比不等于病理轮廓准确率。
 | 细化服务测试（含真实 SAM2 CPU 冒烟） | 20 passed |
 | PT 子集（refine/regions/render context/描绘闸门等） | 231 passed |
 | PT 全量 pytest（plugins/ 无 HP bundle） | 3033 passed / 113 skipped（29 分钟） |
+
+## 11. 二轮复核 F1：推理忙时不排队（2026-10-10，主代理实现）
+
+二轮复核（`navigation-refine-review-20261010.md` §二轮复核）确认 §10 五项修复通过，另发现：推理锁的 2 秒等待只覆盖锁，
+不覆盖 gunicorn 线程池里的等待，客户端 8 s 超时后仍有 6 个请求在第 12 s 开始推理。
+
+修复：`/v1/refine` 非阻塞获取推理锁，被占用即回 503 `busy`，去掉 `CONTOUR_REFINE_QUEUE_WAIT_S`。等待线程不再阻塞，
+线程池在毫秒级排空，已放弃的请求不会再进入 predictor。
+
+验证：复核方探针（真实 gunicorn 23.0.0 + 正式 `gunicorn.conf.py`，首请求 12 s 慢推理，11 个并发 8 s 超时）修复前
+6 个过期请求开始推理、修复后 0 个，等待请求均在约 5 ms 内回 503。同形态回归入仓为
+`services/contour-refine/tests/test_gunicorn_queue.py`（首请求 3 s、8 个 1.5 s 超时客户端；修复前失败、修复后通过）。
+细化服务测试 21 passed（含真实 SAM2 CPU 冒烟与 gunicorn 并发回归）；PT `tests/test_plugin_contour_refine.py` 39 passed。
+GPU 镜像实测仍未做，仍是启用前置项。

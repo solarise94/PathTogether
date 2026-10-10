@@ -19670,8 +19670,7 @@ def _plugin_contour_refine_body(claims, safe, gate, sid):
                 json={"image_png_b64": png_b64, "polygon": crop_polygon},
                 timeout=_CONTOUR_REFINE_TIMEOUT_S, headers=headers)
             if r.status_code == 503:
-                # 服务忙（推理串行、排队等待超 CONTOUR_REFINE_QUEUE_WAIT_S）：
-                # 尽力而为回 busy，不让已超时的客户端在后台继续堆积计算
+                # 服务忙（推理串行、另一推理进行中即回 busy，不排队）
                 try:
                     svc_body = r.json()
                 except ValueError:

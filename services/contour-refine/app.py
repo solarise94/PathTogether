@@ -6,7 +6,7 @@
      （**不触发加载**：本 worker 进程内模型未就绪/加载失败 → 503 ``{ok:false, ...}``）
   POST /v1/refine → ``{image_png_b64, polygon}``（polygon 为 crop 像素坐标）→
      ``{accepted, reason, score, area_ratio, points, model, seconds}``；
-     另一推理进行中且排队等待超过 CONTOUR_REFINE_QUEUE_WAIT_S → 503 ``{error:"busy"}``
+     另一推理进行中 → 立即 503 ``{error:"busy"}``（不排队）
 
 要点：
   - 模型在 **worker 进程内**加载（gunicorn 不用 --preload；gunicorn.conf.py 的
@@ -14,7 +14,8 @@
     CONTOUR_REFINE_EAGER_LOAD=0 可改为惰性，测试用）——CUDA 上下文绝不能在
     master 创建后被 fork 继承（PyTorch poison-fork 约束）；
   - 推理互斥锁串行化（单实例 SAM2ImagePredictor 的 set_image+predict 不并发），
-    且排队等待有上界（见上 busy）——调用方 8 s 超时后的计算不应在后台堆积；
+    锁被占用即回 busy、不等待：在锁上等待会占住 gunicorn 线程，后续请求在线程池
+    里排到调用方超时之后才拿到锁，已放弃的请求仍会开始推理；
   - 权重路径 SAM2_CHECKPOINT（缺省 /models/sam2.1_hiera_base_plus.pt）、配置
     SAM2_CONFIG（缺省 configs/sam2.1/sam2.1_hiera_b+.yaml）；
   - 可选共享密钥：设置 CONTOUR_REFINE_TOKEN 后请求须带 X-Refine-Token 头
@@ -45,17 +46,12 @@ MAX_IMAGE_EDGE = int(os.environ.get("CONTOUR_REFINE_MAX_IMAGE_EDGE") or 2048)
 MAX_BODY_BYTES = int(os.environ.get("CONTOUR_REFINE_MAX_BODY_BYTES") or 8 * 1024 * 1024)
 MIN_POLYGON_POINTS = 3
 MAX_POLYGON_POINTS = 500
-try:
-    QUEUE_WAIT_S = float(os.environ.get("CONTOUR_REFINE_QUEUE_WAIT_S") or 2)
-except (TypeError, ValueError):
-    QUEUE_WAIT_S = 2.0
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_BODY_BYTES
 
 # 推理互斥锁：单模型实例（gunicorn 单 worker 多线程时保护 set_image+predict
-# 成对执行）。/v1/refine 以 acquire(timeout=QUEUE_WAIT_S) 获取——排队等待超过
-# 上界即 503 busy，不无限排队（调用方 8 s 超时后不应在后台继续堆积计算）。
+# 成对执行）。/v1/refine 非阻塞获取，占用即 503 busy。
 _INFERENCE_LOCK = threading.Lock()
 
 
@@ -233,9 +229,7 @@ def v1_refine():
     except Exception:  # noqa: BLE001
         return jsonify({"error": "model not ready (see server logs)"}), 503
 
-    # 排队上界：另一推理进行中时最多等 QUEUE_WAIT_S，超时 503 busy——
-    # 调用方（PT，8 s 超时）不应让已放弃的请求在后台继续排队计算。
-    if not _INFERENCE_LOCK.acquire(timeout=QUEUE_WAIT_S):
+    if not _INFERENCE_LOCK.acquire(blocking=False):
         return jsonify({"error": "busy"}), 503
     img = np.asarray(image.convert("RGB"), dtype=np.uint8)
     started = time.monotonic()

@@ -1,0 +1,12 @@
+
+ RUN  v3.2.7 /home/solarise/ZCodeProject/histopilot-suite/PathTogether/.gate-tmp/hp-integ-wt
+
+ ✓ |unit| test/http-client.test.ts (74 tests) 61ms
+ ✓ |unit| test/ai-drawing-refine.test.ts (16 tests) 47ms
+ ✓ |unit| test/tools.test.ts (71 tests) 131ms
+
+ Test Files  3 passed (3)
+      Tests  161 passed (161)
+   Start at  18:11:38
+   Duration  911ms (transform 480ms, setup 0ms, collect 1.20s, tests 238ms, environment 0ms, prepare 276ms)
+

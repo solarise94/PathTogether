@@ -148,3 +148,56 @@ npx vitest run test/http-client.test.ts test/ai-drawing.test.ts
 ```
 
 本次没有重跑全部 3020/1529 项，也没有新增模型评测开销。现有全量通过与这些新反例并不矛盾：门禁此前没有覆盖这些边界。
+
+## 二轮复核：cb283174 / bc57f57
+
+2026-10-10 复核 PathTogether `cb283174`、HistoPilot `bc57f57`，hotfix 仍为 `64a0396`。以下结论取代上面旧基线的上线判断。
+
+原五项问题对应的代码修复通过复核，四条原始回归的新增代码块逐字一致，断言没有改写。本轮另确认 **1 项 P2：服务线程池中的等待仍能导致已超时请求开始推理**。因此可以关闭原来的 CUDA preload、细化解码超限、旧快照复用、细化 context 丢失及取消后写请求问题；“不会在客户端超时后继续堆积计算”的新增保证尚未成立。
+
+### F1 · P2：推理锁的 2 秒限制没有覆盖 Gunicorn 排队
+
+位置（修复基线）：`services/contour-refine/app.py:236–243`，`services/contour-refine/gunicorn.conf.py:15–18`。
+
+正式配置为一个 worker、两个线程。第一个线程执行推理，第二个线程在锁上最多等 2 秒；其余请求先排在 Gunicorn 的线程池里。每个请求轮到 Flask 处理后才开始自己的 2 秒计时，因此总等待时间可超过调用方 8 秒超时。客户端断开不会自动撤销已经进入线程池的 WSGI 请求，拿到锁后也没有截止时间检查。
+
+独立复现使用 **Gunicorn 23.0.0（符合 requirements 的版本范围）、原 gunicorn.conf.py 和原 app.py**；只注入 predictor：第一笔耗时 12 秒，其余约 20ms。12 个并发请求均使用 8 秒客户端超时。结果：
+
+- 等锁请求的 503 分别在约 2、4、6、8 秒才返回，证明 2 秒不是端到端排队上限。
+- 6 个客户端已超时的请求，在约 12.013–12.124 秒才开始推理。
+- 第一笔在超时前已开始执行，不计入这 6 个反例；本项要求拦住的是**尚未开始的废弃任务**，并不要求强行中断正在运行的 CUDA kernel。
+
+这是服务层的并发慢推理复现，不是 GPU 性能测量，也不表示一次 PT 单进程可以同时通过 12 个并发槽。PT 的闸门按进程设置且会在 HTTP 超时后释放，不能替代服务本身的全局有界准入。
+
+建议优先采用简单的忙时直接返回 `busy` 的非阻塞准入，避免占住第二条线程等待；若仍保留排队，则需要覆盖线程池前的等待，并把可信调用方的截止时间带到推理前校验，过期请求直接回退。只在 Flask 入口记开始时间或把 Gunicorn `timeout` 改成 8 秒，都不能覆盖这个反例。
+
+验收增加真实 HTTP 并发测试：制造慢首请求和多个等待请求，客户端超时后，等待请求不能再进入 predictor。证据和可失败的探针在 `docs/review-evidence/navigation-refine-followup-20261010/`：
+
+- `gunicorn-queue-probe.py`：末尾断言无过期任务开始；当前修复基线会失败。
+- `gunicorn-queue-result.json`：本轮原始时序。
+
+复现时先把探针复制到临时目录，在同目录 `deps/` 安装 Gunicorn 23.0.0；使用带 Flask/Pillow/NumPy/OpenCV 的服务 Python 环境执行，参数为被测 `services/contour-refine` 的绝对路径。脚本只绑定本机随机端口，并在 finally 关闭自身启动的 Gunicorn，不调用真实模型或生产服务。
+
+### 原修复与本轮测试
+
+| 项目 | 本轮核验 |
+| --- | --- |
+| R1 preload | 移除 preload，加载发生在 worker；health 不主动加载并检查当前 PID。真实 CUDA 镜像仍待验收 |
+| R2 解码预算 | 细化用真实 pyramid 选层估算，包含通道数；读像素前共用预算/并发闸，原 80k² 反例不读图 |
+| R3 快照身份 | goto 复用及有坐标写入检查 revision/context，身份相同仍可复用 |
+| R4 显示配置 | 来源快照 context 传到 PT 规范化校验及 crop；legacy context 跳过细化 |
+| R5 取消 | resolve 后和 bundle I/O 后检查 signal，annotate HTTP 转发 signal |
+| HP tools/refine/http-client | **161 passed**（包含原三条 HP 回归） |
+| PT contour-refine/plugin-api | **66 passed**（包含原 PT 回归） |
+| 细化服务 + 真实 SAM2 CPU 冒烟 | **20 passed**，两条依赖 warning |
+| 独立 hotfix http-client/ai-drawing | **74 passed** |
+
+没有重跑用户报告的全量 3033/1543 项或 14 例付费模型评测，也没有 GPU 验收；不能将本次结果表述为已经全面复跑上线门禁。
+
+### 独立 hotfix 与交付状态
+
+0.3.6 可继续独立准备，不依赖 SAM2 修复。源码 `integrations/pathtogether/manifest.json` 仍写 0.3.3，`package-lock.json` 顶层和根包也仍写 0.3.3；发布前宜同步。现有 `scripts/package-pathtogether-plugin.mjs:19` 会用 package.json 的版本重写**产物** manifest，因此按此脚本打包时产物版本会是 0.3.6，不能把源 manifest 旧版本误报为打包产物一定错误。
+
+GPU 最终镜像的 `/healthz device=cuda`、真实 `/v1/refine`、超时回退验收仍是启用细化的前置项。矩形标注工具未贯穿取消信号是本轮未处理的既有缺口，不能扩大成所有标注工具都已具备同样取消保证。
+
+本轮只提交 review 文档、复现脚本和测试证据；没有改业务实现、推送、部署或发布插件。

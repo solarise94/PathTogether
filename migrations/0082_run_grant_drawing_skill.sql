@@ -9,7 +9,8 @@
 --     false→true 置位；不提供 true→false 通道——收回靠既有 revoke/expiry
 --     （run 终态/cancel/TTL/权限钩子，与 annotate 同生命周期）。
 --   - drawing_bound_at：置位时间（审计辅助）。
---   - drawing_intent：判定通道 explicit|natural（审计辅助，空串=未置位）。
+--   - drawing_intent：来源 explicit（用户点了 @描绘）| model（模型按本轮
+--     消息自行描绘）| natural（旧 HP 兼容）；审计辅助，空串=未置位。
 --
 -- 旧 ai_session_drawing_flags（0039/0041）保留不删：表与 /drawing 端点照旧
 -- 可写（generation/CAS 不变），但自本迁移起**不再参与新写入授权**——
@@ -30,4 +31,4 @@ COMMENT ON COLUMN run_grants.allow_ai_drawing IS
 COMMENT ON COLUMN run_grants.drawing_bound_at IS
     '描绘技能置位时间（/skills 端点写入；未置位为 NULL）';
 COMMENT ON COLUMN run_grants.drawing_intent IS
-    '判定通道 explicit|natural（/skills 端点写入；未置位为空串）';
+    '描绘来源 explicit|model|natural（/skills 端点写入；未置位为空串）';

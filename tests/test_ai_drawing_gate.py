@@ -1283,6 +1283,28 @@ def test_skills_endpoint_sets_flag_idempotently(monkeypatch):
     assert stored2["allow_ai_drawing"] is True
 
 
+def test_skills_endpoint_accepts_model_intent(monkeypatch):
+    """模型按本轮消息自行描绘时 HP 以 intent=model 置位；来源只做审计。"""
+    _touch()
+    _mock_skills_channel(monkeypatch)
+    g = _make_bound_grant("sess1")
+    c = app_mod.app.test_client()
+    r = _post_skills(c, g["grant_id"], intent="model")
+    assert r.status_code == 200, r.get_data(as_text=True)
+    stored = share_store.get_run_grant(g["grant_id"])
+    assert stored["allow_ai_drawing"] is True
+    assert stored["drawing_intent"] == "model"
+
+
+def test_skill_provenance_accepts_model_intent():
+    prov, err = app_mod._parse_skill_provenance(
+        {"skill": "delineate", "skill_intent": "model"})
+    assert err is None
+    assert prov == {"skill": "delineate", "skill_intent": "model"}
+    _, err = app_mod._parse_skill_provenance(
+        {"skill": "delineate", "skill_intent": "vibes"})
+    assert err
+
 def test_skills_endpoint_installation_mismatch(monkeypatch):
     """身份隔离：installation 不符 → 403，列保持 false（零副作用）。"""
     _touch()

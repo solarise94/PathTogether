@@ -3780,6 +3780,9 @@ def bind_run_grant_session(grant_id, session_id):
         conn.close()
 
 
+_DRAWING_INTENTS = ("explicit", "model", "natural")
+
+
 def set_run_grant_skill_delineate(grant_id, session_id, intent,
                                   installation_id=None, creator_allowed=None):
     """描绘技能置位（0082 / 契约 §3.2，裁决 5）：run grant 的
@@ -3806,8 +3809,8 @@ def set_run_grant_skill_delineate(grant_id, session_id, intent,
         raise ValueError("grant_id 不能为空")
     if not isinstance(session_id, str) or not session_id:
         raise ValueError("session_id 不能为空")
-    if intent not in ("explicit", "natural"):
-        raise ValueError("intent 需为 explicit|natural")
+    if intent not in _DRAWING_INTENTS:
+        raise ValueError("intent 需为 explicit|model|natural")
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:

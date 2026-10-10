@@ -1,14 +1,51 @@
 # AI 描绘改按需技能：跨仓服务端契约（已批准 + 主代理裁决修订）
 
-日期：2026-10-09。状态：**契约 d19e6a9e 已批准；本文含主代理裁决修订（§0.4），
-实施中**。
+日期：2026-10-09（2026-10-10 修订）。状态：**契约 d19e6a9e 已批准；本文含主代理裁决修订（§0.4）
+与 2026-10-10 修订（§0.5，优先）**。
 上游设计：`docs/viewer-interaction-skills-review-design-20261009.md` §5 / R6 / §7-E、F。
 基线：PathTogether `5328fefc`（vi-skill）；HistoPilot `23e89fa`（release/hp-0.3.5）。
 行号对应该两基线，实施后以函数名定位。
 
+## 0.5 修订（2026-10-10）：模型判断本轮描绘意图，后台检查写权限，授权不跨轮继承
+
+本节**取代** §0.4 第 1 条与 §2.3 的关键词规则、§3.2 的调用时机、§4.1 的装配条件、
+§6 的来源取值和 §7 的自然语言预判标签；其余条款不变。起因：外部复核（
+`viewer-skills-codex-review-20261010.md` §1）实测关键词规则会把否定句与提问
+（如「暂时不需要圈出腺体」「@描绘是什么意思？」）判成授权。用户决定不再补词表。
+
+1. **没有单独的意图分类器。** 可写 main run（有 run grant、非只读 profile、非
+   ephemeral）一律向模型提供 `draw_suspicious_region`，由模型按本轮消息决定是否
+   调用。工具说明只描述环境：结果是待人工复核的标记；用于用户在这一轮要求圈出
+   或描绘时；之前轮次的要求不延续；解释、提问、讨论已有标记时不需要画；消息带
+   `@描绘` 即是明确要求。系统提示不变，不强制模型画图或调用工具。
+2. **写权限在模型首次描绘时由后台检查。** 本 run 第一次调用描绘工具、几何校验
+   通过后、写入前，HP 调 `POST /api/plugin/v1/run-grants/<id>/skills`
+   （§3.2 的事务内复查不变：grant 未撤销/未过期/已绑定同 session，创建者对该
+   切片仍有写权限）。同一 run 内只调用一次（结果缓存，失败也不重试）。置位失败、
+   旧平台无端点、缺 grant → 本次不写入，工具返回说明，事件流发
+   `skill_status: unavailable`（reason：`skill_grant_failed` / `platform_unsupported`
+   / `no_run_grant`）；成功发 `skill_status: assembled`。两条写入口仍只认 grant 列。
+3. **不跨轮继承。** 每条消息是新 run、新 grant；上一轮置位不影响下一轮，下一轮
+   模型不画就不会再置位。
+4. **用户信号只是提示。** `requested_skills`（用户点了 @描绘）只决定来源记为
+   `explicit`，否则为 `model`；`dismissed_skills` 仍被尊重（本 run 不提供工具），
+   但当前 UI 不再自动加标签，也不发送该键。只读 run 不提供工具；用户点了 @描绘
+   时发 `skill_status: unavailable(readonly_profile)`。
+5. **选中范围是上下文，不是范围闸。** 浏览器在每条 run/continue 消息里附带发送时
+   选中的选框或已有标注（`target.kind` = roi | annotation；视野/整片不附带，由
+   viewport 前缀表达）。HP 在任务文本前加一行
+   `【发送时选中】选框|已有标注 <id>，level-0 区域 (x,y,w,h)。`，不再做「描绘与
+   target 无交集则软拒绝」。
+6. **来源取值：** `/skills` 的 `intent` 与 provenance `skill_intent` 接受
+   `explicit | model`，并兼容旧 HP 的 `natural`。0082 列无约束，无需新迁移。
+7. **成本与误判：** 不新增模型调用，判断发生在主模型正常的工具选择中。模型仍可能
+   误判（多画或漏画），不承诺误判方向；结果均为待复核标记，用户可删除。真实模型
+   验收集见 HistoPilot `experiments/evals/drawing-intent-v1.json`，**尚未用真实
+   模型运行**。
+
 ## 0.4 主代理裁决（2026-10-09，对 d19e6a9e 的修订）
 
-1. **判定位置：HP，同意；本轮判定为纯本地确定性规则，不做模型结构化判定
+1. **（已由 §0.5 取代）判定位置：HP，同意；本轮判定为纯本地确定性规则，不做模型结构化判定
    调用**（零成本、可单测、无预算/计费交互）。规则全文见 §2.3 修订；判定
    模块设计为纯函数，未来可插模型判定但本轮不接。目标指代含糊的追问交给
    模型在已授权 run 内按系统提示处理（提示写明：目标范围不明确时先追问，
@@ -233,6 +270,8 @@ execute 重读 session 开关（tools.ts:1943-1948）拒绝运行中关闭后的
 preamble），判定结果经新机器端点写回 PT run_grants**（裁决 1 修订：纯本地
 确定性规则，本轮不做模型调用）
 
+> 2026-10-10：本节已被 §0.5 修订取代（保留为历史记录）。
+
 推荐 HP 单点判定，理由：
 
 1. **技能是 HP 的产品能力定义**（设计 §5.3：能力定义文件——名称、描述、意图
@@ -353,6 +392,8 @@ COMMENT ON COLUMN run_grants.allow_ai_drawing IS
 
 ### 4.1 HP 工具装配与执行复查
 
+> 2026-10-10：本节已被 §0.5 修订取代（保留为历史记录）。
+
 - 装配（tools.ts:2206-2222）：`draw_suspicious_region` 的条件由
   `ctx.cfg.allow_ai_drawing === true`（session 权威注入，agent-runner.ts:2874）
   改为**本 run 判定结果 + grant 置位成功**的 run 级字段（RunConfig 新键
@@ -448,6 +489,8 @@ COMMENT ON COLUMN run_grants.allow_ai_drawing IS
 
 ## 6. 来源标注
 
+> 2026-10-10：skill_intent 取值改为 explicit | model（兼容 natural），见 §0.5 第 6 条。
+
 - 技能创建的结果：两条写路径的 provenance 增加 `skill: "delineate"` 与
   `skill_intent: "explicit"|"natural"`（additive，旧端忽略；随 effect_key 幂等
   一致）。UI 标记详情「来源：AI · 本次描绘」，人工修改保留原始来源快照与
@@ -458,6 +501,8 @@ COMMENT ON COLUMN run_grants.allow_ai_drawing IS
 ---
 
 ## 7. HP UI 改动清单（随 HP release，不能只发 PT CSS）
+
+> 2026-10-10：自然语言预判标签与 dismissed_skills 已移除，选中范围随每条消息附带，见 §0.5 第 4、5 条。
 
 移除：
 - checkbox `#hp-ai-drawing-toggle` 及 switch（sessions.js:585-603）、

@@ -2605,7 +2605,7 @@ def _parse_snapshot_provenance(body, require_snapshot_id=False):
 def _parse_skill_provenance(body):
     """描绘写请求的技能溯源字段（0082 / 契约 §6，可选 additive）。
 
-    - ``skill`` ∈ {"delineate"}；``skill_intent`` ∈ {"explicit","natural"}
+    - ``skill`` ∈ {"delineate"}；``skill_intent`` ∈ {"explicit","model","natural"}
       且必须与 skill 一同携带；
     - 给出即校验形态（畸形 → err，调用方一律 400，不把垃圾持久化）；
     - 仅点列（polygon/freehand）路径调用——矩形 create_annotation 保持现状，
@@ -2622,8 +2622,8 @@ def _parse_skill_provenance(body):
         out["skill"] = skill
     intent = body.get("skill_intent")
     if intent is not None:
-        if intent not in ("explicit", "natural"):
-            return None, "skill_intent 需为 explicit|natural"
+        if intent not in ("explicit", "model", "natural"):
+            return None, "skill_intent 需为 explicit|model|natural"
         if skill is None:
             return None, "skill_intent 需与 skill 一同携带"
         out["skill_intent"] = intent
@@ -19637,10 +19637,12 @@ def plugin_v1_run_grant_skills(grant_id):
     """描绘技能置位（0082 / docs/viewer-drawing-skill-contract-20261009.md §3.2）。
 
     Bearer plugin JWT（annotation:write）。body: {session_id, skills, intent}。
-    HP 在 run 接受处完成意图判定后调用；仅 false→true、幂等；**不提供 false
+    HP 在模型本 run 首次调用描绘工具、写入之前调用（是否描绘由模型按本轮
+    消息决定，平台只复查写权限）；仅 false→true、幂等；**不提供 false
     通道**——收回靠既有 revoke/expiry（run 终态/cancel/TTL/权限钩子）。
 
-    校验（裁决 5）：skills 白名单（仅 delineate）；intent ∈ explicit|natural；
+    校验（裁决 5）：skills 白名单（仅 delineate）；intent ∈ explicit|model|
+    natural（来源标注，不参与授权；natural 为旧 HP 兼容）；
     置位经 share_store.set_run_grant_skill_delineate 在**同一事务（行锁）**内
     完成——installation 匹配、未撤销、未过期、已绑定同一 session、创建者对该
     切片仍有写权限（_run_grant_creator_allowed 同口径，含临时查看到期、只读
@@ -19662,9 +19664,9 @@ def plugin_v1_run_grant_skills(grant_id):
         return _plugin_error(400, "invalid_request",
                              "skills 需为 [\"delineate\"]（白名单）")
     intent = body.get("intent")
-    if intent not in ("explicit", "natural"):
+    if intent not in ("explicit", "model", "natural"):
         return _plugin_error(400, "invalid_request",
-                             "intent 需为 explicit|natural")
+                             "intent 需为 explicit|model|natural")
     try:
         ok, reason = share_store.set_run_grant_skill_delineate(
             grant_id, session_id, intent,

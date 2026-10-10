@@ -40,7 +40,7 @@ PT 子分支：`vi-chrome` 8d46e7c8（A 标题整栏拖动 + B 无黑幕交接�
 - **D 位置锁**：`rois.data.geometry_locked`，无迁移；行锁内先查锁后查 revision；
   锁与几何同请求 400、锁切换须带 expected_revision；已锁改几何/删除 409 `annotation_locked`；
   前端按错误码区分锁定与版本冲突，备注保存不再夹带 geom。
-- **E 描绘技能**：checkbox 全链移除；`@描绘` 候选与可删标签、自然语言预判标签；
+- **E 描绘技能**（2026-10-10 已按 §7 修订，下述判定方式作废）：checkbox 全链移除；`@描绘` 候选与可删标签、自然语言预判标签；
   意图判定唯一权威在 HP，**纯本地确定性规则**（本轮不调模型），只读本次原始用户文本；
   判定成立后 HP 调 PT `POST /api/plugin/v1/run-grants/<id>/skills`（只 false→true，事务内复查
   grant 状态与创建者当前写权）；run_grants 0082 `allow_ai_drawing` 是两条写入口（plugin v1 与
@@ -72,7 +72,8 @@ PT 子分支：`vi-chrome` 8d46e7c8（A 标题整栏拖动 + B 无黑幕交接�
   PT + 真实 HP 客户端栈验证 /skills 与写入口闸门，但模型输出为桩；真实推理 dogfood 需付费 AI，
   未执行。浏览器端「正在描绘……」全链 SSE 未在 e2e 中端到端跑（e2e 无 AI sidecar）。
 - 未做 Mac 实机 / 2×DPR 帧率测量；8 秒超时路径无专门 e2e（代码审查 + 单元覆盖）。
-- 意图判定为枚举规则，误判方向为少授权；新误开/漏判句式按契约 §2.3 表增补，UI 预判须同步。
+- ~~意图判定为枚举规则，误判方向为少授权~~：该说法不成立（复核实测否定句与提问被判成授权），
+  规则已于 2026-10-10 移除，见 §7。
 - branch（askBranch）路径不装配描绘工具；HP 重启后恢复的 run 不恢复技能授权（fail-closed）。
 - 「分享携带已有标记」独立问题（设计 §9）仍未解。
 - 位置锁「锁 + 备注」同请求在后端为两次事务（非原子）；前端始终单独发送锁切换。
@@ -82,7 +83,11 @@ PT 子分支：`vi-chrome` 8d46e7c8（A 标题整栏拖动 + B 无黑幕交接�
 1. PT 迁移 0082（幂等 ADD COLUMN），在生产 schema 副本演练。
 2. PT 与 HP **同一 suite 镜像一起部署**：旧 HP + 新 PT 描绘不可用（fail-closed），新 HP + 旧 PT 同样不可用；
    任何组合都不会回到永久开启。HP 需发布 0.4.0 bundle（UI 改动不能只靠 PT CSS）。
-3. 本分支基于 admin-viewer 5328fefc，包含第四轮未部署内容（0081、插件 0.4.17、APP_REVISION 等）。
+3. ~~本分支基于 admin-viewer 5328fefc，包含第四轮未部署内容（0081、插件 0.4.17、APP_REVISION 等）。~~
+   更正（2026-10-10 复核只读核对 homepc）：生产已运行 PT `5b87fb90`、admin 插件 0.4.17、迁移台账到 0081。
+   本分支相对生产新增的是 0082 与本轮 PT/HP 改动。
+4. 部署形态以契约版本兼容为准：新 PT + 旧 HP、旧 PT + 新 HP 均为描绘不可用（fail-closed），其余功能照常；
+   不以「必须同一镜像」作为前提。HP 根 package.json 已与插件 manifest 对齐为 0.4.0。
 
 ## 6. 追加：切片抽卡动画改为「文件袋抽出 → 翻面 → 铺开」（2026-10-10，主代理实现）
 
@@ -96,3 +101,41 @@ PT 子分支：`vi-chrome` 8d46e7c8（A 标题整栏拖动 + B 无黑幕交接�
 - 验证：CDP 0.1× 慢放逐帧截图人工看过（抽出、侧立、翻面、铺开、交接后无残留）；
   `sidebar-pullout.test.ts` 旧几何断言（右移 40/上抬/放大 240）按新契约改写；vitest 1115 通过；
   Playwright 全量 112 通过（含黑帧逐帧检测仍为 0）。
+
+## 7. 修订：描绘意图改由模型判断（2026-10-10，主代理实现）
+
+依据：用户决定「模型判断本轮描绘意图，后台检查写权限，授权不跨轮继承」，不再补关键词规则；
+复核报告 `docs/viewer-skills-codex-review-20261010.md` §1 的否定、提问案例保留为模型验收集。
+
+- **删除关键词判定**：HP `src/skill-intent.ts` 及其句子表测试删除；UI 删除自然语言预判与「描绘 · 本次」
+  自动标签，删除标签不再发送 `dismissed_skills`（服务端仍尊重该键）。
+- **工具提供**：可写 main run（有 grant、非只读、非 ephemeral）一律提供 `draw_suspicious_region`；
+  工具说明只描述环境（待复核标记、用于本轮要求、之前轮次不延续、提问/讨论不需要画、@描绘 即明确要求），
+  系统提示不变，不强制画图。
+- **后台检查写权限**：模型本 run 首次描绘、几何校验通过后、写入前，HP 调 `/skills`（PT 事务内复查 grant
+  与创建者写权限）；同 run 只调一次。失败则不写入，工具回说明，`skill_status: unavailable`；
+  成功 `skill_status: assembled`（UI 显示「正在描绘……」）。写入口仍只认 grant 列。
+- **不跨轮**：新 run 新 grant；runner 测试覆盖「上一轮画过、本轮不画 → 不再置位」。
+- **选中范围**：浏览器每条 run/continue 附带发送时的选框/已有标注（不附视野/整片），HP 加一行
+  `【发送时选中】…` 上下文；取消「描绘与 target 无交集即拒绝」的范围闸。
+- **来源**：`/skills` intent 与 provenance `skill_intent` 接受 `explicit | model`（兼容旧 `natural`）；
+  0082 列无约束，仅改注释。
+- **成本与误判**：不新增模型调用。模型仍可能多画或漏画，不承诺误判方向；结果均为待复核标记。
+
+门禁（2026-10-10）：
+
+| 门禁 | 结果 |
+| --- | --- |
+| HP `npm test` | 80 files / 1513 passed（句子表测试随规则删除） |
+| HP `tsc -p tsconfig.build.json --noEmit` | 通过 |
+| HP `npm run test:contract`（真实 PT，含 intent=model 置位与 provenance 落库） | 49 passed |
+| PT pytest：描绘闸门文件 | 72 passed（新增 model 来源 2 项） |
+| PT pytest：涉及 run grant / skill / 迁移台账的 29 个文件 | 551 passed |
+| PT vitest `tests/js` | 1115 passed / 2 skipped |
+| PT Playwright 全量（临时装入新 HP bundle，跑完已移除） | 114 passed |
+
+未做：
+- **未用真实模型运行验收集** `HistoPilot experiments/evals/drawing-intent-v1.json`（35 条单轮 + 3 组多轮，
+  含复核报告全部反例与「帮我识别并圈出腺体」「分别圈出两个区域」）。运行需付费调用，须记录模型版本与逐条结果。
+  runner 测试用脚本化模型证明的是「不画不置位 / 画则先置位 / 失败不写 / 不继承 / 只读不提供」等机制，不证明语言判断正确。
+- PT 全量 pytest 本轮未重跑（PT 改动仅限 `/skills` 与 provenance 的取值白名单和迁移注释）。

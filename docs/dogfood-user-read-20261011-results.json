@@ -1,0 +1,87 @@
+{
+  "platform_revision": "89f517f5",
+  "histopilot_version": "0.4.1",
+  "identity": {
+    "role": "user",
+    "account_kind": "dogfood",
+    "normal_login": true
+  },
+  "existing_id_only_slides": {
+    "count": 5,
+    "info_dzi_thumbnail_tile_status": 200,
+    "images_decoded": true
+  },
+  "existing_ai": {
+    "seconds": 6.83,
+    "events": {
+      "dispatch_committed": 1,
+      "slide_opened": 1,
+      "snapshot_captured": 2,
+      "agent_thinking": 2,
+      "tool_started": 1,
+      "agent_finished": 1,
+      "session_ended": 1
+    },
+    "detail_status": 200
+  },
+  "new_upload": {
+    "new_upload_viewer": true,
+    "real_ai": [
+      {
+        "phase": "fresh-upload-read",
+        "posted_stable_slide_id": true,
+        "seconds": 5.86,
+        "events": {
+          "dispatch_committed": 1,
+          "slide_opened": 1,
+          "snapshot_captured": 2,
+          "agent_thinking": 2,
+          "tool_started": 1,
+          "agent_finished": 1,
+          "session_ended": 1
+        },
+        "session_detail_status": 200,
+        "slide_id_preserved": true
+      }
+    ],
+    "tiles_loaded": 1,
+    "jsErrors": [],
+    "apiErrors": []
+  },
+  "api_resume": {
+    "seconds": 3.5,
+    "session_resumed": 1,
+    "agent_finished_including_history": 2,
+    "history_replay": true
+  },
+  "access_boundary": {
+    "other_user_private_slide_denied": 403
+  },
+  "restore_race": [
+    {
+      "mode": "config_after_slide",
+      "session_list_requests": 0,
+      "cacheLength": 0,
+      "configReady": true
+    },
+    {
+      "mode": "config_before_slide",
+      "session_list_requests": 1,
+      "cacheLength": 2,
+      "configReady": true
+    }
+  ],
+  "unresolved_findings": [
+    {
+      "priority": "P2",
+      "title": "AI configuration arriving after the slide skips session restore",
+      "production_fixed": false
+    }
+  ],
+  "cleanup": {
+    "sessions_archived": 3,
+    "test_annotations_deleted": 0,
+    "new_test_slides_deleted": 1,
+    "ai_access_restored": true
+  }
+}

@@ -19372,7 +19372,8 @@ def _plugin_region_body(claims, safe, gate, sid, _region_path, body):
 
     expected_fp = body.get("expected_fingerprint") or body.get("expectedAssetRevision")
     if isinstance(expected_fp, str) and expected_fp:
-        fp = _slide_fingerprint(_region_path)
+        # Compare the content revision advertised by slide info (ID bundles use SHA).
+        fp = _slide_revision(gate if gate is not None else _region_path)
         if fp != expected_fp:
             return _plugin_error(409, "slide_revision_conflict", "切片指纹不匹配（文件已变更）",
                                  details={"expected": expected_fp, "actual": fp})
@@ -19574,7 +19575,8 @@ def _plugin_contour_refine_body(claims, safe, gate, sid):
     _region_path = _desc_path(gate) if gate is not None else (UPLOAD_DIR / safe)
     expected_fp = body.get("expected_fingerprint") or body.get("expectedAssetRevision")
     if isinstance(expected_fp, str) and expected_fp:
-        fp = _slide_fingerprint(_region_path)
+        # Compare the content revision advertised by slide info (ID bundles use SHA).
+        fp = _slide_revision(gate if gate is not None else _region_path)
         if fp != expected_fp:
             return _plugin_error(409, "slide_revision_conflict", "切片指纹不匹配（文件已变更）",
                                  details={"expected": expected_fp, "actual": fp})

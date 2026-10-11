@@ -319,6 +319,32 @@ def test_fingerprint_mismatch_409():
     assert err.get("details", {}).get("expected") == "mtime:2"
 
 
+@pytest.mark.parametrize("endpoint", ["regions", "contours/refine"])
+@pytest.mark.parametrize("stale", [False, True])
+def test_info_asset_revision_roundtrips_to_read_endpoints(monkeypatch, endpoint, stale):
+    """Deployment regression: info advertises content SHA, not file mtime:size."""
+    inst = _bootstrap_installation()
+    slide = _touch_slide()
+    token = _token_for(inst)
+    desc = app_mod._resolve_legacy_read(slide)
+    prefix = "/api/plugin/v1/slides/by-id/" + desc.slide_id
+    monkeypatch.setattr(app_mod, "_read_metadata", lambda *_: {"mpp_x": 0.5})
+    m1, m2 = _slide_read_mocks(_FakeOsr())
+    with m1, m2:
+        info = _client().get(prefix, headers=_bearer(token))
+        assert info.status_code == 200
+        revision = info.get_json()["asset_revision"]
+        assert revision.startswith("sha256:")
+        body = {"expected_fingerprint": revision + ("-stale" if stale else "")}
+        if endpoint == "regions":
+            body.update(bbox={"x": 0, "y": 0, "w": 100, "h": 100}, max_long_edge=64)
+        else:
+            body["points"] = _SQUARE_POINTS
+        result = _client().post(prefix + "/" + endpoint,
+                                headers=_bearer(token), json=body)
+    assert result.status_code == (409 if stale else 200), result.get_json()
+
+
 # --------------------------------------------------------------------------- #
 # 4. 成功路径（坐标映射）
 # --------------------------------------------------------------------------- #

@@ -1,0 +1,189 @@
+{
+  "deployed": true,
+  "platform_runtime": "89f517f504d5b47521dae3df65c510929b3fbb1c",
+  "histopilot_runtime": "66b905b78be423ae49976fa01524a0ae41fcab0e",
+  "histopilot_version": "0.4.1",
+  "contour_build": "4bb9aa90",
+  "schema_latest": "0082_run_grant_drawing_skill.sql",
+  "pytest": {
+    "runtime_revision": "89f517f504d5b47521dae3df65c510929b3fbb1c",
+    "full": {
+      "passed": 3036,
+      "failed": 1,
+      "skipped": 113
+    },
+    "failure": "tests/test_conversion_drain.py::test_compare_prints_reservation_change_count",
+    "cause": "Test fixture assumes repository .gate-tmp directory exists",
+    "test_only_fix": "15735016",
+    "affected_file_rerun": {
+      "passed": 12,
+      "failed": 0
+    },
+    "unresolved_failures": 0
+  },
+  "histopilot_tests": {
+    "passed": 1545,
+    "failed": 0,
+    "build": "passed"
+  },
+  "gpu": {
+    "device": "cuda",
+    "first_seconds": 0.3994,
+    "warm_seconds": 0.1182,
+    "accepted": true,
+    "score": 0.8206868767738342,
+    "points": 24,
+    "concurrent_statuses": [
+      503,
+      200,
+      503,
+      503,
+      503,
+      503,
+      503,
+      503
+    ],
+    "max_concurrent_seconds": 0.1089,
+    "service_tests": {
+      "passed": 20,
+      "skipped": 1
+    }
+  },
+  "browser": {
+    "desktop_title_drag": true,
+    "all_three_header_buttons_drag": true,
+    "normal_title_click": true,
+    "mobile_panel_in_bounds": true,
+    "errors": [],
+    "apiErrors": []
+  },
+  "annotation_actions": {
+    "id_only_slide_create_move_resize_lock_note_unlock_delete_restore": true,
+    "cleanup": true
+  },
+  "session_reopen": [
+    {
+      "phase": "hotfix",
+      "status": 200,
+      "slide_id_present": true
+    },
+    {
+      "phase": "final-read",
+      "status": 200,
+      "slide_id_present": true
+    },
+    {
+      "phase": "final-draw",
+      "status": 200,
+      "slide_id_present": true
+    },
+    {
+      "phase": "final-draw-refined",
+      "status": 200,
+      "slide_id_present": true
+    }
+  ],
+  "cleanup": {
+    "test_annotations_deleted": 2,
+    "test_sessions_archived": 4
+  },
+  "ai_runs": [
+    {
+      "phase": "final-read",
+      "elapsed": 9.83,
+      "events": {
+        "dispatch_committed": 1,
+        "slide_opened": 1,
+        "snapshot_captured": 4,
+        "agent_thinking": 4,
+        "tool_started": 3,
+        "snapshot_reviewed": 2,
+        "agent_finished": 1,
+        "session_ended": 1
+      }
+    },
+    {
+      "phase": "final-draw",
+      "elapsed": 46.0,
+      "events": {
+        "dispatch_committed": 1,
+        "slide_opened": 1,
+        "snapshot_captured": 6,
+        "agent_thinking": 8,
+        "tool_started": 5,
+        "snapshot_reviewed": 4,
+        "observation": 1,
+        "annotation_created": 1,
+        "agent_finished": 1,
+        "session_ended": 1
+      }
+    },
+    {
+      "phase": "final-draw-refined",
+      "elapsed": 55.64,
+      "events": {
+        "dispatch_committed": 1,
+        "slide_opened": 1,
+        "snapshot_captured": 5,
+        "agent_thinking": 6,
+        "tool_started": 4,
+        "snapshot_reviewed": 3,
+        "annotation_created": 1,
+        "agent_finished": 1,
+        "session_ended": 1
+      }
+    },
+    {
+      "phase": "final-resume",
+      "elapsed": 4.26,
+      "events": {
+        "dispatch_committed": 2,
+        "slide_opened": 1,
+        "snapshot_captured": 4,
+        "agent_thinking": 5,
+        "tool_started": 3,
+        "snapshot_reviewed": 2,
+        "agent_finished": 2,
+        "session_resumed": 1,
+        "session_ended": 1
+      },
+      "events_include_historical_replay": true
+    }
+  ],
+  "timeout_fallback": {
+    "actual_timeout_seconds": 8,
+    "response_seconds": 8.219,
+    "status": 200,
+    "refined": false,
+    "reason": "service_error",
+    "scope": "separate PT process with delayed HTTP target; production worker configuration unchanged"
+  },
+  "stored_drawing_provenance": [
+    {
+      "type": "polygon",
+      "source": "ai",
+      "skill_intent": "model",
+      "review_status": "pending",
+      "contour_refine": {
+        "model": "sam2.1-hiera-b+",
+        "score": 0.7305868864059448,
+        "reason": "low_score",
+        "refined": false,
+        "area_ratio": 1.2239475174627148
+      }
+    },
+    {
+      "type": "polygon",
+      "source": "ai",
+      "skill_intent": "model",
+      "review_status": "pending",
+      "contour_refine": {
+        "model": "sam2.1-hiera-b+",
+        "score": 0.5638161897659302,
+        "reason": "low_score",
+        "refined": false,
+        "area_ratio": 1.3109427694166205
+      }
+    }
+  ]
+}

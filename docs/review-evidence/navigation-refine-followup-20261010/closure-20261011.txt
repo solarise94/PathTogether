@@ -1,0 +1,30 @@
+{
+  "tested_pt": "965e5843",
+  "tested_hotfix": "f3616ce",
+  "gunicorn": "23.0.0",
+  "busy_count": 11,
+  "busy_max_seconds": 0.005,
+  "inference_starts": [
+    {
+      "id": "first",
+      "started": 0.017
+    }
+  ],
+  "late_inference": []
+}
+
+.....................                                                    [100%]
+=============================== warnings summary ===============================
+services/contour-refine/tests/test_refine.py::test_real_model_duct_smoke
+  /home/solarise/pytest-tmp/seg-venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+services/contour-refine/tests/test_refine.py::test_real_model_duct_smoke
+  /home/solarise/pytest-tmp/seg-venv/lib/python3.12/site-packages/torchvision/transforms/functional.py:154: UserWarning: The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior. You may want to copy the array to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:213.)
+    img = torch.from_numpy(pic.transpose((2, 0, 1))).contiguous()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+21 passed, 2 warnings in 9.06s
+
+.......................................                                  [100%]
+39 passed in 21.16s

@@ -1115,7 +1115,7 @@ def test_snapshot_connection_is_database_enforced_read_only():
         conn.close()
 
 
-def test_compare_prints_reservation_change_count(capsys):
+def test_compare_prints_reservation_change_count(capsys, tmp_path):
     tool = _drain_tool()
     base = {"ledger": {"per_user": [], "reservations": [
         {"reservation_id": "r1", "state": "reserved",
@@ -1125,8 +1125,7 @@ def test_compare_prints_reservation_change_count(capsys):
         {"reservation_id": "r1", "state": "released",
          "holder_kind": "baidu_batch", "holder_id": "b1"}]},
         "source_charges": {"events": []}}
-    bp, ap = Path(str(_REPO / ".gate-tmp" / "cmp-b.json")), \
-        Path(str(_REPO / ".gate-tmp" / "cmp-a.json"))
+    bp, ap = tmp_path / "cmp-b.json", tmp_path / "cmp-a.json"
     bp.write_text(json.dumps(base)); ap.write_text(json.dumps(after))
     try:
         assert tool.main(["compare", str(bp), str(ap)]) == 0

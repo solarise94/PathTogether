@@ -5,4 +5,5 @@ gunicorn>=21.2,<24
 numpy>=1.26
 opencv-python-headless>=4.9
 pillow>=10.0
-sam2 @ git+https://github.com/facebookresearch/sam2.git
+# 固定已验收的源码；runtime 基础镜像没有 git，使用源码归档直接安装。
+SAM-2 @ https://github.com/facebookresearch/sam2/archive/2b90b9f5ceec907a1c18123530e92e794ad901a4.tar.gz

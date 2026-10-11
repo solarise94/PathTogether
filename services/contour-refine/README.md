@@ -81,6 +81,9 @@ podman run -d --name contour-refine \
   contour-refine
 ```
 
+- SAM2 源码固定为 `2b90b9f5ceec907a1c18123530e92e794ad901a4`，通过
+  HTTPS 源码归档安装；runtime 基础镜像不带 Git。安装使用
+  `--no-build-isolation`，直接复用镜像内 CUDA 版 PyTorch。
 - 权重**不进镜像**，只读挂载到 `/models`（缺省取
   `/models/sam2.1_hiera_base_plus.pt`）；
 - 需要 NVIDIA CDI（`nvidia-ctk cdi generate`）；无 GPU 时自动回落 CPU

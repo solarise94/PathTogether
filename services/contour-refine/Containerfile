@@ -12,7 +12,9 @@ ENV SAM2_BUILD_CUDA=0 \
 
 WORKDIR /srv/contour-refine
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# SAM2 的构建环境直接使用基础镜像已安装的 CUDA PyTorch，避免隔离构建
+# 再下载一份 torch（以及它的 CUDA 依赖）；无需 git 或 nvcc。
+RUN pip install --no-cache-dir --no-build-isolation -r requirements.txt
 COPY refine.py app.py gunicorn.conf.py ./
 
 EXPOSE 8970

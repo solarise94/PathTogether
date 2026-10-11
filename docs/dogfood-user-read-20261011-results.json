@@ -71,17 +71,22 @@
       "configReady": true
     }
   ],
-  "unresolved_findings": [
-    {
-      "priority": "P2",
-      "title": "AI configuration arriving after the slide skips session restore",
-      "production_fixed": false
-    }
-  ],
   "cleanup": {
     "sessions_archived": 3,
     "test_annotations_deleted": 0,
     "new_test_slides_deleted": 1,
     "ai_access_restored": true
-  }
+  },
+  "findings": [
+    {
+      "priority": "P2",
+      "title": "AI configuration arriving after the slide skips session restore",
+      "production_fixed": true,
+      "fixed_version": "0.4.2",
+      "fixed_commit": "29a6c8b"
+    }
+  ],
+  "unresolved_findings": [],
+  "test_snapshot_before_fix": true,
+  "resolution_version": "0.4.2"
 }

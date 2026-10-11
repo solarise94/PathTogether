@@ -1,0 +1,140 @@
+{
+  "versions": {
+    "pt": "ea54bc5db49f8e816abe0a72bcb1aa949f73dd5c",
+    "hp": "29a6c8bc6e909db9e4443553cd8ad88249f0ef99",
+    "tag": "suite-20261011-home-collab"
+  },
+  "deployed": true,
+  "histopilot_version": "0.4.2",
+  "schema": "0082",
+  "tests": {
+    "histopilot_passed": 1550,
+    "platform_js_passed": 1115,
+    "platform_js_skipped": 2,
+    "focused_pytest_passed": 54,
+    "homepage_e2e_passed": 11
+  },
+  "live_user": {
+    "regular_user_login": true,
+    "existing_id_only_viewer": true,
+    "existing_session_reload": true,
+    "real_ai": [
+      {
+        "phase": "existing-read",
+        "posted_stable_slide_id": true,
+        "seconds": 6.29,
+        "events": {
+          "dispatch_committed": 1,
+          "slide_opened": 1,
+          "snapshot_captured": 2,
+          "agent_thinking": 2,
+          "tool_started": 1,
+          "text_delta": 36,
+          "agent_finished": 1,
+          "session_ended": 1
+        },
+        "session_detail_status": 200,
+        "slide_id_preserved": true
+      },
+      {
+        "phase": "existing-resume",
+        "posted_stable_slide_id": true,
+        "seconds": 5.03,
+        "events": {
+          "dispatch_committed": 2,
+          "slide_opened": 1,
+          "snapshot_captured": 2,
+          "agent_thinking": 3,
+          "tool_started": 1,
+          "text_delta": 36,
+          "agent_finished": 2,
+          "session_resumed": 1,
+          "session_ended": 1
+        },
+        "session_detail_status": 200,
+        "slide_id_preserved": true
+      }
+    ],
+    "tiles_loaded": 10,
+    "jsErrors": [],
+    "apiErrors": []
+  },
+  "live_race": [
+    {
+      "mode": "config_after_slide",
+      "session_list_requests": 1,
+      "cacheLength": 2,
+      "configReady": true
+    },
+    {
+      "mode": "config_before_slide",
+      "session_list_requests": 1,
+      "cacheLength": 2,
+      "configReady": true
+    }
+  ],
+  "home_viewports": [
+    {
+      "viewport": "desktop",
+      "width": 1440,
+      "locale": "zh-CN",
+      "manual_steps": true,
+      "reduced_motion": true,
+      "no_overflow": true,
+      "errors": []
+    },
+    {
+      "viewport": "mobile",
+      "width": 390,
+      "locale": "zh-CN",
+      "manual_steps": true,
+      "reduced_motion": true,
+      "no_overflow": true,
+      "errors": []
+    },
+    {
+      "viewport": "english",
+      "width": 1440,
+      "locale": "en-US",
+      "manual_steps": true,
+      "reduced_motion": true,
+      "no_overflow": true,
+      "errors": []
+    }
+  ],
+  "com_viewport": [
+    {
+      "viewport": "english",
+      "width": 1440,
+      "locale": "en-US",
+      "manual_steps": true,
+      "reduced_motion": true,
+      "no_overflow": true,
+      "errors": []
+    }
+  ],
+  "public_checks": [
+    {
+      "domain": "https://histopilot.cn",
+      "health": true,
+      "homepage": true,
+      "static_hashes_verified": 4,
+      "CSP": true
+    },
+    {
+      "domain": "https://histopilot.com",
+      "health": true,
+      "homepage": true,
+      "static_hashes_verified": 4,
+      "CSP": true
+    }
+  ],
+  "cleanup": {
+    "sessions_archived": 1,
+    "test_annotations_deleted": 0,
+    "new_test_slides_deleted": 0,
+    "ai_access_restored": true
+  },
+  "all_static_image_verification_count": 98,
+  "all_static_public_verification_completed": false
+}

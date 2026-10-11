@@ -1,0 +1,44 @@
+import {test,expect} from '@playwright/test';
+test.use({viewport:{width:1440,height:900},locale:'zh-CN'});
+
+test('collaboration walkthrough plays, pauses, navigates, localizes and loads one image',async({page})=>{
+ await page.clock.install();
+ const images:string[]=[],errors:string[]=[];
+ page.on('request',r=>{if(r.url().includes('/entry-media/tcga-left-20-640.webp'))images.push(r.url());});
+ page.on('pageerror',e=>errors.push(e.message));
+ await page.goto('/');
+ const demo=page.locator('[data-collab-demo]');
+ await expect(page.locator('#collaboration h2')).toHaveText('和你的同伴一起查阅切片、标注并讨论');
+ await demo.scrollIntoViewIfNeeded();await page.clock.runFor(100);
+ await expect(demo).toHaveAttribute('data-step','0');
+ await page.clock.runFor(6000);await expect(demo).toHaveAttribute('data-step','1');
+ await page.locator('[data-collab-toggle]').click();
+ await page.clock.runFor(20000);await expect(demo).toHaveAttribute('data-step','1');
+ await page.locator('[data-collab-step="2"]').click();
+ await expect(demo).toHaveAttribute('data-step','2');
+ await expect(page.locator('[data-collab-status]')).toContainText('补充标注和备注');
+ await page.locator('.lang-toggle').click();
+ await expect(page.locator('#collaboration h2')).toContainText('with your peers');
+ await expect(page.locator('[data-collab-toggle]')).toHaveText('Play');
+ await demo.scrollIntoViewIfNeeded();
+ await page.locator('[data-collab-replay]').click();
+ await expect(demo).toHaveAttribute('data-step','0');
+ await page.clock.runFor(100);
+ await page.locator('.hero').scrollIntoViewIfNeeded();await page.clock.runFor(100);
+ const step=await demo.getAttribute('data-step');
+ await page.clock.runFor(20000);await expect(demo).toHaveAttribute('data-step',step!);
+ expect(images).toHaveLength(1);expect(errors).toEqual([]);
+});
+
+for(const width of [320,390])test(`collaboration reduced motion and controls fit ${width}px`,async({page})=>{
+ await page.setViewportSize({width,height:844});await page.emulateMedia({reducedMotion:'reduce'});
+ await page.goto('/');const demo=page.locator('[data-collab-demo]');await demo.scrollIntoViewIfNeeded();
+ await expect(demo).toHaveAttribute('data-step','2');await expect(demo).toHaveAttribute('data-paused','true');
+ await expect(page.locator('[data-collab-toggle]')).toHaveText('播放');
+ await expect(page.locator('.collab-note-b')).toHaveCSS('opacity','1');
+ expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+ for(const button of await page.locator('.collab-controls button').all()){
+  const box=await button.boundingBox();expect(box!.height).toBeGreaterThanOrEqual(44);expect(box!.x+box!.width).toBeLessThanOrEqual(width);
+ }
+ await page.locator('[data-collab-step="0"]').click();await expect(demo).toHaveAttribute('data-step','0');
+});

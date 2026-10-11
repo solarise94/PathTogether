@@ -51,8 +51,9 @@ test('homepage hero ships one preview raster and runs the full SVG flow without 
   expect(await page.evaluate(() => Array.from((window as any).__sceneCoverage).sort()))
     .toEqual(['0', '1', '2', '3', '4', '5', '6', '7']);
   expect(await page.locator('#tissue [data-glands]').innerHTML()).toBe(geometry);
-  // 首页栅格预算：仅 Hero 工作台预览一张（WebP；桌面 1440 视口不选 720 档）
-  expect(images.filter(u => !u.includes('/static/entry-media/workbench-preview'))).toEqual([]);
+  // Hero 保持单张预览，协作模块复用单张样本；动画不逐帧加载图像。
+  expect(images.filter(u => !u.includes('/static/entry-media/workbench-preview') && !u.endsWith('/static/entry-media/tcga-left-20-640.webp'))).toEqual([]);
+  expect(images.filter(u => u.endsWith('/static/entry-media/tcga-left-20-640.webp')).length).toBeLessThanOrEqual(1);
   expect(images.some(u => u.endsWith('/static/entry-media/workbench-preview.webp'))).toBe(true);
   expect(errors).toEqual([]);
 });

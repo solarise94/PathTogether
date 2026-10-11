@@ -439,9 +439,12 @@ def test_index_entry_landing_page_content(monkeypatch):
     # 中文默认文案（测试锁定，勿改写）
     # 主页升级（H1/H2）：Hero 双入口 + 账户头像面板。href="/login" 仅剩
     # 注册视图「已有账号？登录」切换链接（R2 统一弹窗内）；工作台入口
-    # 统一为 /login?next=/app（Hero 主按钮 + 账户面板各一）。
+    # 统一为 /login?next=/app（Hero、账户面板、协作模块）。
     assert body.count('href="/login"') == 1
-    assert body.count('href="/login?next=/app"') == 2
+    for marker in ('class="hero-actions"', 'id="account-panel"', 'id="collaboration"'):
+        block = body.split(marker, 1)[1]
+        block = block.split('</section>' if marker == 'id="collaboration"' else '</div>', 1)[0]
+        assert 'href="/login?next=/app"' in block
     assert 'href="#principle"' not in body
     assert "Demo 无需登录；上传自己的切片请先登录工作台。" in body
     assert "与 AI 一起，观察病理切片。" in body
@@ -496,7 +499,9 @@ def test_index_entry_landing_page_content(monkeypatch):
     # 无内联脚本（CSP script-src 'self'）；标题由 i18n.js 按 data-page=entry 同步
     # entry-releases.js：What's New 发布说明（2026-09-20），同为静态 self 脚本
     # register-turnstile.js：注册弹窗 Turnstile 按需加载（2026-10-08 设计 §5/§7）
-    assert body.count("<script") == 5
+    scripts = re.findall(r'<script\b([^>]*)>(.*?)</script>', body, re.S)
+    assert scripts
+    assert all('src="/static/' in attrs and not source.strip() for attrs, source in scripts)
     assert 'src="/static/i18n.js' in body
     assert 'src="/static/entry.js' in body
     assert 'src="/static/entry-releases.js' in body
@@ -540,7 +545,10 @@ def test_entry_landing_source_guards():
     assert 'class="skip-link"' in html
     # 语言切换沿用 .lang-toggle
     assert 'class="lang-toggle"' in html
-    assert html.count("<script") == 5
+    scripts = re.findall(r'<script\b([^>]*)>(.*?)</script>', html, re.S)
+    assert scripts
+    assert all('src="/static/' in attrs and not source.strip() for attrs, source in scripts)
+    assert 'src="/static/entry-collaboration.js' in html
     assert 'src="/static/i18n.js' in html
     assert 'src="/static/entry.js' in html
     assert 'src="/static/entry-releases.js' in html
@@ -625,8 +633,11 @@ def test_index_authenticated_stays_on_landing(monkeypatch):
     body = r.get_data(as_text=True)
     assert 'id="viewer"' not in body
     assert "进入工作台" in body
-    # Hero 主按钮 + 账户面板各一个 /app 入口
-    assert body.count('href="/app"') == 2
+    # Hero、账户面板与协作模块均进入 /app
+    for marker in ('class="hero-actions"', 'id="account-panel"', 'id="collaboration"'):
+        block = body.split(marker, 1)[1]
+        block = block.split('</section>' if marker == 'id="collaboration"' else '</div>', 1)[0]
+        assert 'href="/app"' in block
     # 账户头像 disclosure（aria 合同 + 身份摘要 + POST 退出带 CSRF）
     assert 'id="account-btn"' in body
     assert 'aria-controls="account-panel"' in body
@@ -1078,7 +1089,10 @@ def test_entry_register_entry_state_matrix(monkeypatch):
     assert "邀请码" not in closed
     # 两模式共同：Hero 主入口始终为登录工作台（/login?next=/app）
     for mode_body in (public, closed):
-        assert mode_body.count('href="/login?next=/app"') == 2
+        hero = mode_body.split('class="hero-actions"', 1)[1].split('</div>', 1)[0]
+        collaboration = mode_body.split('id="collaboration"', 1)[1].split('</section>', 1)[0]
+        assert 'href="/login?next=/app"' in hero
+        assert 'href="/login?next=/app"' in collaboration
         assert 'data-i18n="entry.workbench.login"' in mode_body
         assert 'href="/demo"' in mode_body
 

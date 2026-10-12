@@ -108,12 +108,14 @@ _log = logging.getLogger("svs.site_stats")
 #:   sogouspider 及已知变体）；``whatsapp`` 仅在 UA 非 Mozilla 浏览器形态
 #:   时记 WhatsApp 链接预览抓取（内置浏览器 UA 带 Mozilla/ 前缀，排除）。
 #:   带预期分类的脱敏完整 UA 样本表见 tests/test_site_stats.py。
-#: - 2026-09-21.v3（本版）：OkHttp 不再作为爬虫身份；泛化标记须位于
+#: - 2026-09-21.v3：OkHttp 不再作为爬虫身份；泛化标记须位于
 #:   UA 产品词尾，避免 RobotPhone 等产品名中间子串误判。
+#: - 2026-10-12.v4：显式识别 AI 搜索、用户代理和训练爬虫；不改变授权。
 #: **口径局限**：本模块不保留原始 UA，历史 suspected_bot 行无法按新词表
 #: 可靠重分类——不做批量改写历史，也不宣称历史数据已修复；新词表只影响
 #: 新落库事件的分类。
-SITE_BOT_UA_RULESET_VERSION = "2026-09-21.v3"
+# v4：显式识别 AI 搜索/用户代理，仍只作观测标签，不影响鉴权。
+SITE_BOT_UA_RULESET_VERSION = "2026-10-12.v4"
 
 #: 页面 allowlist（path → page_key）：**精确匹配**，不允许前缀/模糊命中未知
 #: 路径（权威定义；0030 的 page_key CHECK 只约束形态）。集合口径 §4.4：
@@ -196,6 +198,16 @@ _QUERY_DENY_EXACT = frozenset({
 # 标识。带预期分类的脱敏完整 UA 样本表见 tests/test_site_stats.py。
 # --------------------------------------------------------------------------- #
 _BOT_UA_NEEDLES = (
+    ("gptbot", "GPTBot"),
+    ("oai-searchbot", "OAI-SearchBot"),
+    ("chatgpt-user", "ChatGPT-User"),
+    ("claude-searchbot", "Claude-SearchBot"),
+    ("claude-user", "Claude-User"),
+    ("claudebot", "ClaudeBot"),
+    ("perplexity-user", "Perplexity-User"),
+    ("perplexitybot", "PerplexityBot"),
+    ("google-extended", "Google-Extended"),
+    ("ccbot", "CCBot"),
     ("googlebot", "Googlebot"),
     ("google-inspectiontool", "GoogleInspectionTool"),
     ("apis-google", "Google-API"),

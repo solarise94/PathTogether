@@ -395,6 +395,14 @@ button:focus-visible {
 .step h3 { margin-bottom: 6px; color: var(--text); font-size: 15px; }
 .step p { color: var(--text-3); font-size: 13px; line-height: 1.6; }
 .steps-note { margin-top: 12px; color: var(--text-3); font-size: 12.5px; }
+.conversion-steps { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.public-guide { width: min(900px, calc(100% - 40px)); margin: 60px auto; }
+.public-guide p { line-height: 1.8; }
+.public-page-list { padding-left: 24px; }
+.public-page-list li { margin-bottom: 24px; }
+.public-page-list a { font-size: 19px; font-weight: 600; }
+.public-page-list p { color: var(--text-2); margin-top: 8px; }
+@media (max-width: 767px) { .steps.conversion-steps { grid-template-columns: 1fr; } }
 @media (max-width: 1079px) {
   .steps { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

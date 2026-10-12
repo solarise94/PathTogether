@@ -194,6 +194,9 @@ from plugins.sdk.manifest import (  # noqa: E402
 
 app = Flask(__name__)
 
+from public_site import create_blueprint as _public_site_blueprint
+app.register_blueprint(_public_site_blueprint(lambda: _canonical_public_origin()))
+
 # C3 本地切片工具：/static/tools/slide-transform/*.wasm 必须以
 # application/wasm 提供（compileStreaming 的严格前提；页面 CSP 见
 # _apply_slide_tools_security_headers）。本机 /etc/mime.types 已含该映射，
@@ -1050,6 +1053,8 @@ def _require_auth():
         return None
     # 公开路径不回查用户（避免每个静态资源打一次存储）
     path = request.path
+    if request.blueprint == "public_site" and request.method in ("GET", "HEAD"):
+        return None
     if (path in ("/login", "/register", "/demo", "/tools/slides")
             or path.startswith("/static/")
             or path.startswith("/plugins/")):
@@ -1399,6 +1404,18 @@ def _preview_write_guard():
         return None  # 白名单：退出预览本身是写（已过 CSRF）
     return jsonify(error="预览态只读，写操作被拒绝（请先退出预览）",
                    code="preview_readonly"), 403
+
+
+@app.after_request
+def _public_discovery_headers(resp):
+    from public_site import PRIVATE_PREFIXES
+    if request.path.startswith(PRIVATE_PREFIXES):
+        resp.headers["X-Robots-Tag"] = "noindex, nofollow"
+    if request.path in ("/", "/tools/slides", "/demo"):
+        resp.headers.add("Link", '</llms.txt>; rel="describedby"; type="text/markdown"')
+    if request.path == "/" and AUTH_ENABLED:
+        resp.headers.add("Link", '</index.md>; rel="alternate"; type="text/markdown"')
+    return resp
 
 
 @app.after_request

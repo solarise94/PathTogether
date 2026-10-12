@@ -388,7 +388,7 @@ def test_ruleset_version_constant_shape():
     assert sss.SITE_BOT_UA_RULESET_VERSION
     # R5（2026-09-19）：词表收窄（sogou/whatsapp）必须提版——版本历史与
     # 前后口径见 site_stats_store.SITE_BOT_UA_RULESET_VERSION 注释
-    assert sss.SITE_BOT_UA_RULESET_VERSION == "2026-09-21.v3"
+    assert sss.SITE_BOT_UA_RULESET_VERSION == "2026-10-12.v4"
 
 
 def test_bot_ua_classified_with_name(secret):

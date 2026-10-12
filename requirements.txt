@@ -5,7 +5,8 @@ openslide-bin
 # TIFF reader 与 Zarr store 协议成对升级；避免新旧 store API 混搭。
 tifffile==2026.9.20
 zarr>=3.4.1,<4
-imagecodecs
+# 与 tifffile 2026.9.20 的 codecs extra 最低要求一致，保护增量安装。
+imagecodecs>=2026.8.16
 numpy
 gunicorn
 # AI 读片助手调用 OpenAI 兼容端点（chat/completions）用

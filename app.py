@@ -1298,6 +1298,11 @@ _CSRF_STATIC_PREFIXES = ("/static/", "/plugins/", "/admin/plugin-assets/")
 
 
 def _csrf_exempt_path(path: str) -> bool:
+    # 公开文档 GET/HEAD 不使用会话，不应向可缓存响应镜像用户 CSRF cookie。
+    # 写方法仍走认证/CSRF，且 blueprint 没有任何写端点。
+    if (has_request_context() and request.blueprint == "public_site"
+            and request.method in ("GET", "HEAD")):
+        return True
     # C5 用户面 grant 端点走 Cookie+CSRF（前缀豁免的显式例外）
     if path == _PLUGIN_USER_FACE_PREFIX or \
             path.startswith(_PLUGIN_USER_FACE_PREFIX + "/"):

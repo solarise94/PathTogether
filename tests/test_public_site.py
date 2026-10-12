@@ -48,6 +48,12 @@ def test_discovery_head_matches_get_and_is_read_only(client, path):
     assert client.post(path).status_code in (302, 400, 403, 405)
     assert "csrf_token" not in response.text
     assert "password" not in response.text
+    assert not response.headers.getlist("Set-Cookie")
+    with client.session_transaction() as session:
+        session["csrf_token"] = "existing-user-token"
+    cached = client.get(path)
+    assert not cached.headers.getlist("Set-Cookie")
+    assert "existing-user-token" not in cached.text
 
 
 def test_crawler_access_does_not_bypass_authentication(client):

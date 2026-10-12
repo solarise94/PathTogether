@@ -29,6 +29,141 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pg_reap  # noqa: E402  (path 就绪后再 import，不依赖脚本目录恰为 sys.path[0])
 
 
+# --------------------------------------------------------------------------- #
+# HistoPilot 桩插件（CI 无私仓 bundle 时保证 AI 面板 E2E 有意义而非跳过）
+# --------------------------------------------------------------------------- #
+# 拖动/钳制/位置持久化交互全在宿主侧（app.js 面板控制器 + ai-panel-chrome.js），
+# 插件侧只负责面板显隐。桩只需：
+#   - 目录存在 → histopilot_ui_enabled() 为真 → #ai-btn 与 #ai-panel 随壳渲染；
+#   - ui/*.js 可经 /plugins/histopilot/ui/* 服务（index.html 按 flag 引用全套）；
+#   - main.js 桥接 panel.toggle 与 #ai-panel-close：显隐面板并广播
+#     panel.stateChanged（宿主据此互斥标注面板）。
+# 真实 bundle（integrations/pathtogether 解压到 plugins/histopilot 或
+# PLUGIN_BUNDLES_DIR）存在时不装桩——AI 业务链路仍由真实 bundle 覆盖。
+_HISTOPILOT_STUB_MANIFEST = {
+    "manifestSchemaVersion": "1.0.0",
+    "id": "histopilot",
+    "name": "HistoPilot (e2e stub)",
+    "pluginVersion": "0.0.0-e2e",
+    "pluginContractVersion": "1.0.0",
+    "bridgeProtocolVersion": "1.0.0",
+    "ui": {
+        "entry": "/plugins/histopilot/ui/main.js",
+        "slots": ["viewer.right-panel"],
+    },
+    "service": {"baseUrl": "/", "health": "/healthz"},
+    "permissions": [],
+}
+
+# bridge-client.js 建命名空间（HostBridge 同窗口插件端最小实现）；其余文件为
+# 占位，保持与真实 bundle 相同的加载面（缺失仅 404，但补齐免控制台噪音）。
+_HISTOPILOT_STUB_UI_FILES = {
+    "bridge-client.js": """\
+/* e2e 桩：HostBridge 插件端最小实现（同窗口传输；只服务 panel.toggle）。 */
+(function () {
+  "use strict";
+  if (window.HistoPilot && window.HistoPilot._stub) return;
+  var reqHandlers = {};
+  var evtHandlers = {};
+  function reply(env, ok, body) {
+    var host = window.HostBridgeHost;
+    if (!host) return;
+    var out = {
+      kind: "response", protocolVersion: env.protocolVersion,
+      pluginInstallationId: env.pluginInstallationId || "histopilot",
+      requestId: env.requestId, ok: ok,
+    };
+    if (ok) { out.result = body == null ? null : body; }
+    else { out.error = body; }
+    host._receiveFromPlugin(out);
+  }
+  window.HistoPilot = {
+    _stub: true,
+    onRequest: function (method, fn) { reqHandlers[method] = fn; },
+    onEvent: function (type, fn) { evtHandlers[type] = fn; },
+    bridge: {
+      emit: function (type, payload) {
+        var host = window.HostBridgeHost;
+        if (!host) return;
+        host._receiveFromPlugin({
+          kind: "event", protocolVersion: host.PROTO,
+          pluginInstallationId: "histopilot",
+          eventId: "stub_evt_" + Date.now() + "_" + Math.random().toString(36).slice(2),
+          type: type, payload: payload == null ? {} : payload,
+        });
+      },
+    },
+    _onHostMessage: function (env) {
+      if (!env) return;
+      if (env.kind === "event") {
+        var fn = evtHandlers[env.type];
+        try { if (fn) fn(env.payload || {}); } catch (e) {}
+        return;
+      }
+      if (env.kind !== "request") return;  // 桩不向 host 发请求，无 pending
+      var handler = reqHandlers[env.method];
+      Promise.resolve().then(function () {
+        if (!handler) {
+          throw { code: "unknown_method", message: "stub 未实现 " + env.method };
+        }
+        return handler(env.payload || {}, env);
+      }).then(function (result) { reply(env, true, result); },
+             function (err) {
+               reply(env, false, (err && err.code) ? err
+                 : { code: "stub_error", message: String((err && err.message) || err) });
+             });
+    },
+  };
+})();
+""",
+    "main.js": """\
+/* e2e 桩：panel.toggle 与 #ai-panel-close 只做面板显隐（几何/持久化在宿主）。 */
+(function () {
+  "use strict";
+  var HP = window.HistoPilot;
+  if (!HP || !HP._stub) return;
+  var isOpen = false;
+  function setOpen(next) {
+    var panel = document.getElementById("ai-panel");
+    if (!panel) return;
+    isOpen = !!next;
+    panel.style.display = isOpen ? "flex" : "none";
+    HP.bridge.emit("panel.stateChanged", { open: isOpen });
+  }
+  HP.onRequest("panel.toggle", function (payload) {
+    var desired = payload && payload.open;
+    if (desired === true) setOpen(true);
+    else if (desired === false) setOpen(false);
+    else setOpen(!isOpen);
+    return { open: isOpen };
+  });
+  document.addEventListener("click", function (e) {
+    if (e.target && e.target.closest && e.target.closest("#ai-panel-close")) {
+      setOpen(false);
+    }
+  });
+})();
+""",
+}
+_STUB_NOOP_COMMENT = (
+    "/* e2e 桩：占位文件（真实 bundle 子系统不在 CI；拖动 spec 不触达）。 */\n"
+    "(function () { \"use strict\"; })();\n")
+
+
+def _install_histopilot_stub(plugin_dir):
+    """把桩 bundle 写入 plugin_dir（临时目录，随 e2e 进程清理）。"""
+    ui_dir = plugin_dir / "ui"
+    ui_dir.mkdir(parents=True, exist_ok=True)
+    (plugin_dir / "manifest.json").write_text(
+        json.dumps(_HISTOPILOT_STUB_MANIFEST, ensure_ascii=False, indent=2),
+        encoding="utf-8")
+    for name, body in _HISTOPILOT_STUB_UI_FILES.items():
+        (ui_dir / name).write_text(body, encoding="utf-8")
+    for name in ("api.js", "sse.js", "renderer.js",
+                 "config-panel.js", "sessions.js"):
+        (ui_dir / name).write_text(_STUB_NOOP_COMMENT, encoding="utf-8")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8907)
@@ -94,6 +229,18 @@ def main():
     # openslide stub + 数据目录幂等初始化（与 pytest 会话同一套引导）
     import _bootstrap  # noqa: F401
     import app as app_mod  # 启动期自动：owner 首建 + admin 插件 installation 引导
+
+    # HistoPilot 桩（CI 无私仓 bundle）：让 AI 面板 E2E 有意义而非整体 404；
+    # 真实 bundle 已装时 _plugin_dir 命中，绝不覆盖（见 _HISTOPILOT_STUB_ 注释）。
+    # e2e 进程内恒开兼容 UI（开关语义由 Python 单测覆盖）。
+    os.environ.pop("HISTOPILOT_UI_ENABLED", None)
+    tmp_root = Path(tmp).resolve()
+    bundles_root = Path(app_mod.PLUGIN_BUNDLES_DIR).resolve()
+    if tmp_root != bundles_root and tmp_root not in bundles_root.parents:
+        print("e2e: PLUGIN_BUNDLES_DIR=%s 不在临时目录 %s 内，不装 HistoPilot 桩"
+              % (bundles_root, tmp_root), file=sys.stderr)
+    elif app_mod._plugin_dir("histopilot") is None:
+        _install_histopilot_stub(bundles_root / "histopilot")
 
     # R3 Wave1-Money 单轨：注册用户授权面恒为一次性总额度（无 target 种
     # 子行——user_spend_target 键已随 0032 删除）；10d/10e/10f（抽屉

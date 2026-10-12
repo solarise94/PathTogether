@@ -9,7 +9,7 @@
   },
   "devDependencies": {
     "vitest": "^3.2.7",
-    "@playwright/test": "^1.50.0"
+    "@playwright/test": "^1.64.0"
   },
   "engines": {
     "node": ">=20"

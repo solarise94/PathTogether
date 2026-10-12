@@ -150,3 +150,7 @@ tests/test_registration_antibot.py::test_known_and_unknown_email_identical_respo
 证据：`merged-main-ci.json`、`merged-lockfile-recheck.json`，存放于原 review 证据目录。最终复核没有重复安装共享依赖、没有修改产品或测试代码，也没有执行部署。
 
 `release/viewer-skills-20261011` 相比最终 main 落后 7 个提交。后续 release 开发/发布前需要同步 main；独立注册测试稳定化和 tifffile/zarr 3 适配仍待处理。本 review 文档已记录最终状态，仍为本地未提交文件。
+
+## 后续收尾完成
+
+注册时间边界测试 R2 已在 #11 中稳定化，完整 HTML 和入队断言保留；tifffile/Zarr 已配对升级，TIFF store 明确只读。#11 合入 main `aa144cd0`，main 四项 CI 全绿（38283622276）。原 #1/#6 已关闭；release 已同步。网页指南、网站地图与 LLM 入口及部署验证见 `public-site-zarr3-delivery-20261013.md`。

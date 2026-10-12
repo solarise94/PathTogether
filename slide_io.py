@@ -5,7 +5,7 @@
 （.bmp/.jpg/.jpeg，见 ``_RASTER_LOGICAL_EXTS``）只走 ``RasterSlide``
 （Pillow 全量解码，raster_slide.py）；其余优先用 OpenSlide 打开厂商格式
 （SVS/NDPI/MRXS 等）；失败且为 TIFF 类（含 OME-TIFF）时回退到
-``TiffFileSlide``（基于 tifffile + zarr<3 实现 OpenSlide API 子集）。
+``TiffFileSlide``（基于 tifffile + Zarr 3 实现 OpenSlide API 子集）。
 
 三者在各自支持的范围外 duck-type 出 DeepZoomGenerator 需要的接口：
 ``properties``（dict）、``dimensions``、``level_dimensions``、
@@ -16,7 +16,8 @@
 - tifffile.aszarr 方案：用 ``tf.aszarr(series=...)`` 整体打开，金字塔时得到
   zarr Group（key '0','1',... 为各级），单级时得到 zarr Array。这样无需
   为每级单独持有 store，统一在 close 时释放，简化生命周期。注意需配
-  zarr<3（tifffile 较新版本要求 zarr>=3，本项目锁定兼容版本）。
+  TIFF/Zarr store 使用 Zarr 3；成对依赖版本在 requirements.txt 中约束，
+  创建 TIFF store 时明确只读，避免 Zarr 自动复制不支持复制的 store。
 - axes 处理（Batch 2 起）：
   * series 选择按 ``Y*X`` 主空间面积 + 有效金字塔层数（不再按含 C/T/Z 的
     全 shape 乘积，避免小空间高通道辅助 series 抢主图）；
@@ -584,7 +585,9 @@ class TiffFileSlide:
         }
 
         # 打开 zarr store：金字塔 → Group（key '0'/'1'/...），单级 → Array
-        self._store = self._tf.aszarr(series=self._series_index)
+        # Zarr 3 要求读取模式与 store 的只读标志一致；TIFF store 无法复制为
+        # 只读实例，因此在创建时就明确只读，而不是让 zarr.open 自动转换。
+        self._store = self._tf.aszarr(series=self._series_index, read_only=True)
         import zarr  # lazy import
 
         self._zroot = zarr.open(self._store, mode="r")

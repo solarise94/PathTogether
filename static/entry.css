@@ -396,6 +396,7 @@ button:focus-visible {
 .step p { color: var(--text-3); font-size: 13px; line-height: 1.6; }
 .steps-note { margin-top: 12px; color: var(--text-3); font-size: 12.5px; }
 .conversion-steps { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.conversion-section .hero-actions { margin-top: 24px; }
 .public-guide { width: min(900px, calc(100% - 40px)); margin: 60px auto; }
 .public-guide p { line-height: 1.8; }
 .public-page-list { padding-left: 24px; }

@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ title }} · HistoPilot</title>
+  <meta name="description" content="{{ intro }}" />
+  <link rel="canonical" href="{{ canonical }}" />
+  <link rel="describedby" href="/llms.txt" type="text/markdown" />
+  {% if markdown_path %}<link rel="alternate" href="{{ markdown_path }}" type="text/markdown" />{% endif %}
+  <link rel="stylesheet" href="/static/entry.css?v=20261013a" />
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主要内容</a>
+  <header class="topbar"><nav class="topbar-inner" aria-label="文档导航">
+    <a class="brand" href="/">HistoPilot</a>
+    <div class="topbar-actions"><a class="btn btn-secondary" href="/site-map">网页地图</a><a class="btn btn-primary" href="/tools/slides">转换切片</a></div>
+  </nav></header>
+  <main id="main" class="public-guide">
+    <p class="kicker">公开使用指南</p><h1>{{ title }}</h1><p class="lead">{{ intro }}</p>
+    {% for heading, body in sections %}<section class="section section-tight"><h2>{{ heading }}</h2><p>{{ body }}</p></section>{% endfor %}
+    {% if pages %}<section class="section section-tight"><h2>产品与公开文档</h2><ul class="public-page-list">
+      {% for page in pages %}<li><a href="{{ page.path }}">{{ page.title }}</a><p>{{ page.summary }}</p></li>{% endfor %}
+    </ul></section>{% endif %}
+    {% if accounts %}<section class="section section-tight"><h2>账户入口</h2><ul class="public-page-list">
+      {% for page in accounts %}<li><a href="{{ page.path }}">{{ page.title }}</a><p>{{ page.summary }}</p></li>{% endfor %}
+    </ul><p>个人工作台需要登录；未公开的切片和分享链接不会出现在地图中。</p></section>{% endif %}
+    <section class="section section-tight"><h2>自动客户端入口</h2><p><a href="/sitemap.xml">XML 网站地图</a> · <a href="/llms.txt">LLM 阅读索引</a> · <a href="/llms-full.txt">完整功能说明</a> · <a href="/robots.txt">爬虫规则</a></p></section>
+    <p><a class="btn btn-secondary" href="/guide">功能指南</a> <a class="btn btn-secondary" href="/guide/collaboration">协作指南</a> <a class="btn btn-secondary" href="/guide/conversion">转换指南</a></p>
+  </main>
+</body>
+</html>

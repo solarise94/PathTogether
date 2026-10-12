@@ -84,7 +84,7 @@ def main(argv=None):
             return fail_input(
                 f"reference has {n_ref_levels} levels but probe reports "
                 f"resolutions={resolutions}")
-        grp = zarr.open(tf.series[0].aszarr(), mode="r")
+        grp = zarr.open(tf.series[0].aszarr(read_only=True), mode="r")
         arrs = [grp[str(i)] for i in range(n_ref_levels)]
 
         for r in reads:

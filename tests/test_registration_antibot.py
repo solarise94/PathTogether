@@ -1236,6 +1236,12 @@ def _normalize(body):
 
 
 def test_known_and_unknown_email_identical_response_structure(monkeypatch):
+    # 两个请求的绝对重发时间必须用同一时钟，避免跨整数秒误报枚举泄漏。
+    # 只替换 registration_store 的时钟，不冻结整个进程的 time 模块。
+    from types import SimpleNamespace
+    frozen_now = registration_store.time.time()
+    monkeypatch.setattr(registration_store, "time",
+                        SimpleNamespace(time=lambda: frozen_now))
     client = _public_client(monkeypatch)
     # 已存在账号的邮箱（active）与未知邮箱：同一结构/文案（无枚举）
     user_store.create_user("known.acc@x.com", PASSWORD)

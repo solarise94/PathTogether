@@ -1365,3 +1365,20 @@ def test_balance_auto_check_exception_leaves_safe_category(monkeypatch):
     assert detail.get("status") == "check_exception"
     assert detail.get("error_class") == "RuntimeError"
     assert "dsn-secret" not in json.dumps(rows)
+
+
+def test_balance_check_warn_first_log_fires_on_fresh_boot(monkeypatch, caplog):
+    """app._warn_balance_check_throttled：全新主机（monotonic < 300s）首条必发。
+
+    节流状态以 None（从未记过）为哨兵，避免 0.0 起始与 monotonic 比较
+    把刚开机主机的首条告警误判为窗口内而丢失。
+    """
+    import time as _time
+
+    app_mod._balance_check_warn_last["ts"] = None
+    monkeypatch.setattr(_time, "monotonic", lambda: 5.0)
+    with caplog.at_level(logging.WARNING):
+        app_mod._warn_balance_check_throttled("余额检查失败（fresh-boot 回归）")
+    recs = [r for r in caplog.records if "[provider-balance]" in r.getMessage()]
+    assert len(recs) == 1
+    app_mod._balance_check_warn_last["ts"] = None

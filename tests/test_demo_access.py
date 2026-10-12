@@ -1526,3 +1526,26 @@ def test_demo_max_concurrency_read_failure_logs_and_falls_back(caplog, monkeypat
             if "读取 Demo 并发上限失败" in r.getMessage()]
     assert len(recs) == 1
     demo_store._reset_concurrency_warn_state()
+
+
+def test_demo_max_concurrency_warn_fires_on_fresh_boot(monkeypatch, caplog):
+    """全新主机（monotonic ≈ 开机秒数）首条并发上限读取失败告警必发。
+
+    节流状态以 None（从未记过）为哨兵，避免 0.0 起始与 monotonic 比较
+    把刚开机主机的首条告警误判为窗口内而丢失。
+    """
+    import time as _time
+
+    import settings_store
+
+    def _boom():
+        raise RuntimeError("settings 读取失败（test）")
+    monkeypatch.setattr(settings_store, "get_ai_safety_settings", _boom)
+    demo_store._reset_concurrency_warn_state()
+    monkeypatch.setattr(_time, "monotonic", lambda: 5.0)
+    with caplog.at_level(logging.WARNING):
+        assert demo_store._demo_max_concurrency() == 2
+    recs = [r for r in caplog.records
+            if "读取 Demo 并发上限失败" in r.getMessage()]
+    assert len(recs) == 1
+    demo_store._reset_concurrency_warn_state()

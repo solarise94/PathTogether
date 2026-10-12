@@ -3291,12 +3291,12 @@ AUDIT_MAX_EVENTS = 5000
 # site_stats_store `_warn_state`）：PG 故障期间每次审计写都失败，300s 至多记一条
 # 堆栈，防止刷屏；复位函数供测试清零（惯例同 site_stats_store._reset_warn_state）。
 _AUDIT_FAIL_LOG_INTERVAL_SECONDS = 300.0
-_audit_fail_log_last = {"last": 0.0}
+_audit_fail_log_last = {"last": None}  # None = 从未记过（首条必发，不被节流）
 
 
 def _reset_audit_fail_log_state():
     """测试辅助：清空写失败日志节流状态（下一条失败日志必然发出）。"""
-    _audit_fail_log_last["last"] = 0.0
+    _audit_fail_log_last["last"] = None
 
 
 def record_audit(action, actor_user_id=None, actor_role=None, target_type=None,
@@ -3335,7 +3335,8 @@ def record_audit(action, actor_user_id=None, actor_role=None, target_type=None,
         # 只记 action 名与 target_type/target_id 标识 + 异常堆栈；detail 可能
         # 含业务数据/密钥相邻信息，绝不入日志。
         now_mono = time.monotonic()
-        if (now_mono - _audit_fail_log_last["last"]) >= \
+        last = _audit_fail_log_last["last"]
+        if last is None or (now_mono - last) >= \
                 _AUDIT_FAIL_LOG_INTERVAL_SECONDS:
             _audit_fail_log_last["last"] = now_mono
             _LOG.exception(

@@ -502,3 +502,26 @@ def test_record_audit_failure_returns_false_and_logs_throttled(
     recs2 = [r for r in caplog.records
              if r.name == "share_store_pg" and "audit" in r.getMessage()]
     assert len(recs2) == 1
+
+
+def test_record_audit_failure_first_log_fires_on_fresh_boot(monkeypatch, caplog):
+    """全新主机（monotonic ≈ 开机秒数）首条审计写失败日志必发。
+
+    节流状态以 None（从未记过）为哨兵：0.0 起始与 monotonic 比较会在
+    刚开机的 CI runner（uptime < 300s）把首条失败日志误判为窗口内。
+    """
+    import time as _time
+
+    share_store_pg._reset_audit_fail_log_state()
+
+    def _no_conn():
+        raise RuntimeError("pg down（测试注入）")
+
+    monkeypatch.setattr(share_store_pg, "_connect", _no_conn)
+    monkeypatch.setattr(_time, "monotonic", lambda: 5.0)
+    with caplog.at_level(logging.ERROR):
+        assert share_store_pg.record_audit("plugin.install", detail={}) is False
+    recs = [r for r in caplog.records
+            if r.name == "share_store_pg" and "audit" in r.getMessage()]
+    assert len(recs) == 1
+    share_store_pg._reset_audit_fail_log_state()

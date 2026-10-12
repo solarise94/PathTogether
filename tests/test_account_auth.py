@@ -670,3 +670,27 @@ def test_run_summary():
     print("\n== test_account_auth summary: %d ok, %d failed ==" % (PASS, FAIL))
     if FAIL:
         raise AssertionError("%d checks failed" % FAIL)
+
+
+# --------------------------------------------------------------------------- #
+# 5b. 节流首条必发（fresh-boot 回归）：节流状态以 None（从未记过）为哨兵，
+#     刚开机主机（monotonic < 300s）的首条异常日志不再被误判为窗口内。
+# --------------------------------------------------------------------------- #
+def test_password_hash_check_first_log_fires_on_fresh_boot(monkeypatch, caplog):
+    """全新主机（monotonic ≈ 开机秒数）首条 hash 校验异常日志必发。"""
+    import time as _time
+
+    import user_store_pg
+    user_store.create_user("hashfail-fresh@x.com", USER_PW, role="user")
+
+    def _boom(_hash, _password):
+        raise RuntimeError("corrupted hash (test)")
+
+    monkeypatch.setattr(user_store_pg, "check_password_hash", _boom)
+    user_store_pg._reset_hash_check_log_state()
+    monkeypatch.setattr(_time, "monotonic", lambda: 5.0)
+    with caplog.at_level(logging.ERROR):
+        assert user_store.verify_user("hashfail-fresh@x.com", USER_PW) is None
+    recs = [r for r in caplog.records if "密码 hash 校验异常" in r.getMessage()]
+    assert len(recs) == 1
+    user_store_pg._reset_hash_check_log_state()

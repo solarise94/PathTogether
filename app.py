@@ -1430,13 +1430,14 @@ def _mirror_csrf_cookie(resp):
 #     用于即时派生（前缀 hash / hostname-only / bot 分类），派生后即弃。
 # --------------------------------------------------------------------------- #
 _SITE_STATS_WARN_INTERVAL_SECONDS = 300
-_site_stats_warn_last = {"ts": 0.0}
+_site_stats_warn_last = {"ts": None}  # None = 从未记过（首条必发，不被节流）
 
 
 def _warn_site_stats_throttled(message: str) -> None:
     """站点统计故障节流 warning（同类一条/5 分钟；不含 IP/UA 等原始值）。"""
     now = time.monotonic()
-    if now - _site_stats_warn_last["ts"] < _SITE_STATS_WARN_INTERVAL_SECONDS:
+    last = _site_stats_warn_last["ts"]
+    if last is not None and now - last < _SITE_STATS_WARN_INTERVAL_SECONDS:
         return
     _site_stats_warn_last["ts"] = now
     app.logger.warning("[site-stats] %s", message)
@@ -7597,12 +7598,12 @@ PREVIEW_TTL_SECONDS = int(
 #: 一条节流 warning（同类一条/5 分钟，惯例同 _warn_site_stats_throttled）；
 #: 只记 session 是否有 user_id，绝不记 session 内容本身。
 _ROLE_MISSING_WARN_INTERVAL_SECONDS = 300
-_role_missing_warn_last = {"ts": 0.0}
+_role_missing_warn_last = {"ts": None}  # None = 从未记过（首条必发，不被节流）
 
 
 def _reset_role_missing_warn_state():
     """测试辅助：清空 role 缺失告警节流状态（下一条告警必然发出）。"""
-    _role_missing_warn_last["ts"] = 0.0
+    _role_missing_warn_last["ts"] = None
 
 
 def actor_identity():
@@ -7618,7 +7619,8 @@ def actor_identity():
     if role is None:
         if AUTH_ENABLED:
             now = time.monotonic()
-            if (now - _role_missing_warn_last["ts"]) >= \
+            last = _role_missing_warn_last["ts"]
+            if last is None or (now - last) >= \
                     _ROLE_MISSING_WARN_INTERVAL_SECONDS:
                 _role_missing_warn_last["ts"] = now
                 app.logger.warning(
@@ -15907,13 +15909,14 @@ def _start_site_stats_retention_thread():
 
 
 _BALANCE_CHECK_WARN_INTERVAL_SECONDS = 300
-_balance_check_warn_last = {"ts": 0.0}
+_balance_check_warn_last = {"ts": None}  # None = 从未记过（首条必发，不被节流）
 
 
 def _warn_balance_check_throttled(message: str) -> None:
     """余额自动检查故障节流 warning（同类一条/5 分钟；只含安全类别）。"""
     now = time.monotonic()
-    if now - _balance_check_warn_last["ts"] < _BALANCE_CHECK_WARN_INTERVAL_SECONDS:
+    last = _balance_check_warn_last["ts"]
+    if last is not None and now - last < _BALANCE_CHECK_WARN_INTERVAL_SECONDS:
         return
     _balance_check_warn_last["ts"] = now
     app.logger.warning("[provider-balance] %s", message)

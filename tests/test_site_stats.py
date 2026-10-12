@@ -1381,3 +1381,18 @@ def test_unknown_probe_does_not_redirect_to_login(monkeypatch, path):
 @pytest.mark.parametrize("ua", ["okhttp/4.12.0", "Mozilla/5.0 RobotPhone Chrome/130.0 Safari/537.36"])
 def test_mobile_client_is_not_crawler_identity(ua):
     assert sss._classify_user_agent(ua) is None
+
+
+def test_app_site_stats_warn_first_log_fires_on_fresh_boot(monkeypatch, caplog):
+    """app._warn_site_stats_throttled：全新主机（monotonic < 300s）首条必发。
+
+    节流状态以 None（从未记过）为哨兵——0.0 起始与 monotonic 比较会把
+    刚开机主机（CI runner）的首条故障告警误判为窗口内而丢失。
+    """
+    app_mod._site_stats_warn_last["ts"] = None
+    monkeypatch.setattr(time, "monotonic", lambda: 5.0)
+    with caplog.at_level(logging.WARNING):
+        app_mod._warn_site_stats_throttled("访问采集失败（fresh-boot 回归）")
+    recs = [r for r in caplog.records if "[site-stats]" in r.getMessage()]
+    assert len(recs) == 1
+    app_mod._site_stats_warn_last["ts"] = None

@@ -1311,3 +1311,24 @@ def test_current_identity_guest_when_no_role_under_auth(caplog):
     recs = [r for r in caplog.records if "session 缺少 role" in r.getMessage()]
     assert len(recs) == 1
     app_mod._reset_role_missing_warn_state()
+
+
+def test_role_missing_warn_first_log_fires_on_fresh_boot(monkeypatch, caplog):
+    """全新主机（monotonic ≈ 开机秒数）首条 role 缺失告警必发。
+
+    节流状态以 None（从未记过）为哨兵：首条必发、仅窗口内后续被节流；
+    若以 0.0 起始与 monotonic 比较，刚开机的 CI runner（uptime < 300s）
+    会把首条告警误判为窗口内而丢失。
+    """
+    import time as _time
+
+    _setup_users()
+    app_mod.AUTH_ENABLED = True
+    app_mod._reset_role_missing_warn_state()
+    monkeypatch.setattr(_time, "monotonic", lambda: 5.0)
+    with caplog.at_level(logging.WARNING):
+        with app_mod.app.test_request_context("/api/anything"):
+            assert app_mod.actor_identity()["role"] == "guest"
+    recs = [r for r in caplog.records if "session 缺少 role" in r.getMessage()]
+    assert len(recs) == 1
+    app_mod._reset_role_missing_warn_state()

@@ -155,12 +155,12 @@ _DEMO_CONCURRENCY_LOCK_KEY = 0x444D4343
 #: 多一条 warning（惯例同 share_store_pg._audit_fail_log_last）；复位函数供
 #: 测试清零。日志只含异常堆栈，不含 settings 内容/敏感值。
 _DEMO_CONCURRENCY_WARN_INTERVAL_SECONDS = 300.0
-_demo_concurrency_warn_last = {"last": 0.0}
+_demo_concurrency_warn_last = {"last": None}  # None = 从未记过（首条必发，不被节流）
 
 
 def _reset_concurrency_warn_state():
     """测试辅助：清空读取失败告警节流状态（下一条告警必然发出）。"""
-    _demo_concurrency_warn_last["last"] = 0.0
+    _demo_concurrency_warn_last["last"] = None
 
 
 def _demo_max_concurrency() -> int:
@@ -175,7 +175,8 @@ def _demo_max_concurrency() -> int:
         return int(settings_store.get_ai_safety_settings()["demo_max_concurrency"])
     except Exception:
         now_mono = time.monotonic()
-        if (now_mono - _demo_concurrency_warn_last["last"]) >= \
+        last = _demo_concurrency_warn_last["last"]
+        if last is None or (now_mono - last) >= \
                 _DEMO_CONCURRENCY_WARN_INTERVAL_SECONDS:
             _demo_concurrency_warn_last["last"] = now_mono
             _LOG.warning("读取 Demo 并发上限失败（按缺省 %d 处理）",

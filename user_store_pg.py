@@ -62,23 +62,25 @@ _LOG = logging.getLogger(__name__)
 # 日志（惯例同 share_store_pg._audit_fail_log_last）；复位函数供测试清零。
 # --------------------------------------------------------------------------- #
 _HASH_CHECK_LOG_INTERVAL_SECONDS = 300.0
-_hash_check_log_last = {"last": 0.0}
+_hash_check_log_last = {"last": None}  # None = 从未记过（首条必发，不被节流）
 
 
 def _reset_hash_check_log_state():
     """测试辅助：清空 hash 校验异常日志节流状态（下一条日志必然发出）。"""
-    _hash_check_log_last["last"] = 0.0
+    _hash_check_log_last["last"] = None
 
 
 def _log_hash_check_throttled():
-    """hash 校验异常节流留痕（300s 一条；只记异常堆栈，不含任何凭据值）。"""
+    """hash 校验异常节流留痕（300s 一条；首条必发；只记异常堆栈，不含任何凭据值）。"""
     now_mono = time.monotonic()
-    if (now_mono - _hash_check_log_last["last"]) >= \
+    last = _hash_check_log_last["last"]
+    if last is not None and (now_mono - last) < \
             _HASH_CHECK_LOG_INTERVAL_SECONDS:
-        _hash_check_log_last["last"] = now_mono
-        _LOG.exception(
-            "[auth] 密码 hash 校验异常（按校验失败处理；"
-            "300s 节流窗口内同类仅记本条；不含密码/hash 值）")
+        return
+    _hash_check_log_last["last"] = now_mono
+    _LOG.exception(
+        "[auth] 密码 hash 校验异常（按校验失败处理；"
+        "300s 节流窗口内同类仅记本条；不含密码/hash 值）")
 
 
 class UserStoreCorrupt(Exception):

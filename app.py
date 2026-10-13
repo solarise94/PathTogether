@@ -22589,6 +22589,25 @@ def _require_ai_session_owner(session_id):
     return None
 
 
+def _response_json(r):
+    """requests.Response → JSON 解析结果；不可解析时返回 None。
+
+    回调契约（见 _proxy_json）承诺 parsed 为「body 可 JSON 解析时的 dict，
+    否则 None」。r 是 requests.Response，只有 .json()（Flask 的
+    r.get_json(silent=True) 在这里会 AttributeError，且被回调异常兜底吞掉，
+    2026-10 前所有 on_response 回调因此在生产静默失效）。解析失败
+    （JSONDecodeError / UnicodeDecodeError）统一按 ValueError 收敛为 None；
+    非 JSON content-type 直接跳过解析。
+    """
+    ctype = r.headers.get("Content-Type", "") if r.headers is not None else ""
+    if ctype and "json" not in ctype.lower():
+        return None
+    try:
+        return r.json()
+    except ValueError:
+        return None
+
+
 def _proxy_json(path, body, method="POST", query=None, on_response=None):
     """代理普通（非 SSE）端点到 sidecar，原样透传响应 body 与状态码。
 
@@ -22612,7 +22631,7 @@ def _proxy_json(path, body, method="POST", query=None, on_response=None):
             # 返回 None=透传 sidecar 响应；（dict, status)=覆盖为本响应
             #（drawing 开关第四轮 P2：镜像提交失败/被取代时给浏览器稳定
             # 错误，而不是透传 HP 的成功）
-            override = on_response(r.status_code, r.get_json(silent=True))
+            override = on_response(r.status_code, _response_json(r))
         except Exception:
             app.logger.warning("代理 on_response 回调失败", exc_info=True)
     if override is not None:

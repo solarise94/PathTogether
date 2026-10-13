@@ -7,6 +7,9 @@
   <meta name="description" content="HistoPilot：病理切片查看、AI 辅助观察、标注与团队协作；在浏览器本地将支持的切片转换为 OME-TIFF 或金字塔 TIFF。" />
   <link rel="describedby" href="/llms.txt" type="text/markdown" />
   <link rel="alternate" href="/index.md" type="text/markdown" />
+  {# canonical 只随「/」可索引主页渲染（服务端注入）；/login、/register 等
+     私有/错误渲染不注入，标签省略（tests/test_canonical_domain.py） #}
+  {% if canonical %}<link rel="canonical" href="{{ canonical }}" />{% endif %}
   {% include "_site_icons.html" %}
   <link rel="stylesheet" href="/static/entry.css?v=20261013d" />
   <script defer src="/static/i18n.js?v=20261013d"></script>

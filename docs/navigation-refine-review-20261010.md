@@ -201,3 +201,16 @@ npx vitest run test/http-client.test.ts test/ai-drawing.test.ts
 GPU 最终镜像的 `/healthz device=cuda`、真实 `/v1/refine`、超时回退验收仍是启用细化的前置项。矩形标注工具未贯穿取消信号是本轮未处理的既有缺口，不能扩大成所有标注工具都已具备同样取消保证。
 
 本轮只提交 review 文档、复现脚本和测试证据；没有改业务实现、推送、部署或发布插件。
+
+## 三轮复核：F1 关闭（2026-10-11）
+
+核验 PathTogether `965e5843` 和独立 HistoPilot hotfix `f3616ce`。
+
+- 推理锁改为 `acquire(blocking=False)`，占用即返回 503 busy；原等待配置已删除，平台仍按 busy 回退到模型原轮廓。
+- 原探针未改断言，在真实 Gunicorn 23.0.0、正式配置下重新运行：11 个等待请求全部返回 503，最慢 5ms；只有首请求进入 predictor，超时后才开始推理的请求 **0 个**。原 6 个反例消失，F1 可以关闭。
+- 新增的真实 Gunicorn 并发回归实际执行；细化服务 **21 passed**，含真实 SAM2 CPU 冒烟（两条依赖 warning）；平台细化接口 **39 passed**。
+- hotfix 的 package.json、package-lock 顶层及根包、插件 manifest 均为 **0.3.6**。本次确认改动仅涉及版本元数据，未重新运行 hotfix 全量测试。
+
+本轮未发现新的发布阻断项。此结论仅关闭 F1 和版本对齐事项；GPU 最终镜像实测仍未完成，矩形工具取消信号仍属已知遗留。未重跑全量或付费模型评测，未改业务代码、推送或部署。独立 hotfix 的代码审核结论不依赖 SAM2 的 GPU 验收。
+
+本轮结果摘要及测试输出保存在 `docs/review-evidence/navigation-refine-followup-20261010/closure-20261011.txt`。

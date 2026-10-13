@@ -545,7 +545,8 @@ def _fetch_range(cos, key, version_id, start, end, declared_size,
         return wire_cap is not None and wire >= wire_cap
 
     resp = cos.get_object(key, version_id,
-                          range_header="bytes=%d-%d" % (start, end))
+                          range_header="bytes=%d-%d" % (start, end),
+                          object_size=int(declared_size))
     try:
         status = int(getattr(resp, "status", 0) or 0)
         headers = getattr(resp, "headers", None) or {}

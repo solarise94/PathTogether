@@ -7,6 +7,9 @@
      关闭弹窗后焦点回到仍可见的账户按钮（弹窗自身还原到其 opener）。 */
 function initAccountPanel() {
   'use strict';
+  document.querySelectorAll('[data-route]').forEach(link => {
+    if (new URL(link.href).hostname === window.location.hostname) link.setAttribute('aria-current', 'page');
+  });
   const btn = document.getElementById('account-btn');
   const panel = document.getElementById('account-panel');
   if (!btn || !panel) return;

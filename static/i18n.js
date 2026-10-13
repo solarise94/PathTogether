@@ -15,6 +15,10 @@
 
   var DICT = {
     zh: {
+      "entry.route.aria": "访问线路",
+      "entry.route.cn": "中国线路",
+      "entry.route.com": "国际线路",
+      "entry.language": "界面语言",
       "entry.svg.heading": "组织导航",
       "entry.svg.schematic": "形态与流程示意 · 非真实切片",
       "entry.svg.view": "示意视野",
@@ -559,6 +563,8 @@
       "entry.nav.collaboration": "协作",
       "entry.collab.kicker": "一起读片",
       "entry.collab.title": "和你的同伴一起查阅切片、标注并讨论",
+      "entry.collab.title.intro": "和你的同伴一起",
+      "entry.collab.title.action": "查阅切片、标注并讨论",
       "entry.collab.lead": "把切片分享给同伴，让每个观察、每个问题，都有对应的组织区域。",
       "entry.collab.share.title": "分享切片，决定协作范围",
       "entry.collab.share.body": "在分享面板生成链接，设置查看、标注权限和有效期。同伴打开链接即可查阅切片。",
@@ -1657,6 +1663,10 @@
     },
 
     en: {
+      "entry.route.aria": "Connection route",
+      "entry.route.cn": "China route",
+      "entry.route.com": "International route",
+      "entry.language": "Language",
       "entry.svg.heading": "Tissue navigation",
       "entry.svg.schematic": "Illustrated tissue and workflow",
       "entry.svg.view": "Illustrated view",
@@ -2201,6 +2211,8 @@
       "entry.nav.collaboration": "Collaborate",
       "entry.collab.kicker": "Review together",
       "entry.collab.title": "Review, annotate and discuss slides with your peers",
+      "entry.collab.title.intro": "Review, annotate and discuss slides ",
+      "entry.collab.title.action": "with your peers",
       "entry.collab.lead": "Share a slide with your peers and anchor every observation and question to the tissue it refers to.",
       "entry.collab.share.title": "Share a slide on your terms",
       "entry.collab.share.body": "Create a share link and choose viewing, annotation permissions and an expiry. Your peers can open the link to review the slide.",

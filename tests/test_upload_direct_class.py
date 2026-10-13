@@ -502,7 +502,8 @@ class _FakeCos:
         data = vers.get(version_id) or (list(vers.values()) or [None])[0]
         return {"size": len(data)} if data is not None else None
 
-    def get_object(self, key, version_id, range_header=None, timeout=120):
+    def get_object(self, key, version_id, range_header=None, timeout=120,
+                   object_size=None):
         vers = self.objects.get(key, {})
         data = vers.get(version_id) or list(vers.values())[0]
         if range_header and range_header.startswith("bytes="):

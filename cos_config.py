@@ -79,6 +79,30 @@ COS_MONTHLY_DOWNLOAD_BUDGET_BYTES = _env_int(
     "COS_MONTHLY_DOWNLOAD_BUDGET_BYTES", 0)
 
 # --------------------------------------------------------------------------- #
+# 下载传输通道（docs/cos-fast-goapi-relay-design-20261013.md；
+# 线合同 gokapi-relay/docs/slide-relay-contract.md §PathTogether env）
+#
+# ``direct``（默认）走官方 SDK 直连 COS；``fast`` 经腾讯云 fast 纯流式转发
+# （同地域内网回源，节约公网下行费）。**fast 故障时不自动回退 direct**——
+# 回退是显式运维动作。未知取值 fail-closed（不下载、告警）。
+#
+# 这些常量在调用点按属性读取（测试用 ``monkeypatch.setattr(cos_config, ...)``
+# 覆盖，与既有 COS_* 常量同款；模块层不做额外缓存）。
+# --------------------------------------------------------------------------- #
+COS_FAST_TRANSPORT_DIRECT = "direct"
+COS_FAST_TRANSPORT_FAST = "fast"
+#: direct | fast；缺省/空 -> direct，其余非法值由调用方 fail-closed。
+COS_DOWNLOAD_TRANSPORT = _env_str("COS_DOWNLOAD_TRANSPORT", "direct")
+#: fast 转发基地址；必须 https（仅回环主机允许 http，供本机测试）。
+COS_FAST_RELAY_URL = _env_str("COS_FAST_RELAY_URL")
+#: fast 服务 token 私有文件（取首个非空行）；不打印内容。
+COS_FAST_RELAY_TOKEN_FILE = _env_str("COS_FAST_RELAY_TOKEN_FILE")
+#: 连接超时（秒）。
+COS_FAST_RELAY_CONNECT_TIMEOUT = _env_int("COS_FAST_RELAY_CONNECT_TIMEOUT", 10)
+#: 单次 socket 读空闲超时（秒）。
+COS_FAST_RELAY_READ_TIMEOUT = _env_int("COS_FAST_RELAY_READ_TIMEOUT", 60)
+
+# --------------------------------------------------------------------------- #
 # capability（§8：off → internal → on；四项门禁未过前恒 off）
 # --------------------------------------------------------------------------- #
 #: off=任何身份不可用；internal=仅 owner 侧内部身份可见；on=全部可见。

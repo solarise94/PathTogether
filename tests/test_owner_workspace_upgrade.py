@@ -508,7 +508,7 @@ def test_session_owner_injected_for_all_authenticated_roles(monkeypatch):
     monkeypatch.setattr(app_mod, "_build_sidecar_config",
                         lambda ctx, demo_capability_id=None: {"base_url": "x"})
     monkeypatch.setattr(app_mod, "_inject_agent_extra_tools",
-                        lambda ctx, slide, config: None)
+                        lambda ctx, slide, config, slide_id=None: None)
     monkeypatch.setattr(app_mod, "_issue_run_grant",
                         lambda slide, ctx, config: True)
     monkeypatch.setattr(app_mod, "_ai_reserve_run_budget",

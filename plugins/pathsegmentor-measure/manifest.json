@@ -21,7 +21,7 @@
     {
       "name": "segment_region",
       "version": "1.0.0",
-      "description": "在给定 level-0 整数 bbox（x,y,w,h）内用 PathSegmentor 语义分割模型分割指定目标（object：如 nuclei、lymphocytes、tumor cells、gland），返回前景面积（level-0 像素与 µm²）、ROI 面积占比、近似目标计数（连通域，语义分割故为近似值）、尺寸分布摘要，以及最多 20 个最大连通域的 level-0 bbox 与质心（可用于标注示例）。bbox 面积不得超过平台 ROI 上限（超限拒绝）；可选 region 提供组织/器官语境，threshold 覆盖模型默认阈值。",
+      "description": "用 PathSegmentor 语义分割模型在给定 level-0 整数 bbox（x,y,w,h）内分割指定目标（object：nuclei、lymphocytes、tumor cells、gland 等）。注意：这是语义分割——返回该目标的区域与面积（level-0 像素、µm²）与 ROI 占比，不是实例计数器。approx_object_count.connected_components 是连通域近似；estimated_count_split 是距离变换+分水岭的拆分估计，仅当前景大多可分辨（objects_resolved≥0.6）时给出，否则为 null 并附 mask_is_region_not_instances 警告（mask 覆盖成片组织区域）。另有尺寸分布与最多 20 个最大连通域的 bbox/质心。bbox 面积不得超过平台 ROI 上限（超限拒绝）。",
       "parameters": {
         "type": "object",
         "properties": {

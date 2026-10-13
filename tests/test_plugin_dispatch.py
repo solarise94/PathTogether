@@ -345,7 +345,9 @@ def test_dispatch_forwards_principal_and_arguments():
                   arguments={"include_mpp": False})
     assert r.status_code == 200, r.get_json()
     call = app_mod.requests.calls[-1]
-    assert call["json"] == {"slide": "demo.svs", "arguments": {"include_mpp": False}}
+    # P2 双字段转发：slide_id 取 token claim（此 token 无 claim → 空串）
+    assert call["json"] == {"slide": "demo.svs", "slide_id": "",
+                            "arguments": {"include_mpp": False}}
     principal = json.loads(call["headers"]["X-Dispatch-Principal"])
     assert principal == {"type": "agent", "user_id": "usr_1", "role": "user",
                          "session_id": "sess-9"}
@@ -381,14 +383,21 @@ def test_dispatch_plugin_unreachable_maps_capability_unavailable():
     _assert_envelope(r, 503, "capability_unavailable", retryable=True)
 
 
-def test_dispatch_plugin_4xx_passthrough_envelope():
+def test_dispatch_plugin_4xx_maps_capability_failed():
+    """插件 4xx 不再透传自报 code（防与 PT 保留码/HP 渲染冲突）：归一
+    capability_failed + details.plugin_code，状态保持。"""
     _install_tma()
     _give_view("owner")  # owner 主体需对 slide 有 view（读隔离）
     app_mod.requests.handler = lambda *a: _Resp(
         400, {"error": {"code": "invalid_request", "message": "参数非法",
                         "retryable": False}})
     r = _dispatch(_client(), _tool_token())
-    _assert_envelope(r, 400, "invalid_request", retryable=False)
+    assert r.status_code == 400
+    err = r.get_json()["error"]
+    assert err["code"] == "capability_failed"
+    assert err["retryable"] is False
+    assert err["details"]["plugin_code"] == "invalid_request"
+    assert "参数非法" in err["message"]
 
 
 def test_dispatch_plugin_redirect_rejected_503():

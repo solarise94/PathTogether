@@ -276,8 +276,10 @@ def test_dispatch_forwards_delegated_credential(monkeypatch):
         app_mod.slide_store.resolve_slide_id(claims["slide_id"]))
     assert claims["exp"] - claims["iat"] <= 120  # TTL ≤120s
     assert claims["jti"]
-    # body 形状不变（凭证只走头，不进转发 body）
-    assert set(stub.calls[-1]["json"].keys()) == {"slide", "arguments"}
+    # body 形状：slide + slide_id（token 无 claim 时空串）+ arguments
+    assert set(stub.calls[-1]["json"].keys()) == \
+        {"slide", "slide_id", "arguments"}
+    assert stub.calls[-1]["json"]["slide_id"] == ""
 
 
 def test_dispatch_failsafe_without_credential_when_slide_unresolvable(
@@ -763,6 +765,223 @@ def test_dispatch_plugin_5xx_surfaces_plugin_code_in_details(monkeypatch):
     assert err["retryable"] is True
     assert err["details"]["reason"] == "plugin_5xx"
     assert err["details"]["plugin_code"] == "inference_busy"
+
+
+# --------------------------------------------------------------------------- #
+# 5. P2 双字段转发与插件 4xx 归一（真实 E2E 回归：id_bundle 仅名回调 404 被
+#    HP 渲染成「插件已停用」）
+# --------------------------------------------------------------------------- #
+def test_dispatch_forwards_slide_id_claim_and_rejects_mismatch(monkeypatch):
+    """token 的 slide_id claim 进转发 body（权威）；body.slide_id 不符 403。"""
+    _install_with_known_secret(monkeypatch)
+    sid = _register_owned_slide(monkeypatch)
+    stub = _ForwardStub()
+    monkeypatch.setattr(app_mod, "requests", stub)
+    client = _client()
+    token = _tool_token_with_sid("demo.svs", sid)
+    r = _dispatch(client, stub, token)
+    assert r.status_code == 200, r.get_json()
+    assert stub.calls[-1]["json"]["slide_id"] == sid
+    # body.slide_id 与 token claim 不一致 → 403（转发前拒绝）
+    r = client.post(DISPATCH_PATH,
+                    json={"slide": "demo.svs", "slide_id": "sld_other",
+                          "arguments": {}},
+                    headers={"Authorization": "Bearer " + token,
+                             "X-AI-Session": "sess-1"})
+    err = _assert_envelope(r, 403, "forbidden")
+    assert err.get("details", {}).get("reason") == "slide_id_mismatch"
+    assert len(stub.calls) == 1  # 拒绝前只有第一次成功转发
+
+
+def test_dispatch_plugin_404_maps_retryable_503(monkeypatch):
+    """插件回 404（如切片不可读）≠ PT not_found（能力/插件不存在）：归一为
+    可重试 503 capability_unavailable——否则 HP 把它渲染成「插件已停用，
+    本 run 不再重试」。"""
+    _install_with_known_secret(monkeypatch)
+    _register_owned_slide(monkeypatch)
+    stub = _ForwardStub()
+    stub.handler = lambda *a: _Resp(
+        404, {"error": {"code": "slide_unavailable",
+                        "message": "切片不存在或当前不可读", "retryable": False}})
+    monkeypatch.setattr(app_mod, "requests", stub)
+    r = _dispatch(_client(), stub, _tool_token())
+    assert r.status_code == 503
+    err = r.get_json()["error"]
+    assert err["code"] == "capability_unavailable"
+    assert err["retryable"] is True
+    assert err["details"]["plugin_code"] == "slide_unavailable"
+    assert err["details"]["plugin_status"] == 404
+
+
+def test_dispatch_plugin_400_maps_capability_failed(monkeypatch):
+    """插件 4xx（参数问题等）：状态保持，code 归一 capability_failed +
+    details.plugin_code（不与 PT 保留码冲突）。"""
+    _install_with_known_secret(monkeypatch)
+    _register_owned_slide(monkeypatch)
+    stub = _ForwardStub()
+    stub.handler = lambda *a: _Resp(
+        400, {"error": {"code": "invalid_request", "message": "参数非法",
+                        "retryable": False}})
+    monkeypatch.setattr(app_mod, "requests", stub)
+    r = _dispatch(_client(), stub, _tool_token())
+    assert r.status_code == 400
+    err = r.get_json()["error"]
+    assert err["code"] == "capability_failed"
+    assert err["retryable"] is False
+    assert err["details"]["plugin_code"] == "invalid_request"
+    assert "参数非法" in err["message"]
+
+
+def test_id_bundle_slide_denied_when_no_slide_id_claim(monkeypatch):
+    """无 slide_id claim 的 token 打 id_bundle 切片：名通道判权恒 miss →
+    403（fail-closed，不是放行）。"""
+    _install_with_known_secret(monkeypatch)
+    _register_id_bundle_slide(monkeypatch, uid="usr_a")
+    stub = _ForwardStub()
+    monkeypatch.setattr(app_mod, "requests", stub)
+    token = _tool_token(slide="26-005817.tif", user_id="usr_a")
+    r = _dispatch(_client(), stub, token, slide="26-005817.tif")
+    _assert_envelope(r, 403, "permission_denied")
+
+
+# --------------------------------------------------------------------------- #
+# 6. 全链 e2e（dispatch → 真实插件后端 → by-id region → stub 推理）
+# --------------------------------------------------------------------------- #
+_PT_PLATFORM = "http://127.0.0.1:8000"
+_PS_INFER = "http://127.0.0.1:8971"
+
+
+class _BackendRouter:
+    """插件后端 `requests` 替身：平台地址路由到 PT test client，推理地址
+    返回 stub mask；其他地址一律拒绝（后端不得外联）。"""
+
+    ConnectionError = real_requests.ConnectionError
+    Timeout = real_requests.Timeout
+
+    def __init__(self, pt_client, mask_png):
+        self.pt = pt_client
+        self.mask_png = mask_png
+        self.platform_calls = []
+
+    def _route(self, method, url, json=None, headers=None, **_kw):
+        if url.startswith(_PT_PLATFORM):
+            path = url[len(_PT_PLATFORM):]
+            self.platform_calls.append((method, path))
+            resp = self.pt.open(path, method=method, json=json,
+                                headers=headers)
+            try:
+                body = resp.get_json()
+            except Exception:
+                body = {}
+            return _Resp(resp.status_code, body)
+        if url.startswith(_PS_INFER) and method == "POST":
+            return _Resp(200, {"model_id": "psm", "model_sha256": "ab" * 32,
+                               "code_rev": "rev-e2e",
+                               "prompt_used": "nuclei",
+                               "input_width": 8, "input_height": 8,
+                               "mask_png_b64": base64.b64encode(
+                                   self.mask_png).decode("ascii"),
+                               "positive_pixels": 12, "threshold": None,
+                               "timings_ms": {"decode": 1, "infer": 2,
+                                              "total": 3},
+                               "warnings": []})
+        raise ConnectionError("unexpected backend outbound call: %s %s"
+                              % (method, url))
+
+    def post(self, url, json=None, headers=None, timeout=None, **kw):
+        return self._route("POST", url, json=json, headers=headers)
+
+    def get(self, url, headers=None, timeout=None, **kw):
+        return self._route("GET", url, headers=headers)
+
+
+class _BackendAdapter:
+    """app_mod.requests 替身：把 dispatch 转发路由到插件后端 Flask client。"""
+
+    ConnectionError = real_requests.ConnectionError
+    Timeout = real_requests.Timeout
+
+    def __init__(self, backend_mod):
+        self.client = backend_mod.app.test_client()
+        self.calls = []
+
+    def post(self, url, json=None, headers=None, timeout=None, **kw):
+        self.calls.append(url)
+        resp = self.client.post("/capabilities/segment_region", json=json,
+                                headers=headers)
+        try:
+            body = resp.get_json()
+        except Exception:
+            body = {}
+        return _Resp(resp.status_code, body)
+
+
+def _load_measure_backend(monkeypatch, installation_id, secret, nonce):
+    for k, v in (("PT_PLATFORM_URL", _PT_PLATFORM),
+                 ("PATHSEGMENTOR_URL", _PS_INFER),
+                 ("PT_INSTALLATION_ID", installation_id),
+                 ("PT_INSTALLATION_SECRET", secret)):
+        monkeypatch.setenv(k, v)
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "psm_backend_e2e_%s" % nonce,
+        Path(__file__).resolve().parent.parent / "plugins"
+        / "pathsegmentor-measure" / "backend" / "app.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _grid_png(grid):
+    """二值 grid → PNG bytes（推理 mask 合同形态）。"""
+    import io
+    from PIL import Image
+    h, w = len(grid), len(grid[0])
+    img = Image.new("L", (w, h))
+    img.putdata([255 if v else 0 for row in grid for v in row])
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_id_bundle_e2e_dispatch_backend_by_id_region(monkeypatch):
+    """全链：dispatch（签发凭证+转发 slide_id）→ 插件后端 → 平台 by-id
+    region（mocked 读栈）→ stub 推理 → 摘要。8b22db45 上失败：转发无
+    slide_id，后端按名回调 → 平台 404。"""
+    installation, secret = _install_with_known_secret(monkeypatch)
+    sid = _register_id_bundle_slide(monkeypatch, uid="usr_a")
+    backend = _load_measure_backend(monkeypatch, installation["installation_id"],
+                                    secret, nonce="e2e1")
+    blob = [[1 if (1 <= y <= 3 and 1 <= x <= 4) else 0 for x in range(8)]
+            for y in range(8)]
+    router = _BackendRouter(_client(), _grid_png(blob))
+    monkeypatch.setattr(backend, "requests", router)
+    adapter = _BackendAdapter(backend)
+    monkeypatch.setattr(app_mod, "requests", adapter)
+    # 平台 region/slide-info 读栈 mock（真实读路径在单元层已覆盖）
+    mocks = _slide_read_mocks()
+    with mocks[0], mocks[1], mocks[2], \
+            mock.patch.object(app_mod, "_read_region_b64",
+                              return_value=_region_payload(w=8, h=8)):
+        r = _dispatch(_client(), adapter,
+                      _tool_token_with_sid("26-005817.tif", sid),
+                      slide="26-005817.tif",
+                      arguments={"x": 0, "y": 0, "w": 16, "h": 16,
+                                 "object": "nuclei"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    result = r.get_json()["result"]
+    assert result["plugin"] == "dev.pathsegmentor.measure"
+    assert result["slide_id"] == sid
+    assert result["model"]["model_id"] == "psm"
+    aoc = result["approx_object_count"]
+    assert aoc["connected_components"] >= 1
+    assert "estimated_count_split" in aoc
+    text = r.get_data(as_text=True)
+    assert "mask_png_b64" not in text
+    assert len(r.get_data()) < 64 * 1024
+    # 后端确实走了 by-id 路由（平台侧收到 by-id region 调用）
+    assert any(m == "POST" and "/regions" in p and "by-id" in p
+               for m, p in router.platform_calls)
 
 
 if __name__ == "__main__":

@@ -14074,6 +14074,9 @@ _PLUGIN_ERROR_RETRYABLE = {
     "capability_not_granted": False,
     "permission_denied": False,
     "capability_unavailable": True,
+    # 插件自报 4xx 的归一码（2026-10-13）：插件拒绝调用（参数等）不可重试；
+    # retryable 由插件信封原值透传（_plugin_error 显式给出）
+    "capability_failed": False,
     # PR2 usage ingestion（admin-billing §7.4/§7.7）：payload/subject 冲突是
     # 确定性 4xx（进 dead 队列，不重试）；主体绑定未就绪可退避重试；billing
     # 的 PG-only 守卫是配置性错误（不可重试，状态码 503）
@@ -21999,7 +22002,18 @@ def plugin_v1_dispatch(plugin_id, capability_name):
         "role": claims.get("role") or "",
         "session_id": session_id,
     }, ensure_ascii=True, separators=(",", ":"))
-    forward_body = {"slide": slide, "arguments": body.get("arguments") or {}}
+    # P2 双字段转发（合同 §6.3）：slide_id 取**签名 token claim**（权威），
+    # HP 侧 body.slide_id 若给出必须与之一致（不符 403）——id_bundle 行
+    # legacy_filename=NULL，仅名的转发会让插件后端按名回调 404。
+    # slide 字段保留作兼容（legacy 行/审计）。
+    token_sid = str(claims.get("slide_id") or "").strip()
+    body_sid = str(body.get("slide_id") or "").strip()
+    if body_sid and token_sid and body_sid != token_sid:
+        return _plugin_error(403, "forbidden",
+                             "body.slide_id 与 token 绑定切片不符",
+                             details={"reason": "slide_id_mismatch"})
+    forward_body = {"slide": slide, "slide_id": token_sid,
+                    "arguments": body.get("arguments") or {}}
     # ⑥' 委托读凭证：全部门槛通过后签发，仅随转发头下发（不进 body/审计/
     # Agent 结果）。解析失败不签发不阻断（fail-safe，见 _mint_delegated_read_token）。
     forward_headers = {"X-Dispatch-Principal": principal}
@@ -22061,17 +22075,48 @@ def plugin_v1_dispatch(plugin_id, capability_name):
             "插件后端返回 %d，能力暂不可用" % r.status_code,
             details={"reason": "plugin_5xx", "plugin_code": plugin_code})
     if r.status_code >= 400:
-        # 插件 4xx（如参数不合法）：透传其错误信封（无信封时按 invalid_request 归一）
-        code, message = "invalid_request", "插件拒绝本次调用"
+        # 插件 4xx：不再透传插件自报 code——插件回的 not_found 会在 HP 侧
+        # 渲染成「插件或能力已停用」（HP default 分支还按 httpStatus==404
+        # 给同一句），与 PT 保留码语义（能力/插件不存在）冲突。归一：
+        #   - 404 → 503 capability_unavailable（retryable）：插件的输入不可用
+        #     （如切片缺失）不是「能力停用」，应允许模型改参重试/继续；
+        #   - 其余 4xx → 原状态码 + capability_failed（参数问题如实透传）；
+        #   - 细分码一律进 error.details.plugin_code（附加字段，HP 消费方
+        #     只按 code/message/status 渲染，不受影响）。
+        plugin_code = plugin_message = None
+        plugin_retryable = False
         try:
-            pbody = r.json()
-            if isinstance(pbody, dict) and isinstance(pbody.get("error"), dict):
-                code = str(pbody["error"].get("code") or code)
-                message = str(pbody["error"].get("message") or message)
+            pbody_4xx = r.json()
+            if isinstance(pbody_4xx, dict) \
+                    and isinstance(pbody_4xx.get("error"), dict):
+                plugin_code = str(pbody_4xx["error"].get("code") or "") or None
+                plugin_message = str(
+                    pbody_4xx["error"].get("message") or "") or None
+                plugin_retryable = bool(pbody_4xx["error"].get("retryable",
+                                                               False))
         except Exception:
             pass
-        _audit_dispatch(r.status_code, code, (time.time() - started) * 1000)
-        return _plugin_error(r.status_code, code, message)
+        if r.status_code == 404:
+            _audit_dispatch(503, "capability_unavailable",
+                            (time.time() - started) * 1000,
+                            extra={"reason": "plugin_404",
+                                   "plugin_code": plugin_code})
+            return _plugin_error(
+                503, "capability_unavailable",
+                plugin_message or "插件无法完成本次调用（输入不可用）",
+                retryable=True,
+                details={"reason": "plugin_4xx", "plugin_status": 404,
+                         "plugin_code": plugin_code})
+        _audit_dispatch(r.status_code, "capability_failed",
+                        (time.time() - started) * 1000,
+                        extra={"reason": "plugin_4xx",
+                               "plugin_code": plugin_code})
+        return _plugin_error(
+            r.status_code, "capability_failed",
+            plugin_message or "插件拒绝本次调用",
+            retryable=plugin_retryable,
+            details={"reason": "plugin_4xx", "plugin_status": r.status_code,
+                     "plugin_code": plugin_code})
     try:
         pbody = r.json()
     except Exception:

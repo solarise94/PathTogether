@@ -110,11 +110,12 @@ def _stub_platform(monkeypatch, mod, *, mpp=0.5, region=None, image=b"img"):
     region = region or _region_payload(16, 16)
     monkeypatch.setattr(mod, "_installation_jwt", lambda: "jwt-stub")
     monkeypatch.setattr(mod, "_platform_slide_info",
-                        lambda slide, jwt: {"width": 100000, "height": 100000,
-                                            "mpp": mpp,
-                                            "asset_revision": "sha256:abcd1234"})
+                        lambda slide, jwt, slide_id=None, delegated=None:
+                        {"width": 100000, "height": 100000,
+                         "mpp": mpp,
+                         "asset_revision": "sha256:abcd1234"})
 
-    def _read(slide, args, edge, delegated, jwt):
+    def _read(slide, args, edge, delegated, jwt, slide_id=None):
         assert delegated == DELEGATED, "region 读取必须携带委托凭证"
         assert edge <= mod._MAX_LONG_EDGE
         return image, region
@@ -211,7 +212,10 @@ def test_mask_to_level0_mapping_and_um2(monkeypatch):
     assert comp["bbox_l0"] == [100, 200, 8, 8]
     assert comp["centroid_l0"] == [102, 202]  # (0.5,0.5)*4 + (100,200)
     assert comp["area_um2"] == pytest.approx(16.0)
-    assert out["approx_object_count"]["value"] == 1
+    assert out["approx_object_count"]["connected_components"] == 1
+    # µm 尺度可判定 → 拆分 guard 字段齐备
+    assert out["approx_object_count"]["objects_resolved"] is not None
+    assert "estimated_count_split" in out["approx_object_count"]
 
 
 def test_mpp_missing_px_only(monkeypatch):
@@ -233,8 +237,9 @@ def test_component_counting_filtering_and_distribution(monkeypatch):
             grid[y][x] = 1
     grid[9][9] = 1
     out = mod.analyze_mask(grid, 10, 10, _region_payload(10, 10, (0, 0, 40, 40)),
-                           0.25)
-    assert out["approx_object_count"]["value"] == 1  # 单像素被小目标过滤
+                           None)  # mpp 缺失：本用例只看 CC 数学（拆分见下节）
+    assert out["approx_object_count"]["connected_components"] == 1
+    assert out["approx_object_count"]["estimated_count_split"] is None
     assert any("小目标过滤" in w for w in out["warnings"])
     dist = out["size_distribution"]
     assert dist["components"] == 1
@@ -252,7 +257,7 @@ def test_components_top_limit(monkeypatch):
             for x in range(2):
                 grid[i * 4 + y][i * 4 + x] = 1
     out = mod.analyze_mask(grid, 20, 20, _region_payload(20, 20), None)
-    assert out["approx_object_count"]["value"] == 5
+    assert out["approx_object_count"]["connected_components"] == 5
     assert len(out["components_top"]) == 3
 
 
@@ -266,15 +271,85 @@ def test_mask_size_mismatch_rejected(monkeypatch):
 
 def test_target_long_edge_math(monkeypatch):
     mod = _load_backend(monkeypatch)
-    # 2048px @0.25mpp → 1024 输出（恰 0.5µm/px）
-    edge, coarse = mod._target_long_edge(2048, 1024, 0.25)
-    assert edge == 1024 and coarse is False
-    # 4096px @0.5mpp → 想要 4096，钳到 1024（变粗，警告）
+    assert mod._TARGET_MPP == pytest.approx(0.25)  # 默认目标 0.25 µm/px
+    # 1000px @0.25mpp → 1000 输出（恰 0.25µm/px；≤1024 合同上限，≤源长边）
+    edge, coarse = mod._target_long_edge(1000, 800, 0.25)
+    assert edge == 1000 and coarse is False
+    # 512px @0.5mpp → 想要 1024，但源长边只有 512：钳到原生（不上采样）
+    edge, coarse = mod._target_long_edge(512, 512, 0.5)
+    assert edge == 512 and coarse is True
+    # 4096px @0.5mpp → 想要 8192，钳到 1024 合同上限（变粗，警告）
     edge, coarse = mod._target_long_edge(4096, 4096, 0.5)
     assert edge == 1024 and coarse is True
-    # MPP 未知 → 上限 + 调用方附警告
+    # MPP 未知 → 钳到源长边（不上采样）而非 1024 上限
     edge, coarse = mod._target_long_edge(512, 512, None)
-    assert edge == mod._MAX_LONG_EDGE and coarse is True
+    assert edge == 512 and coarse is True
+
+
+# --------------------------------------------------------------------------- #
+# 2b. 计数拆分（距离变换 + 分水岭，guard：objects_resolved）
+# --------------------------------------------------------------------------- #
+def _discs_grid(size, centers, r):
+    g = [[0] * size for _ in range(size)]
+    for cy, cx in centers:
+        for y in range(size):
+            for x in range(size):
+                if (y - cy) ** 2 + (x - cx) ** 2 <= r * r:
+                    g[y][x] = 1
+    return g
+
+
+def _analyze_scaled(mod, grid, mpp=0.25):
+    """src==out（scale 1）的 analyze_mask 便捷封装：输出像素=level-0 像素。"""
+    h, w = len(grid), len(grid[0])
+    return mod.analyze_mask(grid, w, h, _region_payload(w, h, (0, 0, w, h)),
+                            mpp)
+
+
+def test_split_separated_discs_counts_truth(monkeypatch):
+    """分离圆盘：已分辨（resolved=1.0）→ 拆分计数 ≈ 真实目标数。"""
+    mod = _load_backend(monkeypatch)
+    # r=14（直径 28px）；mpp 0.25、scale 1 → 期望直径 28px，期望面积≈615
+    grid = _discs_grid(80, [(30, 15), (30, 60)], 14)
+    out = _analyze_scaled(mod, grid)
+    aoc = out["approx_object_count"]
+    assert aoc["connected_components"] == 2
+    assert aoc["objects_resolved"] == pytest.approx(1.0)
+    assert aoc["estimated_count_split"] == 2
+    assert aoc["split_method"]
+
+
+def test_split_touching_two_discs(monkeypatch):
+    """两枚相切/重叠圆盘（一个连通域）→ 连通域=1、拆分=2。"""
+    mod = _load_backend(monkeypatch)
+    grid = _discs_grid(80, [(30, 22), (30, 42)], 14)  # 圆心距 20 < 2r，粘连
+    out = _analyze_scaled(mod, grid)
+    aoc = out["approx_object_count"]
+    assert aoc["connected_components"] == 1
+    assert aoc["estimated_count_split"] == 2
+
+
+def test_split_touching_three_discs(monkeypatch):
+    """三枚链状粘连圆盘 → 连通域=1、拆分=3。"""
+    mod = _load_backend(monkeypatch)
+    grid = _discs_grid(100, [(30, 20), (30, 40), (30, 60)], 14)
+    out = _analyze_scaled(mod, grid)
+    aoc = out["approx_object_count"]
+    assert aoc["connected_components"] == 1
+    assert aoc["estimated_count_split"] == 3
+
+
+def test_band_blob_guard_null(monkeypatch):
+    """整片细胞带（单个大区域 ≫ 期望单目标面积）→ resolved 低，拆分为 null
+    并附 mask_is_region_not_instances 警告；connected_components 照常给出。"""
+    mod = _load_backend(monkeypatch)
+    grid = [[1] * 100 for _ in range(30)]  # 3000px ≫ 3×期望面积(~1846)
+    out = _analyze_scaled(mod, grid)
+    aoc = out["approx_object_count"]
+    assert aoc["connected_components"] == 1
+    assert aoc["estimated_count_split"] is None
+    assert aoc["objects_resolved"] == pytest.approx(0.0)
+    assert any("mask_is_region_not_instances" in w for w in out["warnings"])
 
 
 # --------------------------------------------------------------------------- #
@@ -321,7 +396,7 @@ def test_happy_path_result_shape_and_hygiene(monkeypatch):
     assert result["foreground"]["positive_pixels_out"] == 4
     assert result["foreground"]["area_px_l0"] == pytest.approx(64.0)
     assert result["foreground"]["area_um2"] == pytest.approx(16.0)
-    assert result["approx_object_count"]["value"] == 1
+    assert result["approx_object_count"]["connected_components"] == 1
     assert result["components_top"][0]["bbox_l0"] == [10, 20, 8, 8]
     assert result["components_top"][0]["centroid_l0"] == [12, 22]
     # 响应卫生：无 mask/base64 图像、不回显委托凭证、体量 ≪64KiB
@@ -329,6 +404,26 @@ def test_happy_path_result_shape_and_hygiene(monkeypatch):
     assert DELEGATED not in text
     assert "mask_png_b64" not in text and "image_base64" not in text
     assert len(r.get_data()) < 32 * 1024
+
+
+def test_happy_path_with_slide_id_uses_result_and_Echoes_id(monkeypatch):
+    """dispatch 转发的 slide_id（P2 双字段）透传到平台回调与结果。"""
+    mod = _happy_setup(monkeypatch)
+    seen = {}
+
+    def _read(slide, args, edge, delegated, jwt, slide_id=None):
+        seen["slide_id"] = slide_id
+        return b"img", _region_payload(4, 4, src=(10, 20, 16, 16))
+    monkeypatch.setattr(mod, "_platform_read_region", _read)
+    r = mod.app.test_client().post(
+        "/capabilities/segment_region",
+        json={"slide": "26-005817.tif", "slide_id": "sld_abc",
+              "arguments": GOOD_ARGS},
+        headers={"X-Dispatch-Principal": json.dumps(_PRINCIPAL),
+                 "X-Delegated-Read-Token": DELEGATED})
+    assert r.status_code == 200, r.get_json()
+    assert seen["slide_id"] == "sld_abc"
+    assert r.get_json()["result"]["slide_id"] == "sld_abc"
 
 
 def test_inference_busy_maps_retryable_503(monkeypatch):
@@ -397,7 +492,8 @@ def test_result_stays_under_64kib_with_many_components(monkeypatch):
     monkeypatch.setattr(mod, "_infer",
                         lambda *a: (infer_body, mask))
     monkeypatch.setattr(mod, "_platform_read_region",
-                        lambda s, a, e, d, j: (b"img", _region_payload(200, 200)))
+                        lambda s, a, e, d, j, slide_id=None:
+                        (b"img", _region_payload(200, 200)))
     r = _call(mod, GOOD_ARGS)
     assert r.status_code == 200, r.get_json()
     assert len(r.get_data()) < 64 * 1024

@@ -40,12 +40,23 @@ HistoPilot agent
 | `threshold` | number? | 可选前景阈值（0..1） |
 
 返回（摘要，恒 ≪64KiB）：`analysis_id`、`model{id,sha256,code_rev}`、
-`prompt_used`、`object/region_hint/threshold`、`slide/slide_revision`、
+`prompt_used`、`object/region_hint/threshold`、`slide/slide_id/revision`、
 `source_bbox`、`rendered{src,width,height,read_level}`、`mpp`、`foreground`
 （level-0 像素面积、ROI 面积占比、µm²——MPP 缺失时仅像素）、
-`approx_object_count`（**语义分割连通域近似值**，非实例计数）、
+`approx_object_count`（**语义分割近似计数**：`connected_components` 连通域
+计数恒给出；`estimated_count_split` 为距离变换+分水岭拆分估计，仅当
+`objects_resolved` ≥ 0.6 时给出，否则 null 并附 `mask_is_region_not_instances`
+警告——mask 覆盖成片组织区域/细胞带时拆分会发明伪目标）、
 `size_distribution`、`components_top`（≤20 个最大连通域的 level-0
 bbox/质心，可用来标示例）、`timings_ms`、`warnings`。
+
+平台回调按 **slide_id**（dispatch 转发，取自签名 token claim）走 by-id
+slide-info / region 路由；仅名（legacy 行）回落 by-name。输出分辨率目标
+**0.25 µm/px**（`PT_PSM_TARGET_MPP` 可调），且永不上采样超过切片原生
+mpp（输出像素 ≤ level-0 源像素）。平台 404（切片不存在/不可读）由后端
+归一为 `slide_unavailable`；dispatch 侧插件 4xx 归一为
+`capability_failed`（404 → 可重试 503 `capability_unavailable`），细分码
+在 `error.details.plugin_code`——避免 HP 把 404 渲染成「插件已停用」。
 
 推理服务 HTTP 合同（独立部署，见下）：`GET /readyz` →
 `{"ready":true,"model_id","model_sha256","code_rev","device"}`；
@@ -65,9 +76,12 @@ bbox/质心，可用来标示例）、`timings_ms`、`warnings`。
 - `PT_PLATFORM_URL`：PathTogether 基地址（默认 `http://127.0.0.1:8000`）；
 - `PT_INSTALLATION_ID` / `PT_INSTALLATION_SECRET`：本插件安装凭证（见下）；
 - `PATHSEGMENTOR_URL`：推理服务基地址（默认 `http://127.0.0.1:8971`）；
-- `PT_PSM_TARGET_MPP`（默认 0.5）/ `PT_PSM_MAX_LONG_EDGE`（默认 1024）/
+- `PT_PSM_TARGET_MPP`：目标输出分辨率 µm/px（缺省 **0.25**，永不超过原生）；
+  `PT_PSM_MAX_LONG_EDGE`（缺省 1024）/
   `PT_PSM_MIN_COMPONENT_FRACTION`（默认 1e-4）/ `PT_PSM_MAX_COMPONENTS`
-  （默认 20）。
+  （默认 20）；
+- `PT_PSM_EXPECTED_DIAMETER_UM`（缺省 7.0，计数拆分的期望单目标直径）/
+  `PT_PSM_OBJECTS_RESOLVED_MIN`（缺省 0.6，拆分 guard 阈值）。
 
 平台侧（PathTogether，可选）：
 

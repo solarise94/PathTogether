@@ -278,6 +278,9 @@ function bootApp(seed?: (s: Seedable) => void, opts: { search?: string; storage?
 	(globalThis as { fetch?: unknown }).fetch = fetchImpl;
 	(globalThis as { HP_ViewerCore?: unknown }).HP_ViewerCore = w.HP_ViewerCore;
 	(globalThis as { HP_I18N?: unknown }).HP_I18N = w.HP_I18N;
+	// app.js 的 pt.cos.jobs 读写用裸 localStorage（浏览器里 = window.localStorage）；
+	// Node 测试环境裸名落在 globalThis——镜像同一份 fake，恢复管线才可驱动
+	(globalThis as { localStorage?: unknown }).localStorage = opts.storage || null;
 
 	if (seed) seed({ routes, hang, laggy });
 	new Function("window", "document", "fetch", "location", appSrc)(w, doc, fetchImpl, w.location);
@@ -318,6 +321,7 @@ function teardown() {
 	delete (globalThis as { location?: unknown }).location;
 	delete (globalThis as { HP_ViewerCore?: unknown }).HP_ViewerCore;
 	delete (globalThis as { HP_I18N?: unknown }).HP_I18N;
+	delete (globalThis as { localStorage?: unknown }).localStorage;
 }
 
 async function flush(times = 10) {
@@ -1182,5 +1186,170 @@ describe("导入默认目标与冻结（folder-experience §1）", () => {
 		// 再次调用复用同一幂等键（冻结语义）
 		expect((w!.HP_UPLOAD!.convertHandoffTarget() as typeof t2).newProject.key).toBe(t2.newProject.key);
 		h.UI.importDrawer.close();
+	});
+});
+
+describe("上传中刷新恢复：完成即按原目标关联（folder-experience §1.3×§5）", () => {
+	/** pt.cos.jobs 记录（cosJobsRead 校验形状：job_id/filename/size/confirmed）。 */
+	function cosJobRecord(jobId: string, account = "u1") {
+		return { job_id: jobId, filename: "restored.tif", size: 1234,
+			slide_id: null, account, digests: {}, digest_scheme: "", confirmed: [] };
+	}
+	function upAssocSeed(jobId: string, target: Record<string, unknown>, at = Date.now()) {
+		return JSON.stringify([{ job_id: jobId, target, at }]);
+	}
+	const UPASSOC_KEY = "pt.fb.upassoc.v1:u1";
+	function ingRoute(body: Record<string, unknown>) {
+		return () => ({ status: 200, body });
+	}
+	function slidesPosts(h: ReturnType<typeof bootApp>) {
+		return h.calls.filter((c) => /^\/api\/project\/[^/]+\/slides$/.test(c.url));
+	}
+	function retryButton(h: ReturnType<typeof bootApp>): BootEl | undefined {
+		for (const row of h.els["upload-progress-list"].children) {
+			const btn = row.children.find((c) => c.textContent === "imp.assoc.retry");
+			if (btn) return btn;
+		}
+		return undefined;
+	}
+
+	it("案例：上传中刷新、恢复行完成 → 按开始时冻结的原目标关联恰好一次", async () => {
+		const storage = fakeStorage({
+			"pt.cos.jobs": JSON.stringify([cosJobRecord("job1")]),
+			[UPASSOC_KEY]: upAssocSeed("job1",
+				{ pid: "p_t", newProjectName: "", createdPid: "", createKey: null }),
+		});
+		const h = bootApp((s) => {
+			seedFx(s);
+			seedAuth(s, AUTH_U1);
+			s.routes.set("/api/ingestions/job1", ingRoute(
+				{ stage: "viewable", slide_id: "sld_r1", slide: "restored.tif" }));
+			s.routes.set("/api/project/p_t/slides", () => ({ status: 200, body: { ok: true } }));
+		}, { storage });
+		await flush(40);
+		const posts = slidesPosts(h);
+		expect(posts.length).toBe(1);
+		expect(posts[0].url).toBe("/api/project/p_t/slides");
+		expect(JSON.parse(String(posts[0].opts && posts[0].opts.body)))
+			.toEqual({ slide_ids: ["sld_r1"] });
+		// 任务与快照记录消费后清理
+		expect(storage.map.get(UPASSOC_KEY)).toBe("[]");
+		expect(JSON.parse(storage.map.get("pt.cos.jobs") as string).length).toBe(0);
+		// 再次恢复（等价于又一次刷新）：无记录 → 绝不重复关联
+		const callsBefore = h.calls.length;
+		(globalThis as { window?: { HP_UPLOAD?: { restoreCosJobs(): void } } })
+			.window!.HP_UPLOAD!.restoreCosJobs();
+		await flush(20);
+		expect(slidesPosts(h).length).toBe(1);
+		expect(h.calls.length).toBe(callsBefore);
+	});
+
+	it("案例：恢复完成时目标目录已被删除 → 明确失败 + 重试入口 + 待办，绝不新建目录", async () => {
+		let slidesStatus = 403;
+		const storage = fakeStorage({
+			"pt.cos.jobs": JSON.stringify([cosJobRecord("job2")]),
+			[UPASSOC_KEY]: upAssocSeed("job2",
+				{ pid: "p_gone", newProjectName: "", createdPid: "", createKey: null }),
+		});
+		const h = bootApp((s) => {
+			seedFx(s);
+			seedAuth(s, AUTH_U1);
+			s.routes.set("/api/ingestions/job2", ingRoute(
+				{ stage: "viewable", slide_id: "sld_r2", slide: "restored.tif" }));
+			s.routes.set("/api/project/p_gone/slides",
+				() => ({ status: slidesStatus, body: { error: "denied" } }));
+		}, { storage });
+		await flush(40);
+		// 失败明确可见：toast + 行内重试按钮 + 按身份落盘待办（原目标）
+		expect(h.els["toast-container"].children.map((c) => c.textContent).join("|"))
+			.toContain("imp.assoc.fail2");
+		expect(retryButton(h)).toBeTruthy();
+		const pending = JSON.parse(storage.map.get("pt.fb.assoc.v1:u1") as string);
+		expect(pending.length).toBe(1);
+		expect(pending[0].slideId).toBe("sld_r2");
+		expect(pending[0].target.pid).toBe("p_gone");
+		// 没有任何「新建目录」的兜底（快照是已有目录，不是 new+createKey）
+		expect(h.calls.some((c) => c.url === "/api/project/create")).toBe(false);
+		// 目录恢复可写后点行内重试 → 只重试原目标，成功清待办
+		slidesStatus = 200;
+		retryButton(h)!.dispatch("click", clickEvt());
+		await flush(20);
+		const posts = slidesPosts(h);
+		expect(posts.length).toBe(2);
+		expect(posts[1].url).toBe("/api/project/p_gone/slides");
+		expect(JSON.parse(String(posts[1].opts && posts[1].opts.body)))
+			.toEqual({ slide_ids: ["sld_r2"] });
+		expect(storage.map.get("pt.fb.assoc.v1:u1")).toBe("[]");
+	});
+
+	it("案例：快照是「新目录」目标 → 恢复完成用原幂等键建目录并关联，不重复建", async () => {
+		const storage = fakeStorage({
+			"pt.cos.jobs": JSON.stringify([cosJobRecord("job3")]),
+			[UPASSOC_KEY]: upAssocSeed("job3",
+				{ pid: "", newProjectName: "恢复目录", createdPid: "", createKey: "idem-r1" }),
+		});
+		const h = bootApp((s) => {
+			seedFx(s);
+			seedAuth(s, AUTH_U1);
+			s.routes.set("/api/ingestions/job3", ingRoute(
+				{ stage: "viewable", slide_id: "sld_r3", slide: "restored.tif" }));
+			s.routes.set("/api/project/create", () => ({ status: 200, body: { pid: "p_new" } }));
+			s.routes.set("/api/project/p_new/slides", () => ({ status: 200, body: { ok: true } }));
+		}, { storage });
+		await flush(40);
+		const creates = h.calls.filter((c) => c.url === "/api/project/create");
+		expect(creates.length).toBe(1);
+		expect(creates[0].opts && (creates[0].opts.headers as Record<string, string>)["Idempotency-Key"])
+			.toBe("idem-r1");
+		const posts = slidesPosts(h);
+		expect(posts.length).toBe(1);
+		expect(posts[0].url).toBe("/api/project/p_new/slides");
+		expect(JSON.parse(String(posts[0].opts && posts[0].opts.body)))
+			.toEqual({ slide_ids: ["sld_r3"] });
+	});
+
+	it("案例：换了账号（其余记录俱在）→ 不读不关联，原快照原样保留", async () => {
+		const storage = fakeStorage({
+			"pt.cos.jobs": JSON.stringify([cosJobRecord("job1")]),   // 任务属 u1
+			[UPASSOC_KEY]: upAssocSeed("job1",
+				{ pid: "p_t", newProjectName: "", createdPid: "", createKey: null }),
+		});
+		const h = bootApp((s) => {
+			seedFx(s);
+			seedAuth(s, { ...AUTH_U1, user_id: "uB" });
+			// 最坏情况：轮询对 uB 也返回 viewable——仍绝不按 A 的快照关联
+			s.routes.set("/api/ingestions/job1", ingRoute(
+				{ stage: "viewable", slide_id: "sld_r1", slide: "restored.tif" }));
+			s.routes.set("/api/project/p_t/slides", () => ({ status: 200, body: { ok: true } }));
+		}, { storage });
+		await flush(40);
+		expect(slidesPosts(h).length).toBe(0);
+		expect(JSON.parse(storage.map.get(UPASSOC_KEY) as string).length).toBe(1);
+	});
+
+	it("案例：快照缺失或过期 → 不猜，保持未归类（无任何关联请求）", async () => {
+		// 缺失
+		const h1 = bootApp((s) => {
+			seedFx(s);
+			seedAuth(s, AUTH_U1);
+			s.routes.set("/api/ingestions/job1", ingRoute(
+				{ stage: "viewable", slide_id: "sld_r1", slide: "restored.tif" }));
+		}, { storage: fakeStorage({ "pt.cos.jobs": JSON.stringify([cosJobRecord("job1")]) }) });
+		await flush(40);
+		expect(slidesPosts(h1).length).toBe(0);
+		// 过期（31 天前）
+		const h2 = bootApp((s) => {
+			seedFx(s);
+			seedAuth(s, AUTH_U1);
+			s.routes.set("/api/ingestions/job1", ingRoute(
+				{ stage: "viewable", slide_id: "sld_r1", slide: "restored.tif" }));
+		}, { storage: fakeStorage({
+			"pt.cos.jobs": JSON.stringify([cosJobRecord("job1")]),
+			[UPASSOC_KEY]: upAssocSeed("job1",
+				{ pid: "p_t", newProjectName: "", createdPid: "", createKey: null },
+				Date.now() - 31 * 24 * 3600 * 1000),
+		}) });
+		await flush(40);
+		expect(slidesPosts(h2).length).toBe(0);
 	});
 });

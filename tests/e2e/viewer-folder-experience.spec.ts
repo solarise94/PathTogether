@@ -113,18 +113,19 @@ test.describe("folder-experience：刷新恢复 / 导入默认目标 / 深链定
     await expandSidebar(page);
 
     // —— 根目录：≥2 页（10 张未归类 + 2 个文件夹卡，每叠 ≤8）——
+    // 页总数随侧栏展开时的可用高度而变（既有装箱行为），断言只锚页码。
     const pageInfo = page.locator("#fb-page-info");
-    await expect(pageInfo).toContainText(/1\/\d+/);
-    const totalPages = Number((await pageInfo.textContent())!.match(/(\d+)\s*页/)?.[1] ?? "0");
+    await expect(pageInfo).toContainText(/^1\/\d+/);
+    const totalPages = Number((await pageInfo.textContent())!.match(/^1\/(\d+)/)?.[1] ?? "0");
     expect(totalPages).toBeGreaterThanOrEqual(2);
 
     // —— 翻到第 2 页后刷新 → 仍停在第 2 页（位置记忆）——
     await page.locator("#fb-next-btn").click();
-    await expect(pageInfo).toContainText("2/" + totalPages);
+    await expect(pageInfo).toContainText(/^2\//);
     await page.screenshot({ path: join(SHOT_DIR, "fx-01-root-page2.png") });
     await page.reload();
     await expandSidebar(page);
-    await expect(pageInfo).toContainText("2/" + totalPages);
+    await expect(pageInfo).toContainText(/^2\//);
     await expect(page.locator("#fb-location")).toContainText("我的切片");
     await page.screenshot({ path: join(SHOT_DIR, "fx-02-restored-page2.png") });
 

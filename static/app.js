@@ -3745,6 +3745,74 @@
     });
   }
 
+  // ---------- 刷新恢复的上传目标快照（§1.3 × 刷新恢复 §5）----------
+  // 上传创建 ingestion（created 事件）时，把该任务开始时冻结的目标快照按
+  // **任务 ID**（非文件名）落盘，同身份隔离、只存 ID/幂等键、30 天过期。
+  // 恢复行完成（pollRestoredRow → viewable）时用原快照走同一条
+  // importAssociateUploaded 路径——失败进入上面的待办/重试机制；快照缺失/
+  // 过期 → 不猜，保持未归类（与既有行为一致）。任务记录移除时一并清理。
+  var FB_UPASSOC_KEY_PREFIX = "pt.fb.upassoc.v1:";
+  var FB_UPASSOC_MAX_ITEMS = 20;
+
+  function fbUpAssocKey() {
+    if (currentUserId == null || currentUserId === "") return null;
+    return FB_UPASSOC_KEY_PREFIX + String(currentUserId);
+  }
+
+  function fbUpAssocRead() {
+    var key = fbUpAssocKey();
+    var store = safeLocalStorage();
+    if (!key || !store) return [];
+    try {
+      var arr = JSON.parse(store.getItem(key) || "[]");
+      if (!Array.isArray(arr)) return [];
+      var now = Date.now();
+      return arr.filter(function (it) {
+        return it && typeof it.job_id === "string" && it.job_id &&
+          it.target && (it.target.pid || it.target.newProjectName) &&
+          typeof it.at === "number" && isFinite(it.at) &&
+          now - it.at <= FB_MEM_MAX_AGE_MS;
+      }).slice(0, FB_UPASSOC_MAX_ITEMS);
+    } catch (e) { return []; }
+  }
+
+  function fbUpAssocWrite(items) {
+    var key = fbUpAssocKey();
+    var store = safeLocalStorage();
+    if (!key || !store) return;
+    try { store.setItem(key, JSON.stringify(items)); } catch (e) { /* 不阻断 */ }
+  }
+
+  function fbUpAssocSave(jobId, target) {
+    if (!jobId || !target ||
+        (!target.pid && !target.newProjectName)) return;   // 未归类：无可恢复目标
+    var items = fbUpAssocRead().filter(function (it) { return it.job_id !== jobId; });
+    items.push({
+      job_id: jobId,
+      target: {
+        pid: target.pid || "",
+        newProjectName: target.newProjectName || "",
+        createdPid: target.createdPid || "",
+        createKey: target.createKey || null,   // 原幂等键：恢复完成不重复建目录
+      },
+      at: Date.now(),
+    });
+    fbUpAssocWrite(items.slice(-FB_UPASSOC_MAX_ITEMS));
+  }
+
+  // 取回并移除（读端一次性消费：关联恰好一次）
+  function fbUpAssocTake(jobId) {
+    if (!jobId) return null;
+    var items = fbUpAssocRead();
+    var hit = null;
+    var rest = items.filter(function (it) {
+      if (!hit && it.job_id === jobId) { hit = it; return false; }
+      return true;
+    });
+    if (hit) fbUpAssocWrite(rest);
+    return hit ? hit.target : null;
+  }
+
   // 每叠页数：可用高度 − 文件夹卡占用 − 一张完整卡 → 余量按最紧露出条带
   // （FB_MIN_GAP）折算——保证整页在最挤时也放得下；铺开是渲染期的自适应。
   // 纯函数（vitest 锁行为）：上限 8、下限 1。（渲染/定位现改用下方
@@ -10098,6 +10166,9 @@
   function cosJobRemove(jobId) {
     if (!jobId) return;
     cosJobsWrite(cosJobsRead().filter(function (j) { return j.job_id !== jobId; }));
+    // folder-experience：任务记录移除即清理其目标快照（同 Tab 完成/取消/终态
+    // 时身份已知，Take 生效；恢复完成路径在身份就绪后自行 Take，不受影响）
+    fbUpAssocTake(jobId);
   }
 
   function cosFindResumableJob(file) {
@@ -10334,7 +10405,12 @@
             retrying = true;
             row.setStage("upload.cos.stage.uploading", null,
                          cosProgressNote(null), true);
-          } else if (ev.type === "created") jobId = ev.jobId;
+          } else if (ev.type === "created") {
+            jobId = ev.jobId;
+            // folder-experience §1.3×§5：ingestion 建成即把上传开始时冻结的
+            // 目标快照按任务 ID 落盘——刷新后恢复行完成仍按原目标关联
+            fbUpAssocSave(jobId, opts.assocTarget);
+          }
         },
       });
 
@@ -10435,7 +10511,7 @@
           if (!st) { setTimeout(tick, 5000); return; }
           if (st === "viewable") {
             done = true;
-            cosJobRemove(job.job_id);
+            cosJobRemove(job.job_id);   // 任务记录移除（快照清理延迟到身份就绪，见下）
             var r0 = ensureRow();
             r0.setStage("upload.stage.done");
             r0.finish();
@@ -10445,6 +10521,17 @@
             // 目标一律按 slide_id，不按名猜。
             toast(t("upload.done", { name: b.slide || job.filename }), "success");
             loadAll();
+            // folder-experience §1.3×§5：恢复轮询常先于 /api/auth/info 完成，
+            // 而目标快照按身份域存取——身份就绪后再取快照并按原快照关联
+            //（失败进入既有待办/行内重试机制）；快照缺失/过期/他号 → 不猜，
+            // 保持未归类，绝不改成当前目录，也绝不重传已发布切片。
+            fbIdentityReady().then(function () {
+              var restoredTarget = fbUpAssocTake(job.job_id);
+              importAssociateUploaded(
+                b.slide_id || null, b.slide || job.filename,
+                restoredTarget || { pid: "", newProjectName: "" },   // 无快照 = 显式未归类，不回退活会话状态
+                r0);
+            });
             return;
           }
           if (st === "terminal") {

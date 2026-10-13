@@ -98,6 +98,24 @@ fast 通道默认只供 PathTogether worker 调用，不对用户提供永久下
 
 这仍需少量 Go 代码扩展，不能仅靠配置把现有通用下载接口接上。不要同时引入第二套文件管理平台或把所有 COS 控制职责迁走。
 
+### PathTogether 配置接线（无秘密）
+
+worker 由容器 env 驱动（`docker_entry.sh` 起 `cos_ingest_worker.py --loop`，
+不改其启停条件）。fast 传输新增下列 env，值不含秘密：
+
+| Env | 默认 | 说明 |
+| --- | --- | --- |
+| `COS_DOWNLOAD_TRANSPORT` | `direct` | `direct` 走官方 SDK 直连 COS；`fast` 经 fast 转发；其他值 fail-closed（空转告警，不自动回退） |
+| `COS_FAST_RELAY_URL` | — | fast 转发基地址；必须 `https://`（仅 `127.0.0.1`/`localhost`/`::1` 允许 `http://` 供本机测试） |
+| `COS_FAST_RELAY_TOKEN_FILE` | — | 服务 token 私有文件（取首个非空行），0600，只读挂载，不进仓库/日志 |
+| `COS_FAST_RELAY_CONNECT_TIMEOUT` | `10` | 连接超时秒 |
+| `COS_FAST_RELAY_READ_TIMEOUT` | `60` | 单次 socket 读空闲秒 |
+
+token 文件沿用本仓既有私有 secret env 约定（发布目录下 0600 文件，参照
+`cos.secret.env` / `turnstile.secret.env` 做法）：只把**文件路径**经 env 注入
+容器并只读挂载该文件；token 内容不进镜像、仓库、命令行或日志。启用 fast 时
+`COS_INGEST_WORKER=1` 与既有 COS bucket/region/secret 保持不变。
+
 ## 专用下载接口合同
 
 以下为**拟新增接口**，不是现有可用 API。

@@ -31,7 +31,7 @@ const FIXTURE_HOST = "http://pt-ta-fixture.test";
 
 // ---------------------------------------------------------------------------
 // 极简 Jinja 渲染：只支持 _app_shell.html 用到的 {% if %}/{% elif %}/{% else %}
-// 与 `{% set %}` 剥离。表达式经 JS 求值（or/and 转 ||/&&）。
+// 与 `{% set %}` 剥离、静态模板 include。表达式经 JS 求值（or/and 转 ||/&&）。
 // ---------------------------------------------------------------------------
 type Node = { text: string } | { tag: string; branches: Array<{ cond: string | null; body: Node[] }> };
 
@@ -63,6 +63,15 @@ function parse(tokens: Array<{ kind: "text" | "tag"; value: string }>, start: nu
 		}
 		const keyword = tok.value.split(/\s+/)[0];
 		if (stopTags.includes(keyword)) return [nodes, i];
+		if (keyword === "include") {
+			const name = tok.value.match(/^include\s+["']([A-Za-z0-9_.-]+\.html)["']$/)?.[1];
+			if (!name) throw new Error(`unsupported include: ${tok.value}`);
+			const source = readFileSync(resolve(here, "../../templates", name), "utf8");
+			const [included] = parse(tokenize(source), 0, []);
+			nodes.push(...included);
+			i += 1;
+			continue;
+		}
 		if (keyword === "if") {
 			const cond = tok.value.replace(/^if\s+/, "");
 			const branches: Array<{ cond: string | null; body: Node[] }> = [];
@@ -200,6 +209,7 @@ function fixtureHtml(opts: { mode?: "official" | "demo" } = {}): string {
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>toolbar-account fixture（虚构数据）</title>
 <link rel="stylesheet" href="/static/style.css" />
+<link rel="stylesheet" href="/static/brand/brand.css" />
 </head>
 <body class="app-mode-${mode}" data-app-mode="${mode}" style="margin:0">
 ${body}
@@ -259,6 +269,10 @@ async function serveFixture(
 	await page.route(FIXTURE_HOST + "/**", (route: Route) => {
 		const url = new URL(route.request().url());
 		const p = url.pathname;
+		if (/^\/static\/brand\/(?:brand\.css|logo-(?:96|192)\.webp)$/.test(p)) {
+			return route.fulfill({ status: 200, contentType: p.endsWith('.css') ? 'text/css' : 'image/webp',
+				body: readFileSync(resolve(here, '../..' + p)) });
+		}
 		if (p === "/static/style.css") {
 			return route.fulfill({ status: 200, contentType: "text/css; charset=utf-8", body: PROD_CSS });
 		}

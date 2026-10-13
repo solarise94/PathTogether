@@ -364,13 +364,17 @@
     });
   }
 
-  // 页面初始化时拉取认证状态：启用认证则显示「修改我的密码」与退出登录
+  // 页面初始化时拉取认证状态：启用认证则显示「修改我的密码」与退出登录。
+  // folder-experience §2：无论成功与否都放行身份就绪闸——位置记忆的恢复/
+  // 持久化以 currentUserId 为准（无可信身份 = 不持久化，见 fbMemoryKey）。
   function initAuth() {
     apiFetch("/api/auth/info").then(function (r) { return r.json(); }).then(function (info) {
       applyAuthInfo(info);
       // 升级 A：身份到位后按「站点:账号」重读侧栏偏好（无偏好保持默认收起）
       if (sidebarCtrl) sidebarCtrl.onScopeReady();
-    }).catch(function () { /* 忽略，不影响主功能 */ });
+    }).catch(function () { /* 忽略，不影响主功能 */ }).then(function () {
+      fbIdentitySettle();
+    });
     if (els.previewStopBtn) {
       els.previewStopBtn.addEventListener("click", stopIdentityPreview);
     }
@@ -3474,6 +3478,9 @@
       renderFolderBrowser();
       rearmTempViewTimerFromList();
       renderShareList(shareListFrom(results[2]));
+      // folder-experience §2：授权项目列表就绪后按记忆恢复（仅初始化一次；
+      // 深链/本次会话导航优先，见 fbRestoreFromMemory）
+      fbRestoreFromMemory();
     }).catch(function (e) {
       toast(t("load.fail", { e: e }), "error");
     });
@@ -3550,10 +3557,193 @@
 
   var fbState = {
     folder: null,   // null=根目录；pid=项目 id；FB_TEMP_KEY=临时查看
-    pages: {},      // 文件夹 → 上次页码（仅内存）
+    pages: {},      // 文件夹 → 上次页码（会话内存 + 位置记忆持久化）
     page: 0,        // 当前文件夹当前页（渲染时钳回有效范围）
     totalPages: 1,
   };
+
+  // =========================================================================
+  // 位置记忆（folder-experience 2026-10-13 §2）：小型版本化 localStorage 记录
+  // {"v":1,"folder":id|null,"pages":{...},"updatedAt":…}，按真实登录身份隔离
+  // （currentUserId=预览中的有效被预览者；actor 不入 key——侧栏呈现的是有效
+  // 身份的授权树）。只存 ID、页码与时间，绝不存名称/缩略图/切片清单/token；
+  // 上限 100 个目录、30 天。storage 抛错/隐私模式 → 纯内存继续，不阻断导航
+  // 与上传。恢复只在初始化尝试一次，且晚于身份与授权项目列表；两个部署域
+  // 各自存储，不做跨域同步。
+  // =========================================================================
+  var FB_MEM_KEY_PREFIX = "pt.fb.pos.v1:";
+  var FB_MEM_MAX_FOLDERS = 100;
+  var FB_MEM_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+  var FB_ASSOC_KEY_PREFIX = "pt.fb.assoc.v1:";   // 关联失败待办（§1.4，同身份隔离）
+  var FB_ASSOC_MAX_ITEMS = 20;
+  var fbMemRecord = null;        // 内存兜底记录（storage 不可用时仍可会话内恢复）
+  var fbMemRestoreDone = false;  // 记忆恢复只在初始化尝试一次
+  var fbNavTouched = false;      // 本次会话已发生导航（优先级高于磁盘记忆）
+  // 身份就绪闸：initAuth 结算后放行恢复。先到先结算——身份先于项目列表到位
+  // 时闸尚未创建，也要记住「已就绪」（fbIdentitySettle），否则无人再放行。
+  var fbIdentitySettled = false;
+  var fbIdentityWaiters = [];
+
+  function fbIdentityReady() {
+    if (fbIdentitySettled) return Promise.resolve();
+    return new Promise(function (res) { fbIdentityWaiters.push(res); });
+  }
+
+  function fbIdentitySettle() {
+    if (fbIdentitySettled) return;
+    fbIdentitySettled = true;
+    fbIdentityWaiters.splice(0).forEach(function (res) { res(); });
+  }
+
+  // 记忆 key：无可信身份（未登录/身份未就绪）→ null，不读写磁盘。
+  function fbMemoryKey() {
+    if (currentUserId == null || currentUserId === "") return null;
+    return FB_MEM_KEY_PREFIX + String(currentUserId);
+  }
+
+  // 读取 + 校验 + 裁剪：只认 {v:1,…} 形状；过期（30 天）整体丢弃；目录数
+  // 截到上限；页码只收非负有限数。「临时查看」是会话级集合，永不恢复。
+  function fbMemoryLoad(store) {
+    var key = fbMemoryKey();
+    if (!key || !store) return null;
+    var raw = null;
+    try { raw = store.getItem(key); } catch (e) { return null; }
+    if (!raw) return null;
+    var rec = null;
+    try { rec = JSON.parse(raw); } catch (e) { return null; }
+    if (!rec || typeof rec !== "object" || rec.v !== 1) return null;
+    var updatedAt = (typeof rec.updatedAt === "number" && isFinite(rec.updatedAt))
+      ? rec.updatedAt : 0;
+    if (Date.now() - updatedAt > FB_MEM_MAX_AGE_MS) return null;
+    var pages = {};
+    if (rec.pages && typeof rec.pages === "object") {
+      Object.keys(rec.pages).slice(0, FB_MEM_MAX_FOLDERS).forEach(function (k) {
+        var n = rec.pages[k];
+        if (typeof n === "number" && isFinite(n) && n >= 0) pages[k] = Math.floor(n);
+      });
+    }
+    var folder = rec.folder ? String(rec.folder) : null;
+    if (folder === FB_TEMP_KEY) folder = null;
+    return { v: 1, folder: folder, pages: pages, updatedAt: updatedAt };
+  }
+
+  // 写入：导航/翻页结束调用。临时查看目录按根记录（刷新后回根，不恢复会话
+  // 集合）；storage 抛错仅失去持久化（fbMemRecord 留作会话内兜底）。
+  function fbMemorySave() {
+    if (fbMemoryKey() == null) return;   // 无可信身份不持久化
+    fbState.pages[fbState.folder] = fbState.page;
+    var pages = {};
+    Object.keys(fbState.pages).slice(0, FB_MEM_MAX_FOLDERS).forEach(function (k) {
+      pages[k] = fbState.pages[k];
+    });
+    var rec = {
+      v: 1,
+      folder: fbState.folder === FB_TEMP_KEY ? null : (fbState.folder || null),
+      pages: pages,
+      updatedAt: Date.now(),
+    };
+    fbMemRecord = rec;
+    var store = safeLocalStorage();
+    if (!store) return;
+    try { store.setItem(fbMemoryKey(), JSON.stringify(rec)); }
+    catch (e) { /* 隐私模式/配额：仅失去刷新恢复，导航照常 */ }
+  }
+
+  // URL ?slide= 深链接检测（与 openSlideFromLocation 同一正则口径）：深链
+  // 优先于磁盘记忆——侧栏由 fbLocateSlide 定位，不被旧记忆拉回。
+  function fbHasSlideDeepLink() {
+    try { return /[?&]slide=([^&]+)/.test(window.location.search || ""); }
+    catch (e) { return false; }
+  }
+
+  // 初始化恢复（仅一次）：身份与授权项目列表都就绪后，按记忆恢复当前目录
+  // 与页码。优先级：URL ?slide= 深链 / 本次搜索定位 > 本次会话内导航 > 磁盘
+  // 记忆。记忆目录已删除/已撤权 → 回根目录：只与本地 allProjects（最新授权
+  // 列表）比对，绝不发起对未授权目录的内容请求。页码交给 renderFolderBrowser
+  // 按 fbPackPages 实际页数钳回（目录内容变少时落在最后一个有效页）。
+  function fbRestoreFromMemory() {
+    if (fbMemRestoreDone) return;
+    fbMemRestoreDone = true;
+    // 关联失败待办（§1.4）同闸重试：沿用原 slide ID/回执与原目标快照
+    fbIdentityReady().then(function () {
+      fbAssocRetryPending();
+      if (fbHasSlideDeepLink()) return;   // 深链优先：fbLocateSlide 负责侧栏
+      if (fbNavTouched) return;           // 本次会话用户已导航：不回拉旧记忆
+      var store = safeLocalStorage();
+      var rec = fbMemRecord || (store ? fbMemoryLoad(store) : null);
+      if (!rec) return;
+      var pages = rec.pages || {};
+      Object.keys(pages).forEach(function (k) {
+        if (fbState.pages[k] == null) fbState.pages[k] = pages[k];
+      });
+      var folder = rec.folder || null;
+      if (folder && !fbProject(folder)) folder = null;   // 已删/撤权 → 根
+      fbState.folder = folder;
+      fbState.page = (typeof pages[folder] === "number") ? pages[folder] : 0;
+      renderFolderBrowser();   // 页码在此按实际页数钳回
+    });
+  }
+
+  // ---------- 关联失败待办（folder-experience §1.4）----------
+  // 只存 slide ID/名 + 目标快照（pid/幂等键），同身份隔离；成功关联即清除。
+  // 换账号绝不读取上一账号的待办；storage 不可用退化为仅行内重试按钮。
+  function fbAssocKey() {
+    if (currentUserId == null || currentUserId === "") return null;
+    return FB_ASSOC_KEY_PREFIX + String(currentUserId);
+  }
+
+  function fbAssocRead() {
+    var key = fbAssocKey();
+    var store = safeLocalStorage();
+    if (!key || !store) return [];
+    try {
+      var arr = JSON.parse(store.getItem(key) || "[]");
+      if (!Array.isArray(arr)) return [];
+      return arr.filter(function (it) {
+        return it && (it.slideId || it.slideName) && it.target &&
+          (it.target.pid || it.target.newProjectName);
+      }).slice(0, FB_ASSOC_MAX_ITEMS);
+    } catch (e) { return []; }
+  }
+
+  function fbAssocWrite(items) {
+    var key = fbAssocKey();
+    var store = safeLocalStorage();
+    if (!key || !store) return;
+    try { store.setItem(key, JSON.stringify(items)); } catch (e) { /* 同上：不阻断 */ }
+  }
+
+  function fbAssocPendingSave(slideId, slideName, target) {
+    var items = fbAssocRead().filter(function (it) {
+      return !(it.slideId === slideId && it.slideName === slideName);
+    });
+    items.push({
+      slideId: slideId || null,
+      slideName: slideName || null,
+      target: {
+        pid: target.pid || "",
+        newProjectName: target.newProjectName || "",
+        createdPid: target.createdPid || "",
+        createKey: target.createKey || null,   // 原幂等键：重试绝不重复建目录
+      },
+      at: Date.now(),
+    });
+    fbAssocWrite(items.slice(-FB_ASSOC_MAX_ITEMS));
+  }
+
+  function fbAssocPendingClear(slideId, slideName) {
+    fbAssocWrite(fbAssocRead().filter(function (it) {
+      return !(it.slideId === slideId && it.slideName === slideName);
+    }));
+  }
+
+  // 每次启动对待办自动重试一次（每次刷新至多一轮）：只重试原目标的关联
+  // 请求，绝不重传已发布切片，也绝不改用当前目录。
+  function fbAssocRetryPending() {
+    fbAssocRead().forEach(function (it) {
+      importAssociateUploaded(it.slideId, it.slideName, it.target, null);
+    });
+  }
 
   // 每叠页数：可用高度 − 文件夹卡占用 − 一张完整卡 → 余量按最紧露出条带
   // （FB_MIN_GAP）折算——保证整页在最挤时也放得下；铺开是渲染期的自适应。
@@ -3757,13 +3947,16 @@
     return { folders: folders, slides: slides };
   }
 
-  // 进入文件夹（翻页记忆：离开时存当前页，回来恢复；§5.3）
+  // 进入文件夹（翻页记忆：离开时存当前页，回来恢复；§5.3）。
+  // folder-experience §2：导航结束即写位置记忆（本会话导航优先于磁盘记忆）。
   function fbGo(folderKey, pageHint) {
     fbState.pages[fbState.folder] = fbState.page;
     fbState.folder = folderKey || null;
     fbState.page = (typeof pageHint === "number" && pageHint >= 0)
       ? pageHint : (fbState.pages[fbState.folder] || 0);
     renderFolderBrowser();
+    fbNavTouched = true;
+    fbMemorySave();
     // 焦点管理：进入（非返回）时落在新内容首个可聚焦元素；根目录回落返回钮
     var first = els.fbStack && els.fbStack.querySelector
       ? els.fbStack.querySelector(".fb-folder, .fb-hit") : null;
@@ -4387,12 +4580,14 @@
     }
     if (els.fbPrevBtn) {
       els.fbPrevBtn.addEventListener("click", function () {
-        if (fbState.page > 0) { fbState.page -= 1; renderFolderBrowser(); }
+        if (fbState.page > 0) { fbState.page -= 1; renderFolderBrowser(); fbMemorySave(); }
       });
     }
     if (els.fbNextBtn) {
       els.fbNextBtn.addEventListener("click", function () {
-        if (fbState.page < fbState.totalPages - 1) { fbState.page += 1; renderFolderBrowser(); }
+        if (fbState.page < fbState.totalPages - 1) {
+          fbState.page += 1; renderFolderBrowser(); fbMemorySave();
+        }
       });
     }
     // ＋ 菜单（导入切片 / 新建文件夹）
@@ -4732,7 +4927,7 @@
   }
 
   // 定位新文件夹（成功后的「locate pid」）：在当前文件夹内创建的——原地重渲
-  // （新文件夹卡直接可见）；否则切到该文件夹。
+  // （新文件夹卡直接可见）；否则切到该文件夹。导航结束写位置记忆（§2）。
   function locateProject(pid) {
     if (!pid || !fbProject(pid)) return;
     var parent = fbParentOf(fbProject(pid));
@@ -4744,6 +4939,8 @@
     fbState.folder = pid;
     fbState.page = 0;
     renderFolderBrowser();
+    fbNavTouched = true;
+    fbMemorySave();
   }
 
   function ensureProjectIdemKey(payloadFp) {
@@ -9444,7 +9641,9 @@
   }
 
 
-  function pollConversionJob(body, row, file) {
+  // snap（folder-experience §1.3）：可选目标快照——有就传给关联（冻结语义）；
+  // 旧调用方（HP_UPLOAD.pollConversionJob 三参）沿用当前导入会话状态。
+  function pollConversionJob(body, row, file, snap) {
     var jobId = body.conversion_job_id;
     var canonical = body.canonical_name;
     row.setStage("upload.stage.converting");
@@ -9513,7 +9712,7 @@
                   name);
                 ref = name;
               }
-              importAssociateUploaded(ref, name);   // W4：上传行自身的目标关联（若有）
+              importAssociateUploaded(ref, name, snap || null, row);   // W4：上传行自身的目标关联（若有；§1.3 冻结快照）
               openSlide(ref);
             });
             return;
@@ -9539,6 +9738,9 @@
   function uploadFile(file, opts) {
     if (!file) return;
     opts = opts || {};
+    // folder-experience §1.3：上传开始即冻结目标快照——之后侧栏切换目录、
+    // 抽屉重开/下拉改动不影响本次任务的关联归属（含失败重试的目标与幂等键）
+    opts.assocTarget = importTargetSnapshot();
     // 先转换后上传阶段 1（docs/slide-tools/upload-convert-first-phase1.md）：
     // 先按文件头嗅探直传类别（slide-sniff.js 共享模块，只读 ≤128KB 头），
     // 按类别分流——直传类（OME-TIFF/转换器 BigTIFF）与暂时直传类立即上传
@@ -10140,7 +10342,7 @@
       // 回执/记录（工具页）或续传候选（工作台）。
       var settled = upload.done.then(function (r) {
         if (!r || r.cancelled) return;
-        cosUploadSucceeded(row, r.body, file);
+        cosUploadSucceeded(row, r.body, file, opts.assocTarget);
       }, function (err) {
         var msg;
         if (err && err.terminal) {
@@ -10175,7 +10377,7 @@
     });
   }
 
-  function cosUploadSucceeded(row, b, file) {
+  function cosUploadSucceeded(row, b, file, assocTarget) {
     // viewable：照 V2 commit 后的跳转习惯（完成 → 刷新列表 → 关联 → 打开）。
     // P2 合同 §5.2：打开目标 = 响应 slide_id（唯一）；缺字段才按名回落。
     // U2 多结果：zip 打开首个已发布 item（其余经列表刷新可见）；
@@ -10195,7 +10397,8 @@
     row.finish();
     toast(t("upload.done", { name: target.name }), "success");
     loadAll();
-    importAssociateUploaded(target.id, target.name);
+    // 关联用上传开始时冻结的目标快照（§1.3）：侧栏后续变化不影响归属
+    importAssociateUploaded(target.id, target.name, assocTarget || null, row);
     openSlide(target.id || target.name);
   }
 
@@ -10470,6 +10673,10 @@
     taskTimer: null,
     taskPollStopped: false,  // 401/403 后停止（权限失效，重试无意义）
     lastFocusEl: null,
+    // folder-experience §1：目标选择会话——每次打开抽屉 generation 前进；
+    // 用户操作任一目标下拉/新建名后 dirty=true，迟到的项目列表不得覆盖。
+    targetGen: 0,
+    targetDirty: false,
   };
 
   // 本地页签目标位置（抽屉会话内保留）："" = 未归类；"<pid>" = 已有项目；
@@ -10482,6 +10689,42 @@
   };
   // 可观测镜像（W4 spec 命名）：上传成功后据此 POST /api/project/<pid>/slides
   window.__importTargetPid = "";
+
+  // ---------- folder-experience §1：默认目标 / 目标快照 ----------
+  // 导入默认目标 = 当前真实文件夹，且仅当它出现在**最新授权项目列表**且服务
+  // 端显式标记 can_write 时才默认写入；根目录、「临时查看」集合、目录不在最
+  // 新列表、字段缺失（旧后端）或显式 false → 未归类。绝不以「列表里看得到」
+  // 推断可写（服务端 /api/projects 逐行下发 can_write，见 api_projects）。
+  function importDefaultTargetPid() {
+    var key = fbState.folder;
+    if (!key || key === FB_TEMP_KEY) return "";
+    var p = fbProject(key);
+    if (!p || p.can_write !== true) return "";
+    return key;
+  }
+
+  // 会话默认落位：本地与百度两个下拉同用；dirty（用户已操作）时不覆盖。
+  function applyImportTargetDefault() {
+    if (importDrawerState.targetDirty) return;
+    var def = importDefaultTargetPid();
+    if (els.importTargetSelect) els.importTargetSelect.value = def;
+    if (els.baiduTargetSelect) els.baiduTargetSelect.value = def;
+    syncImportTargetFromSelect();
+  }
+
+  // 目标快照：上传开始时冻结——之后侧栏切换目录、抽屉重开、下拉改动都不影
+  // 响本次任务的归属；失败重试沿用同一快照（含「新项目」幂等键，绝不重复建
+  // 目录、不重传已发布切片、不自动改成当前目录）。
+  function importTargetSnapshot() {
+    var st = importTargetState;
+    if (st.newProjectName && !st.createKey) st.createKey = uuid();
+    return {
+      pid: st.pid || "",
+      newProjectName: st.newProjectName || "",
+      createdPid: st.createdPid || "",
+      createKey: st.createKey || null,
+    };
+  }
 
   function jsonBody(r) {
     return r.json().then(function (b) { return { ok: r.ok, status: r.status, body: b }; },
@@ -10537,9 +10780,13 @@
   // 关联失败，产物保留在未归类（不静默改目标）。
   // P2 合同 §3.2：slideId 可得时发 {slide_ids:[...]}；旧后端/缺 id 回落
   // {slides:[名]}。
-  function importAssociateUploaded(slideId, slideName) {
+  // folder-experience §1.3/§1.4：snap = 上传开始时冻结的目标快照（缺省沿用
+  // 当前导入会话状态，兼容旧调用方）；失败保留切片与重试入口——行内「重试
+  // 加入文件夹」按钮 + 按身份持久化的待办（下次启动自动重试一次原目标），
+  // 沿用原 slide ID/回执与原幂等键，绝不重传已发布切片、绝不改成当前目录。
+  function importAssociateUploaded(slideId, slideName, snap, row) {
     if (!slideId && !slideName) return Promise.resolve();
-    var st = importTargetState;
+    var st = snap || importTargetState;
     if (!st.pid && !st.newProjectName) return Promise.resolve();
     var ensureProject;
     if (st.pid) {
@@ -10558,6 +10805,10 @@
           throw new Error((res.body && res.body.error) || t("newproj.create.fail"));
         }
         st.createdPid = res.body.pid;
+        // 同一幂等键的活会话共享建目录产物（快照期间不重复创建）
+        if (importTargetState.createKey === st.createKey && !importTargetState.createdPid) {
+          importTargetState.createdPid = st.createdPid;
+        }
         return st.createdPid;
       });
     }
@@ -10570,10 +10821,18 @@
       }).then(jsonBody).then(function (res) {
         if (!res.ok) throw new Error((res.body && res.body.error) || t("imp.assoc.fail"));
         toast(t("imp.assoc.ok", { name: truncateMiddle(slideName || slideId, 24) }), "success");
+        fbAssocPendingClear(slideId, slideName);
         return reloadProjectsAndUnfiled();
       });
     }).catch(function (e) {
       toast(t("imp.assoc.fail2", { e: (e && e.message) ? e.message : e }), "error");
+      fbAssocPendingSave(slideId, slideName, st);
+      if (row && row._row && row._row.appendChild && !row.__assocRetry) {
+        row.__assocRetry = true;   // 同一行只挂一次重试入口
+        addRowButton(row, t("imp.assoc.retry"), function () {
+          importAssociateUploaded(slideId, slideName, st, row);
+        });
+      }
     });
   }
 
@@ -11450,16 +11709,25 @@
     triggerEl = closeSidebarDrawerUnderOverlay(triggerEl);
     importDrawerState.open = true;
     importDrawerState.lastFocusEl = triggerEl || null;
+    // folder-experience §1：一次打开 = 一次新的导入选择会话——generation 前进、
+    // dirty 复位；默认目标等**最新授权项目列表**返回后再落（且该次会话未被
+    // 重开、用户未先操作），迟到的响应不得覆盖用户已做的选择。
+    importDrawerState.targetGen += 1;
+    var targetGen = importDrawerState.targetGen;
+    importDrawerState.targetDirty = false;
     els.importDrawer.hidden = false;
     if (els.importDrawerMask) els.importDrawerMask.hidden = false;
     // 目标下拉按当前项目列表重建（会话内选择保留）
+    var listFresh = false;
     apiFetch("/api/projects").then(jsonBody).then(function (res) {
       if (res.ok && Array.isArray(res.body)) {
         allProjects = res.body;
+        listFresh = true;   // 只有拿到最新授权列表才允许落默认值
       }
     }).catch(function () { /* 保留当前缓存 */ }).then(function () {
+      if (targetGen !== importDrawerState.targetGen) return;   // 抽屉已重开
       renderImportTargetSelects();
-      syncImportTargetFromSelect();
+      if (listFresh) applyImportTargetDefault();
     });
     loadImportFormatCatalog();
     renderFrSampleMax();
@@ -12217,10 +12485,21 @@
       });
     }
     if (els.importTargetSelect) {
-      els.importTargetSelect.addEventListener("change", syncImportTargetFromSelect);
+      els.importTargetSelect.addEventListener("change", function () {
+        // folder-experience §1：用户已操作目标 → 本次导入会话 dirty，
+        // 迟到的项目列表响应不得覆盖其选择
+        importDrawerState.targetDirty = true;
+        syncImportTargetFromSelect();
+      });
+    }
+    if (els.baiduTargetSelect) {
+      els.baiduTargetSelect.addEventListener("change", function () {
+        importDrawerState.targetDirty = true;   // 百度页签同样保护手动选择
+      });
     }
     if (els.importTargetNewName) {
       els.importTargetNewName.addEventListener("input", function () {
+        importDrawerState.targetDirty = true;
         importTargetState.newProjectName = (els.importTargetNewName.value || "").trim();
       });
     }
@@ -13119,6 +13398,10 @@
         refreshTasks: refreshImportTasks,
         loadFormatCatalog: loadImportFormatCatalog,
         associate: importAssociateUploaded,
+        // folder-experience §1：上传开始冻结目标的测试驱动面（真实入口
+        // uploadFile 内同一函数；仅测试预置 __PT_TEST_HOOKS 才挂载）
+        snapshot: importTargetSnapshot,
+        defaultTargetPid: importDefaultTargetPid,
       },
       baidu: {
         state: baiduState,

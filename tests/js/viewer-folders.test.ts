@@ -125,6 +125,40 @@ function clickEvt() {
 	return { stopPropagation() {}, preventDefault() {}, target: null };
 }
 
+/** 假 localStorage（folder-experience §2）：可预置内容、可切换「抛错」降级。 */
+interface FakeStorage {
+	map: Map<string, string>;
+	throws: boolean;
+	getItem(k: string): string | null;
+	setItem(k: string, v: string): void;
+	removeItem(k: string): void;
+}
+
+function fakeStorage(seed: Record<string, string> = {}): FakeStorage {
+	const map = new Map<string, string>(Object.entries(seed));
+	const store: FakeStorage = {
+		map,
+		throws: false,
+		getItem(k: string) {
+			if (store.throws) throw new Error("storage blocked");
+			return map.has(k) ? (map.get(k) as string) : null;
+		},
+		setItem(k: string, v: string) {
+			if (store.throws) throw new Error("storage blocked");
+			map.set(k, String(v));
+		},
+		removeItem(k: string) {
+			map.delete(k);
+		},
+	};
+	return store;
+}
+
+/** folder-experience §2 的版本化位置记忆记录（测试预置用）。 */
+function posRecord(folder: string | null, pages: Record<string, number>, updatedAt = Date.now()) {
+	return JSON.stringify({ v: 1, folder, pages, updatedAt });
+}
+
 interface RouteResult { status: number; body: unknown }
 
 interface FbUI {
@@ -144,7 +178,7 @@ interface FbUI {
 
 type Seedable = { routes: Map<string, () => RouteResult>; hang: Set<string>; laggy: Map<string, (out: RouteResult) => void> };
 
-function bootApp(seed?: (s: Seedable) => void, opts: { search?: string } = {}) {
+function bootApp(seed?: (s: Seedable) => void, opts: { search?: string; storage?: FakeStorage | null } = {}) {
 	const els: Record<string, BootEl> = {};
 	const docListeners: Record<string, Array<(e?: unknown) => void>> = {};
 	const calls: Array<{ url: string; opts?: { method?: string; headers?: Record<string, string>; body?: string } }> = [];
@@ -237,7 +271,7 @@ function bootApp(seed?: (s: Seedable) => void, opts: { search?: string } = {}) {
 			return 1;
 		},
 		addEventListener() {},
-		localStorage: null,
+		localStorage: opts.storage || null,
 	};
 	(globalThis as { document?: unknown }).document = doc;
 	(globalThis as { window?: unknown }).window = w;
@@ -249,9 +283,25 @@ function bootApp(seed?: (s: Seedable) => void, opts: { search?: string } = {}) {
 	new Function("window", "document", "fetch", "location", appSrc)(w, doc, fetchImpl, w.location);
 	(docListeners["DOMContentLoaded"] || []).forEach((cb) => cb());
 
-	const UI = (w as { HP_PROJECT_UI?: { fb: FbUI; viewerState: { slide: Record<string, unknown> | null }; openSlide(ref: string): void } }).HP_PROJECT_UI!;
+	const UI = (w as {
+		HP_PROJECT_UI?: {
+			fb: FbUI;
+			viewerState: { slide: Record<string, unknown> | null };
+			openSlide(ref: string): void;
+			importDrawer: {
+				state: { open: boolean; targetGen: number; targetDirty: boolean };
+				targetState: { pid: string; newProjectName: string; createdPid: string; createKey: string | null };
+				open(trigger?: BootEl): void;
+				close(): void;
+				associate(slideId: string | null, slideName: string, snap?: unknown, row?: unknown): Promise<unknown>;
+				snapshot(): { pid: string; newProjectName: string; createdPid: string; createKey: string | null };
+				defaultTargetPid(): string;
+			};
+		};
+	}).HP_PROJECT_UI!;
 	return {
 		els, calls, routes, hang, laggy, doc, opens, closes: () => closes.n,
+		storage: (opts.storage || null) as FakeStorage | null,
 		docDispatch(type: string, evt?: unknown) {
 			(docListeners[type] || []).forEach((cb) => cb(evt));
 		},
@@ -687,4 +737,450 @@ it("深链打开的切片在侧栏所在叠可见", async () => {
 	h.els["fb-stack"].clientHeight = 200;
 	await flush(20);
 	expect(fbHits(h).some((c) => c.dataset.slideId === "sld_l11")).toBe(true);
+});
+
+// ===========================================================================
+// folder-experience 2026-10-13（docs/followup/folder-experience-implementation-20261013.md）
+// §2 位置记忆（刷新恢复/裁剪/隔离/降级）+ §1 导入默认目标与冻结。
+// ===========================================================================
+
+const AUTH_U1 = { auth_enabled: true, user_id: "u1", role: "user", username: "u1@example.com" };
+
+function seedAuth(s: Seedable, info: Record<string, unknown>) {
+	s.routes.set("/api/auth/info", () => ({ status: 200, body: info }));
+}
+
+/** 12 张未归类 + 「肺组织」(p_t, 4 张) + 「研究」(p_r)；can_write 由服务端逐行下发。 */
+function seedFx(s: Seedable, projectsOverride?: Array<Record<string, unknown>>) {
+	const slides = Array.from({ length: 12 }, (_, i) => ({
+		name: "fx" + String(i + 1).padStart(2, "0") + ".svs",
+		slide_id: "sld_fx" + String(i + 1).padStart(2, "0"),
+		display_name: "", width: 1000, height: 800, mpp_x: 0.5, mpp_source: "native",
+	}));
+	const projects: Array<Record<string, unknown>> = projectsOverride || [
+		{ pid: "p_t", name: "肺组织", can_write: true,
+			slide_ids: slides.slice(0, 4).map((x) => x.slide_id),
+			slides: slides.slice(0, 4).map((x) => x.name) },
+		{ pid: "p_r", name: "研究", can_write: true, slide_ids: [], slides: [] },
+	];
+	s.routes.set("/api/slides", () => ({ status: 200, body: slides }));
+	s.routes.set("/api/projects", () => ({ status: 200, body: projects }));
+	return { slides, projects };
+}
+
+describe("位置记忆：刷新恢复与隔离（folder-experience §2）", () => {
+	it("案例：进入子目录第 2 页后刷新 → 恢复同一目录和合法页码（先存后恢复全链路）", async () => {
+		// 第一次会话：进入 p_t 翻到第 2 页（导航/翻页结束即写记忆）
+		const storage1 = fakeStorage();
+		const h1 = bootApp((s) => { seedFx(s); seedAuth(s, AUTH_U1); }, { storage: storage1 });
+		await flush(20);
+		h1.els["fb-stack"].clientHeight = 200;
+		h1.UI.fb.go("p_t");
+		h1.els["fb-next-btn"].dispatch("click", clickEvt());
+		expect(h1.UI.fb.state.page).toBe(1);
+		const raw = storage1.map.get("pt.fb.pos.v1:u1");
+		expect(raw).toBeTruthy();
+		const saved = JSON.parse(raw!);
+		expect(saved.v).toBe(1);
+		expect(saved.folder).toBe("p_t");
+		// 只存 ID/页码/时间：不含任何切片名或文件夹名
+		expect(JSON.stringify(saved)).not.toContain("肺组织");
+		expect(JSON.stringify(saved)).not.toContain("fx01");
+		// 刷新（第二次 boot，同一 storage）：恢复同一目录和页码
+		const storage2 = fakeStorage(Object.fromEntries(storage1.map));
+		const h2 = bootApp((s) => { seedFx(s); seedAuth(s, AUTH_U1); }, { storage: storage2 });
+		h2.els["fb-stack"].clientHeight = 200;   // 恢复渲染前先固定可用高度
+		await flush(20);
+		expect(h2.UI.fb.state.folder).toBe("p_t");
+		expect(h2.UI.fb.state.page).toBe(1);
+		expect(h2.els["fb-page-info"].textContent).toContain('"p":2');
+		// 卡片确实渲染（非空列表）
+		expect(fbHits(h2).length).toBeGreaterThan(0);
+	});
+
+	it("案例：记忆页码超出剩余页数（第 3 页只剩两页）→ 钳到最后一页，不出现空白列表", async () => {
+		const h = bootApp((s) => { seedFx(s); seedAuth(s, AUTH_U1); }, {
+			storage: fakeStorage({ "pt.fb.pos.v1:u1": posRecord("p_t", { "p_t": 2 }) }),
+		});
+		h.els["fb-stack"].clientHeight = 200;
+		await flush(20);
+		// p_t 只有 4 张 → 2 页；记忆的第 3 页钳到第 2 页
+		expect(h.UI.fb.state.folder).toBe("p_t");
+		expect(h.UI.fb.state.page).toBe(1);
+		expect(h.els["fb-page-info"].textContent).toContain('"m":2');
+		expect(fbHits(h).length).toBeGreaterThan(0);
+	});
+
+	it("案例：记忆目录被删除/撤权 → 回根目录，且不发起对该目录的任何内容请求", async () => {
+		const h = bootApp((s) => {
+			seedFx(s);
+			seedAuth(s, AUTH_U1);
+		}, {
+			storage: fakeStorage({ "pt.fb.pos.v1:u1": posRecord("p_gone", { "p_gone": 1 }) }),
+		});
+		await flush(20);
+		expect(h.UI.fb.state.folder).toBeNull();
+		expect(h.UI.fb.state.page).toBe(0);
+		// 恢复只与本地授权列表比对：没有任何针对 p_gone 的请求
+		expect(h.calls.some((c) => c.url.includes("p_gone"))).toBe(false);
+	});
+
+	it("案例：深链 ?slide= 优先于磁盘记忆 → 定位到链接切片及其真实位置", async () => {
+		const h = bootApp((s) => {
+			seedFx(s);
+			seedAuth(s, AUTH_U1);
+			// p_t 含 sld_fx01；深链打开它 → 侧栏进 p_t，而不是记忆目录
+		}, {
+			search: "?slide=sld_fx01",
+			storage: fakeStorage({ "pt.fb.pos.v1:u1": posRecord("p_r", { "p_r": 0 }) }),
+		});
+		h.els["fb-stack"].clientHeight = 200;
+		await flush(20);
+		expect(h.UI.fb.state.folder).toBe("p_t");
+		expect(fbHits(h).some((c) => c.dataset.slideId === "sld_fx01")).toBe(true);
+	});
+
+	it("案例：本次会话已导航 → 迟到的身份/记忆恢复不回拉旧目录", async () => {
+		let releaseAuth: (out: RouteResult) => void = () => {};
+		const h = bootApp((s) => {
+			seedFx(s);
+			s.routes.set("/api/auth/info", () => ({ status: 200, body: AUTH_U1 }));
+			s.laggy.set("/api/auth/info", (out) => releaseAuth(out));
+		}, {
+			storage: fakeStorage({ "pt.fb.pos.v1:u1": posRecord("p_r", {}) }),
+		});
+		await flush(20);
+		// 身份未到时用户已导航进 p_t（projects 列表正常加载，p_t 可见）
+		h.UI.fb.go("p_t");
+		expect(h.UI.fb.state.folder).toBe("p_t");
+		releaseAuth({ status: 200, body: AUTH_U1 });
+		await flush(20);
+		// 不被记忆目录 p_r 拉回
+		expect(h.UI.fb.state.folder).toBe("p_t");
+	});
+
+	it("案例：无可信身份（未登录/免认证）不持久化", async () => {
+		const storage = fakeStorage();
+		const h = bootApp((s) => {
+			seedFx(s);
+			seedAuth(s, { auth_enabled: false });
+		}, { storage });
+		await flush(20);
+		h.UI.fb.go("p_t");
+		h.els["fb-next-btn"].dispatch("click", clickEvt());
+		await flush(4);
+		expect([...storage.map.keys()].filter((k) => k.startsWith("pt.fb.")).length).toBe(0);
+	});
+
+	it("案例：换账号绝不读取上一账号的记忆；管理员预览按有效身份（被预览者）恢复", async () => {
+		const shared = fakeStorage({
+			"pt.fb.pos.v1:uA": posRecord("p_t", { "p_t": 1 }),
+		});
+		// 用户 B 登录（同一浏览器存储）：看不到 A 的目录
+		const hB = bootApp((s) => { seedFx(s); seedAuth(s, { ...AUTH_U1, user_id: "uB" }); }, { storage: shared });
+		await flush(20);
+		expect(hB.UI.fb.state.folder).toBeNull();
+		// 用户 A 登录：恢复
+		const hA = bootApp((s) => { seedFx(s); seedAuth(s, { ...AUTH_U1, user_id: "uA" }); }, { storage: shared });
+		await flush(20);
+		expect(hA.UI.fb.state.folder).toBe("p_t");
+		// 管理员预览 A（actor=uAdmin，有效身份=uA）：按有效身份恢复 A 的记忆
+		const hP = bootApp((s) => {
+			seedFx(s);
+			seedAuth(s, { ...AUTH_U1, user_id: "uA", actor: { user_id: "uAdmin", role: "owner" }, preview: { subject_user_id: "uA" } });
+		}, { storage: shared });
+		await flush(20);
+		expect(hP.UI.fb.state.folder).toBe("p_t");
+	});
+
+	it("案例：「临时查看」集合与 30 天前/坏形状记录永不恢复", async () => {
+		const stale = posRecord("p_t", { "p_t": 0 }, Date.now() - 31 * 24 * 3600 * 1000);
+		const h = bootApp((s) => { seedFx(s); seedAuth(s, AUTH_U1); }, {
+			storage: fakeStorage({
+				"pt.fb.pos.v1:u1": posRecord("__temp__", {}),
+				"pt.fb.pos.v1:old": stale,
+				"pt.fb.pos.v1:bad": "{\"v\":2,\"folder\":\"p_t\"}",
+				"pt.fb.pos.v1:junk": "not-json",
+			}),
+		});
+		await flush(20);
+		// u1 的记录指向临时查看 → 回根
+		expect(h.UI.fb.state.folder).toBeNull();
+		// 换个身份读 30 天前的记录 → 过期整体丢弃
+		const h2 = bootApp((s) => { seedFx(s); seedAuth(s, { ...AUTH_U1, user_id: "old" }); }, {
+			storage: fakeStorage({ "pt.fb.pos.v1:old": stale }),
+		});
+		await flush(20);
+		expect(h2.UI.fb.state.folder).toBeNull();
+	});
+
+	it("案例：localStorage 抛错（隐私模式）→ 导航、翻页、恢复尝试全部照常", async () => {
+		const storage = fakeStorage();
+		storage.throws = true;
+		const h = bootApp((s) => { seedFx(s); seedAuth(s, AUTH_U1); }, { storage });
+		h.els["fb-stack"].clientHeight = 200;
+		await flush(20);
+		expect(() => h.UI.fb.go("p_t")).not.toThrow();
+		expect(h.UI.fb.state.folder).toBe("p_t");
+		expect(() => h.els["fb-next-btn"].dispatch("click", clickEvt())).not.toThrow();
+		expect(h.UI.fb.state.page).toBe(1);
+	});
+});
+
+describe("导入默认目标与冻结（folder-experience §1）", () => {
+	function openDrawer(h: ReturnType<typeof bootApp>) {
+		h.UI.importDrawer.open();
+		return flush(20);
+	}
+
+	it("案例：在文件夹内打开抽屉 → 默认当前文件夹（本地与百度下拉一致）", async () => {
+		const h = bootApp((s) => { seedFx(s); seedAuth(s, AUTH_U1); });
+		await flush(20);
+		h.UI.fb.go("p_t");
+		await openDrawer(h);
+		expect(h.UI.importDrawer.defaultTargetPid()).toBe("p_t");
+		expect(h.UI.importDrawer.targetState.pid).toBe("p_t");
+		expect(h.els["import-target-select"].value).toBe("p_t");
+		expect(h.els["baidu-target-select"].value).toBe("p_t");
+		h.UI.importDrawer.close();
+	});
+
+	it("案例：根目录与「临时查看」集合 → 默认未归类", async () => {
+		const h = bootApp((s) => {
+			seedFx(s);
+			seedAuth(s, AUTH_U1);
+			// 一张临时切片 → 临时查看虚拟文件夹可用
+			s.routes.set("/api/slides", () => ({ status: 200, body: [
+				{ name: "temp.svs", slide_id: "sld_temp", display_name: "",
+					temporary_view_expires_at: Date.parse("2036-01-01T00:00:00Z") / 1000,
+					width: 10, height: 10, mpp_x: 0.5 },
+			] }));
+		});
+		await flush(20);
+		await openDrawer(h);
+		expect(h.UI.importDrawer.targetState.pid).toBe("");
+		h.UI.importDrawer.close();
+		h.UI.fb.go(h.UI.fb.FB_TEMP_KEY);
+		await openDrawer(h);
+		expect(h.UI.importDrawer.targetState.pid).toBe("");
+		h.UI.importDrawer.close();
+	});
+
+	it("案例：默认只认最新授权列表 + 服务端显式 can_write（缺字段/false/不在列表 → 未归类）", async () => {
+		// 当前目录不在最新列表（已撤权）→ 未归类
+		const h1 = bootApp((s) => {
+			seedFx(s);
+			seedAuth(s, AUTH_U1);
+		});
+		await flush(20);
+		h1.UI.fb.go("p_t");
+		h1.routes.set("/api/projects", () => ({ status: 200, body: [
+			{ pid: "p_r", name: "研究", can_write: true, slide_ids: [], slides: [] },
+		] }));
+		await openDrawer(h1);
+		expect(h1.UI.importDrawer.targetState.pid).toBe("");
+		h1.UI.importDrawer.close();
+
+		// 列表里有目录但 can_write 字段缺失（旧后端）→ 不默认写入
+		const h2 = bootApp((s) => { seedFx(s); seedAuth(s, AUTH_U1); });
+		await flush(20);
+		h2.UI.fb.go("p_t");
+		h2.routes.set("/api/projects", () => ({ status: 200, body: [
+			{ pid: "p_t", name: "肺组织", slide_ids: [], slides: [] },
+		] }));
+		await openDrawer(h2);
+		expect(h2.UI.importDrawer.targetState.pid).toBe("");
+		h2.UI.importDrawer.close();
+
+		// can_write 显式 false → 不默认写入
+		const h3 = bootApp((s) => { seedFx(s, [
+			{ pid: "p_t", name: "肺组织", can_write: false, slide_ids: [], slides: [] },
+		]); seedAuth(s, AUTH_U1); });
+		await flush(20);
+		h3.UI.fb.go("p_t");
+		await openDrawer(h3);
+		expect(h3.UI.importDrawer.targetState.pid).toBe("");
+		h3.UI.importDrawer.close();
+	});
+
+	it("案例：用户先改目标、projects 响应后才返回 → 不覆盖用户选择", async () => {
+		let releaseProjects: (out: RouteResult) => void = () => {};
+		const h = bootApp((s) => {
+			seedFx(s);
+			seedAuth(s, AUTH_U1);
+			s.laggy.set("/api/projects", (out) => releaseProjects(out));
+		});
+		await flush(20);
+		h.UI.fb.go("p_t");
+		h.UI.importDrawer.open();
+		await flush(4);
+		// projects 尚未返回，用户已把目标改成 p_r（本地下拉）
+		h.els["import-target-select"].value = "p_r";
+		h.els["import-target-select"].dispatch("change", {});
+		expect(h.UI.importDrawer.state.targetDirty).toBe(true);
+		// 迟到响应（含 p_t + can_write）返回：不得覆盖
+		releaseProjects({ status: 200, body: [
+			{ pid: "p_t", name: "肺组织", can_write: true, slide_ids: [], slides: [] },
+			{ pid: "p_r", name: "研究", can_write: true, slide_ids: [], slides: [] },
+		] });
+		await flush(20);
+		expect(h.els["import-target-select"].value).toBe("p_r");
+		expect(h.UI.importDrawer.targetState.pid).toBe("p_r");
+		h.UI.importDrawer.close();
+	});
+
+	it("案例：明确选择未归类 → 不被当前文件夹默认值覆盖", async () => {
+		let releaseProjects: (out: RouteResult) => void = () => {};
+		const h = bootApp((s) => {
+			seedFx(s);
+			seedAuth(s, AUTH_U1);
+			s.laggy.set("/api/projects", (out) => releaseProjects(out));
+		});
+		await flush(20);
+		h.UI.fb.go("p_t");
+		h.UI.importDrawer.open();
+		await flush(4);
+		h.els["import-target-select"].value = "";
+		h.els["import-target-select"].dispatch("change", {});
+		releaseProjects({ status: 200, body: [
+			{ pid: "p_t", name: "肺组织", can_write: true, slide_ids: [], slides: [] },
+		] });
+		await flush(20);
+		expect(h.els["import-target-select"].value).toBe("");
+		expect(h.UI.importDrawer.targetState.pid).toBe("");
+		h.UI.importDrawer.close();
+	});
+
+	it("案例：重开抽屉 = 新的导入选择会话 → 重新按当前目录默认（不再保留上次手选）", async () => {
+		const h = bootApp((s) => { seedFx(s); seedAuth(s, AUTH_U1); });
+		await flush(20);
+		h.UI.fb.go("p_t");
+		await openDrawer(h);
+		expect(h.UI.importDrawer.targetState.pid).toBe("p_t");
+		h.els["import-target-select"].value = "p_r";
+		h.els["import-target-select"].dispatch("change", {});
+		h.UI.importDrawer.close();
+		const gen1 = h.UI.importDrawer.state.targetGen;
+		await openDrawer(h);
+		expect(h.UI.importDrawer.state.targetGen).toBe(gen1 + 1);
+		expect(h.UI.importDrawer.state.targetDirty).toBe(false);
+		expect(h.UI.importDrawer.targetState.pid).toBe("p_t");
+		h.UI.importDrawer.close();
+	});
+
+	it("案例：上传开始后冻结目标 → 侧栏切换/下拉改动不影响关联归属", async () => {
+		const h = bootApp((s) => { seedFx(s); seedAuth(s, AUTH_U1); });
+		await flush(20);
+		h.UI.fb.go("p_t");
+		await openDrawer(h);
+		const snap = h.UI.importDrawer.snapshot();
+		expect(snap.pid).toBe("p_t");
+		// 用户随后改下拉并切走侧栏
+		h.els["import-target-select"].value = "p_r";
+		h.els["import-target-select"].dispatch("change", {});
+		h.UI.importDrawer.close();
+		h.UI.fb.go("p_r");
+		h.routes.set("/api/project/p_t/slides", () => ({ status: 200, body: { ok: true } }));
+		await h.UI.importDrawer.associate("sld_fx_new", "n.svs", snap);
+		await flush(20);
+		const posts = h.calls.filter((c) => /^\/api\/project\/[^/]+\/slides$/.test(c.url));
+		expect(posts.length).toBe(1);
+		expect(posts[0].url).toBe("/api/project/p_t/slides");   // 冻结时的目标
+		expect(JSON.parse(String(posts[0].opts && posts[0].opts.body))).toEqual({ slide_ids: ["sld_fx_new"] });
+		// uploadFile 入口接线：上传开始即快照（行为面由 associate+snapshot 锁定）
+		expect(appSrc).toContain("opts.assocTarget = importTargetSnapshot()");
+	});
+
+	it("案例：目标关联失败 → 保留切片与重试入口（行内按钮 + 按身份落盘待办），重试沿用原 slide ID/目标", async () => {
+		let slidesStatus = 403;
+		const storage = fakeStorage();
+		const h = bootApp((s) => { seedFx(s); seedAuth(s, AUTH_U1); }, { storage });
+		await flush(20);
+		h.routes.set("/api/project/p_t/slides", () => ({ status: slidesStatus, body: { error: "denied" } }));
+		const row = { _row: bootEl("row") };
+		await h.UI.importDrawer.associate("sld_fx07", "fail.svs",
+			{ pid: "p_t", newProjectName: "", createdPid: "", createKey: null }, row);
+		await flush(10);
+		// 失败：toast + 行内重试按钮
+		expect(h.els["toast-container"].children.map((c) => c.textContent).join("|"))
+			.toContain("imp.assoc.fail2");
+		const retryBtn = row._row.children.find((c) => c.textContent === "imp.assoc.retry");
+		expect(retryBtn).toBeTruthy();
+		// 待办按身份落盘（原 slide ID + 原目标 + 原幂等键）
+		const pending = JSON.parse(storage.map.get("pt.fb.assoc.v1:u1")!);
+		expect(pending.length).toBe(1);
+		expect(pending[0].slideId).toBe("sld_fx07");
+		expect(pending[0].target.pid).toBe("p_t");
+		// 不自动改成当前目录：期间切到 p_r 再重试 → 仍打原目标
+		h.UI.fb.go("p_r");
+		slidesStatus = 200;
+		retryBtn!.dispatch("click", clickEvt());
+		await flush(20);
+		const posts = h.calls.filter((c) => /^\/api\/project\/[^/]+\/slides$/.test(c.url));
+		expect(posts.length).toBe(2);   // 首次（403）+ 行内重试
+		expect(posts[1].url).toBe("/api/project/p_t/slides");
+		expect(JSON.parse(String(posts[1].opts && posts[1].opts.body))).toEqual({ slide_ids: ["sld_fx07"] });
+		// 成功后待办清除
+		expect(storage.map.get("pt.fb.assoc.v1:u1")).toBe("[]");
+	});
+
+	it("案例：关联失败后刷新 → 启动自动重试沿用原目标与原幂等键（新项目目标不重复建目录）", async () => {
+		const storage1 = fakeStorage();
+		const h1 = bootApp((s) => { seedFx(s); seedAuth(s, AUTH_U1); }, { storage: storage1 });
+		await flush(20);
+		h1.routes.set("/api/project/create", () => ({ status: 500, body: { error: "boom" } }));
+		await h1.UI.importDrawer.associate("sld_fx08", "x.svs",
+			{ pid: "", newProjectName: "新目录", createdPid: "", createKey: "idem-abc" });
+		await flush(10);
+		const saved = JSON.parse(storage1.map.get("pt.fb.assoc.v1:u1")!);
+		expect(saved[0].target.createKey).toBe("idem-abc");
+		expect(saved[0].target.newProjectName).toBe("新目录");
+		// 刷新：create 恢复可用 → 启动自动重试原目标
+		const h2 = bootApp((s) => {
+			seedFx(s);
+			seedAuth(s, AUTH_U1);
+			s.routes.set("/api/project/create", () => ({ status: 200, body: { pid: "p_new" } }));
+			s.routes.set("/api/project/p_new/slides", () => ({ status: 200, body: { ok: true } }));
+		}, { storage: fakeStorage(Object.fromEntries(storage1.map)) });
+		await flush(30);
+		const creates = h2.calls.filter((c) => c.url === "/api/project/create");
+		expect(creates.length).toBe(1);
+		expect(creates[0].opts && (creates[0].opts.headers as Record<string, string>)["Idempotency-Key"]).toBe("idem-abc");
+		const posts = h2.calls.filter((c) => c.url === "/api/project/p_new/slides");
+		expect(posts.length).toBe(1);
+		expect(JSON.parse(String(posts[0].opts && posts[0].opts.body))).toEqual({ slide_ids: ["sld_fx08"] });
+		expect(h2.storage!.map.get("pt.fb.assoc.v1:u1")).toBe("[]");
+	});
+
+	it("案例：localStorage 抛错 → 目标关联照常工作（仅失去待办落盘）", async () => {
+		const storage = fakeStorage();
+		storage.throws = true;
+		const h = bootApp((s) => { seedFx(s); seedAuth(s, AUTH_U1); }, { storage });
+		await flush(20);
+		h.routes.set("/api/project/p_t/slides", () => ({ status: 200, body: { ok: true } }));
+		await expect(h.UI.importDrawer.associate("sld_fx09", "ok.svs",
+			{ pid: "p_t", newProjectName: "", createdPid: "", createKey: null })).resolves.toBeUndefined();
+		await flush(20);
+		expect(h.calls.some((c) => c.url === "/api/project/p_t/slides")).toBe(true);
+	});
+
+	it("案例：本机转换 handoff 沿用同一默认与冻结规则（convertHandoffTarget）", async () => {
+		const h = bootApp((s) => { seedFx(s); seedAuth(s, AUTH_U1); });
+		await flush(20);
+		h.UI.fb.go("p_t");
+		await openDrawer(h);
+		const w = (globalThis as { window?: { HP_UPLOAD?: { convertHandoffTarget(): unknown } } }).window;
+		expect(w!.HP_UPLOAD!.convertHandoffTarget()).toEqual({ project: "p_t" });
+		// 「新项目」目标把名称 + 一次性幂等键交给工具页
+		h.els["import-target-select"].value = "new";
+		h.els["import-target-select"].dispatch("change", {});
+		h.els["import-target-new-name"].value = "转换目录";
+		h.els["import-target-new-name"].dispatch("input", {});
+		const t2 = w!.HP_UPLOAD!.convertHandoffTarget() as { newProject: { name: string; key: string } };
+		expect(t2.newProject.name).toBe("转换目录");
+		expect(typeof t2.newProject.key).toBe("string");
+		// 再次调用复用同一幂等键（冻结语义）
+		expect((w!.HP_UPLOAD!.convertHandoffTarget() as typeof t2).newProject.key).toBe(t2.newProject.key);
+		h.UI.importDrawer.close();
+	});
 });

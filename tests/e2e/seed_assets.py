@@ -48,5 +48,10 @@ def seed_viewer_assets(owner_id):
     buf = io.BytesIO()
     Image.fromarray(raster).save(buf, format='BMP')
     # Each test has its own asset: failure/order of one cannot block the other.
-    return {key: publish_asset(owner_id, 'e2e-raster-' + key + '.bmp', buf.getvalue())
-            for key in ('workbench', 'share')}
+    assets = {key: publish_asset(owner_id, 'e2e-raster-' + key + '.bmp', buf.getvalue())
+              for key in ('workbench', 'share')}
+    # folder-experience E2E：10 张未归类小图——保证根目录堆叠 ≥2 页（每叠 ≤8）。
+    assets['folderSlides'] = [
+        publish_asset(owner_id, 'e2e-fb-%02d.bmp' % i, buf.getvalue())
+        for i in range(1, 11)]
+    return assets

@@ -46,6 +46,13 @@ PLUGIN_ID = "dev.pathsegmentor.measure"
 CAP_NAME = "segment_region"
 FULL_NAME = "%s/%s" % (PLUGIN_ID, CAP_NAME)
 DISPATCH_PATH = "/api/plugin/v1/dispatch/%s/%s" % (PLUGIN_ID, CAP_NAME)
+# 对照插件：manifest/capability 均不声明 slide:region:read
+TMA_PLUGIN_KEY = "sample-tma-score"
+TMA_PLUGIN_ID = "dev.sample.tma"
+TMA_CAP_NAME = "slide_summary"
+TMA_FULL_NAME = "%s/%s" % (TMA_PLUGIN_ID, TMA_CAP_NAME)
+TMA_DISPATCH_PATH = "/api/plugin/v1/dispatch/%s/%s" % (TMA_PLUGIN_ID,
+                                                       TMA_CAP_NAME)
 # getattr 兜底：本文件在旧代码（无委托凭证）上也必须可收集——用例失败本身
 # 就是「旧代码不签发/不受理凭证」的回归证明，而不是收集期 AttributeError。
 HDR = getattr(app_mod, "_DELEGATED_READ_HEADER", "X-Delegated-Read-Token")
@@ -316,6 +323,56 @@ def test_dispatch_credential_not_in_result_or_audit(monkeypatch):
     events = share_store.list_audit(action="plugin_capability_dispatch")
     assert events
     assert tok not in json.dumps(events, ensure_ascii=False)
+
+
+# --------------------------------------------------------------------------- #
+# 1b. 最小披露：凭证只签给声明 slide:region:read 的能力
+# --------------------------------------------------------------------------- #
+def test_dispatch_withholds_credential_for_non_region_plugin(monkeypatch):
+    """manifest/capability 均无 slide:region:read 的插件（sample-tma-score）
+    dispatch 一律不随转发下发委托凭证（旧实现每次 dispatch 都签发）。"""
+    installation, err = app_mod.install_plugin_bundle(TMA_PLUGIN_KEY)
+    assert err is None, err
+    caps = {c["name"]: c for c in installation["capabilities"]}
+    assert app_mod._DELEGATED_READ_SCOPE not in \
+        (caps[TMA_CAP_NAME].get("required_permissions") or [])
+    _register_owned_slide(monkeypatch)
+    stub = _ForwardStub()
+    monkeypatch.setattr(app_mod, "requests", stub)
+    token = _tool_token(capabilities=[TMA_FULL_NAME])
+    r = _client().post(
+        TMA_DISPATCH_PATH,
+        json={"slide": "demo.svs", "arguments": {}},
+        headers={"Authorization": "Bearer " + token,
+                 "X-AI-Session": "sess-1"})
+    assert r.status_code == 200, r.get_json()
+    assert len(stub.calls) == 1
+    assert HDR not in (stub.calls[-1]["headers"] or {})
+
+
+def test_dispatch_credential_gated_per_capability_region_scope(monkeypatch):
+    """同一 token 调两个能力：segment_region（requiredPermissions 含
+    slide:region:read）随转发带凭证；slide_summary（不含）不带——门槛按
+    能力级声明判定，不按插件级一揽子签发。"""
+    _install_measure_plugin(monkeypatch)
+    _install_second_plugin(monkeypatch)
+    _register_owned_slide(monkeypatch)
+    stub = _ForwardStub()
+    monkeypatch.setattr(app_mod, "requests", stub)
+    client = _client()
+    token = _tool_token(capabilities=[FULL_NAME, TMA_FULL_NAME])
+
+    r = _dispatch(client, stub, token)
+    assert r.status_code == 200, r.get_json()
+    assert HDR in (stub.calls[-1]["headers"] or {})  # 区域读能力：带凭证
+
+    r2 = client.post(
+        TMA_DISPATCH_PATH,
+        json={"slide": "demo.svs", "arguments": {}},
+        headers={"Authorization": "Bearer " + token,
+                 "X-AI-Session": "sess-1"})
+    assert r2.status_code == 200, r2.get_json()
+    assert HDR not in (stub.calls[-1]["headers"] or {})  # 非区域读能力：不带
 
 
 # --------------------------------------------------------------------------- #

@@ -13821,6 +13821,12 @@ _DELEGATED_READ_AUDIENCE = "plugin-delegated-read"
 _DELEGATED_READ_TYP = "delegated-read"
 #: 凭证头名（dispatch → 插件后端 → 平台 by-id 读端点，同名透传）
 _DELEGATED_READ_HEADER = "X-Delegated-Read-Token"
+#: 签发门槛 scope（最小披露）：只有声明区域读权限的能力才随转发下发凭证。
+#: 安装行落盘的 region-read 信号只有能力登记项 required_permissions
+#: （manifest 顶层 permissions 不持久化——仅 slide:import 进 approved_scopes），
+#: 故按 `required_permissions ⊇ {slide:region:read}` 判定；不声明的能力
+#: （如 slide_summary）dispatch 一律不带凭证头。
+_DELEGATED_READ_SCOPE = "slide:region:read"
 #: TTL ≤120s：插件拿到后立即用，覆盖一次 region 读取量级；过期即失效
 #: （撤销主路径 = dispatch 不再签发；TTL 仅兜底，与 run grant 同思路）
 _DELEGATED_READ_TTL_SECONDS = max(1, min(
@@ -21620,7 +21626,9 @@ def plugin_v1_capabilities():
 # 委托读凭证（delegated read token）：dispatch 签发 + by-id 读端点复核
 #
 # 签发时机：dispatch ①验签 tool token → ②插件+能力 enabled → ③用户对 slide
-# 实时权限 → ④限流 全部通过之后、⑥转发之前。解析 slide_id/revision 失败时
+# 实时权限 → ④限流 全部通过之后、⑥转发之前，且**仅当能力的
+# required_permissions 声明 slide:region:read**（最小披露，见
+# _DELEGATED_READ_SCOPE）。解析 slide_id/revision 失败时
 # **不签发也不阻断**转发（不带凭证的转发与旧形为一致；需要读图的插件后端会
 # 以 missing credential 拒绝——fail-safe，无提权面）。凭证只放转发请求头，
 # 不入 forward body（既有 body 形状 {slide, arguments} 不变）、不入审计、
@@ -21629,6 +21637,10 @@ def plugin_v1_capabilities():
 def _mint_delegated_read_token(agent_claims, plugin_installation_id, slide,
                                capability_name):
     """为本次 dispatch 调用签发委托读凭证；返回 token 或 None（不签发）。
+
+    调用方（plugin_v1_dispatch ⑥'）只在能力的 required_permissions 声明
+    ``slide:region:read`` 时才调用本函数（最小披露：不读图的能力不随转发
+    下发可读区域凭证）。
 
     绑定 claims：sub=插件 installation_id（读端点按此限定「只有该 installation
     的 plugin JWT 能用这张凭证」）、user_id/role（读时按此**实时**复查 view
@@ -21782,7 +21794,8 @@ def _plugin_delegated_read_gate(plugin_claims, sid, gate, *, body=None,
 #      capability_unavailable（retryable）；
 #   ⑦ result JSON ≤64KB，超限截断并附 truncated: true。
 #   ⑥' ④ 之后另签发委托读凭证（X-Delegated-Read-Token 头）随转发下发，
-#      供测量插件经 by-id region 端点读取用户 ROI（见上一节）。
+#      供测量插件经 by-id region 端点读取用户 ROI（见上一节）；仅签给
+#      requiredPermissions 声明 slide:region:read 的能力。
 # --------------------------------------------------------------------------- #
 def _capability_timeout_ms(cap):
     """登记项 timeout_ms → 转发超时毫秒（clamp 到 [1, 60000]，缺省 15000）。"""
@@ -21818,6 +21831,45 @@ def _capability_result_envelope(result):
     return {"result": {"preview": encoded[:1024],
                        "note": "插件返回超过 64KB 上限，已截断"},
             "truncated": True, "original_bytes": len(raw)}
+
+
+# 插件自报 error 信封的安全上限（dispatch 4xx/404/5xx 分支）：code/message 会
+# 原样进 Agent/HP 可见的响应（message 直接作为 error.message、code 进
+# details.plugin_code）与审计 detail，插件后端被入侵或有缺陷时不得借它们
+# 注入任意文本（控制字符伪造日志/换行逃逸、超长撑爆审计行与前端渲染）。
+_PLUGIN_CODE_MAX_LEN = 64
+_PLUGIN_CODE_RE = re.compile(r"[a-z0-9_.-]+")
+_PLUGIN_MESSAGE_MAX_LEN = 300
+_PLUGIN_MESSAGE_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _sanitize_plugin_error_code(code):
+    """插件自报 error.code → 安全短 token；不合规一律丢弃（返回 None）。
+
+    归一为小写后整段校验：仅放行 ≤64 字的 ``[a-z0-9_.-]``。细分错误码
+    （inference_busy / not_ready 等）是给上游程序消费的枚举键，不是自由
+    文本——带空格/控制字符/超长的「码」直接丢弃，宁缺毋假。
+    """
+    if not isinstance(code, str):
+        return None
+    cand = code.strip().lower()
+    if not cand or len(cand) > _PLUGIN_CODE_MAX_LEN:
+        return None
+    return cand if _PLUGIN_CODE_RE.fullmatch(cand) else None
+
+
+def _sanitize_plugin_error_message(message):
+    """插件自报 error.message → 控制字符剥离 + 300 字截断；空则 None。
+
+    message 在 404/其余 4xx 分支直接作为响应 error.message 返回（浏览器/
+    Agent 可见），返回 None 时调用方落回平台默认文案。
+    """
+    if not isinstance(message, str):
+        return None
+    cleaned = _PLUGIN_MESSAGE_CTRL_RE.sub(" ", message).strip()
+    if not cleaned:
+        return None
+    return cleaned[:_PLUGIN_MESSAGE_MAX_LEN]
 
 
 def _find_registered_capability(plugin_id, capability_name):
@@ -22014,11 +22066,16 @@ def plugin_v1_dispatch(plugin_id, capability_name):
                              details={"reason": "slide_id_mismatch"})
     forward_body = {"slide": slide, "slide_id": token_sid,
                     "arguments": body.get("arguments") or {}}
-    # ⑥' 委托读凭证：全部门槛通过后签发，仅随转发头下发（不进 body/审计/
-    # Agent 结果）。解析失败不签发不阻断（fail-safe，见 _mint_delegated_read_token）。
+    # ⑥' 委托读凭证：全部门槛通过后，仅对声明区域读权限的能力签发
+    # （最小披露：不读图的插件后端拿不到可读区域的凭证），随转发头下发
+    # （不进 body/审计/Agent 结果）。解析失败不签发不阻断（fail-safe，
+    # 见 _mint_delegated_read_token）。
     forward_headers = {"X-Dispatch-Principal": principal}
-    delegated_token = _mint_delegated_read_token(
-        claims, installation.get("installation_id") or "", slide, capability_name)
+    delegated_token = None
+    if _DELEGATED_READ_SCOPE in (cap.get("required_permissions") or []):
+        delegated_token = _mint_delegated_read_token(
+            claims, installation.get("installation_id") or "", slide,
+            capability_name)
     if delegated_token:
         forward_headers[_DELEGATED_READ_HEADER] = delegated_token
     timeout_sec = _capability_timeout_ms(cap) / 1000.0
@@ -22063,7 +22120,8 @@ def plugin_v1_dispatch(plugin_id, capability_name):
             pbody_5xx = r.json()
             if isinstance(pbody_5xx, dict) \
                     and isinstance(pbody_5xx.get("error"), dict):
-                plugin_code = str(pbody_5xx["error"].get("code") or "") or None
+                plugin_code = _sanitize_plugin_error_code(
+                    pbody_5xx["error"].get("code"))
         except Exception:
             plugin_code = None
         _audit_dispatch(r.status_code, "capability_unavailable",
@@ -22089,9 +22147,10 @@ def plugin_v1_dispatch(plugin_id, capability_name):
             pbody_4xx = r.json()
             if isinstance(pbody_4xx, dict) \
                     and isinstance(pbody_4xx.get("error"), dict):
-                plugin_code = str(pbody_4xx["error"].get("code") or "") or None
-                plugin_message = str(
-                    pbody_4xx["error"].get("message") or "") or None
+                plugin_code = _sanitize_plugin_error_code(
+                    pbody_4xx["error"].get("code"))
+                plugin_message = _sanitize_plugin_error_message(
+                    pbody_4xx["error"].get("message"))
                 plugin_retryable = bool(pbody_4xx["error"].get("retryable",
                                                                False))
         except Exception:

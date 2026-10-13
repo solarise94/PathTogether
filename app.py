@@ -23175,8 +23175,13 @@ def api_projects():
 
     review P0 2026-09-05：项目列表引用他人切片名与标注计数，owner 不再
     全量返回；全量清点走管理台 inventory。
+
+    folder-experience 2026-10-13：逐行下发 ``can_write``（与写路径
+    _can_access_project 同一判定：owner 角色任意；其余仅自己的项目）——
+    前端导入默认目标只写显式可写的目录，绝不以「列表里看得到」推断可写。
     """
     uid = _current_uid()
+    is_owner = _is_owner()
     projects = [p for p in share_store.list_projects()
                 if p.get("owner_user_id") == uid]
     # 一次性取 annotations_by_slide（工单 A：按 subject 过滤——roi_count 不
@@ -23196,6 +23201,7 @@ def api_projects():
         item = dict(p)
         item["roi_count"] = _count_for(p.get("slides", []),
                                        p.get("slide_ids", []))
+        item["can_write"] = bool(is_owner or p.get("owner_user_id") == uid)
         out.append(item)
     return jsonify(out)
 

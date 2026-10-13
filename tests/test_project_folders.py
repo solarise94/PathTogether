@@ -262,3 +262,29 @@ def test_user_role_scoping_unchanged():
     bc = _client(userb)
     pids = {p["pid"] for p in bc.get("/api/projects").get_json()}
     assert root not in pids and child not in pids
+
+
+def test_projects_list_rows_carry_can_write():
+    """/api/projects 逐行下发 can_write（folder-experience 2026-10-13 §1）。
+
+    前端导入默认目标只写显式可写的目录，绝不以「列表里看得到」推断可写：
+    与写路径 _can_access_project 同一判定——owner 角色任意；user 仅自己的
+    项目。列表本身按 owner_user_id 过滤，因此行内恒可写，但字段必须显式
+    存在（未来共享目录接入时非可写行以 false 下发）。
+    """
+    owner, usera = _setup()
+
+    # owner 视角：自己的文件夹 can_write=True
+    oc = _client(owner)
+    of_ = _create(oc, "owner根").get_json()
+    items = {p["pid"]: p for p in oc.get("/api/projects").get_json()}
+    assert items[of_["pid"]]["can_write"] is True
+
+    # user 视角：自己的文件夹 can_write=True（可写路径 _can_access_project 同判）
+    ac = _client(usera)
+    ua = _create(ac, "user目录").get_json()
+    items = {p["pid"]: p for p in ac.get("/api/projects").get_json()}
+    assert items[ua["pid"]]["can_write"] is True
+
+    # 他人项目不进列表（读隔离）→ 不存在「看得到但不可写」的行
+    assert of_["pid"] not in items

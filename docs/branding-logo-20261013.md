@@ -23,4 +23,5 @@
 预览：`home-1440.png`、`home-390.png`、`workbench-1440.png`、
 `workbench-mobile-closed.png`。浏览器检查明细为 `browser-check.json`。
 
-本轮仅本地提交，未推送、未部署；上一批统计修复的 0083 迁移仍待上线。
+已与统计修复一同发布，0083 已执行。上线时间为 2026-10-13 10:49:18
+（UTC+8），见 `site-branding-stats-release-20261013.md`。

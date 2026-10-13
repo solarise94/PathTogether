@@ -74,15 +74,18 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     masks = sorted(examples.rglob("*_pathology_*.png"))
-    masks = [m for m in masks if "+" in m.stem]
-    if not masks:
+    parsed = []
+    for mask_path in masks:
+        try:
+            parsed.append((mask_path,) + parse_pair(mask_path))
+        except ValueError:
+            continue  # 无 level+object 后缀 → 是示例图而非掩码
+    if not parsed:
         print("no example masks found under %s" % examples, file=sys.stderr)
         return 2
 
     rows = []
-    for mask_path in masks:
-        image_name, prompt, level, object_phrase, region = \
-            parse_pair(mask_path)
+    for mask_path, image_name, prompt, level, object_phrase, region in parsed:
         image_path = mask_path.with_name(image_name)
         if not image_path.exists():
             print("SKIP (no image): %s" % mask_path, file=sys.stderr)
@@ -108,7 +111,8 @@ def main():
         pred = np.asarray(Image.open(io.BytesIO(
             base64.b64decode(result["mask_png_b64"])))) > 127
         gt_arr = np.asarray(Image.open(mask_path).convert("RGB"))
-        gt = gt_arr[:, :, 0] > 127
+        # 上游 GT 掩码为 0/1 二值（notebook 以 >0.5 二值化），非 0/255
+        gt = gt_arr[:, :, 0] > 0
         if pred.shape != gt.shape:
             print("SKIP (size mismatch %r vs %r): %s"
                   % (pred.shape, gt.shape, image_path.name), file=sys.stderr)

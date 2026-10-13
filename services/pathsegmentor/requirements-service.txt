@@ -6,14 +6,14 @@
 # wheel（固定 MaureenZOU fork @ 42121d75）安装。
 #
 # 上游 environment.yml 另有 mpi4py=4.0.0（utilities/distributed 顶层 import）
-# 与 setuptools=72.1.0（omegaconf 2.3.0 兼容），此处以 pip 等价固定。
+# 与 setuptools=72.1.0（omegaconf 2.3.0 兼容）。mpi4py 无 Linux wheel，
+# 由 builder 阶段编好 wheel 随镜像安装（见 Containerfile）。
 flask>=3.0,<4
 gunicorn>=21.2,<24
 einops==0.6.1
 fvcore==0.1.5.post20221221
 huggingface-hub==0.16.4
 kornia==0.7.0
-mpi4py==4.0.0
 nltk==3.8.1
 numpy==1.26.4
 omegaconf==2.3.0

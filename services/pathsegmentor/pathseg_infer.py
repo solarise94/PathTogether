@@ -343,4 +343,10 @@ def segment(model, img_rgb, prompt, threshold=0.5):
         )[0, :, :height, :width].sigmoid().cpu().numpy()
 
     mask_1024 = prob > threshold
+    if mask_1024.ndim == 3:
+        # 上游 interactive_infer_image 输出即 (1, H, W)：单 prompt 时
+        # matched_id 是长度 1 的向量，索引保留 batch 维。取第 0 通道。
+        assert mask_1024.shape[0] == 1, \
+            "expected a single prompt, got mask batch %r" % (mask_1024.shape,)
+        mask_1024 = mask_1024[0]
     return mask_to_original_size(mask_1024, geometry)

@@ -9,7 +9,11 @@ MIT，上游 commit `e67763ab835b3ef184cb6791eb2cd059ec8b9f9a`）的 GPU 推理 
   到 `/models`，启动时流式校验 SHA-256
   （`008c99b65f1b2a4f130300b298ef5e1425fecdfb6224a43b89ab729eb46763ba`，不符拒绝加载）；
 - 公共 HF 辅助资产（CLIP tokenizer、BiomedBERT——上游语言编码器 build 期
-  `from_pretrained`）在镜像构建期烧入 `/opt/hf`，运行期 `HF_HUB_OFFLINE=1` 全离线。
+  `from_pretrained`）以 HF_HOME 布局 COPY 进镜像 `/opt/hf`，运行期
+  `HF_HUB_OFFLINE=1` 全离线。固定 revision：
+  - `openai/clip-vit-base-patch32` @ `3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268`
+  - `microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext` @
+    `e1354b7a3a09615f6aba48dfad4b7a613eef7062`
 
 ## HTTP 契约（固定，客户端另行对接）
 
@@ -82,9 +86,26 @@ MIT，上游 commit `e67763ab835b3ef184cb6791eb2cd059ec8b9f9a`）的 GPU 推理 
 
 ## 构建（homePC）
 
+homePC 到 docker.io / huggingface.co 不可达（DNS 污染），基础镜像走
+daocloud 镜像拉取后重打 tag，HF 缓存走 hf-mirror（Containerfile 内置
+`HF_ENDPOINT`）：
+
 ```bash
+podman pull docker.m.daocloud.io/pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel
+podman tag docker.m.daocloud.io/pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel \
+    docker.io/pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel
+podman pull docker.m.daocloud.io/pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+podman tag docker.m.daocloud.io/pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime \
+    docker.io/pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+
 mkdir -p ~/build/pathsegmentor && cd ~/build/pathsegmentor
 cp -r <repo>/services/pathsegmentor ./services
+# HF 资产预取（HF_HOME 布局：hub/models--*/{refs/main,snapshots/<rev>/}，
+# 实体文件；本机到 huggingface.co 可直连的机器上执行后拷入）：
+#   huggingface-cli download microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext \
+#     --cache-dir hf-prefetch
+#   huggingface-cli download openai/clip-vit-base-patch32 --cache-dir hf-prefetch
+# 放到 services/hf-prefetch/（Containerfile COPY hf-prefetch/ /opt/hf/）
 cd services
 podman build -f Containerfile -t localhost/pathsegmentor:poc-e67763a .
 ```

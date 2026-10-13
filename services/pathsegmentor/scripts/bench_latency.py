@@ -86,7 +86,7 @@ def main():
     first = threading.Thread(target=worker, args=("first", False))
     second = threading.Thread(target=worker, args=("second", True))
     first.start()
-    time.sleep(0.8)  # 让第一路进入推理（持锁）
+    time.sleep(0.05)  # 仅错开到达顺序；单次推理 ~330ms，第二路必然撞锁
     second.start()
     release.set()
     first.join(timeout=300)

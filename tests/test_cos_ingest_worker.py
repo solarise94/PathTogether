@@ -204,7 +204,8 @@ class FakeCos:
                 return self.head_override(out) if self.head_override else out
         raise cos_client.CosClientError("HEAD %s 失败：HTTP 404" % key)
 
-    def get_object(self, key, version_id, range_header=None, timeout=120):
+    def get_object(self, key, version_id, range_header=None, timeout=120,
+                   object_size=None):
         self.range_log.append((key, version_id, range_header))
         data = None
         for v in self.objects.get(key, []):

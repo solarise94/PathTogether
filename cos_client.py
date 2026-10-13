@@ -238,8 +238,32 @@ class _StreamWrap:
 
 
 def get_object(key: str, version_id: str, range_header: Optional[str] = None,
-               timeout: int = 120):
-    """版本化 GET（流式）。"""
+               timeout: int = 120, object_size: Optional[int] = None):
+    """版本化 GET（流式）。按 ``COS_DOWNLOAD_TRANSPORT`` 分发传输通道。
+
+    - ``direct``（默认）：官方 SDK 直连 COS，行为与既有实现一致
+      （``object_size`` 被忽略）；
+    - ``fast``：经腾讯云 fast 纯流式转发（``cos_fast_relay``）；**需要**
+      ``object_size`` 与 ``range_header``，缺失即 ``CosAdapterError``
+      （不静默改走 direct）；
+    - 其他取值：fail-closed（``CosConfigMissing``，worker 空转告警）。
+
+    HEAD/删除/列举/multipart 仍走 SDK，与传输通道无关。
+    """
+    transport = (cos_config.COS_DOWNLOAD_TRANSPORT or "").strip().lower()
+    if transport == cos_config.COS_FAST_TRANSPORT_FAST:
+        # 延迟 import：cos_fast_relay 依赖本模块的异常/_key_shape，模块级
+        # import 会成环。
+        import cos_fast_relay
+        return cos_fast_relay.get_object(
+            key, version_id, range_header=range_header, timeout=timeout,
+            object_size=object_size)
+    if transport not in ("", cos_config.COS_FAST_TRANSPORT_DIRECT):
+        # 未知取值 fail-closed：绝不自动回退 direct（设计 §最小实施面 5）。
+        raise CosConfigMissing(
+            "COS_DOWNLOAD_TRANSPORT=%s 非法（direct|fast）——fail-closed，"
+            "不自动回退 direct" % transport)
+
     kwargs: Dict[str, object] = {"Bucket": _bucket(), "Key": key,
                                  "VersionId": version_id}
     if range_header:

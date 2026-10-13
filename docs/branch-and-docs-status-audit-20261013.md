@@ -1,6 +1,6 @@
 # 分支与近两周文档收尾审计（2026-10-13）
 
-> 后续执行：用户已授权 review、合入和发布完成部分；当前收口分支 `release/closeout-20261013` 已合入主页修复、COS relay 及 `fd0f7832` 关闭记录。剩余实施任务见 [实现索引](followup/remaining-work-implementation-index-20261013.md)。地域跳转已按用户新决定改为主页线路选择。下文保留初次盘点事实，部署结果另记发布文档。
+> 后续执行：用户已授权 review、合入和发布完成部分；当前收口分支 `release/closeout-20261013` 已合入主页修复、COS relay 及 `fd0f7832` 关闭记录。剩余实施任务见 [实现索引](followup/remaining-work-implementation-index-20261013.md)。地域跳转已按用户新决定改为主页线路选择。下文保留初次盘点事实，部署与归档结果见 [发布记录](closeout-release-20261013.md)。
 
 ## 补充核对：COS fast 转发已实现（同日更新）
 

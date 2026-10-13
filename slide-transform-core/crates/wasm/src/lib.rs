@@ -576,7 +576,9 @@ fn is_tiff_magic(m: &[u8; 8]) -> bool {
 }
 
 /// Source adapter id of an input kind (journal/checkpoint identity; `None`
-/// for the KFB/KFBF readers, which predate adapters).
+/// for the KFB/KFBF readers, which predate adapters). The SVS adapter id is
+/// codec-dependent (JPEG passthrough vs the JP2K re-encode adapter) and is
+/// resolved by `svs_adapter_of` at run time.
 fn adapter_of(kind: InputKind) -> Option<&'static str> {
     match kind {
         InputKind::Svs => Some(slide_transform_core::svs::SOURCE_FORMAT),
@@ -638,12 +640,13 @@ fn resume_adapter_field(resume_json: &str) -> Option<String> {
 
 /// SVS capability document (probe result), mirroring the CLI's report.
 fn svs_doc_json(doc: &slide_transform_core::svs::SvsDoc) -> String {
+    let is_jp2k = doc.codec.is_jp2k();
     let levels: Vec<String> = doc
         .levels
         .iter()
         .map(|lv| {
             format!(
-                "{{\"level\":{},\"width\":{},\"height\":{},\"tile_w\":{},\"tile_h\":{},\"tiles_across\":{},\"tiles_down\":{},\"color\":\"{}\",\"jpeg_tables\":{}}}",
+                "{{\"level\":{},\"width\":{},\"height\":{},\"tile_w\":{},\"tile_h\":{},\"tiles_across\":{},\"tiles_down\":{},\"color\":\"{}\",\"jpeg_tables\":{},\"jp2k\":{}}}",
                 lv.ifd_index,
                 lv.width,
                 lv.height,
@@ -655,7 +658,8 @@ fn svs_doc_json(doc: &slide_transform_core::svs::SvsDoc) -> String {
                     slide_transform_core::svs::PayloadColor::Rgb => "rgb",
                     slide_transform_core::svs::PayloadColor::YCbCr => "ycbcr",
                 },
-                lv.jpeg_tables.is_some()
+                lv.jpeg_tables.is_some(),
+                lv.jp2k_contract.is_some()
             )
         })
         .collect();
@@ -673,9 +677,9 @@ fn svs_doc_json(doc: &slide_transform_core::svs::SvsDoc) -> String {
         .map(|v| json_num(v))
         .unwrap_or_else(|| "null".into());
     format!(
-        "{{\"format\":\"{}\",\"adapter\":\"{}\",\"adapter_version\":\"{}\",\"modality\":\"brightfield\",\"tiff_kind\":\"{}\",\"width\":{},\"height\":{},\"mpp_x\":{},\"mpp_y\":{},\"objective\":{},\"mpp_source\":\"{}\",\"objective_source\":\"{}\",\"levels\":[{}],\"associated\":[{}],\"icc_profile\":{},\"codec\":\"jpeg-baseline-passthrough\",\"estimate\":{}}}",
-        slide_transform_core::svs::SOURCE_FORMAT,
-        slide_transform_core::svs::SOURCE_FORMAT,
+        "{{\"format\":\"{}\",\"adapter\":\"{}\",\"adapter_version\":\"{}\",\"modality\":\"brightfield\",\"tiff_kind\":\"{}\",\"width\":{},\"height\":{},\"mpp_x\":{},\"mpp_y\":{},\"objective\":{},\"mpp_source\":\"{}\",\"objective_source\":\"{}\",\"levels\":[{}],\"associated\":[{}],\"icc_profile\":{},\"codec\":\"{}\",\"source_codec\":\"{}\",\"decoder\":{},\"estimate\":{}}}",
+        doc.codec.source_format(),
+        doc.codec.source_format(),
         slide_transform_core::svs::ADAPTER_VERSION,
         match doc.kind {
             slide_transform_core::tiff_read::TiffKind::Classic => "classic",
@@ -691,6 +695,18 @@ fn svs_doc_json(doc: &slide_transform_core::svs::SvsDoc) -> String {
         levels.join(","),
         assoc.join(","),
         doc.icc.is_some(),
+        if is_jp2k { "jpeg2000-reencode" } else { "jpeg-baseline-passthrough" },
+        doc.codec.id(),
+        if is_jp2k {
+            format!(
+                "{{\"name\":\"{}\",\"version\":\"{}\",\"features\":\"{}\"}}",
+                slide_transform_core::jp2k::DECODER_NAME,
+                slide_transform_core::jp2k::DECODER_VERSION,
+                slide_transform_core::jp2k::DECODER_FEATURES
+            )
+        } else {
+            "null".to_string()
+        },
         estimate_json(&slide_transform_core::svs::estimate_svs(doc))
     )
 }
@@ -1229,7 +1245,22 @@ fn run_convert(
         };
     }
     let is_fl = kind == InputKind::Kfbf;
-    let adapter = adapter_of(kind);
+    // F2: the SVS adapter identity is codec-dependent — a JPEG passthrough
+    // checkpoint can never be resumed against a JP2K input (nor vice versa),
+    // so the journal's adapter field distinguishes aperio-svs-jpeg from
+    // aperio-svs-jp2k via a bounded IFD0 sniff.
+    let svs_codec = if kind == InputKind::Svs {
+        match slide_transform_core::svs::sniff_main_codec(&src) {
+            Ok(c) => Some(c),
+            Err(e) => return err_json(&e),
+        }
+    } else {
+        None
+    };
+    let adapter: Option<&'static str> = match svs_codec {
+        Some(c) => Some(c.source_format()),
+        None => adapter_of(kind),
+    };
     let out_profile = match resolve_profile(is_fl, profile) {
         Ok(p) => p,
         Err(e) => return err_json(&e),

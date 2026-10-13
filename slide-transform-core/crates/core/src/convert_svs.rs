@@ -1,16 +1,34 @@
-//! SVS → brightfield conversion (F1): Aperio JPEG tiles → classic multi-IFD
+//! SVS → brightfield conversion (F1/F2): Aperio SVS tiles → classic multi-IFD
 //! JPEG BigTIFF pyramid or RGB OME-BigTIFF (SubIFD pyramid).
 //!
-//! Default payload policy is **pure passthrough**: every source tile byte is
-//! copied verbatim, in tile order, level by level. The shared `JPEGTables` of
-//! each level are written verbatim into the output IFD (tag 347), so
-//! abbreviated source streams stay abbreviated in the output — no splicing
-//! into tiles, no re-encode, nothing relabelled. The output photometric is
-//! the JPEG payloads' true colorspace (2 = RGB for Aperio `JPEG/RGB`
-//! streams, 6 = YCbCr with the SOF subsampling), and the tile tags (322/323)
-//! carry the source's own tile shape (e.g. 240).
+//! Two source codecs share the structural walk and the two output profiles:
 //!
-//! `compact-jpeg-v1` (U3, merged): every source tile of every level is
+//! **Baseline JPEG (compression 7, F1)** — default payload policy is **pure
+//! passthrough**: every source tile byte is copied verbatim, in tile order,
+//! level by level. The shared `JPEGTables` of each level are written
+//! verbatim into the output IFD (tag 347), so abbreviated source streams
+//! stay abbreviated in the output — no splicing into tiles, no re-encode,
+//! nothing relabelled. The output photometric is the JPEG payloads' true
+//! colorspace (2 = RGB for Aperio `JPEG/RGB` streams, 6 = YCbCr with the
+//! SOF subsampling), and the tile tags (322/323) carry the source's own
+//! tile shape (e.g. 240).
+//!
+//! **JPEG 2000 (compression 33003/33005, F2)** — there is NO passthrough:
+//! every tile is decoded (bounded codestream-header cross-check →
+//! hayro-jpeg2000 → validated YCbCr→RGB for 33003 / direct RGB for 33005)
+//! and re-encoded with the current JPEG-in-TIFF writer in BOTH encoding
+//! modes. Each mode reuses its own LOCKED parameters:
+//!   - preserve-source-v1 → the JP2K high-fidelity re-encode family
+//!     (quality 96, 4:2:2, standard Annex-K Huffman,
+//!     `aperio-jp2k-reencode:q96:y422:hstd:v1`);
+//!   - compact-jpeg-v1 → the locked compact parameters (`cj1:q80:420:hstd:v1`).
+//! A JPEG 2000 source can therefore NEVER be advertised as lossless or as
+//! original-codestream-preserving: `strict-lossless` is a typed refusal
+//! BEFORE the first output byte, the report carries the source codec and
+//! the re-encoded tile count, and the source's own lossy JP2K generation
+//! stays unlaundered (a new lossy JPEG generation on top of it).
+//!
+//! `compact-jpeg-v1` (U3, merged): every source JPEG tile of every level is
 //! decoded with the adapter's colourspace rule (shared `JPEGTables` merged
 //! in, [`crate::jpeg::decode_ex`] `force_rgb` for photometric-RGB payloads)
 //! and re-encoded with the LOCKED [`crate::plan::compact_jpeg_v1_encoder_cfg`]
@@ -22,15 +40,19 @@
 //! Full source resolution and coordinates are kept; the output is lossy by
 //! construction and is never claimed lossless.
 //!
-//! Edge policy (preserve): Aperio keeps full-size tiles past the image
+//! Edge policy (preserve, JPEG): Aperio keeps full-size tiles past the image
 //! boundary; such tiles are copied as-is (standard TIFF edge-tile semantics —
 //! content past the image edge is unspecified and invisible). A genuinely
 //! cropped tile (JPEG smaller than the nominal tile rect) is also copied
 //! verbatim and recorded in `edge_regions`; because no pixel is ever
 //! re-encoded, `StrictLossless` accepts everything the default policy
 //! accepts (there is no lossy step in this adapter to forbid). Under
-//! `compact` every tile is re-encoded anyway, so the two policies are
-//! mutually exclusive and the combination is a typed refusal.
+//! `compact` (and for EVERY JP2K source) every tile is re-encoded anyway,
+//! so the policies are mutually exclusive there and the combination is a
+//! typed refusal. A JP2K codestream smaller than the nominal tile rect is
+//! decoded and pasted onto the white tile canvas (edge region recorded);
+//! the valid region of an edge tile stays exactly level_w×level_h —
+//! padding, downsampling and coordinates never shift.
 //!
 //! Label/macro/thumbnail are NOT exported — this is a main-image
 //! conversion, not an archive of the source file (`aperio_associated_not_
@@ -54,7 +76,12 @@ use crate::plan::{
 };
 use crate::report::{AssociatedSummary, EdgeRegion, LevelStats, LossyReencode, TransformResult};
 use crate::resume::ResumePoint;
-use crate::svs::{self, PayloadColor, SvsDoc, SvsLevel, ADAPTER_VERSION, SOURCE_FORMAT};
+use crate::svs::{self, PayloadColor, SvsDoc, SvsLevel, ADAPTER_VERSION};
+#[allow(unused_imports)]
+use crate::svs::{
+    JP2K_REENCODE_FINGERPRINT, JP2K_REENCODE_HUFFMAN, JP2K_REENCODE_QUALITY, JP2K_REENCODE_SAMPLING,
+    SourceCodec,
+};
 use crate::tiff_read::{self, TiffHeader};
 
 /// Reuse the brightfield output format ids — the outputs ARE the same two
@@ -67,6 +94,9 @@ pub const WARN_SVS_EDGE_PASSTHROUGH: &str = "svs_cropped_edge_tile_passthrough";
 pub const WARN_ASSOC_NOT_EXPORTED: &str = "aperio_associated_not_exported";
 /// Warning: no ICC profile present — colour management is not applied.
 pub const WARN_NO_ICC: &str = "color_management_not_applied";
+/// F2 warning: JPEG 2000 source — every tile decoded + re-encoded (lossy),
+/// in BOTH encoding modes. Never a passthrough, never lossless.
+pub const WARN_JP2K_REENCODED: &str = "svs_jp2k_source_reencoded";
 
 struct LevelMeta {
     width: u32,
@@ -177,18 +207,27 @@ impl SvsWriter<'_> {
 
 /// JSON description of the classic profile (same `json.dumps(sort_keys=True)
 /// + NUL` convention as the KFB path; unknown values are `null`, never
-/// invented).
+/// invented). The source_format id is codec-specific (JPEG passthrough vs
+/// the JP2K re-encode adapter), and JP2K outputs carry the exact source
+/// codec so no consumer can mistake a re-encode for a passthrough.
 fn svs_description_bytes(doc: &SvsDoc) -> Vec<u8> {
     let mpp = doc.mpp;
     let obj = doc.appmag;
+    let source_format = doc.codec.source_format();
+    let codec_kv = if doc.codec.is_jp2k() {
+        format!(", \"source_codec\": \"{}\"", doc.codec.id())
+    } else {
+        String::new()
+    };
     let s = format!(
-        "{{\"adapter\": \"{}\", \"adapter_version\": \"{}\", \"mpp_x\": {}, \"mpp_y\": {}, \"objective\": {}, \"source_format\": \"{}\"}}\u{0}",
-        SOURCE_FORMAT,
+        "{{\"adapter\": \"{}\", \"adapter_version\": \"{}\", \"mpp_x\": {}, \"mpp_y\": {}, \"objective\": {}, \"source_format\": \"{}\"{}}}\u{0}",
+        source_format,
         ADAPTER_VERSION,
         mpp.map(py_repr_f64).unwrap_or_else(|| "null".into()),
         mpp.map(py_repr_f64).unwrap_or_else(|| "null".into()),
         obj.map(py_repr_f64).unwrap_or_else(|| "null".into()),
-        SOURCE_FORMAT,
+        source_format,
+        codec_kv,
     );
     s.into_bytes()
 }
@@ -213,14 +252,29 @@ fn xml_escape(s: &str) -> String {
 /// provenance (source format + adapter version + payload policy).
 fn svs_ome_xml(doc: &SvsDoc, plan: &TransformPlan) -> Vec<u8> {
     let main = &doc.levels[0];
+    let source_format = doc.codec.source_format();
     let mut provenance: Vec<(&str, String)> = vec![
         ("converter", "slide-transform-core".to_string()),
         ("converter_version", plan.core_version.clone()),
         ("output_profile", plan.profile.id().to_string()),
-        ("source_format", SOURCE_FORMAT.to_string()),
-        ("source_adapter", SOURCE_FORMAT.to_string()),
+        ("source_format", source_format.to_string()),
+        ("source_adapter", source_format.to_string()),
         ("adapter_version", ADAPTER_VERSION.to_string()),
     ];
+    // F2: the source codec + decoder identity travel with the file so a
+    // re-encode can never pass itself off as a passthrough.
+    provenance.push(("source_codec", doc.codec.id().to_string()));
+    if doc.codec.is_jp2k() {
+        provenance.push((
+            "decoder",
+            format!(
+                "{} {} ({})",
+                crate::jp2k::DECODER_NAME,
+                crate::jp2k::DECODER_VERSION,
+                crate::jp2k::DECODER_FEATURES
+            ),
+        ));
+    }
     provenance.push((
         "mpp_source",
         if doc.mpp.is_some() { "aperio-description-MPP" } else { "unknown" }.to_string(),
@@ -231,16 +285,46 @@ fn svs_ome_xml(doc: &SvsDoc, plan: &TransformPlan) -> Vec<u8> {
             .to_string(),
     ));
     provenance.push(("pyramid_levels", doc.levels.len().to_string()));
-    // Encoding keys appear ONLY for compact runs: preserve outputs keep their
-    // exact pre-U3 OME-XML (byte-parity gate on pinned sha256 values); a
-    // missing key means preserve-source-v1, exactly like every pre-U3 file.
+    // Encoding keys appear ONLY for compact runs (JPEG sources: preserve
+    // outputs keep their exact pre-U3 OME-XML (byte-parity gate on pinned
+    // sha256 values); a missing key means preserve-source-v1, exactly like
+    // every pre-U3 file). JP2K sources are re-encoded in BOTH modes, so the
+    // key set carries the respective fingerprint either way.
     if plan.encoding == EncodingProfile::CompactJpegV1 {
         provenance.push(("encoding_profile", plan.encoding.id().to_string()));
         provenance.push(("encoding_params_fingerprint", COMPACT_JPEG_V1_FINGERPRINT.to_string()));
+    } else if doc.codec.is_jp2k() {
+        provenance.push(("encoding_profile", plan.encoding.id().to_string()));
+        provenance.push(("encoding_params_fingerprint", JP2K_REENCODE_FINGERPRINT.to_string()));
     }
     provenance.push((
         "tile_payloads",
-        if plan.encoding == EncodingProfile::CompactJpegV1 {
+        if doc.codec.is_jp2k() {
+            if plan.encoding == EncodingProfile::CompactJpegV1 {
+                format!(
+                    "every JPEG 2000 tile decoded (codestream header cross-checked, colour per \
+                     the {} contract) and re-encoded at the locked compact parameters (quality \
+                     {}, {}, standard Annex-K Huffman, fingerprint {}); a new lossy JPEG \
+                     generation over the source's own lossy JP2K — the source codestream is NOT \
+                     preserved",
+                    doc.codec.id(),
+                    COMPACT_JPEG_V1_QUALITY,
+                    compact_sampling_label(),
+                    COMPACT_JPEG_V1_FINGERPRINT
+                )
+            } else {
+                format!(
+                    "every JPEG 2000 tile decoded (codestream header cross-checked, colour per \
+                     the {} contract) and re-encoded at the locked high-fidelity parameters \
+                     (quality {}, 4:2:2, standard Annex-K Huffman, fingerprint {}); a new lossy \
+                     JPEG generation over the source's own lossy JP2K — the source codestream \
+                     is NOT preserved",
+                    doc.codec.id(),
+                    JP2K_REENCODE_QUALITY,
+                    JP2K_REENCODE_FINGERPRINT
+                )
+            }
+        } else if plan.encoding == EncodingProfile::CompactJpegV1 {
             format!(
                 "every tile decoded (shared JPEGTables merged, adapter colourspace rule) and \
                  re-encoded at the locked compact parameters (quality {}, subsampling {}, \
@@ -323,10 +407,10 @@ SizeX=\"{}\" SizeY=\"{}\" SizeC=\"3\" SizeZ=\"1\" SizeT=\"1\"{phys}>\
 }
 
 /// Per-level output metadata (tile shape, photometric, calibration,
-/// JPEGTables; ICC on the main level only). Under `compact` the output
-/// payload is always the locked YCbCr re-encode: photometric 6, the locked
-/// subsampling, NO shared JPEGTables (each tile is self-contained); the
-/// source tile geometry is kept.
+/// JPEGTables; ICC on the main level only). Under `compact` (and for EVERY
+/// JP2K source) the output payload is always a self-contained YCbCr
+/// re-encode: photometric 6 + the encoder's locked subsampling, NO shared
+/// JPEGTables; the source tile geometry is kept.
 fn level_meta(doc: &SvsDoc, li: usize, compact: bool) -> LevelMeta {
     let lv = &doc.levels[li];
     let main = &doc.levels[0];
@@ -337,7 +421,12 @@ fn level_meta(doc: &SvsDoc, li: usize, compact: bool) -> LevelMeta {
         let ry = main.height as f64 / lv.height as f64;
         (m * rx, m * ry)
     });
-    let (photometric, tiff_sub, jpeg_tables) = if compact {
+    let (photometric, tiff_sub, jpeg_tables) = if doc.codec.is_jp2k() {
+        // F2: self-contained 4:2:2 re-encode in BOTH modes; only the
+        // locked parameters differ (96/4:2:2 preserve, 80/4:2:0 compact)
+        let sub = if compact { compact_sampling_tiff() } else { (2u16, 1u16) };
+        (6u16, sub, None)
+    } else if compact {
         (6u16, compact_sampling_tiff(), None)
     } else {
         match lv.color {
@@ -396,6 +485,64 @@ fn li_of(lv: &SvsLevel) -> u32 {
     lv.ifd_index
 }
 
+/// F2: JPEG 2000 re-encode of one SVS source tile (BOTH encoding modes —
+/// a JP2K source has no passthrough path).
+///
+/// The payload is first cross-checked against the level's codestream-header
+/// contract (bounded `parse_header`; dims within the nominal tile rect,
+/// identical component count / bit depth / sampling / MCT / decomposition
+/// levels), then decoded to interleaved RGB8 (one buffer at a time) with
+/// the contract's colour duty. A codestream smaller than the nominal tile
+/// rect is pasted onto a white tile_w×tile_h canvas (compact padding
+/// semantics); the boolean reports the padding so the caller records the
+/// edge region.
+#[allow(clippy::too_many_arguments)]
+fn jp2k_reencode_tile(
+    payload: &[u8],
+    lv: &SvsLevel,
+    cfg: &crate::jpeg::EncoderCfg,
+) -> CoreResult<(Vec<u8>, u32, u32)> {
+    let contract = lv.jp2k_contract.as_ref().ok_or_else(|| {
+        CoreError::validation("jp2k: 层缺少 codestream 契约（probe 未运行）")
+    })?;
+    let hdr = crate::jp2k::parse_header(payload)?;
+    let color = crate::jp2k::check_against_contract(
+        &hdr,
+        contract,
+        contract_color_compression(contract),
+        lv.tile_w,
+        lv.tile_h,
+    )?;
+    let tile_pixels = (lv.tile_w as u64) * (lv.tile_h as u64);
+    let decoded = crate::jp2k::decode_tile_rgb(payload, hdr.width, hdr.height, color, tile_pixels)?;
+    let padded = decoded.width != lv.tile_w || decoded.height != lv.tile_h;
+    if !padded {
+        let jpg = crate::jpeg::encode_rgb(&decoded.rgb, decoded.width, decoded.height, cfg)?;
+        return Ok((jpg, decoded.width, decoded.height));
+    }
+    // codestream smaller than the nominal tile rect → white tile canvas,
+    // row-strided paste (same padding semantics as the JPEG compact path)
+    let mut canvas = vec![255u8; (lv.tile_w as usize) * (lv.tile_h as usize) * 3];
+    for y in 0..decoded.height as usize {
+        let s = y * decoded.width as usize * 3;
+        let d = y * lv.tile_w as usize * 3;
+        let row = decoded.width as usize * 3;
+        canvas[d..d + row].copy_from_slice(&decoded.rgb[s..s + row]);
+    }
+    let jpg = crate::jpeg::encode_rgb(&canvas, lv.tile_w, lv.tile_h, cfg)?;
+    Ok((jpg, decoded.width, decoded.height))
+}
+
+/// The Aperio compression tag implied by a probed contract (a pure mirror
+/// of `classify_aperio`'s MCT rule, after the contract passed it).
+fn contract_color_compression(contract: &crate::jp2k::Jp2kHeader) -> u64 {
+    if contract.mct == 1 {
+        crate::jp2k::COMPRESSION_JP2K_RGB
+    } else {
+        crate::jp2k::COMPRESSION_JP2K_YCBCR
+    }
+}
+
 /// Compact-jpeg-v1 re-encode of one SVS source tile (U3 merged path).
 ///
 /// The abbreviated tile stream (shared `JPEGTables`) is merged into a
@@ -449,9 +596,10 @@ fn compact_reencode_tile(
 
 /// Re-scan the boundary cells of a level for resume bookkeeping (edge
 /// regions / stats). Interior cells are nominal by the accept rules (the
-/// fresh path rejects anything else before writing). Under `compact` every
-/// scanned cell counts as re-encoded and cropped boundary tiles are the
-/// padded edge regions (same reconstruction as the fresh compact path).
+/// fresh path rejects anything else before writing). Under `compact` — and
+/// for EVERY JP2K cell — each scanned cell counts as re-encoded and cropped
+/// boundary tiles are the padded edge regions (same reconstruction as the
+/// fresh paths; JP2K headers are re-PARSED, never re-decoded).
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_cells_svs(
     src: &dyn ByteSource,
@@ -465,6 +613,7 @@ fn reconstruct_cells_svs(
     edge_regions: &mut Vec<EdgeRegion>,
     warnings: &mut Vec<String>,
 ) -> CoreResult<()> {
+    let jp2k = lv.jp2k_contract.is_some();
     let mut cur = tiff_read::TileCursor::new(src, hdr, ifd)?;
     let mut cell = 0u64;
     while cell < up_to {
@@ -474,14 +623,26 @@ fn reconstruct_cells_svs(
         let is_edge = row + 1 == lv.tiles_down as u64 || col + 1 == lv.tiles_across as u64;
         if is_edge {
             let payload = src.read_at(off, len as usize)?;
-            let probe = crate::jpeg::scan_jpeg(&payload)?;
-            if probe.width as u32 != lv.tile_w || probe.height as u32 != lv.tile_h {
-                record_edge(
-                    lv, row, col, probe.width, probe.height, compact, edge_regions, warnings,
-                );
+            if jp2k {
+                // bounded header parse only — resume bookkeeping must not
+                // pay a full decode for already-committed cells
+                let h = crate::jp2k::parse_header(&payload)?;
+                if h.width as u32 != lv.tile_w || h.height as u32 != lv.tile_h {
+                    record_edge(
+                        lv, row, col, h.width as u32, h.height as u32, true, edge_regions,
+                        warnings,
+                    );
+                }
+            } else {
+                let probe = crate::jpeg::scan_jpeg(&payload)?;
+                if probe.width as u32 != lv.tile_w || probe.height as u32 != lv.tile_h {
+                    record_edge(
+                        lv, row, col, probe.width, probe.height, compact, edge_regions, warnings,
+                    );
+                }
             }
         }
-        if compact {
+        if compact || jp2k {
             stats.tiles_reencoded += 1;
         } else {
             stats.tiles_raw_copied += 1;
@@ -599,6 +760,15 @@ fn convert_inner(
     if plan.profile == OutputProfile::OmeBigTiffSubifd {
         return Err(CoreError::variant("荧光 OME profile 不适用于明场 SVS"));
     }
+    let is_jp2k = doc.codec.is_jp2k();
+    if plan.pixel_policy == PixelPolicy::StrictLossless && is_jp2k {
+        // F2: a JPEG 2000 source has no byte-passthrough path — every tile
+        // must be decoded and re-encoded as a new lossy JPEG generation.
+        // Typed refusal BEFORE any writer/output exists (zero output bytes).
+        return Err(CoreError::policy(
+            "strict-lossless 不支持 JPEG2000 源（33003/33005）：tile 无法按原样搬运，输出必然重新编码（有损）；请改用默认或 compact 模式",
+        ));
+    }
     if plan.pixel_policy == PixelPolicy::StrictLossless
         && plan.encoding == EncodingProfile::CompactJpegV1
     {
@@ -610,6 +780,13 @@ fn convert_inner(
         ));
     }
     let compact = plan.encoding == EncodingProfile::CompactJpegV1;
+    // F2: the encoder of a JP2K source in EACH mode (both re-encode):
+    // preserve → the locked JP2K high-fidelity family; compact → the locked
+    // compact parameters. Existing saver/normal budgets are untouched.
+    let jp2k_cfg = crate::jpeg::EncoderCfg::with_quality(
+        JP2K_REENCODE_QUALITY,
+        JP2K_REENCODE_SAMPLING,
+    );
     let compact_cfg = if compact {
         Some(crate::plan::compact_jpeg_v1_encoder_cfg())
     } else {
@@ -617,6 +794,9 @@ fn convert_inner(
     };
 
     let mut warnings: Vec<String> = Vec::new();
+    if is_jp2k {
+        warnings.push(WARN_JP2K_REENCODED.to_string());
+    }
     if !doc.associated.is_empty() {
         warnings.push(WARN_ASSOC_NOT_EXPORTED.to_string());
     }
@@ -661,19 +841,34 @@ fn convert_inner(
             tiles_total: lv.tiles_total,
             ..Default::default()
         };
-        // per-level JPEG truth (cached probe of the first tile + tables)
+        // per-level JPEG truth (cached probe of the first tile + tables).
+        // JP2K levels carry their codestream contract from the probe; the
+        // JPEG probe (and its per-tile check) is theirs alone.
         let head = {
-            let first = {
-                let mut c = tiff_read::TileCursor::new(src, &hdr, ifd)?;
-                c.next_pair()?
-                    .ok_or_else(|| CoreError::validation("层级无 tile"))?
-            };
-            let raw = src.read_at(first.0, first.1.min(svs::PROBE_LIMIT) as usize)?;
-            let merged = match &lv.jpeg_tables {
-                Some(t) => svs::merge_tables_then_tile(t, &raw),
-                None => raw,
-            };
-            crate::jpeg::scan_jpeg(&merged)?
+            if lv.jp2k_contract.is_some() {
+                // dummy — the JP2K path never consults the JPEG probe
+                crate::jpeg::JpegProbe {
+                    width: 0,
+                    height: 0,
+                    sampling: None,
+                    comp_ids: None,
+                    jfif: false,
+                    adobe_transform: None,
+                    sof_marker: 0,
+                }
+            } else {
+                let first = {
+                    let mut c = tiff_read::TileCursor::new(src, &hdr, ifd)?;
+                    c.next_pair()?
+                        .ok_or_else(|| CoreError::validation("层级无 tile"))?
+                };
+                let raw = src.read_at(first.0, first.1.min(svs::PROBE_LIMIT) as usize)?;
+                let merged = match &lv.jpeg_tables {
+                    Some(t) => svs::merge_tables_then_tile(t, &raw),
+                    None => raw,
+                };
+                crate::jpeg::scan_jpeg(&merged)?
+            }
         };
 
         let resume_done = resume.is_some_and(|r| li < r.level);
@@ -720,37 +915,65 @@ fn convert_inner(
             let row = cell / lv.tiles_across as u64;
             let col = cell % lv.tiles_across as u64;
             let payload = src.read_at(off, len as usize)?;
-            let probe = check_tile(&payload, lv, &head)?;
-            // interior cells must be nominal; boundary cells may be cropped
-            let interior_row = row + 1 < lv.tiles_down as u64;
-            let interior_col = col + 1 < lv.tiles_across as u64;
-            if (interior_row && interior_col)
-                && (probe.width != lv.tile_w || probe.height != lv.tile_h)
-            {
-                return Err(CoreError::variant(format!(
-                    "层 {} 内部 tile({row},{col}) 尺寸 {}×{} ≠ 标称 {}×{}（非边界不允许残缺）",
-                    li, probe.width, probe.height, lv.tile_w, lv.tile_h
-                )));
-            }
-            if probe.width != lv.tile_w || probe.height != lv.tile_h {
-                record_edge(
-                    lv, row, col, probe.width, probe.height, compact, &mut edge_regions,
-                    &mut warnings,
-                );
-            }
+            // F2: one decode/encode working set at a time — the JP2K path
+            // decodes straight into the per-tile RGB buffer and the encoded
+            // bytes go to the sink immediately; cancellation is checked per
+            // tile above (a single bounded tile decode is the worst-case
+            // cancel latency; see the F2 evidence doc).
             let data: Vec<u8>;
-            if let Some(cfg) = &compact_cfg {
-                // compact-jpeg-v1: EVERY tile decoded (shared JPEGTables
-                // merged, adapter colourspace rule) → re-encoded at the
-                // LOCKED compact parameters, source tile geometry kept;
-                // cropped tiles padded onto the white tile canvas (already
-                // recorded as the edge region above).
-                let (encoded, _) = compact_reencode_tile(&payload, lv, &probe, cfg)?;
+            if lv.jp2k_contract.is_some() {
+                let cfg = if compact {
+                    compact_cfg.as_ref().expect("compact cfg")
+                } else {
+                    &jp2k_cfg
+                };
+                let (encoded, src_w, src_h) = jp2k_reencode_tile(&payload, lv, cfg)?;
+                let interior = row + 1 < lv.tiles_down as u64 && col + 1 < lv.tiles_across as u64;
+                if src_w != lv.tile_w || src_h != lv.tile_h {
+                    if interior {
+                        return Err(CoreError::variant(format!(
+                            "层 {li} 内部 JP2K tile({row},{col}) codestream {src_w}×{src_h} ≠ 标称 {}×{}（非边界不允许残缺）",
+                            lv.tile_w, lv.tile_h
+                        )));
+                    }
+                    record_edge(
+                        lv, row, col, src_w, src_h, true, &mut edge_regions, &mut warnings,
+                    );
+                }
                 data = encoded;
                 stats.tiles_reencoded += 1;
             } else {
-                data = payload;
-                stats.tiles_raw_copied += 1;
+                let probe = check_tile(&payload, lv, &head)?;
+                // interior cells must be nominal; boundary cells may be cropped
+                let interior_row = row + 1 < lv.tiles_down as u64;
+                let interior_col = col + 1 < lv.tiles_across as u64;
+                if (interior_row && interior_col)
+                    && (probe.width != lv.tile_w || probe.height != lv.tile_h)
+                {
+                    return Err(CoreError::variant(format!(
+                        "层 {} 内部 tile({row},{col}) 尺寸 {}×{} ≠ 标称 {}×{}（非边界不允许残缺）",
+                        li, probe.width, probe.height, lv.tile_w, lv.tile_h
+                    )));
+                }
+                if probe.width != lv.tile_w || probe.height != lv.tile_h {
+                    record_edge(
+                        lv, row, col, probe.width, probe.height, compact, &mut edge_regions,
+                        &mut warnings,
+                    );
+                }
+                if let Some(cfg) = &compact_cfg {
+                    // compact-jpeg-v1: EVERY tile decoded (shared JPEGTables
+                    // merged, adapter colourspace rule) → re-encoded at the
+                    // LOCKED compact parameters, source tile geometry kept;
+                    // cropped tiles padded onto the white tile canvas (already
+                    // recorded as the edge region above).
+                    let (encoded, _) = compact_reencode_tile(&payload, lv, &probe, cfg)?;
+                    data = encoded;
+                    stats.tiles_reencoded += 1;
+                } else {
+                    data = payload;
+                    stats.tiles_raw_copied += 1;
+                }
             }
             writer.write_tile(&data)?;
             cell += 1;
@@ -805,16 +1028,37 @@ fn convert_inner(
         level_stats.push(stats);
     }
     let output_bytes = writer.finish()?;
+    // F2: every JP2K cell (both modes) or compact cell was re-encoded;
+    // under compact/JP2K every padded (cropped) tile is exactly one
+    // EdgeRegion, so the list length IS the padded count (same rule as the
+    // KFB path)
+    let reencode_active = compact || is_jp2k;
     let compact_tiles_reencoded: u64 = level_stats.iter().map(|l| l.tiles_reencoded).sum();
-    // under compact every padded (cropped) tile is exactly one EdgeRegion,
-    // so the list length IS the padded count (same rule as the KFB path)
-    let compact_tiles_padded: u64 = if compact { edge_regions.len() as u64 } else { 0 };
+    let compact_tiles_padded: u64 = if reencode_active { edge_regions.len() as u64 } else { 0 };
+    let (reencode_profile, reencode_fingerprint, reencode_quality, reencode_sampling, reencode_huffman) =
+        if compact {
+            (
+                EncodingProfile::CompactJpegV1.id(),
+                COMPACT_JPEG_V1_FINGERPRINT,
+                COMPACT_JPEG_V1_QUALITY,
+                compact_sampling_label(),
+                COMPACT_JPEG_V1_HUFFMAN,
+            )
+        } else {
+            (
+                EncodingProfile::PreserveSource.id(),
+                JP2K_REENCODE_FINGERPRINT,
+                JP2K_REENCODE_QUALITY,
+                "4:2:2",
+                JP2K_REENCODE_HUFFMAN,
+            )
+        };
 
     let mut result = TransformResult {
         plan_version: plan.plan_version,
         core_version: plan.core_version.clone(),
         format,
-        source_format: Some(SOURCE_FORMAT),
+        source_format: Some(doc.codec.source_format()),
         adapter_version: Some(ADAPTER_VERSION),
         output_bytes,
         output_sha256: None,
@@ -835,12 +1079,12 @@ fn convert_inner(
             },
         },
         ifd_chain,
-        lossy_reencode: compact.then(|| LossyReencode {
-            profile: EncodingProfile::CompactJpegV1.id(),
-            params_fingerprint: COMPACT_JPEG_V1_FINGERPRINT.to_string(),
-            quality: COMPACT_JPEG_V1_QUALITY,
-            sampling: compact_sampling_label(),
-            huffman: COMPACT_JPEG_V1_HUFFMAN,
+        lossy_reencode: reencode_active.then(|| LossyReencode {
+            profile: reencode_profile,
+            params_fingerprint: reencode_fingerprint.to_string(),
+            quality: reencode_quality,
+            sampling: reencode_sampling,
+            huffman: reencode_huffman,
             tiles_reencoded: compact_tiles_reencoded,
             tiles_padded: compact_tiles_padded,
         }),

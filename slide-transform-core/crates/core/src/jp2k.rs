@@ -203,8 +203,8 @@ pub fn parse_header(data: &[u8]) -> CoreResult<Jp2kHeader> {
     let yosiz = u32_be(win, 20)? as u64;
     let xtsiz = u32_be(win, 24)? as u64;
     let ytsiz = u32_be(win, 28)? as u64;
-    let xtOsiz = u32_be(win, 32)? as u64;
-    let ytOsiz = u32_be(win, 36)? as u64;
+    let xt_osiz = u32_be(win, 32)? as u64;
+    let yt_osiz = u32_be(win, 36)? as u64;
     let width = dim_ok(xsiz.saturating_sub(xosiz), "参考网格宽度 Xsiz-XOsiz")?;
     let height = dim_ok(ysiz.saturating_sub(yosiz), "参考网格高度 Ysiz-YOsiz")?;
     let pixels = (width as u64)
@@ -226,7 +226,7 @@ pub fn parse_header(data: &[u8]) -> CoreResult<Jp2kHeader> {
         height,
         origin: (xosiz.min(u32::MAX as u64) as u32, yosiz.min(u32::MAX as u64) as u32),
         tile: (xtsiz.min(u32::MAX as u64) as u32, ytsiz.min(u32::MAX as u64) as u32),
-        tile_origin: (xtOsiz.min(u32::MAX as u64) as u32, ytOsiz.min(u32::MAX as u64) as u32),
+        tile_origin: (xt_osiz.min(u32::MAX as u64) as u32, yt_osiz.min(u32::MAX as u64) as u32),
         components: csiz as u16,
         bit_depth: 0,
         signed: false,

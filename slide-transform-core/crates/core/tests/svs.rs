@@ -836,7 +836,11 @@ fn big_endian_and_bigtiff_sources_read() {
 // --------------------------------------------------------------------------- //
 
 #[test]
-fn jpeg2000_rejected_with_specific_reason() {
+fn jpeg2000_tag_with_jpeg_payloads_rejected_with_specific_reason() {
+    // F2: the compression tag alone does not admit a file — the tag says
+    // JPEG 2000 while the tiles are baseline JPEG, so the bounded codestream
+    // probe rejects the mismatch with a specific typed reason. Real JP2K
+    // conversion is covered by tests/svs_jp2k.rs.
     let mut data = gen(&SvsGenParams::default());
     // Compression tag (259) lives in IFD 0's entry table; find and rewrite it
     // to 33003. Layout: header 8, payloads, IFDs. Walk to IFD 0 first.
@@ -853,9 +857,8 @@ fn jpeg2000_rejected_with_specific_reason() {
         }
     }
     let err = convert(&data, OutputProfile::ClassicJpegBigTiff).unwrap_err();
-    assert_eq!(err.code, UnsupportedKfbVariant);
+    assert_eq!(err.code, ConversionValidationFailed);
     assert!(err.message.contains("JPEG 2000"), "{}", err.message);
-    assert!(err.message.contains("33003"), "{}", err.message);
 }
 
 #[test]

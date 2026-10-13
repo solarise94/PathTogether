@@ -38,6 +38,22 @@ async function main() {
     if (!results.checks.jp2kNotice.text.includes('JPEG2000 源，输出需要重新编码')) {
       throw new Error('JP2K notice wording wrong: ' + JSON.stringify(results.checks.jp2kNotice));
     }
+    // F2 review: the OPTION DESCRIPTIONS themselves must switch to the
+    // re-encode semantics for JP2K sources (no as-is copying in either mode)
+    results.checks.qualityOptionDesc = await page.evaluate(() => ({
+      preserve: document.getElementById('quality-preserve-desc').textContent,
+      compact: document.getElementById('quality-compact-desc').textContent,
+    }));
+    if (!/质量 96|quality 96/.test(results.checks.qualityOptionDesc.preserve)
+        || !results.checks.qualityOptionDesc.preserve.includes('4:2:2')) {
+      throw new Error('preserve option desc not JP2K: '
+        + results.checks.qualityOptionDesc.preserve);
+    }
+    if (!/质量 80|quality 80/.test(results.checks.qualityOptionDesc.compact)
+        || !results.checks.qualityOptionDesc.compact.includes('4:2:0')) {
+      throw new Error('compact option desc not JP2K: '
+        + results.checks.qualityOptionDesc.compact);
+    }
     // probe document identifies the codec (technical summary row)
     const sourceCodecRow = await page.evaluate(() => {
       const g = document.getElementById('probe-grid');
@@ -45,6 +61,10 @@ async function main() {
     });
     results.checks.probeRowHasJp2k = sourceCodecRow.includes('JPEG 2000');
     await L.shot(page, 'jp2k-01-probe');
+    // close-up of the quality options with the JP2K descriptions
+    await page.locator('#quality-fieldset').screenshot({
+      path: path.join(L.SCREENS, 'jp2k-01b-quality-options.png'),
+    });
     // locale note: assertions follow the pinned zh-CN test locale
 
     // strict-lossless: selecting the policy must show the JP2K-specific

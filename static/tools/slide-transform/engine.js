@@ -472,6 +472,20 @@ export const SVS_JP2K_ADAPTER_VERSION = '1';
 /// (MCT=0), 33005 = MCT=1. HTJ2K, 16-bit, fluorescence and other JP2K are
 /// typed rejections, never guesses.
 export const SVS_JP2K_COMPRESSIONS = [33003, 33005];
+
+/// F2: JPEG 2000 sources have NO as-is tile copying — in BOTH quality modes
+/// every tile is decoded and re-encoded. The two quality option descriptions
+/// must say so: returns the i18n keys that REPLACE the default option
+/// descriptions when the probe document identifies a JP2K source, else null
+/// (the static data-i18n text stays). The page re-applies this after every
+/// language switch (rerenderForLang → renderQualitySection).
+export function qualityOptionDescOverride(doc) {
+  if (!doc || doc.codec !== 'jpeg2000-reencode') return null;
+  return {
+    preserve: 'tools.quality.preserve.desc.jp2k',
+    compact: 'tools.quality.compact.desc.jp2k',
+  };
+}
 /// F4: Leica SCN（BigTIFF + SCN XML 描述；JPEG tile 原样搬运）。
 /// Must equal the Rust `ADAPTER_VERSION` (resume refuses on mismatch).
 export const SCN_SOURCE_ADAPTER = 'leica-scn-jpeg';

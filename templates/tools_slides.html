@@ -119,12 +119,12 @@
         <div class="radio-option">
           <input type="radio" id="quality-preserve" name="encoding" value="preserve-source-v1" checked />
           <label for="quality-preserve"><span class="opt-title" data-i18n="tools.quality.preserve">保留画质（推荐）</span>
-            <span class="opt-desc" data-i18n="tools.quality.preserve.desc">尽量保留源切片的原有编码：完整 tile 原样搬运，边缘不完整 tile 可能被重编码（该部分有损）；不是像素级无损。</span></label>
+            <span class="opt-desc" id="quality-preserve-desc" data-i18n="tools.quality.preserve.desc">尽量保留源切片的原有编码：完整 tile 原样搬运，边缘不完整 tile 可能被重编码（该部分有损）；不是像素级无损。</span></label>
         </div>
         <div class="radio-option">
           <input type="radio" id="quality-compact" name="encoding" value="compact-jpeg-v1" />
           <label for="quality-compact"><span class="opt-title" data-i18n="tools.quality.compact">更小文件（有损）</span>
-            <span class="opt-desc" data-i18n="tools.quality.compact.desc">每个 tile 解码后按固定参数重新编码（仅明场）：文件通常变小，但节省幅度可能有限；不适合颜色定量用途。</span></label>
+            <span class="opt-desc" id="quality-compact-desc" data-i18n="tools.quality.compact.desc">每个 tile 解码后按固定参数重新编码（仅明场）：文件通常变小，但节省幅度可能有限；不适合颜色定量用途。</span></label>
         </div>
       </fieldset>
       <!-- F3（MRXS）/F6（NDPI）：画质正下方一行格式特定说明——瓦片总是拼接后重编码 -->

@@ -60,6 +60,8 @@ const els = {
   qualityRasterNote: $('quality-raster-note'),
   qualityBifNote: $('quality-bif-note'),
   qualityJp2kNote: $('quality-jp2k-note'),
+  qualityPreserveDesc: $('quality-preserve-desc'),
+  qualityCompactDesc: $('quality-compact-desc'),
   qualityLocked: $('quality-locked'),
   moreOptions: $('more-options'),
   probeSection: $('probe-section'),
@@ -1075,6 +1077,7 @@ function renderQualitySection() {
   const show = !!page.prep && probeDoc().modality !== 'fluorescence';
   els.qualityFieldset.hidden = !show;
   updateMrsxQualityNote();
+  applyQualityOptionDescriptions();
   if (!show) return;
   const locked = page.encodingLockedProfile;
   els.qualityFieldset.disabled = !!locked;
@@ -1105,6 +1108,18 @@ function updateMrsxQualityNote() {
   // F2（Aperio JPEG 2000 33003/33005）：没有字节搬运路径，两种画质都是
   // 解码后重编码（有损）
   els.qualityJp2kNote.hidden = !(!!page.prep && fmt.startsWith('aperio-svs-jp2k') && bf);
+}
+
+/// F2：JPEG2000 源没有「原样搬运」——两种画质的选项描述都要换成重编码
+/// 语义（preserve = 逐 tile 解码后高质量重编码 q96 4:2:2；compact = 固定
+/// compact 参数）。非 JP2K 恢复默认文案。语言切换后由 rerenderForLang →
+/// renderQualitySection 重放（applyLang 按 data-i18n 重设默认文本，本函数
+/// 在其之后运行覆盖 JP2K 的情况）。
+function applyQualityOptionDescriptions() {
+  const o = E.qualityOptionDescOverride(probeDoc());
+  if (!els.qualityPreserveDesc || !els.qualityCompactDesc) return;
+  els.qualityPreserveDesc.textContent = t(o ? o.preserve : 'tools.quality.preserve.desc');
+  els.qualityCompactDesc.textContent = t(o ? o.compact : 'tools.quality.compact.desc');
 }
 
 /// 「像素严格无损」与「更小文件（有损）」互斥（U2 要求在 UI 也阻止，核心

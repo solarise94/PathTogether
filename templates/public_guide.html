@@ -5,15 +5,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{{ title }} · HistoPilot</title>
   <meta name="description" content="{{ intro }}" />
+  {% include "_site_icons.html" %}
   <link rel="canonical" href="{{ canonical }}" />
   <link rel="describedby" href="/llms.txt" type="text/markdown" />
   {% if markdown_path %}<link rel="alternate" href="{{ markdown_path }}" type="text/markdown" />{% endif %}
-  <link rel="stylesheet" href="/static/entry.css?v=20261013a" />
+  <link rel="stylesheet" href="/static/entry.css?v=20261013b" />
 </head>
 <body>
   <a class="skip-link" href="#main">跳到主要内容</a>
   <header class="topbar"><nav class="topbar-inner" aria-label="文档导航">
-    <a class="brand" href="/">HistoPilot</a>
+    <a class="brand" href="/">{% include "_brand_logo.html" %}<span>HistoPilot</span></a>
     <div class="topbar-actions"><a class="btn btn-secondary" href="/site-map">网页地图</a><a class="btn btn-primary" href="/tools/slides">转换切片</a></div>
   </nav></header>
   <main id="main" class="public-guide">

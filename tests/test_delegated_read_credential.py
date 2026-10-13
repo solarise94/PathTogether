@@ -82,10 +82,13 @@ class _ForwardStub:
     def __init__(self):
         self.calls = []
         self.body = {"result": {"ok": True}}
+        self.handler = None  # fn(url, json, headers, timeout) -> _Resp
 
     def post(self, url, json=None, headers=None, timeout=None, **kw):
         self.calls.append({"url": url, "json": json, "headers": headers,
                            "timeout": timeout})
+        if self.handler is not None:
+            return self.handler(url, json, headers, timeout)
         return _Resp(200, self.body)
 
 
@@ -239,6 +242,15 @@ def _decode_token(token):
     payload, err = app_mod._delegated_read_token_decode(token)
     assert err is None, err
     return payload
+
+
+def _assert_envelope(r, status, code):
+    body = r.get_json() or {}
+    assert r.status_code == status, "got %s body=%r" % (
+        r.status_code, r.get_data(as_text=True))
+    err = body.get("error") or {}
+    assert err.get("code") == code, err
+    return err
 
 
 # --------------------------------------------------------------------------- #
@@ -572,6 +584,185 @@ def test_histopilot_region_with_run_grant_still_works(monkeypatch):
         r = _post_region(_client(), jwt, sid, delegated=None,
                          extra_headers={"X-Run-Grant": grant["grant_id"]})
     assert r.status_code == 200, r.get_data(as_text=True)
+
+
+# --------------------------------------------------------------------------- #
+# 4. id_bundle 行（legacy_filename=NULL，全部新上传的真实形态）
+#
+# E2E 回归（2026-10-13）：id_bundle 行名通道（get_slide_meta_full
+# WHERE legacy_filename=%s）对 original_filename 恒 miss —— 能力不注入、
+# dispatch 403、委托凭证不签发。修复：能力注入/dispatch 判权/凭证签发在
+# token 携带 slide_id claim 时按 ID 权威解析（_subject_slide_permissions_desc）。
+# --------------------------------------------------------------------------- #
+def _register_id_bundle_slide(monkeypatch, uid="usr_a", name="26-005817.tif",
+                              content=b"idbundle-stub"):
+    """登记 id_bundle 切片并去掉夹具回填的冻结别名（复现 E2E 行形态：
+    legacy_filename NULL + original_filename=展示名）。"""
+    _touch_slide(name, content=content)
+    sid = register_slide_row(name)
+    share_store.set_slide_meta(name, owner_user_id=uid)
+    from _pt_helpers import pg_connection
+    conn = pg_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE slides SET legacy_filename=NULL "
+                        "WHERE slide_id=%s", (sid,))
+        conn.commit()
+    finally:
+        conn.close()
+    return sid
+
+
+def _tool_token_with_sid(slide, slide_id, user_id="usr_a", role="user",
+                         capabilities=None):
+    """带 slide_id claim 的 tool token（_inject_agent_extra_tools 的产出形态）。"""
+    claims = {
+        "sub": user_id,
+        "user_id": user_id,
+        "role": role,
+        "session_id": "",
+        "slide": slide,
+        "slide_id": slide_id,
+        "capabilities": capabilities if capabilities is not None else [FULL_NAME],
+    }
+    return app_mod._agent_tool_token_encode(claims)
+
+
+def test_id_bundle_slide_capabilities_injected_for_owner(monkeypatch):
+    _install_with_known_secret(monkeypatch)
+    sid = _register_id_bundle_slide(monkeypatch, uid="usr_a")
+    name = "26-005817.tif"
+    # owner user：ID 权威判定 → 能力注入
+    caps = app_mod._list_agent_capabilities(
+        {"role": "user", "user_id": "usr_a"}, name, slide_id=sid)
+    assert [(i["plugin_id"], c["name"]) for i, c in caps] == \
+        [(PLUGIN_ID, CAP_NAME)]
+    # 另一用户：同一 id_bundle 切片 → 空（fail-closed，无名回退）
+    caps_b = app_mod._list_agent_capabilities(
+        {"role": "user", "user_id": "usr_b"}, name, slide_id=sid)
+    assert caps_b == []
+    # 未知 slide_id → 空集（fail-closed）
+    assert app_mod._list_agent_capabilities(
+        {"role": "user", "user_id": "usr_a"}, name, slide_id="sld_nope") == []
+
+
+def test_id_bundle_slide_inject_carries_slide_id_claim(monkeypatch):
+    _install_with_known_secret(monkeypatch)
+    sid = _register_id_bundle_slide(monkeypatch, uid="usr_a")
+    name = "26-005817.tif"
+    config = {"max_steps": 20}  # 形如 sidecar config（空 dict 为 falsy 不适用）
+    injected = app_mod._inject_agent_extra_tools(
+        {"role": "user", "user_id": "usr_a"}, name, config, slide_id=sid)
+    assert injected is True
+    assert config["extra_tools"], "能力须进入 extra_tools"
+    payload, err = app_mod._agent_tool_token_decode(config["tool_token"])
+    assert err is None
+    assert payload["slide_id"] == sid
+    assert payload["slide"] == name  # 名仍随 token（body.slide 绑定不变）
+    assert payload["capabilities"] == [FULL_NAME]
+
+
+def test_id_bundle_slide_dispatch_succeeds_and_mints_credential(monkeypatch):
+    installation, secret = _install_with_known_secret(monkeypatch)
+    sid = _register_id_bundle_slide(monkeypatch, uid="usr_a")
+    stub = _ForwardStub()
+    monkeypatch.setattr(app_mod, "requests", stub)
+    token = _tool_token_with_sid("26-005817.tif", sid)
+    r = _dispatch(_client(), stub, token, slide="26-005817.tif")
+    assert r.status_code == 200, r.get_json()
+    delegated = (stub.calls[-1]["headers"] or {}).get(HDR)
+    assert delegated, "id_bundle 切片 dispatch 也必须签发委托凭证"
+    claims = _decode_token(delegated)
+    assert claims["sub"] == installation["installation_id"]
+    assert claims["slide_id"] == sid
+    assert claims["user_id"] == "usr_a"
+
+
+def test_id_bundle_slide_dispatch_denies_other_user(monkeypatch):
+    _install_with_known_secret(monkeypatch)
+    sid = _register_id_bundle_slide(monkeypatch, uid="usr_a")
+    stub = _ForwardStub()
+    monkeypatch.setattr(app_mod, "requests", stub)
+    token = _tool_token_with_sid("26-005817.tif", sid, user_id="usr_b")
+    r = _dispatch(_client(), stub, token, slide="26-005817.tif")
+    _assert_envelope(r, 403, "permission_denied")
+    assert stub.calls == []  # 拒绝前零转发
+
+
+def test_id_bundle_slide_delegated_read_works(monkeypatch):
+    """id_bundle 全链：dispatch 签发 → by-id region 凭证读取 → 200。"""
+    installation, secret = _install_with_known_secret(monkeypatch)
+    sid = _register_id_bundle_slide(monkeypatch, uid="usr_a")
+    stub = _ForwardStub()
+    monkeypatch.setattr(app_mod, "requests", stub)
+    token = _tool_token_with_sid("26-005817.tif", sid)
+    r = _dispatch(_client(), stub, token, slide="26-005817.tif")
+    assert r.status_code == 200, r.get_json()
+    delegated = (stub.calls[-1]["headers"] or {}).get(HDR)
+    assert delegated
+    jwt = _plugin_jwt(installation, secret)
+    mocks = _slide_read_mocks()
+    with mocks[0], mocks[1], mocks[2], \
+            mock.patch.object(app_mod, "_read_region_b64",
+                              return_value=_region_payload()):
+        rr = _post_region(_client(), jwt, sid, delegated=delegated)
+    assert rr.status_code == 200, rr.get_data(as_text=True)
+    assert rr.get_json()["src"] == {"x": 0, "y": 0, "w": 16, "h": 16}
+
+
+def test_id_bundle_slide_revoked_owner_denied_at_dispatch(monkeypatch):
+    """id_bundle 判权按 slides 行实时复查：mint 后归属改判 → dispatch 拒绝。"""
+    _install_with_known_secret(monkeypatch)
+    sid = _register_id_bundle_slide(monkeypatch, uid="usr_a")
+    from _pt_helpers import pg_connection
+    conn = pg_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE slides SET owner_user_id='usr_other' "
+                        "WHERE slide_id=%s", (sid,))
+        conn.commit()
+    finally:
+        conn.close()
+    stub = _ForwardStub()
+    monkeypatch.setattr(app_mod, "requests", stub)
+    token = _tool_token_with_sid("26-005817.tif", sid)
+    r = _dispatch(_client(), stub, token, slide="26-005817.tif")
+    _assert_envelope(r, 403, "permission_denied")
+
+
+def test_legacy_name_slide_still_mints_via_name_path(monkeypatch):
+    """legacy 冻结别名行 + 无 slide_id claim 的历史 token：名通道判定不变。"""
+    installation, secret = _install_with_known_secret(monkeypatch)
+    _register_owned_slide(monkeypatch, "legacy.svs", uid="usr_legacy")
+    stub = _ForwardStub()
+    monkeypatch.setattr(app_mod, "requests", stub)
+    token = _tool_token(slide="legacy.svs", user_id="usr_legacy")
+    r = _dispatch(_client(), stub, token, slide="legacy.svs")
+    assert r.status_code == 200, r.get_json()
+    delegated = (stub.calls[-1]["headers"] or {}).get(HDR)
+    assert delegated
+    assert _decode_token(delegated)["slide_id"] == \
+        share_store.get_slide_id("legacy.svs")
+
+
+def test_dispatch_plugin_5xx_surfaces_plugin_code_in_details(monkeypatch):
+    """插件 5xx 保持 capability_unavailable 契约，细分码经 details 透出。"""
+    _install_with_known_secret(monkeypatch)
+    _register_owned_slide(monkeypatch)
+    stub = _ForwardStub()
+
+    def _handler(*a):
+        return _Resp(503, {"error": {"code": "inference_busy",
+                                     "message": "GPU busy", "retryable": True}})
+    stub.handler = _handler
+    monkeypatch.setattr(app_mod, "requests", stub)
+    r = _dispatch(_client(), stub, _tool_token())
+    assert r.status_code == 503
+    err = r.get_json()["error"]
+    assert err["code"] == "capability_unavailable"  # 契约码不变
+    assert err["retryable"] is True
+    assert err["details"]["reason"] == "plugin_5xx"
+    assert err["details"]["plugin_code"] == "inference_busy"
 
 
 if __name__ == "__main__":

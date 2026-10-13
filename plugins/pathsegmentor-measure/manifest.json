@@ -1,0 +1,70 @@
+{
+  "manifestSchemaVersion": "1.1.0",
+  "id": "dev.pathsegmentor.measure",
+  "name": "PathSegmentor Measure",
+  "pluginVersion": "0.1.0",
+  "pluginContractVersion": "1.1.0",
+  "bridgeProtocolVersion": "1.0.0",
+  "ui": {
+    "entry": "/plugins/pathsegmentor-measure/ui/main.js",
+    "slots": ["viewer.right-panel"]
+  },
+  "service": {
+    "baseUrl": "http://127.0.0.1:8062",
+    "health": "/healthz"
+  },
+  "permissions": [
+    "slide:metadata:read",
+    "slide:region:read"
+  ],
+  "provides": [
+    {
+      "name": "segment_region",
+      "version": "1.0.0",
+      "description": "在给定 level-0 整数 bbox（x,y,w,h）内用 PathSegmentor 语义分割模型分割指定目标（object：如 nuclei、lymphocytes、tumor cells、gland），返回前景面积（level-0 像素与 µm²）、ROI 面积占比、近似目标计数（连通域，语义分割故为近似值）、尺寸分布摘要，以及最多 20 个最大连通域的 level-0 bbox 与质心（可用于标注示例）。bbox 面积不得超过平台 ROI 上限（超限拒绝）；可选 region 提供组织/器官语境，threshold 覆盖模型默认阈值。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "integer",
+            "description": "level-0 bbox 左上角 X（整数像素，≥0）"
+          },
+          "y": {
+            "type": "integer",
+            "description": "level-0 bbox 左上角 Y（整数像素，≥0）"
+          },
+          "w": {
+            "type": "integer",
+            "description": "level-0 bbox 宽（整数像素，>0；x+w 不得超过切片宽）"
+          },
+          "h": {
+            "type": "integer",
+            "description": "level-0 bbox 高（整数像素，>0；y+h 不得超过切片高）"
+          },
+          "object": {
+            "type": "string",
+            "description": "要分割的目标名称（受控文本提示），如 nuclei、lymphocytes、tumor cells、gland"
+          },
+          "region": {
+            "type": "string",
+            "description": "可选的组织/器官语境提示，如 liver tissue、colon"
+          },
+          "threshold": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "可选的前景判定阈值（0..1），缺省用模型默认值"
+          }
+        },
+        "required": ["x", "y", "w", "h", "object"]
+      },
+      "accessMode": "read",
+      "requiredPermissions": [
+        "slide:metadata:read",
+        "slide:region:read"
+      ],
+      "timeout_ms": 55000,
+      "agent_exposed": true
+    }
+  ]
+}

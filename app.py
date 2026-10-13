@@ -13754,6 +13754,33 @@ _AGENT_TOOL_TYP = "agent-tool"
 _AI_SESSION_TTL_SECONDS = int(os.environ.get("AI_SESSION_TTL_SECONDS") or 86400)
 _AGENT_TOOL_TOKEN_TTL_SECONDS = _AI_SESSION_TTL_SECONDS + 600
 
+# ---------------------------------------------------------------------------
+# 委托读凭证（delegated read token，测量插件读用户 ROI 的最小授权）
+#
+# 阻塞缺口（docs/measurement-models-homepc-implementation.md §1）：run grant
+# 只发给 HistoPilot installation（_issue_run_grant），_plugin_slide_run_grant_gate
+# 按调用插件的 installation 校验——新的测量插件持有自身 region:read plugin JWT
+# 在普通用户切片上仍会 403。dispatch 在 agent token / 用户实时权限 / 插件启用
+# 全部通过后，为本次调用签发**短时、只读、绑定**{plugin installation, user,
+# slide_id, revision, capability, ROI 像素上限, exp, jti} 的 HS256 凭证（与
+# plugin JWT 同密钥域、独立 aud/typ，按 typ 拒绝跨域混用），经转发请求头
+# 交插件后端；插件用它调 by-id region / slide-info 端点时按 claim 逐项复核
+# （_plugin_delegated_read_gate）。不授予任何写能力、不继承 HistoPilot 的
+# grant/secret，不进 Agent 可见结果与日志。
+# ---------------------------------------------------------------------------
+_DELEGATED_READ_AUDIENCE = "plugin-delegated-read"
+_DELEGATED_READ_TYP = "delegated-read"
+#: 凭证头名（dispatch → 插件后端 → 平台 by-id 读端点，同名透传）
+_DELEGATED_READ_HEADER = "X-Delegated-Read-Token"
+#: TTL ≤120s：插件拿到后立即用，覆盖一次 region 读取量级；过期即失效
+#: （撤销主路径 = dispatch 不再签发；TTL 仅兜底，与 run grant 同思路）
+_DELEGATED_READ_TTL_SECONDS = max(1, min(
+    int(os.environ.get("PLUGIN_DELEGATED_READ_TTL_SECONDS") or 120), 120))
+#: 单凭证可读的 level-0 bbox 像素上限（w*h）：4096² 默认，≈0.5µm/px 下 ~2mm²
+#: 量级的有界 ROI——阻断「整张切片当一个 ROI」的全片调用；env 可收紧
+_DELEGATED_READ_ROI_MAX_PIXELS = max(1, int(os.environ.get(
+    "PLUGIN_DELEGATED_ROI_MAX_PIXELS") or (4096 * 4096)))
+
 
 def _plugin_secret_file(plugin_id: str) -> Path:
     """安装凭证明文文件路径（SHARE_DATA_DIR 下，0600）。"""
@@ -13932,6 +13959,41 @@ def _agent_tool_token_decode(token: str, key: bytes = None):
     if (payload.get("iss") != _PLUGIN_JWT_ISSUER
             or payload.get("aud") != _AGENT_TOOL_AUDIENCE
             or payload.get("typ") != _AGENT_TOOL_TYP):
+        return None, "invalid_token"
+    return payload, None
+
+
+def _delegated_read_token_encode(claims: dict) -> str:
+    """签发委托读凭证（与 plugin JWT 同密钥、独立 aud/typ 域，§10-4 同款）。
+
+    claims 由 dispatch 门槛通过后组装（sub=installation_id/user_id/role/
+    slide_id/revision/capability/roi_max_pixels）；本函数只补 iss/aud/typ 与
+    TTL（≤120s，_DELEGATED_READ_TTL_SECONDS）。jti/iat/exp 由 _plugin_jwt_encode
+    统一补。
+    """
+    body = dict(claims)
+    body.setdefault("iss", _PLUGIN_JWT_ISSUER)
+    body.setdefault("aud", _DELEGATED_READ_AUDIENCE)
+    body.setdefault("typ", _DELEGATED_READ_TYP)
+    return _plugin_jwt_encode(body, ttl=_DELEGATED_READ_TTL_SECONDS)
+
+
+def _delegated_read_token_decode(token: str, key: bytes = None):
+    """校验并解码委托读凭证。
+
+    与 _plugin_jwt_decode 同一套签名/exp 校验，但要求 aud==plugin-delegated-read
+    且 typ==delegated-read（同密钥域不同 typ，按 typ 拒绝跨域使用——plugin
+    JWT / agent-tool-token 在此解码为 invalid，反之亦然）。
+    返回 (payload, None) 或 (None, err)（err 语义同 _plugin_jwt_decode）。
+    """
+    if key is None:
+        key = _PLUGIN_JWT_KEY
+    payload, err = _hs256_jwt_verify(token, key)
+    if err is not None:
+        return None, err
+    if (payload.get("iss") != _PLUGIN_JWT_ISSUER
+            or payload.get("aud") != _DELEGATED_READ_AUDIENCE
+            or payload.get("typ") != _DELEGATED_READ_TYP):
         return None, "invalid_token"
     return payload, None
 
@@ -19098,6 +19160,13 @@ def plugin_v1_slide_info_by_id(slide_id):
     safe, gate, serr = _plugin_resolve_slide_by_id(slide_id)
     if serr is not None:
         return serr
+    # 委托读凭证（测量插件取 MPP/尺寸）：带凭证头时逐 claim 复核（无 ROI
+    # 上限项）；不带凭证保持既有行为（本端点本就无 run grant gate，纯增量）。
+    if (request.headers.get(_DELEGATED_READ_HEADER) or "").strip():
+        derr = _plugin_delegated_read_gate(claims, gate.slide_id if gate is not None else None,
+                                           gate, check_bbox_cap=False)
+        if derr is not None:
+            return derr
     return _plugin_v1_slide_info_impl(safe, gate)
 
 
@@ -19195,10 +19264,18 @@ def plugin_v1_region_impl(slide=None, slide_id=None):
     if serr is not None:
         return serr
     _region_path = _desc_path(gate) if gate is not None else (UPLOAD_DIR / safe)
-    gerr = _plugin_slide_run_grant_gate(safe, claims, slide_id=sid)
-    if gerr is not None:
-        return gerr
     body = request.get_json(silent=True) or {}
+    if (request.headers.get(_DELEGATED_READ_HEADER) or "").strip():
+        # 委托读凭证通道（测量插件）：逐 claim 复核（含 ROI 上限），通过则
+        # 替代 run grant gate；像素预算/并发闸在 _plugin_region_body 照常生效。
+        derr = _plugin_delegated_read_gate(claims, sid, gate, body=body,
+                                           check_bbox_cap=True)
+        if derr is not None:
+            return derr
+    else:
+        gerr = _plugin_slide_run_grant_gate(safe, claims, slide_id=sid)
+        if gerr is not None:
+            return gerr
     return _plugin_region_body(claims, safe, gate, sid, _region_path, body)
 
 
@@ -21460,6 +21537,163 @@ def plugin_v1_capabilities():
 #      capability_unavailable（retryable）；
 #   ⑦ result JSON ≤64KB，超限截断并附 truncated: true。
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# 委托读凭证（delegated read token）：dispatch 签发 + by-id 读端点复核
+#
+# 签发时机：dispatch ①验签 tool token → ②插件+能力 enabled → ③用户对 slide
+# 实时权限 → ④限流 全部通过之后、⑥转发之前。解析 slide_id/revision 失败时
+# **不签发也不阻断**转发（不带凭证的转发与旧形为一致；需要读图的插件后端会
+# 以 missing credential 拒绝——fail-safe，无提权面）。凭证只放转发请求头，
+# 不入 forward body（既有 body 形状 {slide, arguments} 不变）、不入审计、
+# 不入 Agent 可见结果。
+# --------------------------------------------------------------------------- #
+def _mint_delegated_read_token(agent_claims, plugin_installation_id, slide,
+                               capability_name):
+    """为本次 dispatch 调用签发委托读凭证；返回 token 或 None（不签发）。
+
+    绑定 claims：sub=插件 installation_id（读端点按此限定「只有该 installation
+    的 plugin JWT 能用这张凭证」）、user_id/role（读时按此**实时**复查 view
+    权限）、slide_id（稳定 ID，防名伪造）、revision（内容型 revision，切片
+    替换后失效）、capability、roi_max_pixels（level-0 bbox w*h 上限）。
+    exp/jti 由 _plugin_jwt_encode 统一补（TTL ≤120s）。
+    """
+    user_id = str(agent_claims.get("user_id") or agent_claims.get("sub") or "")
+    role = str(agent_claims.get("role") or user_store.ROLE_USER)
+    if not user_id or not plugin_installation_id:
+        return None
+    try:
+        slide_id = share_store.get_slide_id(slide)
+        desc = slide_store.resolve_slide_id(slide_id) if slide_id else None
+    except Exception:
+        app.logger.warning("委托读凭证 slide 解析失败（本次不签发）：%s",
+                           slide, exc_info=True)
+        return None
+    if desc is None:
+        return None
+    revision = _slide_revision(desc)
+    if not revision:
+        # 内容 revision 缺失（发布中断等防御态）：无法绑定切片代际，不签发
+        return None
+    return _delegated_read_token_encode({
+        "sub": plugin_installation_id,
+        "user_id": user_id,
+        "role": role,
+        "slide_id": slide_id,
+        "revision": revision,
+        "capability": capability_name,
+        "roi_max_pixels": _DELEGATED_READ_ROI_MAX_PIXELS,
+    })
+
+
+def _delegated_bbox_pixels(body):
+    """从 region 请求体取 level-0 bbox 面积（契约 bbox 形态 / legacy 平铺同给
+    时以平铺为准，与 _plugin_region_body 同口径）；不可解析返回 None。"""
+    if not isinstance(body, dict):
+        return None
+    bbox = body.get("bbox")
+    flat = dict(body)
+    if isinstance(bbox, dict):
+        for k in ("x", "y", "w", "h"):
+            if k in bbox and k not in flat:
+                flat[k] = bbox[k]
+
+    def _int(k):
+        try:
+            return int(flat.get(k))
+        except (TypeError, ValueError):
+            return None
+    x, y, w, h = _int("x"), _int("y"), _int("w"), _int("h")
+    if x is None or y is None or w is None or h is None:
+        return None
+    if x < 0 or y < 0 or w <= 0 or h <= 0:
+        return None
+    return w * h
+
+
+def _plugin_delegated_read_gate(plugin_claims, sid, gate, *, body=None,
+                                check_bbox_cap=False):
+    """委托读凭证复核（by-id region / slide-info 读通道；fail-closed）。
+
+    前置：调用端点的 plugin JWT 已过 _require_plugin_token（installation
+    存在 + enabled 每次回查 + scope 检查）。本闸只在请求带
+    X-Delegated-Read-Token 时介入；验证项（全部在**读时**重查）：
+      1. 签名/iss/aud/typ/exp（域隔离：plugin JWT / agent-tool-token 拒绝）；
+      2. claims.sub == 调用插件 installation（他 installation 拾到的凭证无用）
+         且该 installation 仍存在并 enabled；
+      3. claims.slide_id == 请求 slide_id（错切片拒绝）；
+      4. claims.user_id/role 对切片的 view 权限实时复查（mint 后撤权即拒；
+         与 run grant 复核同一判定源 _ai_session_subject_can_view）；
+      5. claims.revision == 当前内容 revision（切片替换/重发布后失效）；
+      6. （region）claims.roi_max_pixels：bbox w*h ≤ 上限（阻断全片 ROI）。
+    通过后仍走既有像素预算/并发闸（_plugin_region_body 内，不豁免）。
+    返回 None（放行，且调用方**跳过** run grant gate）或错误响应。
+    """
+    token = (request.headers.get(_DELEGATED_READ_HEADER) or "").strip()
+    claims, err = _delegated_read_token_decode(token)
+    if err is not None:
+        if err == "token_expired":
+            return _plugin_error(401, "token_expired",
+                                 "委托读凭证已过期，请重新发起能力调用")
+        return _plugin_error(401, "unauthorized", "委托读凭证无效")
+    inst_id = str(claims.get("sub") or "")
+    if not inst_id or inst_id != (plugin_claims or {}).get("sub"):
+        return _plugin_error(403, "forbidden",
+                             "委托读凭证与调用插件安装不符")
+    installation = share_store.get_plugin_installation(inst_id)
+    if installation is None or not installation.get("enabled"):
+        return _plugin_error(401, "unauthorized", "插件安装不存在或已停用")
+    if str(claims.get("slide_id") or "") != (sid or ""):
+        return _plugin_error(403, "forbidden", "委托读凭证绑定切片不符")
+    role = str(claims.get("role") or "")
+    uid = str(claims.get("user_id") or "")
+    if not _ai_session_subject_can_view(role, uid, gate):
+        return _plugin_error(403, "forbidden",
+                             "发起用户当前对该切片无读取权限")
+    current_revision = _slide_revision(gate) if gate is not None else ""
+    if not current_revision or current_revision != str(claims.get("revision") or ""):
+        return _plugin_error(409, "slide_revision_conflict",
+                             "切片已变更，委托读凭证失效，请重新发起能力调用")
+    if check_bbox_cap:
+        pixels = _delegated_bbox_pixels(body)
+        cap = claims.get("roi_max_pixels")
+        try:
+            cap = int(cap)
+        except (TypeError, ValueError):
+            return _plugin_error(401, "unauthorized", "委托读凭证无效")
+        if pixels is None:
+            return _plugin_error(400, "invalid_request",
+                                 "x/y/w/h 参数需为整数且 0<=x,y、0<w,h")
+        if pixels > cap:
+            return _plugin_error(
+                403, "forbidden",
+                "ROI 超出委托读凭证上限（%d > %d level-0 像素）" % (pixels, cap),
+                details={"reason": "roi_over_cap", "pixels": pixels,
+                         "max_pixels": cap})
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# 插件能力 dispatch 端点（插件能力层 docs §4.2，P1）
+#
+# 平台是唯一分发点（D1）：所有能力调用经本端点转发，鉴权/启用/权限/限流/
+# 审计单点收口，消费方（sidecar/agent）永不直连插件 baseUrl。P1 消费主体仅
+# agent（agent-tool-token，用户代理）；plugin JWT 调 dispatch 属 P2，明确 403。
+#
+# 门槛顺序（docs §4.2，顺序即语义）：
+#   ① 验签 tool token（typ/exp/session/slide/能力清单 claims）；
+#   ② 插件 + 能力 enabled，否则 404（不泄露存在性）；
+#   ③ 权限检查（D3：发起用户对 slide 的权限 ∩ requiredPermissions，共用
+#      _subject_slide_permissions 映射表）；
+#   ④ 限流：(session, capability) 维度 token bucket → 429 + Retry-After；
+#   ⑤ 审计 plugin_capability_dispatch（主体/session/plugin/capability/slide/
+#      耗时/结果码）；
+#   ⑥ 转发插件 service.baseUrl + POST /capabilities/{name}，带
+#      X-Dispatch-Principal 头（主体类型/id/session）；插件 5xx/超时映射
+#      capability_unavailable（retryable）；
+#   ⑦ result JSON ≤64KB，超限截断并附 truncated: true。
+#   ⑥' ④ 之后另签发委托读凭证（X-Delegated-Read-Token 头）随转发下发，
+#      供测量插件经 by-id region 端点读取用户 ROI（见上一节）。
+# --------------------------------------------------------------------------- #
 def _capability_timeout_ms(cap):
     """登记项 timeout_ms → 转发超时毫秒（clamp 到 [1, 60000]，缺省 15000）。"""
     try:
@@ -21661,6 +21895,13 @@ def plugin_v1_dispatch(plugin_id, capability_name):
         "session_id": session_id,
     }, ensure_ascii=True, separators=(",", ":"))
     forward_body = {"slide": slide, "arguments": body.get("arguments") or {}}
+    # ⑥' 委托读凭证：全部门槛通过后签发，仅随转发头下发（不进 body/审计/
+    # Agent 结果）。解析失败不签发不阻断（fail-safe，见 _mint_delegated_read_token）。
+    forward_headers = {"X-Dispatch-Principal": principal}
+    delegated_token = _mint_delegated_read_token(
+        claims, installation.get("installation_id") or "", slide, capability_name)
+    if delegated_token:
+        forward_headers[_DELEGATED_READ_HEADER] = delegated_token
     timeout_sec = _capability_timeout_ms(cap) / 1000.0
     try:
         # 安装时批准的是登记的 baseUrl；30x 目标未经批准——禁止跟随重定向
@@ -21669,7 +21910,7 @@ def plugin_v1_dispatch(plugin_id, capability_name):
         r = requests.post(
             "%s/capabilities/%s" % (base_url, capability_name),
             json=forward_body,
-            headers={"X-Dispatch-Principal": principal},
+            headers=forward_headers,
             timeout=timeout_sec,
             allow_redirects=False)
     except (requests.ConnectionError, requests.Timeout):

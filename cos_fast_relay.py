@@ -136,13 +136,41 @@ def _deadline_seconds(timeout) -> float:
     return value if value > 0 else 120.0
 
 
+def _partial_bytes(exc) -> bytes:
+    """从传输错误里取出已收到的部分字节（早 EOF 时不可丢弃）。
+
+    urllib3/http.client 在已知长度响应提前断流时抛 ``IncompleteRead``，
+    把已读字节放在 ``.partial``；不取回这些字节会让 wire 记账少算实际
+    传输量（worker 按实收字节计 wire）。
+    """
+    for attr in ("partial", "partial_data"):
+        val = getattr(exc, attr, None)
+        if isinstance(val, (bytes, bytearray)):
+            return bytes(val)
+    return b""
+
+
+def _requested_len(range_header: str) -> Optional[int]:
+    """``bytes=start-end`` → end-start+1；不可解析返回 None。"""
+    if not range_header or not range_header.startswith("bytes="):
+        return None
+    try:
+        start_s, end_s = range_header[len("bytes="):].split("-", 1)
+        start, end = int(start_s), int(end_s)
+    except (ValueError, AttributeError):
+        return None
+    length = end - start + 1
+    return length if length >= 0 else None
+
+
 class _FastStreamWrap:
     """fast 206 响应的 worker 消费形状（对照 ``cos_client._StreamWrap``）。
 
     ``read`` 契约：**绝不把传输错误抛进 worker**。任何 body 中途错误
     （urllib3/requests ProtocolError、IncompleteRead、ReadTimeout、
     ConnectionError、OSError 等）或超出每请求总时限 → 关闭连接并返回
-    ``b""``；worker 据此按 early EOF 计入 wire、不 checkpoint。
+    ``b""``；worker 据此按 early EOF 计入 wire、不 checkpoint。早 EOF 时
+    若异常携带已读部分字节，先返回该部分（计入 wire）再收口。
     """
 
     def __init__(self, response, deadline: float):
@@ -174,9 +202,10 @@ class _FastStreamWrap:
             return b""
         try:
             buf = self._response.raw.read(want)
-        except Exception:  # noqa: BLE001  # 传输错误一律按 early EOF 处理
+        except Exception as exc:  # noqa: BLE001  # 传输错误按 early EOF 处理
             self.close()
-            return b""
+            # 早 EOF：异常可能携带已读字节，不可丢弃（否则 wire 少算）。
+            return _partial_bytes(exc)
         if not buf:
             self.close()
             return b""
@@ -254,5 +283,34 @@ def get_object(key: str, version_id: str, range_header: Optional[str] = None,
         raise cos_client.CosAdapterError(
             "COS GET %s 失败：HTTP %d%s (fast)" % (
                 cos_client._key_shape(key), status, detail))
+
+    # 206 传输级合同校验（relay contract §Success）：在把响应交给 worker 读取
+    # 之前拒绝错的流，避免 worker 把坏响应当数据/提前烧 wire。消息只含固定
+    # 错误码，不含版本值、token 或完整 key。
+    def _reject(code):
+        try:
+            response.close()
+        except Exception:  # noqa: BLE001
+            pass
+        raise cos_client.CosAdapterError(
+            "COS GET %s 失败：HTTP 206 %s (fast)" % (
+                cos_client._key_shape(key), code))
+
+    served_version = response.headers.get("X-HP-Version-Id")
+    if served_version is None or str(served_version) != str(version_id):
+        _reject("version_mismatch")
+    content_encoding = response.headers.get("Content-Encoding")
+    if content_encoding is not None and \
+            str(content_encoding).strip().lower() != "identity":
+        _reject("content_encoding")
+    declared_len = response.headers.get("Content-Length")
+    if declared_len is not None:
+        wanted = _requested_len(str(range_header))
+        try:
+            declared_int = int(str(declared_len).strip())
+        except ValueError:
+            _reject("length_mismatch")
+        if wanted is None or declared_int != wanted:
+            _reject("length_mismatch")
 
     return _FastStreamWrap(response, deadline)

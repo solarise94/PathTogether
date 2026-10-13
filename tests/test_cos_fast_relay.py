@@ -47,6 +47,15 @@ class _RelayHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):  # 静音
         pass
 
+    def log_error(self, *a):  # 静音（客户端提前关闭会触发）
+        pass
+
+    def _write(self, data):
+        try:
+            self.wfile.write(data)
+        except OSError:
+            pass
+
     def do_GET(self):  # noqa: N802
         srv = self.server
         srv.requests.append({
@@ -71,7 +80,7 @@ class _RelayHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            self._write(body)
             return
         if mode == "full200":
             body = srv.object_bytes
@@ -79,22 +88,51 @@ class _RelayHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            self._write(body)
             return
-        # 正常 206：解析 Range
+
+        # 206：解析 Range
         start, end = _parse_range(self.headers.get("Range"))
         size = len(srv.object_bytes)
         chunk = srv.object_bytes[start:end + 1]
-        if mode == "early_eof":
-            # 声明完整长度但只发一部分就断流
-            self.send_response(206)
-            self.send_header("Content-Range",
-                             "bytes %d-%d/%d" % (start, end, size))
-            self.send_header("Content-Length", str(len(chunk)))
-            self.end_headers()
-            half = chunk[: max(1, len(chunk) // 2)]
-            self.wfile.write(half)
+        version = self.headers.get("X-HP-Version-Id", "")
+        content_length = str(len(chunk))
+        content_encoding = None
+        version_out = version
+
+        if mode == "no_version_header":
+            version_out = None
+        elif mode == "wrong_version_header":
+            version_out = "ver-other"
+        elif mode == "gzip":
+            content_encoding = "gzip"
+        elif mode == "wrong_content_length":
+            content_length = str(len(chunk) + 7)
+
+        self.send_response(206)
+        self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+        self.send_header("Content-Length", content_length)
+        if version_out is not None:
+            self.send_header("X-HP-Version-Id", version_out)
+        if content_encoding is not None:
+            self.send_header("Content-Encoding", content_encoding)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.end_headers()
+
+        if mode == "stall":
             self.wfile.flush()
+            time.sleep(srv.stall_seconds)
+            return
+        if mode == "early_eof":
+            if srv.send_bytes is None:
+                sent = chunk[: max(1, len(chunk) // 2)]
+            else:
+                sent = chunk[: srv.send_bytes]
+            self._write(sent)
+            try:
+                self.wfile.flush()
+            except OSError:
+                pass
             # 直接关闭连接（Content-Length 未满足 → 客户端 IncompleteRead）
             self.close_connection = True
             try:
@@ -102,23 +140,7 @@ class _RelayHandler(http.server.BaseHTTPRequestHandler):
             except OSError:
                 pass
             return
-        if mode == "stall":
-            self.send_response(206)
-            self.send_header("Content-Range",
-                             "bytes %d-%d/%d" % (start, end, size))
-            self.send_header("Content-Length", str(len(chunk)))
-            self.end_headers()
-            self.wfile.flush()
-            time.sleep(srv.stall_seconds)
-            return
-        self.send_response(206)
-        self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
-        self.send_header("Content-Length", str(len(chunk)))
-        self.send_header("X-HP-Version-Id", self.headers.get(
-            "X-HP-Version-Id", ""))
-        self.send_header("Content-Type", "application/octet-stream")
-        self.end_headers()
-        self.wfile.write(chunk)
+        self._write(chunk)
 
 
 def _parse_range(value):
@@ -126,15 +148,24 @@ def _parse_range(value):
     return int(start_s), int(end_s)
 
 
+class _QuietServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):  # 断流/提前关闭属预期
+        pass
+
+
 class RelayServer:
-    def __init__(self, object_bytes=b"", mode=None, stall_seconds=30):
+    def __init__(self, object_bytes=b"", mode=None, stall_seconds=30,
+                 send_bytes=None):
         self.requests = []
-        self.httpd = http.server.ThreadingHTTPServer(
+        self.httpd = _QuietServer(
             ("127.0.0.1", 0), _RelayHandler)
         # handler 通过 self.server.* 读取实例态
         self.httpd.object_bytes = object_bytes
         self.httpd.mode = mode
         self.httpd.stall_seconds = stall_seconds
+        self.httpd.send_bytes = send_bytes
         self.httpd.requests = self.requests
         self.thread = threading.Thread(
             target=self.httpd.serve_forever, daemon=True)
@@ -161,8 +192,8 @@ class RelayServer:
 def relay_factory():
     servers = []
 
-    def make(object_bytes=b"", mode=None, stall_seconds=30):
-        srv = RelayServer(object_bytes, mode, stall_seconds)
+    def make(object_bytes=b"", mode=None, stall_seconds=30, send_bytes=None):
+        srv = RelayServer(object_bytes, mode, stall_seconds, send_bytes)
         servers.append(srv)
         return srv
 
@@ -299,6 +330,46 @@ def test_fast_error_statuses_sanitized(
 
 
 # --------------------------------------------------------------------------- #
+# 4b) 206 传输级合同校验（版本头 / Content-Encoding / Content-Length）
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("mode,code", [
+    ("no_version_header", "version_mismatch"),
+    ("wrong_version_header", "version_mismatch"),
+    ("gzip", "content_encoding"),
+    ("wrong_content_length", "length_mismatch"),
+])
+def test_fast_206_contract_violations_rejected(
+        monkeypatch, relay_factory, token_file, caplog, mode, code):
+    relay = relay_factory(object_bytes=_payload(60), mode=mode)
+    _enable_fast(monkeypatch, relay.base_url, token_file)
+    with caplog.at_level(logging.DEBUG):
+        _log.setLevel(logging.DEBUG)
+        with pytest.raises(cos_client.CosAdapterError) as ei:
+            ciw._fetch_range(cos_client, _KEY, _VERSION, 0, 9, 60)
+    msg = str(ei.value)
+    assert "HTTP 206" in msg and code in msg
+    # 不含版本值/token/完整 key
+    for blob in (msg, caplog.text):
+        assert _TOKEN not in blob
+        assert _KEY not in blob
+        assert _VERSION not in blob
+        assert "ver-other" not in blob
+    _log.setLevel(logging.NOTSET)
+
+
+def test_fast_206_contract_violation_no_data_accepted(
+        monkeypatch, relay_factory, token_file):
+    # 即使 Content-Range 正确，Content-Length lie 也必须在读取前拒绝：
+    # _fetch_range 不返回数据（异常在 get_object 内抛，未产生任何采纳字节）。
+    relay = relay_factory(object_bytes=_payload(60), mode="wrong_content_length")
+    _enable_fast(monkeypatch, relay.base_url, token_file)
+    accepted = []
+    with pytest.raises(cos_client.CosAdapterError):
+        accepted.append(ciw._fetch_range(cos_client, _KEY, _VERSION, 0, 9, 60))
+    assert accepted == []
+
+
+# --------------------------------------------------------------------------- #
 # 5) 206 后早 EOF → (None, wire)，不抛
 # --------------------------------------------------------------------------- #
 def test_fast_early_eof_returns_none_wire(monkeypatch, relay_factory, token_file):
@@ -310,6 +381,27 @@ def test_fast_early_eof_returns_none_wire(monkeypatch, relay_factory, token_file
     assert 0 < wire < 50  # 实收字节计入 wire（不足声明长度）
     # wire 精确等于服务端实际写出的字节数
     assert wire == 25
+
+
+def test_fast_early_eof_large_chunk_exact_wire(
+        monkeypatch, relay_factory, token_file):
+    """真实 8 MiB 块 + worker 真实 _IO_BUF_BYTES(=1 MiB) 读：
+    服务端只发 3_000_000 字节后关闭 → wire 精确等于 3_000_000。
+
+    验证 urllib3 在 1 MiB raw.read 命中短 body 时不丢部分字节（若丢，
+    wire 会偏小，见 _partial_bytes 兜底）。
+    """
+    total = 8_000_000  # worker 生产分块（_env 夹具把 ciw 常量缩到 30，故硬编码）
+    payload = bytes(total + 10)  # 对象比一个块略大 → 中间块请求
+    relay = relay_factory(object_bytes=payload, mode="early_eof",
+                          send_bytes=3_000_000)
+    _enable_fast(monkeypatch, relay.base_url, token_file)
+    monkeypatch.setattr(cos_config, "COS_FAST_RELAY_READ_TIMEOUT", 30)
+    assert ciw._IO_BUF_BYTES == 1024 * 1024  # worker 真实读块（1 MiB）
+    data, wire = ciw._fetch_range(
+        cos_client, _KEY, _VERSION, 0, total - 1, total + 10)
+    assert data is None
+    assert wire == 3_000_000  # 精确等于实收字节
 
 
 # --------------------------------------------------------------------------- #

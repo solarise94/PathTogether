@@ -1,5 +1,7 @@
 # COS 经 fast 纯流式转发下载设计
 
+> 2026-10-13 最终部署：实际维护入口为用户配置的 `tencentfast`，服务目录 `/opt/gokapi-relay`。历史调查使用的 Tencent Ubuntu 主机不是当前 DNS 入口，该主机已恢复原服务。平台使用 `https://goapi.solarise94.fun`，通过 DNS 解析，不固定 IP；fast 容器内 COS 域名解析到同地域内网。纯流式通道已经上线，验收与回滚见 [本轮发布记录](closeout-release-20261013.md)。以下现状表保留调查时快照，不作为新部署目录。
+
 日期：2026-10-13。状态：Review 与待实现设计。读者：后续实现及部署负责人。
 
 ## 结论与范围

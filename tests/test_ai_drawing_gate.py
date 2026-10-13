@@ -42,7 +42,7 @@ import pytest  # noqa: E402
 import share_store  # noqa: E402
 import app as app_mod  # noqa: E402
 from _pt_helpers import (FakeRequests, FakeResponse, csrf_client,  # noqa: E402
-                         isolate_app, register_slide_row)
+                         isolate_app, real_json_response, register_slide_row)
 
 
 @pytest.fixture(autouse=True)
@@ -484,6 +484,116 @@ def test_proxy_close_cas_failure_returns_503(monkeypatch):
     assert r.get_json()["code"] == "mirror_write_failed"
     # 预写仍已生效（本地收紧不受影响），用户刷新/重试即可对齐
     assert share_store.get_ai_session_drawing_flag("sess1") is False
+
+
+# =========================================================================== #
+# 回归（2026-10）：_proxy_json 的 on_response 必须按 requests.Response 解析。
+# 历史 bug：对真 Response 调 Flask 的 r.get_json(silent=True) → AttributeError
+# 被「回调异常兜底」吞掉 → 生产所有 on_response 回调（drawing 镜像 CAS/稳定
+# 错误、detail drawing_mirror 回填、cancel/archive 撤 grant）静默失效；而
+# FakeResponse 恰好实现了 get_json，把既有用例全部「测绿」。本节用例统一走
+# **真实 requests.Response**（real_json_response，无 get_json 方法）。
+# =========================================================================== #
+def _install_real_response_sidecar(monkeypatch, status=200, body=None,
+                                   ctype="application/json", raw=None,
+                                   path="/session/sess1/drawing",
+                                   method="POST"):
+    fake = FakeRequests()
+    fake.register(method, path,
+                  lambda b, q, h, k: real_json_response(
+                      status, body, ctype=ctype, raw=raw))
+    monkeypatch.setattr(app_mod, "requests", fake)
+    return fake
+
+
+def test_proxy_mirror_toggle_with_real_requests_response(monkeypatch):
+    """真实 requests.Response：HP 200 + 权威布尔 → 镜像照常 CAS（回调确实跑）。"""
+    _mock_proxy_owner(monkeypatch)
+    c = _browser_client(app_mod.app)
+    _install_real_response_sidecar(
+        monkeypatch, 200, {"ok": True, "allow_ai_drawing": True})
+    assert _proxy_toggle(c, enabled=True).status_code == 200
+    assert share_store.get_ai_session_drawing_flag("sess1") is True
+
+    _install_real_response_sidecar(
+        monkeypatch, 200, {"ok": True, "allow_ai_drawing": False})
+    assert _proxy_toggle(c, enabled=False).status_code == 200
+    assert share_store.get_ai_session_drawing_flag("sess1") is False
+
+
+def test_proxy_cas_failure_override_with_real_requests_response(monkeypatch):
+    """真实 requests.Response：CAS 抛错 → 稳定 503 mirror_write_failed
+    （第四轮 P2 覆盖路径；修复前回调被 AttributeError 吞掉 → 透传 HP 200
+    假成功，浏览器把镜像未知的操作显示为已开启）。"""
+    _mock_proxy_owner(monkeypatch)
+    c = _browser_client(app_mod.app)
+    share_store.upsert_ai_session_drawing_flag("sess1", False)
+    _install_real_response_sidecar(
+        monkeypatch, 200, {"ok": True, "allow_ai_drawing": True})
+
+    def _boom(sid, val, max_gen):
+        raise RuntimeError("pg down")
+
+    monkeypatch.setattr(app_mod.share_store, "cas_ai_session_drawing_flag",
+                        _boom)
+    r = _proxy_toggle(c, enabled=True)
+    assert r.status_code == 503, r.get_data(as_text=True)
+    assert r.get_json()["code"] == "mirror_write_failed"
+    # 本地写闸仍关（fail closed）
+    assert share_store.get_ai_session_drawing_flag("sess1") is False
+
+
+def test_session_detail_drawing_mirror_with_real_requests_response(monkeypatch):
+    """真实 requests.Response：GET detail 2xx 仍回填 session.drawing_mirror
+    （C2；修复前回调被 AttributeError 吞掉 → 响应缺 drawing_mirror 字段，
+    UI 无法对照提示「平台同步未完成」）。GET 不回写镜像。"""
+    _mock_proxy_owner(monkeypatch)
+    _install_real_response_sidecar(
+        monkeypatch, 200,
+        {"session": {"id": "sess1", "allow_ai_drawing": True},
+         "transcript": []},
+        path="/session/sess1", method="GET")
+    c = _browser_client(app_mod.app)
+
+    r = c.get("/api/ai/session/sess1")
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert r.get_json()["session"]["allow_ai_drawing"] is True
+    assert r.get_json()["session"]["drawing_mirror"] is False  # 无行
+    assert share_store.get_ai_session_drawing_flag("sess1") is None
+
+    share_store.upsert_ai_session_drawing_flag("sess1", True)
+    r2 = c.get("/api/ai/session/sess1")
+    assert r2.status_code == 200
+    assert r2.get_json()["session"]["drawing_mirror"] is True
+    assert r2.get_json()["session"]["allow_ai_drawing"] is True
+
+
+def test_response_json_parsing_contract():
+    """_response_json 解析口径：JSON body 解析；坏 JSON / 非 JSON
+    content-type → None（不抛）；缺 Content-Type 的 JSON body 仍解析；
+    SSE 流不解析。全部构造在真实 requests.Response 上。"""
+    assert app_mod._response_json(real_json_response(200, {"a": 1})) == {"a": 1}
+    assert app_mod._response_json(
+        real_json_response(200, raw=b"not-json")) is None
+    assert app_mod._response_json(
+        real_json_response(200, raw=b"<html/>", ctype="text/html")) is None
+    assert app_mod._response_json(
+        real_json_response(200, {"a": 1}, ctype=None)) == {"a": 1}
+    assert app_mod._response_json(
+        real_json_response(200, raw=b"data: x\n\n",
+                           ctype="text/event-stream")) is None
+
+
+def test_proxy_json_callback_exception_swallowed(monkeypatch):
+    """回调自身抛错：记 log 不上抛，仍透传 sidecar 响应（异常语义保持）。"""
+    _install_real_response_sidecar(
+        monkeypatch, 200, {"ok": True, "allow_ai_drawing": True})
+    with app_mod.app.test_request_context():
+        resp = app_mod._proxy_json("/session/sess1/drawing",
+                                   {"enabled": True},
+                                   on_response=lambda s, p: 1 / 0)
+    assert resp.status_code == 200
+    assert resp.get_json() == {"ok": True, "allow_ai_drawing": True}
 
 
 def test_store_mirror_generation_cas(monkeypatch):

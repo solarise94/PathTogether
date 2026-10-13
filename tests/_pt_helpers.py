@@ -408,6 +408,38 @@ class FakeRequests:
         return self._dispatch("POST", url, **kwargs)
 
 
+def real_json_response(status_code=200, body=None, ctype="application/json",
+                       raw=None):
+    """构造**真实** requests.Response（非 FakeResponse）。
+
+    与 FakeResponse 的关键差异：requests.Response 只有 ``.json()``（解析失败
+    抛 ValueError 子类），**没有** Flask/werkzeug 的 ``.get_json``。历史 bug
+    （2026-10 修复）：app._proxy_json 对真 Response 调 ``r.get_json(silent=True)``
+    → AttributeError 被回调兜底吞掉 → 生产所有 on_response 回调静默失效，
+    而 FakeResponse 恰好实现了 get_json 把用例全部「测绿」。凡锁定
+    on_response / _proxy_json 解析口径的用例一律用本构造（配 FakeRequests
+    的 register handler 返回即可，FakeRequests 不关心返回类型）。
+
+    - ``body``：可 JSON 序列化对象；``raw`` 给定则原样作为字节 body
+      （配合 ctype 构造不可解析/非 JSON 响应）。
+    """
+    import requests
+
+    resp = requests.Response()
+    resp.status_code = status_code
+    if raw is not None:
+        if isinstance(raw, str):
+            raw = raw.encode("utf-8")
+        resp._content = raw
+    else:
+        resp._content = json.dumps(
+            body if body is not None else {}).encode("utf-8")
+    resp.encoding = "utf-8"
+    if ctype:
+        resp.headers["Content-Type"] = ctype
+    return resp
+
+
 def make_snapshot_attestation(key, sid, snap, bbox=None, rev=None, fp=None,
                               exp_delta=600, domain="hp-snapshot-attest-v1"):
     """生成 HP 侧同款快照 attestation（P1-3 跨语言 wire 契约的 Python 镜像）。

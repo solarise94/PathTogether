@@ -1,0 +1,126 @@
+# pathsegmentor 服务镜像：PathSegmentor（上游 e67763a）GPU 自然语言提示分割。
+#
+# 布局（与 services/contour-refine 同风格）：
+#   - builder 阶段用 CUDA 12.1 devel 基础镜像（带 nvcc）编译 detectron2
+#     wheel（FORCE_CUDA，只编 sm_75——homePC 的 RTX 2080 Ti）；
+#   - runtime 阶段用 CUDA 12.1 runtime 镜像装 wheel + 上游锁定依赖；
+#     上游代码以固定 commit tarball 解到 /srv/PathSegmentor，服务代码 COPY
+#     进同目录（import modeling/utilities 直接可用，WORKDIR 与上游 notebook
+#     一致）。
+# 模型资产策略：用户权重**绝不进镜像**（运行时只读挂载 /models，见
+# README.md）；公共辅助 HF 资产（CLIP tokenizer、BiomedBERT——上游语言
+# 编码器 build 时 from_pretrained）由宿主侧预取为 HF_HOME 布局的
+# hf-prefetch/ 随上下文 COPY 进 /opt/hf，运行期 HF_HUB_OFFLINE=1 全离线。
+ARG UPSTREAM_COMMIT=e67763ab835b3ef184cb6791eb2cd059ec8b9f9a
+ARG DETECTRON2_COMMIT=42121d75e10d9f858f3a91b6a39f5722c02868f0
+
+# ---------------------------------------------------------------- builder
+FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel AS build
+ARG UPSTREAM_COMMIT
+ARG DETECTRON2_COMMIT
+
+# 构建网络环境：docker.io / huggingface.co / files.pythonhosted.org 直连
+# 不稳（DNS 污染/劫持，见 README），pip 走清华镜像；HF 资产由宿主侧预取
+# 后在 runtime 阶段 COPY（见下）。
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PIP_DEFAULT_TIMEOUT=120 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN DEBIAN_FRONTEND=noninteractive apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        git curl ca-certificates libopenmpi-dev openmpi-bin \
+    && rm -rf /var/lib/apt/lists/*
+# mpi4py 无 Linux wheel（PyPI 只有 sdist），源码编译。conda 自带的
+# compiler_compat/ld 会劫持链接（对系统 openmpi 报大量 undefined reference，
+# conda 仅在无系统编译器时用它），删除以回归系统 GNU ld。
+RUN rm -f /opt/conda/compiler_compat/ld* \
+    && MPICC=/usr/bin/mpicc pip install --no-cache-dir ninja mpi4py==4.0.0
+
+# detectron2：上游 requirements.txt 锁定的 fork+commit；CUDA 算子只编
+# sm_75（构建机无 GPU，FORCE_CUDA 强制开启 CUDA 扩展编译）。
+# github 直连不稳（TLS 被重置），codeload tarball + shell 重试
+# （镜像内 curl 7.68 无 --retry-all-errors）。
+RUN mkdir -p /tmp/detectron2 /wheels \
+    && for i in 1 2 3 4 5 6 7 8 9 10; do \
+           curl -fL --connect-timeout 15 --max-time 300 --speed-time 30 --speed-limit 2048 -o /tmp/d2.tar.gz \
+             "https://codeload.github.com/MaureenZOU/detectron2-xyz/tar.gz/${DETECTRON2_COMMIT}" \
+             && break || { echo "retry $i"; sleep 5; }; \
+       done && test -s /tmp/d2.tar.gz \
+    && tar -xzf /tmp/d2.tar.gz -C /tmp \
+    && rm -rf /tmp/detectron2 && mv /tmp/detectron2-xyz-* /tmp/detectron2 \
+    && FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST="7.5" \
+       pip wheel --no-build-isolation --no-deps -w /wheels /tmp/detectron2
+
+# mpi4py wheel 一并在 builder 编好（runtime 无 mpicc，PyPI 又没有 Linux wheel）
+RUN pip install --no-cache-dir "cython>=3.0,<3.1" \
+    && MPICC=/usr/bin/mpicc pip wheel --no-build-isolation --no-deps \
+        -w /wheels mpi4py==4.0.0
+
+# 上游代码：固定 commit tarball。homePC 到 github codeload 直连极慢
+# （TLS 反复重置），tarball 由 git archive 从 pinned clone 预生成
+# （与 codeload 同一 commit 树），随构建上下文 COPY 进来。
+COPY PathSegmentor-e67763a.tar.gz /tmp/ps.tar.gz
+RUN mkdir -p /srv/PathSegmentor \
+    && tar -xzf /tmp/ps.tar.gz -C /srv/PathSegmentor \
+    && test -f /srv/PathSegmentor/configs/pathsegmentor_inference.yaml
+
+WORKDIR /srv/PathSegmentor
+COPY requirements-service.txt ./
+RUN pip install --no-cache-dir -r requirements-service.txt
+COPY pathseg_infer.py app.py gunicorn.conf.py ./
+
+# ---------------------------------------------------------------- runtime
+FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PIP_DEFAULT_TIMEOUT=120 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HF_HOME=/opt/hf \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    NLTK_DATA=/usr/share/nltk_data \
+    PYTHONUNBUFFERED=1
+
+RUN DEBIAN_FRONTEND=noninteractive apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        libopenmpi3 openmpi-bin \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /wheels /wheels
+COPY --from=build /srv/PathSegmentor /srv/PathSegmentor
+
+WORKDIR /srv/PathSegmentor
+# detectron2 / mpi4py wheel（builder 编好）先带依赖安装（yacs/iopath 等），
+# 再以服务锁定版本收敛
+RUN pip install --no-cache-dir /wheels/mpi4py-*.whl /wheels/detectron2*.whl \
+    && pip install --no-cache-dir -r requirements-service.txt
+
+# 公共 HF 资产烧入 /opt/hf（HF_HOME 布局：hub/models--*/refs+snapshots，
+# 实体文件无符号链接）。clip-vit-base-patch32 @ 3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268、
+# BiomedBERT-base-uncased-abstract-fulltext @ e1354b7a3a09615f6aba48dfad4b7a613eef7062
+# （公共模型权重，允许进镜像；用户权重不在此列）。宿主侧从 huggingface.co
+# 预取后随构建上下文 COPY（homePC 容器网络到 HF/xethub 过慢，见 README）。
+COPY hf-prefetch/ /opt/hf/
+
+# nltk 数据（punkt + averaged_perceptron_tagger，上游 README 环境要求；
+# nltk_data/ 按官方 gh-pages 包解压为 tokenizers/punkt 与
+# taggers/averaged_perceptron_tagger，随构建上下文 COPY——nltk 下载服务器
+# 也在 github，homePC 容器内下载同样过慢）。
+COPY nltk_data/ /usr/share/nltk_data/
+
+# 构建期烟雾测试：import 链路完整（CPU、无 eager load、无 CUDA）+ 离线
+# HF 缓存与 nltk 数据可定位（HF_HUB_OFFLINE=1 下 from_pretrained 走纯缓存）
+RUN PATHSEG_EAGER_LOAD=0 python -c \
+    "from mpi4py import MPI; import torch, torchvision, detectron2; \
+     import pathseg_infer, app; print('import ok: torch', torch.__version__)" \
+    && python -c \
+    "import nltk; nltk.data.find('tokenizers/punkt'); \
+     nltk.data.find('taggers/averaged_perceptron_tagger'); print('nltk data ok')" \
+    && python -c \
+    "from transformers import AutoModel; \
+     AutoModel.from_pretrained('microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext'); \
+     print('hf offline cache ok')"
+
+EXPOSE 8971
+# 单 worker（单模型实例，进程内互斥锁串行推理）+ 2 线程（IO 重叠）。
+# 不用 --preload：CUDA 必须在 worker 进程内初始化（见 gunicorn.conf.py）。
+CMD ["gunicorn", "--config", "gunicorn.conf.py", "app:app"]

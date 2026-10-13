@@ -61,7 +61,7 @@ Compose 会按 service 标签重建改名容器，因此 fast 回滚使用从原
 
 ## 分支与文档收尾
 
-共关闭 40 个已完成的本地功能/发布分支（PT 32、HP 8），以及 2 个已被 PR #11 取代的远端 Dependabot 分支。已完成分支先推送 `archive/20261013/<原分支名>` 标记再关闭；工作树切为同一提交的 detached 状态，目录及其未提交文档、旧测试产物未自动迁移或删除。根 PT 工作树 17 个修改与 21 个未跟踪文档/部署文件已额外保全到本轮私有目录，根 `slide-id-refactor` 保留。
+共关闭 40 个已完成的本地功能/发布分支（PT 32、HP 8），另将 2 个已被 PR #11 取代、服务器上已删除的 Dependabot 残留引用归档并清理。已完成分支先推送 `archive/20261013/<原分支名>` 标记再关闭；工作树切为同一提交的 detached 状态，目录及其未提交文档、旧测试产物未自动迁移或删除。根 PT 工作树 17 个修改与 21 个未跟踪文档/部署文件已额外保全到本轮私有目录，根 `slide-id-refactor` 保留。
 
 漏合的 `fd0f7832` 复核关闭记录已进入主线；历史 Logo/统计发布文档补入，过时状态页链接到本记录。剩余实现任务见 [实现索引](followup/remaining-work-implementation-index-20261013.md)，重点是 [文件夹体验](followup/folder-experience-implementation-20261013.md)、[JPEG2000 转换](followup/jpeg2000-browser-conversion-implementation-20261013.md) 和矩形取消传播。本轮没有代替用户实施这些功能。
 

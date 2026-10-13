@@ -205,7 +205,9 @@ _CATALOG_DISPLAY = (
         "direct_import": "closed",
         "import_mode": "convert",
         "limits": ["本阶段需在本机转换为 OME-TIFF 后上传（转换工具识别 "
-                   "JPEG 编码 SVS）；JPEG2000 编码的 SVS 暂可直接导入"],
+                   "JPEG 编码与 JPEG 2000 编码 33003/33005 的 SVS；JPEG 2000 源的输出为"
+                   "重新编码的 JPEG-in-TIFF，不是无损搬运）；JPEG 2000 编码的 SVS 仍可"
+                   "凭 direct_class 声明例外直接导入（unconverted-variant:svs-jp2k）"],
         "selectable_for_upload": True,
     },
     {

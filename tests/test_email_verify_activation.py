@@ -300,12 +300,15 @@ def test_pending_account_blocked_from_business_api(monkeypatch):
 # 3.5 D1 回归：favicon 放行（公开路径）
 # =========================================================================== #
 def test_favicon_public_without_session():
-    """favicon 对匿名也公开（与 /healthz 同类）：204 且不 302 /login。"""
+    """真实 favicon 对匿名公开，返回图标且不创建会话或跳转登录。"""
     app_mod.AUTH_ENABLED = True
     client = _client()
     r = client.get("/favicon.ico")
-    assert r.status_code == 204
-    assert r.get_data() == b""
+    assert r.status_code == 200
+    assert r.mimetype in ('image/vnd.microsoft.icon', 'image/x-icon')
+    assert r.data[:4] == b'\x00\x00\x01\x00'
+    assert not r.headers.getlist('Set-Cookie')
+    assert r.get_data() == (Path(app_mod.app.static_folder) / 'brand/favicon.ico').read_bytes()
 
 
 # =========================================================================== #

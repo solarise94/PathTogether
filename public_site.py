@@ -2,7 +2,7 @@
 from dataclasses import dataclass
 from xml.etree.ElementTree import Element, SubElement, tostring
 
-from flask import Blueprint, Response, abort, render_template, request
+from flask import Blueprint, Response, abort, render_template, request, current_app
 
 import agreement_store
 
@@ -80,6 +80,10 @@ PRIVATE_PREFIXES = ("/app", "/admin", "/api/", "/internal/", "/r/", "/share/",
 def create_blueprint(origin):
     bp = Blueprint("public_site", __name__)
 
+    @bp.get("/favicon.ico")
+    def favicon():
+        return current_app.send_static_file("brand/favicon.ico")
+
     def text_response(body, mimetype="text/plain"):
         resp = Response(body, mimetype=mimetype)
         resp.headers["Cache-Control"] = "public, max-age=300"
@@ -100,7 +104,7 @@ def create_blueprint(origin):
     @bp.get("/robots.txt")
     def robots():
         # 默认不爬未知资源；发布的页面与必需静态资源显式放行。
-        lines = ["User-agent: *", "Disallow: /", "Allow: /static/",
+        lines = ["User-agent: *", "Disallow: /", "Allow: /static/", "Allow: /favicon.ico$",
                  "Allow: /legal/", "Allow: /guide/", "Disallow: /*?"]
         lines.extend("Allow: " + p.path + "$" for p in public_pages())
         lines.extend("Allow: " + p + "$" for p in sorted(DISCOVERY_PATHS | {"/index.md", "/guide.md"}))

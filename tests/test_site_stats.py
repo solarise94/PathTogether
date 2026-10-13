@@ -728,7 +728,7 @@ def test_migration_0030_applied_idempotent_and_minimal():
         "SELECT conname FROM pg_constraint WHERE conrelid ="
         " 'site_visit_events'::regclass AND contype = 'u'")
     assert {r["conname"] for r in unique} == {
-        "site_visit_events_dedup_unique"}
+        "site_visit_events_dedup_v2_unique"}
     check = _sql_one(
         "SELECT count(*) AS n FROM pg_constraint WHERE conrelid ="
         " 'site_visit_events'::regclass AND contype = 'c'"
@@ -783,6 +783,59 @@ def test_dedup_bucket_unique_and_cross_bucket_new_row(secret):
     _flush([_ev(now=BASE_TIME + timedelta(seconds=601))])   # 跨桶 → 新行
     assert _site_count() == 2
     _flush([_ev(path="/demo")])              # 同 hash 同桶不同 page → 新行
+    assert _site_count() == 3
+
+
+def test_crawler_does_not_suppress_browser_visit(secret):
+    _flush([_ev(user_agent='curl/8.0'), _ev()])
+    assert _site_count() == 2
+
+
+def test_each_entry_domain_keeps_its_visit(secret):
+    _flush([_ev(host='histopilot.com'), _ev(host='pt.solarise94.fun')])
+    assert _site_count() == 2
+
+
+def test_converter_page_is_observable(secret):
+    assert _ev(path='/tools/slides') is not None
+
+
+def test_public_html_map_is_covered_and_metadata_is_excluded(secret):
+    from public_site import public_pages, ACCOUNT_PAGES, DISCOVERY_PATHS
+    for page in (*public_pages(), *ACCOUNT_PAGES):
+        assert _ev(path=page.path) is not None, page.path
+    for path in (*DISCOVERY_PATHS, '/guide.md', '/guide/conversion.md',
+                 '/legal/unknown/version', '/tools/slides/private-file'):
+        assert _ev(path=path) is None, path
+
+
+def test_dedup_dimensions_remain_idempotent_and_visitor_metric_is_not_inflated(secret):
+    events = [_ev(), _ev(signed_in=True), _ev(host='pt.solarise94.fun'),
+              _ev(user_agent='Googlebot/2.1')]
+    _flush(events + events)
+    stats = sss.dashboard_stats(now=BASE_TIME)
+    assert _site_count() == 4
+    assert stats['today'] == {'visits': 4, 'unique_visitors': 1, 'bots': 1}
+
+
+def test_migration_0083_upgrades_existing_events_without_rewriting(secret):
+    import pg_store
+    _flush([_ev()])
+    before = _sql_all('SELECT * FROM site_visit_events')
+    conn = _conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('ALTER TABLE site_visit_events DROP CONSTRAINT site_visit_events_dedup_v2_unique')
+            cur.execute('ALTER TABLE site_visit_events ADD CONSTRAINT site_visit_events_dedup_unique '
+                        'UNIQUE (daily_visitor_hash, page_key, dedup_bucket)')
+            sql = (pg_store.migrations_dir() / '0083_site_visit_dedup_dimensions.sql').read_text()
+            cur.execute(sql)
+            cur.execute(sql)
+        conn.commit()
+    finally:
+        conn.close()
+    assert _sql_all('SELECT * FROM site_visit_events') == before
+    _flush([_ev(user_agent='curl/8.0'), _ev(host='pt.solarise94.fun')])
     assert _site_count() == 3
 
 

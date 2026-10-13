@@ -306,13 +306,14 @@ describe("U2 i18n (zh/en pairs for the new concepts)", () => {
 		expect(i18nSrc).toMatch(/"tools\.drop\.bundle": "[^"]*完整包[^"]*Slidedat\.ini[^"]*"/);
 		expect(i18nSrc).toMatch(/"tools\.drop\.bundle": "[^"]*complete bundle[^"]*Slidedat\.ini[^"]*"/);
 		expect(i18nSrc).toContain('"tools.drop.bundle.multiple"');
-		// subtitle / hint / unsupported-input message now include MRXS
+		// Subtitle and detailed input hint include MRXS; rejection messages
+		// point to that maintained list rather than duplicate its formats.
 		expect(i18nSrc).toMatch(/"tools\.subtitle": "[^"]*MRXS \/ VMS 完整包[^"]*"/);
 		expect(i18nSrc).toMatch(/"tools\.subtitle": "[^"]*complete MRXS \/ VMS bundles[^"]*"/);
 		expect(i18nSrc).toMatch(/"tools\.input\.file\.hint": "[^"]*(?:MRXS 完整包|VMS 完整包)[^"]*"/);
 		expect(i18nSrc).toMatch(/"tools\.input\.folder\.label"[\s\S]*"tools\.input\.folder\.label"/);
-		expect(i18nSrc).toMatch(/"tools\.err\.unsupported_input": "[^"]*MRXS 完整包[^"]*"/);
-		expect(i18nSrc).toMatch(/"tools\.err\.unsupported_input": "[^"]*complete MRXS bundles[^"]*"/);
+		expect(i18nSrc).toMatch(/"tools\.err\.unsupported_input": "[^"]*未做任何复制[^"]*切片转换指南[^"]*"/);
+		expect(i18nSrc).toMatch(/"tools\.err\.unsupported_input": "[^"]*nothing was copied[^"]*slide conversion guide[^"]*"/);
 		// template defaults mirror the zh table (renderer works before i18n.js)
 		const zhHint = i18nSrc.match(/"tools\.input\.file\.hint": "([^"]*)"/);
 		expect(zhHint && shellSrc.includes(zhHint[1])).toBe(true);

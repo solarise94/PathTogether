@@ -7,9 +7,8 @@
   <meta name="description" content="HistoPilot：病理切片查看、AI 辅助观察、标注与团队协作；在浏览器本地将支持的切片转换为 OME-TIFF 或金字塔 TIFF。" />
   <link rel="describedby" href="/llms.txt" type="text/markdown" />
   <link rel="alternate" href="/index.md" type="text/markdown" />
-  <!-- 空 data URI favicon：避免未登录浏览器自动 GET /favicon.ico 撞鉴权闸 -->
-  <link rel="icon" href="data:," />
-  <link rel="stylesheet" href="/static/entry.css?v=20261013a" />
+  {% include "_site_icons.html" %}
+  <link rel="stylesheet" href="/static/entry.css?v=20261013b" />
   <script defer src="/static/i18n.js?v=20261013a"></script>
   <script defer src="/static/entry.js?v=20260920"></script>
   <script defer src="/static/entry-collaboration.js?v=20261011a"></script>
@@ -24,7 +23,7 @@
   <!-- ================= 顶栏：品牌 / 锚点 / GitHub / 语言 / 登录 ================= -->
   <header class="topbar">
     <nav class="topbar-inner" aria-label="主导航">
-      <a class="brand" href="#top">HistoPilot</a>
+      <a class="brand" href="#top">{% include "_brand_logo.html" %}<span>HistoPilot</span></a>
       <ul class="nav-links">
         <li><a href="#get-started" data-i18n="entry.nav.start">如何开始</a></li>
         <li><a href="#whats-new" data-i18n="entry.nav.whatsnew">更新内容</a></li>

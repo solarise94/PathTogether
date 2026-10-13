@@ -93,6 +93,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qsl
 
 import pg_store
+import agreement_store
 
 _log = logging.getLogger("svs.site_stats")
 
@@ -127,7 +128,19 @@ PAGE_ALLOWLIST = {
     "/demo": "demo",
     "/register": "register",
     "/login": "login",
+    "/tools/slides": "slide_converter",
+    "/guide": "guide",
+    "/guide/conversion": "conversion_guide",
+    "/guide/collaboration": "collaboration_guide",
+    "/site-map": "site_map",
+    "/registration-help": "registration_help",
 }
+# Only the published builtin policy version; no arbitrary resource paths.
+# Metadata is static: importing this module still performs no file/DB reads.
+PAGE_ALLOWLIST.update({
+    "/legal/%s/%s" % (slug, agreement_store.BUILTIN_VERSION): "legal_" + doc_type
+    for slug, doc_type in agreement_store.SLUG_TO_TYPE.items()
+})
 
 #: visitor_kind 词表（与 0030 CHECK 一致）
 VISITOR_KINDS = ("anonymous_human", "signed_in_human", "suspected_bot")
@@ -748,7 +761,8 @@ def _new_event_id():
 
 def _flush_batch(events):
     """整批插入；任何 DB 故障（连接/超时/写失败）丢整批 + 节流 warning，
-    绝不抛出。去重桶冲突由 UNIQUE + ON CONFLICT DO NOTHING 丢弃。"""
+    绝不抛出。0083 起去重按入口域名及访客类别隔离；相同维度内的桶冲突
+    由 UNIQUE + ON CONFLICT DO NOTHING 丢弃。"""
     if not events:
         return
     rows = []
@@ -798,7 +812,8 @@ def _flush_batch(events):
                     "  country_code, daily_visitor_hash, visitor_kind,"
                     "  bot_name) "
                     "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
-                    "ON CONFLICT (daily_visitor_hash, page_key, dedup_bucket)"
+                    "ON CONFLICT (daily_visitor_hash, page_key, dedup_bucket,"
+                    " request_host, visitor_kind)"
                     " DO NOTHING",
                     rows)
     except Exception as exc:

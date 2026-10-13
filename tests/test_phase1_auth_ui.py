@@ -472,8 +472,9 @@ def test_index_entry_landing_page_content(monkeypatch):
     assert "app.js" not in body
     assert "openseadragon" not in body
     assert "style.css" not in body
-    # 空 favicon（data URI，避免未登录撞 /favicon.ico 鉴权）
-    assert 'href="data:,"' in body
+    # 真实图标由匿名可读的本站静态资源提供。
+    assert 'href="/static/brand/favicon.ico"' in body
+    assert 'href="data:,"' not in body
     # 不编造尚不存在的条款/隐私路由
     assert 'href="/terms"' not in body
     assert 'href="/privacy"' not in body

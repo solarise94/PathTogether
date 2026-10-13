@@ -15,6 +15,10 @@
 
   var DICT = {
     zh: {
+      "entry.route.aria": "访问线路",
+      "entry.route.cn": "中国线路",
+      "entry.route.com": "国际线路",
+      "entry.language": "界面语言",
       "entry.svg.heading": "组织导航",
       "entry.svg.schematic": "形态与流程示意 · 非真实切片",
       "entry.svg.view": "示意视野",
@@ -1659,6 +1663,10 @@
     },
 
     en: {
+      "entry.route.aria": "Connection route",
+      "entry.route.cn": "China route",
+      "entry.route.com": "International route",
+      "entry.language": "Language",
       "entry.svg.heading": "Tissue navigation",
       "entry.svg.schematic": "Illustrated tissue and workflow",
       "entry.svg.view": "Illustrated view",

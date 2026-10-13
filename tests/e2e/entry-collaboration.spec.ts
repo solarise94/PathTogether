@@ -17,7 +17,7 @@ test('collaboration walkthrough plays, pauses, navigates, localizes and loads on
  await page.locator('[data-collab-step="2"]').click();
  await expect(demo).toHaveAttribute('data-step','2');
  await expect(page.locator('[data-collab-status]')).toContainText('补充标注和备注');
- await page.locator('.lang-toggle').click();
+ await page.locator('#account-btn').click(); await page.locator('.lang-toggle').click(); await page.locator('#account-btn').click();
  await expect(page.locator('#collaboration h2')).toContainText('with your peers');
  await expect(page.locator('[data-collab-toggle]')).toHaveText('Play');
  await demo.scrollIntoViewIfNeeded();
@@ -51,7 +51,7 @@ for (const width of [320, 390, 768, 1100, 1440]) {
   const demo = page.locator('[data-collab-demo]');
   await demo.scrollIntoViewIfNeeded();
   for (const english of [false, true]) {
-   if (english) await page.locator('.lang-toggle').click();
+   if (english) { await page.locator('#account-btn').click(); await page.locator('.lang-toggle').click(); await page.locator('#account-btn').click(); }
    const heights: number[] = [];
    for (const step of [0, 1, 2]) {
     await page.locator(`[data-collab-step="${step}"]`).click();
@@ -75,5 +75,30 @@ for (const width of [320, 390, 768, 1100, 1440]) {
    }
    expect(new Set(heights).size).toBe(1);
   }
+ });
+}
+
+for (const width of [320, 1440]) {
+ test(`homepage routes are explicit links and language remains independent at ${width}px`, async ({page}) => {
+  await page.setViewportSize({width, height: 900});
+  await page.goto('/');
+  const china = page.locator('[data-route="cn"]');
+  const international = page.locator('[data-route="com"]');
+  await expect(china).toHaveText('中国线路');
+  await expect(china).toHaveAttribute('href', 'https://histopilot.cn/');
+  await expect(international).toHaveText('国际线路');
+  await expect(international).toHaveAttribute('href', 'https://histopilot.com/');
+  for (const link of [china, international]) {
+   const box = await link.boundingBox();
+   expect(box!.height).toBeGreaterThanOrEqual(44);
+   expect(box!.x + box!.width).toBeLessThanOrEqual(width);
+  }
+  await page.locator('#account-btn').click();
+  await page.locator('.lang-toggle').click();
+  await expect(china).toHaveText('China route');
+  await expect(international).toHaveText('International route');
+  await expect(china).toHaveAttribute('href', 'https://histopilot.cn/');
+  expect(new URL(page.url()).hostname).toBe('127.0.0.1');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
  });
 }

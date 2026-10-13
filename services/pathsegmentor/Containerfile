@@ -1,0 +1,88 @@
+# pathsegmentor 服务镜像：PathSegmentor（上游 e67763a）GPU 自然语言提示分割。
+#
+# 布局（与 services/contour-refine 同风格）：
+#   - builder 阶段用 CUDA 12.1 devel 基础镜像（带 nvcc）编译 detectron2
+#     wheel（FORCE_CUDA，只编 sm_75——homePC 的 RTX 2080 Ti）；
+#   - runtime 阶段用 CUDA 12.1 runtime 镜像装 wheel + 上游锁定依赖；
+#     上游代码以固定 commit tarball 解到 /srv/PathSegmentor，服务代码 COPY
+#     进同目录（import modeling/utilities 直接可用，WORKDIR 与上游 notebook
+#     一致）。
+# 模型资产策略：用户权重**绝不进镜像**（运行时只读挂载 /models，见
+# README.md）；公共辅助 HF 资产（CLIP tokenizer、BiomedBERT——上游语言
+# 编码器 build 时 from_pretrained）在构建期烧入 /opt/hf，运行期
+# HF_HUB_OFFLINE=1 完全离线。
+ARG UPSTREAM_COMMIT=e67763ab835b3ef184cb6791eb2cd059ec8b9f9a
+ARG DETECTRON2_COMMIT=42121d75e10d9f858f3a91b6a39f5722c02868f0
+
+# ---------------------------------------------------------------- builder
+FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel AS build
+ARG UPSTREAM_COMMIT
+ARG DETECTRON2_COMMIT
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git curl ca-certificates libopenmpi-dev openmpi-bin \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir ninja mpi4py==4.0.0
+
+# detectron2：上游 requirements.txt 锁定的 fork+commit；CUDA 算子只编
+# sm_75（构建机无 GPU，FORCE_CUDA 强制开启 CUDA 扩展编译）。
+RUN git clone https://github.com/MaureenZOU/detectron2-xyz.git /tmp/detectron2 \
+    && git -C /tmp/detectron2 checkout "${DETECTRON2_COMMIT}" \
+    && FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST="7.5" \
+       pip wheel --no-build-isolation --no-deps -w /wheels /tmp/detectron2
+
+# 上游代码：固定 commit tarball（构建期网络仅此一处 + pip + HF）
+RUN curl -fsSL \
+      "https://github.com/zhi-xuan-chen/PathSegmentor/archive/${UPSTREAM_COMMIT}.tar.gz" \
+      | tar -xz -C /srv \
+    && mv "/srv/PathSegmentor-${UPSTREAM_COMMIT}" /srv/PathSegmentor
+
+WORKDIR /srv/PathSegmentor
+COPY requirements-service.txt ./
+RUN pip install --no-cache-dir -r requirements-service.txt
+COPY pathseg_infer.py app.py gunicorn.conf.py ./
+
+# 公共 HF 资产烧入 /opt/hf（公共模型权重，允许进镜像；用户权重不在此列）
+ENV TRANSFORMERS_CACHE=/opt/hf \
+    HF_HOME=/opt/hf
+RUN python - <<'PY'
+from transformers import AutoModel, AutoTokenizer
+AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+AutoModel.from_pretrained(
+    "microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext")
+print("hf assets cached")
+PY
+
+# ---------------------------------------------------------------- runtime
+FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+ENV TRANSFORMERS_CACHE=/opt/hf \
+    HF_HOME=/opt/hf \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    NLTK_DATA=/usr/share/nltk_data \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libopenmpi3 openmpi-bin \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /wheels /wheels
+COPY --from=build /srv/PathSegmentor /srv/PathSegmentor
+COPY --from=build /opt/hf /opt/hf
+
+WORKDIR /srv/PathSegmentor
+# detectron2 wheel 先带依赖安装（yacs/iopath 等），再以服务锁定版本收敛
+RUN pip install --no-cache-dir /wheels/detectron2*.whl \
+    && pip install --no-cache-dir -r requirements-service.txt \
+    && python -m nltk.downloader -d /usr/share/nltk_data \
+        punkt averaged_perceptron_tagger
+
+# 构建期烟雾测试：import 链路完整（CPU、无 eager load、无 CUDA）
+RUN PATHSEG_EAGER_LOAD=0 python -c \
+    "from mpi4py import MPI; import torch, torchvision, detectron2; \
+     import pathseg_infer, app; print('import ok: torch', torch.__version__)"
+
+EXPOSE 8971
+# 单 worker（单模型实例，进程内互斥锁串行推理）+ 2 线程（IO 重叠）。
+# 不用 --preload：CUDA 必须在 worker 进程内初始化（见 gunicorn.conf.py）。
+CMD ["gunicorn", "--config", "gunicorn.conf.py", "app:app"]

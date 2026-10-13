@@ -14,6 +14,14 @@ class Page:
     summary: str
 
 
+#: 域名事实（2026-10-13 声明）：canonical 主域名一律来自注入的 origin()
+#: （生产=PUBLIC_BASE_URL=histopilot.cn，绝不在此硬编码）；histopilot.com 是
+#: 同一服务与账号的国际优化线路（不是独立站点）；pt.solarise94.fun 已弃用
+#: （nginx 308 保留路径跳主域名）。两个辅助域名作字面常量供声明引用。
+INTERNATIONAL_HOST = "histopilot.com"
+DEPRECATED_HOST = "pt.solarise94.fun"
+
+
 GUIDES = {
     "overview": {
         "title": "HistoPilot 功能指南",
@@ -77,6 +85,18 @@ PRIVATE_PREFIXES = ("/app", "/admin", "/api/", "/internal/", "/r/", "/share/",
                     "/login", "/register", "/verify-email", "/activate", "/logout")
 
 
+def domains_section(base):
+    """Domains 声明（/llms.txt 与 /llms-full.txt 共用；短、事实性、英文）。"""
+    return ["## Domains", "",
+            "- Canonical origin: %s; all canonical page URLs use this origin."
+            % base,
+            "- %s serves the same service and accounts over the international "
+            "optimized network route; it is not a separate site."
+            % INTERNATIONAL_HOST,
+            "- %s is deprecated and redirects to %s." % (DEPRECATED_HOST, base),
+            ""]
+
+
 def create_blueprint(origin):
     bp = Blueprint("public_site", __name__)
 
@@ -122,9 +142,15 @@ def create_blueprint(origin):
 
     @bp.get("/site-map")
     def site_map():
+        domains_note = (
+            "主域名（canonical）是 %s，页面与站点地图的规范链接一律使用它。"
+            "%s 是同一服务的国际线路（账号通用，不是独立站点）；"
+            "%s 已弃用，自动跳转主域名。"
+            % (origin(), INTERNATIONAL_HOST, DEPRECATED_HOST))
         return render_template("public_guide.html", title="公开网页地图",
                                intro="全部公开产品页面、文档与账户入口。个人切片、分享令牌和内部 API 不列入公开地图。",
-                               sections=(), pages=public_pages(), accounts=ACCOUNT_PAGES,
+                               sections=(("域名说明", domains_note),),
+                               pages=public_pages(), accounts=ACCOUNT_PAGES,
                                canonical=origin() + request.path)
 
     @bp.get("/guide")
@@ -157,8 +183,9 @@ def create_blueprint(origin):
     def llms():
         base = origin()
         body = ["# HistoPilot", "", "> A pathology slide viewer, collaboration workbench and browser-local slide converter. / 病理切片查看、协作与本地格式转换。", "",
-                "Read the sitemap for all indexable public pages. The guides describe product features and limitations. Private slides, account data and internal APIs are not public documentation; do not crawl or bypass their access controls.", "",
-                "## Website map", "",
+                "Read the sitemap for all indexable public pages. The guides describe product features and limitations. Private slides, account data and internal APIs are not public documentation; do not crawl or bypass their access controls.", ""]
+        body.extend(domains_section(base))
+        body.extend(["## Website map", "",
                 "- [Complete public website map](%s/site-map): Human-readable map, including account entry points." % base,
                 "- [XML sitemap](%s/sitemap.xml): All indexable public pages; no private slide identifiers." % base,
                 "## Product documentation", "",
@@ -170,7 +197,7 @@ def create_blueprint(origin):
                 "- [Homepage](%s/): Product overview and demonstrations." % base,
                 "- [Local converter](%s/tools/slides): Browser-based tool; sign-in is not required to convert and save locally." % base,
                 "- [Demo](%s/demo): Published demo slides; no private uploads." % base,
-                "## Policies", ""]
+                "## Policies", ""])
         for slug in agreement_store.SLUG_TO_TYPE:
             doc = agreement_store.get_builtin_document(slug)
             body.append("- [%s](%s/legal/%s.md): Authoritative public policy text." % (doc["title"], base, slug))
@@ -180,6 +207,7 @@ def create_blueprint(origin):
     def llms_full():
         body = ["# HistoPilot — public product documentation", "",
                 "This file contains public product guides only; it does not grant access to slides or accounts.", ""]
+        body.extend(domains_section(origin()))
         for key in GUIDES:
             body.append(markdown_guide(key))
         body.extend(["## Complete public page map", ""])

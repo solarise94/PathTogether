@@ -3435,6 +3435,10 @@ def _entry_signed_in_context():
 
 def _landing_response(**overrides):
     ctx = _entry_signed_in_context()
+    # canonical 只随「/」（public_pages 口径的可索引主页）输出；/login、
+    # /register 复用本模板的私有/错误渲染（_login_page、_register_landing_page）
+    # 不注入 canonical（tests/test_canonical_domain.py）。
+    ctx["canonical"] = _public_canonical_url("/")
     ctx.update(overrides)
     resp = make_response(render_template("entry.html", **ctx))
     return _apply_landing_security_headers(resp)
@@ -3492,7 +3496,8 @@ def tools_slides():
     /api/tools/slides/upload-capability（登录后、点击时才请求）驱动——
     本页渲染路径仍零网络请求。
     """
-    resp = make_response(render_template("tools_slides.html"))
+    resp = make_response(render_template(
+        "tools_slides.html", canonical=_public_canonical_url("/tools/slides")))
     return _apply_slide_tools_security_headers(resp)
 
 
@@ -3880,6 +3885,21 @@ def _canonical_public_origin(environ=None):
         raise ValueError("request origin 不可用")
     raise ValueError("PUBLIC_BASE_URL 未配置——生产 CSP 需要"
                      " https:// 公网 origin（公网入口 TLS 终止后的规范 origin）")
+
+
+def _public_canonical_url(path):
+    """可索引公开页的 canonical URL（origin 语义，须在请求上下文调用）。
+
+    canonical 只描述 ``public_site.public_pages()`` 口径的公开页：origin 一律
+    取 ``_canonical_public_origin``（生产=PUBLIC_BASE_URL，即 histopilot.cn），
+    与请求 Host 无关——经 histopilot.com（国际优化线路，同一服务与账号）到达
+    的请求同样指向 .cn；query 不参与。PUBLIC_BASE_URL 缺失/非法时返回 None，
+    模板省略该标签：canonical 是渐进增强，不得让页面渲染失败。
+    """
+    try:
+        return _canonical_public_origin() + path
+    except ValueError:
+        return None
 
 
 def _admin_iframe_resource_origins(environ=None):
@@ -6680,6 +6700,7 @@ def demo_landing():
         demo_enabled=enabled,
         adapter_mode=adapter_mode,
         logged_in=logged_in,
+        canonical=_public_canonical_url("/demo"),
     ))
     # 入口 HTML 可重新验证（§5.3）：普通刷新必须取得新 UI
     resp.headers["Cache-Control"] = "no-cache"
@@ -7527,6 +7548,9 @@ def legal_document(slug, version=None):
     else:
         resp = make_response(render_template(
             "legal_doc.html", doc=doc, permalink=permalink,
+            # canonical=版本化不可变链接（public_pages 口径）：/legal/<slug>
+            # 当前版本页与带 query 的 HTML 请求都归一到该 permalink。
+            canonical=_public_canonical_url(permalink),
             content_html=legal_render.render_markdown(doc["content"])))
     # 版本化链接内容不可变 → 长缓存；当前版本页可重新验证
     if version is None:

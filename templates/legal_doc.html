@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <meta name="referrer" content="no-referrer" />
   <title>{{ doc.title }}（{{ doc.version }}）· HistoPilot / PathTogether</title>
+  {# canonical=版本化不可变链接（服务端注入 origin+permalink；query 不参与） #}
+  {% if canonical %}<link rel="canonical" href="{{ canonical }}" />{% endif %}
   {% include "_site_icons.html" %}
   <style>
     body { max-width: 860px; margin: 0 auto; padding: 24px 16px 64px;

@@ -59,6 +59,7 @@ const els = {
   qualityVmsNote: $('quality-vms-note'),
   qualityRasterNote: $('quality-raster-note'),
   qualityBifNote: $('quality-bif-note'),
+  qualityJp2kNote: $('quality-jp2k-note'),
   qualityLocked: $('quality-locked'),
   moreOptions: $('more-options'),
   probeSection: $('probe-section'),
@@ -912,6 +913,12 @@ function renderProbeSummary() {
   if (missing > 0) {
     dlRow(grid, t('tools.probe.missing'), t('tools.probe.missing.note', { n: missing }));
   }
+  // F2: JP2K sources carry their codec identity in the probe document
+  if (String(doc.codec || '') === 'jpeg2000-reencode') {
+    dlRow(grid, t('tools.probe.sourcecodec'), t('tools.probe.sourcecodec.jp2k', {
+      variant: String(doc.source_codec || '').replace('jpeg2000-', ''),
+    }), 'probe-source-codec');
+  }
   dlRow(grid, t('tools.probe.identity.sha'), String(page.prep.identity.sha256 || '—'));
 
   renderEstimate();
@@ -1020,12 +1027,15 @@ function renderChannelSection() {
 
 function updateStrictWarning() {
   const est = probeEstimate();
-  const willRefuse = Number(est.edge_tiles || 0) > 0;
+  const isJp2k = String(probeDoc().codec || '') === 'jpeg2000-reencode';
+  // F2: a JPEG 2000 source has NO byte-passthrough path — strict-lossless is
+  // always refused (the core's typed policy error is the backstop)
+  const willRefuse = Number(est.edge_tiles || 0) > 0 || isJp2k;
   els.policyStrictWarn.hidden = !willRefuse;
   if (willRefuse) {
-    els.policyStrictWarn.textContent = t('tools.policy.strict.warn', {
-      n: Number(est.edge_tiles || 0),
-    });
+    els.policyStrictWarn.textContent = isJp2k
+      ? t('tools.policy.strict.warn.jp2k')
+      : t('tools.policy.strict.warn', { n: Number(est.edge_tiles || 0) });
   }
 }
 
@@ -1092,6 +1102,9 @@ function updateMrsxQualityNote() {
   // Ventana BIF：瓦片带重叠，必须拼接后重编码——「保留画质」是高质量
   // 重编码而非字节复制
   els.qualityBifNote.hidden = !(!!page.prep && fmt.startsWith('ventana-bif') && bf);
+  // F2（Aperio JPEG 2000 33003/33005）：没有字节搬运路径，两种画质都是
+  // 解码后重编码（有损）
+  els.qualityJp2kNote.hidden = !(!!page.prep && fmt.startsWith('aperio-svs-jp2k') && bf);
 }
 
 /// 「像素严格无损」与「更小文件（有损）」互斥（U2 要求在 UI 也阻止，核心

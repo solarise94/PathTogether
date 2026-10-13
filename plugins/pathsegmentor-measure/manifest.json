@@ -1,0 +1,70 @@
+{
+  "manifestSchemaVersion": "1.1.0",
+  "id": "dev.pathsegmentor.measure",
+  "name": "PathSegmentor Measure",
+  "pluginVersion": "0.1.0",
+  "pluginContractVersion": "1.1.0",
+  "bridgeProtocolVersion": "1.0.0",
+  "ui": {
+    "entry": "/plugins/pathsegmentor-measure/ui/main.js",
+    "slots": ["viewer.right-panel"]
+  },
+  "service": {
+    "baseUrl": "http://127.0.0.1:8062",
+    "health": "/healthz"
+  },
+  "permissions": [
+    "slide:metadata:read",
+    "slide:region:read"
+  ],
+  "provides": [
+    {
+      "name": "segment_region",
+      "version": "1.0.0",
+      "description": "用 PathSegmentor 语义分割模型在给定 level-0 整数 bbox（x,y,w,h）内分割指定目标（object：nuclei、lymphocytes、tumor cells、gland 等）。注意：这是语义分割——返回该目标的区域与面积（level-0 像素、µm²）与 ROI 占比，不是实例计数器。approx_object_count.connected_components 是连通域近似；estimated_count_split 是距离变换+分水岭的拆分估计，仅当前景大多可分辨（objects_resolved≥0.6）时给出，否则为 null 并附 mask_is_region_not_instances 警告（mask 覆盖成片组织区域）。另有尺寸分布与最多 20 个最大连通域的 bbox/质心。bbox 面积不得超过平台 ROI 上限（超限拒绝）。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "integer",
+            "description": "level-0 bbox 左上角 X（整数像素，≥0）"
+          },
+          "y": {
+            "type": "integer",
+            "description": "level-0 bbox 左上角 Y（整数像素，≥0）"
+          },
+          "w": {
+            "type": "integer",
+            "description": "level-0 bbox 宽（整数像素，>0；x+w 不得超过切片宽）"
+          },
+          "h": {
+            "type": "integer",
+            "description": "level-0 bbox 高（整数像素，>0；y+h 不得超过切片高）"
+          },
+          "object": {
+            "type": "string",
+            "description": "要分割的目标名称（受控文本提示），如 nuclei、lymphocytes、tumor cells、gland"
+          },
+          "region": {
+            "type": "string",
+            "description": "可选的组织/器官语境提示，如 liver tissue、colon"
+          },
+          "threshold": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "可选的前景判定阈值（0..1），缺省用模型默认值"
+          }
+        },
+        "required": ["x", "y", "w", "h", "object"]
+      },
+      "accessMode": "read",
+      "requiredPermissions": [
+        "slide:metadata:read",
+        "slide:region:read"
+      ],
+      "timeout_ms": 55000,
+      "agent_exposed": true
+    }
+  ]
+}

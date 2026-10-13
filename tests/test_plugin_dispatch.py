@@ -345,7 +345,9 @@ def test_dispatch_forwards_principal_and_arguments():
                   arguments={"include_mpp": False})
     assert r.status_code == 200, r.get_json()
     call = app_mod.requests.calls[-1]
-    assert call["json"] == {"slide": "demo.svs", "arguments": {"include_mpp": False}}
+    # P2 双字段转发：slide_id 取 token claim（此 token 无 claim → 空串）
+    assert call["json"] == {"slide": "demo.svs", "slide_id": "",
+                            "arguments": {"include_mpp": False}}
     principal = json.loads(call["headers"]["X-Dispatch-Principal"])
     assert principal == {"type": "agent", "user_id": "usr_1", "role": "user",
                          "session_id": "sess-9"}
@@ -381,14 +383,88 @@ def test_dispatch_plugin_unreachable_maps_capability_unavailable():
     _assert_envelope(r, 503, "capability_unavailable", retryable=True)
 
 
-def test_dispatch_plugin_4xx_passthrough_envelope():
+def test_dispatch_plugin_4xx_maps_capability_failed():
+    """插件 4xx 不再透传自报 code（防与 PT 保留码/HP 渲染冲突）：归一
+    capability_failed + details.plugin_code，状态保持。"""
     _install_tma()
     _give_view("owner")  # owner 主体需对 slide 有 view（读隔离）
     app_mod.requests.handler = lambda *a: _Resp(
         400, {"error": {"code": "invalid_request", "message": "参数非法",
                         "retryable": False}})
     r = _dispatch(_client(), _tool_token())
-    _assert_envelope(r, 400, "invalid_request", retryable=False)
+    assert r.status_code == 400
+    err = r.get_json()["error"]
+    assert err["code"] == "capability_failed"
+    assert err["retryable"] is False
+    assert err["details"]["plugin_code"] == "invalid_request"
+    assert "参数非法" in err["message"]
+
+
+def test_dispatch_plugin_4xx_code_dropped_and_message_capped():
+    """插件自报信封安全上限：code 非法（空格/控制字符/超 64 字）整段丢弃，
+    message 控制字符剥离 + 300 字截断——响应与审计 detail 同一口径，
+    插件后端不得借错误信封注入任意文本。"""
+    _install_tma()
+    _give_view("owner")
+    bad_code = "Bad Code!!\x00\x1b" + "x" * 100  # 空格+控制字符+超长 → 丢弃
+    bad_msg = "行一\x00\n行二\x1b[31m" + "m" * 400  # 控制字符+超长 → 清洗截断
+    app_mod.requests.handler = lambda *a: _Resp(
+        400, {"error": {"code": bad_code, "message": bad_msg,
+                        "retryable": False}})
+    r = _dispatch(_client(), _tool_token())
+    assert r.status_code == 400
+    err = r.get_json()["error"]
+    assert err["code"] == "capability_failed"
+    assert err["details"]["plugin_code"] is None  # 不合规 code 丢弃
+    msg = err["message"]
+    assert len(msg) == 300  # 截断到 300 字
+    for ch in ("\x00", "\n", "\x1b"):
+        assert ch not in msg
+    assert msg.startswith("行一") and "行二" in msg
+    # 审计同一口径：detail.plugin_code 不落未清洗的插件值
+    events = share_store.list_audit(action="plugin_capability_dispatch")
+    assert events
+    assert events[0]["detail"].get("plugin_code") is None
+
+
+def test_dispatch_plugin_4xx_code_normalized_and_message_boundary():
+    """合规 code 归一小写保留（≤64 字 [a-z0-9_.-]）；message 恰好 300 字
+    保留、超出部分截断不洇入。"""
+    _install_tma()
+    _give_view("owner")
+    app_mod.requests.handler = lambda *a: _Resp(
+        400, {"error": {"code": "a" * 63 + "-Z_1",  # 67 字 > 64 → 丢弃
+                        "message": "推" * 300 + "TAIL"}})
+    r = _dispatch(_client(), _tool_token())
+    err = r.get_json()["error"]
+    assert err["details"]["plugin_code"] is None  # 超 64 字丢弃
+    assert err["message"] == "推" * 300  # 300 字保留，"TAIL" 截掉
+
+    app_mod.requests.handler = lambda *a: _Resp(
+        400, {"error": {"code": "Inference_Busy.01",  # 合法形态 → 小写保留
+                        "message": "推理忙"}})
+    r2 = _dispatch(_client(), _tool_token())
+    err2 = r2.get_json()["error"]
+    assert err2["details"]["plugin_code"] == "inference_busy.01"
+    assert err2["message"] == "推理忙"
+
+
+def test_dispatch_plugin_5xx_plugin_code_capped():
+    """插件 5xx 的 details.plugin_code 同受上限约束：超长/非法码丢弃，
+    合法码归一小写保留。"""
+    _install_tma()
+    _give_view("owner")
+    app_mod.requests.handler = lambda *a: _Resp(
+        500, {"error": {"code": "x" * 65}})
+    r = _dispatch(_client(), _tool_token())
+    _assert_envelope(r, 503, "capability_unavailable", retryable=True)
+    assert r.get_json()["error"]["details"]["plugin_code"] is None
+
+    app_mod.requests.handler = lambda *a: _Resp(
+        500, {"error": {"code": "Inference_Unavailable"}})
+    r2 = _dispatch(_client(), _tool_token())
+    assert r2.get_json()["error"]["details"]["plugin_code"] == \
+        "inference_unavailable"
 
 
 def test_dispatch_plugin_redirect_rejected_503():

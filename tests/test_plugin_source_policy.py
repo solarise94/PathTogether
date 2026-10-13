@@ -66,14 +66,20 @@ def test_sample_manifest_validates_and_policy_pin_matches():
     data = json.loads(SAMPLE_MANIFEST.read_text(encoding="utf-8"))
     assert M.validate_manifest(data) == []
     policy = json.loads((REPO_ROOT / "plugins" / "source-policy.json").read_text(encoding="utf-8"))
-    # 防漂移守卫：三个内置插件的 manifest sha256 pin 均须与磁盘一致
+    # 防漂移守卫：内置插件的 manifest sha256 pin 均须与磁盘一致
     # （pathtogether-admin pin 是 admin 宿主信任链的硬前提——_admin_plugin_trusted
-    # fail-closed 要求显式 pin + hash 精确匹配，docs §8.2）
+    # fail-closed 要求显式 pin + hash 精确匹配，docs §8.2。pathsegmentor-measure
+    # 为测量插件 PoC 的显式 pin，2026-10-13——策略对未列出 key 放行，新
+    # bundle 必须进入本集合，否则漏出防漂移守卫）
     admin_manifest = REPO_ROOT / "plugins" / "pathtogether-admin" / "manifest.json"
-    assert set(policy) == {"sample-annotator", "sample-tma-score", "pathtogether-admin"}
+    psm_manifest = (REPO_ROOT / "plugins" / "pathsegmentor-measure"
+                    / "manifest.json")
+    assert set(policy) == {"sample-annotator", "sample-tma-score",
+                           "pathtogether-admin", "pathsegmentor-measure"}
     assert policy["sample-annotator"] == _sha256(SAMPLE_MANIFEST)
     assert policy["sample-tma-score"] == _sha256(TMA_MANIFEST)
     assert policy["pathtogether-admin"] == _sha256(admin_manifest)
+    assert policy["pathsegmentor-measure"] == _sha256(psm_manifest)
     # pathtogether-admin manifest（Manifest v1.1 adminPermissions）须通过校验器
     admin = json.loads(admin_manifest.read_text(encoding="utf-8"))
     assert M.validate_manifest(admin) == []
@@ -98,6 +104,14 @@ def test_sample_manifest_validates_and_policy_pin_matches():
     tma = json.loads(TMA_MANIFEST.read_text(encoding="utf-8"))
     assert M.validate_manifest(tma) == []
     assert [c["name"] for c in tma["provides"]] == ["slide_summary"]
+    # pathsegmentor-measure 的 provides 声明须通过校验器（安装登记前置）：
+    # segment_region 只读、agent 暴露、timeout ≤60s
+    psm = json.loads(psm_manifest.read_text(encoding="utf-8"))
+    assert M.validate_manifest(psm) == []
+    cap = psm["provides"][0]
+    assert cap["name"] == "segment_region"
+    assert cap["accessMode"] == "read" and cap["agent_exposed"] is True
+    assert 0 < cap["timeout_ms"] <= M.CAPABILITY_MAX_TIMEOUT_MS
 
 
 def test_builtin_plugin_bundle_file_hashes_match_disk():

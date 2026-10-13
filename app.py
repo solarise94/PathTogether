@@ -7988,6 +7988,55 @@ def _subject_slide_permissions(role, user_id, slide):
     return perms
 
 
+def _subject_can_annotate_desc(role, uid, desc):
+    """claims 主体的 descriptor 形态 annotate 判定（归档检查由调用方先行）。
+
+    与名通道 ``_subject_can_annotate_slide`` 完全同语义的 ID 权威版：
+    认证 owner = 本人 ∪ 显式添加（authorize_read allow_public/allow_share=
+    False，升级 B R5）；user = slides 行属主 ∪ annotate 档 share 成员；
+    本地免认证单租户态（owner 无 uid）→ True。
+    """
+    if desc is None:
+        return False
+    if role == user_store.ROLE_OWNER:
+        if not uid:
+            return True
+        return slide_store.authorize_read(desc, actor_user_id=uid,
+                                          allow_public=False, allow_share=False)
+    if not uid:
+        return False
+    if desc.owner_user_id and uid == desc.owner_user_id:
+        return True
+    return slide_store.has_share_permission(uid, desc.slide_id,
+                                            share_store.PERMISSION_ANNOTATE)
+
+
+def _subject_slide_permissions_desc(role, uid, desc):
+    """``_subject_slide_permissions`` 的 **slide_id 权威**形态（P2）。
+
+    id_bundle 行（全部新上传）``legacy_filename`` 恒 NULL——名通道
+    （share_store.get_slide_meta_full ``WHERE legacy_filename=%s``）对
+    original_filename 恒 miss，且 original_filename 跨用户可重名、仅为展示
+    字段，不能作判定键。本函数按 slides 行（owner/public）+ authorize_read
+    + share 成员关系判定，授予集合与名通道同一常量（_CAPABILITY_*_GRANTS）、
+    同一 §6.1 语义；desc 解析不到（None）→ 空集（fail-closed，无「名找不到
+    就放行」回退）。
+    """
+    if desc is None:
+        return set()
+    if role == user_store.ROLE_OWNER and not uid:
+        if _slide_id_archived(desc.slide_id):
+            return set(_CAPABILITY_VIEW_GRANTS)
+        return set(_CAPABILITY_VIEW_GRANTS) | set(_CAPABILITY_ANNOTATE_GRANTS)
+    perms = set()
+    if _ai_session_subject_can_view(role, uid, desc):
+        perms |= _CAPABILITY_VIEW_GRANTS
+    if (not _slide_id_archived(desc.slide_id)
+            and _subject_can_annotate_desc(role, uid, desc)):
+        perms |= _CAPABILITY_ANNOTATE_GRANTS
+    return perms
+
+
 def can_delete_annotation(roi):
     """owner 任意；否则仅本人创建（roi.owner_user_id == 自己）。"""
     ident = current_identity()
@@ -13778,6 +13827,39 @@ _AGENT_TOOL_TYP = "agent-tool"
 _AI_SESSION_TTL_SECONDS = int(os.environ.get("AI_SESSION_TTL_SECONDS") or 86400)
 _AGENT_TOOL_TOKEN_TTL_SECONDS = _AI_SESSION_TTL_SECONDS + 600
 
+# ---------------------------------------------------------------------------
+# 委托读凭证（delegated read token，测量插件读用户 ROI 的最小授权）
+#
+# 阻塞缺口（docs/measurement-models-homepc-implementation.md §1）：run grant
+# 只发给 HistoPilot installation（_issue_run_grant），_plugin_slide_run_grant_gate
+# 按调用插件的 installation 校验——新的测量插件持有自身 region:read plugin JWT
+# 在普通用户切片上仍会 403。dispatch 在 agent token / 用户实时权限 / 插件启用
+# 全部通过后，为本次调用签发**短时、只读、绑定**{plugin installation, user,
+# slide_id, revision, capability, ROI 像素上限, exp, jti} 的 HS256 凭证（与
+# plugin JWT 同密钥域、独立 aud/typ，按 typ 拒绝跨域混用），经转发请求头
+# 交插件后端；插件用它调 by-id region / slide-info 端点时按 claim 逐项复核
+# （_plugin_delegated_read_gate）。不授予任何写能力、不继承 HistoPilot 的
+# grant/secret，不进 Agent 可见结果与日志。
+# ---------------------------------------------------------------------------
+_DELEGATED_READ_AUDIENCE = "plugin-delegated-read"
+_DELEGATED_READ_TYP = "delegated-read"
+#: 凭证头名（dispatch → 插件后端 → 平台 by-id 读端点，同名透传）
+_DELEGATED_READ_HEADER = "X-Delegated-Read-Token"
+#: 签发门槛 scope（最小披露）：只有声明区域读权限的能力才随转发下发凭证。
+#: 安装行落盘的 region-read 信号只有能力登记项 required_permissions
+#: （manifest 顶层 permissions 不持久化——仅 slide:import 进 approved_scopes），
+#: 故按 `required_permissions ⊇ {slide:region:read}` 判定；不声明的能力
+#: （如 slide_summary）dispatch 一律不带凭证头。
+_DELEGATED_READ_SCOPE = "slide:region:read"
+#: TTL ≤120s：插件拿到后立即用，覆盖一次 region 读取量级；过期即失效
+#: （撤销主路径 = dispatch 不再签发；TTL 仅兜底，与 run grant 同思路）
+_DELEGATED_READ_TTL_SECONDS = max(1, min(
+    int(os.environ.get("PLUGIN_DELEGATED_READ_TTL_SECONDS") or 120), 120))
+#: 单凭证可读的 level-0 bbox 像素上限（w*h）：4096² 默认，≈0.5µm/px 下 ~2mm²
+#: 量级的有界 ROI——阻断「整张切片当一个 ROI」的全片调用；env 可收紧
+_DELEGATED_READ_ROI_MAX_PIXELS = max(1, int(os.environ.get(
+    "PLUGIN_DELEGATED_ROI_MAX_PIXELS") or (4096 * 4096)))
+
 
 def _plugin_secret_file(plugin_id: str) -> Path:
     """安装凭证明文文件路径（SHARE_DATA_DIR 下，0600）。"""
@@ -13960,6 +14042,41 @@ def _agent_tool_token_decode(token: str, key: bytes = None):
     return payload, None
 
 
+def _delegated_read_token_encode(claims: dict) -> str:
+    """签发委托读凭证（与 plugin JWT 同密钥、独立 aud/typ 域，§10-4 同款）。
+
+    claims 由 dispatch 门槛通过后组装（sub=installation_id/user_id/role/
+    slide_id/revision/capability/roi_max_pixels）；本函数只补 iss/aud/typ 与
+    TTL（≤120s，_DELEGATED_READ_TTL_SECONDS）。jti/iat/exp 由 _plugin_jwt_encode
+    统一补。
+    """
+    body = dict(claims)
+    body.setdefault("iss", _PLUGIN_JWT_ISSUER)
+    body.setdefault("aud", _DELEGATED_READ_AUDIENCE)
+    body.setdefault("typ", _DELEGATED_READ_TYP)
+    return _plugin_jwt_encode(body, ttl=_DELEGATED_READ_TTL_SECONDS)
+
+
+def _delegated_read_token_decode(token: str, key: bytes = None):
+    """校验并解码委托读凭证。
+
+    与 _plugin_jwt_decode 同一套签名/exp 校验，但要求 aud==plugin-delegated-read
+    且 typ==delegated-read（同密钥域不同 typ，按 typ 拒绝跨域使用——plugin
+    JWT / agent-tool-token 在此解码为 invalid，反之亦然）。
+    返回 (payload, None) 或 (None, err)（err 语义同 _plugin_jwt_decode）。
+    """
+    if key is None:
+        key = _PLUGIN_JWT_KEY
+    payload, err = _hs256_jwt_verify(token, key)
+    if err is not None:
+        return None, err
+    if (payload.get("iss") != _PLUGIN_JWT_ISSUER
+            or payload.get("aud") != _DELEGATED_READ_AUDIENCE
+            or payload.get("typ") != _DELEGATED_READ_TYP):
+        return None, "invalid_token"
+    return payload, None
+
+
 # --------------------------------------------------------------------------- #
 # 统一错误信封（§7.7 的本节点子集）
 #
@@ -13987,6 +14104,9 @@ _PLUGIN_ERROR_RETRYABLE = {
     "capability_not_granted": False,
     "permission_denied": False,
     "capability_unavailable": True,
+    # 插件自报 4xx 的归一码（2026-10-13）：插件拒绝调用（参数等）不可重试；
+    # retryable 由插件信封原值透传（_plugin_error 显式给出）
+    "capability_failed": False,
     # PR2 usage ingestion（admin-billing §7.4/§7.7）：payload/subject 冲突是
     # 确定性 4xx（进 dead 队列，不重试）；主体绑定未就绪可退避重试；billing
     # 的 PG-only 守卫是配置性错误（不可重试，状态码 503）
@@ -15235,8 +15355,14 @@ _CAPABILITY_TOOL_DESCRIPTION_SUFFIX = (
     "不得未经用户确认就作为结论依据。）")
 
 
-def _list_agent_capabilities(user_ctx, slide):
+def _list_agent_capabilities(user_ctx, slide, slide_id=None):
     """注册表中 enabled + read 且发起用户对该 slide 有权调用的能力。
+
+    ``slide_id`` 给出（官方 run 起跑随附，P2 合同）时按 **slide_id 权威**
+    判权（``_subject_slide_permissions_desc``）——id_bundle 行
+    legacy_filename=NULL，名通道对 original_filename 恒 miss，且
+    original_filename 跨用户可重名不能作判定键；仅名（历史调用方/测试）
+    保持既有名通道判定。
 
     另排除 manifest 声明能力级退出（``agent_exposed: false``）的能力——
     不再注入 agent 工具集（如样例插件的 slide_summary：无平台回调时返回
@@ -15256,7 +15382,19 @@ def _list_agent_capabilities(user_ctx, slide):
     ident = user_ctx or {}
     role = ident.get("role") or user_store.ROLE_OWNER
     uid = ident.get("user_id")
-    perms = _subject_slide_permissions(role, uid, slide)
+    if slide_id:
+        # P2 ID 权威（id_bundle 行 legacy_filename=NULL，名通道 get_slide_meta_full
+        # 对 original_filename 恒 miss）：按 slides 行/authorize_read 判权。
+        # 解析失败 → 空集 fail-closed（本轮不注入，无「名找不到就放行」回退）。
+        try:
+            desc = slide_store.resolve_slide_id(slide_id)
+        except Exception:
+            app.logger.warning("能力注入 slide_id 解析失败（fail-closed 不注入）",
+                               exc_info=True)
+            desc = None
+        perms = _subject_slide_permissions_desc(role, uid, desc)
+    else:
+        perms = _subject_slide_permissions(role, uid, slide)
     out = []
     for inst in installations:
         if not inst.get("enabled"):
@@ -15275,7 +15413,7 @@ def _list_agent_capabilities(user_ctx, slide):
     return out
 
 
-def _inject_agent_extra_tools(user_ctx, slide, config):
+def _inject_agent_extra_tools(user_ctx, slide, config, slide_id=None):
     """起跑时注入 extra_tools + tool_token（无可用能力时不写入任何键）。
 
     仅「暴露给 agent」的能力进入工具集：manifest 声明 agent_exposed=false
@@ -15287,8 +15425,10 @@ def _inject_agent_extra_tools(user_ctx, slide, config):
     接受请求时才解析/新建（continueMain/askFork/askBranch），prepare 阶段
     不可预知，预绑错误 id 只会让合法调报 session_mismatch。限流因此不依赖
     该维度可伪造的头，见 dispatch 第 ④ 步：token session 为空时回退 jti）、
-    user_id/role、slide、capabilities=[全名列表]、exp=会话 TTL + 10 分钟。
-    extra_tools 形状见 docs §5.1 jsonc。
+    user_id/role、slide、**slide_id**（P2：起跑时已知的稳定 ID，dispatch
+    判权与委托读凭证签发按它权威解析——id_bundle 行 legacy_filename=NULL，
+    slide 名只是展示字段，跨用户可重名）、capabilities=[全名列表]、
+    exp=会话 TTL + 10 分钟。extra_tools 形状见 docs §5.1 jsonc。
 
     返回 True 表示已注入（调用方须随附 AGENT_EXTRA_TOOLS_ENVELOPE——sidecar
     fail-closed：config 携带 extra_tools 而信封未声明 extra-tools:v1 时整个
@@ -15296,7 +15436,7 @@ def _inject_agent_extra_tools(user_ctx, slide, config):
     """
     if not config or not slide:
         return False
-    caps = _list_agent_capabilities(user_ctx, slide)
+    caps = _list_agent_capabilities(user_ctx, slide, slide_id=slide_id)
     if not caps:
         return False
     ident = user_ctx or {}
@@ -15321,6 +15461,10 @@ def _inject_agent_extra_tools(user_ctx, slide, config):
         "role": ident.get("role") or user_store.ROLE_OWNER,
         "session_id": "",
         "slide": slide,
+        # P2：稳定 ID 随 token 下发（dispatch 判权/委托读凭证签发的权威键；
+        # id_bundle 行 legacy_filename=NULL，slide 名只是展示字段）。空串 =
+        # 历史形态（仅名），dispatch 落回名通道判定。
+        "slide_id": slide_id or "",
         "capabilities": full_names,
     })
     config["extra_tools"] = tools
@@ -15429,7 +15573,10 @@ def _ai_run_prepare(user_ctx, body, slide, need_grant, slide_id=None):
         return (jsonify(error="run grant 签发失败，已拒绝起跑（fail-closed）"), 503)
     # 插件能力注入（docs §5.1）：官方模式专用——demo 路径（/api/demo/ai/run）
     # 直接用 _build_sidecar_config 组装，不经本函数，零改动。
-    injected = _inject_agent_extra_tools(user_ctx, slide, config)
+    # slide_id 随注：token 携带稳定 ID（dispatch 判权/委托凭证签发权威键——
+    # id_bundle 行 legacy_filename=NULL，名通道不可判定）。
+    injected = _inject_agent_extra_tools(user_ctx, slide, config,
+                                         slide_id=slide_id)
     resv, budget_err, hard_ctx = _ai_reserve_run_budget(user_ctx, rid)
     if budget_err is not None:
         # 形状防御：err 必须是 Flask (body, status) tuple（曾因包裹层级错误
@@ -19122,6 +19269,13 @@ def plugin_v1_slide_info_by_id(slide_id):
     safe, gate, serr = _plugin_resolve_slide_by_id(slide_id)
     if serr is not None:
         return serr
+    # 委托读凭证（测量插件取 MPP/尺寸）：带凭证头时逐 claim 复核（无 ROI
+    # 上限项）；不带凭证保持既有行为（本端点本就无 run grant gate，纯增量）。
+    if (request.headers.get(_DELEGATED_READ_HEADER) or "").strip():
+        derr = _plugin_delegated_read_gate(claims, gate.slide_id if gate is not None else None,
+                                           gate, check_bbox_cap=False)
+        if derr is not None:
+            return derr
     return _plugin_v1_slide_info_impl(safe, gate)
 
 
@@ -19219,10 +19373,18 @@ def plugin_v1_region_impl(slide=None, slide_id=None):
     if serr is not None:
         return serr
     _region_path = _desc_path(gate) if gate is not None else (UPLOAD_DIR / safe)
-    gerr = _plugin_slide_run_grant_gate(safe, claims, slide_id=sid)
-    if gerr is not None:
-        return gerr
     body = request.get_json(silent=True) or {}
+    if (request.headers.get(_DELEGATED_READ_HEADER) or "").strip():
+        # 委托读凭证通道（测量插件）：逐 claim 复核（含 ROI 上限），通过则
+        # 替代 run grant gate；像素预算/并发闸在 _plugin_region_body 照常生效。
+        derr = _plugin_delegated_read_gate(claims, sid, gate, body=body,
+                                           check_bbox_cap=True)
+        if derr is not None:
+            return derr
+    else:
+        gerr = _plugin_slide_run_grant_gate(safe, claims, slide_id=sid)
+        if gerr is not None:
+            return gerr
     return _plugin_region_body(claims, safe, gate, sid, _region_path, body)
 
 
@@ -21484,6 +21646,181 @@ def plugin_v1_capabilities():
 #      capability_unavailable（retryable）；
 #   ⑦ result JSON ≤64KB，超限截断并附 truncated: true。
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# 委托读凭证（delegated read token）：dispatch 签发 + by-id 读端点复核
+#
+# 签发时机：dispatch ①验签 tool token → ②插件+能力 enabled → ③用户对 slide
+# 实时权限 → ④限流 全部通过之后、⑥转发之前，且**仅当能力的
+# required_permissions 声明 slide:region:read**（最小披露，见
+# _DELEGATED_READ_SCOPE）。解析 slide_id/revision 失败时
+# **不签发也不阻断**转发（不带凭证的转发与旧形为一致；需要读图的插件后端会
+# 以 missing credential 拒绝——fail-safe，无提权面）。凭证只放转发请求头，
+# 不入 forward body（既有 body 形状 {slide, arguments} 不变）、不入审计、
+# 不入 Agent 可见结果。
+# --------------------------------------------------------------------------- #
+def _mint_delegated_read_token(agent_claims, plugin_installation_id, slide,
+                               capability_name):
+    """为本次 dispatch 调用签发委托读凭证；返回 token 或 None（不签发）。
+
+    调用方（plugin_v1_dispatch ⑥'）只在能力的 required_permissions 声明
+    ``slide:region:read`` 时才调用本函数（最小披露：不读图的能力不随转发
+    下发可读区域凭证）。
+
+    绑定 claims：sub=插件 installation_id（读端点按此限定「只有该 installation
+    的 plugin JWT 能用这张凭证」）、user_id/role（读时按此**实时**复查 view
+    权限）、slide_id（稳定 ID，防名伪造）、revision（内容型 revision，切片
+    替换后失效）、capability、roi_max_pixels（level-0 bbox w*h 上限）。
+    exp/jti 由 _plugin_jwt_encode 统一补（TTL ≤120s）。
+
+    slide_id 解析：agent token 携带 slide_id claim（起跑注入，P2）时**直接
+    按它权威解析**——id_bundle 行 legacy_filename=NULL，
+    share_store.get_slide_id（WHERE legacy_filename）对展示名恒 miss；仅名
+    （历史 token / legacy 冻结别名行）落回名→ID 解析。两条路径都按解析到的
+    行判定，解析不到不签发（fail-closed）。
+    """
+    user_id = str(agent_claims.get("user_id") or agent_claims.get("sub") or "")
+    role = str(agent_claims.get("role") or user_store.ROLE_USER)
+    if not user_id or not plugin_installation_id:
+        return None
+    token_slide_id = str(agent_claims.get("slide_id") or "").strip()
+    try:
+        if token_slide_id:
+            slide_id = token_slide_id
+            desc = slide_store.resolve_slide_id(slide_id)
+        else:
+            slide_id = share_store.get_slide_id(slide)
+            desc = slide_store.resolve_slide_id(slide_id) if slide_id else None
+    except Exception:
+        app.logger.warning("委托读凭证 slide 解析失败（本次不签发）：%s",
+                           slide, exc_info=True)
+        return None
+    if desc is None:
+        return None
+    revision = _slide_revision(desc)
+    if not revision:
+        # 内容 revision 缺失（发布中断等防御态）：无法绑定切片代际，不签发
+        return None
+    return _delegated_read_token_encode({
+        "sub": plugin_installation_id,
+        "user_id": user_id,
+        "role": role,
+        "slide_id": slide_id,
+        "revision": revision,
+        "capability": capability_name,
+        "roi_max_pixels": _DELEGATED_READ_ROI_MAX_PIXELS,
+    })
+
+
+def _delegated_bbox_pixels(body):
+    """从 region 请求体取 level-0 bbox 面积（契约 bbox 形态 / legacy 平铺同给
+    时以平铺为准，与 _plugin_region_body 同口径）；不可解析返回 None。"""
+    if not isinstance(body, dict):
+        return None
+    bbox = body.get("bbox")
+    flat = dict(body)
+    if isinstance(bbox, dict):
+        for k in ("x", "y", "w", "h"):
+            if k in bbox and k not in flat:
+                flat[k] = bbox[k]
+
+    def _int(k):
+        try:
+            return int(flat.get(k))
+        except (TypeError, ValueError):
+            return None
+    x, y, w, h = _int("x"), _int("y"), _int("w"), _int("h")
+    if x is None or y is None or w is None or h is None:
+        return None
+    if x < 0 or y < 0 or w <= 0 or h <= 0:
+        return None
+    return w * h
+
+
+def _plugin_delegated_read_gate(plugin_claims, sid, gate, *, body=None,
+                                check_bbox_cap=False):
+    """委托读凭证复核（by-id region / slide-info 读通道；fail-closed）。
+
+    前置：调用端点的 plugin JWT 已过 _require_plugin_token（installation
+    存在 + enabled 每次回查 + scope 检查）。本闸只在请求带
+    X-Delegated-Read-Token 时介入；验证项（全部在**读时**重查）：
+      1. 签名/iss/aud/typ/exp（域隔离：plugin JWT / agent-tool-token 拒绝）；
+      2. claims.sub == 调用插件 installation（他 installation 拾到的凭证无用）
+         且该 installation 仍存在并 enabled；
+      3. claims.slide_id == 请求 slide_id（错切片拒绝）；
+      4. claims.user_id/role 对切片的 view 权限实时复查（mint 后撤权即拒；
+         与 run grant 复核同一判定源 _ai_session_subject_can_view）；
+      5. claims.revision == 当前内容 revision（切片替换/重发布后失效）；
+      6. （region）claims.roi_max_pixels：bbox w*h ≤ 上限（阻断全片 ROI）。
+    通过后仍走既有像素预算/并发闸（_plugin_region_body 内，不豁免）。
+    返回 None（放行，且调用方**跳过** run grant gate）或错误响应。
+    """
+    token = (request.headers.get(_DELEGATED_READ_HEADER) or "").strip()
+    claims, err = _delegated_read_token_decode(token)
+    if err is not None:
+        if err == "token_expired":
+            return _plugin_error(401, "token_expired",
+                                 "委托读凭证已过期，请重新发起能力调用")
+        return _plugin_error(401, "unauthorized", "委托读凭证无效")
+    inst_id = str(claims.get("sub") or "")
+    if not inst_id or inst_id != (plugin_claims or {}).get("sub"):
+        return _plugin_error(403, "forbidden",
+                             "委托读凭证与调用插件安装不符")
+    installation = share_store.get_plugin_installation(inst_id)
+    if installation is None or not installation.get("enabled"):
+        return _plugin_error(401, "unauthorized", "插件安装不存在或已停用")
+    if str(claims.get("slide_id") or "") != (sid or ""):
+        return _plugin_error(403, "forbidden", "委托读凭证绑定切片不符")
+    role = str(claims.get("role") or "")
+    uid = str(claims.get("user_id") or "")
+    if not _ai_session_subject_can_view(role, uid, gate):
+        return _plugin_error(403, "forbidden",
+                             "发起用户当前对该切片无读取权限")
+    current_revision = _slide_revision(gate) if gate is not None else ""
+    if not current_revision or current_revision != str(claims.get("revision") or ""):
+        return _plugin_error(409, "slide_revision_conflict",
+                             "切片已变更，委托读凭证失效，请重新发起能力调用")
+    if check_bbox_cap:
+        pixels = _delegated_bbox_pixels(body)
+        cap = claims.get("roi_max_pixels")
+        try:
+            cap = int(cap)
+        except (TypeError, ValueError):
+            return _plugin_error(401, "unauthorized", "委托读凭证无效")
+        if pixels is None:
+            return _plugin_error(400, "invalid_request",
+                                 "x/y/w/h 参数需为整数且 0<=x,y、0<w,h")
+        if pixels > cap:
+            return _plugin_error(
+                403, "forbidden",
+                "ROI 超出委托读凭证上限（%d > %d level-0 像素）" % (pixels, cap),
+                details={"reason": "roi_over_cap", "pixels": pixels,
+                         "max_pixels": cap})
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# 插件能力 dispatch 端点（插件能力层 docs §4.2，P1）
+#
+# 平台是唯一分发点（D1）：所有能力调用经本端点转发，鉴权/启用/权限/限流/
+# 审计单点收口，消费方（sidecar/agent）永不直连插件 baseUrl。P1 消费主体仅
+# agent（agent-tool-token，用户代理）；plugin JWT 调 dispatch 属 P2，明确 403。
+#
+# 门槛顺序（docs §4.2，顺序即语义）：
+#   ① 验签 tool token（typ/exp/session/slide/能力清单 claims）；
+#   ② 插件 + 能力 enabled，否则 404（不泄露存在性）；
+#   ③ 权限检查（D3：发起用户对 slide 的权限 ∩ requiredPermissions，共用
+#      _subject_slide_permissions 映射表）；
+#   ④ 限流：(session, capability) 维度 token bucket → 429 + Retry-After；
+#   ⑤ 审计 plugin_capability_dispatch（主体/session/plugin/capability/slide/
+#      耗时/结果码）；
+#   ⑥ 转发插件 service.baseUrl + POST /capabilities/{name}，带
+#      X-Dispatch-Principal 头（主体类型/id/session）；插件 5xx/超时映射
+#      capability_unavailable（retryable）；
+#   ⑦ result JSON ≤64KB，超限截断并附 truncated: true。
+#   ⑥' ④ 之后另签发委托读凭证（X-Delegated-Read-Token 头）随转发下发，
+#      供测量插件经 by-id region 端点读取用户 ROI（见上一节）；仅签给
+#      requiredPermissions 声明 slide:region:read 的能力。
+# --------------------------------------------------------------------------- #
 def _capability_timeout_ms(cap):
     """登记项 timeout_ms → 转发超时毫秒（clamp 到 [1, 60000]，缺省 15000）。"""
     try:
@@ -21518,6 +21855,45 @@ def _capability_result_envelope(result):
     return {"result": {"preview": encoded[:1024],
                        "note": "插件返回超过 64KB 上限，已截断"},
             "truncated": True, "original_bytes": len(raw)}
+
+
+# 插件自报 error 信封的安全上限（dispatch 4xx/404/5xx 分支）：code/message 会
+# 原样进 Agent/HP 可见的响应（message 直接作为 error.message、code 进
+# details.plugin_code）与审计 detail，插件后端被入侵或有缺陷时不得借它们
+# 注入任意文本（控制字符伪造日志/换行逃逸、超长撑爆审计行与前端渲染）。
+_PLUGIN_CODE_MAX_LEN = 64
+_PLUGIN_CODE_RE = re.compile(r"[a-z0-9_.-]+")
+_PLUGIN_MESSAGE_MAX_LEN = 300
+_PLUGIN_MESSAGE_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _sanitize_plugin_error_code(code):
+    """插件自报 error.code → 安全短 token；不合规一律丢弃（返回 None）。
+
+    归一为小写后整段校验：仅放行 ≤64 字的 ``[a-z0-9_.-]``。细分错误码
+    （inference_busy / not_ready 等）是给上游程序消费的枚举键，不是自由
+    文本——带空格/控制字符/超长的「码」直接丢弃，宁缺毋假。
+    """
+    if not isinstance(code, str):
+        return None
+    cand = code.strip().lower()
+    if not cand or len(cand) > _PLUGIN_CODE_MAX_LEN:
+        return None
+    return cand if _PLUGIN_CODE_RE.fullmatch(cand) else None
+
+
+def _sanitize_plugin_error_message(message):
+    """插件自报 error.message → 控制字符剥离 + 300 字截断；空则 None。
+
+    message 在 404/其余 4xx 分支直接作为响应 error.message 返回（浏览器/
+    Agent 可见），返回 None 时调用方落回平台默认文案。
+    """
+    if not isinstance(message, str):
+        return None
+    cleaned = _PLUGIN_MESSAGE_CTRL_RE.sub(" ", message).strip()
+    if not cleaned:
+        return None
+    return cleaned[:_PLUGIN_MESSAGE_MAX_LEN]
 
 
 def _find_registered_capability(plugin_id, capability_name):
@@ -21635,9 +22011,27 @@ def plugin_v1_dispatch(plugin_id, capability_name):
             app.logger.warning("dispatch 审计写入失败（best-effort）", exc_info=True)
 
     # ---- ③ 权限检查（D3）：发起用户对 slide 的权限 ∩ requiredPermissions ---- #
-    perms = _subject_slide_permissions(
-        claims.get("role") or user_store.ROLE_USER,
-        claims.get("user_id") or claims.get("sub"), slide)
+    # P2 ID 权威：token 起跑时携带 slide_id（_inject_agent_extra_tools 注入）
+    # 时按 ID 解析 descriptor 判权——id_bundle 行 legacy_filename=NULL，
+    # 名通道（get_slide_meta_full WHERE legacy_filename）对 original_filename
+    # 恒 miss，且 original_filename 跨用户可重名不能作判定键。解析失败 →
+    # 空集 fail-closed（无「名找不到就放行」回退）。历史 token（无 slide_id
+    # claim）落回名通道判定（legacy 冻结别名行不受影响）。
+    token_slide_id = str(claims.get("slide_id") or "").strip()
+    if token_slide_id:
+        try:
+            token_desc = slide_store.resolve_slide_id(token_slide_id)
+        except Exception:
+            app.logger.warning("dispatch slide_id 解析失败（fail-closed 拒绝）",
+                               exc_info=True)
+            token_desc = None
+        perms = _subject_slide_permissions_desc(
+            claims.get("role") or user_store.ROLE_USER,
+            claims.get("user_id") or claims.get("sub"), token_desc)
+    else:
+        perms = _subject_slide_permissions(
+            claims.get("role") or user_store.ROLE_USER,
+            claims.get("user_id") or claims.get("sub"), slide)
     required = cap.get("required_permissions") or []
     if not set(required) <= perms:
         _audit_dispatch(403, "permission_denied",
@@ -21684,7 +22078,30 @@ def plugin_v1_dispatch(plugin_id, capability_name):
         "role": claims.get("role") or "",
         "session_id": session_id,
     }, ensure_ascii=True, separators=(",", ":"))
-    forward_body = {"slide": slide, "arguments": body.get("arguments") or {}}
+    # P2 双字段转发（合同 §6.3）：slide_id 取**签名 token claim**（权威），
+    # HP 侧 body.slide_id 若给出必须与之一致（不符 403）——id_bundle 行
+    # legacy_filename=NULL，仅名的转发会让插件后端按名回调 404。
+    # slide 字段保留作兼容（legacy 行/审计）。
+    token_sid = str(claims.get("slide_id") or "").strip()
+    body_sid = str(body.get("slide_id") or "").strip()
+    if body_sid and token_sid and body_sid != token_sid:
+        return _plugin_error(403, "forbidden",
+                             "body.slide_id 与 token 绑定切片不符",
+                             details={"reason": "slide_id_mismatch"})
+    forward_body = {"slide": slide, "slide_id": token_sid,
+                    "arguments": body.get("arguments") or {}}
+    # ⑥' 委托读凭证：全部门槛通过后，仅对声明区域读权限的能力签发
+    # （最小披露：不读图的插件后端拿不到可读区域的凭证），随转发头下发
+    # （不进 body/审计/Agent 结果）。解析失败不签发不阻断（fail-safe，
+    # 见 _mint_delegated_read_token）。
+    forward_headers = {"X-Dispatch-Principal": principal}
+    delegated_token = None
+    if _DELEGATED_READ_SCOPE in (cap.get("required_permissions") or []):
+        delegated_token = _mint_delegated_read_token(
+            claims, installation.get("installation_id") or "", slide,
+            capability_name)
+    if delegated_token:
+        forward_headers[_DELEGATED_READ_HEADER] = delegated_token
     timeout_sec = _capability_timeout_ms(cap) / 1000.0
     try:
         # 安装时批准的是登记的 baseUrl；30x 目标未经批准——禁止跟随重定向
@@ -21693,7 +22110,7 @@ def plugin_v1_dispatch(plugin_id, capability_name):
         r = requests.post(
             "%s/capabilities/%s" % (base_url, capability_name),
             json=forward_body,
-            headers={"X-Dispatch-Principal": principal},
+            headers=forward_headers,
             timeout=timeout_sec,
             allow_redirects=False)
     except (requests.ConnectionError, requests.Timeout):
@@ -21718,24 +22135,71 @@ def plugin_v1_dispatch(plugin_id, capability_name):
                              "插件后端返回重定向（%d），能力不可用" % r.status_code,
                              details={"reason": "plugin_redirect"})
     if r.status_code >= 500:
+        # 插件 5xx：保持 capability_unavailable（retryable）契约不变，但解析
+        # 插件错误信封，把细分错误码（inference_busy / inference_unavailable /
+        # not_ready 等）透出到 details（附加字段，既有消费方按 code/message
+        # 消费不受影响；HP 侧 details 只读 Retry-After 相关键）。
+        plugin_code = None
+        try:
+            pbody_5xx = r.json()
+            if isinstance(pbody_5xx, dict) \
+                    and isinstance(pbody_5xx.get("error"), dict):
+                plugin_code = _sanitize_plugin_error_code(
+                    pbody_5xx["error"].get("code"))
+        except Exception:
+            plugin_code = None
         _audit_dispatch(r.status_code, "capability_unavailable",
                         (time.time() - started) * 1000,
-                        extra={"reason": "plugin_5xx"})
+                        extra={"reason": "plugin_5xx",
+                               "plugin_code": plugin_code})
         return _plugin_error(
             503, "capability_unavailable",
-            "插件后端返回 %d，能力暂不可用" % r.status_code)
+            "插件后端返回 %d，能力暂不可用" % r.status_code,
+            details={"reason": "plugin_5xx", "plugin_code": plugin_code})
     if r.status_code >= 400:
-        # 插件 4xx（如参数不合法）：透传其错误信封（无信封时按 invalid_request 归一）
-        code, message = "invalid_request", "插件拒绝本次调用"
+        # 插件 4xx：不再透传插件自报 code——插件回的 not_found 会在 HP 侧
+        # 渲染成「插件或能力已停用」（HP default 分支还按 httpStatus==404
+        # 给同一句），与 PT 保留码语义（能力/插件不存在）冲突。归一：
+        #   - 404 → 503 capability_unavailable（retryable）：插件的输入不可用
+        #     （如切片缺失）不是「能力停用」，应允许模型改参重试/继续；
+        #   - 其余 4xx → 原状态码 + capability_failed（参数问题如实透传）；
+        #   - 细分码一律进 error.details.plugin_code（附加字段，HP 消费方
+        #     只按 code/message/status 渲染，不受影响）。
+        plugin_code = plugin_message = None
+        plugin_retryable = False
         try:
-            pbody = r.json()
-            if isinstance(pbody, dict) and isinstance(pbody.get("error"), dict):
-                code = str(pbody["error"].get("code") or code)
-                message = str(pbody["error"].get("message") or message)
+            pbody_4xx = r.json()
+            if isinstance(pbody_4xx, dict) \
+                    and isinstance(pbody_4xx.get("error"), dict):
+                plugin_code = _sanitize_plugin_error_code(
+                    pbody_4xx["error"].get("code"))
+                plugin_message = _sanitize_plugin_error_message(
+                    pbody_4xx["error"].get("message"))
+                plugin_retryable = bool(pbody_4xx["error"].get("retryable",
+                                                               False))
         except Exception:
             pass
-        _audit_dispatch(r.status_code, code, (time.time() - started) * 1000)
-        return _plugin_error(r.status_code, code, message)
+        if r.status_code == 404:
+            _audit_dispatch(503, "capability_unavailable",
+                            (time.time() - started) * 1000,
+                            extra={"reason": "plugin_404",
+                                   "plugin_code": plugin_code})
+            return _plugin_error(
+                503, "capability_unavailable",
+                plugin_message or "插件无法完成本次调用（输入不可用）",
+                retryable=True,
+                details={"reason": "plugin_4xx", "plugin_status": 404,
+                         "plugin_code": plugin_code})
+        _audit_dispatch(r.status_code, "capability_failed",
+                        (time.time() - started) * 1000,
+                        extra={"reason": "plugin_4xx",
+                               "plugin_code": plugin_code})
+        return _plugin_error(
+            r.status_code, "capability_failed",
+            plugin_message or "插件拒绝本次调用",
+            retryable=plugin_retryable,
+            details={"reason": "plugin_4xx", "plugin_status": r.status_code,
+                     "plugin_code": plugin_code})
     try:
         pbody = r.json()
     except Exception:

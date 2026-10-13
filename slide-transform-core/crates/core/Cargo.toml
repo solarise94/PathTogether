@@ -7,11 +7,15 @@ publish.workspace = true
 description = "C1 shared transform core: KFB/KFBF readers, JPEG-passthrough BigTIFF + OME writers (pure logic, IO via traits)"
 
 [features]
-default = ["codecs", "synth-gen"]
+default = ["codecs", "synth-gen", "jp2k"]
 # Baseline JPEG decode/encode for edge tiles + sparse fill, written to mirror
 # libjpeg/Pillow bit-exactly (the C1 edge-quality gate is defined against the
 # Python oracle's Pillow output). See docs/slide-tools/c1-core-report.md.
 codecs = []
+# F2: Aperio SVS JPEG 2000 (33003/33005) support — bounded codestream header
+# probe + hayro-jpeg2000 tile decode + the validated YCbCr→RGB conversion.
+# Scalar feature set, IDENTICAL for native and wasm (byte parity contract).
+jp2k = ["dep:hayro-jpeg2000"]
 # Streaming >4 GiB synthetic input generators (synthetic v1 KFB + vendor KFBF
 # layouts) used by the >4 GiB proof; no patient data.
 synth-gen = ["codecs"]
@@ -23,3 +27,6 @@ fixtures = ["codecs"]
 # sha256 for streamed output validation / source identity hashing
 # (validate.rs, synth_gen.rs) — needed by native and wasm builds alike.
 sha2 = { workspace = true }
+# F2 JPEG 2000 tile decoder (33003/33005); pinned scalar configuration, see
+# the workspace dependency note. Needed by native and wasm builds alike.
+hayro-jpeg2000 = { workspace = true, optional = true }

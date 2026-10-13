@@ -11,6 +11,12 @@ publish = false
 [workspace.dependencies]
 sha2 = "0.10"
 wasm-bindgen = "=0.2.129"
+# F2: Aperio SVS JPEG 2000 (compression 33003/33005) tile decoder. Pinned to
+# the studied release; `default-features = false` = the scalar configuration
+# (zero unsafe, zero transitive deps) shared by the native and wasm builds —
+# a decoder/feature-set change is a re-acceptance event because output bytes
+# can change (docs/slide-tools/f2-jpeg2000-feasibility.md §8.2).
+hayro-jpeg2000 = "=0.4.0"
 
 [profile.release]
 opt-level = 3

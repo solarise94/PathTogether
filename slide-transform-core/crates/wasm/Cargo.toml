@@ -11,7 +11,9 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["codecs"]
-codecs = ["slide-transform-core/codecs"]
+# F2: the shipped browser artifact includes the JPEG 2000 decoder — same
+# scalar feature set as the native build (byte-parity contract).
+codecs = ["slide-transform-core/codecs", "slide-transform-core/jp2k"]
 
 [dependencies]
 slide-transform-core = { path = "../core", default-features = false }

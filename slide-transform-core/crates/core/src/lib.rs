@@ -43,6 +43,7 @@ pub mod gtiff;
 pub mod inflate;
 pub mod io;
 pub mod job;
+pub mod jp2k;
 pub mod kfb;
 pub mod kfbf;
 pub mod mirax;

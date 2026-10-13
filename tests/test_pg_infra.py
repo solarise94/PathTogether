@@ -344,6 +344,7 @@ def test_schema_migrations_recorded(conn):
         # 描绘按需技能（docs/viewer-drawing-skill-contract-20261009.md §3）：
         # run_grants 加 allow_ai_drawing / drawing_bound_at / drawing_intent。
         "0082_run_grant_drawing_skill.sql",
+        "0083_site_visit_dedup_dimensions.sql",
     ]
 
 

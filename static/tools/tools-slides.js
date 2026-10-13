@@ -85,6 +85,7 @@ const els = {
   saveBtn: $('save-btn'),
   persistBtn: $('persist-btn'),
   saveStatus: $('save-status'),
+  saveCapabilityNote: $('save-capability-note'),
   uploadBtn: $('upload-btn'),
   uploadCancelBtn: $('upload-cancel-btn'),
   uploadStatus: $('upload-status'),
@@ -1406,6 +1407,8 @@ async function selectResultJob(jobId) {
 
 function renderSaveStatus() {
   const supported = typeof window.showSaveFilePicker === 'function';
+  els.saveCapabilityNote.hidden = supported;
+  els.saveCapabilityNote.textContent = supported ? '' : t('tools.input.save.unsupported');
   els.saveBtn.disabled = !supported || !page.readyInfo;
   els.saveBtn.setAttribute('aria-disabled', String(els.saveBtn.disabled));
   if (!supported) {
@@ -1419,8 +1422,10 @@ function renderSaveStatus() {
   }
 }
 
-async function onSave() {
+async function onSave(job = null) {
   if (typeof window.showSaveFilePicker !== 'function') return;
+  const jobId = job ? job.id : page.readyInfo && page.readyInfo.jobId;
+  if (!jobId) return;
   clearError();
   els.saveBtn.disabled = true;
   els.saveStatus.dataset.busy = '1';
@@ -1429,18 +1434,18 @@ async function onSave() {
   try {
     // 必须在用户手势内请求 picker（Chromium 手势约束）
     const handle = await window.showSaveFilePicker({
-      suggestedName: suggestedOutputName(),
-      types: E.saveFileTypes(page.readyInfo),
+      suggestedName: job ? E.outputFileName(job.source && job.source.name, job) : suggestedOutputName(),
+      types: E.saveFileTypes(job || page.readyInfo),
     });
-    const r = await page.runner.exportJob(page.readyInfo.jobId, () => handle.createWritable());
+    const r = await page.runner.exportJob(jobId, () => handle.createWritable());
     page.saveMsg = { key: 'tools.result.save.done', vars: { bytes: fmtBytes(r.exportedBytes) } };
     els.saveStatus.textContent = t('tools.result.save.done', { bytes: fmtBytes(r.exportedBytes) });
     setPageMsg(null);
   } catch (e) {
     if (e && e.name === 'AbortError') {
-      els.saveStatus.textContent = t('tools.result.save.aborted');
+      page.saveMsg = { key: 'tools.result.save.aborted' };
     } else {
-      els.saveStatus.textContent = t('tools.result.save.failed');
+      page.saveMsg = { key: 'tools.result.save.failed' };
       showError(e);
     }
   } finally {
@@ -1635,14 +1640,11 @@ async function onJobAction(action, job) {
     }
     if (action === 'export') {
       if (typeof window.showSaveFilePicker !== 'function') return;
-      const handle = await window.showSaveFilePicker({
-        suggestedName: E.outputFileName(job.source && job.source.name, job),
-        types: E.saveFileTypes(job),
-      });
-      const r = await page.runner.exportJob(job.id, () => handle.createWritable());
-      page.saveMsg = { key: 'tools.result.save.done', vars: { bytes: fmtBytes(r.exportedBytes) } };
-      renderSaveStatus();
-      refreshJobs();
+      // Select the row's result and invoke the picker in this user gesture;
+      // do not wait for any asynchronous job lookup before opening it.
+      const selected = selectResultJob(job.id);
+      await onSave(job);
+      await selected;
       return;
     }
     if (action === 'start' || action === 'resume') {

@@ -30,7 +30,6 @@ from collections import namedtuple
 
 import numpy as np
 from PIL import Image
-from skimage import transform as skimage_transform
 
 #: 上游代码 revision（Containerfile 与运行时共同固定）
 UPSTREAM_COMMIT = "e67763ab835b3ef184cb6791eb2cd059ec8b9f9a"
@@ -75,6 +74,8 @@ def preprocess_image(img):
         src_h = orig_h + 2 * pad
         pad_y = pad
     if (src_h, src_w) != (INPUT_SIZE, INPUT_SIZE):
+        # 延迟导入：服务模块（入参校验等）在无 scikit-image 的平台测试环境中也可导入
+        from skimage import transform as skimage_transform
         resized = np.zeros((INPUT_SIZE, INPUT_SIZE, 3), dtype=np.uint8)
         for channel in range(3):
             resized[:, :, channel] = skimage_transform.resize(

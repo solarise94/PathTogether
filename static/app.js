@@ -1066,6 +1066,183 @@
   var AI_ANNO_FILL = "rgba(255, 149, 0, 0.16)";   // 进标注库的 AI 标注填充（比人工略浓）
   var AI_ANNO_STROKE_FALLBACK = "rgba(214, 108, 10, 0.95)";   // AI 标注描边（同族橙，可读）
 
+  // ---------- count_cells 计数范围高亮（方形取景 2026-10-14） ----------
+  // count_cells 的工具结果（counted_region.bbox）经浏览器 fetch 到达（HP 插件
+  // 消费 run/transcript 响应）。平台侧对 AI 路径的响应体做**只读 tap**（tee 一
+  // 支扫描，另一支原样交给插件），命中 counted_region.bbox 后在 viewer 上画一
+  // 个临时、轻量的高亮方框：不是标注、不持久化、不建库——下一次计数替换、
+  // 新 goto（viewer.navigate）清除、新一轮 run 开始清除、点击方框由用户清除。
+  var countHighlight = null;   // {x,y,w,h} level-0 像素
+  var COUNT_FILL = "rgba(0, 122, 255, 0.10)";
+  var COUNT_STROKE = "#007AFF";
+  var COUNT_HALO = "rgba(0, 0, 0, 0.8)";
+
+  function setCountHighlight(bbox) {
+    // counted_region.bbox（level-0 x/y/w/h）→ 画布临时高亮；非法几何忽略
+    // （不覆盖旧高亮，避免畸形数据擦掉用户的可见参照）。
+    if (!bbox || typeof bbox !== "object") return false;
+    var x = Number(bbox.x), y = Number(bbox.y),
+        w = Number(bbox.w), h = Number(bbox.h);
+    if (!isFinite(x) || !isFinite(y) || !isFinite(w) || !isFinite(h) ||
+        w <= 0 || h <= 0 || x < 0 || y < 0) return false;
+    countHighlight = { x: x, y: y, w: w, h: h };
+    redrawAnnoCanvas();
+    try {
+      document.dispatchEvent(new CustomEvent("pt:count-highlight", {
+        detail: { bbox: countHighlight },
+      }));
+    } catch (e) { /* 事件总线缺失不致命 */ }
+    return true;
+  }
+
+  function clearCountHighlight() {
+    if (!countHighlight) return false;
+    countHighlight = null;
+    redrawAnnoCanvas();
+    return true;
+  }
+
+  // ---- 只读响应扫描（counted_region.bbox 提取；JSON 与 SSE 双形态） ----
+  // 工具结果以 JSON（transcript 刷新）或 SSE data 帧（run 流）里的字符串
+  // 到达——后者是转义过的 JSON 文本，解析后再走一层 walk。
+  function scanCountRegionText(text) {
+    if (!text || text.length > 8 * 1024 * 1024 ||
+        text.indexOf("counted_region") < 0) return null;
+    var parsed = null;
+    try { parsed = JSON.parse(text); } catch (e) { parsed = null; }
+    if (parsed === null && text.trim().charAt(0) !== "{" &&
+        text.trim().charAt(0) !== "[") return null;
+    var found = null;
+    function walk(node, depth) {
+      if (found || depth > 10 || node == null) return;
+      var t = typeof node;
+      if (t === "string") {
+        if (node.length <= 200000 && node.indexOf("counted_region") >= 0) {
+          try { walk(JSON.parse(node), depth + 1); } catch (e) { /* 非JSON */ }
+        }
+        return;
+      }
+      if (t !== "object") return;
+      var cr = node.counted_region;
+      if (cr && typeof cr === "object" && cr.bbox &&
+          typeof cr.bbox === "object") {
+        var x = Number(cr.bbox.x), y = Number(cr.bbox.y),
+            w = Number(cr.bbox.w), h = Number(cr.bbox.h);
+        if (isFinite(x) && isFinite(y) && isFinite(w) && isFinite(h) &&
+            w > 0 && h > 0 && x >= 0 && y >= 0) {
+          found = { x: x, y: y, w: w, h: h };
+          return;
+        }
+      }
+      for (var k in node) {
+        if (Object.prototype.hasOwnProperty.call(node, k)) {
+          walk(node[k], depth + 1);
+          if (found) return;
+        }
+      }
+    }
+    walk(parsed, 0);
+    return found;
+  }
+
+  // ---- AI 响应流 tap：tee 响应体，扫描支不阻塞、不修改插件消费的原流 ----
+  function pumpCountScan(stream, isSSE) {
+    var reader;
+    try { reader = stream.getReader(); } catch (e) { return; }
+    var decoder = null;
+    try { decoder = new TextDecoder("utf-8"); } catch (e) { /* 老环境 */ }
+    var frameBuf = "";
+    function handleText(text) {
+      if (!isSSE) {
+        var direct = scanCountRegionText(text);
+        if (direct) setCountHighlight(direct);
+        return;
+      }
+      frameBuf += text;
+      var parts = frameBuf.split("\n\n");
+      frameBuf = parts.pop() || "";
+      if (frameBuf.length > 1024 * 1024) frameBuf = "";  // 防御性截断
+      for (var i = 0; i < parts.length; i++) {
+        var lines = parts[i].split("\n");
+        var dataLines = [];
+        for (var j = 0; j < lines.length; j++) {
+          if (lines[j].slice(0, 5) === "data:") dataLines.push(lines[j].slice(5).trim());
+        }
+        if (!dataLines.length) continue;
+        var bbox = scanCountRegionText(dataLines.join("\n"));
+        if (bbox) setCountHighlight(bbox);
+      }
+    }
+    (function read() {
+      reader.read().then(function (chunk) {
+        if (chunk.done) return;
+        var text;
+        try {
+          text = decoder ? decoder.decode(chunk.value, { stream: true })
+            : String(chunk.value);
+        } catch (e) { return; }
+        try { handleText(text); } catch (e) { /* 扫描失败不影响主流程 */ }
+        read();
+      }, function () { /* 流中断：扫描支静默退出 */ });
+    })();
+  }
+
+  function tapCountResponse(resp) {
+    // 只挂 AI 路径（run/continue/ask/branch/SSE/transcript）；响应经
+    // new Response(tee 支) 重建，json()/text()/clone() 语义不变。
+    var ctype = "";
+    try {
+      ctype = String((resp.headers && resp.headers.get("content-type")) || "");
+    } catch (e) { return resp; }
+    var isSSE = ctype.indexOf("text/event-stream") >= 0;
+    var isJSON = ctype.indexOf("json") >= 0;
+    if ((!isSSE && !isJSON) || !resp.body ||
+        typeof resp.body.tee !== "function") return resp;
+    var branches;
+    try { branches = resp.body.tee(); } catch (e) { return resp; }
+    var forCaller;
+    try {
+      forCaller = new Response(branches[0], { status: resp.status,
+        statusText: resp.statusText, headers: resp.headers });
+    } catch (e) { return resp; }  // null-body 状态等：放弃扫描，原样返回
+    pumpCountScan(branches[1], isSSE);
+    return forCaller;
+  }
+
+  function installCountHighlightTap() {
+    if (installCountHighlightTap.done) return;
+    if (typeof window.fetch !== "function") return;
+    installCountHighlightTap.done = true;
+    var nativeFetch = window.fetch;
+    window.fetch = function (input, init) {
+      var promise = nativeFetch.apply(this, arguments);
+      try {
+        var url = "";
+        if (typeof input === "string") url = input;
+        else if (input && typeof input.url === "string") url = input.url;
+        if (url.indexOf("/api/ai/") < 0 &&
+            url.indexOf("/api/demo/ai/") < 0) return promise;
+        // 新一轮 run/continue/ask/branch 发起：清上一轮的计数范围高亮
+        //（本论 count_cells 结果命中时由扫描支重新设置）。
+        if (/(^|\/)api\/(demo\/)?ai\/(run|continue|ask|branch)([?#]|$)/.test(url)) {
+          try { clearCountHighlight(); } catch (e) { /* 不阻塞请求 */ }
+        }
+        return promise.then(function (resp) {
+          try { return tapCountResponse(resp); }
+          catch (e) { return resp; }
+        });
+      } catch (e) { return promise; }
+    };
+  }
+  // 平台侧测试/调试入口（scanText 是纯函数，Vitest 直接驱动）
+  window.PTCountHighlight = {
+    show: setCountHighlight,
+    clear: clearCountHighlight,
+    current: function () { return countHighlight; },
+    scanText: scanCountRegionText,
+    install: installCountHighlightTap,
+  };
+
   // 编辑模式状态：选中/拖动（管理端所有标注可编辑）
   // editItem：flatItems 中的引用（可改本地几何）；editDrag：拖动会话
   // editing：备注卡的「保存/取消」模式（§6.2 改版后柄显示与拖动只看
@@ -1685,6 +1862,7 @@
     state.focusAnno = null;
     // 平台侧清叠加层（切片隔离）。插件侧会话 UI/SSE/游标由 slide.opened event 触发其自行 reset+restore。
     aiOverlay = [];
+    countHighlight = null;  // 计数范围高亮随切片关闭一并清除（不跨切片残留）
     redrawAnnoCanvas();
     emitSlideOpened();
     if (state.slide) {
@@ -6289,8 +6467,9 @@
     if (!c || !annoCtx) { if (c) resizeAnnoCanvas(); }
     if (!annoCtx) return;
     var hasAiOverlay = aiOverlay && aiOverlay.length > 0;
+    var hasCount = !!countHighlight;
     var hasContent = !!(state.slide && ((state.showAnno && (flatItems.length || editItem)) ||
-      (state.drawMode != null && drawPreview) || hasAiOverlay));
+      (state.drawMode != null && drawPreview) || hasAiOverlay || hasCount));
     // An already-empty canvas has nothing to clear during viewport movement.
     // Clear once when annotations/AI previews are hidden or the slide closes.
     if (!hasContent && !annoCanvasHasContent) return;
@@ -6366,7 +6545,44 @@
         annoCtx.restore();
       });
     }
-    // 编辑手柄（§6.2：首次点击选择即可直接拖控制点；§6.3：锁定/只读无柄）
+    // count_cells 计数范围（临时高亮，蓝色虚线 + 「计数范围」标签；非标注）
+    if (hasCount) {
+      var cb = countHighlight;
+      var ctl = imgToCanvas(cb.x, cb.y);
+      var cbr = imgToCanvas(cb.x + cb.w, cb.y + cb.h);
+      var cx = Math.min(ctl.x, cbr.x), cy = Math.min(ctl.y, cbr.y);
+      var cw = Math.abs(cbr.x - ctl.x), ch = Math.abs(cbr.y - ctl.y);
+      annoCtx.save();
+      annoCtx.fillStyle = COUNT_FILL;
+      annoCtx.fillRect(cx, cy, cw, ch);
+      annoCtx.setLineDash([6, 4]);
+      annoCtx.lineWidth = 4;
+      annoCtx.strokeStyle = COUNT_HALO;
+      annoCtx.strokeRect(cx, cy, cw, ch);
+      annoCtx.lineWidth = 2;
+      annoCtx.strokeStyle = COUNT_STROKE;
+      annoCtx.strokeRect(cx, cy, cw, ch);
+      annoCtx.setLineDash([]);
+      if (!animating) {
+        var clabel = ((window.HP_I18N && window.HP_I18N.getLang()) === "en")
+          ? "counted region" : "计数范围";
+        annoCtx.font = "600 12px -apple-system, BlinkMacSystemFont, sans-serif";
+        var ctw = annoCtx.measureText(clabel).width;
+        var cbx = cx + 3, cby = cy + (ch > 26 ? ch - 21 : 3);
+        annoCtx.fillStyle = "rgba(0, 40, 90, 0.8)";
+        if (typeof annoCtx.roundRect === "function") {
+          annoCtx.beginPath();
+          annoCtx.roundRect(cbx, cby, ctw + 12, 18, 4);
+          annoCtx.fill();
+        } else {
+          annoCtx.fillRect(cbx, cby, ctw + 12, 18);
+        }
+        annoCtx.fillStyle = "#FFFFFF";
+        annoCtx.textBaseline = "middle";
+        annoCtx.fillText(clabel, cbx + 6, cby + 9.5);
+      }
+      annoCtx.restore();
+    }
     if (editItem && state.showAnno && canDragItem(editItem)) {
       drawEditHandles(editItem);
     }
@@ -12473,7 +12689,32 @@
       vc.addEventListener("pointerup", routeObjectPointerUp, true);
       vc.addEventListener("pointercancel", routeObjectPointerCancel, true);
       vc.addEventListener("dblclick", routeObjectDblClick, true);
+      // count_cells 高亮的用户清除：非绘制态下「点击」方框内部（按下/抬起
+      // 位移 ≤6px 的屏幕像素）即清除；不消费事件，平移/对象编辑照常。
+      var countClickStart = null;
+      vc.addEventListener("pointerdown", function (e) {
+        countClickStart = (countHighlight && state.drawMode == null)
+          ? { x: e.clientX, y: e.clientY } : null;
+      }, true);
+      vc.addEventListener("pointerup", function (e) {
+        if (!countClickStart || !countHighlight) return;
+        var moved = Math.hypot(e.clientX - countClickStart.x,
+                               e.clientY - countClickStart.y);
+        countClickStart = null;
+        if (moved > 6) return;
+        try {
+          var cpt = screenToImg(e);
+          var cb = countHighlight;
+          if (cpt && cpt.x >= cb.x && cpt.x <= cb.x + cb.w &&
+              cpt.y >= cb.y && cpt.y <= cb.y + cb.h) {
+            clearCountHighlight();
+          }
+        } catch (err) { /* 坐标换算失败忽略 */ }
+      }, true);
     }
+    // count_cells 结果高亮的响应流 tap（AI 路径 fetch；插件加载在后，看到的
+    // 是包装后的 fetch）。
+    installCountHighlightTap();
     // §6.2：Space 平移（输入框外）——按住即永远平移，即使指针经过对象
     window.addEventListener("keydown", onSpaceKeyForPan, true);
     window.addEventListener("keyup", onSpaceKeyForPan, true);
@@ -12815,6 +13056,8 @@
       if (!isFinite(nx) || !isFinite(ny) || !isFinite(nw) || !isFinite(nh) || nw <= 0 || nh <= 0) {
         throw { code: "invalid_geometry", message: "导航几何非法", retryable: false };
       }
+      // 新 goto：count_cells 计数范围高亮是「当前快照」的测量展示，导航即过期
+      clearCountHighlight();
       viewer.viewport.fitBounds(
         viewer.viewport.imageToViewportRectangle(nx, ny, nw, nh));
       return { ok: true };

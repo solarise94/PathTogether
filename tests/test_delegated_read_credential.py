@@ -691,11 +691,11 @@ def test_id_bundle_slide_capabilities_injected_for_owner(monkeypatch):
     _install_with_known_secret(monkeypatch)
     sid = _register_id_bundle_slide(monkeypatch, uid="usr_a")
     name = "26-005817.tif"
-    # owner user：ID 权威判定 → 能力注入
+    # owner user：ID 权威判定 → 两个能力都注入（segment_region + count_cells）
     caps = app_mod._list_agent_capabilities(
         {"role": "user", "user_id": "usr_a"}, name, slide_id=sid)
-    assert [(i["plugin_id"], c["name"]) for i, c in caps] == \
-        [(PLUGIN_ID, CAP_NAME)]
+    assert sorted((i["plugin_id"], c["name"]) for i, c in caps) == \
+        sorted([(PLUGIN_ID, "segment_region"), (PLUGIN_ID, "count_cells")])
     # 另一用户：同一 id_bundle 切片 → 空（fail-closed，无名回退）
     caps_b = app_mod._list_agent_capabilities(
         {"role": "user", "user_id": "usr_b"}, name, slide_id=sid)
@@ -718,7 +718,8 @@ def test_id_bundle_slide_inject_carries_slide_id_claim(monkeypatch):
     assert err is None
     assert payload["slide_id"] == sid
     assert payload["slide"] == name  # 名仍随 token（body.slide 绑定不变）
-    assert payload["capabilities"] == [FULL_NAME]
+    assert sorted(payload["capabilities"]) == sorted(
+        [FULL_NAME, "%s/count_cells" % PLUGIN_ID])
 
 
 def test_id_bundle_slide_dispatch_succeeds_and_mints_credential(monkeypatch):
@@ -906,11 +907,13 @@ def test_id_bundle_slide_denied_when_no_slide_id_claim(monkeypatch):
 # --------------------------------------------------------------------------- #
 _PT_PLATFORM = "http://127.0.0.1:8000"
 _PS_INFER = "http://127.0.0.1:8971"
+_CELLPOSE_INFER = "http://127.0.0.1:8972"
 
 
 class _BackendRouter:
     """插件后端 `requests` 替身：平台地址路由到 PT test client，推理地址
-    返回 stub mask；其他地址一律拒绝（后端不得外联）。"""
+    （PathSegmentor :8971 / Cellpose :8972）按路径返回 stub；其他地址一律
+    拒绝（后端不得外联）。"""
 
     ConnectionError = real_requests.ConnectionError
     Timeout = real_requests.Timeout
@@ -942,8 +945,24 @@ class _BackendRouter:
                                "timings_ms": {"decode": 1, "infer": 2,
                                               "total": 3},
                                "warnings": []})
-        raise ConnectionError("unexpected backend outbound call: %s %s"
-                              % (method, url))
+        if url.startswith(_CELLPOSE_INFER) and method == "POST":
+            assert url.endswith("/v1/count"), url
+            return _Resp(200, {
+                "model_id": "cellpose", "model_name": "nuclei",
+                "model_sha256": "cd" * 32, "code_version": "v1.2",
+                "input_width": 8, "input_height": 8,
+                "instance_count": 2, "diameter_px_used": 14.0,
+                "areas_px": {"min": 12.0, "p25": 12.0, "median": 14.0,
+                             "p75": 14.0, "max": 14.0},
+                "instances_top": [
+                    {"bbox": [1, 1, 3, 3], "centroid": [2.5, 2.5],
+                     "area_px": 9.0},
+                    {"bbox": [4, 4, 2, 2], "centroid": [5.0, 5.0],
+                     "area_px": 4.0}],
+                "timings_ms": {"decode": 1, "infer": 3, "total": 4},
+                "warnings": []})
+        raise real_requests.ConnectionError(
+            "unexpected backend outbound call: %s %s" % (method, url))
 
     def post(self, url, json=None, headers=None, timeout=None, **kw):
         return self._route("POST", url, json=json, headers=headers)
@@ -964,8 +983,9 @@ class _BackendAdapter:
 
     def post(self, url, json=None, headers=None, timeout=None, **kw):
         self.calls.append(url)
-        resp = self.client.post("/capabilities/segment_region", json=json,
-                                headers=headers)
+        # url = <base_url>/capabilities/<capability_name>——按转发 URL 取路径
+        path = "/capabilities/" + url.rsplit("/capabilities/", 1)[-1]
+        resp = self.client.post(path, json=json, headers=headers)
         try:
             body = resp.get_json()
         except Exception:
@@ -1037,6 +1057,68 @@ def test_id_bundle_e2e_dispatch_backend_by_id_region(monkeypatch):
     assert "mask_png_b64" not in text
     assert len(r.get_data()) < 64 * 1024
     # 后端确实走了 by-id 路由（平台侧收到 by-id region 调用）
+    assert any(m == "POST" and "/regions" in p and "by-id" in p
+               for m, p in router.platform_calls)
+
+
+def test_dispatch_mints_credential_for_count_cells(monkeypatch):
+    """count_cells 声明 slide:region:read → dispatch 按最小披露门槛随转发
+    签发委托凭证（ecaf30db gating 对第二个能力同样生效）。"""
+    _install_with_known_secret(monkeypatch)
+    sid = _register_owned_slide(monkeypatch)
+    stub = _ForwardStub()
+    monkeypatch.setattr(app_mod, "requests", stub)
+    token = _tool_token(capabilities=["%s/count_cells" % PLUGIN_ID])
+    r = _client().post(
+        "/api/plugin/v1/dispatch/%s/count_cells" % PLUGIN_ID,
+        json={"slide": "demo.svs", "arguments": {}},
+        headers={"Authorization": "Bearer " + token,
+                 "X-AI-Session": "sess-1"})
+    assert r.status_code == 200, r.get_json()
+    delegated = (stub.calls[-1]["headers"] or {}).get(HDR)
+    assert delegated, "count_cells 也必须随转发拿到委托凭证"
+    claims = _decode_token(delegated)
+    assert claims["slide_id"] == sid
+    assert claims["capability"] == "count_cells"
+
+
+def test_id_bundle_e2e_count_cells_dispatch_backend_by_id(monkeypatch):
+    """count_cells 全链：dispatch → 后端 → by-id region → stub /v1/count。
+    8b22db45/2523c64a 上失败：count_cells 未登记（dispatch 404）。"""
+    installation, secret = _install_with_known_secret(monkeypatch)
+    sid = _register_id_bundle_slide(monkeypatch, uid="usr_a")
+    backend = _load_measure_backend(monkeypatch, installation["installation_id"],
+                                    secret, nonce="e2e2")
+    router = _BackendRouter(_client(), b"")  # count 路径不用 mask
+    monkeypatch.setattr(backend, "requests", router)
+    adapter = _BackendAdapter(backend)
+    monkeypatch.setattr(app_mod, "requests", adapter)
+    mocks = _slide_read_mocks()
+    with mocks[0], mocks[1], mocks[2], \
+            mock.patch.object(app_mod, "_read_region_b64",
+                              return_value=_region_payload(w=8, h=8)):
+        r = _client().post(
+            "/api/plugin/v1/dispatch/%s/count_cells" % PLUGIN_ID,
+            json={"slide": "26-005817.tif",
+                  "slide_id": sid,
+                  "arguments": {"x": 0, "y": 0, "w": 16, "h": 16}},
+            headers={"Authorization": "Bearer " + _tool_token_with_sid(
+                        "26-005817.tif", sid,
+                        capabilities=["%s/count_cells" % PLUGIN_ID]),
+                     "X-AI-Session": "sess-1"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    result = r.get_json()["result"]
+    assert result["capability"] == "count_cells"
+    assert result["instance_count"] == 2
+    assert result["slide_id"] == sid
+    # 密度：ROI = (16·0.5/1000)² mm² = 6.4e-5；2 / 6.4e-5 = 31250
+    assert result["density"]["per_mm2"] == pytest.approx(31250.0)
+    # 实例映射回 level-0（scale 2，src (0,0)）
+    inst0 = result["instances_top"][0]
+    assert inst0["bbox_l0"] == [2, 2, 6, 6]
+    assert result["model"]["model_id"] == "cellpose"
+    text = r.get_data(as_text=True)
+    assert len(r.get_data()) < 64 * 1024
     assert any(m == "POST" and "/regions" in p and "by-id" in p
                for m, p in router.platform_calls)
 

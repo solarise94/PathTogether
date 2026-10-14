@@ -94,7 +94,22 @@ _TOKEN_TIMEOUT_S = 5.0
 _INFER_TIMEOUT_S = 32.0
 
 _PLUGIN_ID = "dev.pathsegmentor.measure"
-_CAPABILITY = "segment_region"
+_CAPABILITY_SEGMENT = "segment_region"
+_CAPABILITY_COUNT = "count_cells"
+
+# ---------------------------------------------------------------------------
+# Cellpose 计数服务（count_cells 能力；homePC 第二推理服务）
+# ---------------------------------------------------------------------------
+#: 目标输出分辨率 µm/px：Cellpose 直径驱动，0.5 通常足够（env 可调）；
+#: 与 PSM 同款「永不上采样超过原生 mpp」钳制
+_CELLPOSE_URL = (os.environ.get("CELLPOSE_URL") or
+                 "http://127.0.0.1:8972").rstrip("/")
+_CELLPOSE_TARGET_MPP = float(
+    os.environ.get("PT_CELLPOSE_TARGET_MPP") or 0.5)
+#: diameter_um 合法域（µm）：核 ~6–8、整细胞 15–25；缺省 7
+_COUNT_DIAMETER_DEFAULT_UM = 7.0
+_COUNT_DIAMETER_MIN_UM = 1.0
+_COUNT_DIAMETER_MAX_UM = 200.0
 
 #: 安装 JWT 缓存（demo 单进程；到期前 60s 主动换新）
 _JWT_CACHE = {"token": "", "exp": 0.0}
@@ -261,11 +276,8 @@ def _to_float(v):
     return f if math.isfinite(f) else None
 
 
-def _validate_args(args):
-    """dispatch arguments 校验（跨字段规则平台 schema 不覆盖，这里收口）。
-
-    返回 (normalized, None) 或 (None, PlatformError 400)。
-    """
+def _validate_bbox_args(args):
+    """两个能力共用的 level-0 bbox 校验。返回 (dict, None) 或 (None, err)。"""
     if not isinstance(args, dict):
         return None, PlatformError(400, "invalid_request", "arguments 需为对象")
     out = {}
@@ -283,6 +295,17 @@ def _validate_args(args):
     if out["x"] < 0 or out["y"] < 0 or out["w"] <= 0 or out["h"] <= 0:
         return None, PlatformError(400, "invalid_request",
                                    "参数越界（0<=x,y，0<w,h）")
+    return out, None
+
+
+def _validate_args(args):
+    """segment_region 参数校验（bbox + 受控文本提示/阈值）。
+
+    返回 (normalized, None) 或 (None, PlatformError 400)。
+    """
+    out, aerr = _validate_bbox_args(args)
+    if aerr is not None:
+        return None, aerr
     obj = args.get("object")
     if not isinstance(obj, str) or not obj.strip():
         return None, PlatformError(400, "invalid_request",
@@ -332,19 +355,22 @@ def mask_to_grid(png_bytes):
             for y in range(h)], w, h
 
 
-def _target_long_edge(bbox_w, bbox_h, mpp):
+def _target_long_edge(bbox_w, bbox_h, mpp, target_mpp=None):
     """选输出长边：~target µm/px 或更细，夹到 [1, min(_MAX_LONG_EDGE, 长边)]。
 
-    MPP 未知时用上限（1024）并在调用方附 warning——分辨率不可判定。
+    ``target_mpp`` 缺省用 PathSegmentor 目标（0.25）；Cellpose 计数传
+    ``_CELLPOSE_TARGET_MPP``（0.5，直径驱动通常足够）。MPP 未知时用上限
+    （1024）并在调用方附 warning——分辨率不可判定。
     ``≤ 长边``钳制保证**永不上采样超过切片原生分辨率**（输出像素 ≤ level-0
     源像素 ⇒ 输出分辨率 ≥ 原生 mpp，原生即最细）。
     """
+    tgt = float(target_mpp) if target_mpp else _TARGET_MPP
     cap = max(1, _MAX_LONG_EDGE)
     long_side = max(int(bbox_w), int(bbox_h))
     cap = min(cap, max(1, long_side))
-    if not mpp or mpp <= 0 or _TARGET_MPP <= 0:
+    if not mpp or mpp <= 0 or tgt <= 0:
         return cap, True
-    want = int(round(long_side * mpp / _TARGET_MPP))
+    want = int(round(long_side * mpp / tgt))
     if want < 1:
         want = 1
     if want <= cap:
@@ -770,40 +796,59 @@ def _infer(image_png_bytes, obj, region, threshold):
 def healthz():
     """健康检查（manifest.service.health 指向这里）。"""
     return jsonify(ok=True, plugin=_PLUGIN_ID, version="0.1.0",
-                   inference_url=_INFER_URL)
+                   inference_url=_INFER_URL, cellpose_url=_CELLPOSE_URL,
+                   capabilities=[_CAPABILITY_SEGMENT, _CAPABILITY_COUNT])
 
 
-@app.post("/capabilities/segment_region")
-def capability_segment_region():
-    """只读测量能力 segment_region（manifest.provides 声明的服务端端点）。"""
-    t0 = time.time()
+def _capability_ctx():
+    """两个能力端点共用的入口守卫与请求上下文。
+
+    校验 X-Dispatch-Principal / 委托凭证 / 安装凭证配置 / slide+slide_id
+    双字段。返回 (None, ctx) 或 (error_response, None)；ctx 含
+    {slide, slide_id, delegated, body}。
+    """
     principal = _dispatch_principal()
     if not principal or principal.get("type") != "agent":
         return _error(401, "unauthorized",
-                      "缺少或非法 X-Dispatch-Principal（只接受平台 dispatch 转发）")
+                      "缺少或非法 X-Dispatch-Principal（只接受平台 dispatch 转发）"), None
     delegated = _delegated_token()
     if not delegated:
         return _error(
             401, "unauthorized",
             "缺少 X-Delegated-Read-Token（须由平台 dispatch 签发转发；"
-            "直连调用不受理）")
+            "直连调用不受理）"), None
     if not (_INSTALLATION_ID and _INSTALLATION_SECRET):
         return _error(503, "backend_not_configured",
                       "插件后端未配置平台安装凭证（PT_INSTALLATION_ID/"
-                      "PT_INSTALLATION_SECRET）", retryable=True)
+                      "PT_INSTALLATION_SECRET）", retryable=True), None
     body = request.get_json(silent=True) or {}
     slide = body.get("slide") or ""
     if not isinstance(slide, str) or not slide:
-        return _error(400, "invalid_request", "body.slide 必填")
+        return _error(400, "invalid_request", "body.slide 必填"), None
     # P2 双字段（合同 §6.3）：dispatch 转发的 slide_id（签名 claim 权威值）。
     # 给出 → 平台回调一律走 by-id 路由（id_bundle 行 legacy_filename=NULL，
     # 按名回调恒 404）；仅名（兼容形态）走 by-name。
     slide_id = body.get("slide_id")
     if slide_id is not None:
         if not isinstance(slide_id, str) or not slide_id.strip():
-            return _error(400, "invalid_request", "body.slide_id 需为非空字符串")
+            return _error(400, "invalid_request",
+                          "body.slide_id 需为非空字符串"), None
         slide_id = slide_id.strip()
-    args, aerr = _validate_args(body.get("arguments"))
+    return None, {"slide": slide, "slide_id": slide_id,
+                  "delegated": delegated, "body": body}
+
+
+@app.post("/capabilities/segment_region")
+def capability_segment_region():
+    """只读测量能力 segment_region（manifest.provides 声明的服务端端点）。"""
+    t0 = time.time()
+    cerr, ctx = _capability_ctx()
+    if cerr is not None:
+        return cerr
+    slide = ctx["slide"]
+    slide_id = ctx["slide_id"]
+    delegated = ctx["delegated"]
+    args, aerr = _validate_args(ctx["body"].get("arguments"))
     if aerr is not None:
         return _error(aerr.status, aerr.code, aerr.message)
 
@@ -847,7 +892,7 @@ def capability_segment_region():
     result = {
         "analysis_id": "psm-" + secrets.token_hex(8),
         "plugin": _PLUGIN_ID,
-        "capability": _CAPABILITY,
+        "capability": _CAPABILITY_SEGMENT,
         "model": {
             "model_id": infer_body.get("model_id"),
             "model_sha256": infer_body.get("model_sha256"),
@@ -875,6 +920,258 @@ def capability_segment_region():
         "warnings": warnings,
     }
     result.update(analysis)
+    return jsonify(result=result)
+
+
+# --------------------------------------------------------------------------- #
+# count_cells（Cellpose 实例分割计数）
+# --------------------------------------------------------------------------- #
+def _validate_count_args(args):
+    """count_cells 参数校验：bbox（同 segment_region）+ diameter_um/model。
+
+    返回 (normalized, None) 或 (None, PlatformError 400)。
+    """
+    out, aerr = _validate_bbox_args(args)
+    if aerr is not None:
+        return None, aerr
+    d = args.get("diameter_um")
+    if d is not None:
+        f = _to_float(d)
+        if f is None or not (_COUNT_DIAMETER_MIN_UM <= f
+                             <= _COUNT_DIAMETER_MAX_UM):
+            return None, PlatformError(
+                400, "invalid_request",
+                "diameter_um 需为 %g..%g 的数值（µm）"
+                % (_COUNT_DIAMETER_MIN_UM, _COUNT_DIAMETER_MAX_UM))
+        out["diameter_um"] = f
+    model = args.get("model")
+    if model is not None:
+        if not isinstance(model, str) or not model.strip():
+            return None, PlatformError(400, "invalid_request",
+                                       "model 需为非空字符串或省略")
+        out["model"] = model.strip()[:64]
+    return out, None
+
+
+def _infer_cellpose(image_png_bytes, mpp, diameter_um=None, model=None):
+    """POST /v1/count（Cellpose 计数合同）；错误映射与 PSM 同款。
+
+    返回 (body_dict)；实例坐标为输出图像素（由调用方映射回 level-0）。
+    """
+    payload = {"image_b64": base64.b64encode(image_png_bytes).decode("ascii"),
+               "mpp": mpp if mpp is not None else 0.0}
+    if diameter_um is not None:
+        payload["diameter_um"] = diameter_um
+    if model:
+        payload["model"] = model
+    try:
+        r = requests.post(_CELLPOSE_URL + "/v1/count", json=payload,
+                          timeout=_INFER_TIMEOUT_S)
+    except (requests.ConnectionError, requests.Timeout):
+        raise PlatformError(503, "inference_unavailable",
+                            "Cellpose 计数服务不可达或超时（%s），可稍后重试"
+                            % _CELLPOSE_URL, retryable=True)
+    if r.status_code == 400:
+        try:
+            body = r.json() or {}
+        except Exception:
+            body = {}
+        raise PlatformError(400, "invalid_argument",
+                            "计数服务拒绝输入：%s"
+                            % (body.get("message") or body.get("error")
+                               or r.text[:200]))
+    if r.status_code == 503:
+        try:
+            body = r.json() or {}
+        except Exception:
+            body = {}
+        reason = str(body.get("error") or "busy")
+        raise PlatformError(503, "inference_" + reason,
+                            "计数服务暂不可用（%s），可稍后重试" % reason,
+                            retryable=True)
+    if r.status_code != 200:
+        raise PlatformError(503, "inference_error",
+                            "计数服务返回 HTTP %d" % r.status_code,
+                            retryable=True)
+    body = r.json() or {}
+    if not isinstance(body.get("instance_count"), int) \
+            or isinstance(body.get("instance_count"), bool) \
+            or body.get("instance_count") < 0:
+        raise PlatformError(503, "inference_contract",
+                            "计数服务响应缺少 instance_count", retryable=True)
+    return body
+
+
+def _map_instance(item, src, scale_x, scale_y, mpp_x, mpp_y):
+    """服务端实例（输出像素 bbox/centroid/area）→ level-0 + µm²。"""
+    bbox = item.get("bbox") or [0, 0, 0, 0]
+    centroid = item.get("centroid") or [0.0, 0.0]
+    ox, oy = float(src.get("x", 0)), float(src.get("y", 0))
+    area_px_l0 = _to_float(item.get("area_px"))
+    if area_px_l0 is not None:
+        area_px_l0 *= scale_x * scale_y
+    out = {
+        "bbox_l0": [int(round(ox + float(bbox[0]) * scale_x)),
+                    int(round(oy + float(bbox[1]) * scale_y)),
+                    int(max(1, round(float(bbox[2]) * scale_x))),
+                    int(max(1, round(float(bbox[3]) * scale_y)))],
+        "centroid_l0": [int(round(ox + float(centroid[0]) * scale_x)),
+                        int(round(oy + float(centroid[1]) * scale_y))],
+        "area_px_l0": area_px_l0,
+        "area_um2": (area_px_l0 * mpp_x * mpp_y
+                     if (mpp_x and mpp_y and area_px_l0 is not None) else None),
+    }
+    return out
+
+
+@app.post("/capabilities/count_cells")
+def capability_count_cells():
+    """只读计数能力 count_cells（Cellpose 实例分割；manifest.provides）。
+
+    与 segment_region 共用入口守卫/委托凭证/by-id 读路径；差异：
+      - 目标分辨率 PT_CELLPOSE_TARGET_MPP（0.5，直径驱动）；
+      - 调 CELLPOSE_URL POST /v1/count（服务端做实例分割与计数）；
+      - 返回 instance_count / 密度 / 面积分布 µm² / ≤20 示例实例
+        （映射回 level-0），无 label map / base64。
+    """
+    t0 = time.time()
+    cerr, ctx = _capability_ctx()
+    if cerr is not None:
+        return cerr
+    slide = ctx["slide"]
+    slide_id = ctx["slide_id"]
+    delegated = ctx["delegated"]
+    args, aerr = _validate_count_args(ctx["body"].get("arguments"))
+    if aerr is not None:
+        return _error(aerr.status, aerr.code, aerr.message)
+
+    timings = {}
+    warnings = []
+    try:
+        t = time.time()
+        jwt = _installation_jwt()
+        info = _platform_slide_info(slide, jwt, slide_id=slide_id,
+                                    delegated=delegated)
+        mpp = info.get("mpp")
+        target_edge, coarse = _target_long_edge(
+            args["w"], args["h"], mpp, target_mpp=_CELLPOSE_TARGET_MPP)
+        img_bytes, region_payload = _platform_read_region(
+            slide, args, target_edge, delegated, jwt, slide_id=slide_id)
+        timings["region_read_ms"] = int((time.time() - t) * 1000)
+
+        t = time.time()
+        infer_body = _infer_cellpose(img_bytes, mpp,
+                                     diameter_um=args.get("diameter_um"),
+                                     model=args.get("model"))
+        timings["infer_ms"] = int((time.time() - t) * 1000)
+    except PlatformError as e:
+        return _error(e.status, e.code, e.message, retryable=e.retryable,
+                      extra=e.extra)
+
+    t = time.time()
+    src = region_payload.get("src") or {}
+    out_w = _to_float(region_payload.get("width"))
+    out_h = _to_float(region_payload.get("height"))
+    src_w = _to_float(src.get("w"))
+    src_h = _to_float(src.get("h"))
+    if not out_w or not out_h or not src_w or not src_h \
+            or out_w <= 0 or out_h <= 0 or src_w <= 0 or src_h <= 0:
+        return _error(503, "platform_contract",
+                      "region 响应缺少可用的尺寸元数据", retryable=True)
+    scale_x = src_w / out_w
+    scale_y = src_h / out_h
+    mpp_x = mpp_y = None
+    if mpp is not None and mpp > 0:
+        mpp_x = mpp_y = float(mpp)
+    else:
+        warnings.append("切片 MPP 缺失或无效：不给密度与 µm²，仅像素口径")
+
+    instance_count = int(infer_body["instance_count"])
+    roi_mm2 = None
+    density = None
+    if mpp_x and mpp_y:
+        roi_mm2 = (src_w * mpp_x / 1000.0) * (src_h * mpp_y / 1000.0)
+        if roi_mm2 > 0:
+            density = instance_count / roi_mm2
+    areas_px = infer_body.get("areas_px") or {}
+    area_stats_um2 = None
+    if mpp_x and mpp_y and isinstance(areas_px, dict):
+        um2_per_out_px = (scale_x * scale_y) * mpp_x * mpp_y
+        area_stats_um2 = {k: _to_float(v) * um2_per_out_px
+                          for k, v in areas_px.items()
+                          if _to_float(v) is not None}
+
+    raw_top = infer_body.get("instances_top") or []
+    if not isinstance(raw_top, list):
+        raw_top = []
+        warnings.append("计数服务 instances_top 形状异常，已忽略")
+    if len(raw_top) > _MAX_COMPONENTS:
+        raw_top = raw_top[:_MAX_COMPONENTS]
+    instances = []
+    for item in raw_top:
+        if not isinstance(item, dict):
+            continue
+        try:
+            instances.append(_map_instance(item, src, scale_x, scale_y,
+                                           mpp_x, mpp_y))
+        except (TypeError, ValueError, IndexError):
+            warnings.append("一个实例条目形状异常，已跳过")
+    timings["postprocess_ms"] = int((time.time() - t) * 1000)
+    timings["total_ms"] = int((time.time() - t0) * 1000)
+
+    if coarse and mpp:
+        warnings.append(
+            "ROI 大于 %.0f 输出像素上限或已达原生分辨率：输出未达目标 %.2f µm/px"
+            % (_MAX_LONG_EDGE, _CELLPOSE_TARGET_MPP))
+    for w in (infer_body.get("warnings") or []):
+        if isinstance(w, str) and w:
+            warnings.append("inference: " + w)
+
+    result = {
+        "analysis_id": "cpose-" + secrets.token_hex(8),
+        "plugin": _PLUGIN_ID,
+        "capability": _CAPABILITY_COUNT,
+        "model": {
+            "model_id": infer_body.get("model_id"),
+            "model_name": infer_body.get("model_name"),
+            "model_sha256": infer_body.get("model_sha256"),
+            "code_version": infer_body.get("code_version"),
+        },
+        "diameter_um": args.get("diameter_um") or _COUNT_DIAMETER_DEFAULT_UM,
+        "diameter_px_used": _to_float(infer_body.get("diameter_px_used")),
+        "instance_count": instance_count,
+        "instance_count_note": "Cellpose 实例分割计数（近似值，需人工核对）",
+        "density": {
+            "per_mm2": density,
+            "roi_area_mm2": roi_mm2,
+            "basis": ("实际成像 ROI（level-0 bbox 经边界夹取后的 src）"
+                      if roi_mm2 is not None else None),
+        },
+        "area_stats_px": areas_px if isinstance(areas_px, dict) else {},
+        "area_stats_um2": area_stats_um2,
+        "instances_top": instances,
+        "instances_top_note": "≤20 个实例的 level-0 坐标示例（非全量）",
+        "slide": slide,
+        "slide_id": slide_id,
+        "slide_revision": region_payload.get("asset_revision")
+        or info.get("asset_revision"),
+        "source_bbox": {"x": args["x"], "y": args["y"],
+                        "w": args["w"], "h": args["h"]},
+        "rendered": {
+            "src": region_payload.get("src"),
+            "width": region_payload.get("width"),
+            "height": region_payload.get("height"),
+            "read_level": region_payload.get("read_level"),
+            "upsampled": region_payload.get("upsampled"),
+        },
+        "mpp": {
+            "x": mpp_x, "y": mpp_y,
+            "source": ("slide_info.mpp（mpp_x；两轴同值）" if mpp_x else None),
+        },
+        "target_mpp": _CELLPOSE_TARGET_MPP,
+        "timings_ms": timings,
+        "warnings": warnings,
+    }
     return jsonify(result=result)
 
 

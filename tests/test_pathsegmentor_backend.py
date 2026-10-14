@@ -127,13 +127,14 @@ _PRINCIPAL = {"type": "agent", "user_id": "u1", "role": "user",
               "session_id": "s1"}
 
 
-def _call(mod, arguments=None, *, headers=None, slide="demo.svs"):
+def _call(mod, arguments=None, *, headers=None, slide="demo.svs",
+          capability="segment_region"):
     base = {"X-Dispatch-Principal": json.dumps(_PRINCIPAL),
             "X-Delegated-Read-Token": DELEGATED}
     if headers is not None:
         base = headers
     return mod.app.test_client().post(
-        "/capabilities/segment_region",
+        "/capabilities/%s" % capability,
         json={"slide": slide, "arguments": arguments or {}},
         headers=base)
 
@@ -497,6 +498,212 @@ def test_result_stays_under_64kib_with_many_components(monkeypatch):
     r = _call(mod, GOOD_ARGS)
     assert r.status_code == 200, r.get_json()
     assert len(r.get_data()) < 64 * 1024
+
+
+# --------------------------------------------------------------------------- #
+# 4. count_cells（Cellpose 实例计数；stub /v1/count 服务）
+# --------------------------------------------------------------------------- #
+COUNT_ARGS = {"x": 10, "y": 20, "w": 64, "h": 64}
+
+
+def _count_response():
+    """Cellpose /v1/count stub 响应：输出图 32×32，实例坐标为输出像素。"""
+    return {
+        "model_id": "cellpose", "model_name": "nuclei",
+        "model_sha256": "cd" * 32, "code_version": "v1.2",
+        "input_width": 32, "input_height": 32,
+        "instance_count": 3,
+        "diameter_px_used": 14.0,
+        "areas_px": {"min": 10.0, "p25": 12.0, "median": 14.0,
+                     "p75": 16.0, "max": 18.0},
+        "instances_top": [
+            {"bbox": [2, 4, 6, 6], "centroid": [5.0, 7.0], "area_px": 28.0},
+            {"bbox": [20, 10, 4, 4], "centroid": [22.0, 12.0], "area_px": 14.0},
+        ],
+        "timings_ms": {"decode": 1, "infer": 4, "total": 5},
+        "warnings": [],
+    }
+
+
+class _CellposeStubRequests(_InferStubRequests):
+    """`requests` 替身：/v1/count 按 script 应答（默认成功响应）。"""
+
+    def post(self, url, json=None, headers=None, timeout=None, **kw):
+        assert url.startswith(INFER) or "8972" in url, url
+        spec = self.script.get("POST /v1/count")
+        if spec is None:
+            return _Resp(200, _count_response())
+        if isinstance(spec, Exception):
+            raise spec
+        return _Resp(*spec)
+
+
+def test_count_cells_happy_path_mapping_density_um2(monkeypatch):
+    """实例坐标映射回 level-0、µm² 换算、密度（每 mm²）数学。"""
+    mod = _load_backend(monkeypatch)
+    seen = {}
+
+    def _infer(image_png_bytes, mpp_arg, diameter_um=None, model=None):
+        seen.update({"mpp": mpp_arg, "diameter_um": diameter_um,
+                     "model": model})
+        return _count_response()
+    _stub_platform(monkeypatch, mod,
+                   region=_region_payload(32, 32, (0, 0, 64, 64)))
+    monkeypatch.setattr(mod, "_infer_cellpose", _infer)
+    r = _call(mod, dict(COUNT_ARGS, diameter_um=9), capability="count_cells")
+    assert r.status_code == 200, r.get_json()
+    # 服务端收到的 mpp / diameter
+    assert seen["mpp"] == 0.5 and seen["diameter_um"] == 9
+    result = r.get_json()["result"]
+    assert result["capability"] == "count_cells"
+    assert result["analysis_id"].startswith("cpose-")
+    assert result["instance_count"] == 3
+    assert result["model"] == {"model_id": "cellpose",
+                               "model_name": "nuclei",
+                               "model_sha256": "cd" * 32,
+                               "code_version": "v1.2"}
+    # 映射：scale 2（64/32）；src (0,0) → bbox [2*2, 4*2, 6*2, 6*2]
+    inst0 = result["instances_top"][0]
+    assert inst0["bbox_l0"] == [4, 8, 12, 12]
+    assert inst0["centroid_l0"] == [10, 14]
+    # µm²：area_px(输出) × scale² × mpp² = 28 × 4 × 0.25 = 28
+    assert inst0["area_um2"] == pytest.approx(28.0)
+    assert inst0["area_px_l0"] == pytest.approx(112.0)
+    # 面积分布：area_px × 1.0（scale²·mpp² = 4×0.25 = 1 µm²/输出px）
+    assert result["area_stats_um2"]["median"] == pytest.approx(14.0)
+    assert result["area_stats_um2"]["max"] == pytest.approx(18.0)
+    # 密度：ROI = (64·0.5/1000)² mm² = 1.024e-3；3 / 1.024e-3 ≈ 2929.7
+    assert result["density"]["roi_area_mm2"] == pytest.approx(1.024e-3)
+    assert result["density"]["per_mm2"] == pytest.approx(
+        3 / 1.024e-3, rel=1e-3)
+    assert "实例" in result["instance_count_note"]
+    # 卫生：无 label map / base64 / 凭证；体量小
+    text = r.get_data(as_text=True)
+    assert DELEGATED not in text
+    assert "mask_png_b64" not in text and "label" not in result
+    assert len(r.get_data()) < 32 * 1024
+
+
+def test_count_cells_default_diameter_forwarded(monkeypatch):
+    """缺省 diameter_um=7 传给服务；model 省略不传。"""
+    mod = _load_backend(monkeypatch)
+    seen = {}
+
+    def _infer(image_png_bytes, mpp_arg, diameter_um=None, model=None):
+        seen.update({"diameter_um": diameter_um, "model": model})
+        return _count_response()
+    _stub_platform(monkeypatch, mod)
+    monkeypatch.setattr(mod, "_infer_cellpose", _infer)
+    r = _call(mod, COUNT_ARGS, capability="count_cells")
+    assert r.status_code == 200, r.get_json()
+    assert seen["diameter_um"] is None  # 端点不传，服务端用自身缺省；
+    assert seen["model"] is None
+    # 结果层 diameter_um 如实回显缺省值
+    assert r.get_json()["result"]["diameter_um"] == mod._COUNT_DIAMETER_DEFAULT_UM
+
+
+def test_count_cells_validates_arguments(monkeypatch):
+    mod = _load_backend(monkeypatch)
+    _stub_platform(monkeypatch, mod)
+    for bad in ({"x": 0, "y": 0, "w": 8, "h": 8, "diameter_um": 0},
+                {"x": 0, "y": 0, "w": 8, "h": 8, "diameter_um": 500},
+                {"x": 0, "y": 0, "w": 8, "h": 8, "model": "  "},
+                {"x": 0, "y": 0, "w": 8, "h": 8, "diameter_um": "big"}):
+        r = _call(mod, bad, capability="count_cells")
+        assert r.status_code == 400, bad
+        assert r.get_json()["error"]["code"] == "invalid_request"
+
+
+def test_count_cells_mpp_missing_no_density(monkeypatch):
+    mod = _load_backend(monkeypatch)
+    _stub_platform(monkeypatch, mod, mpp=None)
+    monkeypatch.setattr(mod, "_infer_cellpose",
+                        lambda *a, **kw: _count_response())
+    r = _call(mod, COUNT_ARGS, capability="count_cells")
+    assert r.status_code == 200
+    result = r.get_json()["result"]
+    assert result["density"]["per_mm2"] is None
+    assert result["area_stats_um2"] is None
+    assert result["instances_top"][0]["area_um2"] is None
+    assert any("MPP" in w for w in result["warnings"])
+
+
+def test_count_cells_instances_top_capped(monkeypatch):
+    mod = _load_backend(monkeypatch)
+    _stub_platform(monkeypatch, mod)
+    count = _count_response()
+    count["instances_top"] = [
+        {"bbox": [i, i, 2, 2], "centroid": [i + 1.0, i + 1.0],
+         "area_px": 4.0} for i in range(30)]
+    monkeypatch.setattr(mod, "_infer_cellpose",
+                        lambda *a, **kw: count)
+    r = _call(mod, COUNT_ARGS, capability="count_cells")
+    assert r.status_code == 200
+    assert len(r.get_json()["result"]["instances_top"]) == \
+        mod._MAX_COMPONENTS
+
+
+def test_count_cells_error_mapping(monkeypatch):
+    """busy/not_ready/unreachable/400 与 PSM 同款错误映射。"""
+    mod = _load_backend(monkeypatch)
+    _stub_platform(monkeypatch, mod)
+
+    monkeypatch.setattr(mod, "requests", _CellposeStubRequests({
+        "POST /v1/count": (503, {"error": "busy"})}))
+    r = _call(mod, COUNT_ARGS, capability="count_cells")
+    assert r.status_code == 503
+    assert r.get_json()["error"]["code"] == "inference_busy"
+
+    monkeypatch.setattr(mod, "requests", _CellposeStubRequests({
+        "POST /v1/count": (503, {"error": "not_ready"})}))
+    r = _call(mod, COUNT_ARGS, capability="count_cells")
+    assert r.get_json()["error"]["code"] == "inference_not_ready"
+
+    monkeypatch.setattr(mod, "requests", _CellposeStubRequests({
+        "POST /v1/count": real_requests.ConnectionError("down")}))
+    r = _call(mod, COUNT_ARGS, capability="count_cells")
+    assert r.get_json()["error"]["code"] == "inference_unavailable"
+
+    monkeypatch.setattr(mod, "requests", _CellposeStubRequests({
+        "POST /v1/count": (400, {"error": "bad_input",
+                                 "message": "image too large"})}))
+    r = _call(mod, COUNT_ARGS, capability="count_cells")
+    assert r.status_code == 400
+    assert r.get_json()["error"]["code"] == "invalid_argument"
+
+
+def test_count_cells_contract_violation(monkeypatch):
+    """200 但缺 instance_count → inference_contract（可重试）。"""
+    mod = _load_backend(monkeypatch)
+    _stub_platform(monkeypatch, mod)
+    bad = _count_response()
+    del bad["instance_count"]
+    monkeypatch.setattr(mod, "requests", _CellposeStubRequests({
+        "POST /v1/count": (200, bad)}))
+    r = _call(mod, COUNT_ARGS, capability="count_cells")
+    assert r.status_code == 503
+    assert r.get_json()["error"]["code"] == "inference_contract"
+
+
+def test_count_cells_size_cap(monkeypatch):
+    """count 目标 0.5 µm/px（env 可调），且不超源长边/1024 上限。"""
+    mod = _load_backend(monkeypatch)
+    assert mod._CELLPOSE_TARGET_MPP == pytest.approx(0.5)
+    # 512px @0.5mpp → 512（恰目标，原生内）
+    edge, coarse = mod._target_long_edge(512, 512, 0.5,
+                                         target_mpp=mod._CELLPOSE_TARGET_MPP)
+    assert edge == 512 and coarse is False
+    # 2048px @0.25mpp → want 1024 = 目标恰达（0.5µm/px 输出）→ 不算粗
+    edge, coarse = mod._target_long_edge(2048, 2048, 0.25,
+                                         target_mpp=mod._CELLPOSE_TARGET_MPP)
+    assert edge == 1024 and coarse is False
+    # 4096px @0.25mpp → want 2048 > 1024 合同上限 → 粗于目标（警告）
+    edge, coarse = mod._target_long_edge(4096, 4096, 0.25,
+                                         target_mpp=mod._CELLPOSE_TARGET_MPP)
+    assert edge == 1024 and coarse is True
+    # segment_region 仍用 0.25 目标（不受 count 目标影响）
+    edge, _ = mod._target_long_edge(1000, 800, 0.25)
+    assert edge == 1000
 
 
 if __name__ == "__main__":

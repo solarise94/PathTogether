@@ -28,7 +28,9 @@ HistoPilot agent
   `POST /capabilities/segment_region`。
 - `ui/main.js`：占位（本插件重点是服务端能力）。
 
-## 能力契约（segment_region）
+## 能力契约
+
+### segment_region（PathSegmentor，语义分割——区域/面积，不是计数器）
 
 参数（level-0 整数 bbox + 受控文本提示）：
 
@@ -67,6 +69,39 @@ mpp（输出像素 ≤ level-0 源像素）。平台 404（切片不存在/不�
 "warnings"}`；400 `{"error","message"}`；503 `{"error":"busy"|"not_ready"}`。
 后端把 busy/not_ready/不可达/契约不符映射为明确的工具级错误。
 
+### count_cells（Cellpose，实例分割计数——逐个细胞/核）
+
+与 segment_region 的分工：**要某类目标的区域/面积/占比 → `segment_region`；
+要逐个计数、密度、单个细胞面积 → `count_cells`**。
+
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `x`,`y`,`w`,`h` | integer | level-0 bbox（同上，受平台 ROI 上限约束） |
+| `diameter_um` | number? | 期望目标直径 µm（缺省 7=细胞核；整细胞 15–25） |
+| `model` | string? | 可选 Cellpose 模型预设名（缺省服务端默认） |
+
+返回（摘要）：`instance_count`（真实实例计数）、`density{per_mm2,
+roi_area_mm2, basis}`（MPP 有效时；分母是实际成像 ROI——bbox 经边界夹取
+后的 src）、`area_stats_px/area_stats_um2`（min/p25/median/p75/max）、
+`instances_top`（≤20 个示例实例的 level-0 bbox/质心，非全量）、
+`model{model_id,model_name,model_sha256,code_version}`、
+`diameter_px_used`、`slide/slide_id/slide_revision`、`source_bbox`、
+`rendered`、`mpp`、`timings_ms`、`warnings`。无 label map、无 base64，
+恒 ≪64KiB。
+
+输出分辨率目标 **0.5 µm/px**（`PT_CELLPOSE_TARGET_MPP` 可调，直径驱动
+通常足够），同样永不上采样超过原生 mpp。计数服务合同（homePC）：
+`GET /readyz` → `{ready, model_id:"cellpose", model_name, model_sha256,
+code_version, device}`；`POST /v1/count`，body `{"image_b64", "mpp",
+"diameter_um"?, "model"?, "flow_threshold"?, "cellprob_threshold"?}` →
+200 `{"model_id","model_name","model_sha256","code_version",
+"input_width","input_height","instance_count","diameter_px_used",
+"areas_px":{min,p25,median,p75,max},"instances_top":[{bbox,centroid,
+area_px}],"timings_ms","warnings"}`；400 `{"error","message"}`；
+503 `{"error":"busy"|"not_ready"}`。错误映射与 PathSegmentor 相同
+（busy/not_ready/unreachable → 可重试 `capability_unavailable`，
+细分码在 `details.plugin_code`）。
+
 ## 环境变量
 
 插件后端（`backend/app.py`）：
@@ -75,9 +110,12 @@ mpp（输出像素 ≤ level-0 源像素）。平台 404（切片不存在/不�
   `service.baseUrl` 一致）；
 - `PT_PLATFORM_URL`：PathTogether 基地址（默认 `http://127.0.0.1:8000`）；
 - `PT_INSTALLATION_ID` / `PT_INSTALLATION_SECRET`：本插件安装凭证（见下）；
-- `PATHSEGMENTOR_URL`：推理服务基地址（默认 `http://127.0.0.1:8971`）；
-- `PT_PSM_TARGET_MPP`：目标输出分辨率 µm/px（缺省 **0.25**，永不超过原生）；
-  `PT_PSM_MAX_LONG_EDGE`（缺省 1024）/
+- `PATHSEGMENTOR_URL`：PathSegmentor 推理服务基地址（默认
+  `http://127.0.0.1:8971`）；
+- `CELLPOSE_URL`：Cellpose 计数服务基地址（默认 `http://127.0.0.1:8972`）；
+- `PT_PSM_TARGET_MPP`：PathSegmentor 目标输出分辨率 µm/px（缺省 **0.25**，
+  永不超过原生）；`PT_CELLPOSE_TARGET_MPP`：count_cells 目标（缺省
+  **0.5**，同样不超过原生）；`PT_PSM_MAX_LONG_EDGE`（缺省 1024）/
   `PT_PSM_MIN_COMPONENT_FRACTION`（默认 1e-4）/ `PT_PSM_MAX_COMPONENTS`
   （默认 20）；
 - `PT_PSM_EXPECTED_DIAMETER_UM`（缺省 7.0，计数拆分的期望单目标直径）/
@@ -128,8 +166,10 @@ curl -s -X POST \
 ### 3) 打通 homePC 推理服务（本机经 SSH 隧道）
 
 ```bash
-ssh -N -L 8971:127.0.0.1:8971 homepc &
+ssh -N -L 8971:127.0.0.1:8971 homepc &   # PathSegmentor
+ssh -N -L 8972:127.0.0.1:8972 homepc &   # Cellpose（count_cells）
 curl -s http://127.0.0.1:8971/readyz   # 期望 {"ready":true,...}
+curl -s http://127.0.0.1:8972/readyz   # 期望 {"ready":true,"model_id":"cellpose",...}
 ```
 
 ### 4) 起插件后端（勿打印 secret）
@@ -140,6 +180,7 @@ set -a; source /path/to/psm-install.env   # 只含 PT_INSTALLATION_ID/SECRET
 set +a
 PT_PLATFORM_URL=http://127.0.0.1:8000 \
 PATHSEGMENTOR_URL=http://127.0.0.1:8971 \
+CELLPOSE_URL=http://127.0.0.1:8972 \
 /home/solarise/ZCodeProject/histopilot-suite/PathTogether/.venv/bin/python \
   plugins/pathsegmentor-measure/backend/app.py
 # 监听 127.0.0.1:8062；curl -s http://127.0.0.1:8062/healthz
@@ -148,9 +189,11 @@ PATHSEGMENTOR_URL=http://127.0.0.1:8971 \
 ### 5) E2E
 
 owner 登录 PT Viewer → 上传/打开切片 → 起 AI 会话（官方模式 run，注入
-extra_tools）→ 让模型调用 `segment_region`（例如「统计这片区域的 lymphocytes
-面积与近似数量，bbox 取 (x,y,w,h)」）。工具名：
-`dev_pathsegmentor_measure__segment_region`。验证点：
+extra_tools）→ 模型按需要自选两个工具（工具名
+`dev_pathsegmentor_measure__segment_region` /
+`dev_pathsegmentor_measure__count_cells`）：
+「这片区域有多少个 nucleus？bbox 取 (x,y,w,h)」→ count_cells；
+「gland 在这片区域的面积占比」→ segment_region。验证点：
 
 - 无权切片 / 插件停用 / ROI 超限 / 推理 busy → agent 收到明确工具级错误；
 - 返回 JSON 无 mask/base64；重复同参调用可复核（revision 绑定）。

@@ -7,7 +7,7 @@
   <title>HistoPilot · 邮箱验证</title>
   <!-- D1（2026-09-10）：空 data URI favicon，避免浏览器自动 GET /favicon.ico 撞鉴权闸 -->
   {% include "_site_icons.html" %}
-  <script src="/static/i18n.js?v=20261008c"></script>
+  <script src="/static/i18n.js?v=20261014c"></script>
   <style>
     :root {
       --accent: #007AFF;
@@ -197,9 +197,9 @@
                重新明确同意；仅当未变化且用户此前勾选时才保留 checked -->
           <input id="research_opt" type="checkbox" value="1"{% if public_ctx.research_opt_in and not public_ctx.research_changed %} checked{% endif %} />
           {% if public_ctx.research_changed %}
-          <span><a href="/legal/research-sharing" target="_blank" rel="noopener noreferrer" data-i18n="register.agreement.research">《数据共享与软件改进协议》</a> <span data-i18n="verify.agreement.research.updated">已更新，请重新确认是否同意（自愿，可随时撤回；不选不影响注册、登录、读片和 AI 额度）。</span></span>
+          <span><span data-i18n="datashare.optin">共享数据以帮助开发者改进本系统</span> <a href="/legal/research-sharing" target="_blank" rel="noopener noreferrer" data-i18n="datashare.optin.more">（说明）</a> <span data-i18n="verify.agreement.research.updated">说明已更新，请重新选择。</span></span>
           {% else %}
-          <span><span data-i18n="register.agreement.research.accept">我自愿同意</span> <a href="/legal/research-sharing" target="_blank" rel="noopener noreferrer" data-i18n="register.agreement.research">《数据共享与软件改进协议》</a> <span data-i18n="register.agreement.research.optional">（自愿，可随时撤回；不选也能注册、登录、读片和使用相同 AI 额度策略）</span></span>
+          <span><span data-i18n="datashare.optin">共享数据以帮助开发者改进本系统</span> <a href="/legal/research-sharing" target="_blank" rel="noopener noreferrer" data-i18n="datashare.optin.more">（说明）</a></span>
           {% endif %}
         </label>
         {% if public_ctx.research_changed %}

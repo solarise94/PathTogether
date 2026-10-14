@@ -680,24 +680,27 @@ def test_verify_email_jobs_drain_in_public_mode(monkeypatch):
 # =========================================================================== #
 # 7. HTTP 端到端：register 表单 / verify 页面 / 429 / 登录跳转 / 快照
 # =========================================================================== #
-def test_register_get_public_form_two_checkboxes(monkeypatch):
-    """GET /register：恰好两个 checkbox、均不预勾选、协议版本随表单、
-    名额文案与协议文稿一致（§3.1/§4.1）。"""
+def test_register_get_public_form_single_optional_checkbox(monkeypatch):
+    """GET /register（2026-10-14 简化）：唯一的 checkbox 是自愿数据共享，
+    不预勾选；用户协议改为提交按钮旁的「注册即表示同意」告知，随表单提交
+    terms_accepted 与协议版本/hash（服务端照旧权威校验并记录凭据）。"""
     _open_public_mode(monkeypatch)
     client = _client()
     r = client.get("/register")
     assert r.status_code == 200
     body = r.get_data(as_text=True)
-    assert 'name="terms_accepted"' in body
-    assert 'name="research_opt_in"' in body
+    form = body[body.index('name="research_opt_in"') - 2000:]
+    form = form[:form.index("</form>")]
     assert 'name="invite_token"' not in body
-    # 不预勾选
+    checkboxes = re.findall(r'<input[^>]*type="checkbox"[^>]*>', form)
+    assert len(checkboxes) == 1 and 'name="research_opt_in"' in checkboxes[0]
+    assert "checked" not in checkboxes[0]
+    assert "共享数据以帮助开发者改进本系统" in form
     terms_input = re.search(
-        r'<input[^>]*name="terms_accepted"[^>]*>', body).group(0)
-    research_input = re.search(
-        r'<input[^>]*name="research_opt_in"[^>]*>', body).group(0)
-    assert "checked" not in terms_input
-    assert "checked" not in research_input
+        r'<input[^>]*name="terms_accepted"[^>]*>', form).group(0)
+    assert 'type="hidden"' in terms_input and 'value="1"' in terms_input
+    notice_at = form.index("注册即表示你已阅读并同意")
+    assert notice_at < form.index('class="login-dialog-submit"')
     # 协议版本/hash 随表单提交（服务端权威校验）
     terms = _doc("user_agreement")
     assert 'name="terms_version" value="%s"' % terms["version"] in body

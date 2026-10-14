@@ -6,7 +6,8 @@
   - mask → level-0 映射（src 缩放）、面积占比、MPP µm² 换算（缺失只给 px）、
     连通域计数与小目标过滤、尺寸分布、top 连通域 bbox/质心；
   - 输出长边选层（segment_region ~0.25 µm/px 目标 + ≤1024 钳制）；
-  - count_cells：固定分辨率枚举（512/768/1024）、推理输入 MPP = 原生 MPP ×
+  - count_cells：固定分辨率枚举（512/1024/2048）＝**模型处理长边上限**
+    （含 Cellpose 内部放大；F2 合同）、推理输入 MPP = 原生 MPP ×
     实际渲染缩放（R3）、缩放预算资源准入（R2）、MPP 缺失发 null（R4）；
   - 推理服务错误映射：busy / not_ready / 不可达 / 400 / 契约不符（mask 尺寸
     不一致）；
@@ -728,17 +729,23 @@ def test_count_render_plan_math(monkeypatch):
 
 
 def test_count_max_roi_table(monkeypatch):
-    """d=7、原生细于处理尺度（0.2 < 7/30）时各选项最大视场：
-    119.5/238.9/477.9 µm；原生更粗（0.25）时按原生渲染、上限随之增大。"""
+    """F2 合同：resolution = 模型处理长边上限 → 各选项最大视场与切片 MPP
+    无关：max FOV = resolution×d/30（d=7：119.47/238.93/477.87 µm），
+    预算封顶约 96.54×d µm。"""
     mod = _load_backend(monkeypatch)
     for res, um in ((512, 119.4667), (1024, 238.9333), (2048, 477.8667)):
-        max_um, max_l0 = mod._count_max_roi(0.2, 7.0, res)
-        assert max_um == pytest.approx(um, abs=1e-3)
-        assert max_l0 == math.floor(max_um / 0.2)
-    # 原生 0.25 > 7/30：mpp_render = 原生 → 上限 = resolution×0.25
-    max_um, max_l0 = mod._count_max_roi(0.25, 7.0, 1024)
-    assert max_um == pytest.approx(256.0)
-    assert max_l0 == 1024
+        for native in (0.12, 0.2, 0.25, 0.5):
+            max_um, max_l0 = mod._count_max_roi(native, 7.0, res)
+            assert max_um == pytest.approx(um, abs=1e-3), (res, native)
+            assert max_l0 == math.floor(max_um / native)
+    # 直径进入线性：d=25、2048 → 1706.67 µm；d=100 → 6826.67 µm
+    # （预算边 √8Mi≈2896 px 高于全部固定档位，预算项对枚举档永不封顶）
+    max_um, _ = mod._count_max_roi(0.25, 25.0, 2048)
+    assert max_um == pytest.approx(2048 * 25.0 / 30.0)
+    max_um, _ = mod._count_max_roi(0.25, 100.0, 2048)
+    assert max_um == pytest.approx(2048 * 100.0 / 30.0)
+    budget_edge = math.floor(math.sqrt(mod._CELLPOSE_MAX_SCALED_PIXELS))
+    assert budget_edge > max(mod._COUNT_RESOLUTIONS)
 
 
 def test_count_cells_validates_resolution(monkeypatch):
@@ -752,12 +759,11 @@ def test_count_cells_validates_resolution(monkeypatch):
 
 
 def test_count_cells_exceeds_option_rejected_before_region_read(monkeypatch):
-    """所需处理长边超过选项：读 ROI **之前** 400 resource_limit（R2 重设计）。
+    """模型处理长边超过选项：读 ROI **之前** 400 resource_limit（F2 合同）。
 
-    2048 level-0 px @0.25、d=7 → 处理尺度 0.2333 粗于原生 → 按原生渲染需要
-    2048 px 长边 > 显式选择的 1024 选项；不做「渲染到 1024 再让模型放大
-    30/14 倍」（缺省 2048 时同一 ROI 会放行，见 reviewer 回归）。
-    """
+    2048 level-0 px @0.25、d=7 → 视场 512 µm，按处理尺度需要 2194 px 模型
+    处理长边 > 显式选择的 1024 选项（选项最大视场 = 1024×7/30 = 238.93 µm
+    ≈ 955 level-0 px）；extra 给出该选项的真实容量。"""
     mod = _load_backend(monkeypatch)
     reads = []
 
@@ -776,14 +782,16 @@ def test_count_cells_exceeds_option_rejected_before_region_read(monkeypatch):
     assert err["code"] == "resource_limit"
     assert err["extra"]["resolution"] == 1024
     assert err["extra"]["diameter_um"] == 7.0
-    # 原生 0.25 > d/30 → mpp_render = 原生：上限 = resolution×native
-    assert err["extra"]["max_roi_um"] == [256.0, 256.0]
-    assert err["extra"]["max_roi_level0_px"] == [1024, 1024]
+    # F2：上限与切片 MPP 无关 = resolution×d/30（µm）与对应 level-0 px
+    assert err["extra"]["max_roi_um"] == [238.93, 238.93]
+    assert err["extra"]["max_roi_level0_px"] == [955, 955]
+    assert "diameter_um" in err["message"]
     assert reads == [], "must reject before any region read"
 
 
 def test_count_cells_resolution_2048_fits_big_roi(monkeypatch):
-    """同一 ROI 选 2048 选项即可处理：渲染长边 2048、R3 推理 mpp 不变。"""
+    """视场在 2048 处理上限内（1900² @0.25 = 475 µm ≤ 477.87）选 2048 即可
+    处理：渲染长边 1900、半尺寸输出 → 推理 mpp 0.5。"""
     mod = _load_backend(monkeypatch)
     seen = {}
 
@@ -793,16 +801,16 @@ def test_count_cells_resolution_2048_fits_big_roi(monkeypatch):
 
     _stub_platform(monkeypatch, mod, mpp=0.25)
     seen_edge = _stub_read(monkeypatch, mod,
-                           _region_payload(1024, 1024, (0, 0, 2048, 2048)))
+                           _region_payload(950, 950, (0, 0, 1900, 1900)))
     monkeypatch.setattr(mod, "_infer_cellpose", _infer)
-    r = _call(mod, {"x": 0, "y": 0, "w": 2048, "h": 2048, "resolution": 2048},
+    r = _call(mod, {"x": 0, "y": 0, "w": 1900, "h": 1900, "resolution": 2048},
               capability="count_cells")
     assert r.status_code == 200, r.get_json()
-    assert seen_edge["edge"] == 2048
+    assert seen_edge["edge"] == 1900
     assert seen["mpp"] == pytest.approx(0.5)
     result = r.get_json()["result"]
     assert result["resolution"] == 2048
-    assert result["rendered"]["requested_long_edge"] == 2048
+    assert result["rendered"]["requested_long_edge"] == 1900
 
 
 def test_count_cells_inference_mpp_from_actual_scale(monkeypatch):
@@ -816,20 +824,20 @@ def test_count_cells_inference_mpp_from_actual_scale(monkeypatch):
 
     _stub_platform(monkeypatch, mod, mpp=0.25)
     seen_edge = _stub_read(monkeypatch, mod,
-                           _region_payload(1024, 1024, (0, 0, 2048, 2048)))
+                           _region_payload(950, 950, (0, 0, 1900, 1900)))
     monkeypatch.setattr(mod, "_infer_cellpose", _infer)
-    r = _call(mod, {"x": 0, "y": 0, "w": 2048, "h": 2048, "resolution": 2048},
+    r = _call(mod, {"x": 0, "y": 0, "w": 1900, "h": 1900, "resolution": 2048},
               capability="count_cells")
     assert r.status_code == 200, r.get_json()
-    assert seen_edge["edge"] == 2048
+    assert seen_edge["edge"] == 1900
     assert seen["mpp"] == pytest.approx(0.5)
     result = r.get_json()["result"]
     assert result["inference_input"]["mpp"] == pytest.approx(0.5)
     assert result["inference_input"]["mpp_render"] == pytest.approx(0.25)
     assert result["inference_input"]["scale"] == {"x": 2.0, "y": 2.0}
-    # 原生 MPP 映射密度：ROI = (2048·0.25/1000)² mm²
+    # 原生 MPP 映射密度：ROI = (1900·0.25/1000)² mm²
     assert result["mpp"]["x"] == pytest.approx(0.25)
-    assert result["density"]["roi_area_mm2"] == pytest.approx(0.262144)
+    assert result["density"]["roi_area_mm2"] == pytest.approx(0.225625)
 
 
 def test_count_cells_render_at_processing_scale(monkeypatch):
@@ -937,15 +945,16 @@ def test_count_cells_scale_from_actual_src_after_clamp(monkeypatch):
         seen["mpp"] = mpp_arg
         return _count_response()
 
-    # 请求 2048×64 @0.25 → 处理长边 2048；平台夹取后返回 src 512×32 → 256×16
+    # 请求 1900×64 @0.25 → 处理长边 2035 ≤ 2048；平台夹取后返回 src
+    # 512×32 → 256×16，scale 按实际 src/输出算
     _stub_platform(monkeypatch, mod, mpp=0.25)
     seen_edge = _stub_read(monkeypatch, mod,
                            _region_payload(256, 16, (0, 0, 512, 32)))
     monkeypatch.setattr(mod, "_infer_cellpose", _infer)
-    r = _call(mod, {"x": 0, "y": 0, "w": 2048, "h": 64, "resolution": 2048},
+    r = _call(mod, {"x": 0, "y": 0, "w": 1900, "h": 64, "resolution": 2048},
               capability="count_cells")
     assert r.status_code == 200, r.get_json()
-    assert seen_edge["edge"] == 2048
+    assert seen_edge["edge"] == 1900
     assert seen["mpp"] == pytest.approx(0.5)
     result = r.get_json()["result"]
     assert result["inference_input"]["scale"] == {"x": 2.0, "y": 2.0}
@@ -962,17 +971,17 @@ def test_count_cells_non_square_scale(monkeypatch):
 
     _stub_platform(monkeypatch, mod, mpp=0.25)
     seen_edge = _stub_read(monkeypatch, mod,
-                           _region_payload(1024, 512, (0, 0, 2048, 1024)))
+                           _region_payload(950, 475, (0, 0, 1900, 950)))
     monkeypatch.setattr(mod, "_infer_cellpose", _infer)
-    r = _call(mod, {"x": 0, "y": 0, "w": 2048, "h": 1024, "resolution": 2048},
+    r = _call(mod, {"x": 0, "y": 0, "w": 1900, "h": 950, "resolution": 2048},
               capability="count_cells")
     assert r.status_code == 200, r.get_json()
-    assert seen_edge["edge"] == 2048
+    assert seen_edge["edge"] == 1900
     assert seen["mpp"] == pytest.approx(0.5)
     result = r.get_json()["result"]
     assert result["inference_input"]["scale"] == {"x": 2.0, "y": 2.0}
-    assert result["rendered"]["width"] == 1024
-    assert result["rendered"]["height"] == 512
+    assert result["rendered"]["width"] == 950
+    assert result["rendered"]["height"] == 475
 
 
 def test_count_cells_anisotropic_scale_rejected(monkeypatch):
@@ -980,10 +989,10 @@ def test_count_cells_anisotropic_scale_rejected(monkeypatch):
     mod = _load_backend(monkeypatch)
     _stub_platform(monkeypatch, mod, mpp=0.25)
     seen_edge = _stub_read(monkeypatch, mod,
-                           _region_payload(1024, 900, (0, 0, 2048, 2048)))
+                           _region_payload(950, 900, (0, 0, 1900, 1900)))
     monkeypatch.setattr(mod, "_infer_cellpose",
                         lambda *a, **kw: _count_response())
-    r = _call(mod, {"x": 0, "y": 0, "w": 2048, "h": 2048, "resolution": 2048},
+    r = _call(mod, {"x": 0, "y": 0, "w": 1900, "h": 1900, "resolution": 2048},
               capability="count_cells")
     assert r.status_code == 400
     assert r.get_json()["error"]["code"] == "anisotropic_scale"
@@ -1013,6 +1022,178 @@ def test_count_cells_small_roi_rounding_tolerated(monkeypatch):
     result = r.get_json()["result"]
     assert result["inference_input"]["mpp"] == pytest.approx(
         (0.12 * 100 / 52 + 0.12 * 30 / 16) / 2)
+
+
+# --------------------------------------------------------------------------- #
+# 5. F2 处理长边上限合同（模型处理边 = 30×视场/diameter，含内部放大）
+# --------------------------------------------------------------------------- #
+def _aspect_fit(long_px, short_px, edge):
+    """平台 _aspect_fit_size 契约的最小镜像（保宽高比、逐轴 round、≥1）。"""
+    out_short = max(1, int(round(short_px * (edge / float(long_px)))))
+    return edge, out_short
+
+
+def _count_sweep_setup(monkeypatch, mod, mpp, long_px, short_px):
+    """平台 stub：region 输出按 _aspect_fit_size 真实取整返回（未夹取）。"""
+    reads = []
+
+    def _read(slide, args, edge, delegated, jwt, slide_id=None):
+        reads.append((args["w"], args["h"], edge))
+        ow, oh = (_aspect_fit(long_px, short_px, edge)
+                  if long_px >= short_px else
+                  tuple(reversed(_aspect_fit(long_px, short_px, edge))))
+        return b"img", _region_payload(ow, oh, (0, 0, long_px, short_px))
+
+    _stub_platform(monkeypatch, mod, mpp=mpp)
+    monkeypatch.setattr(mod, "_platform_read_region", _read)
+    monkeypatch.setattr(mod, "_infer_cellpose",
+                        lambda *a, **kw: _count_response())
+    return reads
+
+
+def test_count_cells_native_coarse_diameter_variants(monkeypatch):
+    """原生 0.5（粗于 d/30）× 不同直径：处理边 = 30×视场/diameter 决定放行。
+
+    500² @0.5、res 512：d=7 → 1071 px > 512 拒绝（reviewer round-2 场景）；
+    d=15 → 500 ≤ 512、d=25 → 300 放行。"""
+    mod = _load_backend(monkeypatch)
+    reads = _count_sweep_setup(monkeypatch, mod, 0.5, 500, 500)
+    r = _call(mod, {"x": 0, "y": 0, "w": 500, "h": 500, "resolution": 512,
+                    "diameter_um": 7}, capability="count_cells")
+    assert r.status_code == 400
+    assert r.get_json()["error"]["code"] == "resource_limit"
+    assert reads == [], "over-cap request must not read the region"
+    for d in (15, 25):
+        r = _call(mod, {"x": 0, "y": 0, "w": 500, "h": 500, "resolution": 512,
+                        "diameter_um": d}, capability="count_cells")
+        assert r.status_code == 200, (d, r.get_json())
+    assert len(reads) == 2
+
+
+def test_count_cells_strip_roi_fine_native(monkeypatch):
+    """长条 ROI（2000×200 L0 @0.12，视场 240×24 µm ≤ 2048 档上限）放行：
+    渲染长边 1029、平台 round 短轴 103、模型处理长边 ≈1028。"""
+    mod = _load_backend(monkeypatch)
+    reads = _count_sweep_setup(monkeypatch, mod, 0.12, 2000, 200)
+    r = _call(mod, {"x": 0, "y": 0, "w": 2000, "h": 200}, capability="count_cells")
+    assert r.status_code == 200, r.get_json()
+    assert reads and reads[0][2] == 1029
+    assert r.get_json()["result"]["inference_input"]["scale"] == \
+        {"x": pytest.approx(2000 / 1029), "y": pytest.approx(200 / 103)}
+
+
+def test_count_cells_strip_roi_over_cap(monkeypatch):
+    """长条超限：4779×200 L0 @0.12（视场 573.5 µm > 477.87）→ 读前拒绝；
+    2000×200 @0.5（粗原生、内部放大 2.14×→处理长边 4285）同样拒绝。"""
+    mod = _load_backend(monkeypatch)
+    reads = _count_sweep_setup(monkeypatch, mod, 0.12, 4779, 200)
+    r = _call(mod, {"x": 0, "y": 0, "w": 4779, "h": 200}, capability="count_cells")
+    assert r.status_code == 400
+    assert r.get_json()["error"]["code"] == "resource_limit"
+    assert reads == []
+    reads = _count_sweep_setup(monkeypatch, mod, 0.5, 2000, 200)
+    r = _call(mod, {"x": 0, "y": 0, "w": 2000, "h": 200}, capability="count_cells")
+    assert r.status_code == 400
+    assert r.get_json()["error"]["code"] == "resource_limit"
+    assert reads == []
+
+
+def test_count_cells_exact_option_boundaries(monkeypatch):
+    """选项边界：视场恰在 max FOV（resolution×d/30）放行，多 1 个 level-0 px
+    拒绝。原生 0.12（细于处理尺度）与 0.5（粗于处理尺度）各测 512 档；
+    2048 档见边界扫描。"""
+    mod = _load_backend(monkeypatch)
+    for native, res in ((0.12, 512), (0.5, 512)):
+        max_l0 = int(res * 7.0 / 30.0 / native)
+        reads = _count_sweep_setup(monkeypatch, mod, native, max_l0, max_l0)
+        r = _call(mod, {"x": 0, "y": 0, "w": max_l0, "h": max_l0,
+                        "resolution": res}, capability="count_cells")
+        assert r.status_code == 200, (native, res, r.get_json())
+        assert len(reads) == 1
+        reads = _count_sweep_setup(monkeypatch, mod, native,
+                                   max_l0 + 1, max_l0 + 1)
+        r = _call(mod, {"x": 0, "y": 0, "w": max_l0 + 1, "h": max_l0 + 1,
+                        "resolution": res}, capability="count_cells")
+        assert r.status_code == 400, (native, res, r.get_json())
+        assert r.get_json()["error"]["code"] == "resource_limit"
+        assert reads == [], (native, res)
+
+
+def test_count_cells_native_finer_than_processing_scale(monkeypatch):
+    """原生 0.12 细于 d/30：900×720（视场 108×86.4 µm）在 512 档内放行；
+    1000×800（视场 120 µm > 119.47）超 512 档读前拒绝。"""
+    mod = _load_backend(monkeypatch)
+    reads = _count_sweep_setup(monkeypatch, mod, 0.12, 900, 720)
+    r = _call(mod, {"x": 0, "y": 0, "w": 900, "h": 720, "resolution": 512},
+              capability="count_cells")
+    assert r.status_code == 200, r.get_json()
+    assert reads and reads[0][2] == 463
+    reads = _count_sweep_setup(monkeypatch, mod, 0.12, 1000, 800)
+    r = _call(mod, {"x": 0, "y": 0, "w": 1000, "h": 800, "resolution": 512},
+              capability="count_cells")
+    assert r.status_code == 400
+    assert r.get_json()["error"]["code"] == "resource_limit"
+    assert reads == []
+
+
+def test_count_cells_mpp_null_option_cap_post_ok(monkeypatch):
+    """mpp null：rescale 1、输入边 = 选项钳到源 → 处理尺寸 = 输入 ≤ 选项，
+    读后硬闸不触发；仅像素口径。"""
+    mod = _load_backend(monkeypatch)
+    reads = _count_sweep_setup(monkeypatch, mod, None, 4096, 2000)
+    r = _call(mod, {"x": 0, "y": 0, "w": 4096, "h": 2000, "resolution": 512},
+              capability="count_cells")
+    assert r.status_code == 200, r.get_json()
+    assert reads and reads[0][2] == 512
+    result = r.get_json()["result"]
+    assert result["density"]["per_mm2"] is None
+    assert result["inference_input"]["mpp"] is None
+
+
+def test_count_cells_processing_cap_margin_strip_rejected(monkeypatch):
+    """预读镜像的平台取整余量：3982×30 @0.12 名义处理长边恰 2048，但短轴
+    round 到 15 px 使两轴均值 MPP 变粗 → 实际处理长边 2077 > 2048，读前
+    拒绝（否则读了 ROI 才被读后硬闸拒）。"""
+    mod = _load_backend(monkeypatch)
+    plan = mod._count_render_plan(3982, 30, 0.12, 7.0, 2048)
+    assert plan["scaled_long"] == 2048
+    assert plan["proc_long"] == 2077
+    reads = _count_sweep_setup(monkeypatch, mod, 0.12, 3982, 30)
+    r = _call(mod, {"x": 0, "y": 0, "w": 3982, "h": 30}, capability="count_cells")
+    assert r.status_code == 400
+    assert r.get_json()["error"]["code"] == "resource_limit"
+    assert reads == []
+
+
+def test_count_cells_pre_admit_never_post_rejected_sweep(monkeypatch):
+    """边界扫描：对多组 MPP × bbox（最大视场 ±2 level-0 px × 三种短轴），
+    预准入放行的请求必须走完读后硬闸返回 200；拒绝的请求绝不读 ROI。"""
+    mod = _load_backend(monkeypatch)
+    cases = admitted = 0
+    for native in (0.10, 0.12, 0.15, 0.2, 7.0 / 30.0, 0.25, 0.4, 0.5, 0.65):
+        for res in (512, 2048):
+            max_l0 = int(res * 7.0 / 30.0 / native)
+            for long_px in (max_l0 - 2, max_l0 - 1, max_l0, max_l0 + 1,
+                            max_l0 + 2):
+                if long_px < 1:
+                    continue
+                for short_px in (long_px, max(16, long_px // 2), 16):
+                    reads = _count_sweep_setup(monkeypatch, mod, native,
+                                               long_px, short_px)
+                    r = _call(mod, {"x": 0, "y": 0, "w": long_px,
+                                    "h": short_px, "resolution": res},
+                              capability="count_cells")
+                    cases += 1
+                    body = r.get_json()
+                    if r.status_code == 400 \
+                            and body["error"]["code"] == "resource_limit":
+                        assert reads == [], \
+                            (native, res, long_px, short_px)
+                        continue
+                    assert r.status_code == 200, (native, res, long_px,
+                                                  short_px, body)
+                    admitted += 1
+    assert cases >= 200 and admitted >= 100, (cases, admitted)
 
 
 def test_count_cells_resource_limit_before_inference(monkeypatch):

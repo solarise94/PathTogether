@@ -1,0 +1,21 @@
+# cellpose 服务的运行时依赖。**镜像内实际安装走构建上下文预取的 wheels/**
+# （py310 manylinux，与本文件逐项对应，见 Containerfile）——homePC 到 PyPI
+# 直连不稳，本文件用于记录锁定版本与本地开发。
+#
+# torch/torchvision 由基础镜像提供（pytorch/pytorch:2.1.0-cuda12.1-cudnn8-*，
+# 2.1.0+cu121 / 0.16.0；sm_75 兼容），不要在此固定（避免覆盖 CUDA 构建）。
+# numpy 1.26.4 / Pillow 9.4.0 亦用基础镜像自带（已验证 cellpose 4.2.1.1
+# 与之相容，wheel 集刻意不含 numpy/pillow/torch 升级）。
+cellpose==4.2.1.1
+flask>=3.0,<4
+gunicorn>=21.2,<24
+scipy==1.13.1
+opencv-python-headless==4.10.0.84
+segment-anything==1.0
+fastremap==1.17.4
+fill-voids==2.1.0
+imagecodecs==2025.3.30
+roifile==2025.12.12
+natsort==8.4.0
+tifffile==2025.5.10
+tqdm==4.70.1

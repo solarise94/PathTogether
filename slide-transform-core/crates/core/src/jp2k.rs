@@ -34,10 +34,57 @@
 
 use crate::error::{CoreError, CoreResult};
 
+/// Test-only decoder-invocation counter (review R1). Compiled to nothing in
+/// normal builds; with `--features fixtures` it lets a test prove an
+/// over-budget header is rejected BEFORE the decoder entry point is reached
+/// (i.e. no multi-GB allocation was attempted). The counter is THREAD-LOCAL:
+/// the conversion is synchronous on the calling thread, so parallel tests in
+/// one binary never observe each other's conversions.
+pub mod decoder_probe {
+    #[cfg(feature = "fixtures")]
+    use core::cell::Cell;
+
+    #[cfg(feature = "fixtures")]
+    std::thread_local! {
+        static CALLS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Record that the decoder entry point was reached.
+    #[inline]
+    pub fn record() {
+        #[cfg(feature = "fixtures")]
+        CALLS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Number of decoder invocations recorded so far on this thread.
+    #[cfg(feature = "fixtures")]
+    pub fn calls() -> u64 {
+        CALLS.with(|c| c.get())
+    }
+
+    /// Reset the counter (tests that assert "zero calls").
+    #[cfg(feature = "fixtures")]
+    pub fn reset() {
+        CALLS.with(|c| c.set(0));
+    }
+
+    /// Stub for non-fixture builds (keeps the call site unconditional).
+    #[cfg(not(feature = "fixtures"))]
+    pub fn calls() -> u64 {
+        0
+    }
+    #[cfg(not(feature = "fixtures"))]
+    pub fn reset() {}
+}
+
 /// Decoder identity recorded in provenance (OME-XML / reports) and in the
 /// evidence docs. A version/feature change must re-run the colour + parity
 /// acceptance (output bytes can change).
 pub const DECODER_NAME: &str = "hayro-jpeg2000";
+/// Review R1: the accounted decode transient is bound to the pinned decoder.
+/// A version change must re-derive [`peak`] against the new source (the
+/// hayro allocation sites are cited per constant below).
+pub const DECODER_PEAK_BASIS: &str = "hayro-jpeg2000 0.4.0 allocation sites";
 pub const DECODER_VERSION: &str = "0.4.0";
 /// The pinned feature configuration: hayro's `simd` feature (its only
 /// feature) is DISABLED — the pure-Rust scalar path, `forbid(unsafe_code)`.
@@ -519,6 +566,165 @@ pub struct DecodedTileRgb {
     pub rgb: Vec<u8>,
 }
 
+// --------------------------------------------------------------------------- //
+// Review R1: pre-allocation working-set accounting for one JP2K tile.         //
+// --------------------------------------------------------------------------- //
+//
+// The SVS/JP2K adapter decodes ONE tile at a time, but "one tile" is NOT a     //
+// memory bound: a legal codestream may claim up to MAX_SIDE×MAX_SIDE pixels    //
+// (2²⁶) and the decoder holds several full-resolution f32 planes at the same   //
+// instant. Before the decoder is allowed to allocate, the adapter computes a   //
+// CONSERVATIVE peak of everything live together and charges it against the     //
+// host budget (`plan.limits.memory_budget_bytes`); an over-budget estimate is  //
+// the existing typed `resource_profile_insufficient` refusal (never an OOM).
+//
+// Derivation of every term (hayro-jpeg2000 0.4.0, the pinned scalar build —
+// see [`DECODER_PEAK_BASIS`]; a decoder version change re-runs this review):
+//
+// * Decode planes — `DecoderContext::reset` allocates one `SimdBuffer` of
+//   `image_width × image_height` f32 PER COMPONENT (`src/j2c/decode.rs:117`),
+//   i.e. `components × w × h × 4 B`. Subsampled 33003 chroma still gets a
+//   full-resolution buffer in this build, which is the worst case.
+// * `storage.coefficients` — the per-component sub-band coefficient array
+//   (`src/j2c/build.rs:28`). The LL band + the 3 AC bands partition each
+//   component tile, so it is ≤ `components × w × h × 4 B`.
+// * IDWT — `idwt_output.coefficients` and `idwt_scratch_buffer`
+//   (`src/j2c/idwt.rs:96,107`), each ≤ `(w+1) × (h+1)` f32 (the code reserves
+//   `(total+1)²` for sub-band shift padding): `2 × (w+2) × (h+2) × 4 B`.
+// * Bit-plane code-block scratch (`src/j2c/bitplane.rs:432-446`): one
+//   `Coefficient` u32 + one `NeighborSignificances` u8 + one `CoefficientState`
+//   u8 per padded coefficient, plus padded stripe flags. The buffers are
+//   reused per code block, so the live transient is bounded by the LARGEST
+//   code block; a malicious COD cannot exceed the tile area (a code block is a
+//   sub-rect of the tile), giving ≈ 6.3 B/px worst case — rounded up to a
+//   documented [`peak::DECODER_BITPLANE_BPP`] = 8 B/px.
+// * RGB output — `DecodedTileRgb.rgb`, `w × h × 3 B`.
+// * Padded canvas — when (and only when) the codestream is smaller than the
+//   nominal tile rect, a white `tile_w × tile_h × 3 B` canvas is live
+//   alongside the RGB buffer (edge tiles).
+// * JPEG encoder — `encode_rgb` builds three full-resolution u8 component
+//   planes (`src/jpeg/encoder.rs`), i.e. `3 × tw × th` at the encode geometry
+//   (`max(w,tile_w) × max(h,tile_h)`, covered by `tw × th`), plus the
+//   entropy-coded output buffer (≤ half the input area, `tw×th/2`).
+// * A fixed [`peak::FIXED_SLACK`] (1 MiB) covers everything not proportional
+//   to pixels: the YCbCr/Huffman/DQT tables, hayro's segment/precinct/tag-tree
+//   metadata and allocator rounding.
+pub mod peak {
+    use super::*;
+
+    /// f32 element size.
+    pub const F32: u64 = 4;
+    /// Bytes per pixel of the interleaved RGB8 output.
+    pub const RGB_BPP: u64 = 3;
+    /// Documented worst-case hayro code-block bit-plane transient per tile
+    /// pixel (Coefficient u32 + NeighborSignificances u8 + CoefficientState u8
+    /// + stripe flags, padded and rounded up).
+    pub const DECODER_BITPLANE_BPP: u64 = 8;
+    /// The JPEG entropy-coded output buffer is bounded by half the input area
+    /// (see `encode_rgb`'s `Vec::with_capacity(w*h/2 + …)`).
+    pub const ENCODER_OUTPUT_DIV: u64 = 2;
+    /// Non-pixel-proportional slack (tables, decoder metadata, allocator).
+    pub const FIXED_SLACK: u64 = 1 << 20;
+
+    /// Named terms of the conservative per-tile peak working set (kept so
+    /// tests can assert each term and the docs can cite the derivation).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Breakdown {
+        pub decode_planes: u64,
+        pub storage_coefficients: u64,
+        pub idwt_buffers: u64,
+        pub bitplane_transient: u64,
+        pub rgb_output: u64,
+        pub padded_canvas: u64,
+        pub encoder_planes: u64,
+        pub encoder_output: u64,
+        pub fixed_slack: u64,
+    }
+
+    impl Breakdown {
+        /// The conservative peak: the sum of every term live at the same time.
+        pub fn total(&self) -> u64 {
+            [
+                self.decode_planes,
+                self.storage_coefficients,
+                self.idwt_buffers,
+                self.bitplane_transient,
+                self.rgb_output,
+                self.padded_canvas,
+                self.encoder_planes,
+                self.encoder_output,
+                self.fixed_slack,
+            ]
+            .into_iter()
+            .fold(0u64, u64::saturating_add)
+        }
+    }
+
+    fn mul(a: u64, b: u64) -> CoreResult<u64> {
+        a.checked_mul(b)
+            .ok_or_else(|| CoreError::resource_limit("JPEG2000 工作集估算溢出"))
+    }
+
+    /// Conservative peak working set of decoding + re-encoding ONE tile whose
+    /// codestream is `w × h` with `components` components, onto a nominal
+    /// `tile_w × tile_h` canvas. Checked arithmetic; overflow is a typed
+    /// resource refusal (never a wrap).
+    pub fn working_set(
+        components: u64,
+        w: u64,
+        h: u64,
+        tile_w: u64,
+        tile_h: u64,
+    ) -> CoreResult<Breakdown> {
+        let pixels = mul(w, h)?;
+        let tile_pixels = mul(tile_w, tile_h)?;
+        let comps = components.max(1);
+        let decode_planes = mul(mul(comps, pixels)?, F32)?;
+        let storage_coefficients = decode_planes; // same order of magnitude
+        let idwt_buffers = mul(
+            mul(2, mul(w.saturating_add(2), h.saturating_add(2))?)?,
+            F32,
+        )?;
+        let bitplane_transient = mul(pixels, DECODER_BITPLANE_BPP)?;
+        let rgb_output = mul(pixels, RGB_BPP)?;
+        // only allocated when the codestream is smaller than the nominal tile
+        let padded_canvas =
+            if w < tile_w || h < tile_h { mul(tile_pixels, RGB_BPP)? } else { 0 };
+        let encoder_planes = mul(3, tile_pixels)?;
+        let encoder_output = tile_pixels / ENCODER_OUTPUT_DIV;
+        Ok(Breakdown {
+            decode_planes,
+            storage_coefficients,
+            idwt_buffers,
+            bitplane_transient,
+            rgb_output,
+            padded_canvas,
+            encoder_planes,
+            encoder_output,
+            fixed_slack: FIXED_SLACK,
+        })
+    }
+
+    /// Charge the conservative one-tile peak against a fresh host budget and
+    /// return the charged total. Over budget ⇒ the existing typed
+    /// `resource_profile_insufficient` (`ResourceLimitExceeded`) BEFORE any
+    /// decode/encode allocation.
+    pub fn charge_against_budget(
+        budget_bytes: u64,
+        components: u64,
+        w: u64,
+        h: u64,
+        tile_w: u64,
+        tile_h: u64,
+        what: &str,
+    ) -> CoreResult<u64> {
+        let total = working_set(components, w, h, tile_w, tile_h)?.total();
+        let mut budget = crate::budget::MemBudget::host(budget_bytes);
+        budget.charge(total, what)?;
+        Ok(total)
+    }
+}
+
 /// Decode one raw J2K tile payload to interleaved RGB8 with the colour duty
 /// `color` (decided by [`classify_aperio`] / [`check_against_contract`]).
 ///
@@ -544,6 +750,10 @@ pub fn decode_tile_rgb(
             "JPEG 2000 tile {width}×{height} 超过该层像素预算 {max_pixels}"
         )));
     }
+    // The decode entry point (first hayro allocation is downstream, inside
+    // `Image::decode`). The R1 test hook records reaching here so an
+    // over-budget header can be proved rejected BEFORE the decoder ran.
+    decoder_probe::record();
     let image = Image::new(payload, &DecodeSettings::default())
         .map_err(|e| CoreError::jpeg(format!("JPEG 2000 头解析失败: {e}")))?;
     let mut ctx = DecoderContext::default();

@@ -131,10 +131,12 @@ pub struct ResourceLimits {
     /// (native CLI `--memory-budget`, default the browser `saver` profile's
     /// 192 MiB; the browser worker passes the active profile's
     /// `budgetBytes`). Adapters whose working-set estimate exceeds it refuse
-    /// with `resource_profile_insufficient` BEFORE the allocation. Only the
-    /// MRXS adapter charges against it today (its metadata working set is
-    /// data-dependent); KFB/KFBF/SVS working sets are already bound by
-    /// fixed per-tile/cell structures.
+    /// with `resource_profile_insufficient` BEFORE the allocation. The MRXS
+    /// adapter charges its data-dependent metadata working set against it, and
+    /// the SVS JPEG 2000 path (review R1) charges the conservative one-tile
+    /// decode/re-encode peak (`crate::jp2k::peak`) at plan time and again per
+    /// tile from the real codestream header. KFB/KFBF/SVS-baseline-JPEG
+    /// working sets are already bound by fixed per-tile/cell structures.
     pub memory_budget_bytes: u64,
 }
 

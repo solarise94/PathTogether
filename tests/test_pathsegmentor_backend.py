@@ -1191,6 +1191,46 @@ def test_count_max_side_table():
     assert mod._count_max_side(None, 7.0, 512) is None
 
 
+def test_count_cells_option_mpp_diameter_sweep_integer_boundary():
+    """验收矩阵（设计 §验收用例）：512/1024/2048 × MPP(0.12/0.25/0.5) ×
+    直径(7/15/25) ——规划器取到的边长在**真实取整物理**下恰为最大可处理
+    值（side 放行、同一快照下 side+1 越档），渲染边与处理边长均 ≤ 档位。"""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "psm_sweep", REPO_ROOT / "plugins/pathsegmentor-measure/backend/app.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    cases = 0
+    for res in (512, 1024, 2048):
+        for mpp in (0.12, 0.25, 0.5):
+            for d in (7.0, 15.0, 25.0):
+                geo_cap = 4096
+                side = geo_cap
+                while side >= 1 and not mod._square_admits(side, mpp, d, res):
+                    side -= 1
+                assert side >= 1, (res, mpp, d)
+                edge = mod._square_render_edge(side, mpp, d)
+                proc = mod._square_processing_dims(side, edge, mpp, d)
+                assert proc is not None and max(proc) <= res, (res, mpp, d)
+                assert proc[0] * proc[1] <= mod._CELLPOSE_MAX_SCALED_PIXELS
+                # 整数边界（非理想公式）：处理上限先于几何上限生效时，
+                # side+1 在同一几何下必须越档；几何上限（4096 ROI/平台钳制）
+                # 先生效时 side 恰为几何上限且仍满足处理档位。
+                if side < geo_cap:
+                    assert not mod._square_admits(side + 1, mpp, d, res), \
+                        (res, mpp, d, side)
+                else:
+                    assert side == geo_cap, (res, mpp, d, side)
+                # 规划器在大快照里取到的就是该最大值
+                plan, err = mod._plan_count_square(
+                    {"x": 0, "y": 0, "w": geo_cap * 2, "h": geo_cap * 2},
+                    geo_cap * 4, geo_cap * 4, mpp, d, res)
+                assert err is None
+                assert plan["side"] == side, (res, mpp, d, plan["side"])
+                cases += 1
+    assert cases == 27
+
+
 def test_count_cells_mpp_invalid_normalized(monkeypatch):
     """R4：原生 MPP ≤0 / 非有限 → 规范为缺失（null）。"""
     mod = _load_backend(monkeypatch)

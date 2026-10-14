@@ -1072,7 +1072,11 @@
   // 支扫描，另一支原样交给插件），命中 counted_region.bbox 后在 viewer 上画一
   // 个临时、轻量的高亮方框：不是标注、不持久化、不建库——下一次计数替换、
   // 新 goto（viewer.navigate）清除、新一轮 run 开始清除、点击方框由用户清除。
+  // 高亮绑定当前打开切片：openSlideId 随 openSlide 成功/切片关闭维护（review
+  // 2026-10-14 修复 3）——counted_region.slide_id 不等于当前切片（或缺失）
+  // 一律不画，transcript 刷新/历史会话的跨切片结果不会画到当前切片上。
   var countHighlight = null;   // {x,y,w,h} level-0 像素
+  var openSlideId = "";        // 当前打开切片的稳定 slide_id（高亮绑定用）
   var COUNT_FILL = "rgba(0, 122, 255, 0.10)";
   var COUNT_STROKE = "#007AFF";
   var COUNT_HALO = "rgba(0, 0, 0, 0.8)";
@@ -1100,6 +1104,18 @@
     countHighlight = null;
     redrawAnnoCanvas();
     return true;
+  }
+
+  function handleCountedRegion(cr) {
+    // counted_region → 高亮（review 2026-10-14 修复 3）：slide_id 必须存在
+    // 且等于当前打开切片的稳定 ID；缺失（legacy 通道）或属于其他切片
+    // （transcript 刷新/历史会话）一律不画。
+    if (!cr || typeof cr !== "object") return false;
+    var sid = cr.slide_id;
+    if (!sid || !openSlideId || String(sid) !== String(openSlideId)) {
+      return false;
+    }
+    return setCountHighlight(cr.bbox);
   }
 
   // ---- 只读响应扫描（counted_region.bbox 提取；JSON 与 SSE 双形态） ----
@@ -1130,7 +1146,9 @@
             w = Number(cr.bbox.w), h = Number(cr.bbox.h);
         if (isFinite(x) && isFinite(y) && isFinite(w) && isFinite(h) &&
             w > 0 && h > 0 && x >= 0 && y >= 0) {
-          found = { x: x, y: y, w: w, h: h };
+          found = { bbox: { x: x, y: y, w: w, h: h },
+                    slide_id: (typeof cr.slide_id === "string"
+                      ? cr.slide_id : "") };
           return;
         }
       }
@@ -1155,7 +1173,7 @@
     function handleText(text) {
       if (!isSSE) {
         var direct = scanCountRegionText(text);
-        if (direct) setCountHighlight(direct);
+        if (direct) handleCountedRegion(direct);
         return;
       }
       frameBuf += text;
@@ -1169,8 +1187,8 @@
           if (lines[j].slice(0, 5) === "data:") dataLines.push(lines[j].slice(5).trim());
         }
         if (!dataLines.length) continue;
-        var bbox = scanCountRegionText(dataLines.join("\n"));
-        if (bbox) setCountHighlight(bbox);
+        var counted = scanCountRegionText(dataLines.join("\n"));
+        if (counted) handleCountedRegion(counted);
       }
     }
     (function read() {
@@ -1204,6 +1222,16 @@
     try {
       forCaller = new Response(branches[0], { status: resp.status,
         statusText: resp.statusText, headers: resp.headers });
+      // Response.url/redirected 是原型只读 getter，重建实例会回落缺省值——
+      // 用自有属性遮蔽还原（review 2026-10-14 修复 3；失败仅影响属性回显）。
+      try {
+        if (resp.url) {
+          Object.defineProperty(forCaller, "url",
+            { value: String(resp.url), configurable: true });
+        }
+        Object.defineProperty(forCaller, "redirected",
+          { value: !!resp.redirected, configurable: true });
+      } catch (e2) { /* 老环境不可定义 */ }
     } catch (e) { return resp; }  // null-body 状态等：放弃扫描，原样返回
     pumpCountScan(branches[1], isSSE);
     return forCaller;
@@ -1234,12 +1262,17 @@
       } catch (e) { return promise; }
     };
   }
-  // 平台侧测试/调试入口（scanText 是纯函数，Vitest 直接驱动）
+  // 平台侧测试/调试入口（scanText 是纯函数，Vitest 直接驱动；noteOpenSlide
+  // 由 openSlide 成功/切片关闭的生产路径调用，维护高亮的切片绑定）。
   window.PTCountHighlight = {
     show: setCountHighlight,
     clear: clearCountHighlight,
     current: function () { return countHighlight; },
     scanText: scanCountRegionText,
+    handle: handleCountedRegion,
+    noteOpenSlide: function (slideId) {
+      openSlideId = String(slideId || "");
+    },
     install: installCountHighlightTap,
   };
 
@@ -1863,6 +1896,7 @@
     // 平台侧清叠加层（切片隔离）。插件侧会话 UI/SSE/游标由 slide.opened event 触发其自行 reset+restore。
     aiOverlay = [];
     countHighlight = null;  // 计数范围高亮随切片关闭一并清除（不跨切片残留）
+    openSlideId = "";       // 切片绑定同步清空（新切片 openSlide 时重建）
     redrawAnnoCanvas();
     emitSlideOpened();
     if (state.slide) {
@@ -2352,6 +2386,7 @@
           toast(t("open.fail", { e: info.error }), "error");
           return;
         }
+        openSlideId = String(info.slide_id || "");  // 计数高亮的切片绑定
         state.slide = {
           // slide ID 化（P2 合同 §5.1）：id = slide_id 唯一操作键；name 保持
           // legacy 文件名（显示/快照）；旧后端 DTO 无 slide_id → id 为 null，

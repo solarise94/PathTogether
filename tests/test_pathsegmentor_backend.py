@@ -631,6 +631,9 @@ def test_count_cells_only_resolution_works_and_maps_level0(monkeypatch):
     assert cr["bbox"] == {"x": 111, "y": 211, "w": 478, "h": 478}
     assert cr["snapshot_id"] == "snap-1"
     assert cr["slide_revision"] == "sha256:abcd1234"
+    # review 2026-10-14 修复 3：counted_region 携带稳定切片 ID（viewer 高亮
+    # 跨切片绑定用；dispatch 转发的 body.slide_id）
+    assert cr["slide_id"] == "sld_demo"
     assert cr["reduced"] is True
     assert "不是整张切片" in cr["note"]
     # 密度：ROI = (478·0.5/1000)² mm²；3 / ROI

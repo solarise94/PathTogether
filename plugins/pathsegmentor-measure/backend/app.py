@@ -1634,6 +1634,10 @@ def capability_count_cells():
             "bbox": {"x": plan["x"], "y": plan["y"],
                      "w": plan["side"], "h": plan["side"]},
             "snapshot_id": snap["snapshot_id"],
+            # 稳定切片 ID（dispatch 转发的 body.slide_id，网关已按 token
+            # 权威解析）：viewer 高亮据此绑定当前打开的切片，跨切片结果
+            # 不画框。legacy 名通道缺失时为空串——前端 fail-closed 不画。
+            "slide_id": (slide_id or ""),
             "slide_revision": (region_payload.get("asset_revision")
                                or info.get("asset_revision")),
             "render_context_fingerprint": snap["render_context_fingerprint"],

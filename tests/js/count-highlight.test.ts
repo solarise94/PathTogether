@@ -81,6 +81,8 @@ function loadApp(fetchImpl: typeof fetch) {
 		clear: () => boolean;
 		current: () => unknown;
 		scanText: (t: string) => unknown;
+		handle: (cr: unknown) => boolean;
+		noteOpenSlide: (id: string) => void;
 		install: () => void;
 	};
 	expect(mod).toBeTruthy();
@@ -113,10 +115,14 @@ function makeResp(body: ReadableStream<Uint8Array>, ctype: string): Response {
 }
 
 const BBOX = { x: 10, y: 20, w: 300, h: 300 };
+const SLIDE_ID = "sld_a";
 
-function dispatchResult() {
+function dispatchResult(slideId = SLIDE_ID) {
 	return JSON.stringify({
-		result: { capability: "count_cells", counted_region: { bbox: BBOX } },
+		result: {
+			capability: "count_cells",
+			counted_region: { bbox: BBOX, slide_id: slideId },
+		},
 	});
 }
 
@@ -125,9 +131,11 @@ afterEach(() => {
 });
 
 describe("count highlight scanText", () => {
-	it("extracts bbox from a dispatch result JSON", () => {
+	it("extracts bbox + slide_id from a dispatch result JSON", () => {
 		const { mod } = loadApp(vi.fn());
-		expect(mod.scanText(dispatchResult())).toEqual(BBOX);
+		expect(mod.scanText(dispatchResult())).toEqual({
+			bbox: BBOX, slide_id: SLIDE_ID,
+		});
 	});
 
 	it("unwraps stringified tool results in transcripts (double-encoded)", () => {
@@ -143,19 +151,23 @@ describe("count highlight scanText", () => {
 				},
 			],
 		});
-		expect(mod.scanText(transcript)).toEqual(BBOX);
+		expect(mod.scanText(transcript)).toEqual({
+			bbox: BBOX, slide_id: SLIDE_ID,
+		});
 	});
 
 	it("extracts bbox from a single SSE data frame payload", () => {
 		const { mod } = loadApp(vi.fn());
 		const frame = sseFrame(JSON.stringify({
 			type: "extra_tool_called", payload: {
-				result: { counted_region: { bbox: BBOX } },
+				result: { counted_region: { bbox: BBOX, slide_id: SLIDE_ID } },
 			},
 		}));
 		const dataLine = frame.split("\n").find((l) => l.startsWith("data:"))!
 			.slice(5).trim();
-		expect(mod.scanText(dataLine)).toEqual(BBOX);
+		expect(mod.scanText(dataLine)).toEqual({
+			bbox: BBOX, slide_id: SLIDE_ID,
+		});
 	});
 
 	it("returns null for non-JSON / bad JSON / invalid bbox", () => {
@@ -187,20 +199,64 @@ describe("count highlight show/clear", () => {
 	});
 });
 
+describe("count highlight slide binding", () => {
+	it("draws when counted_region.slide_id matches the open slide", () => {
+		const { mod } = loadApp(vi.fn());
+		mod.noteOpenSlide(SLIDE_ID);
+		expect(mod.handle({ bbox: BBOX, slide_id: SLIDE_ID })).toBe(true);
+		expect(mod.current()).toEqual(BBOX);
+	});
+
+	it("does not draw for another slide's result", () => {
+		const { mod } = loadApp(vi.fn());
+		mod.noteOpenSlide(SLIDE_ID);
+		expect(mod.handle({ bbox: BBOX, slide_id: "sld_other" })).toBe(false);
+		expect(mod.current()).toBeNull();
+	});
+
+	it("does not draw when slide_id is missing or empty", () => {
+		const { mod } = loadApp(vi.fn());
+		mod.noteOpenSlide(SLIDE_ID);
+		expect(mod.handle({ bbox: BBOX })).toBe(false);
+		expect(mod.handle({ bbox: BBOX, slide_id: "" })).toBe(false);
+		expect(mod.current()).toBeNull();
+	});
+
+	it("does not draw when no slide is open", () => {
+		const { mod } = loadApp(vi.fn());
+		expect(mod.handle({ bbox: BBOX, slide_id: SLIDE_ID })).toBe(false);
+		expect(mod.current()).toBeNull();
+	});
+
+	it("noteOpenSlide with empty id re-binds (slide switch) so the old result no longer draws", () => {
+		const { mod } = loadApp(vi.fn());
+		mod.noteOpenSlide(SLIDE_ID);
+		expect(mod.handle({ bbox: BBOX, slide_id: SLIDE_ID })).toBe(true);
+		mod.clear();
+		mod.noteOpenSlide("");
+		expect(mod.handle({ bbox: BBOX, slide_id: SLIDE_ID })).toBe(false);
+	});
+});
+
 describe("fetch tap on AI responses", () => {
 	it("scans AI JSON responses and sets the highlight; body stays usable", async () => {
-		const responses: Response[] = [];
-		const fetchImpl = vi.fn(() => {
-			const r = makeResp(textStream([dispatchResult()]),
-				"application/json");
-			responses.push(r);
-			return Promise.resolve(r);
-		}) as unknown as typeof fetch;
+		const original = makeResp(textStream([dispatchResult()]),
+			"application/json");
+		// 构造的 Response 的 url 恒为空串——以自有属性遮蔽模拟真实 fetch 的
+		// 非 url 属性，锁定重建后保真（生产路径读 resp.url / resp.redirected）。
+		Object.defineProperty(original, "url",
+			{ value: "http://local/api/ai/session/s1", configurable: true });
+		const fetchImpl = vi.fn(() => Promise.resolve(original)
+		) as unknown as typeof fetch;
 		const { mod } = loadApp(fetchImpl);
+		mod.noteOpenSlide(SLIDE_ID);
 		mod.install();
 		const resp = await (window as unknown as { fetch: typeof fetch })
 			.fetch("/api/ai/session/s1");
-		// 插件视图：json() 仍可用且内容不变
+		expect(resp).not.toBe(original);  // 插件拿到的是 tee 后重建的 Response
+		// 插件视图：url/redirected 保真；json() 仍可用且内容不变
+		expect(resp.url).toBe("http://local/api/ai/session/s1");
+		expect(resp.redirected).toBe(false);
 		const body = await resp.json();
 		expect(body.result.counted_region.bbox).toEqual(BBOX);
 		await flush();
@@ -211,12 +267,13 @@ describe("fetch tap on AI responses", () => {
 		const noise = JSON.stringify({ type: "text_delta", text: "hello" });
 		const hit = sseFrame(JSON.stringify({
 			type: "extra_tool_called",
-			payload: { result: { counted_region: { bbox: BBOX } } },
+			payload: { result: { counted_region: { bbox: BBOX, slide_id: SLIDE_ID } } },
 		}));
 		const fetchImpl = vi.fn(() => Promise.resolve(makeResp(
 			textStream([noise, hit]),
 			"text/event-stream"))) as unknown as typeof fetch;
 		const { mod } = loadApp(fetchImpl);
+		mod.noteOpenSlide(SLIDE_ID);
 		mod.install();
 		const resp = await (window as unknown as { fetch: typeof fetch })
 			.fetch("/api/ai/run");
@@ -240,6 +297,7 @@ describe("fetch tap on AI responses", () => {
 			: makeResp(textStream([dispatchResult()]), "application/json")
 		)) as unknown as typeof fetch;
 		const { mod } = loadApp(fetchImpl);
+		mod.noteOpenSlide(SLIDE_ID);
 		mod.install();
 		const wfetch = (window as unknown as { fetch: typeof fetch }).fetch;
 		void wfetch("/api/ai/session/s1");

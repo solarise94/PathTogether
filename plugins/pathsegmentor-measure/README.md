@@ -77,7 +77,7 @@ mpp（输出像素 ≤ level-0 源像素）。平台 404（切片不存在/不�
 | 参数 | 类型 | 说明 |
 | --- | --- | --- |
 | `x`,`y`,`w`,`h` | integer | level-0 bbox（同上，受平台 ROI 上限约束） |
-| `resolution` | integer | **处理长边上限**固定枚举 `512/1024/2048`（缺省 1024，2048=服务输入上限；平台 regions 路由允许 max_long_edge ≤4096）。ROI 按 Cellpose 的实际处理尺度渲染（见下），所需处理长边超过该选项时在读图前拒绝（`resource_limit`）——改选更大选项或把 ROI 拆成多个 tile |
+| `resolution` | integer | **处理长边上限**固定枚举 `512/1024/2048`（缺省 2048=服务输入上限，最少误拒；512/1024 为更快的显式选项；平台 regions 路由允许 max_long_edge ≤4096）。ROI 按 Cellpose 的实际处理尺度渲染（见下），所需处理长边超过该选项时在读图前拒绝（`resource_limit`）——改选更大选项或把 ROI 拆成多个 tile |
 | `diameter_um` | number? | 期望目标直径 µm，4–100（缺省 7=细胞核；整细胞 15–25）。决定处理尺度（d/30 µm/px）与可处理的最大视场 |
 | `model` | string? | 可选 Cellpose 模型预设名（缺省服务端默认） |
 

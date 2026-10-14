@@ -706,7 +706,7 @@ def test_count_render_plan_math(monkeypatch):
     """R2 重设计：渲染尺度 = max(原生, d/30)，resolution 只是处理长边上限。"""
     mod = _load_backend(monkeypatch)
     assert mod._COUNT_RESOLUTIONS == (512, 1024, 2048)
-    assert mod._COUNT_RESOLUTION_DEFAULT == 1024
+    assert mod._COUNT_RESOLUTION_DEFAULT == 2048
     # 细于处理尺度（native 0.2 < 7/30≈0.2333）：按 d/30 渲染、rescale=1
     plan = mod._count_render_plan(1000, 800, 0.2, 7.0, 1024)
     assert plan["mpp_render"] == pytest.approx(7.0 / 30.0)
@@ -755,7 +755,8 @@ def test_count_cells_exceeds_option_rejected_before_region_read(monkeypatch):
     """所需处理长边超过选项：读 ROI **之前** 400 resource_limit（R2 重设计）。
 
     2048 level-0 px @0.25、d=7 → 处理尺度 0.2333 粗于原生 → 按原生渲染需要
-    2048 px 长边 > 缺省 1024；不做「渲染到 1024 再让模型放大 15/7 倍」。
+    2048 px 长边 > 显式选择的 1024 选项；不做「渲染到 1024 再让模型放大
+    30/14 倍」（缺省 2048 时同一 ROI 会放行，见 reviewer 回归）。
     """
     mod = _load_backend(monkeypatch)
     reads = []
@@ -768,7 +769,7 @@ def test_count_cells_exceeds_option_rejected_before_region_read(monkeypatch):
     monkeypatch.setattr(mod, "_platform_read_region", _read)
     monkeypatch.setattr(mod, "_infer_cellpose",
                         lambda *a, **kw: _count_response())
-    r = _call(mod, {"x": 0, "y": 0, "w": 2048, "h": 2048},
+    r = _call(mod, {"x": 0, "y": 0, "w": 2048, "h": 2048, "resolution": 1024},
               capability="count_cells")
     assert r.status_code == 400
     err = r.get_json()["error"]
@@ -887,12 +888,21 @@ def test_count_cells_mpp_null_uses_option_edge(monkeypatch):
     monkeypatch.setattr(mod, "_infer_cellpose",
                         lambda *a, **kw: _count_response())
     _stub_platform(monkeypatch, mod, mpp=None)
+    # 显式 1024 选项
     seen = _stub_read(monkeypatch, mod,
                       _region_payload(1024, 500, (0, 0, 4096, 2000)))
-    r = _call(mod, {"x": 0, "y": 0, "w": 4096, "h": 2000},
+    r = _call(mod, {"x": 0, "y": 0, "w": 4096, "h": 2000, "resolution": 1024},
               capability="count_cells")
     assert r.status_code == 200, r.get_json()
     assert seen["edge"] == 1024
+    # 缺省 2048 选项
+    seen = _stub_read(monkeypatch, mod,
+                      _region_payload(2048, 1000, (0, 0, 4096, 2000)))
+    r = _call(mod, {"x": 0, "y": 0, "w": 4096, "h": 2000},
+              capability="count_cells")
+    assert r.status_code == 200, r.get_json()
+    assert seen["edge"] == 2048
+    # 源长边钳制
     seen = _stub_read(monkeypatch, mod,
                       _region_payload(500, 300, (0, 0, 500, 300)))
     r = _call(mod, {"x": 0, "y": 0, "w": 500, "h": 300},
@@ -994,8 +1004,9 @@ def test_count_cells_resource_limit_before_inference(monkeypatch):
         reads.append(a)
         return b"img", _region_payload(1024, 1024, (0, 0, 1024, 1024))
 
-    # 原生 2.0 µm/px、1024² level-0：处理尺度 0.2333 粗于原生 → 按原生渲染
-    # 1024 长边 ≤ 1024 选项，但模型内部放大 30×2/7≈8.57× → 8778² ≈ 77M px
+    # 原生 2.0 µm/px、1024² level-0（缺省 2048 选项内）：处理尺度 0.2333
+    # 粗于原生 → 按原生渲染 1024 长边，但模型内部放大 30×2/7≈8.57×
+    # → 8778² ≈ 77M px
     _stub_platform(monkeypatch, mod, mpp=2.0)
     monkeypatch.setattr(mod, "_platform_read_region", _read)
     monkeypatch.setattr(mod, "_infer_cellpose", _infer)

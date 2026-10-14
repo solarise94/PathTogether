@@ -116,7 +116,11 @@ _CAPABILITY_COUNT = "count_cells"
 #: 决定渲染长边。2048 为服务输入上限（平台 regions 路由 max_long_edge
 #: 1..4096、单请求像素上限 4096²，2048² 输出在内）。
 _COUNT_RESOLUTIONS = (512, 1024, 2048)
-_COUNT_RESOLUTION_DEFAULT = 1024
+#: 缺省取上限 2048：Cellpose 的处理量与渲染分辨率无关，缺省给最大视场
+#: （d=7、原生 ≤0.2333 µm/px → 约 478 µm）最少误拒；最坏缺省算力
+#: 2048²×1.07² ≈ 4.8M px（原生 0.25），在 8 Mi px 预算与插件 32s 超时内。
+#: 512/1024 是更快的显式选项。
+_COUNT_RESOLUTION_DEFAULT = 2048
 _CELLPOSE_URL = (os.environ.get("CELLPOSE_URL") or
                  "http://127.0.0.1:8972").rstrip("/")
 #: 与 services/cellpose/cellpose_infer.MAX_SCALED_PIXELS / DIAM_MEAN_PX 同源
@@ -1210,7 +1214,7 @@ def capability_count_cells():
     与 segment_region 共用入口守卫/委托凭证/by-id 读路径；差异：
       - 渲染在 Cellpose 的实际处理尺度上：``mpp_render = max(原生, d/30)``、
         所需长边 = ceil(L_level0 × 原生 / mpp_render)（R2 重设计）；
-        ``resolution``（512/1024/2048，缺省 1024）只是**处理长边上限**选项，
+        ``resolution``（512/1024/2048，缺省 2048）只是**处理长边上限**选项，
         所需长边或处理预算超限在读 ROI **之前**拒绝（400 resource_limit，
         不做粗渲染 + 模型上采样）；mpp 缺失时按所选选项长边渲染（算力 =
         edge²）；

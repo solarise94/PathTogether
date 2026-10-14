@@ -1,0 +1,42 @@
+# cellpose 服务镜像：Cellpose-SAM（cellpose==4.2.1.1）GPU 核实例计数。
+#
+# 布局（对齐 services/pathsegmentor）：
+#   - 基础镜像与 PathSegmentor 相同（pytorch/pytorch:2.1.0-cuda12.1-*，
+#     torch 2.1.0+cu121 支持 sm_75 / RTX 2080 Ti；homePC 已有本地镜像，
+#     无需新拉）；
+#   - PyPI 依赖全部由宿主侧预取为 wheels/（py310 manylinux）随上下文
+#     COPY 进来，容器内 --no-index 离线安装——homePC 到 PyPI 直连不稳；
+#   - **权重绝不进镜像**：运行时只读挂载 ~/models/cellpose 到 /models
+#     （README 详述布局），CELLPOSE_LOCAL_MODELS_PATH=/models 全离线，
+#     预设路径以 /models/<preset>-sha256-*/<preset> 显式解析 + SHA-256
+#     强校验，运行期绝不触发下载。
+#
+# bf16 说明：cellpose 4.2 缺省 use_bfloat16=True，RTX 2080 Ti（sm_75,
+# Turing）无原生 bf16——服务固定 use_bfloat16=False（fp32），见
+# cellpose_infer.load_model。
+FROM docker.io/pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_DEFAULT_TIMEOUT=120 \
+    CELLPOSE_LOCAL_MODELS_PATH=/models \
+    PYTHONUNBUFFERED=1
+
+# 依赖：预取 wheel 离线安装（pip 23.2.1 支持 --no-index --find-links）。
+# numpy 1.26.4 / Pillow 9.4.0 用基础镜像自带，wheel 列表中刻意不含。
+COPY wheels/ /wheels
+RUN pip install --no-cache-dir --no-index --find-links /wheels \
+        "cellpose==4.2.1.1" "flask>=3.0,<4" "gunicorn>=21.2,<24" \
+    && rm -rf /wheels
+
+WORKDIR /srv/cellpose
+COPY cellpose_infer.py app.py gunicorn.conf.py ./
+
+# 构建期烟雾测试：import 链路完整（CPU、无 eager load、无 CUDA、无权重）
+RUN CELLPOSE_EAGER_LOAD=0 python -c \
+    "import torch, torchvision, cellpose, segment_anything; \
+     import cellpose_infer, app; \
+     print('import ok: torch', torch.__version__, 'cellpose', cellpose.version)"
+
+EXPOSE 8972
+# 单 worker（单模型实例，进程内互斥锁串行推理）+ 2 线程（IO 重叠）。
+# 不用 --preload：CUDA 必须在 worker 进程内初始化（见 gunicorn.conf.py）。
+CMD ["gunicorn", "--config", "gunicorn.conf.py", "app:app"]

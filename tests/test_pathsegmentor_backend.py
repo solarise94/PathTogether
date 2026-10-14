@@ -976,17 +976,43 @@ def test_count_cells_non_square_scale(monkeypatch):
 
 
 def test_count_cells_anisotropic_scale_rejected(monkeypatch):
-    """两轴 MPP 相对差 >1% → 拒绝（单一 MPP 合同不做猜测）。"""
+    """真各向异常（输出不是 src 的等比 round）→ 拒绝（单一 MPP 不猜测）。"""
     mod = _load_backend(monkeypatch)
     _stub_platform(monkeypatch, mod, mpp=0.25)
     seen_edge = _stub_read(monkeypatch, mod,
-                           _region_payload(1024, 400, (0, 0, 2048, 1024)))
+                           _region_payload(1024, 900, (0, 0, 2048, 2048)))
     monkeypatch.setattr(mod, "_infer_cellpose",
                         lambda *a, **kw: _count_response())
-    r = _call(mod, {"x": 0, "y": 0, "w": 2048, "h": 1024, "resolution": 2048},
+    r = _call(mod, {"x": 0, "y": 0, "w": 2048, "h": 2048, "resolution": 2048},
               capability="count_cells")
     assert r.status_code == 400
     assert r.get_json()["error"]["code"] == "anisotropic_scale"
+
+
+def test_count_cells_small_roi_rounding_tolerated(monkeypatch):
+    """小 ROI 的合法短轴取整不再误拒：native 0.12、bbox 100×30、d=7 →
+    处理尺度 0.2333 渲染长边 52，平台 round 短边 16（两轴 mpp 相对差
+    ≈2.5%，旧 >1% 口径会误拒）→ 正常计数，推理 mpp 取两轴均值。"""
+    mod = _load_backend(monkeypatch)
+    seen = {}
+
+    def _infer(image_png_bytes, mpp_arg, diameter_um=None, model=None):
+        seen["mpp"] = mpp_arg
+        return _count_response()
+
+    _stub_platform(monkeypatch, mod, mpp=0.12)
+    seen_edge = _stub_read(monkeypatch, mod,
+                           _region_payload(52, 16, (0, 0, 100, 30)))
+    monkeypatch.setattr(mod, "_infer_cellpose", _infer)
+    r = _call(mod, {"x": 0, "y": 0, "w": 100, "h": 30},
+              capability="count_cells")
+    assert r.status_code == 200, r.get_json()
+    assert seen_edge["edge"] == 52  # ceil(100×0.12×30/7)
+    # 两轴均值：mpp_x = 0.12×100/52，mpp_y = 0.12×30/16
+    assert seen["mpp"] == pytest.approx((0.12 * 100 / 52 + 0.12 * 30 / 16) / 2)
+    result = r.get_json()["result"]
+    assert result["inference_input"]["mpp"] == pytest.approx(
+        (0.12 * 100 / 52 + 0.12 * 30 / 16) / 2)
 
 
 def test_count_cells_resource_limit_before_inference(monkeypatch):

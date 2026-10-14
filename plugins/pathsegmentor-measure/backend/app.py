@@ -489,11 +489,15 @@ def _inference_scale(native_mpp, src_w, src_h, out_w, out_h):
     不用请求目标值代替。
 
     输入 MPP = level-0 原生 MPP × 实际缩放（src/输出）。单一 MPP 合同
-    （服务只收一个标量）：两轴 mpp 相对差 >1% 视为平台异常——region 渲染
-    保宽高比（``_aspect_fit_size`` 逐轴 round），正常只引入 ≤1 输出像素的
-    取整差（1024 长边下 ≈0.1%）——拒绝（anisotropic_scale）而非猜测；
-    否则取两轴均值（直径换算对 ≤1% 各向差不敏感）。原生 MPP 本身仍用于
-    结果映射（密度/µm²/坐标），保持不变。
+    （服务只收一个标量），两轴各向差按**平台渲染的取整物理**容忍：region
+    渲染（``_aspect_fit_size``）保宽高比、逐轴 round——长轴输出恰为渲染
+    长边，短轴 round 误差 ≤0.5 输出像素，因此小 ROI 上两轴 mpp 的相对差
+    可达 1/min(out_w, out_h)（16 px 短边即 ≈3%，重试无益）。据此仅在输出
+    **不是**「src 按长轴尺度的等比 round」时拒绝（anisotropic_scale）：
+    取 k = out_long/src_long，``|out_short − round(src_short×k)| > 1`` 输出
+    像素（等价口径：两轴 mpp 相对差 > max(1%, 1/min(out_w, out_h)) + ε 才
+    算真各向异常）；否则照常发送两轴均值（直径换算对取整级各向差不敏感）。
+    原生 MPP 本身仍用于结果映射（密度/µm²/坐标），保持不变。
 
     返回 ``(scale_x, scale_y, infer_mpp)``；native_mpp 缺失 → infer_mpp=None
     （服务按模型缺省尺度计数，见 _infer_cellpose）。
@@ -504,13 +508,21 @@ def _inference_scale(native_mpp, src_w, src_h, out_w, out_h):
         return scale_x, scale_y, None
     mpp_x = native_mpp * scale_x
     mpp_y = native_mpp * scale_y
-    lo = min(mpp_x, mpp_y)
-    if lo > 0 and abs(mpp_x - mpp_y) > 0.01 * lo:
+    if src_w >= src_h:
+        k = out_w / float(src_w)
+        expected_short = src_h * k
+        actual_short = float(out_h)
+    else:
+        k = out_h / float(src_h)
+        expected_short = src_w * k
+        actual_short = float(out_w)
+    if abs(actual_short - round(expected_short)) > 1.0:
         raise PlatformError(
             400, "anisotropic_scale",
-            "region 渲染两轴尺度不一致（%.4f vs %.4f µm/px，>1%%）："
-            "单一 MPP 计数服务无法表达，请重试；持续出现请反馈平台"
-            % (mpp_x, mpp_y))
+            "region 渲染两轴尺度不一致（%.4f vs %.4f µm/px；输出 %dx%d 不"
+            "是 src %dx%d 的等比 round）：单一 MPP 计数服务无法表达，"
+            "请重试；持续出现请反馈平台"
+            % (mpp_x, mpp_y, out_w, out_h, int(src_w), int(src_h)))
     return scale_x, scale_y, (mpp_x + mpp_y) / 2.0
 
 

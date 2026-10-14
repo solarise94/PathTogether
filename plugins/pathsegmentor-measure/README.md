@@ -105,8 +105,10 @@ d=7 且原生 ≤0.2333 µm/px 时各选项最大视场：**512→119.5 µm、
 
 **推理输入 MPP（R3）**：Cellpose 收到的是渲染后 ROI 的实际分辨率——
 `inference_input.mpp = 原生 MPP × 实际渲染缩放`（由平台实际返回的
-`src` 与输出 `width/height` 计算，非请求目标值；两轴 MPP 相对差 >1% 拒绝
-`anisotropic_scale`）。原生 MPP 仅用于结果映射（密度/µm²/坐标）。
+`src` 与输出 `width/height` 计算，非请求目标值；两轴各向差按平台渲染的
+取整物理容忍——仅当输出不是「src 按长轴尺度的等比 round」（短轴偏差
+>1 输出像素）时拒绝 `anisotropic_scale`，小 ROI 的合法取整（如 16 px 短边
+≈3% 相对差）照常接受）。原生 MPP 仅用于结果映射（密度/µm²/坐标）。
 原生 MPP 缺失/无效时按所选 `resolution` 长边渲染（算力 = edge²，恒在
 预算内），推理侧发送 JSON `null`（服务按模型缺省尺度计数并附 warning），
 结果只给像素口径、不给密度/µm²（R4）。

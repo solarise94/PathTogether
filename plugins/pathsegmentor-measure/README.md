@@ -17,15 +17,17 @@ HistoPilot agent
 
 ## 结构
 
-- `manifest.json`：`provides[0] = segment_region`（read-only、
-  `agent_exposed: true`、`timeout_ms: 55000`）；`ui` 为最小合法占位（schema
+- `manifest.json`：`provides = [segment_region, count_cells]`（read-only、
+  `agent_exposed: true`、`timeout_ms: 55000`；count_cells v2.0.0 另声明
+  `context: "current_snapshot"`——平台登记该需求并在 extra_tools 条目透出，
+  dispatch 验证签名快照上下文）；`ui` 为最小合法占位（schema
   必填）；manifest 内容由 `plugins/source-policy.json` 显式 sha256 pin。
 - `backend/app.py`：插件后端。**强制校验** `X-Dispatch-Principal`（平台
   附加）与 `X-Delegated-Read-Token`（平台 dispatch 在 agent token / 用户实时
   权限 / 插件启用全部通过后签发的短时只读凭证，TTL ≤120s，绑定
   installation / user / slide_id / revision / capability / ROI 上限）——直连
   调用不受理。健康检查 `GET /healthz`；能力端点
-  `POST /capabilities/segment_region`。
+  `POST /capabilities/segment_region`、`POST /capabilities/count_cells`。
 - `ui/main.js`：占位（本插件重点是服务端能力）。
 
 ## 能力契约
@@ -69,77 +71,89 @@ mpp（输出像素 ≤ level-0 源像素）。平台 404（切片不存在/不�
 "warnings"}`；400 `{"error","message"}`；503 `{"error":"busy"|"not_ready"}`。
 后端把 busy/not_ready/不可达/契约不符映射为明确的工具级错误。
 
-### count_cells（Cellpose，实例分割计数——逐个细胞/核）
+### count_cells（Cellpose，实例分割计数——逐个细胞/核；v2.0.0 方形取景）
 
 与 segment_region 的分工：**要某类目标的区域/面积/占比 → `segment_region`；
 要逐个计数、密度、单个细胞面积 → `count_cells`**。
 
+**v2.0.0（2026-10-14 方形取景，破坏性变更）**：模型**不再提供**
+`x/y/w/h`（也拒绝 `center/side/bbox/mpp/snapshot_id/slide_id/
+render_context/return_labels/model` 等任何其他键——schema
+`additionalProperties:false` 之外后端同样 400）。位置由系统决定：HP 执行
+阶段从服务端 pending 快照冻结最近一次成功 goto 的当前视野，签名
+`snapshot_context`（HMAC 域 `hp-snapshot-context-v1`，与写入 provenance 的
+`hp-snapshot-attest-v1` 域分离）随 dispatch 下发；PT 网关验签、绑定
+session/slide、校验 bbox 界内与 `exp` 时间窗、比对资产 revision（不符
+409 `snapshot_stale`，提示重新 goto）后，仅把结构化 `context.snapshot`
+转发给本插件。无当前快照 → 400 `snapshot_required`（先 goto 再调用）。
+**上下文只用于读**——不签发描绘/写授权。
+
+模型可见参数（全部可选）：
+
 | 参数 | 类型 | 说明 |
 | --- | --- | --- |
-| `x`,`y`,`w`,`h` | integer | level-0 bbox（同上，受平台 ROI 上限约束） |
-| `resolution` | integer | **模型处理长边上限**固定枚举 `512/1024/2048`（缺省 2048=服务输入上限、每档最大视场；512/1024 为更快的显式选项，时间成本约随 option² 增长；平台 regions 路由允许 max_long_edge ≤4096）。ROI 按 Cellpose 的实际处理尺度渲染（见下），模型处理长边（含内部放大）超过该选项时在读图前拒绝（`resource_limit`）——改选更大选项、把 ROI 拆成多个 tile，或在语义上适当增大 `diameter_um` |
-| `diameter_um` | number? | 期望目标直径 µm，4–100（缺省 7=细胞核；整细胞 15–25）。决定处理尺度（d/30 µm/px）与可处理的最大视场 |
-| `model` | string? | 可选 Cellpose 模型预设名（缺省服务端默认） |
+| `resolution` | integer | **模型处理边长上限**固定枚举 `512/1024/2048`（缺省 2048；512/1024 为更快的显式选项，时间成本约随 option² 增长）。系统在当前视场内自动取不越界方形，实际边长受快照/切片大小与该档位约束，可能小于档位上限（`counted_region.reduced=true` + note 披露） |
+| `diameter_um` | number? | 期望目标直径 µm，4–100（缺省 7=细胞核；整细胞 15–25）。决定处理尺度（d/30 µm/px）与每档最大视场；MPP 缺失时直径无物理标定意义，不参与换算（附提示） |
+| `flow_threshold` | number? | Cellpose flow 阈值 0..1（缺省 0.4，显式转发给推理服务） |
+| `cellprob_threshold` | number? | Cellpose cellprob 阈值 -6..6（缺省 0，显式转发给推理服务） |
 
-返回（摘要）：`instance_count`（真实实例计数）、`density{per_mm2,
-roi_area_mm2, basis}`（MPP 有效时；分母是实际成像 ROI——bbox 经边界夹取
-后的 src）、`area_stats_px/area_stats_um2`（min/p25/median/p75/max）、
-`instances_top`（≤20 个示例实例的 level-0 bbox/质心，非全量）、
-`model{model_id,model_name,model_sha256,code_version}`、
-`diameter_px_used`、`resolution`、`inference_input{mpp,scale,mpp_render}`、
-`slide/slide_id/slide_revision`、`source_bbox`、`rendered`（含
-`requested_long_edge`）、`mpp`、`timings_ms`、`warnings`。无 label map、
-无 base64，恒 ≪64KiB。
+**方形规划器**：位置固定为当前快照 bbox 的中心；统一生成一个 level-0
+正方形（渲染为方形输入，不做长条拉伸、不给切片外补边）：
 
-**渲染与算力模型（R2 重设计；F2 处理长边合同）**：cpsam 内部按
-`rescale=30/diameter_px` 把输入缩放到「每 diameter 30 px」的处理分辨率——
-处理尺度 = `d/30 µm/px`（d=7 → 0.2333），处理边 = `30×视场/diameter`，
-**与渲染分辨率无关**。因此渲染尺度取 `mpp_render = max(原生 MPP, d/30)`
-（永不上采样超过原生），所需处理长边 = `ceil(L_level0 × 原生 / mpp_render)`。
-`resolution` 是**模型处理长边**上限：预准入同时检查名义长边（逐轴 ceil）
-与读后硬闸的预读镜像（平台 `_aspect_fit_size` 逐轴 round 的输出预测 + 两轴
-均值 MPP + cellpose 4.2.1.1 的逐轴 `int(size×rescale)` 截断——同一几何下
-与读后计算逐位一致，短轴取整变粗的窄长 ROI 也会在读前被拒），超过所选
-选项或处理预算（8 Mi px）在读 ROI **之前**拒绝。渲染粗于处理尺度只会扔掉
-真像素再让模型上采样（算力不变、信息变差），不做这种回退。原生粗于
-d/30 时按原生渲染、模型内部上采样（附 warning，不增加信息）。
-**每档最大视场 = resolution × diameter/30 µm，与切片 MPP 无关**；
-d=7 时：**512→119.47 µm、1024→238.93 µm、2048→477.87 µm**
-（原生 0.25 → 最长 477/955/1911 level-0 px；原生 0.12 → 995/1991/3982）。
+1. 边长上限 = min(快照短边, 切片短边, 平台 ROI 像素上限开方)；已知原生
+   MPP 时再受档位处理边长与 8 Mi px 预算约束；
+2. 处理尺度 = `diameter/30 µm/px`；渲染尺度 = `max(原生, d/30)`（永不
+   上采样超过原生）：原生较粗 → 按原生像素渲染（模型内部上采样，附
+   warning）；原生较细 → 按 d/30 渲染（模型内部 rescale≈1）；
+3. 档位上限先用理想式 `resolution×d/(30×mpp)`（level-0 px）起步，再用
+   平台真实渲染取整 + cellpose 4.2.1.1 逐轴 `int(size×rescale)` 截断的
+   预读镜像逐级递减验证——不依赖理想公式恰好等于上限；
+4. 中心定位整数取左上角，靠边时平移整框（方形必须完整落在快照 bbox 内
+   且在切片内）；快照/切片更小则缩边；取不出 ≥1px 的合法方形 → 400
+   `resource_limit`（附每档最大方形提示）。
 
-**推理输入 MPP（R3）**：Cellpose 收到的是渲染后 ROI 的实际分辨率——
-`inference_input.mpp = 原生 MPP × 实际渲染缩放`（由平台实际返回的
-`src` 与输出 `width/height` 计算，非请求目标值；两轴均值与预读镜像同式，
-保证预准入放行 ⇒ 读后硬闸必过；两轴各向差按平台渲染的取整物理容忍——
-仅当输出不是「src 按长轴尺度的等比 round」（短轴偏差 >1 输出像素）时拒绝
-`anisotropic_scale`，小 ROI 的合法取整（如 16 px 短边 ≈3% 相对差）照常
-接受）。原生 MPP 仅用于结果映射（密度/µm²/坐标）。原生 MPP 缺失/无效时
-按所选 `resolution` 长边渲染（rescale 1、处理尺寸 = 输入尺寸，恒在选项
-与预算内），推理侧发送 JSON `null`（服务按模型缺省尺度计数并附 warning），
-结果只给像素口径、不给密度/µm²（R4）。
+**MPP 缺失（null）**：边长 ≤ min(档位, 快照短边, 切片短边, ROI 上限)，
+以**原生像素**输入、发送 `mpp: null`（服务按模型缺省尺度计数）；直径不
+参与换算（附提示）；结果只给像素口径，不给密度/µm²（R4 延续）。
 
-**资源预算**：预算闸有三道，错误引导都按真实物理（缩小 ROI 拆 tile、增大
-diameter_um 或改选更大 resolution）：读图前按 level-0 bbox + 原生 MPP +
-diameter 推出模型处理长边与处理像素量（超选项 → 提示更大 resolution/
-拆 tile/增大 diameter，附 `extra{max_roi_um, max_roi_level0_px, resolution,
-diameter_um}`；超预算 → 提示缩小 ROI/增大直径）；读图后按**实际返回几何
-与实际两轴均值推理 MPP**、以 cellpose 4.2.1.1 的真实缩放物理（逐轴
-`int(size×rescale)` 截断，`CellposeModel.eval` models.py:267 与
-`run_net` core.py:191 / `resize_image` transforms.py:747）再过一次硬闸：
-模型处理长边 ≤ resolution 且总像素 ≤ 预算（正常路径与预读镜像一致，
-此处纯防御；服务端同式准入仍在，双保险）。
+返回（摘要）：`counted_region{bbox(level-0 实际方形 x/y/w/h), snapshot_id,
+slide_revision, render_context_fingerprint, reduced, note}`、
+`cellpose_params{resolution, diameter_um, flow_threshold,
+cellprob_threshold}`（实际转发给服务的有效参数）、`instance_count`、
+`density{per_mm2, roi_area_mm2, basis}`（MPP 有效时）、
+`area_stats_px/area_stats_um2`、`instances_top`（≤20 个示例实例的 level-0
+bbox/质心）、`model{...}`、`diameter_px_used`、`processing{input_edge,
+processing_dims, processing_edge, inference_mpp}`（实际输入/处理边长）、
+`rendered`（含 `requested_long_edge`）、`inference_input{mpp, scale,
+mpp_render}`、`slide/slide_id/slide_revision`、`mpp`、`timings_ms`、
+`warnings`。无 label map、无 base64，恒 ≪64KiB。
+
+**显示配置（render context）限制**：快照的显示上下文以
+`render_context_fingerprint`（服务端 SHA-256 指纹）随结果返回作溯源——
+指纹是单向哈希，插件**无法**由它重建 canonical render context，平台
+委托读通道也没有按指纹取回显示配置的机制；因此 region 读取用的是
+**默认（native）渲染管线**。多通道显示配置下的计数结果与用户当前配色
+可能有差异，属已知边界（如需像素级一致，需平台提供按指纹读回显示配置
+的受控机制后接入，不做客户端猜测）。
+
+**读后硬闸（方形一致性）**：平台实际返回的 `src` 与输出尺寸必须是正方形
+且与规划一致（src 边 = 计划 level-0 边、输出边 = 计划渲染边）；违背几何
+合同 → 400 `platform_contract`，不进入推理。推理 MPP 取两轴均值（R3），
+cellpose 处理边长/总像素以真实截断物理再核（超档位/预算 → 400
+`resource_limit`；服务端同式准入仍在，双保险）。
 
 计数服务合同（homePC）：`GET /readyz` → `{ready, model_id:"cellpose",
 model_name, model_sha256, code_version, device}`；`POST /v1/count`，body
-`{"image_b64", "mpp", "diameter_um"?, "model"?, "flow_threshold"?,
-"cellprob_threshold"?}` → 200 `{"model_id","model_name","model_sha256",
-"code_version","input_width","input_height","instance_count",
-"diameter_px_used","areas_px":{min,p25,median,p75,max},"instances_top":
-[{bbox,centroid,area_px}],"timings_ms","warnings"}`；400
-`{"error","message"}`（含 `resource_limit`：图像头超限在解码前拒绝；合法
-参数造成的内部放大超预算在进模型前拒绝）；503 `{"error":"busy"|
-"not_ready"}`。错误映射与 PathSegmentor 相同（busy/not_ready/unreachable →
-可重试 `capability_unavailable`，细分码在 `details.plugin_code`）。
+`{"image_b64", "mpp", "diameter_um"?, "flow_threshold"?,
+"cellprob_threshold"?}`（MPP null 时插件不发 `diameter_um`）→ 200
+`{"model_id","model_name","model_sha256", "code_version","input_width",
+"input_height","instance_count", "diameter_px_used","areas_px":
+{min,p25,median,p75,max},"instances_top": [{bbox,centroid,area_px}],
+"timings_ms","warnings"}`；400 `{"error","message"}`（含 `resource_limit`：
+图像头超限在解码前拒绝；合法参数造成的内部放大超预算在进模型前拒绝）；
+503 `{"error":"busy"|"not_ready"}`。错误映射与 PathSegmentor 相同
+（busy/not_ready/unreachable → 可重试 `capability_unavailable`，细分码在
+`details.plugin_code`）。
 
 ## 环境变量
 
@@ -229,11 +243,12 @@ CELLPOSE_URL=http://127.0.0.1:8972 \
 ### 5) E2E
 
 owner 登录 PT Viewer → 上传/打开切片 → 起 AI 会话（官方模式 run，注入
-extra_tools）→ 模型按需要自选两个工具（工具名
+extra_tools）→ 模型先 goto 取景、再按需要自选两个工具（工具名
 `dev_pathsegmentor_measure__segment_region` /
 `dev_pathsegmentor_measure__count_cells`）：
-「这片区域有多少个 nucleus？bbox 取 (x,y,w,h)」→ count_cells；
-「gland 在这片区域的面积占比」→ segment_region。验证点：
+「当前视野里有多少个 nucleus？」→ count_cells（系统在当前快照内自动取
+方形，模型只需选档位/直径/阈值）；
+「gland 在 bbox (x,y,w,h) 这片区域的面积占比」→ segment_region。验证点：
 
 - 无权切片 / 插件停用 / ROI 超限 / 推理 busy → agent 收到明确工具级错误；
 - 返回 JSON 无 mask/base64；重复同参调用可复核（revision 绑定）。

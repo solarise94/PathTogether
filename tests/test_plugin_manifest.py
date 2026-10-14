@@ -367,6 +367,47 @@ def test_provides_not_array_rejected():
     assert errs and any("provides" in e for e in errs), errs
 
 
+def test_provides_context_current_snapshot_only():
+    """context 可选枚举（wire 合同 v1 §1，2026-10-14）：唯一合法值
+    current_snapshot；缺省/JSON null = 未声明（普通 remote tool）；其他值
+    fail-closed 拒绝。"""
+    assert M.validate_manifest(_valid_manifest(provides=[
+        _valid_capability(context="current_snapshot")])) == []
+    assert M.validate_manifest(_valid_manifest(provides=[
+        _valid_capability()])) == []
+    assert M.validate_manifest(_valid_manifest(provides=[
+        _valid_capability(context=None)])) == []
+    for bad in ("snapshot", "pending_snapshot", "CURRENT_SNAPSHOT", "",
+                1, True, [], {}):
+        errs = M.validate_manifest(_valid_manifest(provides=[
+            _valid_capability(context=bad)]))
+        assert errs and any("context" in e for e in errs), \
+            "context=%r 应被拒绝" % (bad,)
+
+
+def test_provides_parameters_additional_properties_bool():
+    """additionalProperties 布尔（2026-10-14 wire 合同 §5）：false（拒绝未
+    声明键）与 true 都放行；非布尔（字符串/容器）拒绝。"""
+    assert M.validate_manifest(_valid_manifest(provides=[
+        _valid_capability(parameters={
+            "type": "object", "additionalProperties": False,
+            "properties": {"resolution": {"type": "integer",
+                                          "enum": [512, 1024, 2048]}},
+        })])) == []
+    assert M.validate_manifest(_valid_manifest(provides=[
+        _valid_capability(parameters={
+            "type": "object", "additionalProperties": True})])) == []
+    for bad in ("false", 0, 1, [], {}):
+        errs = M.validate_manifest(_valid_manifest(provides=[
+            _valid_capability(parameters={
+                "type": "object", "additionalProperties:": bad})]))
+    # （键名打错时走 unknown-key 分支也必须报错）
+    errs2 = M.validate_manifest(_valid_manifest(provides=[
+        _valid_capability(parameters={
+            "type": "object", "additionalProperties": "false"})]))
+    assert errs2 and any("additionalProperties" in e for e in errs2), errs2
+
+
 def test_capability_tool_name_mangling():
     """注入 agent 的工具名 = {pluginId 去域名点下划线连接}__{name}（§3.2）。"""
     assert M.capability_tool_name("dev.example.tma", "score_core") == \

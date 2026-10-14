@@ -474,6 +474,35 @@ def make_snapshot_attestation(key, sid, snap, bbox=None, rev=None, fp=None,
 # 服务级切片发布夹具（U5 检查点 B 起：测试不再经 HTTP 上传造资产——旧
 # V1/V2 端点已删除，COS 链路夹具见 test_cos_ingest_worker/_kinds 模式）
 # --------------------------------------------------------------------------- #
+
+def make_snapshot_context(key, sid, slide_id, snap, bbox, rev=None, fp=None,
+                          exp_delta=60,
+                          domain="hp-snapshot-context-v1"):
+    """生成 count_cells 方形取景 wire 合同 v1 §3.4 的签名 snapshot_context
+    （Python 镜像 HP signSnapshotContext；域 hp-snapshot-context-v1 与写入
+    provenance 的 hp-snapshot-attest-v1 域分离）。bbox 为 [x,y,w,h] 整数
+    level-0。"""
+    import base64
+    import hashlib
+    import hmac as _hmac
+    import json as _json
+    import time as _time
+
+    def _shorten(b):
+        return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
+
+    payload = _json.dumps(
+        {"sid": sid, "slide_id": slide_id, "snap": snap, "bbox": list(bbox),
+         "rev": rev or None, "fp": fp or None,
+         "exp": int(_time.time() + exp_delta)},
+        separators=(",", ":"))
+    payload_bytes = payload.encode("utf-8")
+    mac = _hmac.new(key.encode("utf-8"),
+                    ("%s\n" % domain).encode("utf-8") + payload_bytes,
+                    hashlib.sha256).digest()
+    return "v1.%s.%s" % (_shorten(payload_bytes), _shorten(mac))
+
+
 def publish_test_slide(name, data, *, owner_user_id="", upload_dir=None):
     """直接发布一张 ready 切片，返回 slide_id。
 

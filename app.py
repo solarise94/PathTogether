@@ -185,6 +185,7 @@ from plugins.sdk.manifest import (  # noqa: E402
     SUPPORTED_BRIDGE_MAJORS,
     CAPABILITY_DEFAULT_TIMEOUT_MS,
     CAPABILITY_MAX_TIMEOUT_MS,
+    CAPABILITY_CONTEXT_CURRENT_SNAPSHOT,
     CAPABILITY_REQUIRED_PERMISSIONS,
     MANIFEST_APPROVAL_REQUIRED_PERMISSIONS,
     capability_tool_name,
@@ -2732,6 +2733,129 @@ def _parse_contour_refine_provenance(body):
 # 请求体里的快照字段只是「声称值」：只有通过 attestation 验证（签名、
 # 归属、逐项一致、未过期、资产未替换）才允许作为审计事实落库。
 _SNAPSHOT_ATTEST_DOMAIN = b"hp-snapshot-attest-v1"
+#: 读上下文域（count_cells 方形取景 wire 合同 v1 §4，2026-10-14）：与写入
+#: provenance 的 attestation **域分离**（密钥同为两服务共享的 internal token，
+#: 但 domain 前缀不同——两类令牌不可互换；跨用即验签失败）。
+_SNAPSHOT_CONTEXT_DOMAIN = b"hp-snapshot-context-v1"
+#: snapshot_context 的签发 TTL（HP 侧 120s）与网关接受的未来偏移上限：
+#: exp 已过期、或 exp 超过 now+TTL+60s（过度未来的伪造/时钟漂移滥用）都拒绝。
+_SNAPSHOT_CONTEXT_TTL_SECONDS = 120
+_SNAPSHOT_CONTEXT_FUTURE_SLACK_SECONDS = 60
+
+
+def _decode_signed_snapshot_payload(att, domain):
+    """快照签名令牌的共用解码 + 域分离 HMAC 验签（wire 合同 v1 §3.4/§4）。
+
+    wire 形状：``v1.<b64url(payload_json)>.<b64url(hmac_sha256)>``；对收到的
+    payload **原始字节**验签（PT 不重序列化，杜绝跨语言数值序列化歧义），
+    HMAC 消息 = ``domain + b"\\n" + payload_bytes``、密钥 = AI_INTERNAL_TOKEN。
+    写入 provenance（hp-snapshot-attest-v1）与读上下文（hp-snapshot-context-v1）
+    共用本函数，仅 domain 不同——两类令牌域分离，不可互换。
+
+    返回 ``(payload_dict, payload_bytes, None)`` 或 ``(None, None, err_kind)``；
+    err_kind ∈ {"shape", "encoding", "hmac", "payload"}（调用方映射各自的
+    客户端文案——不含签名细节）。
+    """
+    parts = str(att or "").split(".")
+    if len(parts) != 3 or parts[0] != "v1" or not parts[1] or not parts[2]:
+        return None, None, "shape"
+
+    def _b64url_dec(seg):
+        try:
+            return base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4))
+        except Exception:
+            return None
+
+    payload_bytes = _b64url_dec(parts[1])
+    mac = _b64url_dec(parts[2])
+    if payload_bytes is None or mac is None:
+        return None, None, "encoding"
+    key = (AI_INTERNAL_TOKEN or "").encode("utf-8")
+    digest = hmac.new(
+        key, domain + b"\n" + payload_bytes, hashlib.sha256).digest()
+    if not hmac.compare_digest(digest, mac):
+        return None, None, "hmac"
+    try:
+        payload = json.loads(payload_bytes.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("not an object")
+    except Exception:
+        return None, None, "payload"
+    return payload, payload_bytes, None
+
+
+def _verify_snapshot_context(att, session_id, effective_slide_id,
+                             slide_dims, current_revision, now=None):
+    """dispatch 网关的 snapshot_context 验证（wire 合同 v1 §4；count_cells
+    方形取景读上下文）。返回 ``(payload, None)`` 或 ``(None, (status, code,
+    message))``——status/code 直接映射错误信封（403 一律不回显签名细节）。
+
+    校验项（全部通过才算有效读上下文）：
+      1. 域分离 HMAC 验签（hp-snapshot-context-v1，对收到的 payload 字节）；
+      2. ``exp``：已过期、或超过 TTL+60s 的未来值都拒绝（缩放重放窗口）；
+      3. ``sid`` == 本次 agent-tool-token/X-AI-Session 绑定的会话；
+      4. ``slide_id`` == 本次请求解析出的稳定切片 ID（token 绑定切片）；
+      5. ``bbox``：正整数四元组且完整落在切片 level-0 尺寸内；
+      6. ``rev``（可选 string|null）与当前资产 revision 不符 → 409
+         snapshot_stale（快照抓取后切片被替换，几何坐标系可能漂移，提示
+         重新 goto）。
+    """
+    now = time.time() if now is None else float(now)
+    payload, _raw, derr = _decode_signed_snapshot_payload(
+        att, _SNAPSHOT_CONTEXT_DOMAIN)
+    if derr is not None:
+        # 403 一律粗粒度文案：不回显形状/编码/签名细节（wire 合同 §4）
+        return None, (403, "snapshot_context_invalid",
+                      "snapshot_context 验证失败")
+    try:
+        exp = float(payload.get("exp") or 0)
+    except (TypeError, ValueError):
+        return None, (403, "snapshot_context_invalid",
+                      "snapshot_context 验证失败")
+    if not math.isfinite(exp) or exp <= now \
+            or exp > now + _SNAPSHOT_CONTEXT_TTL_SECONDS \
+            + _SNAPSHOT_CONTEXT_FUTURE_SLACK_SECONDS:
+        return None, (403, "snapshot_context_invalid",
+                      "snapshot_context 已过期或时间窗非法（请重新 goto 后重试）")
+    if str(payload.get("sid") or "") != str(session_id or ""):
+        return None, (403, "snapshot_context_invalid",
+                      "snapshot_context 与当前会话不符")
+    if str(payload.get("slide_id") or "") != str(effective_slide_id or ""):
+        return None, (403, "snapshot_context_invalid",
+                      "snapshot_context 与请求切片不符")
+    bbox = payload.get("bbox")
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None, (403, "snapshot_context_invalid",
+                      "snapshot_context bbox 非法")
+    ints = []
+    for v in bbox:
+        if isinstance(v, bool) or not isinstance(v, int):
+            return None, (403, "snapshot_context_invalid",
+                          "snapshot_context bbox 非法")
+        ints.append(v)
+    sw, sh = slide_dims
+    if sw <= 0 or sh <= 0:
+        # 切片尺寸未知/为零（fail-closed，review 2026-10-14 修复 2）：无法
+        # 证明 bbox 界内 → 拒绝，绝不跳过界内性检查放行。
+        return None, (403, "snapshot_context_invalid",
+                      "snapshot_context 验证失败")
+    if ints[0] < 0 or ints[1] < 0 or ints[2] <= 0 or ints[3] <= 0 \
+            or ints[0] + ints[2] > sw or ints[1] + ints[3] > sh:
+        return None, (403, "snapshot_context_invalid",
+                      "snapshot_context bbox 越界")
+    rev = payload.get("rev")
+    if rev is not None and not isinstance(rev, str):
+        return None, (403, "snapshot_context_invalid",
+                      "snapshot_context 验证失败")
+    if current_revision:
+        # 当前资产 revision 已知（review 2026-10-14 修复 1）：rev 必须是
+        # 非空字符串且与之一致——rev 为 null/缺失等于无法证明快照基于当前
+        # 资产，同样按 stale fail-closed（提示重新 goto），不留绕过口。
+        if not rev or str(rev) != str(current_revision):
+            return None, (409, "snapshot_stale",
+                          "当前快照已过期（切片资产已更新），请重新 goto")
+    # 仅当前 revision 未知（防御态）时 rev 允许为 null（无从比对）。
+    return payload, None
 
 
 def _verify_snapshot_attestation(att, prov, session_id, current_revision):
@@ -2753,31 +2877,15 @@ def _verify_snapshot_attestation(att, prov, session_id, current_revision):
          后资产被替换，几何坐标系可能漂移；与 expected_asset_revision
          同语义 fail-closed）。
     """
-    parts = str(att or "").split(".")
-    if len(parts) != 3 or parts[0] != "v1" or not parts[1] or not parts[2]:
+    payload, _payload_bytes, derr = _decode_signed_snapshot_payload(
+        att, _SNAPSHOT_ATTEST_DOMAIN)
+    if derr == "shape":
         return "描绘 snapshot_attestation 形状非法（v1.<payload>.<mac>）", None
-
-    def _b64url_dec(seg):
-        try:
-            return base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4))
-        except Exception:
-            return None
-
-    payload_bytes = _b64url_dec(parts[1])
-    mac = _b64url_dec(parts[2])
-    if payload_bytes is None or mac is None:
+    if derr == "encoding":
         return "描绘 snapshot_attestation 编码非法", None
-    key = (AI_INTERNAL_TOKEN or "").encode("utf-8")
-    digest = hmac.new(
-        key, _SNAPSHOT_ATTEST_DOMAIN + b"\n" + payload_bytes,
-        hashlib.sha256).digest()
-    if not hmac.compare_digest(digest, mac):
+    if derr == "hmac":
         return "描绘 snapshot_attestation 签名不匹配", None
-    try:
-        payload = json.loads(payload_bytes.decode("utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError("not an object")
-    except Exception:
+    if derr == "payload":
         return "描绘 snapshot_attestation 载荷非法", None
 
     try:
@@ -14591,11 +14699,14 @@ def _parse_provides_registry(manifest):
     校验失败（validate_manifest/validate_provides 任何错误）抛 ``ValueError``
     （message 含全部错误，安装端点映射 400）。登记项形状：
     ``{name, version, description, parameters, access_mode, required_permissions,
-    timeout_ms, base_url, agent_exposed, enabled}``——base_url 取
+    timeout_ms, base_url, agent_exposed, context, enabled}``——base_url 取
     manifest.service.baseUrl 快照（dispatch 转发用；插件内网地址不外泄给任何
     消费方，docs D1）。agent_exposed 是能力级 AI agent 退出标记（additive 可选
     manifest 字段，缺省/None 归一为 True=暴露；false 时注入侧不再把该能力
-    进 agent 工具集，dispatch 与登记行不受影响）。
+    进 agent 工具集，dispatch 与登记行不受影响）。context 是能力级「当前快照
+    上下文」需求（2026-10-14 wire 合同 v1 §1，可选；缺省 None=普通 remote
+    tool；恰为 current_snapshot 时 dispatch 要求并验证签名 snapshot_context、
+    注入侧在 extra_tools 条目带 ``"context": "current_snapshot"``）。
     """
     errors = validate_manifest(manifest)
     if errors:
@@ -14626,6 +14737,12 @@ def _parse_provides_registry(manifest):
             # 历史安装行。
             "agent_exposed": True if item.get("agent_exposed") is None
                              else bool(item["agent_exposed"]),
+            # 能力级「当前快照上下文」需求（wire 合同 v1 §1；校验层已保证
+            # 非 None 即恰为 current_snapshot）：dispatch 按它切换上下文校验
+            # 路径；注入侧把标记透给 HP（HP 侧其他值跳过该条目 fail-closed）。
+            "context": (item["context"]
+                        if item.get("context") ==
+                        CAPABILITY_CONTEXT_CURRENT_SNAPSHOT else None),
             "enabled": True,
         })
     return out
@@ -15445,7 +15562,7 @@ def _inject_agent_extra_tools(user_ctx, slide, config, slide_id=None):
     for inst, cap in caps:
         plugin_id = inst.get("plugin_id") or ""
         full_names.append("%s/%s" % (plugin_id, cap["name"]))
-        tools.append({
+        entry = {
             "name": capability_tool_name(plugin_id, cap["name"]),
             "description": (cap.get("description") or
                             "") + _CAPABILITY_TOOL_DESCRIPTION_SUFFIX,
@@ -15454,7 +15571,13 @@ def _inject_agent_extra_tools(user_ctx, slide, config, slide_id=None):
             "auth": "agent-tool-token",  # token 放 config.tool_token
             "access_mode": "read",
             "timeout_ms": _capability_timeout_ms(cap),
-        })
+        }
+        # wire 合同 v1 §2：能力声明 context=current_snapshot 时条目带同值标记
+        #（不是模型参数，HP 执行阶段据此注入签名 snapshot_context；HP 对其他
+        # 值跳过该条目 fail-closed）。历史安装行缺该字段不写键（普通工具）。
+        if cap.get("context") == CAPABILITY_CONTEXT_CURRENT_SNAPSHOT:
+            entry["context"] = CAPABILITY_CONTEXT_CURRENT_SNAPSHOT
+        tools.append(entry)
     token = _agent_tool_token_encode({
         "sub": ident.get("user_id") or "owner",
         "user_id": ident.get("user_id") or "",
@@ -21918,6 +22041,24 @@ def _find_registered_capability(plugin_id, capability_name):
     return None, None
 
 
+def _dispatch_slide_level0_dims(gate):
+    """dispatch 上下文 bbox 越界检查用的切片 level-0 尺寸。
+
+    借句柄池读头部元数据（与 region 读取同一来源）；读取失败 → (0, 0)
+    fail-closed——``_verify_snapshot_context`` 对零尺寸一律 403（无法证明
+    bbox 界内，绝不跳过界内性检查放行；review 2026-10-14 修复 2）。
+    """
+    try:
+        entry = _get_slide(gate)
+        with slide_cache.borrow_pair(entry) as pair:
+            meta = _read_metadata(pair["osr"], _desc_path(gate))
+        return int(meta.get("width") or 0), int(meta.get("height") or 0)
+    except Exception:
+        app.logger.warning("dispatch 快照上下文切片尺寸读取失败（fail-closed）",
+                           exc_info=True)
+        return 0, 0
+
+
 @app.route("/api/plugin/v1/dispatch/<plugin_id>/<capability_name>",
            methods=["POST"])
 def plugin_v1_dispatch(plugin_id, capability_name):
@@ -22056,6 +22197,53 @@ def plugin_v1_dispatch(plugin_id, capability_name):
             details={"reason": "dispatch_session_capability",
                      "capability": full_name})
 
+    # ---- ⑤'' 上下文能力（count_cells 方形取景 wire 合同 v1 §4，2026-10-14）：
+    # 声明 context=current_snapshot 的能力必须携带 HP 服务端签名的
+    # snapshot_context（读上下文；不是模型参数）。位置/几何/身份绝不采信
+    # arguments；验签通过后仅把结构化 context.snapshot 转发给插件（原始签名
+    # 串不出网关）。上下文只用于读——不签发描绘/写授权，委托读凭证路径
+    # （⑥'）不变。未声明 context 的能力：请求里即使带 snapshot_context 也
+    # 一律丢弃不转发（forward_body 显式构造，天然不带）。---- #
+    context_snapshot = None
+    if cap.get("context") == CAPABILITY_CONTEXT_CURRENT_SNAPSHOT:
+        att = body.get("snapshot_context")
+        if not isinstance(att, str) or not att:
+            return _plugin_error(
+                400, "snapshot_context_required",
+                "该能力需要当前快照上下文：请先用 goto 查看要计数的位置，"
+                "再调用本工具")
+        # 有效切片 ID：token 绑定的 slide_id claim（权威）；历史形态（仅名）
+        # 按名解析。解析不到 → fail-closed 403（与委托凭证同口径）。
+        ctx_token_sid = str(claims.get("slide_id") or "").strip()
+        ctx_desc = None
+        try:
+            if ctx_token_sid:
+                ctx_desc = slide_store.resolve_slide_id(ctx_token_sid)
+            else:
+                named_sid = share_store.get_slide_id(slide)
+                ctx_desc = (slide_store.resolve_slide_id(named_sid)
+                            if named_sid else None)
+        except Exception:
+            app.logger.warning("dispatch 上下文切片解析失败（fail-closed）",
+                               exc_info=True)
+            ctx_desc = None
+        if ctx_desc is None:
+            return _plugin_error(403, "snapshot_context_invalid",
+                                 "snapshot_context 验证失败")
+        ctx_payload, ctx_err = _verify_snapshot_context(
+            att, session_id, ctx_desc.slide_id,
+            _dispatch_slide_level0_dims(ctx_desc), _slide_revision(ctx_desc))
+        if ctx_err is not None:
+            ctx_status, ctx_code, ctx_message = ctx_err
+            return _plugin_error(ctx_status, ctx_code, ctx_message)
+        cbx, cby, cbw, cbh = ctx_payload.get("bbox")
+        context_snapshot = {
+            "snapshot_id": str(ctx_payload.get("snap") or ""),
+            "bbox": {"x": cbx, "y": cby, "w": cbw, "h": cbh},
+            "slide_revision": ctx_payload.get("rev") or None,
+            "render_context_fingerprint": ctx_payload.get("fp") or None,
+        }
+
     # ---- ⑥ 转发：service.baseUrl + POST /capabilities/{name} ---- #
     base_url = str(cap.get("base_url") or "").rstrip("/")
     if not base_url:
@@ -22090,6 +22278,12 @@ def plugin_v1_dispatch(plugin_id, capability_name):
                              details={"reason": "slide_id_mismatch"})
     forward_body = {"slide": slide, "slide_id": token_sid,
                     "arguments": body.get("arguments") or {}}
+    # ⑤''续（wire 合同 v1 §4）：验签通过的上下文以结构化 context.snapshot
+    # 转发（原始签名串、exp/sid 等信封字段不出网关）；未声明 context 的
+    # 能力即使请求携带 snapshot_context 也丢弃不转发（forward_body 显式
+    # 构造，天然不带）。
+    if context_snapshot is not None:
+        forward_body["context"] = {"snapshot": context_snapshot}
     # ⑥' 委托读凭证：全部门槛通过后，仅对声明区域读权限的能力签发
     # （最小披露：不读图的插件后端拿不到可读区域的凭证），随转发头下发
     # （不进 body/审计/Agent 结果）。解析失败不签发不阻断（fail-safe，

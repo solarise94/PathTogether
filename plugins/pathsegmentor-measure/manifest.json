@@ -76,27 +76,13 @@
     },
     {
       "name": "count_cells",
-      "version": "1.2.0",
-      "description": "用 Cellpose 实例分割模型在给定 level-0 整数 bbox（x,y,w,h）内逐个计数细胞/细胞核：返回实例数、每 mm² 密度（MPP 有效时）、面积分布（µm²）与最多 20 个示例实例的 level-0 bbox/质心。与 segment_region 不同：这是实例计数，不是语义区域面积。模型以 diameter/30 µm/px 的分辨率处理（d=7→0.2333），ROI 按该尺度渲染（不超过原生）；resolution 是模型处理长边上限固定选项，每档最大视场 = resolution×diameter/30 µm、与切片 MPP 无关（d=7：512→119.47 µm、1024→238.93 µm、2048→477.87 µm；耗时约随 option² 增长），超限/超预算在读图前拒绝（resource_limit）——请改选更大 resolution、拆分 tile 或适当增大 diameter_um。diameter_um 缺省 7（核；整细胞 15–25）。MPP 缺失仅像素口径。结果为近似值，需人工核对；bbox 面积不得超过平台 ROI 上限。",
+      "version": "2.0.0",
+      "description": "在当前已查看视场中自动取一个方形区域，用 Cellpose 计数细胞/细胞核。只需选择处理档位，可选目标直径和分割阈值。要统计其他位置，请先 goto 查看该位置。返回计数、实际统计范围和可用的密度；不是整张切片总数。",
+      "context": "current_snapshot",
       "parameters": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
-          "x": {
-            "type": "integer",
-            "description": "level-0 bbox 左上角 X（整数像素，≥0）"
-          },
-          "y": {
-            "type": "integer",
-            "description": "level-0 bbox 左上角 Y（整数像素，≥0）"
-          },
-          "w": {
-            "type": "integer",
-            "description": "level-0 bbox 宽（整数像素，>0；x+w 不得超过切片宽）"
-          },
-          "h": {
-            "type": "integer",
-            "description": "level-0 bbox 高（整数像素，>0；y+h 不得超过切片高）"
-          },
           "resolution": {
             "type": "integer",
             "enum": [
@@ -104,25 +90,27 @@
               1024,
               2048
             ],
-            "description": "模型处理长边上限固定选项（含 Cellpose 内部放大；缺省 2048=服务输入上限、每档最大视场；512/1024 为更快的显式选项，时间成本约随 option² 增长）：ROI 按 Cellpose 处理尺度（diameter/30 µm/px，不超过切片原生）渲染，模型处理长边超过该选项时在读图前拒绝（resource_limit——改选更大选项、拆分 ROI 或适当增大 diameter_um）。每档最大视场 = resolution×diameter/30 µm，与切片 MPP 无关；d=7：512→119.47 µm、1024→238.93 µm、2048→477.87 µm"
+            "description": "模型处理边长上限固定选项（缺省 2048=最大视场；512/1024 为更快的显式选项，时间成本约随 option² 增长）：系统在当前视场内自动取不越界方形，方形实际边长受快照/切片大小与该档位约束，可能小于档位上限（结果 counted_region 给出实际范围与披露）"
           },
           "diameter_um": {
             "type": "number",
             "minimum": 4,
             "maximum": 100,
-            "description": "期望目标直径 µm（缺省 7=细胞核；整细胞 15–25）。决定 Cellpose 处理尺度（d/30 µm/px）与可处理的最大 ROI 视场（= resolution×d/30 µm，与切片 MPP 无关）；直径过小会缩小可处理视场"
+            "description": "期望目标直径 µm（缺省 7=细胞核；整细胞 15–25）。决定 Cellpose 处理尺度（d/30 µm/px）与每档最大视场（= resolution×d/30 µm，与切片 MPP 无关；d=7：512→119.47、1024→238.93、2048→477.87 µm）；切片无物理标尺（MPP 缺失）时直径不参与换算"
           },
-          "model": {
-            "type": "string",
-            "description": "可选 Cellpose 模型预设名（缺省用服务端默认）"
+          "flow_threshold": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Cellpose flow 阈值（0..1，缺省 0.4）；调高减少假阳性碎片，调低召回更松"
+          },
+          "cellprob_threshold": {
+            "type": "number",
+            "minimum": -6,
+            "maximum": 6,
+            "description": "Cellpose cellprob 阈值（-6..6，缺省 0）；调低检出更多弱边界目标，调高更保守"
           }
-        },
-        "required": [
-          "x",
-          "y",
-          "w",
-          "h"
-        ]
+        }
       },
       "accessMode": "read",
       "requiredPermissions": [

@@ -33,12 +33,12 @@ def backend(monkeypatch):
     mod = load_module(ROOT / 'plugins/pathsegmentor-measure/backend/app.py', 'review_backend')
     monkeypatch.setattr(mod, '_capability_ctx', lambda: (None, {
         'slide': 'x.svs', 'slide_id': 'sld_x', 'delegated': 'test-only',
-        'body': {'arguments': {'x': 0, 'y': 0, 'w': 2048, 'h': 2048}},
+        'body': {'arguments': {'x': 0, 'y': 0, 'w': 1900, 'h': 1900}},
     }))
     monkeypatch.setattr(mod, '_installation_jwt', lambda: 'test-only')
     monkeypatch.setattr(mod, '_platform_slide_info', lambda *a, **k: {'mpp': 0.25})
     monkeypatch.setattr(mod, '_platform_read_region', lambda *a, **k: (b'image', {
-        'src': {'x': 0, 'y': 0, 'w': 2048, 'h': 2048}, 'width': 1024, 'height': 1024,
+        'src': {'x': 0, 'y': 0, 'w': 1900, 'h': 1900}, 'width': 950, 'height': 950,
     }))
     return mod
 
@@ -53,6 +53,27 @@ def test_cellpose_receives_rendered_image_mpp(monkeypatch):
         response = client.post('/capabilities/count_cells', json={})
     assert response.status_code == 200
     assert seen == [0.5], '2048 L0 px @0.25 rendered to 1024 px is 0.5 um/px'
+
+def test_original_2048_fixture_now_refused_by_processing_cap(monkeypatch):
+    mod = load_module(ROOT / 'plugins/pathsegmentor-measure/backend/app.py', 'review_backend_orig')
+    monkeypatch.setattr(mod, '_capability_ctx', lambda: (None, {
+        'slide': 'x.svs', 'slide_id': 'sld_x', 'delegated': 'test-only',
+        'body': {'arguments': {'x': 0, 'y': 0, 'w': 2048, 'h': 2048}},
+    }))
+    monkeypatch.setattr(mod, '_installation_jwt', lambda: 'test-only')
+    monkeypatch.setattr(mod, '_platform_slide_info', lambda *a, **k: {'mpp': 0.25})
+    reads = []
+    def read(*args, **kwargs):
+        reads.append('region')
+        return b'image', {'src': {'x': 0, 'y': 0, 'w': 2048, 'h': 2048},
+                          'width': 1024, 'height': 1024}
+    monkeypatch.setattr(mod, '_platform_read_region', read)
+    monkeypatch.setattr(mod, '_infer_cellpose', lambda *a, **k: {'instance_count': 0})
+    with mod.app.test_client() as client:
+        response = client.post('/capabilities/count_cells', json={})
+    assert reads == []
+    assert response.status_code == 400
+    assert response.get_json()['error']['code'] == 'resource_limit'
 
 def test_missing_mpp_is_forwarded_as_null(monkeypatch):
     mod = backend(monkeypatch)

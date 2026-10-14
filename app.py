@@ -2834,18 +2834,27 @@ def _verify_snapshot_context(att, session_id, effective_slide_id,
                           "snapshot_context bbox 非法")
         ints.append(v)
     sw, sh = slide_dims
+    if sw <= 0 or sh <= 0:
+        # 切片尺寸未知/为零（fail-closed，review 2026-10-14 修复 2）：无法
+        # 证明 bbox 界内 → 拒绝，绝不跳过界内性检查放行。
+        return None, (403, "snapshot_context_invalid",
+                      "snapshot_context 验证失败")
     if ints[0] < 0 or ints[1] < 0 or ints[2] <= 0 or ints[3] <= 0 \
-            or (sw > 0 and ints[0] + ints[2] > sw) \
-            or (sh > 0 and ints[1] + ints[3] > sh):
+            or ints[0] + ints[2] > sw or ints[1] + ints[3] > sh:
         return None, (403, "snapshot_context_invalid",
                       "snapshot_context bbox 越界")
     rev = payload.get("rev")
     if rev is not None and not isinstance(rev, str):
         return None, (403, "snapshot_context_invalid",
                       "snapshot_context 验证失败")
-    if rev and current_revision and str(rev) != str(current_revision):
-        return None, (409, "snapshot_stale",
-                      "当前快照已过期（切片资产已更新），请重新 goto")
+    if current_revision:
+        # 当前资产 revision 已知（review 2026-10-14 修复 1）：rev 必须是
+        # 非空字符串且与之一致——rev 为 null/缺失等于无法证明快照基于当前
+        # 资产，同样按 stale fail-closed（提示重新 goto），不留绕过口。
+        if not rev or str(rev) != str(current_revision):
+            return None, (409, "snapshot_stale",
+                          "当前快照已过期（切片资产已更新），请重新 goto")
+    # 仅当前 revision 未知（防御态）时 rev 允许为 null（无从比对）。
     return payload, None
 
 
@@ -22036,8 +22045,8 @@ def _dispatch_slide_level0_dims(gate):
     """dispatch 上下文 bbox 越界检查用的切片 level-0 尺寸。
 
     借句柄池读头部元数据（与 region 读取同一来源）；读取失败 → (0, 0)
-    fail-closed（0 会让 _verify_snapshot_context 的越界比较跳过轴检查——
-    尺寸未知时 bbox 界内性交由插件与 region 端点兜底，这里不放行也不误拒）。
+    fail-closed——``_verify_snapshot_context`` 对零尺寸一律 403（无法证明
+    bbox 界内，绝不跳过界内性检查放行；review 2026-10-14 修复 2）。
     """
     try:
         entry = _get_slide(gate)

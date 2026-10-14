@@ -380,6 +380,36 @@ def test_dispatch_bbox_out_of_slide_bounds_rejected_403():
     assert app_mod.requests.calls == []
 
 
+def test_dispatch_null_rev_with_known_revision_409(monkeypatch):
+    """review 2026-10-14 修复 1：当前资产 revision 已知时 rev 必须为非空
+    字符串且一致——null/缺失不能绕过 staleness 检查（409 snapshot_stale）。"""
+    _install()
+    client = _client()
+    for rev in (None, ""):
+        r = _dispatch(client, _tool_token(),
+                      body={"slide": SLIDE, "slide_id": SLIDE_ID,
+                            "arguments": {},
+                            "snapshot_context": _valid_context(rev=rev)})
+        assert r.status_code == 409, (rev, r.get_json())
+        err = _err(r)
+        assert err["code"] == "snapshot_stale"
+        assert "goto" in err["message"]
+    assert app_mod.requests.calls == []
+
+
+def test_dispatch_unknown_slide_dims_403(monkeypatch):
+    """review 2026-10-14 修复 2：切片尺寸未知/为零（读取失败 fail-closed
+    (0,0)）→ 无法证明 bbox 界内 → 403 snapshot_context_invalid，绝不放行。"""
+    monkeypatch.setattr(app_mod, "_dispatch_slide_level0_dims",
+                        lambda gate: (0, 0))
+    _install()
+    client = _client()
+    r = _dispatch(client, _tool_token())
+    assert r.status_code == 403, r.get_json()
+    assert _err(r)["code"] == "snapshot_context_invalid"
+    assert app_mod.requests.calls == []
+
+
 def test_dispatch_stale_revision_returns_409():
     _install()
     client = _client()

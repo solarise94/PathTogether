@@ -193,7 +193,9 @@ def _slide_read_mocks(mpp=0.5):
             mock.patch.object(app_mod.slide_cache, "borrow_pair",
                               side_effect=lambda _e: _borrow_pair_ctx(pair)),
             mock.patch.object(app_mod, "_read_metadata",
-                              return_value={"mpp_x": mpp}))
+                              return_value={"mpp_x": mpp,
+                                            "width": 100000,
+                                            "height": 100000}))
 
 
 def _region_payload(w=8, h=8, bbox=(0, 0, 16, 16)):
@@ -1076,13 +1078,17 @@ def test_dispatch_mints_credential_for_count_cells(monkeypatch):
     stub = _ForwardStub()
     monkeypatch.setattr(app_mod, "requests", stub)
     token = _tool_token(capabilities=["%s/count_cells" % PLUGIN_ID])
+    # review 2026-10-14 修复 1：当前 revision 已知时 rev 必须一致（null 会被
+    # 409 snapshot_stale 拒绝）——按登记行真实 revision 签名。
+    desc = app_mod.slide_store.resolve_slide_id(sid)
+    rev = app_mod._slide_revision(desc)
     r = _client().post(
         "/api/plugin/v1/dispatch/%s/count_cells" % PLUGIN_ID,
         json={"slide": "demo.svs",
               "arguments": {},
               "snapshot_context": make_snapshot_context(app_mod.AI_INTERNAL_TOKEN,
                   sid="sess-1", slide_id=sid, snap="snap-1",
-                  bbox=[0, 0, 1000, 1000])},
+                  bbox=[0, 0, 1000, 1000], rev=rev or None)},
         headers={"Authorization": "Bearer " + token,
                  "X-AI-Session": "sess-1"})
     assert r.status_code == 200, r.get_json()

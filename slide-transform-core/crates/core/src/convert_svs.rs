@@ -501,6 +501,7 @@ fn jp2k_reencode_tile(
     payload: &[u8],
     lv: &SvsLevel,
     cfg: &crate::jpeg::EncoderCfg,
+    memory_budget_bytes: u64,
 ) -> CoreResult<(Vec<u8>, u32, u32)> {
     let contract = lv.jp2k_contract.as_ref().ok_or_else(|| {
         CoreError::validation("jp2k: 层缺少 codestream 契约（probe 未运行）")
@@ -512,6 +513,21 @@ fn jp2k_reencode_tile(
         contract_color_compression(contract),
         lv.tile_w,
         lv.tile_h,
+    )?;
+    // Review R1: charge THIS tile's real codestream geometry against the host
+    // budget BEFORE the decode/encode allocations. The plan-time check used
+    // the nominal contract; here the actual header (which may be a smaller
+    // cropped edge tile, or — if the contract check above ever passed — the
+    // same size) decides the padded-canvas term. A malicious over-budget
+    // header is rejected without the decoder ever being invoked.
+    crate::jp2k::peak::charge_against_budget(
+        memory_budget_bytes,
+        hdr.components as u64,
+        hdr.width as u64,
+        hdr.height as u64,
+        lv.tile_w as u64,
+        lv.tile_h as u64,
+        &format!("JPEG2000 tile({},{}) 解码/编码工作集", hdr.width, hdr.height),
     )?;
     let tile_pixels = (lv.tile_w as u64) * (lv.tile_h as u64);
     let decoded = crate::jp2k::decode_tile_rgb(payload, hdr.width, hdr.height, color, tile_pixels)?;
@@ -793,6 +809,33 @@ fn convert_inner(
         None
     };
 
+    // Review R1: a JP2K source is the one SVS codec whose per-tile working set
+    // is NOT fixed — it scales with the decoded pixel count (three f32 planes,
+    // IDWT, RGB, padded canvas, JPEG encoder). Charge the conservative
+    // one-tile peak of every level against the host memory budget HERE, at
+    // plan/probe time from the level CONTRACT (the first-tile header), so an
+    // over-budget input is refused before any writer/output exists. This is the
+    // early, best-effort gate; the per-tile path re-charges the REAL codestream
+    // header against the nominal tile rect (which bounds the padded canvas and
+    // encoder terms) before that tile's allocation — that is the hard gate for
+    // a container whose later tile is larger than its first.
+    if is_jp2k {
+        for (li, lv) in levels.iter().enumerate() {
+            let contract = lv.jp2k_contract.as_ref().ok_or_else(|| {
+                CoreError::validation("jp2k: 层缺少 codestream 契约（probe 未运行）")
+            })?;
+            crate::jp2k::peak::charge_against_budget(
+                plan.limits.memory_budget_bytes,
+                contract.components as u64,
+                contract.width as u64,
+                contract.height as u64,
+                lv.tile_w as u64,
+                lv.tile_h as u64,
+                &format!("JPEG2000 层 {li} tile 解码/编码工作集"),
+            )?;
+        }
+    }
+
     let mut warnings: Vec<String> = Vec::new();
     if is_jp2k {
         warnings.push(WARN_JP2K_REENCODED.to_string());
@@ -927,7 +970,8 @@ fn convert_inner(
                 } else {
                     &jp2k_cfg
                 };
-                let (encoded, src_w, src_h) = jp2k_reencode_tile(&payload, lv, cfg)?;
+                let (encoded, src_w, src_h) =
+                    jp2k_reencode_tile(&payload, lv, cfg, plan.limits.memory_budget_bytes)?;
                 let interior = row + 1 < lv.tiles_down as u64 && col + 1 < lv.tiles_across as u64;
                 if src_w != lv.tile_w || src_h != lv.tile_h {
                     if interior {

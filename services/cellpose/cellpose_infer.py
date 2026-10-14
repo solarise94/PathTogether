@@ -20,6 +20,7 @@ README 明示 **所有 Cellpose 模型的训练数据为 CC-BY-NC**（cpsam/cpsa
 """
 import hashlib
 import io
+import math
 
 import numpy as np
 from PIL import Image
@@ -44,6 +45,20 @@ LABEL_MAP_MAX = 65535
 #: 请求图最长边上限（合同：≤2048²）
 MAX_IMAGE_EDGE = 2048
 
+#: cpsam diam_mean（cellpose 4.2.1.1）：``CellposeModel.eval`` 在给出 diameter
+#: （像素）时按 ``rescale = DIAM_MEAN_PX / diameter_px`` 先整体缩放输入。
+DIAM_MEAN_PX = 30.0
+
+#: 模型内部缩放后的像素量预算（R2 资源准入）：合法参数组合可以把入口内的
+#: 2048² 图放大许多倍（极端例：diameter_um=1 @ mpp=0.5 → diameter_px=2 →
+#: 15×，1024² → 15360²≈2.36 亿 px）。8 Mi px（≈2896²）：
+#:   - 缺省插件流（1024² 输入 + 7µm @ 0.5 µm/px → diameter_px=14 →
+#:     rescale≈2.14 → 2195²≈4.82M px）有 1.7× 余量；
+#:   - 单路推理墙钟按缩放后像素近似线性（实测 1024²@rescale1.07 ≈ 3.6s），
+#:     预算内 ≈≤25s，低于插件侧 32s 推理超时；
+#:   - fp32 平面 67 MiB/张，流场等临时结构在 22 GB 卡、~5 GB 基线上安全。
+MAX_SCALED_PIXELS = 8 * 1024 * 1024
+
 
 # --------------------------------------------------------------------------
 # 直径换算与参数校验（纯逻辑）
@@ -58,6 +73,31 @@ def diameter_px(diameter_um, mpp):
     if diameter_um <= 0:
         raise ValueError("diameter_um must be > 0, got %r" % (diameter_um,))
     return float(diameter_um) / float(mpp)
+
+
+def scaled_pixel_count(width, height, diameter_px_):
+    """cpsam 内部缩放后的像素量估计（资源准入用，纯逻辑）。
+
+    ``CellposeModel.eval`` 按每轴 ``round-ish(size × rescale)`` 缩放输入
+    （resample=True 再插值回原尺寸，但流场/中间激活都在缩放后尺寸上分配）。
+    这里按逐轴 ceil 保守估计：
+
+    - ``diameter_px_`` 为 None（mpp 缺省尺度）→ rescale=1.0，工作集即输入；
+    - rescale 非有限（diameter_px 异常小导致溢出）→ 返回 None（调用方拒绝）；
+    - 其余返回 ``ceil(w×r) × ceil(h×r)``（Python 大整数，不截断溢出）。
+    """
+    width = int(width)
+    height = int(height)
+    if diameter_px_ is None:
+        return width * height
+    rescale = DIAM_MEAN_PX / float(diameter_px_)
+    if not math.isfinite(rescale) or rescale <= 0:
+        return None
+    scaled_w = width * rescale
+    scaled_h = height * rescale
+    if not (math.isfinite(scaled_w) and math.isfinite(scaled_h)):
+        return None
+    return math.ceil(scaled_w) * math.ceil(scaled_h)
 
 
 # --------------------------------------------------------------------------

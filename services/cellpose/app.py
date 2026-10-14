@@ -12,8 +12,9 @@
      200 ``{model_id, model_name, model_sha256, code_version, input_width,
      input_height, instance_count, diameter_px_used, areas_px,
      instances_top, labels_png_b64?, timings_ms, warnings}``；
-     错误：400 ``{error, message}``（坏输入）/ 503 ``{error:"busy"}``（已有
-     一路推理在跑，不排队）/ 503 ``{error:"not_ready"}``（模型未就绪）。
+     错误：400 ``{error, message}``（坏输入 / ``resource_limit``：内部缩放
+     超预算）/ 503 ``{error:"busy"}``（已有一路推理在跑，不排队）/
+     503 ``{error:"not_ready"}``（模型未就绪）。
 
 要点（风格对齐 services/pathsegmentor）：
   - 模型在 **worker 进程内**加载（gunicorn 不用 --preload——CUDA 上下文
@@ -22,8 +23,13 @@
   - ``_INFERENCE_LOCK`` 单飞 GPU 推理：非阻塞获取，占用即 503 busy，
     不排队；预设切换（``model`` 字段非当前预设）也在锁内完成——单模型
     实例驻留，切换即卸旧载新（首次多付一次加载延迟，不占双份显存）；
-  - 入参校验：image ≤ 2048×2048、请求体 ≤ 8MB、mpp null → 模型缺省尺度
-    + warning；flow_threshold 0..1、cellprob_threshold -6..6；
+  - 入参校验：image ≤ 2048×2048（**先读图片头拒超大图，再解码像素**——
+    8 MiB 压缩体不约束解压后像素，R2）、请求体 ≤ 8MB、mpp null → 模型缺省
+    尺度 + warning；flow_threshold 0..1、cellprob_threshold -6..6；
+  - 资源准入（R2）：cpsam 按 ``rescale=30/diameter_px`` 内部放大输入；调用
+    模型前按输入几何 × mpp × diameter 计算缩放后像素量，非有限/超预算
+    （MAX_SCALED_PIXELS=8 Mi px）→ 400 ``resource_limit``（调用方可改
+    ROI/参数后重试）；
   - 请求体与图像**不落盘、不进日志**（日志只有状态码与耗时）；
   - 权重只读挂载 /models（``<preset>-sha256-<12hex>/<preset>`` 布局），
     启动时流式校验 SHA-256（CELLPOSE_EXPECTED_SHA256_<PRESET>，不符拒绝
@@ -240,7 +246,12 @@ def readyz():
 
 
 def _decode_image(image_b64):
-    """base64 → PIL RGB 图像；返回 (错误元组或 None, 图像或 None)。"""
+    """base64 → PIL RGB 图像；返回 (错误元组或 None, 图像或 None)。
+
+    尺寸闸在**像素解码前**（R2）：``Image.open`` 只读文件头，先按头部的
+    两轴与像素总量拒绝超大图，再 ``load()`` 解码像素——否则 4096² 等低
+    压缩体积的输入会在被拒绝前白白完成整幅解码，入口限制形同虚设。
+    """
     if not isinstance(image_b64, str) or not image_b64:
         return ("missing_image",
                 "image_b64 must be a non-empty base64 string"), None
@@ -252,15 +263,20 @@ def _decode_image(image_b64):
         return ("invalid_base64", "image_b64 decodes to zero bytes"), None
     try:
         image = Image.open(io.BytesIO(raw))
-        image.load()
     except Exception:  # noqa: BLE001 — PIL 对坏数据的各类异常统一 400
         return ("image_not_decodable",
                 "image_b64 is not a decodable image"), None
-    width, height = image.size
-    if width > MAX_IMAGE_EDGE or height > MAX_IMAGE_EDGE:
+    width, height = image.size  # 仅头部；像素尚未解码
+    if (width > MAX_IMAGE_EDGE or height > MAX_IMAGE_EDGE
+            or width * height > MAX_IMAGE_EDGE * MAX_IMAGE_EDGE):
         return ("image_too_large",
                 "image %dx%d exceeds %dx%d limit"
                 % (width, height, MAX_IMAGE_EDGE, MAX_IMAGE_EDGE)), None
+    try:
+        image.load()
+    except Exception:  # noqa: BLE001 — 头部合法但像素数据坏（如截断 JPEG）
+        return ("image_not_decodable",
+                "image_b64 is not a decodable image"), None
     return None, image.convert("RGB")
 
 
@@ -327,6 +343,35 @@ def _validate_request(body):
     return None, params
 
 
+def _scaled_budget_error(width, height, diameter_px_):
+    """资源准入（R2）：模型内部缩放后的像素量预算检查（进模型前）。
+
+    cpsam 按 ``rescale=30/diameter_px`` 先放大输入——只限制请求直径挡不住
+    「合法直径 × 粗 mpp」的组合（如 diameter_um=1 @ mpp=0.5 → 2 px →
+    1024² 放大 15× 到 15360²）。diameter_px 为 None（mpp 缺省尺度）按
+    rescale 1.0 计，工作集即输入像素，已被入口尺寸闸约束。
+    返回 (code, message) 或 None。
+    """
+    scaled = cellpose_infer.scaled_pixel_count(width, height, diameter_px_)
+    if scaled is not None and scaled <= cellpose_infer.MAX_SCALED_PIXELS:
+        return None
+    if scaled is None:
+        return ("resource_limit",
+                "requested diameter/mpp imply a non-finite internal rescale; "
+                "refusing to allocate (raise diameter_um or provide a finer "
+                "mpp)")
+    rescale = (1.0 if diameter_px_ is None
+               else cellpose_infer.DIAM_MEAN_PX / diameter_px_)
+    return ("resource_limit",
+            "input %dx%d px with internal rescale x%.3f (diameter_px=%s) "
+            "would be upscaled to ~%dx%d px (%d px), beyond the %d px "
+            "inference budget; retry with a larger diameter_um, a finer "
+            "input mpp (smaller ROI), or a smaller image"
+            % (width, height, rescale, diameter_px_,
+               int(width * rescale), int(height * rescale), scaled,
+               cellpose_infer.MAX_SCALED_PIXELS))
+
+
 @app.route("/v1/count", methods=["POST"])
 def v1_count():
     body = request.get_json(silent=True)
@@ -337,6 +382,11 @@ def v1_count():
     if err is not None:
         return _bad_request(err[0], err[1])
     err, params = _validate_request(body)
+    if err is not None:
+        return _bad_request(err[0], err[1])
+    # 资源准入在推理锁与模型加载之前：超预算请求不应挤占单飞 GPU 通道。
+    err = _scaled_budget_error(image.size[0], image.size[1],
+                               params["diameter_px"])
     if err is not None:
         return _bad_request(err[0], err[1])
 

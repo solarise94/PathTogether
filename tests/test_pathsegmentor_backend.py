@@ -5,7 +5,9 @@
   - 入口守卫：缺 X-Dispatch-Principal / 委托凭证 → 401；参数校验 → 400；
   - mask → level-0 映射（src 缩放）、面积占比、MPP µm² 换算（缺失只给 px）、
     连通域计数与小目标过滤、尺寸分布、top 连通域 bbox/质心；
-  - 输出长边选层（~0.5 µm/px 目标 + ≤1024 钳制）；
+  - 输出长边选层（segment_region ~0.25 µm/px 目标 + ≤1024 钳制）；
+  - count_cells：固定分辨率枚举（512/768/1024）、推理输入 MPP = 原生 MPP ×
+    实际渲染缩放（R3）、缩放预算资源准入（R2）、MPP 缺失发 null（R4）；
   - 推理服务错误映射：busy / not_ready / 不可达 / 400 / 契约不符（mask 尺寸
     不一致）；
   - 响应卫生：恒 ≪64KiB、无 mask/base64、不回显委托凭证。
@@ -15,6 +17,7 @@
 import base64
 import io
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -552,8 +555,10 @@ def test_count_cells_happy_path_mapping_density_um2(monkeypatch):
     monkeypatch.setattr(mod, "_infer_cellpose", _infer)
     r = _call(mod, dict(COUNT_ARGS, diameter_um=9), capability="count_cells")
     assert r.status_code == 200, r.get_json()
-    # 服务端收到的 mpp / diameter
-    assert seen["mpp"] == 0.5 and seen["diameter_um"] == 9
+    # 服务端收到的 mpp / diameter。R3 修正旧断言的物理意义：64 level-0 px
+    # @原生 0.5 渲染成 32 输出 px（scale 2）→ 推理输入 MPP = 0.5×2 = 1.0，
+    # 不是原生的 0.5（密度/坐标映射仍用原生 MPP，见下方数学断言）。
+    assert seen["mpp"] == pytest.approx(1.0) and seen["diameter_um"] == 9
     result = r.get_json()["result"]
     assert result["capability"] == "count_cells"
     assert result["analysis_id"].startswith("cpose-")
@@ -685,25 +690,421 @@ def test_count_cells_contract_violation(monkeypatch):
     assert r.get_json()["error"]["code"] == "inference_contract"
 
 
-def test_count_cells_size_cap(monkeypatch):
-    """count 目标 0.5 µm/px（env 可调），且不超源长边/1024 上限。"""
+def _stub_read(monkeypatch, mod, region):
+    """替换平台 region 读取（无 1024 长边断言；count 可按计划读到 2048）。"""
+    seen = {}
+
+    def _read(slide, args, edge, delegated, jwt, slide_id=None):
+        seen["edge"] = edge
+        return b"img", region
+
+    monkeypatch.setattr(mod, "_platform_read_region", _read)
+    return seen
+
+
+def test_count_render_plan_math(monkeypatch):
+    """R2 重设计：渲染尺度 = max(原生, d/30)，resolution 只是处理长边上限。"""
     mod = _load_backend(monkeypatch)
-    assert mod._CELLPOSE_TARGET_MPP == pytest.approx(0.5)
-    # 512px @0.5mpp → 512（恰目标，原生内）
-    edge, coarse = mod._target_long_edge(512, 512, 0.5,
-                                         target_mpp=mod._CELLPOSE_TARGET_MPP)
-    assert edge == 512 and coarse is False
-    # 2048px @0.25mpp → want 1024 = 目标恰达（0.5µm/px 输出）→ 不算粗
-    edge, coarse = mod._target_long_edge(2048, 2048, 0.25,
-                                         target_mpp=mod._CELLPOSE_TARGET_MPP)
-    assert edge == 1024 and coarse is False
-    # 4096px @0.25mpp → want 2048 > 1024 合同上限 → 粗于目标（警告）
-    edge, coarse = mod._target_long_edge(4096, 4096, 0.25,
-                                         target_mpp=mod._CELLPOSE_TARGET_MPP)
-    assert edge == 1024 and coarse is True
-    # segment_region 仍用 0.25 目标（不受 count 目标影响）
-    edge, _ = mod._target_long_edge(1000, 800, 0.25)
-    assert edge == 1000
+    assert mod._COUNT_RESOLUTIONS == (512, 1024, 2048)
+    assert mod._COUNT_RESOLUTION_DEFAULT == 2048
+    # 细于处理尺度（native 0.2 < 7/30≈0.2333）：按 d/30 渲染、rescale=1
+    plan = mod._count_render_plan(1000, 800, 0.2, 7.0, 1024)
+    assert plan["mpp_render"] == pytest.approx(7.0 / 30.0)
+    assert plan["edge_long"] == 858   # ceil(1000×0.2×30/7)
+    assert plan["edge_short_req"] == 686
+    assert plan["rescale"] == pytest.approx(1.0)
+    assert plan["native_clamped"] is False
+    # 原生粗于处理尺度（native 0.5）：按原生渲染、模型内部上采样 30×0.5/7
+    plan = mod._count_render_plan(600, 400, 0.5, 7.0, 1024)
+    assert plan["mpp_render"] == pytest.approx(0.5)
+    assert plan["edge_long"] == 600
+    assert plan["rescale"] == pytest.approx(30.0 * 0.5 / 7.0)
+    assert plan["native_clamped"] is True
+    # null mpp：按所选选项长边渲染（钳到源长边），rescale 1.0
+    plan = mod._count_render_plan(4096, 2000, None, 7.0, 1024)
+    assert plan["edge_long"] == 1024 and plan["rescale"] == 1.0
+    plan = mod._count_render_plan(500, 300, None, 7.0, 2048)
+    assert plan["edge_long"] == 500
+
+
+def test_count_max_roi_table(monkeypatch):
+    """d=7、原生细于处理尺度（0.2 < 7/30）时各选项最大视场：
+    119.5/238.9/477.9 µm；原生更粗（0.25）时按原生渲染、上限随之增大。"""
+    mod = _load_backend(monkeypatch)
+    for res, um in ((512, 119.4667), (1024, 238.9333), (2048, 477.8667)):
+        max_um, max_l0 = mod._count_max_roi(0.2, 7.0, res)
+        assert max_um == pytest.approx(um, abs=1e-3)
+        assert max_l0 == math.floor(max_um / 0.2)
+    # 原生 0.25 > 7/30：mpp_render = 原生 → 上限 = resolution×0.25
+    max_um, max_l0 = mod._count_max_roi(0.25, 7.0, 1024)
+    assert max_um == pytest.approx(256.0)
+    assert max_l0 == 1024
+
+
+def test_count_cells_validates_resolution(monkeypatch):
+    """resolution 只接受固定枚举（512/1024/2048），其余 400。"""
+    mod = _load_backend(monkeypatch)
+    for bad in (768, "1024", True, 1024.0, 0):
+        r = _call(mod, dict(COUNT_ARGS, resolution=bad),
+                  capability="count_cells")
+        assert r.status_code == 400, bad
+        assert r.get_json()["error"]["code"] == "invalid_request"
+
+
+def test_count_cells_exceeds_option_rejected_before_region_read(monkeypatch):
+    """所需处理长边超过选项：读 ROI **之前** 400 resource_limit（R2 重设计）。
+
+    2048 level-0 px @0.25、d=7 → 处理尺度 0.2333 粗于原生 → 按原生渲染需要
+    2048 px 长边 > 显式选择的 1024 选项；不做「渲染到 1024 再让模型放大
+    30/14 倍」（缺省 2048 时同一 ROI 会放行，见 reviewer 回归）。
+    """
+    mod = _load_backend(monkeypatch)
+    reads = []
+
+    def _read(*a, **kw):
+        reads.append(a)
+        return b"img", _region_payload(1024, 1024, (0, 0, 2048, 2048))
+
+    _stub_platform(monkeypatch, mod, mpp=0.25)
+    monkeypatch.setattr(mod, "_platform_read_region", _read)
+    monkeypatch.setattr(mod, "_infer_cellpose",
+                        lambda *a, **kw: _count_response())
+    r = _call(mod, {"x": 0, "y": 0, "w": 2048, "h": 2048, "resolution": 1024},
+              capability="count_cells")
+    assert r.status_code == 400
+    err = r.get_json()["error"]
+    assert err["code"] == "resource_limit"
+    assert err["extra"]["resolution"] == 1024
+    assert err["extra"]["diameter_um"] == 7.0
+    # 原生 0.25 > d/30 → mpp_render = 原生：上限 = resolution×native
+    assert err["extra"]["max_roi_um"] == [256.0, 256.0]
+    assert err["extra"]["max_roi_level0_px"] == [1024, 1024]
+    assert reads == [], "must reject before any region read"
+
+
+def test_count_cells_resolution_2048_fits_big_roi(monkeypatch):
+    """同一 ROI 选 2048 选项即可处理：渲染长边 2048、R3 推理 mpp 不变。"""
+    mod = _load_backend(monkeypatch)
+    seen = {}
+
+    def _infer(image_png_bytes, mpp_arg, diameter_um=None, model=None):
+        seen["mpp"] = mpp_arg
+        return _count_response()
+
+    _stub_platform(monkeypatch, mod, mpp=0.25)
+    seen_edge = _stub_read(monkeypatch, mod,
+                           _region_payload(1024, 1024, (0, 0, 2048, 2048)))
+    monkeypatch.setattr(mod, "_infer_cellpose", _infer)
+    r = _call(mod, {"x": 0, "y": 0, "w": 2048, "h": 2048, "resolution": 2048},
+              capability="count_cells")
+    assert r.status_code == 200, r.get_json()
+    assert seen_edge["edge"] == 2048
+    assert seen["mpp"] == pytest.approx(0.5)
+    result = r.get_json()["result"]
+    assert result["resolution"] == 2048
+    assert result["rendered"]["requested_long_edge"] == 2048
+
+
+def test_count_cells_inference_mpp_from_actual_scale(monkeypatch):
+    """R3：推理 mpp = 原生 × 实际渲染缩放；原生 MPP 仍用于密度映射。"""
+    mod = _load_backend(monkeypatch)
+    seen = {}
+
+    def _infer(image_png_bytes, mpp_arg, diameter_um=None, model=None):
+        seen["mpp"] = mpp_arg
+        return _count_response()
+
+    _stub_platform(monkeypatch, mod, mpp=0.25)
+    seen_edge = _stub_read(monkeypatch, mod,
+                           _region_payload(1024, 1024, (0, 0, 2048, 2048)))
+    monkeypatch.setattr(mod, "_infer_cellpose", _infer)
+    r = _call(mod, {"x": 0, "y": 0, "w": 2048, "h": 2048, "resolution": 2048},
+              capability="count_cells")
+    assert r.status_code == 200, r.get_json()
+    assert seen_edge["edge"] == 2048
+    assert seen["mpp"] == pytest.approx(0.5)
+    result = r.get_json()["result"]
+    assert result["inference_input"]["mpp"] == pytest.approx(0.5)
+    assert result["inference_input"]["mpp_render"] == pytest.approx(0.25)
+    assert result["inference_input"]["scale"] == {"x": 2.0, "y": 2.0}
+    # 原生 MPP 映射密度：ROI = (2048·0.25/1000)² mm²
+    assert result["mpp"]["x"] == pytest.approx(0.25)
+    assert result["density"]["roi_area_mm2"] == pytest.approx(0.262144)
+
+
+def test_count_cells_render_at_processing_scale(monkeypatch):
+    """细于处理尺度的切片（native 0.2 < 7/30）：按 d/30 渲染、推理 mpp 即
+    处理尺度（rescale≈1，模型不再缩放）。"""
+    mod = _load_backend(monkeypatch)
+    seen = {}
+
+    def _infer(image_png_bytes, mpp_arg, diameter_um=None, model=None):
+        seen["mpp"] = mpp_arg
+        return _count_response()
+
+    # 平台按 max_long_edge=858 保宽高比渲染：out = (858, round(800·858/1000))
+    _stub_platform(monkeypatch, mod, mpp=0.2)
+    seen_edge = _stub_read(monkeypatch, mod,
+                           _region_payload(858, 686, (0, 0, 1000, 800)))
+    monkeypatch.setattr(mod, "_infer_cellpose", _infer)
+    r = _call(mod, {"x": 0, "y": 0, "w": 1000, "h": 800},
+              capability="count_cells")
+    assert r.status_code == 200, r.get_json()
+    assert seen_edge["edge"] == 858
+    assert seen["mpp"] == pytest.approx(7.0 / 30.0, rel=0.01)
+    result = r.get_json()["result"]
+    assert result["inference_input"]["mpp_render"] == pytest.approx(7.0 / 30.0)
+    # 预算防御（实际几何）：rescale = 30×infer_mpp/7 ≈ 1
+    assert seen["mpp"] == pytest.approx(0.2 * 1000 / 858, rel=1e-3)
+
+
+def test_count_cells_native_coarser_renders_at_native(monkeypatch):
+    """原生粗于处理尺度：按原生渲染（不上采样超过原生），模型内部放大并在
+    结果中给出 warning。"""
+    mod = _load_backend(monkeypatch)
+    seen = {}
+
+    def _infer(image_png_bytes, mpp_arg, diameter_um=None, model=None):
+        seen["mpp"] = mpp_arg
+        return _count_response()
+
+    _stub_platform(monkeypatch, mod, mpp=0.5)
+    seen_edge = _stub_read(monkeypatch, mod,
+                           _region_payload(600, 400, (0, 0, 600, 400)))
+    monkeypatch.setattr(mod, "_infer_cellpose", _infer)
+    r = _call(mod, {"x": 0, "y": 0, "w": 600, "h": 400},
+              capability="count_cells")
+    assert r.status_code == 200, r.get_json()
+    assert seen_edge["edge"] == 600
+    assert seen["mpp"] == pytest.approx(0.5)
+    result = r.get_json()["result"]
+    assert result["inference_input"]["mpp_render"] == pytest.approx(0.5)
+    assert any("上采样" in w for w in result["warnings"])
+
+
+def test_count_cells_mpp_null_uses_option_edge(monkeypatch):
+    """null mpp：按所选 resolution 长边渲染（钳到源长边），算力 = edge²。"""
+    mod = _load_backend(monkeypatch)
+    monkeypatch.setattr(mod, "_infer_cellpose",
+                        lambda *a, **kw: _count_response())
+    _stub_platform(monkeypatch, mod, mpp=None)
+    # 显式 1024 选项
+    seen = _stub_read(monkeypatch, mod,
+                      _region_payload(1024, 500, (0, 0, 4096, 2000)))
+    r = _call(mod, {"x": 0, "y": 0, "w": 4096, "h": 2000, "resolution": 1024},
+              capability="count_cells")
+    assert r.status_code == 200, r.get_json()
+    assert seen["edge"] == 1024
+    # 缺省 2048 选项
+    seen = _stub_read(monkeypatch, mod,
+                      _region_payload(2048, 1000, (0, 0, 4096, 2000)))
+    r = _call(mod, {"x": 0, "y": 0, "w": 4096, "h": 2000},
+              capability="count_cells")
+    assert r.status_code == 200, r.get_json()
+    assert seen["edge"] == 2048
+    # 源长边钳制
+    seen = _stub_read(monkeypatch, mod,
+                      _region_payload(500, 300, (0, 0, 500, 300)))
+    r = _call(mod, {"x": 0, "y": 0, "w": 500, "h": 300},
+              capability="count_cells")
+    assert r.status_code == 200, r.get_json()
+    assert seen["edge"] == 500
+
+
+def test_count_cells_no_scale_inference_mpp_native(monkeypatch):
+    """无缩放（src==out）→ 推理 mpp == 原生 MPP。"""
+    mod = _load_backend(monkeypatch)
+    seen = {}
+
+    def _infer(image_png_bytes, mpp_arg, diameter_um=None, model=None):
+        seen["mpp"] = mpp_arg
+        return _count_response()
+
+    _stub_platform(monkeypatch, mod, mpp=0.5,
+                   region=_region_payload(64, 64, (0, 0, 64, 64)))
+    monkeypatch.setattr(mod, "_infer_cellpose", _infer)
+    r = _call(mod, COUNT_ARGS, capability="count_cells")
+    assert r.status_code == 200, r.get_json()
+    assert seen["mpp"] == pytest.approx(0.5)
+
+
+def test_count_cells_scale_from_actual_src_after_clamp(monkeypatch):
+    """边缘夹取：scale 按实际返回的 src/输出算，不用请求的目标长边。"""
+    mod = _load_backend(monkeypatch)
+    seen = {}
+
+    def _infer(image_png_bytes, mpp_arg, diameter_um=None, model=None):
+        seen["mpp"] = mpp_arg
+        return _count_response()
+
+    # 请求 2048×64 @0.25 → 处理长边 2048；平台夹取后返回 src 512×32 → 256×16
+    _stub_platform(monkeypatch, mod, mpp=0.25)
+    seen_edge = _stub_read(monkeypatch, mod,
+                           _region_payload(256, 16, (0, 0, 512, 32)))
+    monkeypatch.setattr(mod, "_infer_cellpose", _infer)
+    r = _call(mod, {"x": 0, "y": 0, "w": 2048, "h": 64, "resolution": 2048},
+              capability="count_cells")
+    assert r.status_code == 200, r.get_json()
+    assert seen_edge["edge"] == 2048
+    assert seen["mpp"] == pytest.approx(0.5)
+    result = r.get_json()["result"]
+    assert result["inference_input"]["scale"] == {"x": 2.0, "y": 2.0}
+
+
+def test_count_cells_non_square_scale(monkeypatch):
+    """长宽不等 ROI：两轴各自按实际 src/输出取整后的缩放一致。"""
+    mod = _load_backend(monkeypatch)
+    seen = {}
+
+    def _infer(image_png_bytes, mpp_arg, diameter_um=None, model=None):
+        seen["mpp"] = mpp_arg
+        return _count_response()
+
+    _stub_platform(monkeypatch, mod, mpp=0.25)
+    seen_edge = _stub_read(monkeypatch, mod,
+                           _region_payload(1024, 512, (0, 0, 2048, 1024)))
+    monkeypatch.setattr(mod, "_infer_cellpose", _infer)
+    r = _call(mod, {"x": 0, "y": 0, "w": 2048, "h": 1024, "resolution": 2048},
+              capability="count_cells")
+    assert r.status_code == 200, r.get_json()
+    assert seen_edge["edge"] == 2048
+    assert seen["mpp"] == pytest.approx(0.5)
+    result = r.get_json()["result"]
+    assert result["inference_input"]["scale"] == {"x": 2.0, "y": 2.0}
+    assert result["rendered"]["width"] == 1024
+    assert result["rendered"]["height"] == 512
+
+
+def test_count_cells_anisotropic_scale_rejected(monkeypatch):
+    """真各向异常（输出不是 src 的等比 round）→ 拒绝（单一 MPP 不猜测）。"""
+    mod = _load_backend(monkeypatch)
+    _stub_platform(monkeypatch, mod, mpp=0.25)
+    seen_edge = _stub_read(monkeypatch, mod,
+                           _region_payload(1024, 900, (0, 0, 2048, 2048)))
+    monkeypatch.setattr(mod, "_infer_cellpose",
+                        lambda *a, **kw: _count_response())
+    r = _call(mod, {"x": 0, "y": 0, "w": 2048, "h": 2048, "resolution": 2048},
+              capability="count_cells")
+    assert r.status_code == 400
+    assert r.get_json()["error"]["code"] == "anisotropic_scale"
+
+
+def test_count_cells_small_roi_rounding_tolerated(monkeypatch):
+    """小 ROI 的合法短轴取整不再误拒：native 0.12、bbox 100×30、d=7 →
+    处理尺度 0.2333 渲染长边 52，平台 round 短边 16（两轴 mpp 相对差
+    ≈2.5%，旧 >1% 口径会误拒）→ 正常计数，推理 mpp 取两轴均值。"""
+    mod = _load_backend(monkeypatch)
+    seen = {}
+
+    def _infer(image_png_bytes, mpp_arg, diameter_um=None, model=None):
+        seen["mpp"] = mpp_arg
+        return _count_response()
+
+    _stub_platform(monkeypatch, mod, mpp=0.12)
+    seen_edge = _stub_read(monkeypatch, mod,
+                           _region_payload(52, 16, (0, 0, 100, 30)))
+    monkeypatch.setattr(mod, "_infer_cellpose", _infer)
+    r = _call(mod, {"x": 0, "y": 0, "w": 100, "h": 30},
+              capability="count_cells")
+    assert r.status_code == 200, r.get_json()
+    assert seen_edge["edge"] == 52  # ceil(100×0.12×30/7)
+    # 两轴均值：mpp_x = 0.12×100/52，mpp_y = 0.12×30/16
+    assert seen["mpp"] == pytest.approx((0.12 * 100 / 52 + 0.12 * 30 / 16) / 2)
+    result = r.get_json()["result"]
+    assert result["inference_input"]["mpp"] == pytest.approx(
+        (0.12 * 100 / 52 + 0.12 * 30 / 16) / 2)
+
+
+def test_count_cells_resource_limit_before_inference(monkeypatch):
+    """原生粗于处理尺度时处理预算可成为紧约束：超预算在读图前拒绝，引导按
+    真实物理（缩小 ROI/增大直径），不建议调 resolution；增大直径后放行。"""
+    mod = _load_backend(monkeypatch)
+    calls = []
+    reads = []
+
+    def _infer(image_png_bytes, mpp_arg, **kw):
+        calls.append(mpp_arg)
+        return _count_response()
+
+    def _read(*a, **kw):
+        reads.append(a)
+        return b"img", _region_payload(1024, 1024, (0, 0, 1024, 1024))
+
+    # 原生 2.0 µm/px、1024² level-0（缺省 2048 选项内）：处理尺度 0.2333
+    # 粗于原生 → 按原生渲染 1024 长边，但模型内部放大 30×2/7≈8.57×
+    # → 8778² ≈ 77M px
+    _stub_platform(monkeypatch, mod, mpp=2.0)
+    monkeypatch.setattr(mod, "_platform_read_region", _read)
+    monkeypatch.setattr(mod, "_infer_cellpose", _infer)
+    r = _call(mod, {"x": 0, "y": 0, "w": 1024, "h": 1024},
+              capability="count_cells")
+    assert r.status_code == 400
+    err = r.get_json()["error"]
+    assert err["code"] == "resource_limit"
+    assert err["extra"]["budget_pixels"] == mod._CELLPOSE_MAX_SCALED_PIXELS
+    assert "diameter" in err["message"]
+    assert "resolution 无法" in err["message"]
+    assert reads == [] and calls == [], "reject before region read/inference"
+
+    # 直径 30 → rescale = 30×2/30 = 2 → 2048² = 4.19M px，预算内放行
+    r2 = _call(mod, {"x": 0, "y": 0, "w": 1024, "h": 1024, "diameter_um": 30},
+               capability="count_cells")
+    assert r2.status_code == 200, r2.get_json()
+    assert calls == [2.0]
+    assert len(reads) == 1
+
+
+def test_count_cells_service_resource_limit_mapping(monkeypatch):
+    """服务端双保险 400 resource_limit → 透传同码（不是 invalid_argument）。"""
+    mod = _load_backend(monkeypatch)
+    _stub_platform(monkeypatch, mod)
+    monkeypatch.setattr(mod, "requests", _CellposeStubRequests({
+        "POST /v1/count": (400, {"error": "resource_limit",
+                                 "message": "upscaled beyond budget"})}))
+    r = _call(mod, COUNT_ARGS, capability="count_cells")
+    assert r.status_code == 400
+    assert r.get_json()["error"]["code"] == "resource_limit"
+
+
+def test_count_cells_mpp_invalid_normalized(monkeypatch):
+    """R4：原生 MPP ≤0 / 非有限 → 规范为缺失（null）。"""
+    mod = _load_backend(monkeypatch)
+    assert mod._normalize_mpp(0.0) is None
+    assert mod._normalize_mpp(-0.5) is None
+    assert mod._normalize_mpp("abc") is None
+    assert mod._normalize_mpp(float("nan")) is None
+    assert mod._normalize_mpp(0.25) == pytest.approx(0.25)
+
+
+def test_count_cells_mpp_invalid_normalized(monkeypatch):
+    """R4：原生 MPP ≤0 / 非有限 → 规范为缺失（null）。"""
+    mod = _load_backend(monkeypatch)
+    assert mod._normalize_mpp(0.0) is None
+    assert mod._normalize_mpp(-0.5) is None
+    assert mod._normalize_mpp("abc") is None
+    assert mod._normalize_mpp(float("nan")) is None
+    assert mod._normalize_mpp(0.25) == pytest.approx(0.25)
+
+
+def test_count_cells_mpp_zero_sends_null_and_pixel_only(monkeypatch):
+    """原生 MPP=0（无效）→ 推理收 null、结果仅像素口径。"""
+    mod = _load_backend(monkeypatch)
+    seen = {}
+
+    def _infer(image_png_bytes, mpp_arg, diameter_um=None, model=None):
+        seen["mpp"] = mpp_arg
+        return _count_response()
+
+    _stub_platform(monkeypatch, mod, mpp=0.0)
+    monkeypatch.setattr(mod, "_infer_cellpose", _infer)
+    r = _call(mod, COUNT_ARGS, capability="count_cells")
+    assert r.status_code == 200, r.get_json()
+    assert seen["mpp"] is None
+    result = r.get_json()["result"]
+    assert result["density"]["per_mm2"] is None
+    assert result["area_stats_um2"] is None
+    assert result["inference_input"]["mpp"] is None
+    assert any("MPP" in w for w in result["warnings"])
 
 
 if __name__ == "__main__":

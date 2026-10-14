@@ -23,7 +23,7 @@ const CREDS = JSON.parse(readFileSync(
   baseUrl: string; ownerLogin: string; ownerPassword: string;
   userLogin: string; userPassword: string;
 };
-const SHOT_DIR = process.env.E2E_SHOT_DIR || "./gui-test-screenshots";
+const SHOT_DIR = process.env.E2E_SHOT_DIR || join(tmpdir(), "gui-test-screenshots");
 const RUN = "fx" + Date.now().toString(36);
 
 test.beforeEach(async ({ page }) => {
@@ -132,7 +132,8 @@ test.describe("folder-experience：刷新恢复 / 导入默认目标 / 深链定
     // —— 进入文件夹 A，导入抽屉目标默认 A（最新授权列表 + can_write）——
     // 文件夹卡在首页（文件夹卡排前）；先翻回第 1 页
     await page.locator("#fb-prev-btn").click();
-    await expect(pageInfo).toContainText("1/" + totalPages);
+    // 刷新后侧栏可用高度可能不同，总页数随之变化：只锚当前页
+    await expect(pageInfo).toContainText(/^1\//);
     await page.locator('.fb-folder[data-pid="' + folderA + '"]').click();
     await expect(page.locator("#fb-location")).toContainText("-肺组织");
     await page.locator("#fb-plus-btn").click();

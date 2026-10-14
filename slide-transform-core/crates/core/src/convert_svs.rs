@@ -17,7 +17,12 @@
 //! every tile is decoded (bounded codestream-header cross-check →
 //! hayro-jpeg2000 → validated YCbCr→RGB for 33003 / direct RGB for 33005)
 //! and re-encoded with the current JPEG-in-TIFF writer in BOTH encoding
-//! modes. Each mode reuses its own LOCKED parameters:
+//! modes. Review round 2 (F1): the declared TileByteCount is part of the
+//! per-tile memory admission — the codestream header is read with a bounded
+//! (≤ [`crate::jp2k::HEADER_PROBE_BYTES`]) prefix, and the compressed payload
+//! residency is charged TOGETHER with the decode/re-encode working set
+//! against the budget BEFORE the full payload is read; the resume recovery
+//! path reads the header only. Each mode reuses its own LOCKED parameters:
 //!   - preserve-source-v1 → the JP2K high-fidelity re-encode family
 //!     (quality 96, 4:2:2, standard Annex-K Huffman,
 //!     `aperio-jp2k-reencode:q96:y422:hstd:v1`);
@@ -488,40 +493,35 @@ fn li_of(lv: &SvsLevel) -> u32 {
 /// F2: JPEG 2000 re-encode of one SVS source tile (BOTH encoding modes —
 /// a JP2K source has no passthrough path).
 ///
-/// The payload is first cross-checked against the level's codestream-header
-/// contract (bounded `parse_header`; dims within the nominal tile rect,
-/// identical component count / bit depth / sampling / MCT / decomposition
-/// levels), then decoded to interleaved RGB8 (one buffer at a time) with
-/// the contract's colour duty. A codestream smaller than the nominal tile
-/// rect is pasted onto a white tile_w×tile_h canvas (compact padding
-/// semantics); the boolean reports the padding so the caller records the
-/// edge region.
+/// F1 (review round 2): the CALLER has already (a) read the codestream header
+/// with the bounded [`read_jp2k_header_bounded`] read, (b) cross-checked it
+/// against the level contract and (c) run the combined payload + working-set
+/// admission BEFORE the full payload was read; the parsed header and the
+/// colour duty travel with the payload so this function re-parses nothing.
+/// The charge below re-runs the working-set half of that admission as defense
+/// in depth for any future caller that skips the pre-read gate.
+///
+/// The tile is decoded to interleaved RGB8 (one buffer at a time) with the
+/// contract's colour duty. A codestream smaller than the nominal tile rect is
+/// pasted onto a white tile_w×tile_h canvas (compact padding semantics); the
+/// boolean reports the padding so the caller records the edge region.
 #[allow(clippy::too_many_arguments)]
 fn jp2k_reencode_tile(
     payload: &[u8],
+    hdr: &crate::jp2k::Jp2kHeader,
+    color: crate::jp2k::Jp2kColor,
     lv: &SvsLevel,
     cfg: &crate::jpeg::EncoderCfg,
     memory_budget_bytes: u64,
 ) -> CoreResult<(Vec<u8>, u32, u32)> {
-    let contract = lv.jp2k_contract.as_ref().ok_or_else(|| {
-        CoreError::validation("jp2k: 层缺少 codestream 契约（probe 未运行）")
-    })?;
-    let hdr = crate::jp2k::parse_header(payload)?;
-    let color = crate::jp2k::check_against_contract(
-        &hdr,
-        contract,
-        contract_color_compression(contract),
-        lv.tile_w,
-        lv.tile_h,
-    )?;
     // Review R1: charge THIS tile's real codestream geometry against the host
-    // budget BEFORE the decode/encode allocations. The plan-time check used
-    // the nominal contract; here the actual header (which may be a smaller
-    // cropped edge tile, or — if the contract check above ever passed — the
-    // same size) decides the padded-canvas term. A malicious over-budget
-    // header is rejected without the decoder ever being invoked.
+    // budget BEFORE the decode/encode allocations (the compressed payload term
+    // was already admitted pre-read by the caller — see the F1 gate in the
+    // tile loop). A malicious over-budget header is rejected without the
+    // decoder ever being invoked.
     crate::jp2k::peak::charge_against_budget(
         memory_budget_bytes,
+        0, // the payload residency is admitted by the pre-read F1 gate
         hdr.components as u64,
         hdr.width as u64,
         hdr.height as u64,
@@ -547,6 +547,41 @@ fn jp2k_reencode_tile(
     }
     let jpg = crate::jpeg::encode_rgb(&canvas, lv.tile_w, lv.tile_h, cfg)?;
     Ok((jpg, decoded.width, decoded.height))
+}
+
+/// F1 (review round 2): bounded JPEG 2000 header read for the tile declared
+/// at `(off, len)`.
+///
+/// `parse_header` never inspects more than
+/// [`crate::jp2k::HEADER_PROBE_BYTES`] bytes of a codestream (its marker walk
+/// fails with a typed error at the window edge), so a caller that only needs
+/// the header must not honour the declared TileByteCount — that number is
+/// host-controlled input and can demand a read of hundreds of MiB BEFORE any
+/// budget admission has run. The read here is capped at the probe window (or
+/// the declared length, whichever is smaller), with a checked u64→usize
+/// conversion; a header that needs more than the cap is the SAME typed
+/// failure as before, minus the unbounded read. Returns the prefix (which IS
+/// the whole payload whenever `len ≤` the cap) so the caller can reuse it
+/// instead of re-reading.
+fn read_jp2k_header_bounded(
+    src: &dyn ByteSource,
+    off: u64,
+    len: u64,
+) -> CoreResult<(Vec<u8>, crate::jp2k::Jp2kHeader)> {
+    let want = len.min(crate::jp2k::HEADER_PROBE_BYTES as u64);
+    let want = usize::try_from(want)
+        .map_err(|_| CoreError::resource_limit(format!("JPEG 2000 tile 长度 {len} 越界")))?;
+    let prefix = src.read_at(off, want)?;
+    let hdr = crate::jp2k::parse_header(&prefix)?;
+    Ok((prefix, hdr))
+}
+
+/// F1 (review round 2): the checked u64→usize conversion every full payload
+/// read must pass (the WASM build is 32-bit: a declared length beyond the
+/// address space is a typed refusal, never a silent truncation).
+fn payload_len_checked(len: u64) -> CoreResult<usize> {
+    usize::try_from(len)
+        .map_err(|_| CoreError::resource_limit(format!("JPEG 2000 tile 长度 {len} 超出地址空间")))
 }
 
 /// The Aperio compression tag implied by a probed contract (a pure mirror
@@ -638,7 +673,23 @@ fn reconstruct_cells_svs(
         let col = cell % lv.tiles_across as u64;
         let is_edge = row + 1 == lv.tiles_down as u64 || col + 1 == lv.tiles_across as u64;
         if is_edge {
-            let payload = src.read_at(off, len as usize)?;
+            // F1 (review round 2): the JP2K recovery path needs the HEADER
+            // only — the read is bounded by HEADER_PROBE_BYTES (checked
+            // conversion) instead of the declared TileByteCount, so the
+            // committed-cell rescan cannot be turned into a large allocation
+            // by a hostile byte count. (`parse_header` never looks past the
+            // probe window, so this cannot change any parse outcome.)
+            let payload = if jp2k {
+                src.read_at(
+                    off,
+                    usize::try_from(len.min(crate::jp2k::HEADER_PROBE_BYTES as u64))
+                        .map_err(|_| {
+                            CoreError::resource_limit(format!("JPEG 2000 tile 长度 {len} 越界"))
+                        })?,
+                )?
+            } else {
+                src.read_at(off, len as usize)?
+            };
             if jp2k {
                 // bounded header parse only — resume bookkeeping must not
                 // pay a full decode for already-committed cells
@@ -814,11 +865,13 @@ fn convert_inner(
     // IDWT, RGB, padded canvas, JPEG encoder). Charge the conservative
     // one-tile peak of every level against the host memory budget HERE, at
     // plan/probe time from the level CONTRACT (the first-tile header), so an
-    // over-budget input is refused before any writer/output exists. This is the
-    // early, best-effort gate; the per-tile path re-charges the REAL codestream
-    // header against the nominal tile rect (which bounds the padded canvas and
-    // encoder terms) before that tile's allocation — that is the hard gate for
-    // a container whose later tile is larger than its first.
+    // over-budget input is refused before any writer/output exists. This is
+    // the early, best-effort gate (payload term 0: the declared TileByteCounts
+    // are admitted per tile below): the per-tile path re-charges the REAL
+    // codestream header TOGETHER with the tile's declared compressed payload
+    // BEFORE that payload is read — the mandatory hard gate for a container
+    // whose later tiles are larger than the first or declare huge byte counts
+    // (review round 2, F1).
     if is_jp2k {
         for (li, lv) in levels.iter().enumerate() {
             let contract = lv.jp2k_contract.as_ref().ok_or_else(|| {
@@ -826,6 +879,7 @@ fn convert_inner(
             })?;
             crate::jp2k::peak::charge_against_budget(
                 plan.limits.memory_budget_bytes,
+                0,
                 contract.components as u64,
                 contract.width as u64,
                 contract.height as u64,
@@ -957,7 +1011,6 @@ fn convert_inner(
             job.check()?;
             let row = cell / lv.tiles_across as u64;
             let col = cell % lv.tiles_across as u64;
-            let payload = src.read_at(off, len as usize)?;
             // F2: one decode/encode working set at a time — the JP2K path
             // decodes straight into the per-tile RGB buffer and the encoded
             // bytes go to the sink immediately; cancellation is checked per
@@ -970,8 +1023,47 @@ fn convert_inner(
                 } else {
                     &jp2k_cfg
                 };
+                // F1 (review round 2): admission BEFORE the payload read.
+                // (1) bounded header read — at most HEADER_PROBE_BYTES, never
+                //     the declared TileByteCount;
+                let (prefix, hdr) = read_jp2k_header_bounded(src, off, len)?;
+                // (2) contract cross-check on the real header — still before
+                //     any full-payload allocation;
+                let contract = lv.jp2k_contract.as_ref().expect("jp2k contract");
+                let color = crate::jp2k::check_against_contract(
+                    &hdr,
+                    contract,
+                    contract_color_compression(contract),
+                    lv.tile_w,
+                    lv.tile_h,
+                )?;
+                // (3) ONE combined admission: the declared compressed payload
+                //     residency (checked u64, attacker-controlled) PLUS the
+                //     decode/re-encode working set the header implies, against
+                //     the budget net of the reserve. `len` vs budget alone is
+                //     NOT sufficient — the payload and the working set are
+                //     resident at the same time.
+                crate::jp2k::peak::charge_against_budget(
+                    plan.limits.memory_budget_bytes,
+                    len,
+                    hdr.components as u64,
+                    hdr.width as u64,
+                    hdr.height as u64,
+                    lv.tile_w as u64,
+                    lv.tile_h as u64,
+                    &format!("JPEG2000 tile({row},{col}) 压缩载荷 {len} B + 解码/编码工作集"),
+                )?;
+                // (4) only now the full payload: checked conversion, and the
+                // bounded prefix is reused verbatim when it already covers
+                // the whole tile.
+                let payload_len = payload_len_checked(len)?;
+                let payload = if payload_len <= prefix.len() {
+                    prefix
+                } else {
+                    src.read_at(off, payload_len)?
+                };
                 let (encoded, src_w, src_h) =
-                    jp2k_reencode_tile(&payload, lv, cfg, plan.limits.memory_budget_bytes)?;
+                    jp2k_reencode_tile(&payload, &hdr, color, lv, cfg, plan.limits.memory_budget_bytes)?;
                 let interior = row + 1 < lv.tiles_down as u64 && col + 1 < lv.tiles_across as u64;
                 if src_w != lv.tile_w || src_h != lv.tile_h {
                     if interior {
@@ -987,6 +1079,7 @@ fn convert_inner(
                 data = encoded;
                 stats.tiles_reencoded += 1;
             } else {
+                let payload = src.read_at(off, len as usize)?;
                 let probe = check_tile(&payload, lv, &head)?;
                 // interior cells must be nominal; boundary cells may be cropped
                 let interior_row = row + 1 < lv.tiles_down as u64;

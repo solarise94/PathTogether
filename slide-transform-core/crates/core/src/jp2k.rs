@@ -94,12 +94,23 @@ pub const DECODER_FEATURES: &str = "scalar (default-features = false)";
 pub const COMPRESSION_JP2K_YCBCR: u64 = 33003;
 pub const COMPRESSION_JP2K_RGB: u64 = 33005;
 
+/// Header bytes the bounded probe ever looks at (real Aperio tile headers
+/// are < 200 B; 64 KiB leaves room for pathological-but-legal marker spray).
+///
+/// PUBLIC read cap (review round 2, F1): a caller that only needs a tile's
+/// codestream HEADER must read at most this many bytes of the declared
+/// payload — never the full TileByteCount, which is host-controlled input
+/// and can declare hundreds of MiB. `parse_header` fails with a typed error
+/// when the marker walk would need bytes beyond this window, so the cap can
+/// never turn a parseable header into a silent truncation: a header that
+/// does not fit is rejected exactly as before, minus the unbounded read.
+pub const HEADER_PROBE_BYTES: usize = 64 * 1024;
+
 /// Hard caps of the bounded header probe (checked arithmetic; every limit is
 /// rejected as a typed error before any allocation).
 mod cap {
-    /// Header bytes the probe ever looks at (real Aperio tile headers are
-    /// < 200 B; 64 KiB leaves room for pathological-but-legal marker spray).
-    pub const PROBE_WINDOW: usize = 64 * 1024;
+    /// Alias of the public [`HEADER_PROBE_BYTES`] (single source of truth).
+    pub const PROBE_WINDOW: usize = super::HEADER_PROBE_BYTES;
     /// A tile codestream is one JPEG 2000 "image" of the TIFF tile's pixels;
     /// the SVS adapter's own tile cap is 8192 px per side.
     pub const MAX_SIDE: u64 = 8192;
@@ -568,19 +579,36 @@ pub struct DecodedTileRgb {
 
 // --------------------------------------------------------------------------- //
 // Review R1: pre-allocation working-set accounting for one JP2K tile.         //
+// Review round 2 (F1): the COMPRESSED payload itself is part of the same      //
+// admission — it is resident alongside the decode/encode working set from the //
+// moment the tile is read, so it is charged together with everything else     //
+// BEFORE the full payload is ever read.                                       //
 // --------------------------------------------------------------------------- //
 //
 // The SVS/JP2K adapter decodes ONE tile at a time, but "one tile" is NOT a     //
 // memory bound: a legal codestream may claim up to MAX_SIDE×MAX_SIDE pixels    //
-// (2²⁶) and the decoder holds several full-resolution f32 planes at the same   //
-// instant. Before the decoder is allowed to allocate, the adapter computes a   //
-// CONSERVATIVE peak of everything live together and charges it against the     //
-// host budget (`plan.limits.memory_budget_bytes`); an over-budget estimate is  //
-// the existing typed `resource_profile_insufficient` refusal (never an OOM).
+// (2²⁶), the decoder holds several full-resolution f32 planes at the same      //
+// instant, and the tile's compressed codestream (the TIFF TileByteCount —      //
+// attacker-controlled, only range-checked against the file) is live at the     //
+// same time. Before the full payload is read and the decoder is allowed to     //
+// allocate, the adapter computes a CONSERVATIVE peak of everything live        //
+// together — declared payload + decode/re-encode working set — and charges it  //
+// against the host budget (`plan.limits.memory_budget_bytes`) via              //
+// `MemBudget::host` (which subtracts [`crate::budget::ADAPTER_RESERVE_BYTES`]  //
+// for the process baseline). An over-budget estimate is the existing typed     //
+// `resource_profile_insufficient` refusal (never an OOM).                      //
 //
 // Derivation of every term (hayro-jpeg2000 0.4.0, the pinned scalar build —
 // see [`DECODER_PEAK_BASIS`]; a decoder version change re-runs this review):
 //
+// * Compressed payload — the declared TileByteCount (`len`), read with a
+//   checked u64→usize conversion and charged as-is: from the moment the tile
+//   is read until its decode finishes, the codestream bytes and the decoder
+//   working set below are resident AT THE SAME TIME, so the admission is one
+//   sum, never `len` vs budget alone. (The `Breakdown` field is u64 and the
+//   sum folds with saturating adds, so a pathological near-u64 declaration
+//   can only ever OVER-estimate — it can never wrap into an "affordable"
+//   figure.)
 // * Decode planes — `DecoderContext::reset` allocates one `SimdBuffer` of
 //   `image_width × image_height` f32 PER COMPONENT (`src/j2c/decode.rs:117`),
 //   i.e. `components × w × h × 4 B`. Subsampled 33003 chroma still gets a
@@ -604,8 +632,25 @@ pub struct DecodedTileRgb {
 //   alongside the RGB buffer (edge tiles).
 // * JPEG encoder — `encode_rgb` builds three full-resolution u8 component
 //   planes (`src/jpeg/encoder.rs`), i.e. `3 × tw × th` at the encode geometry
-//   (`max(w,tile_w) × max(h,tile_h)`, covered by `tw × th`), plus the
-//   entropy-coded output buffer (≤ half the input area, `tw×th/2`).
+//   (`max(w,tile_w) × max(h,tile_h)`, covered by `tw × th`). The entropy
+//   output is NOT bounded by `Vec::with_capacity(w*h/2)`'s argument — that is
+//   only an initial capacity hint and a Rust `Vec` grows on demand. The
+//   justified conservative bound per 8×8 block of the BASELINE encoder with
+//   the standard Annex-K tables and 8-bit samples:
+//     - DC difference category ≤ 11, std DC code ≤ 9 bits → ≤ 20 bits;
+//     - each of the 63 ACs ≤ one 16-bit std run/size code + a ≤ 10-bit
+//       magnitude → ≤ 26 bits;
+//     - block total ≤ 20 + 63×26 = 1658 bits ≤ 208 B, and every 0xFF byte
+//       the bit writer emits is stuffed with an 0x00 (`HuffEncoder::emit_bits`),
+//       which at worst DOUBLES the entropy bytes → ≤ 416 B per 64-sample
+//       block ≤ 6.5 B/sample, rounded up to [`peak::ENCODER_MAX_BPS`] = 7.
+//   With ≤ 3 samples/pixel (4:4:4 worst case; the locked 4:2:2/4:2:0 profiles
+//   are cheaper) the entropy buffer is ≤ 21 B/px, and the final
+//   `out.extend_from_slice(&he.out)` holds the entropy Vec, the grown output
+//   Vec and its previous `w*h/2` capacity allocation at the same instant:
+//   ≤ (21 + 21 + 0.5) B/px, rounded up to [`peak::ENCODER_OUTPUT_BPP`] = 43
+//   B/px of nominal tile area. Headers (~2 KiB) and capacity rounding fall
+//   under the fixed slack.
 // * A fixed [`peak::FIXED_SLACK`] (1 MiB) covers everything not proportional
 //   to pixels: the YCbCr/Huffman/DQT tables, hayro's segment/precinct/tag-tree
 //   metadata and allocator rounding.
@@ -620,9 +665,19 @@ pub mod peak {
     /// pixel (Coefficient u32 + NeighborSignificances u8 + CoefficientState u8
     /// + stripe flags, padded and rounded up).
     pub const DECODER_BITPLANE_BPP: u64 = 8;
-    /// The JPEG entropy-coded output buffer is bounded by half the input area
-    /// (see `encode_rgb`'s `Vec::with_capacity(w*h/2 + …)`).
-    pub const ENCODER_OUTPUT_DIV: u64 = 2;
+    /// Worst-case entropy-coded BASELINE JPEG output per SAMPLE, in bytes
+    /// (see the derivation above: ≤ 208 B per 8×8 block with the standard
+    /// Annex-K tables, doubled by worst-case 0xFF byte stuffing → 6.5 B per
+    /// sample, rounded up). This bounds the GROWN `HuffEncoder` buffer — the
+    /// `Vec::with_capacity` argument is only a hint and never a bound.
+    pub const ENCODER_MAX_BPS: u64 = 7;
+    /// Conservative ceiling of the whole encode transient per PIXEL of the
+    /// nominal tile area: entropy buffer (≤ 3 samples ×
+    /// [`ENCODER_MAX_BPS`]) + the grown assembling output Vec + its previous
+    /// `w×h/2` capacity still live during the final extend
+    /// (≤ 21 + 21 + 0.5 B/px, rounded up). Replaces the wrong
+    /// `tw×th/2` "upper bound" (review round 2, item 4).
+    pub const ENCODER_OUTPUT_BPP: u64 = 43;
     /// Non-pixel-proportional slack (tables, decoder metadata, allocator).
     pub const FIXED_SLACK: u64 = 1 << 20;
 
@@ -630,6 +685,10 @@ pub mod peak {
     /// tests can assert each term and the docs can cite the derivation).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Breakdown {
+        /// The declared compressed payload (TIFF TileByteCount) — resident
+        /// alongside everything below from the moment the tile is read
+        /// (review round 2, F1).
+        pub compressed_payload: u64,
         pub decode_planes: u64,
         pub storage_coefficients: u64,
         pub idwt_buffers: u64,
@@ -643,8 +702,12 @@ pub mod peak {
 
     impl Breakdown {
         /// The conservative peak: the sum of every term live at the same time.
+        /// The fold is SATURATING by design: a pathological declaration can
+        /// only ever push the estimate up to u64::MAX (which refuses against
+        /// any real budget), never wrap it into an "affordable" figure.
         pub fn total(&self) -> u64 {
             [
+                self.compressed_payload,
                 self.decode_planes,
                 self.storage_coefficients,
                 self.idwt_buffers,
@@ -665,11 +728,15 @@ pub mod peak {
             .ok_or_else(|| CoreError::resource_limit("JPEG2000 工作集估算溢出"))
     }
 
-    /// Conservative peak working set of decoding + re-encoding ONE tile whose
-    /// codestream is `w × h` with `components` components, onto a nominal
-    /// `tile_w × tile_h` canvas. Checked arithmetic; overflow is a typed
-    /// resource refusal (never a wrap).
+    /// Conservative peak working set of ONE admitted tile: the declared
+    /// compressed payload `compressed_payload` (checked u64, charged as-is)
+    /// PLUS the decode/re-encode transient of a codestream whose geometry is
+    /// `w × h` with `components` components, onto a nominal `tile_w × tile_h`
+    /// canvas. Checked arithmetic on every term; overflow of a term is a
+    /// typed resource refusal (never a wrap), and the saturating total can
+    /// only over-estimate.
     pub fn working_set(
+        compressed_payload: u64,
         components: u64,
         w: u64,
         h: u64,
@@ -691,8 +758,10 @@ pub mod peak {
         let padded_canvas =
             if w < tile_w || h < tile_h { mul(tile_pixels, RGB_BPP)? } else { 0 };
         let encoder_planes = mul(3, tile_pixels)?;
-        let encoder_output = tile_pixels / ENCODER_OUTPUT_DIV;
+        // worst-case entropy output + assembly transient (see ENCODER_OUTPUT_BPP)
+        let encoder_output = mul(tile_pixels, ENCODER_OUTPUT_BPP)?;
         Ok(Breakdown {
+            compressed_payload,
             decode_planes,
             storage_coefficients,
             idwt_buffers,
@@ -705,12 +774,18 @@ pub mod peak {
         })
     }
 
-    /// Charge the conservative one-tile peak against a fresh host budget and
-    /// return the charged total. Over budget ⇒ the existing typed
-    /// `resource_profile_insufficient` (`ResourceLimitExceeded`) BEFORE any
-    /// decode/encode allocation.
+    /// ONE combined admission of everything simultaneously live for a tile —
+    /// the declared compressed payload residency AND the decode/re-encode
+    /// working set — against a fresh host budget (`MemBudget::host` first
+    /// subtracts [`crate::budget::ADAPTER_RESERVE_BYTES`]). Over budget ⇒ the
+    /// typed `resource_profile_insufficient` (`ResourceLimitExceeded`) BEFORE
+    /// the payload is read and before any decode/encode allocation.
+    /// `compressed_payload` arrives as u64 from the container; the CALLER
+    /// performs the checked u64→usize conversion before any read of that
+    /// many bytes.
     pub fn charge_against_budget(
         budget_bytes: u64,
+        compressed_payload: u64,
         components: u64,
         w: u64,
         h: u64,
@@ -718,7 +793,7 @@ pub mod peak {
         tile_h: u64,
         what: &str,
     ) -> CoreResult<u64> {
-        let total = working_set(components, w, h, tile_w, tile_h)?.total();
+        let total = working_set(compressed_payload, components, w, h, tile_w, tile_h)?.total();
         let mut budget = crate::budget::MemBudget::host(budget_bytes);
         budget.charge(total, what)?;
         Ok(total)

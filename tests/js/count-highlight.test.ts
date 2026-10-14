@@ -156,6 +156,34 @@ describe("count highlight scanText", () => {
 		});
 	});
 
+	it("multiple counts in one transcript → the latest one wins", () => {
+		const { mod } = loadApp(vi.fn());
+		const later = { x: 900, y: 900, w: 120, h: 120 };
+		const transcript = JSON.stringify({
+			transcript: [
+				{ role: "tool", content: [{ type: "text", text: dispatchResult() }] },
+				{
+					role: "tool",
+					content: [{ type: "text", text: JSON.stringify({
+						result: { counted_region: { bbox: later, slide_id: SLIDE_ID } },
+					}) }],
+				},
+			],
+		});
+		expect(mod.scanText(transcript)).toEqual({ bbox: later, slide_id: SLIDE_ID });
+	});
+
+	it("extracts counted_region carried on the live extra_tool_called event", () => {
+		const { mod } = loadApp(vi.fn());
+		const data = JSON.stringify({
+			tool: "dev_pathsegmentor_measure__count_cells",
+			ok: true,
+			status: 200,
+			counted_region: { bbox: BBOX, slide_id: SLIDE_ID, snapshot_id: "snap-1" },
+		});
+		expect(mod.scanText(data)).toEqual({ bbox: BBOX, slide_id: SLIDE_ID });
+	});
+
 	it("extracts bbox from a single SSE data frame payload", () => {
 		const { mod } = loadApp(vi.fn());
 		const frame = sseFrame(JSON.stringify({

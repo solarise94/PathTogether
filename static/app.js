@@ -1128,9 +1128,10 @@
     try { parsed = JSON.parse(text); } catch (e) { parsed = null; }
     if (parsed === null && text.trim().charAt(0) !== "{" &&
         text.trim().charAt(0) !== "[") return null;
+    // 取文档序**最后一个**命中：transcript 按时间排列，多次计数时显示最新一次
     var found = null;
     function walk(node, depth) {
-      if (found || depth > 10 || node == null) return;
+      if (depth > 10 || node == null) return;
       var t = typeof node;
       if (t === "string") {
         if (node.length <= 200000 && node.indexOf("counted_region") >= 0) {
@@ -1155,7 +1156,6 @@
       for (var k in node) {
         if (Object.prototype.hasOwnProperty.call(node, k)) {
           walk(node[k], depth + 1);
-          if (found) return;
         }
       }
     }

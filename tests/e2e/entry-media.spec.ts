@@ -74,7 +74,7 @@ test('manual annotation types progressively, pauses, and updates language in pla
   const text = await page.locator('#note-body').textContent();
   await page.clock.runFor(1000);
   await expect(page.locator('#note-body')).toHaveText(text!);
-  await page.locator('#account-btn').click(); await page.locator('.lang-toggle').click(); await page.locator('#account-btn').click();
+  await page.locator('.lang-toggle').click();
   await expect(page.locator('h1')).toHaveText('Explore pathology slides with AI.');
   await expect(page.locator('#phase')).toHaveText('Record the first observation');
   await expect(page.locator('#note-title')).toContainText('Region A');

@@ -11,7 +11,7 @@
      私有/错误渲染不注入，标签省略（tests/test_canonical_domain.py） #}
   {% if canonical %}<link rel="canonical" href="{{ canonical }}" />{% endif %}
   {% include "_site_icons.html" %}
-  <link rel="stylesheet" href="/static/entry.css?v=20261013d" />
+  <link rel="stylesheet" href="/static/entry.css?v=20261014b" />
   <script defer src="/static/i18n.js?v=20261013d"></script>
   <script defer src="/static/entry.js?v=20261013d"></script>
   <script defer src="/static/entry-collaboration.js?v=20261011a"></script>
@@ -23,18 +23,13 @@
 <body id="top">
   <a class="skip-link" href="#main" data-i18n="entry.skip">跳到主要内容</a>
 
-  <!-- ================= 顶栏：品牌 / 锚点 / GitHub / 语言 / 登录 ================= -->
+  <!-- ================= 顶栏：品牌 / 导航 / 语言 / 线路 / 账户 ================= -->
   <header class="topbar">
     <nav class="topbar-inner" aria-label="主导航">
       <a class="brand" href="#top">{% include "_brand_logo.html" %}<span>HistoPilot</span></a>
       <ul class="nav-links">
         <li><a href="#get-started" data-i18n="entry.nav.start">如何开始</a></li>
-        <li><a href="#whats-new" data-i18n="entry.nav.whatsnew">更新内容</a></li>
         <li><a href="/tools/slides" data-i18n="entry.nav.slides">切片格式转换工具</a></li>
-        <li><a href="#product" data-i18n="entry.nav.product">产品</a></li>
-        <li><a href="#collaboration" data-i18n="entry.nav.collaboration">协作</a></li>
-        <li><a href="/guide" data-i18n="entry.nav.guide">使用指南</a></li>
-        <li><a href="#suite" data-i18n="entry.nav.suite">套件</a></li>
         <li>
           <a href="https://github.com/solarise94/HistoPilot" target="_blank"
              rel="noopener noreferrer"><span data-i18n="entry.nav.github">GitHub</span><span class="ext" aria-hidden="true">↗</span></a>
@@ -43,8 +38,8 @@
           <a href="https://me.solarise94.fun" target="_blank"
              rel="noopener noreferrer"><span data-i18n="entry.nav.home">关于我</span><span class="ext" aria-hidden="true">↗</span></a>
         </li>
-        <li>
-          <a href="mailto:solarise94@gmail.com"><span data-i18n="entry.nav.email">联系我</span></a>
+        <li class="nav-lang">
+          <button type="button" class="lang-toggle" data-i18n-aria="lang.toggle.aria" aria-label="切换为英文">EN</button>
         </li>
       </ul>
       <div class="topbar-actions">
@@ -84,9 +79,6 @@
           {% endif %}
           <a class="account-link account-link-demo" href="/demo" data-i18n="entry.demo">直接体验 Demo</a>
           {% endif %}
-          <div class="account-language"><span data-i18n="entry.language">界面语言</span>
-            <button type="button" class="lang-toggle" data-i18n-aria="lang.toggle.aria" aria-label="切换为英文">EN</button>
-          </div>
         </div>
       </div>
     </nav>

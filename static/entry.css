@@ -771,6 +771,8 @@ button:focus-visible {
     scrollbar-width: none;
   }
   .nav-links::-webkit-scrollbar { display: none; }
+  /* 窄屏导航横向滚动时语言切换始终可见 */
+  .nav-lang { position: sticky; right: 0; margin-left: auto; padding-left: 12px; background: linear-gradient(to right, rgba(22,22,22,0), var(--bg) 12px); }
   .hero h1 { font-size: 36px; }
   .hero { padding: 40px 16px 56px; }
   .section { padding: 56px 16px; }

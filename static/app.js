@@ -1896,7 +1896,9 @@
     // 平台侧清叠加层（切片隔离）。插件侧会话 UI/SSE/游标由 slide.opened event 触发其自行 reset+restore。
     aiOverlay = [];
     countHighlight = null;  // 计数范围高亮随切片关闭一并清除（不跨切片残留）
-    openSlideId = "";       // 切片绑定同步清空（新切片 openSlide 时重建）
+    // 本回调在 openSlide 已写入 state.slide 之后才触发：绑定取刚打开的切片，
+    // 不能清空（否则新切片的计数结果永远不画）
+    openSlideId = String((state.slide && state.slide.id) || "");
     redrawAnnoCanvas();
     emitSlideOpened();
     if (state.slide) {
@@ -2849,6 +2851,8 @@
     cancelSlideDeal();
     var closedRef = state.slide ? String(state.slide.id || state.slide.name || "") : "";
     state.slide = null;
+    openSlideId = "";
+    countHighlight = null;
     state.mppX = null;
     state.roiMode = null;
     clearTempViewTimer();

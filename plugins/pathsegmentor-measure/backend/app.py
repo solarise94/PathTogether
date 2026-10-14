@@ -1545,6 +1545,7 @@ def capability_count_cells():
         return _error(e.status, e.code, e.message, retryable=e.retryable,
                       extra=e.extra)
 
+    t = time.time()
     mpp_x = mpp_y = None
     if mpp is not None and mpp > 0:
         mpp_x = mpp_y = float(mpp)

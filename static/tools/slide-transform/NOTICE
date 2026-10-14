@@ -13,6 +13,9 @@ This software is based in part on the work of the Independent JPEG Group.
 
 Rust dependencies
 -----------------
+hayro-jpeg2000 =0.4.0 (core: Aperio SVS JPEG 2000 tile decoding, F2;
+pinned scalar configuration via default-features = false — no unsafe
+code, no transitive dependencies) is dual-licensed Apache-2.0 OR MIT.
 sha2 (core: output validation and source hashing, native and wasm),
 wasm-bindgen =0.2.129 (wasm only) and their transitive
 crates are licensed MIT OR Apache-2.0 (unicode-ident additionally

@@ -131,10 +131,33 @@ describe("sniffTiffSlideCapability (bounded pre-stage probe)", () => {
 		}
 	});
 
-	it("rejects JPEG 2000 with a specific reason", async () => {
-		const cap = await E.sniffTiffSlideCapability(asFile(buildTiff({ compression: 33003 })));
+	it("accepts an Aperio JPEG 2000 (33003/33005) TIFF with the JP2K adapter id (F2)", async () => {
+		for (const comp of [33003, 33005]) {
+			const cap = await E.sniffTiffSlideCapability(asFile(buildTiff({ compression: comp })));
+			expect(cap).toMatchObject({
+				supported: true,
+				modality: "brightfield",
+				adapter: "aperio-svs-jp2k",
+				format: "aperio-svs-jp2k",
+				codec: "jpeg2000",
+				jp2kCompression: comp,
+			});
+		}
+	});
+
+	it("rejects non-Aperio JPEG 2000 with the vendor-scoped reason", async () => {
+		const cap = await E.sniffTiffSlideCapability(
+			asFile(buildTiff({ compression: 33003, aperio: false })));
 		expect(cap.supported).toBe(false);
 		expect(cap.reason).toContain("JPEG 2000");
+		expect(cap.reason).toContain("Aperio");
+	});
+
+	it("rejects multi-channel Aperio JPEG 2000 before staging", async () => {
+		const cap = await E.sniffTiffSlideCapability(
+			asFile(buildTiff({ compression: 33005, samples: 4 })));
+		expect(cap.supported).toBe(false);
+		expect(cap.reason).toContain("SamplesPerPixel");
 	});
 
 	it("rejects stripped (non-tiled) mains, planar and fluorescence page sets", async () => {

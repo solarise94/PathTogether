@@ -53,6 +53,7 @@
     "kfb_bf_v1": 1,
     "kfb_kfbio_jpeg": 1,
     "aperio-svs-jpeg": 1,
+    "aperio-svs-jp2k": 1,
     "mirax-bundle": 1,
     "leica-scn-jpeg": 1,
     "generic-tiled-jpeg-tiff": 1,
@@ -253,7 +254,10 @@
       return result;
     }
     if (ext === ".svs" && (compression === 33003 || compression === 33005)) {
-      // JPEG2000 编码 SVS：暂无浏览器转换器 → 暂时直传（声明例外）
+      // JPEG2000 编码 SVS（F2 起浏览器转换器已覆盖该变体）：既可本机转换
+      //（输出为重新编码的 JPEG-in-TIFF，不是无损搬运），也可走暂时直传
+      //（保留源码流，声明例外 unconverted-variant:svs-jp2k）。工作台上传
+      // 侧维持暂时直传退路，由 /tools/slides 承担转换路径。
       result.directClass = DIRECT_CLASS.SVS_JP2K;
       return result;
     }

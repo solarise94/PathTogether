@@ -449,6 +449,7 @@ fn svs_doc_json(doc: &slide_transform_core::svs::SvsDoc) -> String {
                     ],
                 ),
                 jb("jpeg_tables", lv.jpeg_tables.is_some()),
+                jb("jp2k", lv.jp2k_contract.is_some()),
             ])
         })
         .collect();
@@ -458,7 +459,7 @@ fn svs_doc_json(doc: &slide_transform_core::svs::SvsDoc) -> String {
         .map(|a| obj(&[jstr("name", &a.name), ju("width", a.width as u64), ju("height", a.height as u64)]))
         .collect();
     obj(&[
-        jstr("format", slide_transform_core::svs::SOURCE_FORMAT),
+        jstr("format", doc.codec.source_format()),
         jstr("adapter_version", slide_transform_core::svs::ADAPTER_VERSION),
         jstr("modality", "brightfield"),
         jstr(
@@ -484,7 +485,8 @@ fn svs_doc_json(doc: &slide_transform_core::svs::SvsDoc) -> String {
         jarr("levels", &levels),
         jarr("associated", &assoc),
         jb("icc_profile", doc.icc.is_some()),
-        jstr("codec", "jpeg-baseline-passthrough"),
+        jstr("codec", if doc.codec.is_jp2k() { "jpeg2000-reencode" } else { "jpeg-baseline-passthrough" }),
+        jstr("source_codec", doc.codec.id()),
     ])
 }
 

@@ -591,3 +591,136 @@ pub fn build_synthetic_svs(out: &mut dyn RandomAccessSink, p: &SvsGenParams) -> 
     out.flush()?;
     Ok(buf.len() as u64)
 }
+
+// --------------------------------------------------------------------------- //
+// F2: JPEG 2000 fixture containers (committed codestreams, see
+// tests/fixtures/jp2k/README.md). The structural walk is identical to the
+// JPEG one; only the compression tag, the tile payloads (raw J2K
+// codestreams) and the description differ. No JPEGTables / tag 530 are
+// written (JP2K levels never carry them).
+// --------------------------------------------------------------------------- //
+
+/// Parameters of a synthetic Aperio JP2K SVS container.
+pub struct SvsJp2kFixture {
+    /// 33003 or 33005 (the Aperio JPEG 2000 compression tags).
+    pub compression: u16,
+    /// TIFF photometric of the level IFDs (real 33003 files advertise 2 even
+    /// for YCbCr codestreams — the codestream header, not this tag, decides).
+    pub photometric: u16,
+    pub tile: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Reduction factor per level step (Aperio: 4).
+    pub downsample: u32,
+    pub mpp: Option<f64>,
+    pub appmag: Option<f64>,
+    /// Row-major tile codestreams of every level (each may be smaller than
+    /// the nominal tile rect — the cropped-codestream edge case).
+    pub levels: Vec<Vec<Vec<u8>>>,
+}
+
+/// Build the synthetic JP2K SVS file; returns the file size.
+pub fn build_synthetic_svs_jp2k(
+    out: &mut dyn RandomAccessSink,
+    f: &SvsJp2kFixture,
+) -> CoreResult<u64> {
+    let levels = level_geometry(f.width, f.height, f.downsample, f.tile);
+    assert_eq!(levels.len(), f.levels.len(), "fixture: 层级几何与 codestream 组数不符");
+    for (li, tiles) in f.levels.iter().enumerate() {
+        let (lw, lh) = levels[li];
+        let across = (lw + f.tile - 1) / f.tile;
+        let down = (lh + f.tile - 1) / f.tile;
+        assert_eq!(tiles.len(), (across * down) as usize, "fixture: 层 {li} tile 数不符");
+    }
+
+    let w = W { bigtiff: false, little: true };
+    let hdr_len: u64 = 8;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.resize(hdr_len as usize, 0);
+
+    let mut lvl_offsets: Vec<Vec<u64>> = Vec::new();
+    let mut lvl_counts: Vec<Vec<u64>> = Vec::new();
+    for tiles in &f.levels {
+        let mut offs = Vec::new();
+        let mut cnts = Vec::new();
+        for t in tiles {
+            let at = buf.len() as u64;
+            buf.extend_from_slice(t);
+            offs.push(at);
+            cnts.push(t.len() as u64);
+        }
+        lvl_offsets.push(offs);
+        lvl_counts.push(cnts);
+    }
+
+    let codec_label = match f.compression {
+        33003 => "J2K/YUV16",
+        33005 => "J2K/KDU",
+        other => panic!("fixture: 不支持的 JP2K 压缩标签 {other}"),
+    };
+    let mut desc_main = format!(
+        "Aperio Image Library v11.2.1 \r\n46920x33014 [0,100 {}x{}] ({}x{}) {} Q=70|StripeWidth = 2048|ScanScope ID = PTGFIX|Filename = FIXTURE|Date = 12/29/09",
+        f.width, f.height, f.tile, f.tile, codec_label
+    );
+    if let Some(m) = f.mpp {
+        desc_main.push_str(&format!("|MPP = {m:.4}"));
+    }
+    if let Some(a) = f.appmag {
+        desc_main.push_str(&format!("|AppMag = {a}"));
+    }
+    let desc_level = "Aperio Image Library v10.0.51\r".to_string();
+
+    let mut bodies: Vec<IfdB> = Vec::new();
+    for (li, &(lw, lh)) in levels.iter().enumerate() {
+        let mut b = IfdB::new(w);
+        b.add_long(256, lw);
+        b.add_long(257, lh);
+        let bits: Vec<u8> = [8u16, 8, 8].iter().flat_map(|v| w.p16(*v)).collect();
+        b.add(258, 3, 3, bits);
+        b.add_short(259, f.compression);
+        b.add_short(262, f.photometric);
+        let desc = if li == 0 { desc_main.clone() } else { desc_level.clone() };
+        b.add(270, 2, desc.len() as u64 + 1, {
+            let mut d = desc.into_bytes();
+            d.push(0);
+            d
+        });
+        b.add_short(277, 3);
+        b.add_short(284, 1);
+        b.add_short(322, f.tile as u16);
+        b.add_short(323, f.tile as u16);
+        let offs = &lvl_offsets[li];
+        let cnts = &lvl_counts[li];
+        let ob: Vec<u8> = offs.iter().flat_map(|o| w.p32(*o as u32)).collect();
+        let cb: Vec<u8> = cnts.iter().flat_map(|c| w.p32(*c as u32)).collect();
+        b.add(324, 4, offs.len() as u64, ob);
+        b.add(325, 4, cnts.len() as u64, cb);
+        bodies.push(b);
+    }
+
+    let mut lens: Vec<u64> = Vec::new();
+    let mut ats: Vec<u64> = Vec::new();
+    {
+        let mut cursor = buf.len() as u64;
+        for b in &bodies {
+            ats.push(cursor);
+            let bytes = b.serialize(cursor, None);
+            lens.push(bytes.len() as u64);
+            cursor += bytes.len() as u64;
+        }
+    }
+    for (i, b) in bodies.iter().enumerate() {
+        let next = if i + 1 < bodies.len() { Some(ats[i + 1]) } else { None };
+        let bytes = b.serialize(ats[i], next);
+        buf.extend_from_slice(&bytes);
+    }
+
+    let first_ifd = ats.first().copied().unwrap_or(0);
+    buf[0..2].copy_from_slice(b"II");
+    buf[2..4].copy_from_slice(&w.p16(42));
+    buf[4..8].copy_from_slice(&w.p32(first_ifd as u32));
+
+    out.write_at(0, &buf)?;
+    out.flush()?;
+    Ok(buf.len() as u64)
+}

@@ -37,12 +37,80 @@ use crate::tiff_read::{self, Ifd, TiffHeader, TiffKind, TileCursor};
 
 /// Stable source-format id recorded in plans/reports/provenance/journals.
 pub const SOURCE_FORMAT: &str = "aperio-svs-jpeg";
+/// F2: stable source-format id of the JPEG 2000 variants (compression
+/// 33003/33005). A SEPARATE adapter identity from the JPEG one: journals and
+/// checkpoints can never be resumed across the two codecs (every JP2K tile
+/// is re-encoded; a JPEG passthrough state mixed into a JP2K output would
+/// violate the output contract).
+pub const SOURCE_FORMAT_JP2K: &str = "aperio-svs-jp2k";
 /// Adapter version (bump on any output-affecting change). Enforced in the
 /// core's resume entry: a checkpoint that NAMES another generation is
 /// refused. A state with NO version field is a legacy pre-adapter journal
 /// and stays resumable (the browser layer pins those to the recorded
-/// default).
+/// default). Shared by both codecs (each has its own source-format id).
 pub const ADAPTER_VERSION: &str = "1";
+
+/// F2 locked preserve-mode re-encode parameters for JPEG 2000 sources — the
+/// same documented high-fidelity family as the NDPI/RASTER/BIF/VMS compose
+/// encodes (a JP2K source has no JPEG tables to preserve, so "preserve"
+/// means highest-fidelity re-encode, never passthrough).
+pub const JP2K_REENCODE_QUALITY: u8 = 96;
+pub const JP2K_REENCODE_SAMPLING: crate::jpeg::Sampling = crate::jpeg::Sampling::S422;
+pub const JP2K_REENCODE_HUFFMAN: &str = "standard-annex-k";
+/// Versioned fingerprint of the JP2K preserve-mode encode parameters.
+pub const JP2K_REENCODE_FINGERPRINT: &str = "aperio-jp2k-reencode:q96:y422:hstd:v1";
+
+/// Source payload codec of an SVS document, decided by the IFD0 compression
+/// tag and cross-checked against every level's first codestream header
+/// ([`crate::jp2k::classify_aperio`]). Colour is NEVER taken from the tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceCodec {
+    /// Compression 7: baseline JPEG tiles (F1 passthrough / compact paths).
+    JpegBaseline,
+    /// Compression 33003: codestream YCbCr, MCT=0, 4:2:2 — the reader
+    /// converts with the OpenSlide tables.
+    Jpeg2000Ycbcr422,
+    /// Compression 33005: codestream MCT=1 — RGB after the decoder's
+    /// inverse MCT; no further conversion.
+    Jpeg2000Rgb,
+}
+
+impl SourceCodec {
+    pub fn is_jp2k(self) -> bool {
+        !matches!(self, SourceCodec::JpegBaseline)
+    }
+    pub fn id(self) -> &'static str {
+        match self {
+            SourceCodec::JpegBaseline => "jpeg-baseline",
+            SourceCodec::Jpeg2000Ycbcr422 => "jpeg2000-33003",
+            SourceCodec::Jpeg2000Rgb => "jpeg2000-33005",
+        }
+    }
+    /// Stable source-format id for plans/reports/provenance/journals.
+    pub fn source_format(self) -> &'static str {
+        match self {
+            SourceCodec::JpegBaseline => SOURCE_FORMAT,
+            _ => SOURCE_FORMAT_JP2K,
+        }
+    }
+    pub fn aperio_compression(self) -> u64 {
+        match self {
+            SourceCodec::JpegBaseline => 7,
+            SourceCodec::Jpeg2000Ycbcr422 => crate::jp2k::COMPRESSION_JP2K_YCBCR,
+            SourceCodec::Jpeg2000Rgb => crate::jp2k::COMPRESSION_JP2K_RGB,
+        }
+    }
+    fn from_compression(c: u64) -> CoreResult<SourceCodec> {
+        match c {
+            7 => Ok(SourceCodec::JpegBaseline),
+            crate::jp2k::COMPRESSION_JP2K_YCBCR => Ok(SourceCodec::Jpeg2000Ycbcr422),
+            crate::jp2k::COMPRESSION_JP2K_RGB => Ok(SourceCodec::Jpeg2000Rgb),
+            _ => Err(CoreError::variant(format!(
+                "压缩编码 {c} 不是基线 JPEG（7）或已验证的 Aperio JPEG 2000 变体（33003/33005），无法按原样搬运"
+            ))),
+        }
+    }
+}
 
 /// TIFF tags used here.
 mod tag {
@@ -96,6 +164,9 @@ pub struct SvsLevel {
     pub color: PayloadColor,
     /// SOF sampling (the truth; the TIFF 530 tag is not trusted).
     pub sampling: (u8, u8, u8, u8, u8, u8),
+    /// F2: the level's codestream-header contract (JP2K levels only). Every
+    /// tile's header is cross-checked against it before decoding.
+    pub jp2k_contract: Option<crate::jp2k::Jp2kHeader>,
 }
 
 impl SvsLevel {
@@ -110,6 +181,10 @@ impl SvsLevel {
 #[derive(Debug, Clone)]
 pub struct SvsDoc {
     pub kind: TiffKind,
+    /// Payload codec of the whole page set (IFD0's compression tag; every
+    /// tiled level must match, and each level's codestream headers are
+    /// cross-checked against the colour contract).
+    pub codec: SourceCodec,
     pub levels: Vec<SvsLevel>,
     /// µm/px from `MPP = …` (main IFD description).
     pub mpp: Option<f64>,
@@ -177,13 +252,15 @@ fn is_aperio(desc: &[u8]) -> bool {
     s.contains("Aperio")
 }
 
-/// Verify one level IFD's tile geometry and determine the JPEG truth.
+/// Verify one level IFD's tile geometry and determine the payload truth
+/// (JPEG: SOF colourspace probe; JP2K: bounded codestream header probe).
 fn inspect_level(
     src: &dyn ByteSource,
     hdr: &TiffHeader,
     ifd: &Ifd,
     ifd_index: u32,
     photometric: u64,
+    codec: SourceCodec,
 ) -> CoreResult<SvsLevel> {
     let width = get_u64(src, hdr, ifd, tag::WIDTH)?.unwrap_or(0);
     let height = get_u64(src, hdr, ifd, tag::HEIGHT)?.unwrap_or(0);
@@ -222,11 +299,42 @@ fn inspect_level(
     while let Some((_, c)) = cur.next_pair()? {
         payload_bytes = payload_bytes.saturating_add(c);
     }
+    let head = first_tile_head(src, hdr, ifd)?;
+    if codec.is_jp2k() {
+        // F2: the colour contract comes from the codestream header, never
+        // from the TIFF tags (a 33003 file may advertise photometric RGB
+        // while its codestreams are YCbCr 4:2:2 — the header wins).
+        let contract = crate::jp2k::parse_header(&head)?;
+        let jp2k_color = crate::jp2k::classify_aperio(codec.aperio_compression(), &contract)?;
+        let color = match jp2k_color {
+            crate::jp2k::Jp2kColor::Ycbcr422 => PayloadColor::YCbCr,
+            crate::jp2k::Jp2kColor::RgbCodestream => PayloadColor::Rgb,
+        };
+        let sampling = match jp2k_color {
+            crate::jp2k::Jp2kColor::Ycbcr422 => (2u8, 1u8, 2u8, 1u8, 1u8, 1u8),
+            crate::jp2k::Jp2kColor::RgbCodestream => (1u8, 1u8, 1u8, 1u8, 1u8, 1u8),
+        };
+        let _ = photometric;
+        return Ok(SvsLevel {
+            ifd_index,
+            width: width as u32,
+            height: height as u32,
+            tile_w: tw as u32,
+            tile_h: th as u32,
+            tiles_across: across as u32,
+            tiles_down: down as u32,
+            tiles_total: total,
+            jpeg_tables: None, // JP2K payloads are self-contained; tag 347 is meaningless
+            payload_bytes,
+            color,
+            sampling,
+            jp2k_contract: Some(contract),
+        });
+    }
     let jpeg_tables = match ifd.find(tag::JPEG_TABLES) {
         Some(e) => Some(tiff_read::entry_value(src, hdr, e)?),
         None => None,
     };
-    let head = first_tile_head(src, hdr, ifd)?;
     let probe_full = match &jpeg_tables {
         Some(t) => merge_tables_then_tile(t, &head),
         None => head.clone(),
@@ -269,7 +377,20 @@ fn inspect_level(
         payload_bytes,
         color,
         sampling,
+        jp2k_contract: None,
     })
+}
+
+/// Bounded IFD0 compression sniff: the codec identity journals/checkpoints
+/// need BEFORE any conversion state exists (cheap: header + IFD0 entry scan).
+/// Structural TIFF failures propagate; an unknown compression is a typed
+/// rejection, never a guess.
+pub fn sniff_main_codec(src: &dyn ByteSource) -> CoreResult<SourceCodec> {
+    let hdr = tiff_read::read_header(src)?;
+    let chain = tiff_read::ifd_chain(src, &hdr)?;
+    let main = &chain[0];
+    let compression = get_u64(src, &hdr, main, tag::COMPRESSION)?.unwrap_or(0);
+    SourceCodec::from_compression(compression)
 }
 
 /// Capability probe: recognised + convertible, or a typed rejection.
@@ -298,20 +419,27 @@ pub fn probe_svs(src: &dyn ByteSource) -> CoreResult<SvsDoc> {
             "主图不是分块（tiled）存储：带状 Aperio 变体不在支持集",
         ));
     }
-    match compression.unwrap_or(0) {
-        7 => {}
-        33003 | 33005 => {
-            return Err(CoreError::variant(format!(
-                "JPEG 2000 压缩（{}）不在 F1 支持集（需要独立解码器，见计划 §5.3）",
-                compression.unwrap_or(0)
-            )))
+    let codec = match compression.unwrap_or(0) {
+        7 => SourceCodec::JpegBaseline,
+        crate::jp2k::COMPRESSION_JP2K_YCBCR | crate::jp2k::COMPRESSION_JP2K_RGB => {
+            #[cfg(feature = "jp2k")]
+            {
+                SourceCodec::from_compression(compression.unwrap_or(0))?
+            }
+            #[cfg(not(feature = "jp2k"))]
+            {
+                return Err(CoreError::variant(format!(
+                    "JPEG 2000 压缩（{}）不在本构建的支持集（jp2k feature 未启用）",
+                    compression.unwrap_or(0)
+                )));
+            }
         }
         c => {
             return Err(CoreError::variant(format!(
-                "压缩编码 {c} 不是基线 JPEG（259=7），无法按原样搬运"
+                "压缩编码 {c} 不是基线 JPEG（259=7）或已验证的 Aperio JPEG 2000 变体（33003/33005），无法按原样搬运"
             )))
         }
-    }
+    };
     if planar != 1 {
         return Err(CoreError::variant(format!(
             "PlanarConfiguration={planar}（平面存储）不在支持集（仅 chunky/1）"
@@ -354,7 +482,7 @@ pub fn probe_svs(src: &dyn ByteSource) -> CoreResult<SvsDoc> {
         ));
     }
 
-    let mut levels = vec![inspect_level(src, &hdr, main, 0, photo)?];
+    let mut levels = vec![inspect_level(src, &hdr, main, 0, photo, codec)?];
     let mut associated: Vec<AssociatedSummary> = Vec::new();
 
     // ---- following IFDs: levels and associated images ------------------- //
@@ -386,10 +514,12 @@ pub fn probe_svs(src: &dyn ByteSource) -> CoreResult<SvsDoc> {
             )));
         }
         if tiled {
-            // a true reduced level: tiled JPEG, strictly smaller, 1.5–8× per step
-            if c != 7 {
+            // a true reduced level: tiled with the SAME codec as IFD 0,
+            // strictly smaller, 1.5–8× per step
+            if c != codec.aperio_compression() {
                 return Err(CoreError::variant(format!(
-                    "第 {idx} 页为分块存储但压缩编码 {c} 不是基线 JPEG",
+                    "第 {idx} 页为分块存储但压缩编码 {c} 与主图（{}）不一致：混合编码页组不在支持集",
+                    codec.aperio_compression()
                 )));
             }
             let prev = levels.last().expect("level 0 exists");
@@ -411,7 +541,7 @@ pub fn probe_svs(src: &dyn ByteSource) -> CoreResult<SvsDoc> {
                     "第 {idx} 页 PhotometricInterpretation={p} 不在支持集",
                 )));
             }
-            levels.push(inspect_level(src, &hdr, ifd, idx as u32, p)?);
+            levels.push(inspect_level(src, &hdr, ifd, idx as u32, p, codec)?);
         } else {
             // stripped page: associated image (thumbnail / label / macro)
             let name = if line_marker("label") {
@@ -443,11 +573,50 @@ pub fn probe_svs(src: &dyn ByteSource) -> CoreResult<SvsDoc> {
         Some(e) => Some(tiff_read::entry_value(src, &hdr, e)?),
         None => None,
     };
-    Ok(SvsDoc { kind: hdr.kind, levels, mpp, appmag, icc, associated })
+    Ok(SvsDoc { kind: hdr.kind, codec, levels, mpp, appmag, icc, associated })
 }
 
 /// Disk-precheck estimate for the SVS adapter (same shape as the KFB ones).
 pub fn estimate_svs(doc: &SvsDoc) -> crate::estimate::OutputEstimate {
+    if doc.codec.is_jp2k() {
+        // F2: every tile of every level is decoded and re-encoded — the
+        // output is PIXEL-bound, not byte-bound (same rationale as the
+        // raster/NDPI compose estimates): measured q96 4:2:2 tissue output
+        // stays under ~1 B/px; 2 B/px is the conservative noisy-pixel bound.
+        let mut payload = 0u64;
+        let mut pixels = 0u64;
+        let mut tiles = 0u64;
+        for lv in &doc.levels {
+            payload = payload.saturating_add(lv.payload_bytes);
+            pixels = pixels.saturating_add(
+                (lv.tile_w as u64)
+                    .saturating_mul(lv.tile_h as u64)
+                    .saturating_mul(lv.tiles_total),
+            );
+            tiles = tiles.saturating_add(lv.tiles_total);
+        }
+        let ifds = doc.levels.len() as u64;
+        let extras = doc.icc.as_ref().map_or(0, |i| i.len() as u64);
+        let fixed = tiles
+            .saturating_mul(16)
+            .saturating_add(ifds.saturating_mul(4 * 1024))
+            .saturating_add(extras)
+            .saturating_add(1024 * 1024);
+        let out = pixels.saturating_mul(2).saturating_add(fixed);
+        let compact = pixels
+            .saturating_add(pixels / 2)
+            .saturating_add(fixed);
+        return crate::estimate::OutputEstimate {
+            payload_bytes: payload,
+            tiles_present: tiles,
+            cells_total: tiles,
+            cells_missing: 0,
+            edge_tiles: 0,
+            ifds,
+            output_upper_bound_bytes: out,
+            compact_upper_bound_bytes: compact,
+        };
+    }
     let mut payload = 0u64;
     let mut tiles = 0u64;
     for lv in &doc.levels {

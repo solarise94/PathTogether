@@ -1,6 +1,6 @@
 # Aperio JPEG2000 浏览器转换实现交接（F2）
 
-日期：2026-10-13。状态：待实施。已有 [可行性研究](../slide-tools/f2-jpeg2000-feasibility.md)，没有生产集成；不得把研究里的时间或内存数字当作上线验收。
+日期：2026-10-13。状态：已实施（分支 `jpeg2000-browser`；实现报告与验收数字见 [F2 实现报告](../slide-tools/f2-jpeg2000-adapter-report.md)）。[可行性研究](../slide-tools/f2-jpeg2000-feasibility.md) 的结论已按其 §8 条件落地：解码器钉在 hayro-jpeg2000 0.4.0 标量配置，颜色判定来自 codestream header，输出合同（重编码、strict-lossless 拒绝、provenance）如实标注。
 
 ## 交付范围
 

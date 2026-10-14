@@ -460,6 +460,32 @@ export function inputExtensionHint(name) {
 ///         adapter: '<adapter id>' }
 ///     | { supported: false, modality: null, reason: '<typed reason>' }
 export const SVS_SOURCE_ADAPTER = 'aperio-svs-jpeg';
+/// F2: Aperio SVS JPEG 2000（compression 33003/33005）。A DISTINCT adapter id
+/// from the JPEG one: journals/checkpoints can never be resumed across the
+/// two codecs (every JP2K tile is decoded + re-encoded — no passthrough).
+/// Must equal the Rust `SOURCE_FORMAT_JP2K` / `ADAPTER_VERSION`.
+export const SVS_JP2K_SOURCE_ADAPTER = 'aperio-svs-jp2k';
+export const SVS_JP2K_ADAPTER_VERSION = '1';
+/// The supported Aperio JP2K variant scope (shown in the UI vocabulary and
+/// mirrored by the wasm core's typed rejections): 3-channel 8-bit brightfield
+/// tiles of exactly the two studied shapes — 33003 = codestream YCbCr 4:2:2
+/// (MCT=0), 33005 = MCT=1. HTJ2K, 16-bit, fluorescence and other JP2K are
+/// typed rejections, never guesses.
+export const SVS_JP2K_COMPRESSIONS = [33003, 33005];
+
+/// F2: JPEG 2000 sources have NO as-is tile copying — in BOTH quality modes
+/// every tile is decoded and re-encoded. The two quality option descriptions
+/// must say so: returns the i18n keys that REPLACE the default option
+/// descriptions when the probe document identifies a JP2K source, else null
+/// (the static data-i18n text stays). The page re-applies this after every
+/// language switch (rerenderForLang → renderQualitySection).
+export function qualityOptionDescOverride(doc) {
+  if (!doc || doc.codec !== 'jpeg2000-reencode') return null;
+  return {
+    preserve: 'tools.quality.preserve.desc.jp2k',
+    compact: 'tools.quality.compact.desc.jp2k',
+  };
+}
 /// F4: Leica SCN（BigTIFF + SCN XML 描述；JPEG tile 原样搬运）。
 /// Must equal the Rust `ADAPTER_VERSION` (resume refuses on mismatch).
 export const SCN_SOURCE_ADAPTER = 'leica-scn-jpeg';
@@ -524,6 +550,7 @@ export const CONVERTER_SOURCE_FORMATS = [
   'kfb_bf_v1',
   'kfb_kfbio_jpeg',
   'aperio-svs-jpeg',
+  SVS_JP2K_SOURCE_ADAPTER,
   'mirax-bundle',
   GTIFF_SOURCE_ADAPTER,
   SCN_SOURCE_ADAPTER,
@@ -674,8 +701,32 @@ export async function sniffTiffSlideCapability(file) {
       }
     }
     const comp = scalar(259);
+    // F2: Aperio JPEG 2000 (33003/33005) is convertible — the deep variant
+    // verdicts (exact codestream shape, colour contract, per-tile headers,
+    // strict-lossless policy) come from the wasm core's bounded probe on the
+    // staged copy; this sniff only gates the staging copy.
     if (comp === 33003 || comp === 33005) {
-      return bad('JPEG 2000 压缩不在当前支持集（需要独立解码器）');
+      if (vendor === 'aperio') {
+        // cheap pre-stage gates (the codestream-level verdicts stay in the
+        // core): 3-channel chunky brightfield only
+        const jp2kSpp = scalar(277) ?? 1;
+        if (jp2kSpp !== 3) return bad(`JPEG 2000 源 SamplesPerPixel=${jp2kSpp}（荧光/多通道或灰度不在明场支持集）`);
+        const jp2kPlanar = scalar(284) ?? 1;
+        if (jp2kPlanar !== 1) return bad(`PlanarConfiguration=${jp2kPlanar}（平面存储）不在支持集`);
+        return {
+          supported: true,
+          modality: 'brightfield',
+          format: SVS_JP2K_SOURCE_ADAPTER,
+          adapter: SVS_JP2K_SOURCE_ADAPTER,
+          codec: 'jpeg2000',
+          jp2kCompression: comp,
+          bigtiff,
+          littleEndian: little,
+        };
+      }
+      // non-Aperio JP2K (generic TIFF / BIF / unknown vendors): outside the
+      // studied variant set — keep the existing typed fallback paths
+      return bad(`JPEG 2000 压缩（${comp}）仅支持 Aperio SVS 变体（33003/33005）：该文件的厂商/容器不在支持集`);
     }
     if (comp !== 7) return bad(`压缩编码 ${comp} 不是基线 JPEG，无法按原样搬运`);
     const spp = scalar(277) ?? 1;

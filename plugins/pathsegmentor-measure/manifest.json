@@ -21,7 +21,7 @@
     {
       "name": "segment_region",
       "version": "1.0.0",
-      "description": "用 PathSegmentor 语义分割模型在给定 level-0 整数 bbox（x,y,w,h）内分割指定目标（object：nuclei、lymphocytes、tumor cells、gland 等）。注意：这是语义分割——返回该目标的区域与面积（level-0 像素、µm²）与 ROI 占比，不是实例计数器。approx_object_count.connected_components 是连通域近似；estimated_count_split 是距离变换+分水岭的拆分估计，仅当前景大多可分辨（objects_resolved≥0.6）时给出，否则为 null 并附 mask_is_region_not_instances 警告（mask 覆盖成片组织区域）。另有尺寸分布与最多 20 个最大连通域的 bbox/质心。bbox 面积不得超过平台 ROI 上限（超限拒绝）。",
+      "description": "用 PathSegmentor 语义分割模型在给定 level-0 整数 bbox（x,y,w,h）内分割指定目标（object：nuclei、lymphocytes、tumor cells、gland 等）。注意：这是语义分割——返回该目标的区域与面积（level-0 像素、µm²）与 ROI 占比，不是实例计数器（要逐个计数/密度用 count_cells）。approx_object_count.connected_components 是连通域近似；estimated_count_split 是距离变换+分水岭的拆分估计，仅当前景大多可分辨（objects_resolved≥0.6）时给出，否则为 null 并附 mask_is_region_not_instances 警告（mask 覆盖成片组织区域）。另有尺寸分布与最多 20 个最大连通域的 bbox/质心。bbox 面积不得超过平台 ROI 上限（超限拒绝）。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -57,6 +57,50 @@
           }
         },
         "required": ["x", "y", "w", "h", "object"]
+      },
+      "accessMode": "read",
+      "requiredPermissions": [
+        "slide:metadata:read",
+        "slide:region:read"
+      ],
+      "timeout_ms": 55000,
+      "agent_exposed": true
+    },
+    {
+      "name": "count_cells",
+      "version": "1.0.0",
+      "description": "用 Cellpose 实例分割模型在给定 level-0 整数 bbox（x,y,w,h）内逐个分割并计数细胞/细胞核：返回实例数（真实实例计数）、每 mm² 密度（MPP 有效时）、单个面积分布（µm²）与最多 20 个示例实例的 level-0 bbox/质心（可用于标注典型细胞）。与 segment_region 不同：这是实例分割计数，不是语义区域面积；要某类组织的面积/占比用 segment_region。diameter_um 缺省 7（细胞核；整细胞给 15–25）；可选 model 预设。结果为近似值，需人工核对。bbox 面积不得超过平台 ROI 上限（超限拒绝）。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "integer",
+            "description": "level-0 bbox 左上角 X（整数像素，≥0）"
+          },
+          "y": {
+            "type": "integer",
+            "description": "level-0 bbox 左上角 Y（整数像素，≥0）"
+          },
+          "w": {
+            "type": "integer",
+            "description": "level-0 bbox 宽（整数像素，>0；x+w 不得超过切片宽）"
+          },
+          "h": {
+            "type": "integer",
+            "description": "level-0 bbox 高（整数像素，>0；y+h 不得超过切片高）"
+          },
+          "diameter_um": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 200,
+            "description": "期望目标直径 µm（缺省 7=细胞核；整细胞 15–25）"
+          },
+          "model": {
+            "type": "string",
+            "description": "可选 Cellpose 模型预设名（缺省用服务端默认）"
+          }
+        },
+        "required": ["x", "y", "w", "h"]
       },
       "accessMode": "read",
       "requiredPermissions": [

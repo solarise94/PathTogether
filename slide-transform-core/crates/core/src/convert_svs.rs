@@ -1029,7 +1029,9 @@ fn convert_inner(
                 let (prefix, hdr) = read_jp2k_header_bounded(src, off, len)?;
                 // (2) contract cross-check on the real header — still before
                 //     any full-payload allocation;
-                let contract = lv.jp2k_contract.as_ref().expect("jp2k contract");
+                let contract = lv.jp2k_contract.as_ref().ok_or_else(|| {
+                    CoreError::validation("jp2k: 层缺少 codestream 契约（probe 未运行）")
+                })?;
                 let color = crate::jp2k::check_against_contract(
                     &hdr,
                     contract,

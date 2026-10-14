@@ -1150,11 +1150,11 @@ def _validate_count_args(args):
     else:
         if isinstance(res, bool) or not isinstance(res, int) \
                 or res not in _COUNT_RESOLUTIONS:
-                return None, PlatformError(
-                    400, "invalid_request",
-                    "resolution 需为 %s 之一（模型处理长边上限；缺省 %d）"
-                    % ("/".join(str(r) for r in _COUNT_RESOLUTIONS),
-                       _COUNT_RESOLUTION_DEFAULT))
+            return None, PlatformError(
+                400, "invalid_request",
+                "resolution 需为 %s 之一（模型处理长边上限；缺省 %d）"
+                % ("/".join(str(r) for r in _COUNT_RESOLUTIONS),
+                   _COUNT_RESOLUTION_DEFAULT))
         out["resolution"] = res
     d = args.get("diameter_um")
     if d is not None:

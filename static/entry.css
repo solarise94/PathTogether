@@ -144,8 +144,8 @@ button:focus-visible {
 .route-switch a { display: inline-flex; align-items: center; justify-content: center; min-height: 44px; padding: 0 10px; color: var(--text-2); border-radius: 999px; font-size: 13px; text-decoration: none; }
 .route-switch a:hover, .route-switch a:focus-visible { color: var(--text); background: rgba(255,255,255,.08); }
 .route-switch a[aria-current="page"] { color: var(--text); background: rgba(255,255,255,.13); }
-.account-language { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 12px; color: var(--text-2); font-size: 13px; }
-.account-language .lang-toggle { min-height: 44px; }
+.nav-lang { display: flex; align-items: center; }
+.nav-lang .lang-toggle { min-height: 44px; }
 @media (max-width: 380px) { .route-switch a { font-size: 12px; padding: 0 7px; } .topbar-actions { gap: 6px; } }
 
 /* ---- 账户头像（H2：右上唯一身份入口；disclosure 面板承载操作） ---- */

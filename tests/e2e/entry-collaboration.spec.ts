@@ -17,7 +17,7 @@ test('collaboration walkthrough plays, pauses, navigates, localizes and loads on
  await page.locator('[data-collab-step="2"]').click();
  await expect(demo).toHaveAttribute('data-step','2');
  await expect(page.locator('[data-collab-status]')).toContainText('补充标注和备注');
- await page.locator('#account-btn').click(); await page.locator('.lang-toggle').click(); await page.locator('#account-btn').click();
+ await page.locator('.lang-toggle').click();
  await expect(page.locator('#collaboration h2')).toContainText('with your peers');
  await expect(page.locator('[data-collab-toggle]')).toHaveText('Play');
  await demo.scrollIntoViewIfNeeded();
@@ -51,7 +51,7 @@ for (const width of [320, 390, 768, 1100, 1440]) {
   const demo = page.locator('[data-collab-demo]');
   await demo.scrollIntoViewIfNeeded();
   for (const english of [false, true]) {
-   if (english) { await page.locator('#account-btn').click(); await page.locator('.lang-toggle').click(); await page.locator('#account-btn').click(); }
+   if (english) { await page.locator('.lang-toggle').click(); }
    const heights: number[] = [];
    for (const step of [0, 1, 2]) {
     await page.locator(`[data-collab-step="${step}"]`).click();
@@ -93,7 +93,6 @@ for (const width of [320, 1440]) {
    expect(box!.height).toBeGreaterThanOrEqual(44);
    expect(box!.x + box!.width).toBeLessThanOrEqual(width);
   }
-  await page.locator('#account-btn').click();
   await page.locator('.lang-toggle').click();
   await expect(china).toHaveText('China route');
   await expect(international).toHaveText('International route');

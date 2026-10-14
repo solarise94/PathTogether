@@ -74,8 +74,15 @@ def test_area_summary_empty_all_none():
 # ---------------------------------------------------------------- 16-bit PNG
 
 def _decode_labels_png(png_bytes):
+    """16-bit PNG 解码（IHDR 位深校验与 Pillow 版本无关）。
+
+    16-bit 灰度 PNG 打开后的 mode 因 Pillow 版本而异（9.4 报 "I"，
+    ≥10 报 "I;16"），故直接校验 IHDR bit depth == 16。
+    """
+    assert png_bytes[:8] == b"\x89PNG\r\n\x1a\n"
+    assert png_bytes[12:16] == b"IHDR"
+    assert png_bytes[24] == 16  # bit depth
     image = Image.open(io.BytesIO(png_bytes))
-    assert image.mode == "I;16"
     return np.asarray(image).astype(np.int64)
 
 

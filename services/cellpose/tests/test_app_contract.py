@@ -155,8 +155,10 @@ def test_count_return_labels_16bit_png(client):
     resp = client.post("/v1/count", json=_count_body(return_labels=True))
     assert resp.status_code == 200
     payload = resp.get_json()
-    image = Image.open(io.BytesIO(base64.b64decode(payload["labels_png_b64"])))
-    assert image.mode == "I;16"
+    png = base64.b64decode(payload["labels_png_b64"])
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    assert png[24] == 16  # IHDR bit depth：16-bit 标签图
+    image = Image.open(io.BytesIO(png))
     labels = np.asarray(image).astype(np.int64)
     assert labels.shape == (128, 256)
     assert set(np.unique(labels)) == {0, 1, 2}

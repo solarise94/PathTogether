@@ -170,6 +170,11 @@
           "agent_exposed": {
             "description": "是否把该能力注入官方 AI 读片的 agent 工具集（extra_tools，可选布尔，缺省 true=暴露）。false = 能力级退出：平台网关不再注入（_list_agent_capabilities 过滤），dispatch 端点与能力登记行不受影响；历史安装行缺该字段按暴露处理。",
             "type": "boolean"
+          },
+          "context": {
+            "description": "能力级「当前快照上下文」需求（count_cells 方形取景 wire 合同 v1 §1，2026-10-14；可选）。唯一合法值 current_snapshot：HP 执行阶段冻结服务端 pending 快照并以签名 snapshot_context 随 dispatch 下发（不是模型参数，不进模型可见 schema），PT dispatch 验签/绑定校验后以 context.snapshot 转发给插件。缺省不声明 = 普通 remote tool，行为不变；其他值校验失败（安装被拒，fail-closed）。",
+            "type": "string",
+            "enum": ["current_snapshot"]
           }
         }
       }

@@ -116,11 +116,20 @@ CAPABILITY_DESCRIPTION_MAX = 500
 CAPABILITY_DEFAULT_TIMEOUT_MS = 15000
 CAPABILITY_MAX_TIMEOUT_MS = 60000
 
+# 能力级「当前快照上下文」需求（count_cells 方形取景 wire 合同 v1 §1，2026-10-14）：
+# 可选字段 ``context``，唯一合法值 ``current_snapshot``——声明后 HP 执行阶段
+# 冻结服务端 pending 快照并以签名 snapshot_context 随 dispatch 请求下发（该
+# 标记不是模型参数，不进模型可见 schema）；PT dispatch 验签/绑定校验后以
+# ``context.snapshot`` 转发给插件。其他任何值校验失败（fail-closed）。
+CAPABILITY_CONTEXT_CURRENT_SNAPSHOT = "current_snapshot"
+
 # parameters 允许的 JSON Schema 子集键（与 sidecar TypeBox 校验兼容的公共
-# 子集；注册表用同源逻辑拒绝超集，docs §3.2）。
+# 子集；注册表用同源逻辑拒绝超集，docs §3.2）。2026-10-14：新增布尔
+# ``additionalProperties``（count_cells 方形取景合同 v1 §5 要求模型可见
+# schema 显式 ``additionalProperties: false``——多余键前后端都拒绝）。
 _CAPABILITY_PARAM_KEYS = frozenset(
     ("type", "properties", "required", "enum", "minimum", "maximum",
-     "items", "description"))
+     "items", "description", "additionalProperties"))
 _CAPABILITY_PARAM_TYPES = frozenset(
     ("object", "array", "string", "number", "integer", "boolean", "null"))
 
@@ -185,9 +194,11 @@ def check_manifest_schema_supported(mv):
 def _validate_capability_parameters(node, path, errors):
     """递归校验 parameters JSON Schema 子集（docs §3.2）。
 
-    只放行 ``type/properties/required/enum/minimum/maximum/items/description``
-    八个键；``type`` 限 TypeBox 兼容的七种基础类型。发现超集键/类型错/结构错
-    即向 ``errors`` 追加一条（含字段路径），不中断遍历。
+    只放行 ``type/properties/required/enum/minimum/maximum/items/description/
+    additionalProperties``；``type`` 限 TypeBox 兼容的七种基础类型；
+    ``additionalProperties`` 仅接受布尔值（合同上 false = 拒绝模型附加键）。
+    发现超集键/类型错/结构错即向 ``errors`` 追加一条（含字段路径），不中断
+    遍历。
     """
     if not isinstance(node, dict):
         errors.append("%s 需为对象，got %s" % (path, type(node).__name__))
@@ -196,6 +207,10 @@ def _validate_capability_parameters(node, path, errors):
         if key not in _CAPABILITY_PARAM_KEYS:
             errors.append("%s.%s 不在 parameters 允许子集内（允许：%s）"
                           % (path, key, ", ".join(sorted(_CAPABILITY_PARAM_KEYS))))
+    addl = node.get("additionalProperties")
+    if addl is not None and not isinstance(addl, bool):
+        errors.append("%s.additionalProperties 需为布尔值（false = 拒绝未"
+                      "声明键）" % path)
     t = node.get("type")
     if t is not None:
         if t not in _CAPABILITY_PARAM_TYPES:
@@ -251,6 +266,10 @@ def validate_provides(d):
         缺省/true = 注入官方 AI 读片的 agent 工具集（extra_tools）；false =
         能力级退出——平台网关不再注入，dispatch 端点与登记行不受影响。
         历史安装行缺该字段按暴露处理（app.py _list_agent_capabilities）。
+      - context 为可选枚举（2026-10-14 count_cells 方形取景 wire 合同 v1 §1）：
+        缺省不声明 = 普通 remote tool（行为不变）；恰为 ``current_snapshot``
+        = 该能力需要 HP 执行阶段注入服务端当前快照上下文（签名
+        snapshot_context）；其他任何值拒绝登记（fail-closed）。
     """
     errors = []
     provides = d.get("provides")
@@ -270,7 +289,7 @@ def validate_provides(d):
         for key in item:
             if key not in ("name", "version", "description", "parameters",
                            "accessMode", "requiredPermissions", "timeout_ms",
-                           "agent_exposed"):
+                           "agent_exposed", "context"):
                 errors.append("%s.%s 不在 provides 允许字段内" % (path, key))
         name = item.get("name")
         if isinstance(name, str):
@@ -337,6 +356,15 @@ def validate_provides(d):
             # 可选布尔：缺省/None 视为未声明（= 暴露，与其它可选字段口径一致）
             errors.append("%s.agent_exposed 需为布尔值（缺省 true=暴露给 AI "
                           "agent）" % path)
+        ctx = item.get("context")
+        if ctx is not None:
+            # 可选枚举（wire 合同 v1 §1）：唯一合法值 current_snapshot；
+            # 其他值（含空串/未知标记）fail-closed 拒绝登记。
+            if ctx != CAPABILITY_CONTEXT_CURRENT_SNAPSHOT:
+                errors.append(
+                    "%s.context=%r 不在允许枚举中（允许：%r；不声明 = 普通 "
+                    "remote tool）" % (path, ctx,
+                                       CAPABILITY_CONTEXT_CURRENT_SNAPSHOT))
     return errors
 
 

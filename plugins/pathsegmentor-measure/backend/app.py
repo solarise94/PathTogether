@@ -17,11 +17,15 @@ installation / user / slide_id / revision / ROI 上限，TTL ≤120s）。本服
      即拒绝（直连调用不受理，与平台「D1 唯一分发点」口径一致）；
   2. 用安装凭证换 scoped JWT（/api/plugin/v1/auth/token，带缓存）；
   3. 经 ``POST /api/plugin/v1/slides/{slide}/regions``（by-name 与 by-id 共一
-     实现）读取 ROI：目标 ~0.5 µm/px 或更细、输出长边 ≤1024（且 ≤ 平台
-     ROI 像素上限——超限由平台 403 roi_over_cap 拒绝，本服务透传为工具级
-     错误）；同时取 slide_info 的 MPP 做 µm² 换算；
-  4. 调推理服务 ``POST /v1/segment``（busy / not_ready / 不可达 / 契约不符
-     映射为明确的错误信封）；
+     实现）读取 ROI：segment_region 目标 ~0.25 µm/px、count_cells 由 agent
+     在固定分辨率枚举（512/768/1024 长边）里选；输出长边 ≤1024、永不上
+     采样超过切片原生分辨率（≤ 平台 ROI 像素上限——超限由平台 403
+     roi_over_cap 拒绝，本服务透传为工具级错误）；同时取 slide_info 的
+     原生 MPP 做 µm² 换算（缺失/无效 → null，仅像素口径）；
+  4. 调推理服务（segment_region → ``POST /v1/segment``；count_cells →
+     Cellpose ``POST /v1/count``，输入 MPP = 原生 MPP × 实际渲染缩放，
+     调用前镜像服务端缩放预算做资源准入；busy / not_ready / 不可达 /
+     契约不符 / resource_limit 映射为明确的错误信封）；
   5. 纯后处理（无 CV 依赖）：mask 像素映射回 level-0、面积/占比/µm²
      （MPP 按轴有效才给 µm²）、小目标过滤后的连通域计数（语义分割 → 计数
      为**近似值** approx_object_count）、尺寸分布摘要、最大 20 个连通域的
@@ -41,7 +45,9 @@ installation / user / slide_id / revision / ROI 上限，TTL ≤120s）。本服
   - ``PT_INSTALLATION_ID`` / ``PT_INSTALLATION_SECRET``：本插件安装凭证
     （owner 安装 API 创建安装行后取回/轮换获得）；
   - ``PATHSEGMENTOR_URL``：推理服务基地址（缺省 http://127.0.0.1:8971）；
-  - ``PT_PSM_TARGET_MPP``：目标输出分辨率 µm/px（缺省 0.5）；
+  - ``PT_PSM_TARGET_MPP``：segment_region 目标输出分辨率 µm/px（缺省
+    0.25）；count_cells 的渲染长边为固定枚举（512/768/1024，缺省 1024，
+    常量 ``_COUNT_RESOLUTIONS``，无 env）；
   - ``PT_PSM_MAX_LONG_EDGE``：ROI 输出图长边上限（缺省 1024，≤2048² 合同）；
   - ``PT_PSM_MIN_COMPONENT_FRACTION``：连通域小目标过滤阈值（占 ROI 输出
     像素比例，缺省 1e-4，下限 4 像素）；
@@ -100,16 +106,28 @@ _CAPABILITY_COUNT = "count_cells"
 # ---------------------------------------------------------------------------
 # Cellpose 计数服务（count_cells 能力；homePC 第二推理服务）
 # ---------------------------------------------------------------------------
-#: 目标输出分辨率 µm/px：Cellpose 直径驱动，0.5 通常足够（env 可调）；
-#: 与 PSM 同款「永不上采样超过原生 mpp」钳制
+#: 渲染分辨率**固定枚举**（输出长边，输出像素；R2 用户口径：agent 只在固定
+#: 选项里选，不再自由取目标 mpp）。预算视角：最坏常用组合（1024² 输入 +
+#: 缺省直径 7µm @ 0.5 µm/px 推理分辨率 → cpsam rescale≈2.14 → 2195²
+#: ≈4.82M px）落在 8 Mi px 预算内且有 1.7× 余量；更粗的 512/768 档供
+#: 大 ROI / 低倍扫描用（推理更快，diameter_px 更大 → 内部放大更小）。
+_COUNT_RESOLUTIONS = (512, 768, 1024)
+_COUNT_RESOLUTION_DEFAULT = 1024
 _CELLPOSE_URL = (os.environ.get("CELLPOSE_URL") or
                  "http://127.0.0.1:8972").rstrip("/")
-_CELLPOSE_TARGET_MPP = float(
-    os.environ.get("PT_CELLPOSE_TARGET_MPP") or 0.5)
-#: diameter_um 合法域（µm）：核 ~6–8、整细胞 15–25；缺省 7
+#: 与 services/cellpose/cellpose_infer.MAX_SCALED_PIXELS / DIAM_MEAN_PX 同源
+#: （两处独立部署，常量镜像；服务端准入仍在，此处是前置防线）。cpsam 在给出
+#: diameter（像素）时按 rescale=30/diameter_px 内部放大输入，合法参数组合在
+#: 粗分辨率切片上可放大许多倍（极端例：diameter_um=1 @ 4 µm/px 输入 →
+#: diameter_px=0.25 → 120×），必须在调用前按实际几何拒绝。
+_CELLPOSE_MAX_SCALED_PIXELS = 8 * 1024 * 1024
+_CELLPOSE_DIAM_MEAN_PX = 30.0
+#: diameter_um 合法域（µm）：核 ~6–8、整细胞 15–25；缺省 7。下限 4：更小
+#: 的「直径」在推理分辨率粗于 0.25 µm/px 的切片上会把 diameter_px 压到个位
+#: 数、触发内部放大爆炸（预算闸拒绝）；上限 100 覆盖成片大目标。
 _COUNT_DIAMETER_DEFAULT_UM = 7.0
-_COUNT_DIAMETER_MIN_UM = 1.0
-_COUNT_DIAMETER_MAX_UM = 200.0
+_COUNT_DIAMETER_MIN_UM = 4.0
+_COUNT_DIAMETER_MAX_UM = 100.0
 
 #: 安装 JWT 缓存（demo 单进程；到期前 60s 主动换新）
 _JWT_CACHE = {"token": "", "exp": 0.0}
@@ -231,7 +249,7 @@ def _platform_slide_info(slide, jwt, slide_id=None, delegated=None):
     return {
         "width": body.get("width"),
         "height": body.get("height"),
-        "mpp": _to_float(body.get("mpp")),
+        "mpp": _normalize_mpp(body.get("mpp")),
         "asset_revision": body.get("asset_revision"),
     }
 
@@ -376,6 +394,83 @@ def _target_long_edge(bbox_w, bbox_h, mpp, target_mpp=None):
     if want <= cap:
         return want, False
     return cap, True  # 受 1024 合同上限或原生分辨率钳制（变粗/不放大）
+
+
+def _normalize_mpp(mpp):
+    """切片原生 MPP 规范化（R4）：非有限/≤0 一律按缺失（None）处理。
+
+    此前缺失/无效的 MPP 会被发成 0.0，真实计数服务 ``_validate_request``
+    对非空 MPP 要求 >0 → 直接 400，降级分支不可达。
+    """
+    f = _to_float(mpp)
+    return f if (f is not None and f > 0) else None
+
+
+def _render_long_edge(bbox_w, bbox_h, requested):
+    """count_cells 渲染长边：agent 选的固定分辨率选项，钳到源长边。
+
+    ``≤ 长边``钳制保证**永不上采样超过切片原生分辨率**（与 segment_region
+    的 ``_target_long_edge`` 同款约束；count_cells 不再按目标 mpp 取边）。
+    返回 ``(edge, coarse)``——coarse=True 表示被原生分辨率钳制（输出粗于
+    请求的分辨率选项）。
+    """
+    cap = max(1, int(requested))
+    long_side = max(int(bbox_w), int(bbox_h))
+    edge = min(cap, max(1, long_side))
+    return edge, edge < cap
+
+
+def _inference_scale(native_mpp, src_w, src_h, out_w, out_h):
+    """实际推理尺度与输入 MPP（R3）：用平台**实际返回**的 src 与输出尺寸，
+    不用请求目标值代替。
+
+    输入 MPP = level-0 原生 MPP × 实际缩放（src/输出）。单一 MPP 合同
+    （服务只收一个标量）：两轴 mpp 相对差 >1% 视为平台异常——region 渲染
+    保宽高比（``_aspect_fit_size`` 逐轴 round），正常只引入 ≤1 输出像素的
+    取整差（1024 长边下 ≈0.1%）——拒绝（anisotropic_scale）而非猜测；
+    否则取两轴均值（直径换算对 ≤1% 各向差不敏感）。原生 MPP 本身仍用于
+    结果映射（密度/µm²/坐标），保持不变。
+
+    返回 ``(scale_x, scale_y, infer_mpp)``；native_mpp 缺失 → infer_mpp=None
+    （服务按模型缺省尺度计数，见 _infer_cellpose）。
+    """
+    scale_x = src_w / float(out_w)
+    scale_y = src_h / float(out_h)
+    if native_mpp is None:
+        return scale_x, scale_y, None
+    mpp_x = native_mpp * scale_x
+    mpp_y = native_mpp * scale_y
+    lo = min(mpp_x, mpp_y)
+    if lo > 0 and abs(mpp_x - mpp_y) > 0.01 * lo:
+        raise PlatformError(
+            400, "anisotropic_scale",
+            "region 渲染两轴尺度不一致（%.4f vs %.4f µm/px，>1%%）："
+            "单一 MPP 计数服务无法表达，请重试；持续出现请反馈平台"
+            % (mpp_x, mpp_y))
+    return scale_x, scale_y, (mpp_x + mpp_y) / 2.0
+
+
+def _cellpose_scaled_pixels(out_w, out_h, infer_mpp, diameter_um):
+    """镜像 cellpose 服务准入（R2 前置防线）：内部缩放后的像素量估计。
+
+    cpsam 按 ``rescale = 30 / diameter_px`` 放大输入（diameter_px =
+    diameter_um / 推理 MPP）；逐轴 ceil 保守估计。infer_mpp 缺失（null
+    mpp）→ 模型缺省尺度（rescale 1.0），工作集即输入像素。直径/MPP 非法
+    或 rescale 非有限 → None（调用方拒绝）。
+    """
+    if infer_mpp is None or infer_mpp <= 0:
+        return float(out_w) * float(out_h)
+    diameter_px = float(diameter_um) / float(infer_mpp)
+    if not math.isfinite(diameter_px) or diameter_px <= 0:
+        return None
+    rescale = _CELLPOSE_DIAM_MEAN_PX / diameter_px
+    if not math.isfinite(rescale) or rescale <= 0:
+        return None
+    scaled_w = math.ceil(out_w * rescale)
+    scaled_h = math.ceil(out_h * rescale)
+    if scaled_w <= 0 or scaled_h <= 0:
+        return None
+    return scaled_w * scaled_h
 
 
 def connected_components(grid, return_labels=False):
@@ -927,13 +1022,29 @@ def capability_segment_region():
 # count_cells（Cellpose 实例分割计数）
 # --------------------------------------------------------------------------- #
 def _validate_count_args(args):
-    """count_cells 参数校验：bbox（同 segment_region）+ diameter_um/model。
+    """count_cells 参数校验：bbox（同 segment_region）+ resolution +
+    diameter_um/model。
 
+    resolution 是**固定枚举**（渲染长边，输出像素；R2 用户口径：agent 只在
+    固定选项里选）——与 diameter_um、切片实际 MPP 一起决定模型内部缩放，
+    任意组合超资源预算在调用前被拒绝（见 capability_count_cells）。
     返回 (normalized, None) 或 (None, PlatformError 400)。
     """
     out, aerr = _validate_bbox_args(args)
     if aerr is not None:
         return None, aerr
+    res = args.get("resolution")
+    if res is None:
+        out["resolution"] = _COUNT_RESOLUTION_DEFAULT
+    else:
+        if isinstance(res, bool) or not isinstance(res, int) \
+                or res not in _COUNT_RESOLUTIONS:
+            return None, PlatformError(
+                400, "invalid_request",
+                "resolution 需为 %s 之一（渲染长边，输出像素；缺省 %d）"
+                % ("/".join(str(r) for r in _COUNT_RESOLUTIONS),
+                   _COUNT_RESOLUTION_DEFAULT))
+        out["resolution"] = res
     d = args.get("diameter_um")
     if d is not None:
         f = _to_float(d)
@@ -956,10 +1067,13 @@ def _validate_count_args(args):
 def _infer_cellpose(image_png_bytes, mpp, diameter_um=None, model=None):
     """POST /v1/count（Cellpose 计数合同）；错误映射与 PSM 同款。
 
+    ``mpp`` 是**推理输入图**的 µm/px（调用方按实际渲染缩放换算，R3）；缺失
+    时序列化为 JSON ``null``（R4：真实服务对非空 MPP 要求 >0，发 0.0 会被
+    400 拒绝；null → 服务按模型缺省尺度计数并附 warning）。
     返回 (body_dict)；实例坐标为输出图像素（由调用方映射回 level-0）。
     """
     payload = {"image_b64": base64.b64encode(image_png_bytes).decode("ascii"),
-               "mpp": mpp if mpp is not None else 0.0}
+               "mpp": mpp if (mpp is not None and mpp > 0) else None}
     if diameter_um is not None:
         payload["diameter_um"] = diameter_um
     if model:
@@ -976,7 +1090,12 @@ def _infer_cellpose(image_png_bytes, mpp, diameter_um=None, model=None):
             body = r.json() or {}
         except Exception:
             body = {}
-        raise PlatformError(400, "invalid_argument",
+        # 服务端资源准入（与插件侧同式，双保险）透传专用码，便于 agent
+        # 理解「改 ROI/参数后重试」而不是当成坏参数
+        code = ("resource_limit"
+                if str(body.get("error") or "") == "resource_limit"
+                else "invalid_argument")
+        raise PlatformError(400, code,
                             "计数服务拒绝输入：%s"
                             % (body.get("message") or body.get("error")
                                or r.text[:200]))
@@ -1029,8 +1148,12 @@ def capability_count_cells():
     """只读计数能力 count_cells（Cellpose 实例分割；manifest.provides）。
 
     与 segment_region 共用入口守卫/委托凭证/by-id 读路径；差异：
-      - 目标分辨率 PT_CELLPOSE_TARGET_MPP（0.5，直径驱动）；
-      - 调 CELLPOSE_URL POST /v1/count（服务端做实例分割与计数）；
+      - 渲染长边取 agent 选的**固定分辨率枚举**（512/768/1024，缺省 1024；
+        永不上采样超过切片原生分辨率，R2 用户口径）；
+      - 推理输入 MPP = 原生 MPP × **实际渲染缩放**（由实际返回的 src 与
+        输出尺寸计算，R3），缺失/无效的原生 MPP 规范为 JSON null（R4）；
+      - 调 CELLPOSE_URL POST /v1/count 前按「输出几何 × 推理 MPP × 直径」
+        镜像服务端缩放预算，超限 400 resource_limit（调用方可改 ROI/参数）；
       - 返回 instance_count / 密度 / 面积分布 µm² / ≤20 示例实例
         （映射回 level-0），无 label map / base64。
     """
@@ -1052,15 +1175,55 @@ def capability_count_cells():
         jwt = _installation_jwt()
         info = _platform_slide_info(slide, jwt, slide_id=slide_id,
                                     delegated=delegated)
-        mpp = info.get("mpp")
-        target_edge, coarse = _target_long_edge(
-            args["w"], args["h"], mpp, target_mpp=_CELLPOSE_TARGET_MPP)
+        mpp = _normalize_mpp(info.get("mpp"))  # level-0 原生 MPP（可能 None）
+        resolution = args["resolution"]
+        target_edge, coarse = _render_long_edge(args["w"], args["h"],
+                                                resolution)
         img_bytes, region_payload = _platform_read_region(
             slide, args, target_edge, delegated, jwt, slide_id=slide_id)
         timings["region_read_ms"] = int((time.time() - t) * 1000)
 
+        src = region_payload.get("src") or {}
+        out_w = _to_float(region_payload.get("width"))
+        out_h = _to_float(region_payload.get("height"))
+        src_w = _to_float(src.get("w"))
+        src_h = _to_float(src.get("h"))
+        if not out_w or not out_h or not src_w or not src_h \
+                or out_w <= 0 or out_h <= 0 or src_w <= 0 or src_h <= 0:
+            raise PlatformError(503, "platform_contract",
+                                "region 响应缺少可用的尺寸元数据",
+                                retryable=True)
+        # R3：推理输入 MPP 从实际 src/输出尺寸算（不是请求目标值）
+        scale_x, scale_y, infer_mpp = _inference_scale(
+            mpp, src_w, src_h, out_w, out_h)
+
+        # R2 资源准入（镜像服务端公式；服务端闸仍在，双保险）
+        diameter_um = args.get("diameter_um") or _COUNT_DIAMETER_DEFAULT_UM
+        scaled_px = _cellpose_scaled_pixels(out_w, out_h, infer_mpp,
+                                            diameter_um)
+        if scaled_px is None or scaled_px > _CELLPOSE_MAX_SCALED_PIXELS:
+            diameter_px = (None if infer_mpp is None
+                           else diameter_um / infer_mpp)
+            raise PlatformError(
+                400, "resource_limit",
+                "该 ROI/参数组合会使 Cellpose 内部放大约 %s 像素，超出 %d "
+                "像素推理预算（推理输入 %dx%d px、推理分辨率 %s µm/px、"
+                "直径 %.1f µm ≈ %s px）。请改用更粗的 resolution（%s）、"
+                "更大的 diameter_um 或更小的 ROI 后重试"
+                % ("未知" if scaled_px is None else "%d" % int(scaled_px),
+                   _CELLPOSE_MAX_SCALED_PIXELS, int(out_w), int(out_h),
+                   ("%.2f" % infer_mpp) if infer_mpp else "未知",
+                   diameter_um,
+                   ("%.1f" % diameter_px) if diameter_px else "未知",
+                   "/".join(str(r) for r in _COUNT_RESOLUTIONS)),
+                extra={"scaled_pixels": (None if scaled_px is None
+                                         else int(scaled_px)),
+                       "budget_pixels": _CELLPOSE_MAX_SCALED_PIXELS,
+                       "resolution": resolution,
+                       "diameter_um": diameter_um})
+
         t = time.time()
-        infer_body = _infer_cellpose(img_bytes, mpp,
+        infer_body = _infer_cellpose(img_bytes, infer_mpp,
                                      diameter_um=args.get("diameter_um"),
                                      model=args.get("model"))
         timings["infer_ms"] = int((time.time() - t) * 1000)
@@ -1068,18 +1231,6 @@ def capability_count_cells():
         return _error(e.status, e.code, e.message, retryable=e.retryable,
                       extra=e.extra)
 
-    t = time.time()
-    src = region_payload.get("src") or {}
-    out_w = _to_float(region_payload.get("width"))
-    out_h = _to_float(region_payload.get("height"))
-    src_w = _to_float(src.get("w"))
-    src_h = _to_float(src.get("h"))
-    if not out_w or not out_h or not src_w or not src_h \
-            or out_w <= 0 or out_h <= 0 or src_w <= 0 or src_h <= 0:
-        return _error(503, "platform_contract",
-                      "region 响应缺少可用的尺寸元数据", retryable=True)
-    scale_x = src_w / out_w
-    scale_y = src_h / out_h
     mpp_x = mpp_y = None
     if mpp is not None and mpp > 0:
         mpp_x = mpp_y = float(mpp)
@@ -1121,8 +1272,8 @@ def capability_count_cells():
 
     if coarse and mpp:
         warnings.append(
-            "ROI 大于 %.0f 输出像素上限或已达原生分辨率：输出未达目标 %.2f µm/px"
-            % (_MAX_LONG_EDGE, _CELLPOSE_TARGET_MPP))
+            "ROI 长边小于请求的 %d 输出像素：已达切片原生分辨率（不放大），"
+            "输出粗于请求分辨率" % resolution)
     for w in (infer_body.get("warnings") or []):
         if isinstance(w, str) and w:
             warnings.append("inference: " + w)
@@ -1168,7 +1319,13 @@ def capability_count_cells():
             "x": mpp_x, "y": mpp_y,
             "source": ("slide_info.mpp（mpp_x；两轴同值）" if mpp_x else None),
         },
-        "target_mpp": _CELLPOSE_TARGET_MPP,
+        "resolution": resolution,
+        "inference_input": {
+            "mpp": infer_mpp,
+            "scale": {"x": scale_x, "y": scale_y},
+            "note": "推理输入 MPP = 原生 MPP × 实际渲染缩放（实际 src/输出"
+                    "尺寸，R3）；原生 MPP 仅用于结果映射",
+        },
         "timings_ms": timings,
         "warnings": warnings,
     }

@@ -68,8 +68,8 @@
     },
     {
       "name": "count_cells",
-      "version": "1.0.0",
-      "description": "用 Cellpose 实例分割模型在给定 level-0 整数 bbox（x,y,w,h）内逐个分割并计数细胞/细胞核：返回实例数（真实实例计数）、每 mm² 密度（MPP 有效时）、单个面积分布（µm²）与最多 20 个示例实例的 level-0 bbox/质心（可用于标注典型细胞）。与 segment_region 不同：这是实例分割计数，不是语义区域面积；要某类组织的面积/占比用 segment_region。diameter_um 缺省 7（细胞核；整细胞给 15–25）；可选 model 预设。结果为近似值，需人工核对。bbox 面积不得超过平台 ROI 上限（超限拒绝）。",
+      "version": "1.1.0",
+      "description": "用 Cellpose 实例分割模型在给定 level-0 整数 bbox（x,y,w,h）内逐个分割并计数细胞/细胞核：返回实例数（真实实例计数）、每 mm² 密度（MPP 有效时）、单个面积分布（µm²）与最多 20 个示例实例的 level-0 bbox/质心（可用于标注典型细胞）。与 segment_region 不同：这是实例分割计数，不是语义区域面积；要某类组织的面积/占比用 segment_region。ROI 先按 resolution 选定的固定渲染长边（512/768/1024，缺省 1024，不超过切片原生分辨率）渲染后再推理。diameter_um 缺省 7（细胞核；整细胞 15–25）；直径与切片分辨率共同决定模型内部缩放，超资源预算的组合会被拒绝（resource_limit——改用更粗 resolution、更大 diameter_um 或更小 ROI 重试）。切片 MPP 缺失时计数仍可用，但不返回密度/µm²（仅像素口径）。结果为近似值，需人工核对。bbox 面积不得超过平台 ROI 上限（超限拒绝）。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -89,11 +89,16 @@
             "type": "integer",
             "description": "level-0 bbox 高（整数像素，>0；y+h 不得超过切片高）"
           },
+          "resolution": {
+            "type": "integer",
+            "enum": [512, 768, 1024],
+            "description": "渲染长边（输出像素）固定选项，缺省 1024：ROI 按此长边保宽高比渲染（不超过切片原生分辨率）再送 Cellpose。大 ROI 或低倍扫描选 512/768 更快、更省资源"
+          },
           "diameter_um": {
             "type": "number",
-            "minimum": 1,
-            "maximum": 200,
-            "description": "期望目标直径 µm（缺省 7=细胞核；整细胞 15–25）"
+            "minimum": 4,
+            "maximum": 100,
+            "description": "期望目标直径 µm（缺省 7=细胞核；整细胞 15–25）。过小直径在粗分辨率切片上会超推理资源预算（resource_limit）"
           },
           "model": {
             "type": "string",

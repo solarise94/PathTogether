@@ -1352,4 +1352,91 @@ describe("上传中刷新恢复：完成即按原目标关联（folder-experienc
 		await flush(40);
 		expect(slidesPosts(h2).length).toBe(0);
 	});
+
+	// R5 复核（integration-20261014 §R5）：两种响应顺序都必须恰好关联一次。
+	// 本案例（源自评审补丁 folder-regression.patch）：**身份先就绪**——
+	// ingestion 故意延迟，/api/auth/info 先完成；旧行为在 viewable 时立即
+	// cosJobRemove（内含 fbUpAssocTake 消费快照），身份闸里第二次 Take 落空
+	// → 0 次关联、静默未归类。修复后：先取快照再清任务记录，与请求到达
+	// 顺序无关。
+	it("案例：身份先就绪（auth/info 先于 ingestion 返回）→ 仍按原目标关联恰好一次（R5 回归）", async () => {
+		const storage = fakeStorage({
+			"pt.cos.jobs": JSON.stringify([cosJobRecord("job_review")]),
+			[UPASSOC_KEY]: upAssocSeed("job_review",
+				{ pid: "p_t", newProjectName: "", createdPid: "", createKey: null }),
+		});
+		const h = bootApp((s) => {
+			seedFx(s);
+			seedAuth(s, AUTH_U1);
+			s.laggy.set("/api/ingestions/job_review", () => {});
+			s.routes.set("/api/project/p_t/slides", () => ({ status: 200, body: { ok: true } }));
+		}, { storage });
+		await flush(40); // /api/auth/info 完成而 ingestion 仍挂起
+		expect(JSON.parse(storage.map.get(UPASSOC_KEY)!).length).toBe(1);
+		h.laggy.get("/api/ingestions/job_review")!({ status: 200, body: { stage: "viewable", slide_id: "sld_review", slide: "restored.tif" } });
+		await flush(40);
+		const posts = slidesPosts(h);
+		expect(posts.length).toBe(1);
+		expect(JSON.parse(String(posts[0].opts && posts[0].opts.body)))
+			.toEqual({ slide_ids: ["sld_review"] });
+		// 快照一次性消费、任务记录清理；再次恢复（再刷新）绝不重复关联
+		expect(storage.map.get(UPASSOC_KEY)).toBe("[]");
+		expect(JSON.parse(storage.map.get("pt.cos.jobs") as string).length).toBe(0);
+		const callsBefore = h.calls.length;
+		(globalThis as { window?: { HP_UPLOAD?: { restoreCosJobs(): void } } })
+			.window!.HP_UPLOAD!.restoreCosJobs();
+		await flush(20);
+		expect(h.calls.length).toBe(callsBefore);
+	});
+
+	// R5 的另一半：**任务先到**——viewable 在 /api/auth/info 之前返回，
+	// 关联必须等身份就绪且仍然恰好一次（旧行为里 cosJobRemove 的 Take 在
+	// 无身份域时退化为空操作，靠身份闸里的 Take 成功；修复后语义不变）。
+	it("案例：任务先到（ingestion 先于 auth/info 返回）→ 等身份就绪后仍恰好关联一次", async () => {
+		const storage = fakeStorage({
+			"pt.cos.jobs": JSON.stringify([cosJobRecord("job4")]),
+			[UPASSOC_KEY]: upAssocSeed("job4",
+				{ pid: "p_t", newProjectName: "", createdPid: "", createKey: null }),
+		});
+		const h = bootApp((s) => {
+			seedFx(s);
+			seedAuth(s, AUTH_U1);
+			s.laggy.set("/api/auth/info", () => {});
+			s.routes.set("/api/ingestions/job4", ingRoute(
+				{ stage: "viewable", slide_id: "sld_r4", slide: "restored.tif" }));
+			s.routes.set("/api/project/p_t/slides", () => ({ status: 200, body: { ok: true } }));
+		}, { storage });
+		await flush(40);
+		// 身份未就绪：绝不发起关联（快照按身份域存取，无键不读）
+		expect(slidesPosts(h).length).toBe(0);
+		// 任务记录已随 viewable 清理（§5：已可查看即清理），快照仍在
+		expect(JSON.parse(storage.map.get("pt.cos.jobs") as string).length).toBe(0);
+		expect(JSON.parse(storage.map.get(UPASSOC_KEY) as string).length).toBe(1);
+		h.laggy.get("/api/auth/info")!({ status: 200, body: AUTH_U1 });
+		await flush(40);
+		const posts = slidesPosts(h);
+		expect(posts.length).toBe(1);
+		expect(JSON.parse(String(posts[0].opts && posts[0].opts.body)))
+			.toEqual({ slide_ids: ["sld_r4"] });
+		expect(storage.map.get(UPASSOC_KEY)).toBe("[]");
+	});
+
+	// 取消/终态仍清理快照（R5 修复约束：只把恢复成功路径改成先取后清；
+	// 终态路径 cosJobRemove 的「记录 + 快照」一并清理保持不变）。
+	it("案例：恢复轮询遇终态 → 任务记录与原目标快照一并清理，绝无关联请求", async () => {
+		const storage = fakeStorage({
+			"pt.cos.jobs": JSON.stringify([cosJobRecord("job9")]),
+			[UPASSOC_KEY]: upAssocSeed("job9",
+				{ pid: "p_t", newProjectName: "", createdPid: "", createKey: null }),
+		});
+		const h = bootApp((s) => {
+			seedFx(s);
+			seedAuth(s, AUTH_U1);
+			s.routes.set("/api/ingestions/job9", ingRoute({ stage: "terminal" }));
+		}, { storage });
+		await flush(40);
+		expect(JSON.parse(storage.map.get("pt.cos.jobs") as string).length).toBe(0);
+		expect(storage.map.get(UPASSOC_KEY)).toBe("[]");
+		expect(slidesPosts(h).length).toBe(0);
+	});
 });

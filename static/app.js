@@ -10163,11 +10163,20 @@
     cosJobsWrite(jobs);
   }
 
-  function cosJobRemove(jobId) {
+  // 只删任务记录（pt.cos.jobs），不碰目标快照——快照消费（fbUpAssocTake）
+  // 是身份域的一次性读端，由各完成路径明确择时调用（R5 复核：恢复完成路径
+  // 必须等身份就绪后先 Take 再清记录；两条请求的相对速度不得影响结果）。
+  function cosJobsDrop(jobId) {
     if (!jobId) return;
     cosJobsWrite(cosJobsRead().filter(function (j) { return j.job_id !== jobId; }));
-    // folder-experience：任务记录移除即清理其目标快照（同 Tab 完成/取消/终态
-    // 时身份已知，Take 生效；恢复完成路径在身份就绪后自行 Take，不受影响）
+  }
+
+  // 任务记录 + 快照一并清理：同 Tab 完成/取消/终态（uploadFileCos 行与
+  // pollRestoredRow 终态分支）此时身份已知（或 Take 退化为无键空操作），
+  // Take 即消费。恢复完成路径（pollRestoredRow viewable）不走这里。
+  function cosJobRemove(jobId) {
+    if (!jobId) return;
+    cosJobsDrop(jobId);
     fbUpAssocTake(jobId);
   }
 
@@ -10511,7 +10520,7 @@
           if (!st) { setTimeout(tick, 5000); return; }
           if (st === "viewable") {
             done = true;
-            cosJobRemove(job.job_id);   // 任务记录移除（快照清理延迟到身份就绪，见下）
+            cosJobsDrop(job.job_id);   // 任务记录移除；快照消费延迟到身份就绪（见下，R5）
             var r0 = ensureRow();
             r0.setStage("upload.stage.done");
             r0.finish();
@@ -10522,7 +10531,10 @@
             toast(t("upload.done", { name: b.slide || job.filename }), "success");
             loadAll();
             // folder-experience §1.3×§5：恢复轮询常先于 /api/auth/info 完成，
-            // 而目标快照按身份域存取——身份就绪后再取快照并按原快照关联
+            // 而目标快照按身份域存取——身份就绪后**先取快照**（一次性消费），
+            // 再按已取得的原快照关联（R5 复核：auth/info 与 ingestion 谁先
+            // 返回都恰好消费一次；此处绝不再调 cosJobRemove——那会提前 Take
+            // 掉快照，身份先就绪时第二次 Take 落空 → 静默丢失关联）。
             //（失败进入既有待办/行内重试机制）；快照缺失/过期/他号 → 不猜，
             // 保持未归类，绝不改成当前目录，也绝不重传已发布切片。
             fbIdentityReady().then(function () {
@@ -10536,11 +10548,16 @@
           }
           if (st === "terminal") {
             done = true;
-            cosJobRemove(job.job_id);
+            cosJobsDrop(job.job_id);   // 任务记录立即清理（§5：终态即清理）
             var r1 = ensureRow();
             r1.markError();
             r1.setStage("upload.stage.failed");
             r1.finish(10000);
+            // 快照清理同恢复完成路径：等身份就绪后按本号域消费（与轮询、
+            // auth/info 谁先返回无关）；取消/终态绝不保留遗留快照。
+            fbIdentityReady().then(function () {
+              fbUpAssocTake(job.job_id);
+            });
             return;
           }
           var note = (st === "uploading") ? tt("upload.cos.resume_hint") : "";

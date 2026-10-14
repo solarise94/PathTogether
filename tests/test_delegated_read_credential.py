@@ -34,7 +34,7 @@ import requests as real_requests  # noqa: E402
 
 import app as app_mod  # noqa: E402
 import share_store  # noqa: E402
-from _pt_helpers import isolate_app, register_slide_row  # noqa: E402
+from _pt_helpers import isolate_app, make_snapshot_context, register_slide_row  # noqa: E402
 
 app_mod.UPLOAD_DIR = Path(os.environ["UPLOAD_DIR"])
 app_mod.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -1063,15 +1063,26 @@ def test_id_bundle_e2e_dispatch_backend_by_id_region(monkeypatch):
 
 def test_dispatch_mints_credential_for_count_cells(monkeypatch):
     """count_cells 声明 slide:region:read → dispatch 按最小披露门槛随转发
-    签发委托凭证（ecaf30db gating 对第二个能力同样生效）。"""
+    签发委托凭证（ecaf30db gating 对第二个能力同样生效）。
+
+    2026-10-14 方形取景：count_cells 另声明 context=current_snapshot，
+    dispatch 先验证签名 snapshot_context（本用例按合同 wire 形态真签），
+    通过后才到达凭证签发点——上下文路径不改变委托凭证的最小披露。"""
     _install_with_known_secret(monkeypatch)
     sid = _register_owned_slide(monkeypatch)
+    # 网关 bbox 界内检查的切片尺寸钉桩（维度读取与本用例无关）
+    monkeypatch.setattr(app_mod, "_dispatch_slide_level0_dims",
+                        lambda gate: (4096, 4096))
     stub = _ForwardStub()
     monkeypatch.setattr(app_mod, "requests", stub)
     token = _tool_token(capabilities=["%s/count_cells" % PLUGIN_ID])
     r = _client().post(
         "/api/plugin/v1/dispatch/%s/count_cells" % PLUGIN_ID,
-        json={"slide": "demo.svs", "arguments": {}},
+        json={"slide": "demo.svs",
+              "arguments": {},
+              "snapshot_context": make_snapshot_context(app_mod.AI_INTERNAL_TOKEN,
+                  sid="sess-1", slide_id=sid, snap="snap-1",
+                  bbox=[0, 0, 1000, 1000])},
         headers={"Authorization": "Bearer " + token,
                  "X-AI-Session": "sess-1"})
     assert r.status_code == 200, r.get_json()
@@ -1094,14 +1105,21 @@ def test_id_bundle_e2e_count_cells_dispatch_backend_by_id(monkeypatch):
     adapter = _BackendAdapter(backend)
     monkeypatch.setattr(app_mod, "requests", adapter)
     mocks = _slide_read_mocks()
+    # 方形取景（2026-10-14）：快照 16² 中心方形、原生 0.5 渲染（out==src==16）
+    # ——平台按合同对界内方形恒渲染恰好请求边（不再模拟 16→8 的越契约渲染）。
+    desc = app_mod.slide_store.resolve_slide_id(sid)
+    rev = app_mod._slide_revision(desc)
     with mocks[0], mocks[1], mocks[2], \
             mock.patch.object(app_mod, "_read_region_b64",
-                              return_value=_region_payload(w=8, h=8)):
+                              return_value=_region_payload(w=16, h=16)):
         r = _client().post(
             "/api/plugin/v1/dispatch/%s/count_cells" % PLUGIN_ID,
             json={"slide": "26-005817.tif",
                   "slide_id": sid,
-                  "arguments": {"x": 0, "y": 0, "w": 16, "h": 16}},
+                  "arguments": {"resolution": 2048, "diameter_um": 7},
+                  "snapshot_context": make_snapshot_context(app_mod.AI_INTERNAL_TOKEN,
+                      sid="sess-1", slide_id=sid, snap="snap-e2e",
+                      bbox=[0, 0, 16, 16], rev=rev or None)},
             headers={"Authorization": "Bearer " + _tool_token_with_sid(
                         "26-005817.tif", sid,
                         capabilities=["%s/count_cells" % PLUGIN_ID]),
@@ -1111,11 +1129,17 @@ def test_id_bundle_e2e_count_cells_dispatch_backend_by_id(monkeypatch):
     assert result["capability"] == "count_cells"
     assert result["instance_count"] == 2
     assert result["slide_id"] == sid
-    # 密度：ROI = (16·0.5/1000)² mm² = 6.4e-5；2 / 6.4e-5 = 31250
+    # counted_region：快照内自动取的方形（16² 短边封顶、中心定位）
+    cr = result["counted_region"]
+    assert cr["bbox"] == {"x": 0, "y": 0, "w": 16, "h": 16}
+    assert cr["snapshot_id"] == "snap-e2e"
+    assert cr["reduced"] is False
+    # 密度：ROI = (16·0.5/1000)² mm² = 6.4e-5；2 / 6.4e-5 = 31250（不变：
+    # 原生像素渲染时 src 16 与原夹具的 level-0 bbox 同一物理）
     assert result["density"]["per_mm2"] == pytest.approx(31250.0)
-    # 实例映射回 level-0（scale 2，src (0,0)）
+    # 实例映射回 level-0（scale 1，src (0,0)：原生渲染下 1:1）
     inst0 = result["instances_top"][0]
-    assert inst0["bbox_l0"] == [2, 2, 6, 6]
+    assert inst0["bbox_l0"] == [1, 1, 3, 3]
     assert result["model"]["model_id"] == "cellpose"
     text = r.get_data(as_text=True)
     assert len(r.get_data()) < 64 * 1024

@@ -76,8 +76,8 @@
     },
     {
       "name": "count_cells",
-      "version": "1.1.0",
-      "description": "用 Cellpose 实例分割模型在给定 level-0 整数 bbox（x,y,w,h）内逐个计数细胞/细胞核：返回实例数、每 mm² 密度（MPP 有效时）、面积分布（µm²）与最多 20 个示例实例的 level-0 bbox/质心。与 segment_region 不同：这是实例计数，不是语义区域面积。模型以 diameter/30 µm/px 的分辨率处理（d=7→0.2333），ROI 按该尺度渲染（不超过原生）；resolution 是处理长边上限固定选项，超限或超预算在读图前拒绝（resource_limit）——处理量只取决于视场与直径，调 resolution 不改变算力。d=7 且原生 ≤0.2333 时各选项最大视场：512→约119 µm、1024→约239 µm、2048→约478 µm；超限请改更大 resolution 或拆分 tile。diameter_um 缺省 7（核；整细胞 15–25）。MPP 缺失时仅像素口径。结果为近似值，需人工核对；bbox 面积不得超过平台 ROI 上限。",
+      "version": "1.2.0",
+      "description": "用 Cellpose 实例分割模型在给定 level-0 整数 bbox（x,y,w,h）内逐个计数细胞/细胞核：返回实例数、每 mm² 密度（MPP 有效时）、面积分布（µm²）与最多 20 个示例实例的 level-0 bbox/质心。与 segment_region 不同：这是实例计数，不是语义区域面积。模型以 diameter/30 µm/px 的分辨率处理（d=7→0.2333），ROI 按该尺度渲染（不超过原生）；resolution 是模型处理长边上限固定选项，每档最大视场 = resolution×diameter/30 µm、与切片 MPP 无关（d=7：512→119.47 µm、1024→238.93 µm、2048→477.87 µm；耗时约随 option² 增长），超限/超预算在读图前拒绝（resource_limit）——请改选更大 resolution、拆分 tile 或适当增大 diameter_um。diameter_um 缺省 7（核；整细胞 15–25）。MPP 缺失仅像素口径。结果为近似值，需人工核对；bbox 面积不得超过平台 ROI 上限。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -104,13 +104,13 @@
               1024,
               2048
             ],
-            "description": "处理长边上限固定选项（缺省 2048=服务输入上限，最少误拒；512/1024 为更快的显式选项）：ROI 按 Cellpose 处理尺度（diameter/30 µm/px，不超过切片原生）渲染，所需处理长边超过该选项时拒绝（resource_limit——改选更大选项或拆分 ROI）。d=7 且原生 ≤0.2333 µm/px 时可处理的最大 ROI 视场：512→约119 µm、1024→约239 µm、2048→约478 µm"
+            "description": "模型处理长边上限固定选项（含 Cellpose 内部放大；缺省 2048=服务输入上限、每档最大视场；512/1024 为更快的显式选项，时间成本约随 option² 增长）：ROI 按 Cellpose 处理尺度（diameter/30 µm/px，不超过切片原生）渲染，模型处理长边超过该选项时在读图前拒绝（resource_limit——改选更大选项、拆分 ROI 或适当增大 diameter_um）。每档最大视场 = resolution×diameter/30 µm，与切片 MPP 无关；d=7：512→119.47 µm、1024→238.93 µm、2048→477.87 µm"
           },
           "diameter_um": {
             "type": "number",
             "minimum": 4,
             "maximum": 100,
-            "description": "期望目标直径 µm（缺省 7=细胞核；整细胞 15–25）。决定 Cellpose 处理尺度（d/30 µm/px）与可处理的最大 ROI 视场（约 resolution×d/30 µm，预算封顶约 96.5×d µm）；直径过小会缩小可处理视场"
+            "description": "期望目标直径 µm（缺省 7=细胞核；整细胞 15–25）。决定 Cellpose 处理尺度（d/30 µm/px）与可处理的最大 ROI 视场（= resolution×d/30 µm，与切片 MPP 无关）；直径过小会缩小可处理视场"
           },
           "model": {
             "type": "string",

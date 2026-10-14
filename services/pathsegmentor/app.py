@@ -19,8 +19,10 @@
     一路 1024² 假图推理，PATHSEG_EAGER_LOAD=0 可关 import 期加载供测试）；
   - ``_INFERENCE_LOCK`` 单飞 GPU 推理：非阻塞获取，占用即 503 busy，
     不排队（在锁上等待会占住 gunicorn 线程直到调用方超时）；
-  - 入参校验：image ≤ 2048×2048、请求体 ≤ 8MB、object 必填、threshold
-    0..1；RGBA/灰度统一转 RGB；
+  - 入参校验：image ≤ 2048×2048（**先读图片头拒超大图，再解码像素**——
+    8 MiB 压缩体不约束解压后像素，R2；模型内部固定 resize 到 1024²，无
+    第二次放大，故除入口闸外无额外资源准入）、请求体 ≤ 8MB、object 必填、
+    threshold 0..1；RGBA/灰度统一转 RGB；
   - 请求体与图像**不落盘、不进日志**（日志只有状态码与耗时）；
   - 权重 PATHSEG_WEIGHTS（缺省 /models/model_state_dict.pt，只读挂载），
     启动时流式校验 SHA-256（PATHSEG_EXPECTED_SHA256，不符拒绝加载）。
@@ -179,7 +181,12 @@ def readyz():
 
 
 def _decode_image(image_b64):
-    """base64 → PIL RGB 图像；返回 (错误元组或 None, 图像或 None)。"""
+    """base64 → PIL RGB 图像；返回 (错误元组或 None, 图像或 None)。
+
+    尺寸闸在**像素解码前**（R2）：``Image.open`` 只读文件头，先按头部的
+    两轴与像素总量拒绝超大图，再 ``load()`` 解码像素——否则低压缩体积的
+    大图会在被拒绝前白白完成整幅解码。
+    """
     if not isinstance(image_b64, str) or not image_b64:
         return ("missing_image",
                 "image_b64 must be a non-empty base64 string"), None
@@ -191,15 +198,20 @@ def _decode_image(image_b64):
         return ("invalid_base64", "image_b64 decodes to zero bytes"), None
     try:
         image = Image.open(io.BytesIO(raw))
-        image.load()
     except Exception:  # noqa: BLE001 — PIL 对坏数据的各类异常统一 400
         return ("image_not_decodable",
                 "image_b64 is not a decodable image"), None
-    width, height = image.size
-    if width > MAX_IMAGE_EDGE or height > MAX_IMAGE_EDGE:
+    width, height = image.size  # 仅头部；像素尚未解码
+    if (width > MAX_IMAGE_EDGE or height > MAX_IMAGE_EDGE
+            or width * height > MAX_IMAGE_EDGE * MAX_IMAGE_EDGE):
         return ("image_too_large",
                 "image %dx%d exceeds %dx%d limit"
                 % (width, height, MAX_IMAGE_EDGE, MAX_IMAGE_EDGE)), None
+    try:
+        image.load()
+    except Exception:  # noqa: BLE001 — 头部合法但像素数据坏（如截断 JPEG）
+        return ("image_not_decodable",
+                "image_b64 is not a decodable image"), None
     return None, image.convert("RGB")
 
 

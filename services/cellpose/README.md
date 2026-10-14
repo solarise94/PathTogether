@@ -66,7 +66,15 @@ Cellpose annotated dataset is also CC-BY-NC."——训练数据非商用授权�
 - `flow_threshold` 0..1（缺省 0.4，上游固定值）、`cellprob_threshold`
   -6..6（缺省 0.0）；
 - `return_labels`：true 时响应带 `labels_png_b64`（16-bit PNG 标签图）；
-- 图像 ≤ 2048×2048，请求体 ≤ 8MB；RGBA/灰度统一转 RGB；**仅 RGB 参与推理**。
+- 图像 ≤ 2048×2048（**按图片头先拒后解码**：`Image.open` 只读头部即查
+  两轴/像素量，超大图不解码像素直接 400，R2），请求体 ≤ 8MB；RGBA/灰度
+  统一转 RGB；**仅 RGB 参与推理**；
+- **内部缩放资源准入（R2）**：cpsam 按 `rescale=30/diameter_px` 在模型内
+  先放大输入。服务在调用模型前按「输入几何 × mpp × diameter」计算缩放后
+  像素量，非有限/超过 `MAX_SCALED_PIXELS`（8 Mi px ≈ 2896²，见
+  `cellpose_infer.py`）→ 400 `resource_limit`，消息含预计放大尺寸并提示
+  调用方改 ROI/参数（更大 `diameter_um`、更细输入 mpp、更小图）；
+  `mpp:null` 走 rescale 1.0，恒在预算内。并发与 busy 行为不变。
 
 响应 `200`：
 
@@ -89,9 +97,10 @@ Cellpose annotated dataset is also CC-BY-NC."——训练数据非商用授权�
 `return_labels=true` 时出现（实例 >65535 时截断并附 warning）。
 
 错误：`400 {"error":"<code>","message":..}`（`invalid_json` / `missing_image`
-/ `invalid_base64` / `image_not_decodable` / `image_too_large` / `invalid_mpp`
-/ `invalid_diameter_um` / `invalid_flow_threshold` / `invalid_cellprob_threshold`
-/ `invalid_model` / `invalid_return_labels` / `body_too_large`）；
+/ `invalid_base64` / `image_not_decodable` / `image_too_large`（头部即拒，
+像素未解码）/ `invalid_mpp` / `invalid_diameter_um` / `invalid_flow_threshold`
+/ `invalid_cellprob_threshold` / `invalid_model` / `invalid_return_labels`
+/ `resource_limit`（内部缩放超预算，进模型前拒绝）/ `body_too_large`）；
 `503 {"error":"busy"}`（已有一路推理在跑——单飞 GPU 推理，不排队）；
 `503 {"error":"not_ready"}`（模型未就绪/加载失败）。
 

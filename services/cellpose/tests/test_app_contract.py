@@ -117,6 +117,91 @@ def test_count_image_too_large_400(client):
     assert resp.get_json()["error"] == "image_too_large"
 
 
+# ---------------------------------------------------------------- 资源准入（R2）
+
+def test_count_oversized_header_rejected_before_pixel_decode(monkeypatch,
+                                                             client):
+    """超大图必须只读图片头即拒绝，不得先解码像素（R2 预解码闸）。"""
+    calls = []
+
+    class _HeaderOnly:
+        size = (4096, 4096)
+
+        def load(self):
+            calls.append("decoded_pixels")
+
+    monkeypatch.setattr(app.Image, "open", lambda _f: _HeaderOnly())
+    resp = client.post("/v1/count", json=_count_body(
+        image_b64=base64.b64encode(b"header-only").decode()))
+    assert resp.status_code == 400
+    assert resp.get_json()["error"] == "image_too_large"
+    assert calls == [], "oversized input must never reach pixel decoding"
+
+
+def test_count_oversized_non_square_header_rejected(monkeypatch, client):
+    """两轴分别校验（窄长图绕不过单边闸）。"""
+
+    class _HeaderOnly:
+        size = (64, 40000)
+
+        def load(self):
+            raise AssertionError("must not decode pixels")
+
+    monkeypatch.setattr(app.Image, "open", lambda _f: _HeaderOnly())
+    resp = client.post("/v1/count", json=_count_body(
+        image_b64=base64.b64encode(b"header-only").decode()))
+    assert resp.status_code == 400
+    assert resp.get_json()["error"] == "image_too_large"
+
+
+def test_count_explosive_internal_rescale_rejected_before_model(client,
+                                                                monkeypatch):
+    """合法 diameter_um=1 @ mpp=0.5 → diameter_px=2 → cpsam 15× 内部放大
+    （1024² → 15360²≈2.36 亿 px）：必须在进模型前拒绝（R2 第二道闸）。"""
+    calls = []
+
+    def spy(img, **kwargs):
+        calls.append(img.shape)
+        return np.zeros(img.shape[:2], np.int32)
+
+    app._MODEL.inject(spy)
+    monkeypatch.setattr(app, "_decode_image",
+                        lambda _b: (None, Image.new("RGB", (1024, 1024))))
+    resp = client.post("/v1/count",
+                       json=_count_body(mpp=0.5, diameter_um=1.0))
+    assert resp.status_code == 400
+    body = resp.get_json()
+    assert body["error"] == "resource_limit"
+    assert "diameter_um" in body["message"]
+    assert calls == [], "must refuse before calling the model"
+
+
+def test_count_default_params_within_budget(client):
+    """缺省 7µm @0.25mpp 的 1024²：rescale≈1.07 → ≈1097²≈1.2M px，预算内。"""
+    resp = client.post("/v1/count",
+                       json=_count_body(image_b64=_png_b64(1024, 1024),
+                                        mpp=0.25))
+    assert resp.status_code == 200
+    assert resp.get_json()["instance_count"] == 2
+
+
+def test_count_2048_coarse_mpp_default_diameter_rejected(client):
+    """2048² @ mpp0.5 + 缺省直径 → rescale≈2.14 → ≈4390²≈19M px：拒绝。"""
+    resp = client.post("/v1/count",
+                       json=_count_body(image_b64=_png_b64(2048, 2048),
+                                        mpp=0.5))
+    assert resp.status_code == 400
+    assert resp.get_json()["error"] == "resource_limit"
+
+
+def test_count_mpp_null_never_busts_scaled_budget(client):
+    """mpp null → rescale 1.0（模型缺省尺度）：2048² 输入恒在预算内。"""
+    resp = client.post("/v1/count",
+                       json=_count_body(image_b64=_png_b64(2048, 2048),
+                                        mpp=Ellipsis))
+    assert resp.status_code == 200
+
+
 def test_count_body_too_large_400(client):
     app.app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
     big = "A" * (8 * 1024 * 1024 + 2)  # 超 8MB 的 body

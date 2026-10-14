@@ -119,6 +119,25 @@ def test_segment_image_too_large_400(client):
     assert resp.get_json()["error"] == "image_too_large"
 
 
+def test_segment_oversized_header_rejected_before_pixel_decode(monkeypatch,
+                                                               client):
+    """超大图必须只读图片头即拒绝，不得先解码像素（R2 预解码闸）。"""
+    calls = []
+
+    class _HeaderOnly:
+        size = (4096, 4096)
+
+        def load(self):
+            calls.append("decoded_pixels")
+
+    monkeypatch.setattr(app.Image, "open", lambda _f: _HeaderOnly())
+    resp = client.post("/v1/segment", json=_segment_body(
+        image_b64=base64.b64encode(b"header-only").decode()))
+    assert resp.status_code == 400
+    assert resp.get_json()["error"] == "image_too_large"
+    assert calls == [], "oversized input must never reach pixel decoding"
+
+
 def test_segment_body_too_large_400(client):
     app.app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
     big = "A" * (8 * 1024 * 1024 + 2)  # 超 8MB 的 body

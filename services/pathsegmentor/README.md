@@ -42,7 +42,10 @@ MIT，上游 commit `e67763ab835b3ef184cb6791eb2cd059ec8b9f9a`）的 GPU 推理 
 - `region` 可选（组织/器官语境，如 `liver`、`bile duct`）；缺省按上游约定
   记为 `multiple`（上游 `format_string` 将 `unspecified` 归一为 `multiple`）；
 - `threshold` 可选，0..1，缺省 0.5（上游固定值）；
-- 图像 ≤ 2048×2048，请求体 ≤ 8MB；RGBA/灰度统一转 RGB；
+- 图像 ≤ 2048×2048（**按图片头先拒后解码**：`Image.open` 只读头部即查
+  两轴/像素量，超大图不解码像素直接 400，R2；模型内部固定 resize 到
+  1024²，无第二次放大，故除入口闸外无额外资源准入），请求体 ≤ 8MB；
+  RGBA/灰度统一转 RGB；
 - 服务端完成官方预处理（pad 成正方形 → 1024×1024），掩码映射回输入尺寸。
 
 **提示词构造**（上游语法 `{level}-level {target} in {region} pathology`，

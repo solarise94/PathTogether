@@ -30,6 +30,26 @@ def test_diameter_px_invalid_raises(diameter_um, mpp):
         cellpose_infer.diameter_px(diameter_um, mpp)
 
 
+# ---------------------------------------------------------------- 缩放预算（R2）
+
+def test_scaled_pixel_count_mirror_of_cpsam_rescale():
+    # diameter_px=2（diameter_um=1 @ 0.5mpp）→ rescale 15 → 1024² → 15360²
+    assert cellpose_infer.scaled_pixel_count(1024, 1024, 2.0) == 15360 ** 2
+    # 缺省流：7µm @ 0.5mpp → 14px → rescale≈2.143 → 逐轴 ceil
+    expect = ((30.0 / 14.0) * 1024).__ceil__() ** 2
+    assert cellpose_infer.scaled_pixel_count(1024, 1024, 14.0) == expect
+
+
+def test_scaled_pixel_count_null_diameter_is_native():
+    # mpp null → 模型缺省尺度（rescale 1.0），工作集即输入像素
+    assert cellpose_infer.scaled_pixel_count(2048, 1536, None) == 2048 * 1536
+
+
+def test_scaled_pixel_count_nonfinite_rescale_returns_none():
+    # diameter_px 异常小 → rescale 溢出为 inf → None（调用方拒绝）
+    assert cellpose_infer.scaled_pixel_count(1024, 1024, 1e-320) is None
+
+
 # ---------------------------------------------------------------- 实例统计
 
 def _two_blob_masks():

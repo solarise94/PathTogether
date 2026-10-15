@@ -406,9 +406,14 @@ probe 判 false 只可能因为「同一文件的字节在读取之间变化」�
 `format_request_http.handle_submit`，`format_request_http.py:118`）：
 
 - `format_ext` ≤ 40 字符、`message` ≤ 2000 字符、`contact` 可选（邮箱正则
-  `format_request_http.py:37`）、样本可选且 ≤ `importDrawerState.maxSampleBytes`
-  （默认 64 MiB，`app.py:12063`；`/api/slide-formats` 的 `max_sample_bytes` 覆盖，
-  `app.py:12141` 附近）；
+  `format_request_http.py:37`）、样本可选且 ≤ `FORMAT_REQUEST_MAX_SAMPLE_BYTES`
+  （默认 64 MiB，`app.py:12063`）。
+  前端上限的取值链有一个**现状缺口**：`app.js:11450` 会读
+  `body.max_sample_bytes`，但 `GET /api/slide-formats`（`app.py:12126`）返回的是
+  `public_catalog()` 的**裸列表**，没有该字段——所以
+  `importDrawerState.maxSampleBytes` 实际一直是模板初值 64 MiB
+  （`app.js:11179` 附近的默认值）。本设计**不改**这条链路（申请支持用与抽屉
+  相同的默认值），只把它记为既有事实，避免把「服务端会告诉我上限」写成前提；
 - 202 → 在行内显示申请编号 + 业务状态（沿用
   `renderFormatRequestResult`，`app.js:11478` 的语义：**只说已登记，不说已兼容**）；
 - 413 → 「样本超过上限」（`fr.sample.too.large`）就地提示，草稿保留；

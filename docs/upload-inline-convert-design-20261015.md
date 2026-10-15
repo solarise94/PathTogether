@@ -104,7 +104,7 @@
 
 | 文件 | 改动 |
 | --- | --- |
-| `static/app.js` | ① `uploadFile`（:10104）→ 交 `HP_INLINE_CONVERT.enqueue`；② `uploadFileClassified`（:10128）→ 判定表驱动（直传 / 转换 / 当场拒绝）；③ `offerBrowserConvert`（:10326）/`openConvertHandoff`（:10247）/`handoffBundleFolder`（:11123）保留但**仅在 `inline_convert.enabled=false` 时可达**（回滚路径，零删除）；④ 新增面板内行的渲染与按钮（转换进度/取消/继续/申请支持）；⑤ 新增 runner 动态 import 与生命周期（`beforeunload`）；⑥ 新增刷新恢复：`listJobs()` 里带 `intent.channel==='workbench-inline'` 的未完成任务 → 行 + 「继续」；⑦ `HP_UPLOAD` 导出面补新入口（测试驱动）；⑧ `submitFormatRequest`（:11530）抽出可复用内核 `submitFormatRequestCore({ext,message,contact,sampleFile})` |
+| `static/app.js` | ① `uploadFile`（:10104）→ 交 `HP_INLINE_CONVERT.enqueue`；② `uploadFileClassified`（:10128）→ 判定表驱动（直传 / 转换 / 当场拒绝）；③ `offerBrowserConvert`（:10326）/`openConvertHandoff`（:10247）/`handoffBundleFolder`（:11123）保留但**仅在 `inline_convert.enabled=false` 时可达**（回滚路径，零删除）；④ 新增面板内行的渲染与按钮组——完整清单见 §6.3（转换进度 / 取消 / 继续转换 / 继续上传 / 重新选择文件 / **删除本地产物** / 申请支持）；⑤ 新增 runner 动态 import 与生命周期（`beforeunload`）；⑥ 新增刷新恢复：`listJobs()` 里带 `intent.channel==='workbench-inline'` 的未完成任务 → 行 + 「继续」；⑦ `HP_UPLOAD` 导出面补新入口（测试驱动）；⑧ `submitFormatRequest`（:11530）抽出可复用内核 `submitFormatRequestCore({ext,message,contact,sampleFile})` |
 | `templates/index.html` | 在 `cos-uploader.js` / `slide-sniff.js` 之后、`app.js` 之前加载 `/static/upload/inline-convert.js?v=20261015` |
 | `static/i18n.js` | 新增上传面板内转换文案（zh/en 同步）；**改写**两条指向 `/tools/slides` 的旧文案（`upload.cos.err.convert_in_browser` @:1025/2686、`upload.err.unsupported` @:1026/2687）——见 §7 |
 | `static/app.js` 的 `_EXTRA_I18N`（:30 起） | 同步兜底键（`cos-upload.test.ts:964` 那条断言会检查 `_EXTRA_I18N` 与 stage 映射同步） |
@@ -129,11 +129,11 @@
   `defaultOutputProfile` / `defaultEncodingProfile` / `isOmeProfile` /
   `outputFileName`（产物命名）、`getProfile` / `defaultProfileId`（资源档位）、
   `errCode` / `errText`（类型化错误）、`checkDiskBudget` 的 `uncertain` 语义。
-- 上传控制器语义照搬 `tools-slides-upload.js:667 runLocked` 的**四道门禁次序**
-  （能力 → 账号 → 最终产物大小 `max_size_bytes` → `viewable_formats`）与
+- 上传控制器语义照搬 `tools-slides-upload.js:667 runLocked` 的**四道门禁**与
   `opfsStorage`（:330）的 `setJobUpload` 适配器写法；面板不 import 该模块
   （它是 ES module + 工具页 DOM），而是把同一套判定抽进
-  `inline-convert.js` 的纯函数，等价性由 §9 的对照测试锁定。
+  `inline-convert.js` 的纯函数。**门禁的作用域按条目类型不同（评审 R2 修正）**，
+  见 §5.1；等价性由 §9.2 第 12 项的对照测试锁定。
 
 ## 3. 队列状态机
 
@@ -181,10 +181,10 @@ upload_queued ──(上传槽 = pt:upload-slot:<acct>)──► uploading ─�
 
 - `sniffing` 是**本页同步/微任务级**步骤（有界读 ≤ 128 KiB + 引擎嗅探 ≤ 256 KiB），
   不做用户可见的排队；但仍是状态（防止重复入队）。
-- `converted` 不是终态：立刻转 `upload_queued`（不自动上传？**自动上传**——
-  见 §3.4）。
+- `converted` 不是终态：立刻转 `upload_queued`（**自动上传**——见 §3.4）。
 - `done` / `rejected` / `convert_failed` / `upload_failed` / `cancelled` 为终态；
-  终态行的按钮按 §6。
+  **终态行的按钮表在 §6.3**（含「删除本地产物」，本设计必须提供的 OPFS 清理
+  入口——否则源副本与产物永久残留）。
 - 「1 个转换 + 1 个上传并行」：`converting` 与 `uploading` 各至多 1 个 entry
   （§5）。其余条目停在 `convert_queued` / `upload_queued`，行上显示排队位置。
 
@@ -227,8 +227,10 @@ bundle 任务另接 `progress.unit==='stage-bundle'`（`worker.js:994`）显示
 不会被误拒（回归：`upload-liveness` `dca42ac2`）。
 
 **步 3（可转换终审，面板不得比引擎更严）**：
-`cls==='convert'` 时用引擎嗅探确认：
+`cls==='convert'` 时用引擎嗅探确认，**按 `cls.bundle` 先分派**：
 
+- **`bundle === true`**（`.mrxs` / `.dat` / `.vms`，`slide-sniff.js:722-729`）
+  → 不进单文件魔数分派，而是判「手上是不是一个完整包」（见 §4.1.1）；
 - TIFF 容器（`engine.isTiffHeader`，`engine.js:400`）→ `await sniffTiffSlideCapability(file)`
   （`engine.js:578`）；
 - 普通图片（`engine.isRasterHeader`，`engine.js:384`）→ `await sniffRasterCapability(file)`
@@ -236,9 +238,40 @@ bundle 任务另接 `progress.unit==='stage-bundle'`（`worker.js:994`）显示
 - KFB/KFBF → `engine.magicSupported`（`engine.js:405`，8 字节魔数）。
 
 `supported===true` → `needsConvert=true`（并且把引擎给出的 `modality` 用于
-输出格式默认：明场 `bf-ome`、荧光 `fl-ome`，见 §4.3）。
+输出格式默认：明场 `bf-ome`、荧光 `fl-ome`，见 §4.4）。
 `supported===false` → **不转换**，按 §4.2 的「引擎拒绝分支」处理
 （说出 `cap.reason`，`direct_import` 开放的重放直传，关闭的不上传 + 申请支持）。
+
+#### 4.1.1 bundle 类条目（评审 R6 修正）
+
+原设计只定义了 TIFF/普通图片/KFB 三类魔数分派，而 `classifyFile` 对
+`.mrxs`/`.dat`/`.vms` 返回 `{cls:'convert', bundle:true}` —— **不取决于它是不是
+来自文件夹选择**（实测：`classifyExt('a.vms') = {cls:'convert', ext:'.vms',
+bundle:true}`、`a.mrxs` / `x/a.dat` 同形）。同时原设计§2.2③ 又把散文件入口
+（`uploadFile` → `handoffBundleFolder`）限定为开关关闭才可达，于是**开关默认开
+时用户直接拖入一个 `.mrxs` 或单个 `.vms` 没有任何定义好的结局**——评审 R6 成立。
+
+修正后的 bundle 判定与动作（**开关开、关两种形态都有定义**）：
+
+| 输入形态 | 判定 | 动作 |
+| --- | --- | --- |
+| 拖入/选择**文件夹**（`webkitGetAsEntry` 目录遍历，`app.js:11066`）含 `.mrxs`/`.dat`/`.vms` 成员 | 成员行 `[{name, relPath, file}]` → `runner.prepareBundle` 内部的 `engine.planBundle`（`engine.js:1353`）判定（`sniffMrxBundle` `:1096` / `sniffVmsBundle` `:1257`） | **整包转换**（`stage-bundle`，`progress.unit==='stage-bundle'`）。开关开：进面板队列；开关关：仍走 `handoffBundleFolder` 交接 |
+| `webkitdirectory` 选择文件夹（`#import-folder-input`，`app.js:12992` 附近） | 同上 | 同上 |
+| **散文件**（单文件拖入/选择）`.mrxs` / `.dat` | `classifyFile` 给 `bundle:true`，但**手上没有伴随成员** | 行内**类型化说明**：「MRXS 需要完整包（`.mrxs` + 同名目录 + `Slidedat.ini`）；请选择或拖入整个文件夹」（文案取 `sniffMrxBundle` 的 `missing` 列表，`engine.js:1143-1146`），**不上传、不建任务** |
+| **散文件** `.vms` | 同上（VMS 需入口 + 同目录 tile JPEG 的完整文件夹） | 同上（`sniffVmsBundle` 的 `missing`，`engine.js:1275-1277`） |
+| `.vmu` | `classifyFile` 给 `cls:'temporary'`（**不是** `bundle`），`directClass:'legacy-direct'` | 照 §4.2 直传（VMU 是暂时直传，不是 bundle 转换输入） |
+
+**散文件的实现要点**：`uploadFile`（单文件路径）拿到 `cls.bundle===true` 时
+**不再走 `handoffBundleFolder`**（那需要 `rows`），而是**先尝试把该文件所在的
+文件夹补齐**——但浏览器不给「读取同目录其他文件」的能力（`File` 无目录句柄），
+所以**唯一可行**的处置就是上面那条行内说明 + 一个「选择文件夹」按钮
+（复用 `#import-folder-input` 的 click，`app.js:12995-12998`）。这是设计对
+R6 的诚实答复：**散落的 `.mrxs` 无法在面板内转换**，因为不可能在缺乏伴随
+目录的情况下完成 MRXS 转换；工具页今天的行为也是「类型化拒绝」（`planBundle`
+在复制前抛 `unsupported_input` + `missing` 列表）。
+
+**bundle 条目的声明**：转换产物同样是 `.tif`/`.ome.tif`，声明按 §4.3 从产物
+字节嗅探（MRXS 明场 → `bf-*` → `ome-tiff` 或 `converter-bigtiff`；VMS 同）。
 
 > 「面板不得比引擎更严」的具体含义：步 1/2 只决定**路由与当场拒绝**，
 > 「能不能转换」的唯一裁决是步 3 的引擎嗅探（与 `runner._prepare`
@@ -269,15 +302,15 @@ probe 判 false 只可能因为「同一文件的字节在读取之间变化」�
 
 | 扩展名 / 变体 | `classifyFile` | 引擎步 3 | 面板动作 | `direct_class` | 服务端对应 |
 | --- | --- | --- | --- | --- | --- |
-| `.kfb` | `convert` | `magicSupported` 真 | **转换**（明场 → `bf-ome`/`bf-classic`） | — | 创建闸 `conversion` 分支 422 `convert_in_browser`（`app.py:12440`）；转换产物经 `converter-bigtiff` 声明放行 |
-| `.kfbf` | `convert` | 真 | **转换**（荧光 → `fl-ome`，保留画质） | — | 同上 |
+| `.kfb` | `convert` | `magicSupported` 真 | **转换**（明场 → `bf-ome`/`bf-classic`） | 见 §4.3（产物侧） | 创建闸 `conversion` 分支 422 `convert_in_browser`（`app.py:12440`）；转换产物按**产物字节**声明（§4.3） |
+| `.kfbf` | `convert` | 真 | **转换**（荧光 → `fl-ome`，保留画质） | 见 §4.3（产物侧） | 同上 |
 | `.svs`（IFD0 压缩 7） | `convert` | `sniffTiffSlideCapability` 真 → `aperio-svs-jpeg` | **转换** | — | 直传关闭（`slide_format_registry.py:207`） |
 | `.svs`（33003/33005） | `svsJp2k`（`temporary`） | （不适用） | **直接上传原文件** | `unconverted-variant:svs-jp2k` | 词表 ↔ 扩展名匹配 + 第 0 层压缩核验（`upload_direct_class.declaration_matches`，`.py:348`） |
 | `.tif/.tiff`（OME-XML 描述） | `ome-tiff` | （不适用） | **直接上传** | `ome-tiff` | 描述必须含 OME-XML（`.py:371`） |
 | `.tif/.tiff`（转换器来源标记） | `converter-bigtiff` | （不适用） | **直接上传** | `converter-bigtiff` | 描述 JSON `source_format ∈ CONVERTER_SOURCE_FORMATS`（`.py:238/_converter_marked`） |
 | `.tif/.tiff`（通用瓦片 JPEG） | `convert` | `sniffTiffSlideCapability` 真 → `generic-tiled-jpeg-tiff` | **转换** | — | 直传仍开放（`direct_import=open`） |
 | `.tif/.tiff`（条带/LZW/deflate/非 8 位/多通道） | `temporary` | （不适用） | **直接上传** | `legacy-direct` | `legacy-direct` 只对 `direct_upload` 集（`app.py:3174`） |
-| `.tif/.tiff`（+ 引擎判不支持） | `convert` 但引擎拒 | `supported:false` | 不转换；`legacy-direct` 直传（服务端 open_slide 终审） | `legacy-direct` | worker：`enforcement_failure` 若内容是 Aperio JPEG SVS → `convert_in_browser` → §6 回队 |
+| `.tif/.tiff`（+ 引擎判不支持） | `convert` 但引擎拒 | `supported:false` | 不转换；`legacy-direct` 直传（服务端 open_slide 终审） | `legacy-direct` | worker：`enforcement_failure` 若内容是 Aperio JPEG SVS → `convert_in_browser` → §7.2 回队 |
 | `.ndpi`（Make=Hamamatsu + 整层单条带 JPEG） | `convert` | `sniffTiffSlideCapability` 真 → `hamamatsu-ndpi-jpeg` | **转换** | — | 直传仍开放 |
 | `.ndpi`（JP2K/分块/多通道） | `temporary` | （不适用） | **直接上传** | `legacy-direct` | — |
 | `.scn`（JPEG + 明场） | `convert` | 真 → `leica-scn-jpeg` | **转换** | — | 直传仍开放 |
@@ -300,16 +333,73 @@ probe 判 false 只可能因为「同一文件的字节在读取之间变化」�
 **两点实测澄清**（§10.8 的判定表核对）：
 
 - `classifyFile` 对 `cls==='convert'` 的条目一律回填 `directClass:'legacy-direct'`
-  （`slide-sniff.js:821-824` 的收口分支）。**转换条目绝不使用该值**——转换后
-  上传的声明由嗅探产物字节得出（`converter-bigtiff`）；表里的「—」就是这个
-  意思。若把 `legacy-direct` 发给 `.svs`，服务端会 422
-  `convert_in_browser`（`app.py:3167`）。
+  （`slide-sniff.js:821-824` 的收口分支）。**转换条目绝不使用该值**；表里的
+  「—」就是这个意思。若把 `legacy-direct` 发给 `.svs`，服务端会 422
+  `convert_in_browser`（`app.py:3167`）。转换条目的声明按 §4.3 从**产物字节**
+  重新嗅探得出。
 - `.svs`（JPEG）在 `classifyExt` 走 tiff 路由、最终由 `decideTiff`
   （`slide-sniff.js:264`）判 `convert`；`.svs`（33003/33005）判 `temporary`
   且 `directClass='unconverted-variant:svs-jp2k'`（`slide-sniff.js:256`）——
   与表一致。
 
-### 4.3 输出格式 / 画质默认（不做成可选项）
+### 4.3 转换后上传的 `direct_class`（本轮评审修正，原设计有误）
+
+**结论**：转换产物的声明**必须从产物字节嗅探得出**，不能假定为
+`converter-bigtiff`；在 §4.4 选定的 `bf-ome`/`fl-ome` 默认下，正确值是
+`ome-tiff`。
+
+**证据链**（产物侧代码 + 服务端核验 + 实测）：
+
+1. `bf-ome`/`fl-ome` 产物 IFD0 的 ImageDescription 是 **OME-XML**
+   （`convert_bf.rs:487` 的 `ome_xml: Some(ome_rgb_description(...))`；
+   `ome.rs:204` 写的 `<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06" …>`；
+   荧光 `convert_fl.rs:155` 同构），且未降采样层带该描述（`convert_gtiff.rs:96`
+   `let desc = if m.reduced { None } else { ome_xml.take() }`，明场在
+   `convert_bf.rs:57` 的 `BfWriter::Ome` 上同一写法）。
+   `bf-classic` 产物才是 JSON 来源标记
+   （`convert_bf.rs:487` `description_bytes(source_format, ...)`）。
+2. 服务端核验是**按声明字符串分派**的（`upload_direct_class.declaration_matches`，
+   `upload_direct_class.py:348`）：`ome-tiff` 要求描述含 OME-XML
+   （`_looks_like_ome_xml`，`.py:255`）；`converter-bigtiff` 要求描述是带来源
+   标记的 JSON（`_converter_marked`，`.py:238`）。worker 在 `open_slide`
+   **之前**用它裁定，不符即 `_fail("convert_in_browser")`
+   （`cos_ingest_worker.py:1054-1063`）。注意：`open_slide` 本身两者都能读，
+   被拒的**唯一**原因是声明错配。
+3. **实测**（命令见 §10.11）：用 `upload_direct_class` 对两枚构造夹具核对 ——
+
+   | 产物描述 | `sniff_tiff_class` | `declaration_matches('ome-tiff')` | `declaration_matches('converter-bigtiff')` |
+   | --- | --- | --- | --- |
+   | OME-XML（`bf-ome`/`fl-ome`） | `ome-tiff` | **True** | **False** |
+   | JSON 来源标记（`bf-classic`） | `converter-bigtiff` | False | **True** |
+
+**设计修正（面板的产物声明算法）**：
+
+```
+// 转换完成、拿到 artifactView(jobId) 之后、创建 ingestion 之前：
+const artifact = await runner.artifactView(jobId);        // runner.js:1386
+const name = E.outputFileName(source.name, job);          // engine.js:1571
+const cls  = await HP_SLIDE_SNIFF.classifyFile(artifact); // 同一份共享嗅探
+// → bf-ome/fl-ome 得 'ome-tiff'；bf-classic 得 'converter-bigtiff'
+const directClass = (cls.cls === 'ome-tiff') ? 'ome-tiff'
+                  : (cls.cls === 'converter-bigtiff') ? 'converter-bigtiff'
+                  : null;   // 其他（理论不可达）→ 不带声明，交给 open_slide + enforcement
+```
+
+- 声明只与 `.tif/.tiff` 名匹配（`app.py:3147/3154`）——`bf-ome`/`fl-ome` 是
+  `.ome.tif`，服务端按末段 `tif` 判（`app.py:3140`），合法。
+- 兜底：嗅探读失败/结果既非 OME 也非转换器标记 → **不带 `direct_class`**
+  （`None`）：`declaration_matches(p, None) = True`、`enforcement_failure` 对
+  无声明 + `.tif` 名只做 Aperio-SVS 检查（实测 `_converter_marked` 与
+  OME-XML 描述都不命中），字节合法性仍由 `open_slide` 终审（§10.11 第 3 组）。
+  **绝不**在嗅探不确定时硬发 `converter-bigtiff`。
+- 若 §4.4 的默认改成 `bf-classic`（评审 R7），本算法自动得出
+  `converter-bigtiff`——**这正是把它写成「从产物嗅探」而不是写死常量的原因**。
+
+> 评审指出「照原设计实现则转换后上传主链路（含 §9.4 用例 A）必然失败」——
+> **成立**，已按上述修正。原文档 §4.2 的 `.kfb` 行把产物声明写成
+> `converter-bigtiff` 是错的。
+
+### 4.4 输出格式 / 画质默认（不做成可选项）
 
 面板内**不提供**输出格式与画质选择（避免在 300px 侧栏里塞单选组）；
 固定为：
@@ -335,7 +425,45 @@ probe 判 false 只可能因为「同一文件的字节在读取之间变化」�
 | 面板内转换并发 | 面板自己的 FIFO：至多 1 个 entry 处于 `converting` | **新增**（避免同页多次撞锁、避免排队期无限重试） |
 | 跨标签上传并发 | Web Lock `pt:upload-slot:<account>` | **新增**（用户确认的口径） |
 | 同文件内容身份 | `HP_COS_UPLOAD.contentLockName(account,{name,size,lastModified})` + `acquireContentLock`（`cos-uploader.js:1203/1215`） | **沿用**（双标签同一文件各建 ingestion 的既有防护） |
-| 单任务产物读取 | `engine.uploadLockName(jobId)`（`engine.js:38`）由 `discardJob`（`runner.js:659`）自持 | **沿用**（上传中禁止 discard） |
+| 单任务产物读取 | `engine.uploadLockName(jobId)`（`engine.js:38`） | **必须由面板上传期间持有**（评审 R3 修正，见下） |
+
+**`engine.uploadLockName(jobId)` 必须被面板的上传阶段持有**（评审 R3 修正）：
+
+现状的互斥链是：工具页 `startOrContinue` 在上传前后持
+`E.uploadLockName(jobId)`（`tools-slides-upload.js:647-649` 的
+`navigator.locks.request(E.uploadLockName(jobId), {ifAvailable:true}, …)`），
+而 `runner.discardJob`（`runner.js:659-673`）**只在拿不到同一把锁、或 upload
+记录活跃且未 `abandonUpload` 时才拒删**——它保护的是 `uploadLockName`，
+**不认识**新加的 `pt:upload-slot:<account>`。
+
+面板创建的任务会出现在工具页任务列表里且可被操作：`listJobs()`
+（`runner.js:1355-1372`）枚举 OPFS `slide-jobs/` 全部目录，`renderJobs`
+（`tools-slides.js:1533`）**不按 `intent.channel` 过滤**，工具页「删除」按钮
+直接走 `discardJob`（`tools-slides.js:1654-1667`）。因此若面板只依赖新槽锁：
+
+- 用户在另一标签的工具页点「删除」→ 若面板的 `record.upload.state` 还没写成
+  活跃态（例如刚进 `uploading` 但记录尚未落盘），`discardJob` 会在**无锁**下
+  删掉 `slide-jobs/<jobId>/`（含唯一源副本与产物），面板上传随即失败且产物
+  不可恢复；
+- 或用户在工具页对同一任务点「上传」（列表里的 `nextAction==='export'` 行）
+  → 工具页**另建一个 ingestion** 重复上传同一产物，容量记账与
+  `slide-jobs` 记录互相覆盖（工具页与面板各写 `record.upload`）。
+
+**设计修正**：面板在**整个上传阶段**（`upload_queued` → 终态）持两把锁：
+
+1. `pt:upload-slot:<account>`（跨标签「1 个上传」的调度槽，本设计新增）；
+2. `E.uploadLockName(jobId)`（同任务产物的读写互斥，既有语义）——
+   `navigator.locks.request(engine.uploadLockName(jobId), {ifAvailable:true}, …)`，
+   拿不到即在行内说明「该任务正在另一处上传/被操作」，**不并发**。
+
+这样：工具页 `discardJob` 会因拿不到锁而拒删（`runner.js:665` 的
+`!lock` 分支 → `upload_active` + `lockHeld:false`，工具页还会再确认一次
+`abandonUpload`，`tools-slides.js:1661-1664`）；工具页的
+`startOrContinue` 也会因拿不到锁回 `tools.upload.other.tab`
+（`tools-slides-upload.js:649-653`）。上传收口后两把锁都释放。
+
+> 注：这条也意味着面板与工具页可**同时存在**于两个标签（用户偏好），互相
+> 串行而不是互相破坏——本设计不去「删掉」工具页的入口。
 
 `pt:upload-slot:<account>` 语义：
 
@@ -348,23 +476,47 @@ probe 判 false 只可能因为「同一文件的字节在读取之间变化」�
 - `navigator.locks` 不可用（旧浏览器/非安全上下文）→ `held:false` 照常执行
   （与既有 `acquireContentLock` 的退化语义一致，绝不阻塞）。
 
-**ingestion 创建时机**：只有拿到上传槽 + 四道门禁通过后才 POST `/api/ingestions`
-（`cos-uploader.js:1033`）。转换期间（含刷新、崩溃）服务端零任务。
+**ingestion 创建时机**：只有拿到上传槽 + 本条目适用的门禁全部通过后才
+POST `/api/ingestions`（`cos-uploader.js:1033`）。转换期间（含刷新、崩溃）
+服务端零任务。
+
+### 5.1 门禁作用域（评审 R2 修正）
+
+`viewable_formats` 是**按核心 `result.format` 字符串键控**的门禁
+（`tools-slides-upload.js:783-789`），它的语义是「**本机转换器的这个产物**平台
+能不能查看」。直传条目没有 `result.format`（没有本机产物），把它套上去会把
+**全部直传条目**判成「平台暂不支持查看」而拒绝——与 §4.2 逐行要求的
+「直接上传」直接矛盾，而且比现有工作台直传更严（`cosUploadEligible`，
+`app.py`/`app.js:10404` 只看词表 + 上限）。
+
+| 条目类型 | 能力（`cos_upload.available`） | 账号 | 大小上限 | `viewable_formats` |
+| --- | --- | --- | --- | --- |
+| **转换产物**（kfb/kfbf/svs-jpeg/ndpi/scn/bif/vms 整包/mrxs 整包/gtiff/bmp/jpg） | 要求 | 要求 | 按**最终产物** `result.outputBytes` ↔ `max_size_bytes`（`tools-slides-upload.js:778`） | **要求**（`job.result.format` ∈ 载荷的 `viewable_formats`） |
+| **直传**（OME-TIFF / 转换器 BigTIFF / SVS-JP2K / 普通 TIFF / NDPI 变体 / SCN 变体 / BIF 变体 / VMS 原样 / VMU / SVSlide / BMP-JPEG 变体 / zip） | 要求 | 要求 | 按**源文件大小** ↔ `max_size_bytes`（与现状 `cosUploadEligible`、`app.js:10411` 同口径） | **不适用**——不参与判定；平台可查看性由服务端 `open_slide` 终审（失败则终态 `validation_failed`，按 §7 给出原因） |
+
+即：直传条目的门禁 = 现状（能力 + 账号 + 源大小 + 词表），**一行都不加严**；
+只有本机转换出来的产物才吃 `viewable_formats`，因为只有它存在「产物格式」
+这个新维度。审计线索：`viewable_formats` 现仅出现在
+`tools-slides-upload.js:783` 一处，`tools-slides-direct-upload.js` 的直传
+路径（:320/:332）只看 `max_size_bytes` 与 `cfg.formats`——本设计与之对齐。
 
 ## 6. 刷新 / 续转
 
 ### 6.1 持久化面
 
+（表中 `record.upload` 与「继续上传」的续传语义见 §6.4。）
+
 | 数据 | 存放 | 依据 |
 | --- | --- | --- |
 | 转换任务（源副本、日志、产物） | OPFS `slide-jobs/<jobId>/` | 运行器既有 |
 | 上传意图（授权账号 + 目标 + 渠道） | OPFS `record.intent`（`runner.setJobIntent`，`runner.js:634`） | R1 既有；本设计写 `channel: 'workbench-inline'` |
+| 上传记录（ingestion id / 已确认分块 / 分片摘要 / 账号 / slide_id） | OPFS `record.upload`（`runner.setJobUpload`，`runner.js:611`） | 既有；见 §6.4 |
 | 直传任务的续传记录 | localStorage `pt.cos.jobs`（`app.js:10383`） | 既有 |
 | 目标快照 | localStorage `pt.fb.upassoc.v1:<uid>`（`app.js:4028`） | 既有 |
 
 **不新增任何 localStorage 键**用于转换恢复：恢复的唯一权威是 OPFS 任务记录
-（含 `intent`），这与「绝不凭名称/大小把浏览器文件当同一份」的隐私约定一致
-（`app.js:10404` 附近注释）。
+（含 `intent` / `upload`），这与「绝不凭名称/大小把浏览器文件当同一份」的隐私
+约定一致（`app.js:10404` 附近注释）。
 
 ### 6.2 刷新后的行为（沿用现有隐私约定：不自动开始）
 
@@ -372,9 +524,11 @@ probe 判 false 只可能因为「同一文件的字节在读取之间变化」�
 2. `runner.listJobs()`（`runner.js:1355`）→ 过滤 `intent.channel === 'workbench-inline'`
    且 `state ∈ {prepared, planned, paused, failed}` 或
    `state ∈ {ready, exported} && upload 未收口`的记录。
-3. 每个命中 → 行显示「未完成的转换：<名> · 已提交 X / 共 Y」+ 按钮：
+3. 每个命中 → 行显示「未完成的转换：<名> · 已提交 X / 共 Y」+ 按钮（§6.3 的
+   完整按钮表）：
    - `nextAction==='resume'`（有 journal）→ 「继续转换」（`resumeJob`，不重选文件）；
-   - `nextAction==='start'`（prepared/planned 无 journal）→ 「继续转换」（`startJob(null,{jobId})`）；
+   - `nextAction==='start'`（prepared，无 journal）→ 「继续转换」
+     （`startJob(null, {jobId})`——源副本已在 OPFS，无需 File）；
    - `ready/exported` → 「继续上传」（跳过转换，直接进 `upload_queued`）。
    映射取自 `runner.js:1310-1317` 的 `nextAction` 计算。
 4. `resumeJob` 的断点续转不需要重选文件：源副本是 OPFS 里的 `source.bin`，
@@ -384,11 +538,85 @@ probe 判 false 只可能因为「同一文件的字节在读取之间变化」�
 5. 版本/设置不符的续跑拒绝（`resume_refused` 的 `kind`：`core-version` /
    `profile` / `policy` / `output-profile` / `encoding-profile` /
    `channel-json` / `source-adapter`，`runner.js:886-1027`）→ 行内说明 +
-   「重新开始转换」（丢弃旧任务 + 重新 `probe`），**绝不静默改设置续跑**。
+   **「重新开始转换（需重新选择文件）」**，**绝不静默改设置续跑**（理由见 §6.3）。
 6. `job_dir_missing`（目录被浏览器驱逐，`engine.js:19`）→ 行内说明 +
-   「重新选择文件」。
+   「重新选择文件」（与第 5 点同一处置：**丢弃 + 重选**）。
 7. `beforeunload`：只要有 entry 处于 `converting` 或 `uploading`，注册
    `preventDefault()` 提醒（照 `tools-slides.js:1772` 的写法）。
+
+### 6.3 终态 / 恢复态按钮表与清理（评审 R4 + R5 修正）
+
+刷新后**没有原始 `File`**（§6.1 明确不新增本地句柄，隐私约定不自动开始），
+这一点决定了哪些按钮可实现。运行器侧的两条硬约束：
+
+- 已有 journal 的非 prepared 记录**只能用 `resumeJob`**：`startJob(null,{jobId})`
+  会抛 `resume_refused ... kind='use-resume'`（`runner.js:854-858`）；
+- 「重新 `probe`」需要 `file`：`_startOrResume` 在 `!reusable` 且非 bundle 时
+  `if (!file) throw io_recoverable: 缺少输入文件`（`runner.js:861-869`）。
+  bundle 记录是例外（`reusable = true`，源就是 OPFS 里的成员）。
+
+因此**原设计 §6.2 第 5 点「丢弃旧任务 + 重新 probe」在刷新路径上不可实现**
+（评审 R4 成立）：丢弃后没有 File，再调运行器只会再抛一次
+`io_recoverable: 缺少输入文件`，把用户引向第二次失败。修正后的按钮表：
+
+| entry 状态 | 行按钮 | 动作 | 可实现性依据 |
+| --- | --- | --- | --- |
+| `planned/paused` + 有 journal | **继续转换** | `resumeJob(jobId)` | `runner.js:807` |
+| `prepared`（无 journal） | **继续转换** | `startJob(null, {jobId})`（`reusable` 为真，不需要 File） | `runner.js:851-853`、`:874-880` |
+| `planned/paused` 无 journal | **继续转换** | 同上（`startJob(null,{jobId})`） | 同上 |
+| `ready/exported`（upload 未收口） | **继续上传** | 直接进 `upload_queued`（§6.4） | `runner.js:1386` |
+| bundle 记录（任意非终态） | **继续转换** | `startJob(null,{jobId})` 或 `resumeJob`（成员已在 OPFS） | `runner.js:862-864` |
+| `resume_refused`（版本/设置不符） | **重新开始转换** + **重新选择文件** | 提示「请重新选择同一文件」→ 用户重选后走全新 `probe`；旧任务由清理入口删除 | `runner.js:861-869` 的 `!file` 分支 |
+| `job_dir_missing` | **重新选择文件** | 同上 | `engine.js:19` |
+| 任一终态（`done`/`convert_failed`/`upload_failed`/`cancelled`/`rejected`） | **删除本地产物**（+ 按 §7 的申请支持） | `discardJob(jobId)`，失败按 `upload_active` 的 `lockHeld:false` 分支再确认 `abandonUpload` | `runner.js:659`；工具页同一处置 `tools-slides.js:1654-1667` |
+
+**本地产物清理（评审 R5 修正）**：原设计缺这条，会导致 OPFS 里的
+`source.bin` + `output.tif` 在收口后**永远残留**——`_sweepIncompleteStaging`
+只收 `!rec || rec.state === 'staging'` 且显式跳过 `rec.upload` 存在的记录
+（`runner.js:361-366`），ready/published 任务永不被自动清理；工作台又没有工具页
+那样的任务列表，大切片（设计自述 5 GiB）转几次就撞
+`quota_exceeded_recoverable`。修正：
+
+- **每个终态行都提供「删除本地产物」**（`discardJob`），并显示它释放的字节数
+  （`getJob` 的 `source.size` + `result.outputBytes`）；
+- `done`（已发布）行的删除**只删本地副本**，不影响已发布切片——文案必须说清
+  「已上传到平台的切片不受影响」，避免用户以为会删库里的；
+- 面板启动时（§6.2 第 2 步的同一批 `listJobs()` 结果）对 `intent.channel ===
+  'workbench-inline'` 的**已收口**记录**不自动删**（删除是不可逆动作，且
+  `record.upload` 是到服务端 ingestion 的唯一线索），只在行上给按钮；
+- 行被用户忽略/浏览器关闭后残留的，由既有 `_processPendingCleanups` /
+  `_sweepIncompleteStaging`（运行器启动期）与工作台下次续转/删除入口兜底——
+  本设计不新增自动删除策略。
+
+### 6.4 「继续上传」的续传语义（评审 R7 修正）
+
+原设计 §6.1 的持久化表只列了 `intent`，没说清「继续上传」是**续传同一个
+ingestion** 还是**重新创建**。修正：
+
+| 数据 | 存放 | 依据 |
+| --- | --- | --- |
+| 转换任务（源副本、日志、产物） | OPFS `slide-jobs/<jobId>/` | 运行器既有 |
+| 上传意图（授权账号 + 目标 + 渠道） | OPFS `record.intent`（`runner.setJobIntent`，`runner.js:634`） | R1 既有；本设计写 `channel: 'workbench-inline'` |
+| **上传记录**（ingestion id / 已确认分块 / 分片摘要 / 账号 / slide_id / 终态） | OPFS `record.upload`（`runner.setJobUpload`，`runner.js:611`） | 既有；面板照 `tools-slides-upload.js:330-370 opfsStorage` 的适配器写法（`save`/`complete`/`remove`/`readConfirmed`/`readRecord`） |
+| 直传任务的续传记录 | localStorage `pt.cos.jobs`（`app.js:10383`） | 既有 |
+| 目标快照 | localStorage `pt.fb.upassoc.v1:<uid>`（`app.js:4028`） | 既有 |
+
+「继续上传」（`ready/exported` 行）的语义与工具页**逐条一致**
+（`tools-slides-upload.js:667 runLocked` 的 ④）：
+
+- 读 `record.upload`：有 `ingestionId` 且 `state ∉ UPLOAD_ACTIVE_STATES 的终态集`
+  （`engine.js:31`，终态 = `published`/`failed`/`cancelled`）→
+  以 `resumeJobId = ingestionId` 传 `createUpload`：引擎走 `prepareResume`
+  （`cos-uploader.js:1075`），读回已有确认分块 + 分片摘要，**逐片核验字节**后
+  跳过已传分块（`verifyResumeDigests`，`cos-uploader.js:591`）；
+- 记录是终态 / 不存在 → **不自动重建**：行内给「重新上传」按钮，点击才建新
+  ingestion（否则刷新一次就多一个服务端任务，违反 §0 不变量 2，也重复占容量）；
+- 无 `record.upload` 且服务端可能仍有孤儿任务（`save` 落盘失败的情形）→
+  照工具页的 `settleOrphan` 语义先确认取消再新建（`tools-slides-upload.js:472`）。
+
+`§9.2` 第 8 项据此补强：断言必须区分「续传同一 ingestion」（`readRecord` 非空
+→ `resumeJobId` 等于记录里的 id、且**零** `POST /api/ingestions`）与
+「记录为空 → 显示按钮但不请求」。
 
 ## 7. 失败与「申请支持」
 
@@ -537,22 +765,54 @@ probe 判 false 只可能因为「同一文件的字节在读取之间变化」�
    **零 fetch / 零 XHR**（照 `cos-upload-liveness.test.ts` 的 FakeXHR 计数）。
 4. 队列：3 个转换类条目 → 任一时刻至多 1 个 `converting`；转换 A 完成前
    B/C 停 `convert_queued`。
-5. 转换完成自动上传、无第二次确认；大小/格式门禁失败 → 不建 ingestion
-   （断言 `/api/ingestions` 调用数 0）。
-6. `convert_in_browser`（`createNewJob` 422）→ 自动回队**恰一次**；第二次 → 终态 + 申请支持按钮。
-7. 上传槽：假 `navigator.locks` 记录名字，断言 `pt:upload-slot:<acct>`
-   被获取/释放；同号第二次请求排队（不并发两个 `createUpload`）。
-8. 刷新恢复：`listJobs()` 返回带 `intent.channel==='workbench-inline'` 的
-   `planned+journal` / `ready` 记录 → 行 + 「继续」按钮；**加载期间零
-   fetch / 零 runner 调用**（不自动开始）。
-9. 申请支持：按钮 → `POST /api/format-requests`，body 含预填 `format_ext` 与
-   带机器码的 `message`；202 显示编号；429 → 今日上限文案；413 → 样本超限。
-10. i18n：新键 zh/en 成对存在（静态扫描 `i18n.js`），`_EXTRA_I18N` 同步；
+5. **门禁作用域**（§5.1）：同一组假记录下 —— 转换产物条目在
+   `job.result.format ∉ viewable_formats` 时**不建 ingestion**（断言
+   `/api/ingestions` 调用数 0）；直传条目**没有** `result.format` 时照常建
+   ingestion（断言 `viewable_formats` 不参与判定，与
+   `tools-slides-direct-upload.js:320/332` 的直传口径一致）。两条断言一起
+   才排除了「直传被 viewable_formats 误杀」。
+6. **产物声明（§4.3）**：转换完成后，`createUpload` 的 `createBody.direct_class`
+   必须等于对**产物视图**`classifyFile` 的结果 —— OME-XML 描述产物 →
+   `'ome-tiff'`；JSON 来源标记产物 → `'converter-bigtiff'`；嗅探失败 →
+   不带字段（`undefined`）。**反向断言**：绝不出现「OME 产物 + converter-bigtiff」
+   （该组合服务端 `declaration_matches=False` → worker `convert_in_browser`）。
+7. `convert_in_browser`（`createNewJob` 422）→ 自动回队**恰一次**；第二次 → 终态 + 申请支持按钮。
+8. 上传槽与产物锁：假 `navigator.locks` 记录**锁名**，断言上传阶段同时持有
+   `pt:upload-slot:<acct>` 与 `engine.uploadLockName(jobId)`
+   （后者是 `discardJob` 的保护对象，§5）；同号第二次请求排队（不并发两个
+   `createUpload`）。
+9. 刷新恢复**不自动开始**：`listJobs()` 返回带 `intent.channel==='workbench-inline'`
+   的 `planned+journal` / `ready` 记录 → 行 + 「继续」按钮；**加载期间零
+   `fetch`（含 runner 网络无关的控制请求）**。注意与 `SlideToolsRunner.create()`
+   自身的行为区分：`_init()`（`runner.js:146-152`）会跑
+   `_processPendingCleanups` / `_sweepIncompleteStaging` / `_spawnWorker`，
+   这是**本地 OPFS + worker 启动**，不是「开始转换或上传」——断言口径写
+   「零 `/api/` 请求、零 `probe`/`prepareBundle`/`startJob`/`resumeJob`/
+   `createUpload` 调用」，而不是含混的「零 runner 调用」（评审 R8a）。
+10. **续传语义**（§6.4）：`record.upload` 有未收口 `ingestionId` → 「继续上传」
+    传 `resumeJobId` 等于该 id 且 **零** `POST /api/ingestions`；记录为空/终态
+    → 只显示按钮、**零请求**；点击后才建新任务。
+11. **终态清理**（§6.3）：终态行有「删除本地产物」→ 调用 `discardJob`；
+    `upload_active` + `lockHeld:false` → 二次确认后 `abandonUpload:true`。
+12. **门禁等价性对照**（§2.3 承诺）：对同一组夹具，
+    `inline-convert.js` 导出的纯判定函数与 `tools-slides-upload.js:667
+    runLocked` 的判定序列（能力 → 账号 → 大小 → 格式）在每条输入上给出相同
+    结论 —— 直接 `import { createUploadController } from
+    '../../static/tools/tools-slides-upload.js'` 用同一组假 runner/cap 驱动，
+    与面板的 `decide()` 逐例比对（评审 R8b：原设计只承诺「§9 的对照测试」
+    但清单里没有它，现补为第 12 项）。
+13. 申请支持：按钮 → `POST /api/format-requests`，body 含预填 `format_ext` 与
+    带机器码的 `message`；202 显示编号；429 → 今日上限文案；413 → 样本超限。
+14. i18n：新键 zh/en 成对存在（静态扫描 `i18n.js`），`_EXTRA_I18N` 同步；
     **反向断言**：`upload.cos.err.convert_in_browser` / `upload.err.unsupported`
     的 zh/en 文案里不再出现 `/tools/slides`（§7 的改写）。
-11. 回退：`inline_convert.enabled=false` → 走 `offerBrowserConvert`，
+15. 回退：`inline_convert.enabled=false` → 走 `offerBrowserConvert`，
     断言 `window.open` 收到 `/tools/slides`（与 `r1-convert-upload.test.ts`
     现有断言同形）。
+16. bundle：`classifyFile` 给 `bundle:true` 的**散文件**（单 `.mrxs` / 单
+    `.vms`）→ 类型化说明 + 「选择文件夹」按钮，**零 fetch / 零转换**；
+    文件夹形态 → `prepareBundle` 被调用、`progress.unit==='stage-bundle'`
+    映射到行文案（§4.1.1）。
 
 ### 9.3 pytest（新增 `tests/test_upload_inline_convert_capability.py`）
 
@@ -578,9 +838,9 @@ probe 判 false 只可能因为「同一文件的字节在读取之间变化」�
 
 | # | 用例 | 验收点 |
 | --- | --- | --- |
-| A | 「转换后上传且上传字节能被平台读取器 `slide_io.open_slide` 打开」 | 真 KFB 夹具（`kfb.fixture.build_synthetic_kfb`，或 CLI `gen-kfb`）→ 工作台拖入 → 面板内转换（真 wasm）→ 上传 → 行到「入库完成」→ 服务端用 `slide_io.open_slide` 打开**已发布**资产并读到层级/尺寸/区域像素 |
+| A | 「转换后上传且上传字节能被平台读取器 `slide_io.open_slide` 打开」 | 真 KFB 夹具（`kfb.fixture.build_synthetic_kfb`，或 CLI `gen-kfb`）→ 工作台拖入 → 面板内转换（真 wasm）→ 上传 → 行到「入库完成」→ 服务端用 `slide_io.open_slide` 打开**已发布**资产并读到层级/尺寸/区域像素。**另断言创建体里的 `direct_class` 与产物字节一致**（`bf-ome` 默认 → `'ome-tiff'`；写死 `converter-bigtiff` 会让 worker `declaration_matches=False` → 终态 `convert_in_browser`，用例 A 必红——这正是评审 R1 的缺陷） |
 | B | 「PNG 改名 `.jpg` 当场被拒且申请支持提交成功」 | 真 PNG 字节 named `x.jpg` → 行内出现检测类型 + 申请支持按钮 → 点击 → `POST /api/format-requests` 202 → 行内出现申请编号；**全程零 `/api/ingestions`、零跨源 PUT** |
-| C | 「刷新后点继续能把转换做完」 | 转换进行中 `page.reload()` → 行显示「继续转换」且**不自动开始**（断言 reload 后若干秒内零 `/api/` 与零 runner 进度）→ 点「继续」→ 转换完成 → 产物 sha256 与 OPFS 产物一致 → 上传完成 |
+| C | 「刷新后点继续能把转换做完」 | 转换进行中 `page.reload()` → 行显示「继续转换」且**不自动开始**（断言 reload 后若干秒内零 `/api/`、零 `probe`/`startJob`/`resumeJob`/`createUpload`；`SlideToolsRunner.create()` 的 OPFS cleanup/sweep 与 worker 启动不算「开始」）→ 点「继续」→ 转换完成 → 产物 sha256 与 OPFS 产物一致 → 上传完成 |
 
 为让 A 的「上传字节被平台读取器打开」真成立，需要（**本设计的关键新增测试基建**）：
 
@@ -652,6 +912,10 @@ export TEST_RUN_DIR=/mnt/ssd2/tests/run-inline-convert-Mwpad1 \
      「zip 不携带 `direct_class`」的权威断言，§4.2 表里对应行的依据）；
    - `npx vitest run tests/js/{workbench-direct-class,cos-upload,cos-upload-liveness,
      r1-convert-upload,slide-sniff}.test.ts` → **5 files / 112 passed, 2 skipped**。
+   - **评审后复跑**（本文件修改后、未改仓库代码）：
+     `python3 -m pytest tests/test_upload_direct_class.py tests/test_r1_conversion_gate.py
+     -q -p no:cacheprovider --basetemp=$TEST_RUN_DIR/pytest-recheck` →
+     **39 passed in 14.97s**。
 6. `CosConfig` 签名含 `Endpoint` / `VerifySSL`（假 COS 的可行性依据）。
 7. **`run_workbench.js` 的 64 B 假 `.tif` 在真实工作台里被 fail-fast 拒**（既有
    回归，非本设计引入）：照 `tests/browser/slide_tools_c4/server.py` 的假 COS env
@@ -705,6 +969,30 @@ export TEST_RUN_DIR=/mnt/ssd2/tests/run-inline-convert-Mwpad1 \
     （而 `enforcement_failure(path,'ome-tiff','tif') = None`，
     `declaration_matches(path,'legacy-direct') = True`）——
     即 §7.2(a)/(b) 两条分支都按设计成立。
+11. **转换产物的 `direct_class`（§4.3 的依据）**：构造两枚 `.tif` 夹具，用
+    `upload_direct_class` 直接裁定 ——
+
+    ```
+    bf-ome/fl-ome 产物（OME-XML 描述）
+       sniff_tiff_class                        = ome-tiff
+       declaration_matches('ome-tiff')          = True
+       declaration_matches('converter-bigtiff') = False
+    bf-classic 产物（JSON 来源标记）
+       sniff_tiff_class                        = converter-bigtiff
+       declaration_matches('ome-tiff')          = False
+       declaration_matches('converter-bigtiff') = True
+    ```
+
+    另对无声明路径实测：OME-XML 与 JSON 两种产物在
+    `declared ∈ {None,'','legacy-direct'}` 下 `declaration_matches=True` 且
+    `enforcement_failure=None`（即 §4.3 的「嗅探不确定 → 不带声明」兜底安全）。
+    这直接证明评审 R1 成立：在 §4.3 的 `bf-ome` 默认下声明
+    `converter-bigtiff` 会被 worker 以 `convert_in_browser` 拒绝。
+12. **工具页上传不发 `direct_class`**（对照面）：`grep -c createBody
+    static/tools/tools-slides-upload.js` = **0**（该路径靠**无声明** +
+    `open_slide` 终审）；只有 `tools-slides-direct-upload.js:401` 的直传路径发
+    `createBody: { direct_class: directClass }`。这解释了为什么既有工具页转换
+    上传不受 R1 影响，而面板一旦「主动声明」就会踩到。
 
 ## 11. 风险
 
@@ -715,21 +1003,43 @@ export TEST_RUN_DIR=/mnt/ssd2/tests/run-inline-convert-Mwpad1 \
 | R3 | **动态 import 的 URL**：`import('/static/tools/slide-transform/runner.js')` 是硬编码路径；部署前缀变化即失效 | 面板整体不可用 | 路径写成单一常量并在 pytest 里断言文件存在；import 失败 → 行内说明 + 回退到手交（开关关闭路径） |
 | R4 | **e2e 假 COS 基建**（§9.4）是新增量：本地 HTTPS + DNS 映射 + `cos_client` 注入 | 若做不成，A 用例只能降级到 pytest 证明（`test_bf_ome_platform_chain.py` 已是既有证据） | 先做 pytest 侧证明（转换产物 → 上传字节 → `open_slide`），e2e 用力争；做不成时如实上报，不伪造 |
 | R5 | **自动回队死循环**：`convert_in_browser` ↔ `temporary` 互推 | 无限循环 + 网络噪声 | 同 entry 最多回队 1 次（§7.2） |
-| R6 | **磁盘/配额**：面板内转换把源副本 + 产物都放 OPFS，大文件（5 GiB KFB）在浏览器的 `uncertain` 报告下需要用户确认 | 用户看到额外弹层（与工具页一致） | 行内确认而非模态弹层；文案给出 need/available 两个数（`runner.js:697`） |
-| R7 | **两处默认输出格式分歧**（用户口径 `bf-classic` vs 工具页默认 `bf-ome`） | 产物扩展名 `.tif` vs `.ome.tif`、mpp 元数据有无 | 记为待确认项（§4.3）；改一个常量 |
+| R6 | **磁盘/配额**：面板内转换把源副本 + 产物都放 OPFS，大文件（5 GiB KFB）在浏览器的 `uncertain` 报告下需要用户确认 | 用户看到额外弹层（与工具页一致） | 行内确认而非模态弹层；文案给出 need/available 两个数（`runner.js:697`）；**每个终态行给「删除本地产物」**（§6.3 的评审 R5 修正） |
+| R7 | **两处默认输出格式分歧**（用户口径 `bf-classic` vs 工具页默认 `bf-ome`） | 产物扩展名 `.tif` vs `.ome.tif`、mpp 元数据有无；**并连带决定产物声明是 `converter-bigtiff` 还是 `ome-tiff`** | 记为待确认项（§4.4）；§4.3 的声明算法从产物嗅探，切换默认**不需要**同步改声明 |
 | R8 | 旧文案改写（去掉 `/tools/slides` 指引）会同时改掉工具页可见文案 | 工具页用户看不到「用转换工具」提示（该页不需要） | 改写为「在本机转换（本页面板内自动完成）」；工具页有自己的输入提示文案，不受影响 |
 | R9 | `tests/browser/slide_tools_r1/run_e2e.js` 的 i/i3/i4/l2/l3 依赖弹窗交接 | 这些浏览器回归在开关默认开后失效 | 明确这些场景只在 `inline_convert.enabled=false` 下有意义，脚本内显式注入关闭；新面板行为由 §9.4 新 spec 覆盖 |
 | R10 | `run_workbench.js` 的 64 B 假 `.tif` 与步 2 魔数闸冲突 | **已实测失效**（§10.7）：零 ingestion、零 COS、行停在「上传失败」 | 换真 TIFF 头夹具（既有测试维护，非本设计引入）；面板路径同样受该闸约束，故新 spec 一律用真头夹具 |
+| R11（本轮评审新增） | **产物声明错配会静默打穿主链路**：`ome-tiff` 产物 + `converter-bigtiff` 声明 → worker `convert_in_browser`，且只在 worker 阶段才暴露（创建闸不看内容） | 「转换后上传」全链路失败（工具页因不发声明而从未暴露此坑） | §4.3 的**产物嗅探**算法 + §9.2 第 6 项的反向断言 + §9.4 用例 A 的创建体断言，三道锁 |
+| R12（本轮评审新增） | **门禁过严把直传杀光**：把 `viewable_formats` 套到直传条目 | 所有直传格式不可上传（与 §4.2 矛盾） | §5.1 的作用域表 + §9.2 第 5 项两条断言（转换产物受限、直传不受限） |
+| R13（本轮评审新增） | **面板与工具页双标签互相破坏**：面板不持 `uploadLockName` 时，工具页可删掉正在上传的唯一本地产物 | 产物不可恢复 | §5 的「上传阶段持两把锁」（`pt:upload-slot:<acct>` + `engine.uploadLockName(jobId)`） |
+| R14（本轮评审新增） | **散落 bundle 无归宿**（单 `.mrxs`/`.vms`） | 开关默认开时用户拖入后无定义行为 | §4.1.1 的类型化说明 + 「选择文件夹」按钮 |
 
 ## 12. 实施顺序建议
 
-1. `static/upload/inline-convert.js` 判定表 + 状态机（纯逻辑，vitest 先行）。
+1. `static/upload/inline-convert.js` 判定表 + 状态机（纯逻辑，vitest 先行）——
+   含 §4.3 的产物声明算法（先于任何上传接线，否则主链路必红）与 §5.1 的
+   门禁作用域。
 2. `app.py` capability 两个新字段 + `tests/js`/pytest（§9.2/§9.3）——此时开关
    仍可 close。
-3. `app.js` 接线：面板行渲染、单文件路径、刷新恢复、`beforeunload`；回退路径
-   保留不动。
-4. bundle（MRXS/VMS）路径 + 拖入文件夹。
-5. 失败/申请支持/回队。
+3. `app.js` 接线：面板行渲染 + 按钮表（§6.3）、单文件路径、两把锁（§5）、
+   刷新恢复（§6.2）、`beforeunload`、终态清理；回退路径保留不动。
+4. bundle（MRXS/VMS）路径 + 拖入文件夹（§4.1.1 两种形态）。
+5. 失败/申请支持/回队（§7）。
 6. i18n（zh/en 同步 + 旧文案改写）。
 7. e2e 基建（假 COS + project + spec）。
 8. 旧测试按 §9.1 调整。
+
+## 13. 本轮评审处置一览
+
+| 评审项 | 严重度 | 处置 |
+| --- | --- | --- |
+| 1 产物 `direct_class` 应为 `ome-tiff` | high | **接受**——新增 §4.3（产物嗅探算法）+ 实测证据 §10.11/§10.12 + §9.2 第 6 项反向断言 + §9.4 用例 A 断言；§4.2 `.kfb/.kfbf` 行改为指向 §4.3 |
+| 2 `viewable_formats` 误杀直传 | medium | **接受**——新增 §5.1 作用域表 + §9.2 第 5 项两条断言；§2.3 由「四道门禁次序」改为「四道门禁（作用域见 §5.1）」 |
+| 3 缺 `uploadLockName` 持有 | medium | **接受**——§5 锁表改写 + 锁定理由（`discardJob`/工具页 `renderJobs`/`onJobAction` 的实际调用链）+ §9.2 第 8 项 |
+| 4 刷新路径「重新 probe」不可实现 | medium | **接受**——§6.2 第 5/6 点改为「丢弃 + 重新选择文件」，新增 §6.3 按钮表并逐行标注可实现性依据（`runner.js:854-869`） |
+| 5 终态无清理入口 | medium | **接受**——新增 §6.3 的「删除本地产物」行与清理策略说明（含 `_sweepIncompleteStaging` 不清理 ready/upload 记录的依据） |
+| 6 散落 bundle 无归宿 | medium | **接受**——新增 §4.1.1（bundle 判定与两种形态的动作表；明确散落 `.mrxs`/`.vms` 在浏览器内**不可能**补齐伴随文件，故给类型化说明 + 选择文件夹） |
+| 7 「继续上传」续传语义缺 | low | **接受**——新增 §6.4（`record.upload` 持久化 + `resumeJobId` 续传而非重建 + 孤儿确认）+ §9.2 第 10 项 |
+| 8a 「零 runner 调用」表述矛盾 | low | **接受**——§9.2 第 9 项与 §9.4 用例 C 的断言口径改为「零 `/api/` + 零 probe/startJob/resumeJob/createUpload」，并注明 `_init()` 的 OPFS cleanup/sweep 与 worker 启动不算「开始」 |
+| 8b 「对照测试」悬空承诺 | low | **接受**——§9.2 新增第 12 项（真 import `tools-slides-upload.js` 的 `runLocked` 判定序列与面板 `decide()` 逐例比对） |
+
+无不同意项；九条全部按评审意见修正（8b 是「补上缺失的测试项」，不是改结论）。

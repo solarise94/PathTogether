@@ -1503,4 +1503,25 @@ describe("上传行按钮（§6.3 是按钮全集的唯一权威）", () => {
 		expect(String(fd.get("message"))).toContain("code=content_ext_mismatch");
 		expect(String(fd.get("message"))).toContain("detected=png");
 	});
+	it("续传语义：未收口的 ingestionId 作为 resumeJobId 复用（§6.4）", () => {
+		const h = loadApp(inlineCaps(true));
+		const up = h.w.HP_UPLOAD as unknown as {
+			resumeIdFromRecord(job: unknown): string | null;
+		};
+		// 未收口（uploading / awaiting_server / …）→ 复用同一 ingestion
+		expect(up.resumeIdFromRecord({ upload: { ingestionId: "inj_1", state: "uploading" } }))
+			.toBe("inj_1");
+		expect(up.resumeIdFromRecord({ upload: { ingestionId: "inj_1", state: "awaiting_server" } }))
+			.toBe("inj_1");
+		// 终态 → 不续传（只由用户显式点击新建；刷新一次绝不多个服务端任务）
+		for (const st of ["published", "failed", "cancelled"]) {
+			expect(up.resumeIdFromRecord({ upload: { ingestionId: "inj_1", state: st } }), st)
+				.toBeNull();
+		}
+		// 无记录 / 无 ingestionId → null
+		expect(up.resumeIdFromRecord(null)).toBeNull();
+		expect(up.resumeIdFromRecord({})).toBeNull();
+		expect(up.resumeIdFromRecord({ upload: {} })).toBeNull();
+	});
+	
 });

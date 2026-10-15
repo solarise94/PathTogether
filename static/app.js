@@ -11326,12 +11326,31 @@
     if (!artifact) {
       return Promise.reject({ data: { code: "cos_unavailable" } });
     }
+    var name = entry.artifactName || entry.name;
+    var declaration = window.HP_INLINE_CONVERT
+      ? window.HP_INLINE_CONVERT.artifactDeclaration(entry.artifactCls) : null;
+    var cfg = resolveCosConfig();
+    if (!cfg) return Promise.reject({ data: { code: "cos_unavailable" } });
+    // 续传语义（设计 §6.4）：先读回 record.upload，再决定续传还是新建
+    return inlineRunner.getJob(entry.jobId).then(function (job) {
+      return createEntryUpload(entry, artifact, job, name, declaration, cfg);
+    }, function () {
+      return createEntryUpload(entry, artifact, null, name, declaration, cfg);
+    });
+  }
+
+  /// 读回记录的续传判定（与工具页 tools-slides-upload.js:786-793 同语义）：
+  /// 未收口的 ingestionId → resumeJobId 复用；终态/无记录 → null（新建）。
+  function resumeIdFromRecord(job) {
+    var up = job && job.upload;
+    if (!up || !up.ingestionId) return null;
+    if (up.state === "published" || up.state === "failed" ||
+        up.state === "cancelled") return null;
+    return up.ingestionId;
+  }
+
+  function createEntryUpload(entry, artifact, job, name, declaration, cfg) {
     return new Promise(function (resolve, reject) {
-      var name = entry.artifactName || entry.name;
-      var declaration = window.HP_INLINE_CONVERT
-        ? window.HP_INLINE_CONVERT.artifactDeclaration(entry.artifactCls) : null;
-      var cfg = resolveCosConfig();
-      if (!cfg) { reject({ data: { code: "cos_unavailable" } }); return; }
       var upload = window.HP_COS_UPLOAD.createUpload({
         source: {
           name: name, size: artifact.size,
@@ -11385,7 +11404,7 @@
           },
         },
         account: String(currentUserId || ""),
-        resumeJobId: null,
+        resumeJobId: resumeIdFromRecord(job),
         skipConfirm: true,
         confirmResume: function () { return true; },
         retryCompleteOnNetworkError: false,
@@ -11475,6 +11494,7 @@
     inlineRowEls: inlineRowEls,
     inlineWarnNeeded: function () { return inlineUnloadOn; },
     uploadEntryArtifact: uploadEntryArtifact,
+    resumeIdFromRecord: resumeIdFromRecord,
     legacyUploadFile: legacyUploadFile,
     importBundleRows: importBundleRows,
     submitFormatRequestCore: submitFormatRequestCore,

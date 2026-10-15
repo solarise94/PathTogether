@@ -11164,13 +11164,31 @@
     if (host && host.appendChild) {
       note = document.createElement("div");
       note.className = "upload-item-status";
-      note.textContent = tt("upload.inline.note.keepopen");
+      // 「请保持页面打开」只对**正在进行**的条目显示（设计 §3）；排队/终态
+      // 不需要它。文案随状态在 inlineRowButtons / setStage 里刷新。
+      note.textContent = inlineRowNoteText(entry);
       host.appendChild(note);
       btnHost = document.createElement("div");
       btnHost.className = "upload-item-actions";
       host.appendChild(btnHost);
     }
-    inlineRowEls[entry.id] = { row: row, note: note, btnHost: btnHost, kinds: {} };
+    inlineRowEls[entry.id] = { row: row, note: note, btnHost: btnHost };
+  }
+
+  /// 行附注：进行中 → 「请保持页面打开」；磁盘待确认 → need/available 数字；
+  /// 其余不显示（设计 §3 / §7.3）。
+  function inlineRowNoteText(entry) {
+    if (entry.state === "need_disk_confirm" && entry.diskInfo) {
+      return tt("upload.inline.needDisk", {
+        available: humanSize(entry.diskInfo.available || 0),
+        need: humanSize((entry.diskInfo.need && entry.diskInfo.need.total) || 0),
+      });
+    }
+    if (entry.state === "converting" || entry.state === "uploading" ||
+        entry.state === "upload_queued" || entry.state === "convert_queued") {
+      return tt("upload.inline.note.keepopen");
+    }
+    return "";
   }
 
   function inlineRowSetStage(entry, key, frac, noteText, indeterminate) {
@@ -11178,6 +11196,9 @@
     if (!rec) return;
     var extra = noteText ? " · " + tt(noteText) : "";
     rec.row.setStage(key, frac, extra, indeterminate);
+    if (rec.note && rec.note.textContent !== undefined) {
+      rec.note.textContent = inlineRowNoteText(entry);
+    }
   }
 
   function inlineRowMarkError(entry) {
@@ -11278,9 +11299,15 @@
     if (kind === "chooseFolder") return tt("upload.inline.action.chooseFolder");
     if (kind === "reselect") return tt("upload.inline.action.reselect");
     if (kind === "discard") {
-      return (entry.uploadState === "published")
+      var base = (entry.uploadState === "published")
         ? tt("upload.inline.action.discard.published")
         : tt("upload.inline.action.discard");
+      // 释放字节数（源副本 + 产物；设计 §6.3）
+      var freed = (Number(entry.size) || 0) + (Number(entry.artifactSize) || 0);
+      if (entry.jobId && freed > 0) {
+        base += " · " + tt("upload.inline.freed", { bytes: humanSize(freed) });
+      }
+      return base;
     }
     return tt("upload.inline.action.continue");
   }

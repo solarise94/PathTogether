@@ -1566,4 +1566,39 @@ describe("上传行按钮（§6.3 是按钮全集的唯一权威）", () => {
 		expect(requeue).toContain("requeue_convert");
 	});
 
+	it("行附注：进行中给「请保持页面空开」提示、磁盘待确认给 need/available 数字", () => {
+		const src = appSrc.slice(
+			appSrc.indexOf("function inlineRowNoteText"),
+			appSrc.indexOf("function inlineRowSetStage"));
+		expect(src).toContain("upload.inline.note.keepopen");
+		expect(src).toContain("upload.inline.needDisk");
+		expect(src).toContain("humanSize");
+		// 只对进行中的状态显示「保持页面打开」
+		expect(src).toContain('entry.state === "converting"');
+		expect(src).toContain('entry.state === "uploading"');
+	});
+
+	it("删除按钮文案带释放字节数（§6.3），且不误用 published 措辞", () => {
+		const h = loadApp(inlineCaps(true));
+		const up = h.w.HP_UPLOAD as unknown as {
+			inlineButtonLabel(kind: string, e: unknown): string;
+		};
+		const label = up.inlineButtonLabel("discard", {
+			jobId: "j1", size: 1024, artifactSize: 2048, uploadState: "uploading",
+		});
+		// harness 未载 i18n.js → tt 回落 app.js 自带文案表；**带形参**的键
+		// （{bytes}）在 harness 里回落到 key:vars 形态，故断言 key 与格式化值
+		expect(String(label)).toContain("upload.inline.freed");
+		expect(String(label)).toContain("3.0 KB");   // 1024 + 2048
+		expect(String(label)).not.toContain("不受影响");
+		// 已发布态的措辞会说「不受影响」，同样带释放字节
+		const pub = String(up.inlineButtonLabel("discard",
+			{ jobId: "j1", size: 1024, artifactSize: 0, uploadState: "published" }));
+		expect(pub).toContain("不受影响");
+		expect(pub).toContain("upload.inline.freed");
+		// 无 jobId（散文件从未建任务）→ 不显示释放字节
+		expect(String(up.inlineButtonLabel("discard", { jobId: null, size: 10 })))
+			.not.toContain("upload.inline.freed");
+	});
+
 });

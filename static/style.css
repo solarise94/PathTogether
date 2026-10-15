@@ -865,6 +865,17 @@ button {
 }
 .upload-item.upload-item-error .upload-item-status { color: var(--danger); }
 
+/* 上传面板内转换（docs/upload-inline-convert-design-20261015.md §11 R1）：
+   一行的附注 + 按钮组（转换进度/取消/继续转换/继续上传/重新选择文件/
+   删除本地产物/申请支持）。窄侧栏里按钮换行排列，不撑破行宽。 */
+.upload-item-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+.upload-item-actions .upload-item-btn { margin-top: 0; }
+
 /* =========================================================================
    项目行（Finder 风源列表行）
    ========================================================================= */

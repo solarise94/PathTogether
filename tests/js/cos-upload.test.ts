@@ -177,6 +177,14 @@ function cosCaps(overrides?: Record<string, unknown>) {
 	return Object.assign({
 		available: true,
 		manual_only: true,
+		// 上传面板内转换显式**关闭**（设计 §9.1）：本文件锁定的是 COS 直传的
+		// 既有状态机（工作台 uploadFile → uploadFileCos 的六段阶段/配额/续传），
+		// 那正是开关关闭时的回退路径；面板队列的行为由
+		// tests/js/inline-convert.test.ts 覆盖。
+		inline_convert: {
+			enabled: false, url: "/tools/slides",
+			viewable_formats: ["classic-bigtiff-jpeg-pyramid"],
+		},
 		formats: ["bif", "ndpi", "svs", "tif"],
 		max_size_bytes: 1000,
 		part_bytes: 8,

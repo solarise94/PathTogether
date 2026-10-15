@@ -9,6 +9,10 @@
  *   - 未登记扩展名 → 明确错误 toast，不建任务；
  *   - MRXS 文件夹（handoffBundleFolder）→ 交接消息携带 bundle 成员数组
  *     （{file, relPath}）+ folderName，工具页按文件夹接收。
+ *
+ * 本文件把 inline_convert 显式设为 **enabled=false**（设计 §9.1）：它锁定的
+ * 是面板内转换关闭时的回退路径（弹窗交接 + 直传），开关开启的行为由
+ * tests/js/inline-convert.test.ts 覆盖。
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
@@ -85,6 +89,13 @@ function resp(body: unknown, status = 200) {
 
 const COS_CAPS = {
 	available: true,
+	// 上传面板内转换**关闭**（设计 §9.1）：本文件锁定的是阶段 1 的既有分流
+	// 合同（KFB → 弹窗交接入口 / 未登记扩展名 → 报错），那正是开关关闭时
+	// 的回退路径。开关开启的行为由 tests/js/inline-convert.test.ts 覆盖。
+	inline_convert: {
+		enabled: false, url: "/tools/slides",
+		viewable_formats: ["classic-bigtiff-jpeg-pyramid"],
+	},
 	max_size_bytes: 1000,
 	part_bytes: 100,
 	url_ttl_seconds: 600,

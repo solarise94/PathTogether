@@ -96,14 +96,20 @@
     return null;   // 嗅探不确定 → 不带声明（declaration_matches(None)=True）
   }
 
-  /// 直传声明（设计 §4.2）：用**源文件**嗅探出的 directClass；转换类回填的
-  /// 'legacy-direct' 绝不用于直传关闭格式（服务端会 422 convert_in_browser）。
-  function directDeclaration(cls, cfg) {
+  /// 直传声明（设计 §4.2）：用**源文件**嗅探出的 directClass。
+  /// `engineRejectedPassthrough`（引擎判不支持但 direct_import 开放 → 按原样
+  /// 直传，§4.1「引擎拒绝分支」）时，convert 类也照发 `legacy-direct`
+  /// （表里那一行的声明值）；除此之外 convert 类绝不发声明——`.svs` 等
+  /// 直传关闭格式发 legacy-direct 会被服务端 422 convert_in_browser。
+  function directDeclaration(cls, cfg, engineRejectedPassthrough) {
     if (!cls) return null;
     if (cls.cls === "ome-tiff") return "ome-tiff";
     if (cls.cls === "converter-bigtiff") return "converter-bigtiff";
     if (cls.svsJp2k) return "unconverted-variant:svs-jp2k";
     if (cls.cls === "temporary") return cls.directClass || null;
+    if (cls.cls === "convert" && engineRejectedPassthrough) {
+      return cls.directClass || null;
+    }
     return null;
   }
 
@@ -470,7 +476,8 @@
           }
           // route === 'upload'（含「引擎拒绝分支」）
           e.needsConvert = false;
-          e.directClass = directDeclaration(cls, caps);
+          e.directClass = directDeclaration(cls, caps,
+            cls.cls === "convert" && supported === false);
           if (cls.cls === "convert" && supported === false) {
             // 引擎拒绝但 direct_import 开放 → 按原样直传；关闭格式不上传
             if (!isDirectUploadOpen(e, cls)) {
@@ -792,10 +799,11 @@
     }
 
     function runUpload(e) {
-      // 直传条目（无转换任务、无本机产物）：门禁只到「直传口径」——能力 +
-      // 账号 + **源文件**大小 + 词表，在入队判定里已做过；这里直接交给
-      // app.js 的直传实现（设计 §5.1：viewable_formats 不适用于直传）。
-      if (!e.jobId || !e.needsConvert) {
+      // 判别式：**有没有本机转换任务**（jobId）。没有 = 直传条目，门禁只到
+      // 「直传口径」（能力 + 账号 + **源文件**大小 + 词表，入队判定已做过），
+      // 直接交给 app.js 的直传实现（设计 §5.1：viewable_formats 不适用于直传）。
+      // 有 = 本机产物（转换产物 / 刷新恢复的 ready 行）→ 走产物门禁。
+      if (!e.jobId) {
         if (typeof deps.onArtifact !== "function") {
           failUpload(e, { data: { code: "cos_unavailable" } });
           return Promise.resolve();

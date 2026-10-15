@@ -10204,6 +10204,12 @@
     if (cls && cls.cls === "unsupported") {
       row.markError();
       row.setStage("upload.stage.failed");
+      // 未登记扩展名：说明 + 同行的「申请支持该格式」（设计 §7.1）。文案不再
+      // 点名 /tools/slides（该分支与开关无关，开启时也不走工具页）。
+      addRowButton(row, tt("upload.inline.action.requestSupport"), function () {
+        openSupportForEntry({ name: file && file.name,
+          error: { code: "unsupported_ext" } });
+      });
       row.finish(10000);
       toast(t("upload.fail", { e: tt("upload.err.unsupported") }), "error");
       return;
@@ -10600,6 +10606,21 @@
   }
 
   // ---------- 稳定机器码 → 可读文案（未知码保留原文的兜底模式） ----------
+  /// `convert_in_browser` 的**条件性入口**（设计 §8 / 第四轮复审 A5）：
+  /// 面板内转换开启时面板会自行回队处理，文案**不给**链接（给链接反而误导）；
+  /// 关闭时用户只能在工具页完成，追加一个可点的工具页链接。
+  /// 文案里的 {link} 是占位（i18n 里不再写死路径）。
+  function convertInBrowserMessage() {
+    var cfg = inlineEnabled() ? inlineConvertCaps() : null;
+    if (cfg && cfg.enabled) {
+      return tt("upload.cos.err.convert_in_browser", { link: "" }).trim();
+    }
+    var url = (cfg && cfg.url) || CONVERT_HANDOFF_URL;
+    return tt("upload.cos.err.convert_in_browser", {
+      link: " " + tt("upload.kfb.tools.link") + "(" + url + ")",
+    });
+  }
+
   function cosErrorMessage(status, data) {
     var code = (data && (data.code || data.error)) || "";
     if (code === "upload_too_large") return tt("upload.cos.err.too_large");
@@ -10608,7 +10629,7 @@
     // 阶段 1：直传关闭格式（旧码 conversion_moved_to_browser 同文案兼容）
     if (code === "convert_in_browser" ||
         code === "conversion_moved_to_browser") {
-      return tt("upload.cos.err.convert_in_browser");
+      return convertInBrowserMessage();
     }
     if (code === "cos_waiting_limit") return tt("upload.cos.err.waiting_limit");
     if (code === "ingestion_state_conflict") return tt("upload.cos.err.state");

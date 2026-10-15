@@ -1524,4 +1524,46 @@ describe("上传行按钮（§6.3 是按钮全集的唯一权威）", () => {
 		expect(up.resumeIdFromRecord({ upload: {} })).toBeNull();
 	});
 	
+	it("直传条目复用 uploadFileCos（经 onOutcome 收口），仍带 direct_class 与 assocTarget", () => {
+		// 源码级：直传分支（artifact 为 null）不得 reject，而是走既有直传状态机
+		const fn = appSrc.slice(
+			appSrc.indexOf("function uploadEntryArtifact"),
+			appSrc.indexOf("function createEntryUpload"));
+		expect(fn).toContain("uploadFileCos(entry.file");
+		expect(fn).toContain("directClass: entry.directClass");
+		expect(fn).toContain("assocTarget: entry.target");
+		expect(fn).toContain("onOutcome");
+		// uploadFileCos 支持结果回调（面板模式）：行 UI/关联交给面板
+		const cos = appSrc.slice(
+			appSrc.indexOf("function uploadFileCos"),
+			appSrc.indexOf("function cosUploadSucceeded"));
+		expect(cos).toContain("opts.onOutcome");
+		// 直传声明与冻结目标的转发仍在（第四轮 A1）——该字面量在**调用方**
+		// uploadFileClassified 内，所以从那里取片段
+		const callSite = appSrc.slice(
+			appSrc.indexOf("uploadFileCos(file, row, {"),
+			appSrc.indexOf("uploadFileCos(file, row, {") + 900);
+		expect(callSite).toContain("assocTarget: opts.assocTarget");
+		expect(callSite).toContain("directClass: cls ? (cls.directClass || null) : null");
+	});
+
+	it("面板 entry → row 适配器（setStage / markError / _row）", () => {
+		const fn = appSrc.slice(
+			appSrc.indexOf("function inlineEntryRow"),
+			appSrc.indexOf("function resumeIdFromRecord"));
+		expect(fn).toContain("setStage:");
+		expect(fn).toContain("markError:");
+		expect(fn).toContain("_row:");
+	});
+
+	it("回队时清掉 ingestion 与声明（§7.2：绝不带着旧声明重试）", () => {
+		const mod = readFileSync(resolve(root, "static/upload/inline-convert.js"), "utf8");
+		const at = mod.indexOf("e.requeueCount < 1");
+		expect(at).toBeGreaterThan(-1);
+		const requeue = mod.slice(at, at + 800);
+		expect(requeue).toContain("e.directClass = null");
+		expect(requeue).toContain("e.uploadJobId = null");
+		expect(requeue).toContain("requeue_convert");
+	});
+
 });

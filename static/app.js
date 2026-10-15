@@ -10877,9 +10877,19 @@
       // done 收口（成功/失败/取消）后立刻释放内容锁：等待标签随后重读
       // 回执/记录（工具页）或续传候选（工作台）。
       var settled = upload.done.then(function (r) {
-        if (!r || r.cancelled) return;
+        if (!r || r.cancelled) {
+          if (opts.onOutcome) opts.onOutcome(null, { cancelled: true });
+          return;
+        }
+        if (opts.onOutcome) {
+          // 面板直传条目：结果交回编排器收口（行 UI/关联/打开由面板负责），
+          // 不在这里刷新列表与打开切片（避免与面板回调重复）
+          opts.onOutcome(r.body, null);
+          return;
+        }
         cosUploadSucceeded(row, r.body, file, opts.assocTarget);
       }, function (err) {
+        if (opts.onOutcome) { opts.onOutcome(null, err); return; }
         var msg;
         if (err && err.magicMismatch) {
           // 前置魔数校验拒绝（零网络请求）：说出检测到的内容类型
@@ -11324,7 +11334,19 @@
   /// 记录适配与直传完全一致。
   function uploadEntryArtifact(entry, artifact) {
     if (!artifact) {
-      return Promise.reject({ data: { code: "cos_unavailable" } });
+      // 直传条目（无本机产物）：复用既有直传状态机 uploadFileCos——它的
+      // 门禁（能力/账号/源大小/词表）、记录持久化、跨标签内容锁与心跳全部
+      // 保留；结果经 onOutcome 交回编排器收口（设计 §5.1 直传口径不变）。
+      return new Promise(function (resolve, reject) {
+        uploadFileCos(entry.file, inlineEntryRow(entry), {
+          directClass: entry.directClass,
+          assocTarget: entry.target,
+          onOutcome: function (body, err) {
+            if (err) reject(err);
+            else resolve({ body: body || {} });
+          },
+        });
+      });
     }
     var name = entry.artifactName || entry.name;
     var declaration = window.HP_INLINE_CONVERT
@@ -11337,6 +11359,19 @@
     }, function () {
       return createEntryUpload(entry, artifact, null, name, declaration, cfg);
     });
+  }
+
+  /// 面板 entry → uploadFileCos 期望的 row 接口（复用面板已有的 setStage /
+  /// markError 与 addRowButton 的行按钮）。
+  function inlineEntryRow(entry) {
+    return {
+      setStage: function (key, frac, note, indeterminate) {
+        inlineRowSetStage(entry, key, frac, note, indeterminate);
+      },
+      markError: function () { inlineRowMarkError(entry); },
+      finish: function () { /* 行的存留由面板队列决定（终态按钮要用行） */ },
+      _row: (inlineRowEls[entry.id] && inlineRowEls[entry.id].row._row) || null,
+    };
   }
 
   /// 读回记录的续传判定（与工具页 tools-slides-upload.js:786-793 同语义）：

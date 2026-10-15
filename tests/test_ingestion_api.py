@@ -534,3 +534,87 @@ def test_capability_payload_release_numbers(monkeypatch):
         p = app_mod._cos_upload_capability_payload(demo=False)
     assert p["available"] is True
     assert p["max_size_bytes"] == 9_500_000_000
+
+
+# --------------------------------------------------------------------------- #
+# 客户端在场触点与 fail_detail（0084，upload-liveness）
+# --------------------------------------------------------------------------- #
+def _sql_api(fn):
+    import pg_store
+    conn = pg_store.connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                return fn(cur)
+    finally:
+        conn.close()
+
+
+def _age_client_seen(job_id, seconds=300):
+    _sql_api(lambda cur: cur.execute(
+        "UPDATE ingestion_jobs SET client_seen_at = now() - "
+        "make_interval(secs => %s) WHERE job_id=%s", (seconds, job_id)))
+
+
+def test_status_touches_client_seen_throttled(owner_client):
+    r = _create(owner_client, size=1000)
+    job_id = r.get_json()["job_id"]
+    seen0 = ist.get_job(job_id)["client_seen_at"]
+    assert seen0 is not None  # 创建即写
+    # 节流窗内的立即轮询：no-op
+    assert owner_client.get("/api/ingestions/%s" % job_id).status_code == 200
+    assert ist.get_job(job_id)["client_seen_at"] == seen0
+    # 超过节流阈值后的轮询：刷新
+    _age_client_seen(job_id)
+    assert owner_client.get("/api/ingestions/%s" % job_id).status_code == 200
+    assert ist.get_job(job_id)["client_seen_at"] > seen0
+
+
+def test_admin_view_does_not_touch_client_seen(owner_client, monkeypatch):
+    """liveness 表达「上传方浏览器在场」：owner 视角查看他人任务不触发
+    （单 enabled owner 约束下以注入身份模拟另一查看者）。"""
+    _create(owner_client, size=1000)
+    job_id = ist.list_jobs_for_owner("owner-1")[0]["job_id"]
+    _age_client_seen(job_id)
+    seen0 = ist.get_job(job_id)["client_seen_at"]
+    monkeypatch.setattr(
+        app_mod, "current_identity",
+        lambda: {"role": "owner", "user_id": "another-viewer"})
+    assert owner_client.get("/api/ingestions/%s" % job_id).status_code == 200
+    assert ist.get_job(job_id)["client_seen_at"] == seen0
+
+
+def test_parts_sign_touches_client_seen(owner_client):
+    job_id, plan = _mk_uploading(owner_client, size=500_000)
+    _age_client_seen(job_id)
+    seen0 = ist.get_job(job_id)["client_seen_at"]
+    r = owner_client.post(
+        "/api/ingestions/%s/parts/sign" % job_id,
+        json={"part_numbers": [1]})
+    assert r.status_code == 200, r.get_json()
+    assert ist.get_job(job_id)["client_seen_at"] > seen0
+
+
+def test_upload_complete_touches_client_seen(owner_client):
+    job_id, _plan = _mk_uploading(owner_client, size=500_000)
+    _age_client_seen(job_id)
+    seen0 = ist.get_job(job_id)["client_seen_at"]
+    r = owner_client.post("/api/ingestions/%s/upload-complete" % job_id)
+    assert r.status_code == 202
+    assert ist.get_job(job_id)["client_seen_at"] > seen0
+
+
+def test_status_body_exposes_fail_detail(owner_client):
+    r = _create(owner_client, size=1000)
+    job_id = r.get_json()["job_id"]
+    # 非终态：fail_detail 恒 null（契约字段始终在）
+    body = owner_client.get("/api/ingestions/%s" % job_id).get_json()
+    assert body["fail_detail"] is None
+    _sql_api(lambda cur: cur.execute(
+        "UPDATE ingestion_jobs SET fail_detail='raster_format_mismatch', "
+        "state='failed', fail_code='validation_failed', "
+        "terminal_at=now() WHERE job_id=%s", (job_id,)))
+    body = owner_client.get("/api/ingestions/%s" % job_id).get_json()
+    assert body["stage"] == "terminal"
+    assert body["fail_code"] == "validation_failed"
+    assert body["fail_detail"] == "raster_format_mismatch"

@@ -45,6 +45,7 @@ json/dual 后端 fail-closed：仅 postgres 后端可用（调用方保证）。
 import json
 import os
 import secrets
+import time
 
 import psycopg
 
@@ -131,6 +132,16 @@ ITEM_PENDING = "pending"
 ITEM_PUBLISHED = "published"
 ITEM_FAILED = "failed"
 
+#: fail_detail 稳定白名单（0084，upload-liveness）：终态失败可透出的安全
+#: 细节值。白名单外一律不落库/不透出（不泄露内部异常细节）；fail_code
+#: 语义保持不变（如 validation_failed）。
+VALID_FAIL_DETAILS = frozenset({
+    "raster_format_mismatch",   # 图片真实格式与扩展名不符（PNG/WebP 改名 .jpg 等）
+    "slide_open_unsupported",   # 解析器明确不支持该格式
+    "slide_open_failed",        # 解析/IO 在允许格式内失败（损坏/截断等）
+    "invalid_slide",            # 逻辑格式拒绝/字节明显无效（其余 invalid_slide）
+})
+
 #: 调度器清理重试的文件锁等待上界（秒）——writer 长期占锁时跳过本轮，
 #: 持久重试继续（R12 §3.2：超时不是删除成功）。
 _CLEANUP_LOCK_WAIT_SECONDS = float(
@@ -183,6 +194,8 @@ _JOB_FIELDS = (
     "local_cleanup_last_error", "local_cleanup_next_retry_at",
     # 0075 列：任务形态 / 可选整对象 sha 声明 / 转换任务关联。
     "kind", "sha256_expected", "conversion_job_id",
+    # 0084 列：客户端在场证据（liveness 闸）+ 终态失败安全细节。
+    "client_seen_at", "fail_detail",
 )
 
 _INT_FIELDS = frozenset({
@@ -195,7 +208,7 @@ _TS_FIELDS = frozenset({
     "cleanup_next_retry_at", "cleanup_lease_expires_at",
     "worker_lease_expires_at", "waiting_expires_at", "job_deadline_at",
     "terminal_at", "created_at", "updated_at",
-    "local_cleanup_next_retry_at",
+    "local_cleanup_next_retry_at", "client_seen_at",
 })
 _JSON_FIELDS = frozenset({
     "part_plan_json", "download_checkpoint_json", "commit_intent_json",
@@ -224,6 +237,12 @@ def _norm_row(row):
                 job[k] = None
     job["viewer_ready"] = bool(job.get("viewer_ready"))
     return job
+
+
+def _now_epoch():
+    """当前时刻（epoch 秒；仅用于回填刚写入行的展示值，权威判定恒在 SQL
+    侧与 now() 同钟）。"""
+    return time.time()
 
 
 def _connect():
@@ -375,9 +394,11 @@ def create_waiting_job(owner_user_id, owner_role, filename, safe_name,
                             "owner_role, idempotency_key, filename, safe_name, "
                             "format_ext, declared_size, state, transport, "
                             "policy_version, route_reason, slide_id, kind, "
-                            "sha256_expected, direct_class, waiting_expires_at) "
+                            "sha256_expected, direct_class, client_seen_at, "
+                            "waiting_expires_at) "
                             "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'presign_parts',"
-                            "%s,%s,%s,%s,%s,%s, now() + make_interval(secs => %s))",
+                            "%s,%s,%s,%s,%s,%s, now(), "
+                            "now() + make_interval(secs => %s))",
                             (job_id, owner_user_id, owner_role, idempotency_key,
                              filename, safe_name, format_ext, declared_size,
                              WAITING, policy_version, route_reason,
@@ -408,6 +429,13 @@ def create_waiting_job(owner_user_id, owner_role, filename, safe_name,
                                 "updated_at=now() WHERE job_id=%s",
                                 (backfill.slide_id, existing["job_id"]))
                             existing["slide_id"] = backfill.slide_id
+                        # 幂等复用同样是 owner 在场证据：刷新 client_seen_at
+                        #（0084；等待中的既有任务不因幂等重发创建而被误判失活）。
+                        cur.execute(
+                            "UPDATE ingestion_jobs SET client_seen_at=now(), "
+                            "updated_at=now() WHERE job_id=%s",
+                            (existing["job_id"],))
+                        existing["client_seen_at"] = _now_epoch()
                         return existing, False
                     if constraint == "ingestion_jobs_one_waiting_per_owner":
                         raise IngestionStateError(
@@ -444,6 +472,8 @@ def try_admit_job(job_id, *, disk_watermark_ok=True):
 
     1. 锁 job 行；非 waiting_capacity → 返回现状（已准入/已终态）；
     2. 等待超时 → 就地转 expired（terminal）；
+    2b. 客户端失活（client_seen_at 静默超阈值，0084）→ 就地转 expired
+        （terminal, fail_code=client_gone；FIFO 继续下一条）；
     3. 磁盘水位不过 → 暂缓（waiting, disk_watermark）；
     4. 每身份/全局活跃上限 → 暂缓（不因此终止）；
     5. quota 适用身份：reserve_upload_locked 预占本地配额——
@@ -498,6 +528,30 @@ def _try_admit_txn(cur, job_id, *, disk_watermark_ok=True):
         cur.execute("SELECT * FROM ingestion_jobs WHERE job_id=%s", (job_id,))
         return {"outcome": "terminal", "reason": "waiting_timeout",
                 "job": _norm_row(cur.fetchone())}
+    # 客户端失活闸（0084，upload-liveness）：等待中的任务若归属客户端已
+    # 超过短阈值未被看到（waiting 期浏览器 5s 轮询，触点节流 30s），不再
+    # 准入——就地终止（fail_code=client_gone，同 waiting_timeout 的
+    # expired 终态；staging 资产行一并作废），FIFO 继续看下一条。绝不给
+    # 已离开的客户端发凭证/占池。NULL（升级窗口旧行）= 无在场证据，
+    # fail-safe 跳过本闸（waiting_expires_at 绝对期限照常兜底）。
+    stale_after = int(cos_config.COS_WAITING_CLIENT_SEEN_TIMEOUT_SECONDS)
+    if stale_after > 0:
+        cur.execute(
+            "SELECT (client_seen_at IS NOT NULL AND client_seen_at <= "
+            "now() - make_interval(secs => %s)) AS gone "
+            "FROM ingestion_jobs WHERE job_id=%s",
+            (stale_after, job_id))
+        if cur.fetchone()["gone"]:
+            _abandon_staging_asset(cur, job)
+            cur.execute(
+                "UPDATE ingestion_jobs SET state=%s, fail_code="
+                "'client_gone', terminal_at=now(), updated_at=now() "
+                "WHERE job_id=%s AND state=%s", (EXPIRED, job_id, WAITING))
+            _append_event(cur, job_id, "expired", {"reason": "client_gone"})
+            cur.execute("SELECT * FROM ingestion_jobs WHERE job_id=%s",
+                        (job_id,))
+            return {"outcome": "terminal", "reason": "client_gone",
+                    "job": _norm_row(cur.fetchone())}
     if not disk_watermark_ok:
         raise _AdmissionDeferred("disk_watermark")
     # 活跃计数 fast-path（池锁前，仅省无谓工作，不做权威判定）。
@@ -1367,9 +1421,15 @@ def cancel_job(job_id, *, reason_code="cancelled_by_user"):
     return out
 
 
-def _terminate_fail_tx(job_id, generation, code):
+def _terminate_fail_tx(job_id, generation, code, *, detail=None):
     """失败终态的**短事务**段（R12 拆分；文件清理在锁内由
-    ``_local_cleanup_finish`` 执行）。返回 (job, local_pending)。"""
+    ``_local_cleanup_finish`` 执行）。返回 (job, local_pending)。
+
+    ``detail``（0084）：可选的安全细节（``VALID_FAIL_DETAILS`` 白名单值，
+    如 raster_format_mismatch）——落 ``fail_detail`` 列并随 failed 事件
+    持久化；白名单外一律丢弃（不透出内部异常细节，fail_code 语义不变）。
+    """
+    safe_detail = detail if detail in VALID_FAIL_DETAILS else None
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
@@ -1386,13 +1446,16 @@ def _terminate_fail_tx(job_id, generation, code):
                 _abandon_staging_asset(cur, job)
                 cur.execute(
                     "UPDATE ingestion_jobs SET state=%s, fail_code=%s, "
-                    "terminal_at=now(), cleanup_status=%s, "
+                    "fail_detail=%s, terminal_at=now(), cleanup_status=%s, "
                     "local_cleanup_status=%s, updated_at=now() "
                     "WHERE job_id=%s",
-                    (FAILED, code, CLEANUP_PENDING,
+                    (FAILED, code, safe_detail, CLEANUP_PENDING,
                      LOCAL_CLEANUP_PENDING if local_pending
                      else LOCAL_CLEANUP_NONE, job_id))
-                _append_event(cur, job_id, "failed", {"reason": code})
+                event_detail = {"reason": code}
+                if safe_detail:
+                    event_detail["fail_detail"] = safe_detail
+                _append_event(cur, job_id, "failed", event_detail)
                 cur.execute("SELECT * FROM ingestion_jobs WHERE job_id=%s",
                             (job_id,))
                 return _norm_row(cur.fetchone()), local_pending
@@ -1400,16 +1463,175 @@ def _terminate_fail_tx(job_id, generation, code):
         conn.close()
 
 
-def fail_job(job_id, generation, code):
+def fail_job(job_id, generation, code, *, detail=None):
     """worker 终态失败（本地容量经清理确认后释放；远端清理转 pending）。
 
     生命周期（0072）：同事务持久化失败终态 + 远端/本地清理责任（本地
     预约保持绑定+reserved）；文件清理在任务存储锁内等待旧 writer 退出后
-    执行（R12）。P4-b：staging 资产行同事务 CAS → failed。"""
-    out, local_pending = _terminate_fail_tx(job_id, generation, code)
+    执行（R12）。P4-b：staging 资产行同事务 CAS → failed。
+    ``detail``：``VALID_FAIL_DETAILS`` 白名单内的安全细节（0084），落
+    ``fail_detail`` 列供状态体透出（fail_code 兼容不变）。"""
+    out, local_pending = _terminate_fail_tx(job_id, generation, code,
+                                            detail=detail)
     if local_pending:
         _local_cleanup_finish(job_id)
     return out
+
+
+# --------------------------------------------------------------------------- #
+# 客户端在场证据（0084，upload-liveness）
+# --------------------------------------------------------------------------- #
+_CLIENT_RELEVANT_STATES = frozenset({WAITING}) | ACTIVE_UPLOAD_STATES
+
+
+def touch_client_seen(job_id, *, throttle_seconds=None):
+    """owner 触点刷新 ``client_seen_at``（节流；单条 UPDATE，0084）。
+
+    status 轮询 / parts/sign / upload-complete（owner 本人）调用。节流下限
+    ``COS_CLIENT_SEEN_TOUCH_SECONDS``（默认 30s）：阈值内的重复触点是
+    no-op（幂等且廉价）。只对客户端相关的非终态（waiting + 活跃上传态）
+    生效——终态任务不刷新（不扰动按 updated_at 排序的清理重试）。
+    返回 True 表示本轮确实刷新。
+    """
+    throttle = (cos_config.COS_CLIENT_SEEN_TOUCH_SECONDS
+                if throttle_seconds is None else max(0, int(throttle_seconds)))
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE ingestion_jobs SET client_seen_at=now(), "
+                    "updated_at=now() WHERE job_id=%s AND state = ANY(%s) "
+                    "AND (client_seen_at IS NULL OR client_seen_at <= "
+                    "now() - make_interval(secs => %s))",
+                    (job_id, list(_CLIENT_RELEVANT_STATES), throttle))
+                return cur.rowcount == 1
+    finally:
+        conn.close()
+
+
+def refresh_client_seen(job_id):
+    """无条件刷新 ``client_seen_at``（服务端活性证据，不节流）。
+
+    失活 sweep 经 COS ListParts 判定「客户端实际在场」（分块在阈值内被
+    修改/分块数增长）时调用——慢而在场的旧客户端不因缺心跳被误杀。
+    """
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE ingestion_jobs SET client_seen_at=now(), "
+                    "updated_at=now() WHERE job_id=%s AND state = ANY(%s)",
+                    (job_id, list(_CLIENT_RELEVANT_STATES)))
+                return cur.rowcount == 1
+    finally:
+        conn.close()
+
+
+def list_idle_uploading_jobs(idle_seconds, *, limit=20):
+    """失活候选：uploading 且 client_seen_at 静默超过 idle_seconds 的任务。
+
+    NULL client_seen_at（升级窗口旧行）**不**入选——无在场证据时绝不按
+    失活终止（job_deadline_at 绝对期限照常兜底）。按静默时长升序。
+    """
+    idle = max(0, int(idle_seconds))
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM ingestion_jobs WHERE state=%s AND "
+                "client_seen_at IS NOT NULL AND client_seen_at <= "
+                "now() - make_interval(secs => %s) "
+                "ORDER BY client_seen_at LIMIT %s",
+                (UPLOADING, idle, int(limit)))
+            return [_norm_row(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def terminate_client_idle_job(job_id):
+    """失活上传任务的终止短事务 + 本地清理编排（cancel 同款收口路径）。
+
+    uploading → cancelled（fail_code=client_idle_timeout）：同事务置远端/
+    本地清理责任 pending（worker 清理编排 Abort multipart + 删版本 +
+    finalize 释放池预约）、staging 资产行 CAS → failed；事务提交后执行
+    本地暂存清理（确认后释放本地预约，R12 §3.2 与取消同序）。非
+    uploading（并发终态/推进先赢）幂等返回 None。
+    """
+    conn = _connect()
+    out = None
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                job = get_job_locked(cur, job_id)
+                if job is None or job["state"] != UPLOADING:
+                    return None
+                local_pending = _needs_local_cleanup(job)
+                _abandon_staging_asset(cur, job)
+                cur.execute(
+                    "UPDATE ingestion_jobs SET state=%s, fail_code="
+                    "'client_idle_timeout', terminal_at=now(), "
+                    "cleanup_status=%s, local_cleanup_status=%s, "
+                    "updated_at=now() WHERE job_id=%s",
+                    (CANCELLED, CLEANUP_PENDING,
+                     LOCAL_CLEANUP_PENDING if local_pending
+                     else LOCAL_CLEANUP_NONE, job_id))
+                _append_event(cur, job_id, "cancelled",
+                              {"reason": "client_idle_timeout"})
+                cur.execute("SELECT * FROM ingestion_jobs WHERE job_id=%s",
+                            (job_id,))
+                out = _norm_row(cur.fetchone())
+    finally:
+        conn.close()
+    if out is not None and out.get("local_cleanup_status") == \
+            LOCAL_CLEANUP_PENDING:
+        _local_cleanup_finish(job_id)
+    return out
+
+
+def last_upload_observation(job_id):
+    """上次失活 sweep 观测的分块数（无观测记录返回 None）。
+
+    ListParts 的 last_modified 全部不可用时的退化活性证据：分块数较上次
+    观测增长 = 客户端在场（0084 upload-liveness；观测经
+    ``record_upload_observation`` 以 upload_observed 事件持久化）。
+    """
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT detail FROM ingestion_events WHERE job_id=%s AND "
+                "kind='upload_observed' AND detail IS NOT NULL "
+                "ORDER BY event_id DESC LIMIT 1", (job_id,))
+            row = cur.fetchone()
+            if row is None:
+                return None
+            detail = row["detail"]
+            if isinstance(detail, str):
+                try:
+                    detail = json.loads(detail)
+                except (TypeError, ValueError):
+                    return None
+            try:
+                return int((detail or {}).get("parts"))
+            except (TypeError, ValueError):
+                return None
+    finally:
+        conn.close()
+
+
+def record_upload_observation(job_id, part_count):
+    """登记失活 sweep 的分块数观测（upload_observed 事件；诊断/退化活性
+    证据基线，绝不携带任何秘密）。"""
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                _append_event(cur, job_id, "upload_observed",
+                              {"parts": int(part_count)})
+    finally:
+        conn.close()
 
 
 def sweep_expired_waiting():
@@ -1578,7 +1800,9 @@ def admit_waiting_fifo(*, disk_watermark_ok=True, max_admissions=1):
     """FIFO 准入扫描（§6.1：按 created_at,id；首发不允许后来者插队）。
 
     队首因「所属身份已有活跃任务」被跳过时继续看下一条（该原因属于
-    队首自己的暂态占用，不阻塞全局）；队首因容量/对账暂停/水位暂缓时
+    队首自己的暂态占用，不阻塞全局）；队首已被就地终止（waiting 超时/
+    客户端失活 client_gone/本地配额不可满足——terminal 收口属于队首
+    自己，见 0084）同样继续看下一条；队首因容量/对账暂停/水位暂缓时
     停止扫描（后面的任务同样过不了这两关）。每轮最多准入
     max_admissions 条（调度器串行推进，防一次放空池）。
     """
@@ -1598,11 +1822,14 @@ def admit_waiting_fifo(*, disk_watermark_ok=True, max_admissions=1):
         out = try_admit_job(jid, disk_watermark_ok=disk_watermark_ok)
         if out["outcome"] == "admitted":
             admitted.append(jid)
-        elif out["reason"] in ("identity_active_limit",):
+        elif out["outcome"] == "terminal" or \
+                out["reason"] in ("identity_active_limit",):
+            # terminal（waiting_timeout / client_gone / local_quota_*）：
+            # 终态是队首自己的收口，不阻塞队列——继续看下一条。
             continue
         else:
             # pool_capacity / reconcile_required / disk_watermark /
-            # global_active_limit / local_quota_*：停止本轮
+            # global_active_limit：停止本轮
             break
     return admitted
 

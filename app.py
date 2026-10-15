@@ -12329,6 +12329,10 @@ def _ingestion_state_body(job, *, queue_position=None):
         # 证明本地已删除）。
         "local_cleanup_status": job.get("local_cleanup_status"),
         "fail_code": job.get("fail_code"),
+        # 0084（upload-liveness）：终态失败的安全细节（稳定白名单值，如
+        # raster_format_mismatch）——前端映射为针对性可读文案；fail_code
+        # 语义保持不变。
+        "fail_detail": job.get("fail_detail") or None,
         "created_at": job.get("created_at"),
         "expires_at": job.get("waiting_expires_at")
         if job["state"] == ingestion_store.WAITING else job.get("job_deadline_at"),
@@ -12372,6 +12376,24 @@ def _ingestion_fetch(job_id):
                 and ident.get("role") != user_store.ROLE_OWNER)):
         return None, (jsonify(error="无权限"), 403)
     return job, None
+
+
+def _touch_ingestion_client_seen(job):
+    """owner 触点：刷新任务的 ``client_seen_at``（0084，upload-liveness）。
+
+    liveness 表达「上传方浏览器还在场」——只在归属客户端本人发起的
+    status 轮询 / parts/sign / upload-complete 时刷新（owner 视角的他人
+    查看不触发；节流由 store 侧 COS_CLIENT_SEEN_TOUCH_SECONDS 控制）。
+    任何失败只降级记日志，绝不影响响应。"""
+    ident = current_identity()
+    uid = (ident.get("user_id") or "").strip()
+    if not uid or (job.get("owner_user_id") or "") != uid:
+        return
+    try:
+        ingestion_store.touch_client_seen(job["job_id"])
+    except Exception:  # noqa: BLE001 - 触点失败不阻塞控制请求
+        app.logger.debug("client_seen_at 刷新失败（job=%s）", job["job_id"],
+                         exc_info=True)
 
 
 @app.route("/api/ingestions", methods=["POST"])
@@ -12511,10 +12533,14 @@ def api_ingestions_create():
 
 @app.route("/api/ingestions/<job_id>", methods=["GET"])
 def api_ingestion_status(job_id):
-    """阶段/进度快照（不触发任何远程读取；进度是服务端权威持久值）。"""
+    """阶段/进度快照（不触发任何远程读取；进度是服务端权威持久值）。
+
+    owner 本人的轮询同时刷新 client_seen_at（0084 liveness；等待期 5s
+    轮询、上传期心跳共用的在场证据）。"""
     job, err = _ingestion_fetch(job_id)
     if err is not None:
         return err
+    _touch_ingestion_client_seen(job)
     position = (ingestion_store.queue_position(job_id)
                 if job["state"] == ingestion_store.WAITING else None)
     return jsonify(_ingestion_state_body(job, queue_position=position))
@@ -12522,10 +12548,14 @@ def api_ingestion_status(job_id):
 
 @app.route("/api/ingestions/<job_id>/upload-complete", methods=["POST"])
 def api_ingestion_upload_complete(job_id):
-    """幂等记录「浏览器侧完成」（§4）：worker 随后核验远端对象。"""
+    """幂等记录「浏览器侧完成」（§4）：worker 随后核验远端对象。
+
+    owner 触点先行刷新 client_seen_at（0084 liveness；终态冲突时同样算
+    在场证据）。"""
     job, err = _ingestion_fetch(job_id)
     if err is not None:
         return err
+    _touch_ingestion_client_seen(job)
     try:
         job = ingestion_store.request_upload_complete(job_id)
     except ingestion_store.IngestionStateError as e:
@@ -12563,6 +12593,8 @@ def api_ingestion_parts_sign(job_id):
     job, err = _ingestion_fetch(job_id)
     if err is not None:
         return err
+    # owner 触点（0084 liveness）：分块签名是上传方浏览器在场的最强证据。
+    _touch_ingestion_client_seen(job)
     if job["state"] != ingestion_store.UPLOADING:
         return jsonify(
             error="任务当前状态 %s 不接受分块签名" % job["state"],

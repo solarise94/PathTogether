@@ -18,6 +18,7 @@ import itertools
 import json
 import logging
 import os
+import time
 
 import psycopg
 import pytest
@@ -155,6 +156,10 @@ class FakeCos:
         self.head_override = None
         self.deleted = []
         self.aborted = []
+        # upload-liveness（0084）：list_parts 可注入故障与分块修改时刻
+        #（epoch 秒；缺省无 last_modified——退化基线路径可测）。
+        self.list_parts_fault = None
+        self.part_times = {}
         self._n = 0
 
     # ---- multipart ----
@@ -170,11 +175,14 @@ class FakeCos:
         self.uploads[key][upload_id][number] = bytes(data)
 
     def list_parts(self, key, upload_id):
+        if self.list_parts_fault is not None:
+            raise self.list_parts_fault
         ups = self.uploads.get(key, {}).get(upload_id)
         if ups is None:
             return []
         # ETag 恒伪造：worker 只信服务端 size（浏览器/伪造 ETag 只是提示）
-        return [{"part_number": n, "etag": "FORGED-%d" % n, "size": len(ups[n])}
+        return [{"part_number": n, "etag": "FORGED-%d" % n, "size": len(ups[n]),
+                 "last_modified": self.part_times.get((upload_id, n))}
                 for n in sorted(ups)]
 
     def complete_multipart(self, key, upload_id, parts):
@@ -1026,3 +1034,223 @@ def test_cleanup_keyless_admitted_job_releases_pool_directly(monkeypatch, tmp_pa
     assert final["cleanup_status"] == ist.CLEANUP_CLEANED
     assert final["pool_reserved_bytes"] == 0
     assert cos_pool_store.get_pool_state()["reserved_bytes"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# 1b) 失活 sweep 与校验细节（0084，upload-liveness）
+# --------------------------------------------------------------------------- #
+def _idle_uploading(fake, st, *, size=150, owner="own", role="owner",
+                    name="a.svs", idle_seconds=3600):
+    """推进到 uploading 并把 client_seen_at 拨回 idle_seconds 之前。"""
+    if role == "user":
+        _mk_user(owner)
+    job, payload = _prepare(fake, st, size=size, owner=owner, role=role,
+                            name=name)
+    job = ist.get_job(job["job_id"])
+    _sql(lambda cur: cur.execute(
+        "UPDATE ingestion_jobs SET client_seen_at = now() - "
+        "make_interval(secs => %s) WHERE job_id=%s",
+        (idle_seconds, job["job_id"])))
+    return ist.get_job(job["job_id"])
+
+
+def test_last_modified_epoch_parsing():
+    f = cos_client._last_modified_epoch
+    assert f(None) is None
+    assert f("") is None
+    assert f(1_760_000_000) == 1_760_000_000.0
+    assert f(1_760_000_000.5) == 1_760_000_000.5
+    got = f("2026-10-15T08:00:00.000Z")
+    assert isinstance(got, float) and got > 0
+    assert f("not-a-date") is None
+
+
+def test_validation_fail_detail_mapping_and_whitelist():
+    m = ciw.validation_fail_detail
+    assert m(slide_io.SlideValidationError(
+        "invalid_slide", "真实格式不符",
+        cause_type="RasterFormatMismatch")) == "raster_format_mismatch"
+    assert m(slide_io.SlideValidationError("slide_open_unsupported")) == \
+        "slide_open_unsupported"
+    assert m(slide_io.SlideValidationError("slide_open_failed")) == \
+        "slide_open_failed"
+    assert m(slide_io.SlideValidationError("invalid_slide", "其他")) == \
+        "invalid_slide"
+    assert m(ValueError("意外异常")) is None
+    # 白名单外值不会落库（store 侧丢弃）
+    fake, st = FakeCos(), {}
+    job = _idle_uploading(fake, st)
+    failed, _pending = ist._terminate_fail_tx(
+        job["job_id"], job["worker_generation"], "validation_failed",
+        detail="InternalError /srv/secret/path.tif")
+    assert failed["fail_detail"] is None
+    assert failed["fail_code"] == "validation_failed"
+
+
+def test_validating_raster_mismatch_logs_code_and_persists_detail(
+        monkeypatch, caplog):
+    """open_slide 失败：日志带 code/cause（不含路径/内容），fail_detail
+    落白名单值并随 failed 事件持久化。"""
+    fake, st = FakeCos(), {}
+    job, _payload = _drive_to_validating(fake, st)
+
+    def _mismatch(path, format_hint=None):
+        raise slide_io.SlideValidationError(
+            "invalid_slide", "图片真实格式（PNG）与扩展名要求（JPEG）不符",
+            cause_type="RasterFormatMismatch")
+
+    monkeypatch.setattr(slide_io, "open_slide", _mismatch)
+    with caplog.at_level(logging.WARNING, logger="svs.cos_ingest"):
+        ciw.process_validating(cos=fake, state=st)
+    out = ist.get_job(job["job_id"])
+    assert out["state"] == ist.FAILED
+    assert out["fail_code"] == "validation_failed"
+    assert out["fail_detail"] == "raster_format_mismatch"
+    warn = [r.getMessage() for r in caplog.records
+            if "open_slide 校验失败" in r.getMessage()]
+    assert warn and "code=invalid_slide" in warn[0] and \
+        "cause=RasterFormatMismatch" in warn[0]
+    # failed 事件同样携带 fail_detail（审计可回放）
+    def ev(cur):
+        cur.execute("SELECT detail FROM ingestion_events WHERE job_id=%s "
+                    "AND kind='failed'", (job["job_id"],))
+        return cur.fetchall()
+    rows = _sql(ev)
+    assert any((r["detail"] or {}).get("fail_detail") ==
+               "raster_format_mismatch" for r in rows)
+
+
+def test_idle_uploading_zero_parts_terminated_and_reservations_released(
+        monkeypatch):
+    """生产事故形态：uploading、client_seen_at 静默、COS 零分块 → 终止
+    client_idle_timeout；本地预约经清理确认释放、远端清理编排收口池预约。"""
+    monkeypatch.setattr(cos_config, "COS_UPLOADING_CLIENT_IDLE_SECONDS", 1800)
+    fake, st = FakeCos(), {}
+    job = _idle_uploading(fake, st, owner="u9", role="user")
+    gone = ciw.sweep_client_idle_uploads(fake)
+    assert gone == [job["job_id"]]
+    out = ist.get_job(job["job_id"])
+    assert out["state"] == ist.CANCELLED
+    assert out["fail_code"] == "client_idle_timeout"
+    # 本地清理编排已跑：暂存树收口 + 本地预约释放
+    assert out["local_cleanup_status"] == ist.LOCAL_CLEANUP_CLEANED
+    res = upload_guard.get_reservation(out["local_reservation_id"])
+    assert not upload_guard.reservation_holds_capacity(res)
+    # staging 资产行 failed；远端清理责任 pending（池预约未释放）
+    desc = slide_store.resolve_slide_id(out["slide_id"])
+    assert desc.asset_state == "failed"
+    assert out["cleanup_status"] == ist.CLEANUP_PENDING
+    assert cos_pool_store.get_pool_state()["reserved_bytes"] > 0
+    # 远端清理编排：Abort multipart + finalize 释放池预约
+    assert ciw.process_cleanup(cos=fake) == job["job_id"]
+    final = ist.get_job(job["job_id"])
+    assert final["cleanup_status"] == ist.CLEANUP_CLEANED
+    assert cos_pool_store.get_pool_state()["reserved_bytes"] == 0
+    assert (job["object_key"], job["upload_id"]) in fake.aborted
+
+
+def test_idle_uploading_recent_part_kept_alive(monkeypatch):
+    """ListParts 显示分块在阈值内被修改 → 视为在场：刷新 client_seen_at，
+    不终止（慢而在场的旧客户端保护）。"""
+    monkeypatch.setattr(cos_config, "COS_UPLOADING_CLIENT_IDLE_SECONDS", 1800)
+    fake, st = FakeCos(), {}
+    job = _idle_uploading(fake, st, size=150)
+    fake.put_part(job["object_key"], job["upload_id"], 1, b"x" * 64)
+    fake.part_times[(job["upload_id"], 1)] = time.time() - 60  # 阈值内
+    assert ciw.sweep_client_idle_uploads(fake) == []
+    out = ist.get_job(job["job_id"])
+    assert out["state"] == ist.UPLOADING
+    assert out["client_seen_at"] > job["client_seen_at"]
+
+
+def test_idle_uploading_listparts_error_fail_safe(monkeypatch):
+    """ListParts 网络错误 → 本轮跳过（绝不因对端错误终止）。"""
+    monkeypatch.setattr(cos_config, "COS_UPLOADING_CLIENT_IDLE_SECONDS", 1800)
+    fake, st = FakeCos(), {}
+    job = _idle_uploading(fake, st, size=150)
+    fake.put_part(job["object_key"], job["upload_id"], 1, b"x" * 64)
+    fake.list_parts_fault = cos_client.CosClientError("ListParts 网络错误")
+    assert ciw.sweep_client_idle_uploads(fake) == []
+    out = ist.get_job(job["job_id"])
+    assert out["state"] == ist.UPLOADING
+    assert out["client_seen_at"] == job["client_seen_at"]
+
+
+def test_idle_uploading_stale_parts_terminated_on_first_sweep(monkeypatch):
+    """分块 last_modified 权威且全部早于阈值 → 首轮即终止（不需要基线）。"""
+    monkeypatch.setattr(cos_config, "COS_UPLOADING_CLIENT_IDLE_SECONDS", 1800)
+    fake, st = FakeCos(), {}
+    job = _idle_uploading(fake, st, size=150)
+    fake.put_part(job["object_key"], job["upload_id"], 1, b"x" * 64)
+    fake.part_times[(job["upload_id"], 1)] = time.time() - 7200  # 陈旧
+    assert ciw.sweep_client_idle_uploads(fake) == [job["job_id"]]
+    out = ist.get_job(job["job_id"])
+    assert out["state"] == ist.CANCELLED
+    assert out["fail_code"] == "client_idle_timeout"
+
+
+def test_idle_uploading_unavailable_ts_baseline_then_terminated(monkeypatch):
+    """last_modified 全不可用（旧适配）：首轮只记观测基线（绝不首证即
+    杀）；次轮分块数未增长 → 终止。"""
+    monkeypatch.setattr(cos_config, "COS_UPLOADING_CLIENT_IDLE_SECONDS", 1800)
+    fake, st = FakeCos(), {}
+    job = _idle_uploading(fake, st, size=150)
+    fake.put_part(job["object_key"], job["upload_id"], 1, b"x" * 64)
+    # 不注入 part_times：list_parts 无 last_modified（退化基线路径）
+    assert ciw.sweep_client_idle_uploads(fake) == []
+    assert ist.get_job(job["job_id"])["state"] == ist.UPLOADING
+    assert ist.last_upload_observation(job["job_id"]) == 1
+    # 次轮：分块数未增长 → 终态
+    _sql(lambda cur: cur.execute(
+        "UPDATE ingestion_jobs SET client_seen_at = now() - "
+        "make_interval(secs => %s) WHERE job_id=%s",
+        (1800, job["job_id"])))
+    assert ciw.sweep_client_idle_uploads(fake) == [job["job_id"]]
+    out = ist.get_job(job["job_id"])
+    assert out["state"] == ist.CANCELLED
+    assert out["fail_code"] == "client_idle_timeout"
+
+
+def test_idle_uploading_part_growth_kept_alive(monkeypatch):
+    """last_modified 全不可用（旧适配）：分块数较基线增长 → 在场。"""
+    monkeypatch.setattr(cos_config, "COS_UPLOADING_CLIENT_IDLE_SECONDS", 1800)
+    fake, st = FakeCos(), {}
+    job = _idle_uploading(fake, st, size=150)
+    fake.put_part(job["object_key"], job["upload_id"], 1, b"x" * 64)
+    assert ciw.sweep_client_idle_uploads(fake) == []  # 基线 1
+    assert ist.last_upload_observation(job["job_id"]) == 1
+    # 追加第 2 块（last_modified 缺失）后再次失活：增长即在场
+    fake.put_part(job["object_key"], job["upload_id"], 2, b"y" * 64)
+    _sql(lambda cur: cur.execute(
+        "UPDATE ingestion_jobs SET client_seen_at = now() - "
+        "make_interval(secs => %s) WHERE job_id=%s",
+        (1800, job["job_id"])))
+    assert ciw.sweep_client_idle_uploads(fake) == []
+    out = ist.get_job(job["job_id"])
+    assert out["state"] == ist.UPLOADING
+    assert ist.last_upload_observation(job["job_id"]) == 2
+
+
+def test_scheduler_tick_runs_idle_sweep(monkeypatch):
+    """scheduler_tick 内嵌失活 sweep：终止结果先于 FIFO 准入（释放的
+    名额本轮即可被等待任务使用）。"""
+    monkeypatch.setattr(cos_config, "COS_UPLOADING_CLIENT_IDLE_SECONDS", 1800)
+    fake, st = FakeCos(), {}
+    job = _idle_uploading(fake, st, owner="uA", role="user")
+    _sql(lambda cur: cur.execute(
+        "UPDATE ingestion_jobs SET client_seen_at = now() - "
+        "make_interval(secs => %s) WHERE job_id=%s",
+        (1800, job["job_id"])))
+    assert ciw.scheduler_tick(cos=fake, state=st, force=True) is True
+    out = ist.get_job(job["job_id"])
+    assert out["state"] == ist.CANCELLED
+    assert out["fail_code"] == "client_idle_timeout"
+
+
+def test_scheduler_tick_no_idle_jobs_makes_no_cos_calls():
+    st = {}
+    class _ExplodingCos:
+        def __getattr__(self, name):
+            raise AssertionError("无失活候选时不应触碰 COS：%s" % name)
+    assert ciw.scheduler_tick(cos=_ExplodingCos(), state=st, force=True) \
+        is True

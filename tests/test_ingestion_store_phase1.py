@@ -17,6 +17,7 @@ import cos_config
 import cos_pool_store
 import ingestion_store as ist
 import pg_store
+import slide_store
 import upload_guard
 
 
@@ -636,3 +637,152 @@ def test_events_reject_secret_shaped_detail():
                                       {"secret_token": "abc"})
     finally:
         conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# 客户端在场（0084，upload-liveness）
+# --------------------------------------------------------------------------- #
+def test_migration_0084_applied_and_idempotent(pg_uri):
+    """conftest ensure_schema 已应用 0084；原始 SQL 重跑两次 no-op。"""
+    c = psycopg.connect(pg_uri)
+    try:
+        with c.cursor() as cur:
+            cur.execute("SELECT 1 FROM schema_migrations WHERE filename=%s",
+                        ("0084_ingestion_client_seen.sql",))
+            assert cur.fetchone() is not None, "0084 应已被 ensure_schema 应用"
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='ingestion_jobs' AND column_name = ANY(%s)",
+                (["client_seen_at", "fail_detail"],))
+            assert {r[0] for r in cur.fetchall()} == \
+                {"client_seen_at", "fail_detail"}
+    finally:
+        c.close()
+    sql = (pg_store.migrations_dir() /
+           "0084_ingestion_client_seen.sql").read_text(encoding="utf-8")
+    c = psycopg.connect(pg_uri)
+    try:
+        with c.cursor() as cur:
+            for _ in range(2):
+                cur.execute(sql)
+        c.commit()
+    finally:
+        c.close()
+
+
+def test_create_sets_client_seen_and_admission_terminates_stale_waiting():
+    """创建即写 client_seen_at；等待任务客户端失活超阈值 → 不准入、就地
+    终止（expired/client_gone），池无预约，staging 资产行作废。"""
+    job = _mkjob(owner="own", size=1000, key="CG1")
+    assert job["client_seen_at"] is not None  # 创建即在场证据
+    _sql(lambda cur: cur.execute(
+        "UPDATE ingestion_jobs SET client_seen_at = now() - "
+        "interval '300 seconds' WHERE job_id=%s", (job["job_id"],)))
+    out = _admit(job["job_id"])
+    assert out["outcome"] == "terminal"
+    assert out["reason"] == "client_gone"
+    assert out["job"]["state"] == ist.EXPIRED
+    assert out["job"]["fail_code"] == "client_gone"
+    assert cos_pool_store.get_pool_state()["reserved_bytes"] == 0
+    # staging 资产行已随终态作废（同 sweep_expired_waiting 口径）
+    desc = slide_store.resolve_slide_id(job["slide_id"])
+    assert desc.asset_state == "failed"
+    # 事件留证
+    def ev(cur):
+        cur.execute("SELECT kind, detail FROM ingestion_events "
+                    "WHERE job_id=%s AND kind='expired'", (job["job_id"],))
+        return cur.fetchall()
+    rows = _sql(ev)
+    assert any((r["detail"] or {}).get("reason") == "client_gone"
+               for r in rows)
+
+
+def test_admission_admits_fresh_waiting_job():
+    job = _mkjob(owner="own", size=1000, key="CG2")
+    assert _admit(job["job_id"])["outcome"] == "admitted"
+
+
+def test_admission_legacy_null_client_seen_fail_safe():
+    """NULL client_seen_at（升级窗口旧行）：不按失活终止（fail-safe）。"""
+    job = _mkjob(owner="own", size=1000, key="CG3")
+    _sql(lambda cur: cur.execute(
+        "UPDATE ingestion_jobs SET client_seen_at = NULL WHERE job_id=%s",
+        (job["job_id"],)))
+    assert _admit(job["job_id"])["outcome"] == "admitted"
+
+
+def test_admission_gate_disabled_when_threshold_nonpositive(monkeypatch):
+    monkeypatch.setattr(
+        cos_config, "COS_WAITING_CLIENT_SEEN_TIMEOUT_SECONDS", 0)
+    job = _mkjob(owner="own", size=1000, key="CG4")
+    _sql(lambda cur: cur.execute(
+        "UPDATE ingestion_jobs SET client_seen_at = now() - "
+        "interval '300 seconds' WHERE job_id=%s", (job["job_id"],)))
+    assert _admit(job["job_id"])["outcome"] == "admitted"
+
+
+def test_fifo_continues_past_stale_head_to_next_job():
+    """队首失活终止后 FIFO 继续准入下一条（不阻塞队列）。"""
+    stale = _mkjob(owner="o1", size=1000, key="S1", name="s1.svs")
+    fresh = _mkjob(owner="o2", size=1000, key="F1", name="f1.svs")
+    _sql(lambda cur: cur.execute(
+        "UPDATE ingestion_jobs SET client_seen_at = now() - "
+        "interval '300 seconds' WHERE job_id=%s", (stale["job_id"],)))
+    admitted = ist.admit_waiting_fifo()
+    assert admitted == [fresh["job_id"]]
+    assert ist.get_job(stale["job_id"])["fail_code"] == "client_gone"
+    assert ist.get_job(fresh["job_id"])["state"] == ist.PREPARING
+
+
+def test_touch_client_seen_throttled():
+    """触点节流：阈值内 no-op；超阈值刷新；终态不刷新。"""
+    job = _mkjob(owner="own", size=1000, key="TC1")
+    # 创建刚写入：节流窗内 no-op
+    assert ist.touch_client_seen(job["job_id"]) is False
+    _sql(lambda cur: cur.execute(
+        "UPDATE ingestion_jobs SET client_seen_at = now() - "
+        "interval '300 seconds' WHERE job_id=%s", (job["job_id"],)))
+    assert ist.touch_client_seen(job["job_id"]) is True
+    # 终态任务不刷新（不扰动按 updated_at 排序的清理重试）
+    ist.cancel_job(job["job_id"])
+    _sql(lambda cur: cur.execute(
+        "UPDATE ingestion_jobs SET client_seen_at = now() - "
+        "interval '300 seconds' WHERE job_id=%s", (job["job_id"],)))
+    assert ist.touch_client_seen(job["job_id"]) is False
+
+
+def test_refresh_client_seen_unconditional_for_active_states():
+    """ListParts 活性证据的无条件刷新（不节流；活跃态才生效）。"""
+    job = _mkjob(owner="own", size=1000, key="TC2")
+    _sql(lambda cur: cur.execute(
+        "UPDATE ingestion_jobs SET client_seen_at = now() - "
+        "interval '300 seconds' WHERE job_id=%s", (job["job_id"],)))
+    assert ist.refresh_client_seen(job["job_id"]) is True
+    fresh = ist.get_job(job["job_id"])
+    assert fresh["client_seen_at"] > job["client_seen_at"]
+
+
+def test_fail_detail_whitelist_only(monkeypatch):
+    """fail_detail 只落白名单值（fail_code 兼容不变）；白名单外丢弃。"""
+    job = _mkjob(owner="own", size=1000, key="FD1")
+    out = _admit(job["job_id"])
+    assert out["outcome"] == "admitted"
+    claim = ist.claim_next_job_for_worker([ist.PREPARING])
+    gen = claim["worker_generation"]
+    failed, _pending = ist._terminate_fail_tx(
+        job["job_id"], gen, "validation_failed",
+        detail="raster_format_mismatch")
+    assert failed["state"] == ist.FAILED
+    assert failed["fail_code"] == "validation_failed"
+    assert failed["fail_detail"] == "raster_format_mismatch"
+
+    job2 = _mkjob(owner="own", size=1000, key="FD2")
+    assert _admit(job2["job_id"])["outcome"] == "admitted"
+    claim2 = ist.claim_next_job_for_worker([ist.PREPARING])
+    gen2 = claim2["worker_generation"]
+    # 白名单外的细节一律丢弃（绝不透出内部异常细节/路径）
+    failed2, _pending = ist._terminate_fail_tx(
+        job2["job_id"], gen2, "validation_failed",
+        detail="InternalError: /srv/secret/path.tif")
+    assert failed2["fail_detail"] is None
+    assert failed2["fail_code"] == "validation_failed"

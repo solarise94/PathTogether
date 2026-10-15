@@ -135,8 +135,32 @@ def presign_upload_part(key: str, upload_id: str, part_number: int,
             "content_length": int(content_length)}
 
 
+def _last_modified_epoch(raw) -> Optional[float]:
+    """ListParts 分块的 LastModified → epoch 秒（缺失/解析失败 → None）。
+
+    SDK 返回 ISO8601 字符串（如 ``2026-10-15T08:00:00.000Z``）；数字直接用。
+    只服务 liveness 活性判定（0084）：解析失败按「无证据」处理（fail-safe，
+    绝不因解析问题终止任务）。
+    """
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return float(raw)
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
 def list_parts(key: str, upload_id: str) -> List[Dict[str, object]]:
-    """分页列举已上传分块 → [{part_number, etag, size}]（编号升序）。"""
+    """分页列举已上传分块 → [{part_number, etag, size, last_modified}]
+    （编号升序）。``last_modified`` 为分块最近修改时刻（epoch 秒），
+    liveness 活性判定（0084）用；SDK 未返回/解析失败时为 None。"""
     try:
         parts: List[Dict[str, object]] = []
         marker = 0
@@ -146,7 +170,9 @@ def list_parts(key: str, upload_id: str) -> List[Dict[str, object]]:
                 PartNumberMarker=marker)
             for p in (resp.get("Part") or []):
                 parts.append({"part_number": int(p["PartNumber"]),
-                              "etag": p["ETag"], "size": int(p["Size"])})
+                              "etag": p["ETag"], "size": int(p["Size"]),
+                              "last_modified":
+                                  _last_modified_epoch(p.get("LastModified"))})
             if str(resp.get("IsTruncated", "false")).lower() != "true":
                 break
             marker = int(resp.get("NextPartNumberMarker", 0) or 0)

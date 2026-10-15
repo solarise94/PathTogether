@@ -45,6 +45,25 @@ COS_WAITING_MAX_AGE_SECONDS = _env_int("COS_WAITING_MAX_AGE_SECONDS", 86_400)
 COS_JOB_MAX_AGE_SECONDS = _env_int("COS_JOB_MAX_AGE_SECONDS", 259_200)
 
 # --------------------------------------------------------------------------- #
+# 客户端活性（upload-liveness 修复：vanish 的浏览器不得长期占用活跃名额
+# 与池预约；浏览器 waiting 轮询 5s、分块上传心跳 60s）
+# --------------------------------------------------------------------------- #
+#: owner 触点（状态轮询/parts/sign/upload-complete）刷新 client_seen_at 的
+#: 节流下限（秒）——单条 UPDATE，幂等且廉价。
+COS_CLIENT_SEEN_TOUCH_SECONDS = _env_int("COS_CLIENT_SEEN_TOUCH_SECONDS", 30)
+#: waiting 准入闸：client_seen_at 静默超过该秒数的等待任务不再准入，就地
+#: 终止（fail_code=client_gone）。客户端等待期 5s 轮询，120s ≈ 24 个轮询
+#: 周期。0/负 = 关闭该闸（不推荐）。
+COS_WAITING_CLIENT_SEEN_TIMEOUT_SECONDS = _env_int(
+    "COS_WAITING_CLIENT_SEEN_TIMEOUT_SECONDS", 120)
+#: uploading 失活 sweep：client_seen_at 静默超过该秒数的上传任务，经 COS
+#: ListParts 活性复核（任一分块在阈值内被修改/分块数增长 → 视为在场并
+#: 刷新；ListParts 错误 → 本轮跳过，绝不因对端错误终止）后终止
+#: （fail_code=client_idle_timeout）。0/负 = 关闭 sweep（不推荐）。
+COS_UPLOADING_CLIENT_IDLE_SECONDS = _env_int(
+    "COS_UPLOADING_CLIENT_IDLE_SECONDS", 1800)
+
+# --------------------------------------------------------------------------- #
 # 分块与预签名（A-presign-parts；§3.1 PoC 起点，非生产定值）
 # --------------------------------------------------------------------------- #
 #: 分块字节数（十进制起点 32_000_000，合同 §3.1）。

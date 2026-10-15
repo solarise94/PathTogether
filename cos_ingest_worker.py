@@ -16,7 +16,10 @@ Delete/List 分页）只发生在本 worker。对象 key 由服务端生成
 主循环 duties（按序执行，单 duty 失败只记日志不炸循环）：
 
 1. ``scheduler_tick``（节流 ``COS_SCHEDULER_INTERVAL_SECONDS``，须 < 600s）：
-   等待超期 sweep → 已准入超期 sweep → 活跃本地预约续租 → 磁盘水位 → FIFO 准入；
+   等待超期 sweep → 已准入超期 sweep → 活跃本地预约续租 → 失活上传 sweep
+   （0084：client_seen_at 静默超阈值的 uploading 任务经 ListParts 活性复核
+   后终止 client_idle_timeout 或刷新在场；waiting 队首客户端失活由准入
+   事务就地终止 client_gone）→ 磁盘水位 → FIFO 准入；
 2. ``process_preparing``：生成 key + 分块计划（declared × COS_PART_BYTES）→
    Initiate → ``worker_begin_uploading`` 冻结 key/uploadId/计划；
 3. ``process_completing``：ListParts 核对（连续编号 1..N、每块 size==计划长、
@@ -209,6 +212,35 @@ def _sha256_file(path, chunk=_IO_BUF_BYTES) -> str:
     return h.hexdigest()
 
 
+#: open_slide 失败的安全细节白名单（ingestion_store.VALID_FAIL_DETAILS 同
+#: 词表；fail_code 保持 validation_failed 兼容，细节只在此词表内透出）。
+_VALIDATION_FAIL_DETAILS = (
+    "raster_format_mismatch",   # 图片真实格式与扩展名不符（PNG/WebP 改名 .jpg）
+    "slide_open_unsupported",
+    "slide_open_failed",
+    "invalid_slide",
+)
+
+
+def validation_fail_detail(exc):
+    """SlideValidationError → ``fail_detail`` 白名单值（其余 → None）。
+
+    ``cause_type`` 只进日志（slide_io 契约），但 ``RasterFormatMismatch``
+    是唯一需要透出的归因（浏览器嗅探漏网的最常见形态：PNG/WebP 内容改名
+    .jpg）——映射为 ``raster_format_mismatch``；其余按稳定机器码透出白名
+    词值，非 SlideValidationError（缺库/IO 意外等）不透出细节。
+    """
+    if not isinstance(exc, slide_io.SlideValidationError):
+        return None
+    code = getattr(exc, "code", "") or ""
+    if code == "invalid_slide" and \
+            (getattr(exc, "cause_type", "") or "") == "RasterFormatMismatch":
+        return "raster_format_mismatch"
+    if code in _VALIDATION_FAIL_DETAILS:
+        return code
+    return None
+
+
 def _release_lease(job_id, token, state=None):
     """duty 收尾释放执行租约：同 cycle 的后继 duty / 其它 worker 可立即接手。
 
@@ -232,8 +264,11 @@ def scheduler_tick(cos=None, state=None, *, force=False):
     """容量调度器单步（节流 COS_SCHEDULER_INTERVAL_SECONDS，非 COS 网络调用）。
 
     顺序固定：过期 sweep（waiting / 已准入）→ 本地清理重试（0072）→
-    活跃本地预约续租（绑定核验）→ 磁盘水位 → FIFO 准入（水位不过则
-    disk_watermark_ok=False，任务保持等待）。
+    活跃本地预约续租（绑定核验）→ 失活上传 sweep（0084：client_seen_at
+    静默超阈值的 uploading 任务经 ListParts 活性复核后终止/刷新——先于
+    FIFO，释放的活跃名额本轮即可被等待任务使用）→ 磁盘水位 → FIFO 准入
+    （水位不过则 disk_watermark_ok=False，任务保持等待；waiting 队首客户
+    端失活由准入事务就地终止 client_gone 并继续下一条）。
     返回 True 表示本轮实际执行了调度。
     """
     state = _STATE if state is None else state
@@ -254,6 +289,13 @@ def scheduler_tick(cos=None, state=None, *, force=False):
     if any(v not in ("skipped", "exempt") for v in renew.values()):
         _log.info("scheduler renew：%s", renew)
     try:
+        idle_gone = sweep_client_idle_uploads(cos)
+        if idle_gone:
+            _log.info("client idle sweep：终止 %d 条：%s",
+                      len(idle_gone), idle_gone)
+    except Exception:  # noqa: BLE001  失活 sweep 失败不影响本轮其余调度
+        _log.exception("client idle sweep 异常（跳过本轮）")
+    try:
         upload_guard.check_disk_watermark(_ensure_upload_dir())
         watermark_ok = True
     except upload_guard.DiskWatermarkExceeded as exc:
@@ -263,6 +305,96 @@ def scheduler_tick(cos=None, state=None, *, force=False):
     if admitted:
         _log.info("FIFO 准入 %d 条：%s", len(admitted), admitted)
     return True
+
+
+# --------------------------------------------------------------------------- #
+# 1b) 失活上传 sweep（0084，upload-liveness：vanish 的浏览器释放名额/池预约）
+# --------------------------------------------------------------------------- #
+def _parts_show_activity(parts, idle_cutoff_epoch, baseline_parts):
+    """ListParts 活性判定（fail-safe 取真：无法证伪一律视为在场）。
+
+    - 零分块 → 不在场（无任何远端活性证据——生产事故形态：uploading
+      数小时、COS 上零分块）；
+    - 任一分块在 ``idle_cutoff_epoch``（now - 阈值）之后被修改 → 在场；
+    - 分块的 last_modified **全部**不可用（旧适配/解析失败）时退化为
+      「分块数较上次观测增长」：无基线 → 视为在场（先记录观测，下轮起
+      可判死）；有基线且增长 → 在场；
+    - 有 last_modified 但全部早于阈值，或分块数未增长 → 不在场。
+    """
+    if not parts:
+        return False
+    seen_any_ts = False
+    for p in parts:
+        lm = p.get("last_modified")
+        if isinstance(lm, (int, float)):
+            seen_any_ts = True
+            if float(lm) >= idle_cutoff_epoch:
+                return True
+    if not seen_any_ts:
+        if baseline_parts is None:
+            return True  # 无基线：先记录观测，绝不首证即杀
+        return len(parts) > int(baseline_parts)
+    return False
+
+
+def sweep_client_idle_uploads(cos=None):
+    """uploading 失活 sweep（scheduler_tick 内；返回本轮终止的 job_id）。
+
+    ``client_seen_at`` 静默超过 ``COS_UPLOADING_CLIENT_IDLE_SECONDS`` 的
+    uploading 任务逐条经 COS ListParts 复核活性：
+
+    - 任一分块在阈值内被修改（或分块数较上次观测增长、last_modified 全
+      不可用）→ 客户端实际在场（慢而在场的旧客户端）：刷新 client_seen_at
+      并记录观测，不终止；
+    - 无任何在场证据（含零分块——生产事故形态：uploading 数小时、COS 上
+      零分块）→ 终止（fail_code=client_idle_timeout；经取消同款清理路径：
+      Abort multipart、删版本、finalize 释放池预约、本地清理释放预约）；
+    - ListParts 网络错误 → 本轮跳过该任务（fail-safe，下轮再判——绝不因
+      对端错误终止）；配置缺失 → 整体空转返回。
+
+    观测基线经 ``upload_observed`` 事件持久化（跨 sweep/重启一致）。
+    """
+    cos = cos_client if cos is None else cos
+    idle = int(cos_config.COS_UPLOADING_CLIENT_IDLE_SECONDS)
+    if idle <= 0:
+        return []  # 显式关闭（不推荐）：不做失活终止
+    jobs = ist.list_idle_uploading_jobs(idle)
+    if not jobs:
+        return []
+    cutoff = time.time() - idle
+    terminated = []
+    for job in jobs:
+        jid = job["job_id"]
+        key = job.get("object_key") or ""
+        upload_id = job.get("upload_id") or ""
+        if not key or not upload_id:
+            # 从未发起远端会话：无任何远端活性证据可查 → 直接终止。
+            if ist.terminate_client_idle_job(jid) is not None:
+                terminated.append(jid)
+                _log.info("失活终止（无远端会话，job=%s）", jid)
+            continue
+        try:
+            parts = cos.list_parts(key, upload_id)
+        except cos_client.CosConfigMissing:
+            _log.warning("COS 配置缺失，失活 sweep 空转（job=%s）", jid)
+            return terminated
+        except cos_client.CosClientError as exc:
+            # fail-safe：对端错误不是失活证据，下轮再判。
+            _log.warning("失活复核 ListParts 失败，本轮跳过（job=%s）：%s",
+                         jid, exc)
+            continue
+        if _parts_show_activity(parts, cutoff,
+                                ist.last_upload_observation(jid)):
+            ist.refresh_client_seen(jid)
+            ist.record_upload_observation(jid, len(parts))
+            _log.info("失活复核判定在场（job=%s parts=%d）——刷新在场时刻",
+                      jid, len(parts))
+            continue
+        if ist.terminate_client_idle_job(jid) is not None:
+            terminated.append(jid)
+            _log.info("失活终止（job=%s parts=%d idle>%ds）",
+                      jid, len(parts), idle)
+    return terminated
 
 
 # --------------------------------------------------------------------------- #
@@ -856,11 +988,13 @@ def _validating_critical_section(job, state, cleanup_due):
     directory = _ensure_upload_dir()
     entry = "data.%s" % ext
 
-    def _fail(code):
+    def _fail(code, detail=None):
         state.pop("download_token", None)
         try:
-            # 锁内只做终态短事务；文件清理延迟到锁外（防 flock 自等待）
-            ist._terminate_fail_tx(job_id, gen, code)
+            # 锁内只做终态短事务；文件清理延迟到锁外（防 flock 自等待）。
+            # detail：VALID_FAIL_DETAILS 白名单内的安全细节（0084），store
+            # 侧白名单外丢弃——绝不透出内部异常细节。
+            ist._terminate_fail_tx(job_id, gen, code, detail=detail)
             cleanup_due.append(job_id)
         except ist.StaleLease:
             pass
@@ -948,6 +1082,17 @@ def _validating_critical_section(job, state, cleanup_due):
                     opened.close()
                 except Exception:  # noqa: BLE001
                     pass
+            except slide_io.SlideValidationError as exc:
+                # upload-liveness：记录稳定机器码与底层异常类型（不含文件
+                # 内容/路径），并把白名单细节随终态落库（fail_detail）供
+                # 状态体透出——排障可见「为什么被拒」。
+                _fail("validation_failed", validation_fail_detail(exc))
+                _log.warning(
+                    "open_slide 校验失败（job=%s）：%s code=%s cause=%s",
+                    job_id, type(exc).__name__,
+                    getattr(exc, "code", "") or "",
+                    getattr(exc, "cause_type", "") or "")
+                return None
             except Exception as exc:  # noqa: BLE001
                 _fail("validation_failed")
                 _log.warning("open_slide 校验失败（job=%s）：%s", job_id,

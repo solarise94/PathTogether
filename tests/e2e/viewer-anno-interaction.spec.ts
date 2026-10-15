@@ -310,6 +310,46 @@ test.describe("viewer 标注交互（§5.4/§6，真实后端）", () => {
 		await expect(unsaved).toHaveCount(0);
 	});
 
+	test("⋯ 再点收起菜单；菜单删除后工具条消失（不残留可点的旧对象）", async ({ page }) => {
+		const SID = CREDS.rasterSlides.workbench.slide_id;
+		await initSession(page);
+		await login(page, CREDS.userLogin, CREDS.userPassword);
+		await wipeAnnotations(page, SID);
+		const created = await pageApi(page, "POST", "/api/annotation", {
+			slide_id: SID, type: "rect", x: 60, y: 50, w: 80, h: 60,
+			label: "e2e-delete", shared: true,
+		});
+		expect(created.status, JSON.stringify(created.j)).toBe(200);
+		await openSlideWithAnnos(page, SID);
+
+		const c = await markerCenter(page);
+		await page.mouse.click(c.x, c.y);
+		const toolbar = page.locator("#anno-obj-toolbar");
+		const more = toolbar.locator(".aot-more");
+		const menu = toolbar.locator(".aot-menu");
+		await expect(toolbar).toBeVisible();
+		await more.click();
+		await expect(menu).toBeVisible();
+		await more.click();
+		await expect(menu).toHaveCount(0);
+		await more.click();
+		await expect(menu).toBeVisible();
+
+		const [del] = await Promise.all([
+			page.waitForResponse((r) => r.request().method() === "DELETE"
+				&& r.url().includes("/api/annotation/")),
+			menu.locator(".aot-menu-item", { hasText: "删除" }).click(),
+		]);
+		expect(del.status()).toBe(200);
+		await expect(toolbar).toBeHidden();
+		await page.screenshot({ path: `${EVIDENCE_DIR}/e2e-after-delete.png` });
+		const after = await pageApi(page, "GET",
+			`/api/annotations?slide_id=${encodeURIComponent(SID)}`);
+		const live = ((after.j.annotations as Array<{ items: unknown[] }>) || [])
+			.flatMap((g) => g.items);
+		expect(live).toHaveLength(0);
+	});
+
 	test("选中后直接拖右下角缩放（§6.2 可直接拖控制点，无需先点编辑备注）", async ({ page }) => {
 		const SID = CREDS.rasterSlides.workbench.slide_id;
 		await initSession(page);

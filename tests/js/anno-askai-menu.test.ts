@@ -114,7 +114,14 @@ function fakeEl(id = ""): FakeEl {
       }
       return c;
     },
-    remove() {},
+    remove() {
+      const p = el.parentNode;
+      if (p) {
+        const i = (p.children as FakeEl[]).indexOf(el);
+        if (i >= 0) (p.children as FakeEl[]).splice(i, 1);
+      }
+      el.parentNode = null;
+    },
     querySelector: () => null,
     querySelectorAll: () => [],
     closest: () => null,
@@ -173,7 +180,7 @@ interface BootResult {
   fakeViewer: { viewport: unknown; open: (url: string) => void };
 }
 
-function bootApp(opts: { pluginLoaded?: boolean } = {}): BootResult {
+function bootApp(opts: { pluginLoaded?: boolean; aiPending?: boolean } = {}): BootResult {
   const pluginLoaded = opts.pluginLoaded !== false;
   const els: Record<string, FakeEl> = {};
   const created: FakeEl[] = [];
@@ -220,7 +227,8 @@ function bootApp(opts: { pluginLoaded?: boolean } = {}): BootResult {
         label: "病理医生", count: 1,
         items: [{ index: 0, token: "tok1", slide: SLIDE, slide_id: SLIDE_ID, type: "arrow",
                   x1: 100, y1: 100, x2: 300, y2: 200, ts: 1700000000,
-                  note: "核异型区域", annotation_id: "anno-7", revision: 2 }],
+                  note: "核异型区域", annotation_id: "anno-7", revision: 2,
+                  ...(opts.aiPending ? { source: "ai", review_status: "pending" } : {}) }],
       }] });
     }
     if (u.includes("/api/annotations")) return jsonResponse({ by_slide: {} });
@@ -356,7 +364,7 @@ afterEach(() => {
   delete (globalThis as { OpenSeadragon?: unknown }).OpenSeadragon;
 });
 
-async function bootOnSlide(opts: { pluginLoaded?: boolean } = {}) {
+async function bootOnSlide(opts: { pluginLoaded?: boolean; aiPending?: boolean } = {}) {
   const app = bootApp(opts);
   await settle();
   findSlideRow(app.created).dispatch("click");
@@ -403,13 +411,23 @@ describe("标记 ⋯ 菜单「✨ 让 AI 解读」", () => {
     expect(typeof p.frozen_at).toBe("number");
   });
 
-  it("AI 待复核与普通标注同一路径（菜单目标为真实标注 item，与 review 态无关）", async () => {
-    // harness 的标注无 review 标记：这里锁定 ⋯ 菜单对同一 item 恒出解读项
-    // （renderAnnoToolbar 的 AI 待复核分支不改变 ⋯ 菜单的 askai 逻辑）。
-    const app = await bootOnSlide();
+  it("AI 待复核标注（source=ai, review_status=pending）→ 解读项仍为首项，与驳回并存，点击正常 emit", async () => {
+    const app = await bootOnSlide({ aiPending: true });
     selectAnnoAt(app, 150, 130);
     const menu = openAnnoMenu(app);
-    expect((menu!.children as FakeEl[])[0]!.classList.contains("aot-askai")).toBe(true);
+    const items = menu!.children as FakeEl[];
+    expect(items[0]!.classList.contains("aot-askai")).toBe(true);
+    expect(items[0]!.disabled).toBe(false);
+    // 真实待复核态：⋯ 菜单出现驳回项（证明夹具确实进入了 AI 待复核分支）
+    expect(items.some((b) => b.textContent === "anno.review.reject")).toBe(true);
+    clickMenuItem(menu!, "aot-askai");
+    const evt = app.emitted.find((e) => e.type === "conversation.attachIntent");
+    expect(evt).toBeTruthy();
+    const p = evt!.payload as Record<string, unknown>;
+    expect(p.kind).toBe("marker");
+    expect(p.intent).toBe("interpret");
+    expect(p.annotation_id).toBe("anno-7");
+    expect(p.revision).toBe(2);
   });
 
   it("插件未加载（hpReady=false）→ 解读项禁用并给「插件未加载」说明；点击不 emit", async () => {
@@ -443,5 +461,44 @@ describe("标记 ⋯ 菜单「✨ 让 AI 解读」", () => {
     // composer 不再有「+」按钮（入口移到标记上）
     expect(shellSrc).not.toContain("ai-task-jump");
     expect(shellSrc).not.toContain("ai-plus-btn");
+  });
+});
+
+describe("标记工具条 ⋯ 开合与删除后收起", () => {
+  function liveMenus(app: BootResult) {
+    return app.created.filter((e) => e.classList.contains("aot-menu") && e.parentNode);
+  }
+
+  it("⋯ 再点一次关闭菜单；第三次重新打开", async () => {
+    const app = await bootOnSlide();
+    selectAnnoAt(app, 150, 130);
+    const btn = moreButton(app)!;
+    btn.dispatch("click", { stopPropagation() {} });
+    expect(liveMenus(app)).toHaveLength(1);
+    btn.dispatch("click", { stopPropagation() {} });
+    expect(liveMenus(app)).toHaveLength(0);
+    btn.dispatch("click", { stopPropagation() {} });
+    expect(liveMenus(app)).toHaveLength(1);
+  });
+
+  it("菜单内删除成功 → 工具条 hidden，菜单移除", async () => {
+    const app = await bootOnSlide({ aiPending: true });
+    selectAnnoAt(app, 150, 130);
+    // harness 无布局：选中后 updateAnnoToolbarPos 即置 hidden；此处只锁删除路径收起，
+    // 「hidden 真能隐藏」由下方样式表断言与真实浏览器验证覆盖。
+    const bar = app.created.filter((e) => e.id === "anno-obj-toolbar").pop()!;
+    const menu = openAnnoMenu(app)!;
+    const del = (menu.children as FakeEl[]).find((b) => b.textContent === "🗑 edit.del")!;
+    del.dispatch("click", { preventDefault() {}, stopPropagation() {} });
+    await settle();
+    expect(bar.hidden).toBe(true);
+    expect(liveMenus(app)).toHaveLength(0);
+  });
+
+  it("两份样式表的 display:flex 不压过 hidden 属性", () => {
+    for (const css of ["../../static/style.css", "../../static/share.css"]) {
+      const src = readFileSync(resolve(here, css), "utf8");
+      expect(src).toMatch(/#anno-obj-toolbar\[hidden\]\s*\{\s*display:\s*none;?\s*\}/);
+    }
   });
 });

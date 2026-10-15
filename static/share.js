@@ -2074,8 +2074,9 @@
     if (disabled) b.disabled = true;
     if (onClick && !disabled) b.addEventListener("click", function (ev) {
       ev.stopPropagation();
+      var menuWasOpen = !!annoToolbarMenuEl;
       closeAnnoToolbarMenu();
-      onClick();
+      onClick(menuWasOpen);
     });
     return b;
   }
@@ -2098,7 +2099,7 @@
           state.roiGeometryLocked ? t("anno.lock.unlock") : t("anno.lock.lock.tip"),
           function () { toggleDraftGeometryLocked(); }));
         el.appendChild(annoToolbarButton("aot-more", "⋯", t("anno.toolbar.more"),
-          function () { openAnnoToolbarMenu("draft"); }));
+          function (menuWasOpen) { if (!menuWasOpen) openAnnoToolbarMenu("draft"); }));
       } else {
         el.hidden = true;
       }
@@ -2113,7 +2114,7 @@
       el.appendChild(annoToolbarButton("aot-readonly", "🔒 " + t("anno.lock.readonly"),
         t("anno.lock.readonly.tip"), null, true));
       el.appendChild(annoToolbarButton("aot-more", "⋯", t("anno.toolbar.more"),
-        function () { openAnnoToolbarMenu(it); }));
+        function (menuWasOpen) { if (!menuWasOpen) openAnnoToolbarMenu(it); }));
       return;
     }
     el.appendChild(annoToolbarButton("aot-note", "✎ " + t("anno.toolbar.note"),
@@ -2129,7 +2130,7 @@
       locked ? t("anno.lock.unlock.tip") : t("anno.lock.lock.tip"),
       function () { toggleItemGeometryLocked(it, !locked); }));
     el.appendChild(annoToolbarButton("aot-more", "⋯", t("anno.toolbar.more"),
-      function () { openAnnoToolbarMenu(it); }));
+      function (menuWasOpen) { if (!menuWasOpen) openAnnoToolbarMenu(it); }));
   }
 
   // 临时框草稿位置锁（§6.3：draft.geometryLocked 只对当前草稿有效；

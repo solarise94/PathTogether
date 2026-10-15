@@ -8142,8 +8142,9 @@
     if (disabled) b.disabled = true;
     if (onClick && !disabled) b.addEventListener("click", function (ev) {
       ev.stopPropagation();
+      var menuWasOpen = !!annoToolbarMenuEl;
       closeAnnoToolbarMenu();
-      onClick();
+      onClick(menuWasOpen);
     });
     return b;
   }
@@ -8168,7 +8169,7 @@
         state.roiGeometryLocked ? t("anno.lock.unlock") : t("anno.lock.lock.tip"),
         function () { toggleDraftGeometryLocked(); }));
       el.appendChild(annoToolbarButton("aot-more", "⋯", t("anno.toolbar.more"),
-        function () { openAnnoToolbarMenu("draft"); }));
+        function (menuWasOpen) { if (!menuWasOpen) openAnnoToolbarMenu("draft"); }));
       return;
     }
 
@@ -8180,7 +8181,7 @@
       el.appendChild(annoToolbarButton("aot-readonly", "🔒 " + t("anno.lock.readonly"),
         t("anno.lock.readonly.tip"), null, true));
       el.appendChild(annoToolbarButton("aot-more", "⋯", t("anno.toolbar.more"),
-        function () { openAnnoToolbarMenu(it); }));
+        function (menuWasOpen) { if (!menuWasOpen) openAnnoToolbarMenu(it); }));
       return;
     }
     // AI 待复核：[接受] [编辑备注] [锁定位置] [⋯]
@@ -8200,7 +8201,7 @@
       locked ? t("anno.lock.unlock.tip") : t("anno.lock.lock.tip"),
       function () { toggleItemGeometryLocked(it, !locked); }));
     el.appendChild(annoToolbarButton("aot-more", "⋯", t("anno.toolbar.more"),
-      function () { openAnnoToolbarMenu(it); }));
+      function (menuWasOpen) { if (!menuWasOpen) openAnnoToolbarMenu(it); }));
   }
 
   function openAnnoToolbarMenu(target) {

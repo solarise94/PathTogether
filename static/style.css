@@ -5245,6 +5245,7 @@ body.app-mode-official { overflow: clip; }
   pointer-events: auto;
   user-select: none;
 }
+#anno-obj-toolbar[hidden] { display: none; }
 #anno-obj-toolbar .aot-btn {
   appearance: none;
   border: 0.5px solid rgba(0, 0, 0, 0.10);

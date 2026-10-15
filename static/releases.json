@@ -3,6 +3,33 @@
   "version_scheme": "YYYY.MM.DD product release. Do not use PathTogether package.json 0.1.0 (test package) as the product version.",
   "releases": [
     {
+      "version": "2026.10.15",
+      "date": "2026-10-15",
+      "published": true,
+      "components": {
+        "histopilot": "0.4.3",
+        "pathtogether": "suite-20261015"
+      },
+      "items": {
+        "zh": [
+          "标记的「⋯」菜单新增「让 AI 解读」：一键把该标记加入 AI 对话并预填问题，确认后再发送；对话框里原来的「+」已移除。",
+          "修复带标记或视野附件向 AI 提问时出现的「HTTP 500」错误；删除或取消选中标记后浮动工具条不再残留，「⋯」菜单再点一次即可收起。",
+          "切片格式转换工具支持 JPEG 2000 编码的 Aperio SVS，转换在浏览器内完成。",
+          "工作台上传默认进入当前文件夹；刷新页面会回到原来的文件夹和页码，上传中途刷新也不会丢失文件夹归属。",
+          "首页顶栏精简，语言切换移到顶栏；注册只保留一项可选的「共享数据以帮助开发者改进本系统」。",
+          "主域名统一为 histopilot.cn，histopilot.com 为国际访问线路。"
+        ],
+        "en": [
+          "Added “Ask AI about this” to the marker ⋯ menu: it attaches the marker to the AI conversation with a suggested question, sent only when you confirm. The old “+” button in the chat box was removed.",
+          "Fixed an “HTTP 500” error when asking the AI with a marker or view attached; the marker toolbar no longer lingers after a marker is deleted or deselected, and clicking ⋯ again closes its menu.",
+          "The slide converter now supports JPEG 2000–compressed Aperio SVS, converted entirely in your browser.",
+          "Workbench uploads go to the current folder by default; refreshing returns to the same folder and page, and refreshing mid-upload keeps the folder assignment.",
+          "Simplified homepage top bar with the language switch moved there; sign-up now has a single optional data-sharing choice.",
+          "histopilot.cn is now the primary domain, with histopilot.com as the international route."
+        ]
+      }
+    },
+    {
       "version": "2026.10.05",
       "date": "2026-10-05",
       "published": true,

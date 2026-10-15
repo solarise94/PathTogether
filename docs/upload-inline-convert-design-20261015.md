@@ -104,7 +104,7 @@
 
 | 文件 | 改动 |
 | --- | --- |
-| `static/app.js` | ① `uploadFile`（:10104）→ 交 `HP_INLINE_CONVERT.enqueue`；② `uploadFileClassified`（:10128）→ 判定表驱动（直传 / 转换 / 当场拒绝）；③ `offerBrowserConvert`（:10326）/`openConvertHandoff`（:10247）/`handoffBundleFolder`（:11123）保留但**仅在 `inline_convert.enabled=false` 时可达**（回滚路径，零删除）；④ 新增面板内行的渲染与按钮组——完整清单见 §6.3（转换进度 / 取消 / 继续转换 / 继续上传 / 重新选择文件 / **删除本地产物** / 申请支持）；⑤ 新增 runner 动态 import 与生命周期（`beforeunload`）；⑥ 新增刷新恢复：`listJobs()` 里带 `intent.channel==='workbench-inline'` 的未完成任务 → 行 + 「继续」；⑦ `HP_UPLOAD` 导出面补新入口（测试驱动）；⑧ `submitFormatRequest`（:11530）抽出可复用内核 `submitFormatRequestCore({ext,message,contact,sampleFile})` |
+| `static/app.js` | ① `uploadFile`（:10104）→ 交 `HP_INLINE_CONVERT.enqueue`；② `uploadFileClassified`（:10128）→ 判定表驱动（直传 / 转换 / 当场拒绝）；③ `offerBrowserConvert`（:10326）/`openConvertHandoff`（:10247）/`handoffBundleFolder`（:11123）保留但**仅在 `inline_convert.enabled=false` 时可达**（回滚路径，零删除）；④ 新增面板内行的渲染与**按钮组**——按钮全集以 **§6.3 为唯一权威**（含「删除本地产物」这一唯一的 OPFS 清理入口）；⑤ 新增 runner 动态 import 与生命周期（`beforeunload`）；⑥ 新增刷新恢复：`listJobs()` 里带 `intent.channel==='workbench-inline'` 的未完成任务 → 行 + 「继续」；⑦ `HP_UPLOAD` 导出面补新入口（测试驱动）；⑧ `submitFormatRequest`（:11530）抽出可复用内核 `submitFormatRequestCore({ext,message,contact,sampleFile})`；⑨ `importDroppedDirectory`（:11109）的 bundle 成员正则补 `.vms`（`.mrxs|dat|vms`，**不加 `.vmu`**——理由见 §4.1.1 note）；⑩ `handleWorkbenchDrop`（:11041）的散文件路径把 `cls.bundle===true` 交给新的「需完整包」分支（§4.1.1）而不是 `uploadFile` |
 | `templates/index.html` | 在 `cos-uploader.js` / `slide-sniff.js` 之后、`app.js` 之前加载 `/static/upload/inline-convert.js?v=20261015` |
 | `static/i18n.js` | 新增上传面板内转换文案（zh/en 同步）；**改写**两条指向 `/tools/slides` 的旧文案（`upload.cos.err.convert_in_browser` @:1025/2686、`upload.err.unsupported` @:1026/2687）——见 §7 |
 | `static/app.js` 的 `_EXTRA_I18N`（:30 起） | 同步兜底键（`cos-upload.test.ts:964` 那条断言会检查 `_EXTRA_I18N` 与 stage 映射同步） |
@@ -130,10 +130,11 @@
   `outputFileName`（产物命名）、`getProfile` / `defaultProfileId`（资源档位）、
   `errCode` / `errText`（类型化错误）、`checkDiskBudget` 的 `uncertain` 语义。
 - 上传控制器语义照搬 `tools-slides-upload.js:667 runLocked` 的**四道门禁**与
-  `opfsStorage`（:330）的 `setJobUpload` 适配器写法；面板不 import 该模块
-  （它是 ES module + 工具页 DOM），而是把同一套判定抽进
+  `opfsStorage`（:330）的 `setJobUpload` 适配器写法；**生产代码不 import 该模块**
+  （它是 ES module + 工具页 DOM 依赖），而是把同一套判定抽进
   `inline-convert.js` 的纯函数。**门禁的作用域按条目类型不同（评审 R2 修正）**，
-  见 §5.1；等价性由 §9.2 第 12 项的对照测试锁定。
+  见 §5.1；判定等价性由 §9.2 第 12 项在**测试里** import 该模块做对照（生产与
+  测试的加载面不同，这不是矛盾）。对照的**可测边界**见 §9.2 第 12 项。
 
 ## 3. 队列状态机
 
@@ -185,6 +186,8 @@ upload_queued ──(上传槽 = pt:upload-slot:<acct>)──► uploading ─�
 - `done` / `rejected` / `convert_failed` / `upload_failed` / `cancelled` 为终态；
   **终态行的按钮表在 §6.3**（含「删除本地产物」，本设计必须提供的 OPFS 清理
   入口——否则源副本与产物永久残留）。
+- `need_disk_confirm` 是**非终态**且**源副本已在 OPFS**：`beforeunload` 提醒
+  必须覆盖它（§6.2 第 7 点，评审 J3）。
 - 「1 个转换 + 1 个上传并行」：`converting` 与 `uploading` 各至多 1 个 entry
   （§5）。其余条目停在 `convert_queued` / `upload_queued`，行上显示排队位置。
 
@@ -253,22 +256,43 @@ bundle:true}`、`a.mrxs` / `x/a.dat` 同形）。同时原设计§2.2③ 又把�
 
 修正后的 bundle 判定与动作（**开关开、关两种形态都有定义**）：
 
+先修一处**既有**的文件夹分流缺口（本轮评审 J2）：`importDroppedDirectory`
+（`app.js:11109-11111`）判 bundle 用的正则是 `/\.(mrxs|dat)$/i`，**不含 `.vms`**——
+所以「纯 VMS 文件夹」（`.vms` 入口 + 同目录 tile JPEG，无 `.mrxs/.dat`）会落到
+`rows.forEach(uploadFile)`，逐成员进上传队列。而工具页的同一判定是
+`tools-slides-bundle.js:16` 的 `looksLikeBundleMember` =
+`/\.(mrxs|dat|vms|vmu)$/i`（`bundleRoute` 见 `:26-31`）。本设计要求把 `app.js`
+的成员正则**对齐到 `.mrxs|dat|vms`**（单一判定，别再维护第二份窄正则）。
+
+> **刻意不对齐 `.vmu`**（与 `looksLikeBundleMember` 的表面差异）：`.vmu` 今天在
+> **直传受理集**里 —— 实测 `_cos_upload_capability_payload(False)` 的
+> `"vmu" in direct_upload.formats` = **True**、`"vmu" in
+> browser_convert.formats` = **False**、`slide_format_registry.lookup('a.vmu')
+> ["capability"] = 'native-single-file'`（命令见 §10.13）。若把 `.vmu` 也划入
+> 文件夹 bundle 分支，**含 `.vmu` 的文件夹会从「可用」变成「planner 专门拒绝」**
+> （`planBundle` 首分支即抛 `unsupported_input`，`engine.js:1358-1362`）——
+> 那是收紧既有能力，本设计不做。`tools-slides-bundle.js` 送 `.vmu` 进 planner 是
+> **工具页**的语义选择，面板不复制。将来若要两处统一，必须同时改注册表与
+> capability 词表，属独立变更。
+
 | 输入形态 | 判定 | 动作 |
 | --- | --- | --- |
-| 拖入/选择**文件夹**（`webkitGetAsEntry` 目录遍历，`app.js:11066`）含 `.mrxs`/`.dat`/`.vms` 成员 | 成员行 `[{name, relPath, file}]` → `runner.prepareBundle` 内部的 `engine.planBundle`（`engine.js:1353`）判定（`sniffMrxBundle` `:1096` / `sniffVmsBundle` `:1257`） | **整包转换**（`stage-bundle`，`progress.unit==='stage-bundle'`）。开关开：进面板队列；开关关：仍走 `handoffBundleFolder` 交接 |
-| `webkitdirectory` 选择文件夹（`#import-folder-input`，`app.js:12992` 附近） | 同上 | 同上 |
-| **散文件**（单文件拖入/选择）`.mrxs` / `.dat` | `classifyFile` 给 `bundle:true`，但**手上没有伴随成员** | 行内**类型化说明**：「MRXS 需要完整包（`.mrxs` + 同名目录 + `Slidedat.ini`）；请选择或拖入整个文件夹」（文案取 `sniffMrxBundle` 的 `missing` 列表，`engine.js:1143-1146`），**不上传、不建任务** |
-| **散文件** `.vms` | 同上（VMS 需入口 + 同目录 tile JPEG 的完整文件夹） | 同上（`sniffVmsBundle` 的 `missing`，`engine.js:1275-1277`） |
-| `.vmu` | `classifyFile` 给 `cls:'temporary'`（**不是** `bundle`），`directClass:'legacy-direct'` | 照 §4.2 直传（VMU 是暂时直传，不是 bundle 转换输入） |
+| 拖入/选择**文件夹**（`webkitGetAsEntry` 目录遍历，`app.js:11066`；`webkitdirectory` 选择同路径）含 `.mrxs`/`.dat`/`.vms` 成员 | 成员行 `[{name, relPath, file}]` **原样交给** `runner.prepareBundle`，由 `engine.planBundle`（`engine.js:1353`）判定：`sniffMrxBundle`（`:1096`）/ `sniffVmsBundle`（`:1257`） | **整包转换**（`stage-bundle`，`progress.unit==='stage-bundle'`）。"缺哪个成员"的类型化信息（`unsupported_input` + `missing`）**由 planner 产出**——面板不预判（见下）。开关开：进面板队列；开关关：仍走 `handoffBundleFolder` 交接 |
+| **散文件**（单文件拖入/选择）`.mrxs` / `.dat` | `classifyFile` 给 `bundle:true`，但**手上没有伴随成员**，且浏览器不允许读取同目录其他文件 | 行内**类型化说明**：「该格式需要完整包（主文件 + 同名目录及其全部数据文件）；请用『选择文件夹』或拖入整个文件夹」。**面板不列出具体缺哪个成员**——那要跑 `planBundle`，而它需要 `File[]`（跨目录取文件），与 §6.1「不新增本地句柄」的隐私口径相悖。文案列举「需要什么」用**静态**文案（`sniffMrxBundle` 的必需成员名规则：`{stem}.mrxs` + `{stem}/Slidedat.ini` + `{stem}/<INDEXFILE>` + 每个 `FILE_i`，`engine.js:1178` + `:1181-1188`），**不**预取实际文件列表 |
+| **散文件** `.vms` | 同上（VMS 需入口 + 同目录全部 tile JPEG；tile 名只在 `.vms` 的 INI 里，见 `parseVmsMembers` 的 `ImageFile(c,r)`，`engine.js:1234-1246`） | 同上（静态文案：「`.vms` 入口 + 同目录全部 tile JPEG」）。注意 `sniffVmsBundle` 本身只对「缺 `.vms` 主入口 / 多个入口」给 `bad`，**不报缺 tile**（实测代码 `:1269-1280`）；真正逐 tile 核对的是 `planVmsBundle`（`engine.js:1340-1345` 的 `missing`）——这正是「判定归 planner」的理由 |
+| `.vmu`（单文件或文件夹成员） | `classifyFile` 给 `cls:'temporary'` + `directClass:'legacy-direct'`（**不是** bundle） | 照 §4.2 **直传**（VMU 是暂时直传的 native 单文件，今天就能上传）；面板**不**因它进 planner 而收紧（理由见上方 note） |
 
-**散文件的实现要点**：`uploadFile`（单文件路径）拿到 `cls.bundle===true` 时
-**不再走 `handoffBundleFolder`**（那需要 `rows`），而是**先尝试把该文件所在的
-文件夹补齐**——但浏览器不给「读取同目录其他文件」的能力（`File` 无目录句柄），
-所以**唯一可行**的处置就是上面那条行内说明 + 一个「选择文件夹」按钮
-（复用 `#import-folder-input` 的 click，`app.js:12995-12998`）。这是设计对
-R6 的诚实答复：**散落的 `.mrxs` 无法在面板内转换**，因为不可能在缺乏伴随
-目录的情况下完成 MRXS 转换；工具页今天的行为也是「类型化拒绝」（`planBundle`
-在复制前抛 `unsupported_input` + `missing` 列表）。
+**判定职责的唯一归属（评审 J2 的实质要求）**：「是不是一个完整包 / 缺哪个成员」
+**只由运行器的 planner 判**（`prepareBundle` → `planBundle` → `sniffMrxBundle` /
+`sniffVmsBundle` / `planVmsBundle`）。面板侧只做两件事：把文件夹的成员行原样
+转交；在**拿不到文件夹**（散文件）时给静态说明 + 「选择文件夹」按钮
+（复用 `#import-folder-input` 的 click，`app.js:12995-12998`）。面板**不得**自己
+读目录、不得自己维护必需的 tile/成员清单——否则就是第二份判定，会与 planner 漂移
+（今天 `app.js:11109` 的窄正则就是这个漂移的实例）。
+
+**散文件的诚实结论**：**散落的 `.mrxs`/`.vms` 无法在面板内转换**——不可能在缺少
+伴随文件的情况下完成转换。工具页今天的行为也是「类型化拒绝」（`planBundle` 在
+复制前抛 `unsupported_input` + `missing`）。
 
 **bundle 条目的声明**：转换产物同样是 `.tif`/`.ome.tif`，声明按 §4.3 从产物
 字节嗅探（MRXS 明场 → `bf-*` → `ome-tiff` 或 `converter-bigtiff`；VMS 同）。
@@ -541,8 +565,21 @@ POST `/api/ingestions`（`cos-uploader.js:1033`）。转换期间（含刷新、
    **「重新开始转换（需重新选择文件）」**，**绝不静默改设置续跑**（理由见 §6.3）。
 6. `job_dir_missing`（目录被浏览器驱逐，`engine.js:19`）→ 行内说明 +
    「重新选择文件」（与第 5 点同一处置：**丢弃 + 重选**）。
-7. `beforeunload`：只要有 entry 处于 `converting` 或 `uploading`，注册
-   `preventDefault()` 提醒（照 `tools-slides.js:1772` 的写法）。
+7. `beforeunload`：只要有 entry 处于**「产物或源副本只存在于 OPFS 且尚未收口」**
+   的状态，注册 `preventDefault()` 提醒（照 `tools-slides.js:1772` 的写法）。
+   集合（**按语义判定，不按状态名枚举**）：`converting`、**`need_disk_confirm`**、
+   `convert_queued`（若其实已有 OPFS 任务/产物）、`upload_queued`、`uploading`、
+   `requeue_convert`。写成语义判据而不是枚举状态名，正是为了避免再犯评审 J3
+   的错（按状态名枚举漏掉了 `need_disk_confirm`）。
+
+   > 为什么 `need_disk_confirm` 必须在内（评审 J3 成立）：它既不属于
+   > `converting` 也不属于 `uploading`，按原设计的状态名枚举不会注册提醒；
+   > 而它恰是**唯一**「用户正在等一个需要他确认的弹层」的状态——此刻源副本
+   > **已经写进 OPFS 且是唯一一份**（`_prepare` 先把任务记录写成 `staging`
+   > `runner.js:734`，复制完成后才写 `prepared` `:772`，随后 probe 与
+   > `_diskGate` 抛 `disk_precheck_failed`）。这份副本无法重建：`_prepare`
+   > 的重试路径在 `file` 为 null 时抛 `io_recoverable: 缺少输入文件`
+   > （`runner.js:867`），刷新后也没有 File 句柄（§6.1）。离开页面即丢掉它。
 
 ### 6.3 终态 / 恢复态按钮表与清理（评审 R4 + R5 修正）
 
@@ -742,6 +779,7 @@ ingestion** 还是**重新创建**。修正：
 | `tests/js/r1-convert-upload.test.ts`（48 项，工具页 + 工作台入口） | 工具页侧全部不受影响；工作台入口侧（:293 `href === '/tools/slides'`）仅在开关关闭时成立 | 给工作台入口用例注入 enabled=false；保留 i18n 静态扫描（:333-370）并扩展到新键 |
 | `tests/js/cos-upload-liveness.test.ts` | 魔数 fail-fast（PNG 改名 .jpg）在面板内**同样**生效且零网络——语义不变 | 无需改；新增面板内该路径的行文案断言 |
 | `tests/js/raster-image-compat.test.ts` | 只测 `acceptFromCatalog` / fallback 目录；不涉上传分流 | 不影响 |
+| `tests/js/tools-u2-page.test.ts`（`bundleRoute` / `looksLikeBundleMember` 的用例） | §4.1.1 要求把 `app.js` 的成员正则对齐到 `.mrxs|dat|vms`（**刻意不含 `.vmu`**）——只改 `app.js` 的**调用侧**，`tools-slides-bundle.js` 里的纯函数与其既有断言不变 | 不受影响；新增一条源码级断言：`app.js` 的成员正则**覆盖** `.mrxs|dat|vms`（刻意**不含** `.vmu`，与 `looksLikeBundleMember` 的表面差异已说明理由），防再次漂移 |
 | `tests/browser/slide_tools_r1/run_e2e.js` i/i2/i3/i4/l2/l3 | i 系列依赖**工作台弹窗交接**（`context.waitForEvent('page')`） | 「工作台入口」场景需在开关关闭下跑（或重写为面板内）；工具页场景不受影响。这不是 pytest/vitest，按 §9.4（Playwright 侧）处理 |
 | `tests/browser/slide_tools_c4/run_workbench.js` | 原生 `.tif` 直传、请求序列逐条比对 | **已实测失效（非本设计引入）**：该脚本的 64 B `wb-regression.tif`（字节 `0..63`，`run_workbench.js:51-55`）经 `f8f130c2` 的 fail-fast 魔数闸判为 `{ext:'.tif', expected:'tiff', detected:'unknown'}`；在真实 app.js + 真实引擎上实测：**零 `/api/ingestions`、零 COS 请求，行停在「上传失败」**（命令与输出见 §10.7）。`dca42ac2` 只修了 `slide_tools_c4/run_e2e.js` 的夹具，未动本脚本 | 换真 TIFF 头夹具（属既有测试维护）；本设计的面板路径同样受该闸约束，故 §9.4 的新 spec 一律用真 TIFF/BigTIFF 头 |
 | `tests/test_ingestion_api.py:483` / `test_r1_conversion_gate.py:77` | 断言 `_cos_upload_capability_payload` 的字段/词表 | 只新增键，现有断言（含 `browser_convert` 集合 `:93`、`direct_upload` 集合 `:98`）不变；**无**测试断言精确键集合（已核） |
@@ -750,6 +788,16 @@ ingestion** 还是**重新创建**。修正：
 | `tests/e2e/*`（现有 15 个 spec） | 都不断言工作台上传行为；`e2e_server.py` 不配置 COS（capability off） | 不受影响；新增 spec 需要 COS 配置，见 §9.4 |
 
 ### 9.2 vitest（新增 `tests/js/inline-convert.test.ts`）
+
+**两种加载面，同一文件但分开描述**（评审 J4）：`app.js` 与 `inline-convert.js`
+是 classic script，用 `new Function('window','document',…)` 加载（形态照
+`workbench-direct-class.test.ts:100-152`）；第 12 项的对照对象
+`tools-slides-upload.js` 是 **ES module**，只能用顶层 `import`（照
+`tools-upload-limit.test.ts:19`、`tools-upload-feedback.test.ts:23` 的既有写法）——
+vitest 单文件内两者**可以并存**（`import` 提升到模块顶，`new Function` 在
+用例里执行），本设计明确要求这样拆，不许把 `tools-slides-upload.js` 塞进
+`new Function`（它 `import * as E from './slide-transform/engine.js'`，见该文件
+头部，且依赖工具页 DOM 与注入的 `t`/`runner`）。
 
 形态照 `workbench-direct-class.test.ts`：`new Function` 加载 `cos-uploader.js`
 + `slide-sniff.js` + `inline-convert.js` + `app.js`，注入假 fetch / 假
@@ -794,13 +842,33 @@ ingestion** 还是**重新创建**。修正：
     → 只显示按钮、**零请求**；点击后才建新任务。
 11. **终态清理**（§6.3）：终态行有「删除本地产物」→ 调用 `discardJob`；
     `upload_active` + `lockHeld:false` → 二次确认后 `abandonUpload:true`。
-12. **门禁等价性对照**（§2.3 承诺）：对同一组夹具，
-    `inline-convert.js` 导出的纯判定函数与 `tools-slides-upload.js:667
-    runLocked` 的判定序列（能力 → 账号 → 大小 → 格式）在每条输入上给出相同
-    结论 —— 直接 `import { createUploadController } from
-    '../../static/tools/tools-slides-upload.js'` 用同一组假 runner/cap 驱动，
-    与面板的 `decide()` 逐例比对（评审 R8b：原设计只承诺「§9 的对照测试」
-    但清单里没有它，现补为第 12 项）。
+12. **门禁等价性对照**（§2.3 承诺；评审 R8b + 本轮 J4 修正）：**对照面不是
+    `runLocked` 全序列**——它含人工交互分支（`chooseAccountAction` 的
+    dialog、`signOutForOriginal` 的登录跳转、`:553/:580`）与孤儿结算
+    （`settleOrphan`、`:494`），无法逐例自动比对（本轮评审成立）。改为对照两点
+    可自动化的观察面：
+
+    - **观察面 A（判定结论）**：真 `import { createUploadController } from
+      '../../static/tools/tools-slides-upload.js'`（既有先例：
+      `tools-upload-limit.test.ts:19`、`tools-upload-feedback.test.ts:23` 已这样
+      import 并驱动它），用同一组假 `runner`/假 capability/假 `job` 记录注入
+      `createUploadController({runner, t, …})`，对每条输入同时读
+      **`ctl.isDisabled(jobId)`**（`:1137-1141` 的返回面；既有测试正是这样断言
+      `tools-upload-limit.test.ts:169`、`tools-upload-feedback.test.ts:270`）与
+      面板 `decide()` 的结论（allow/deny + 原因键），断言**等价**。覆盖输入：
+      产物 > `max_size_bytes`（→ 双方 refuse，`tools.upload.too.large`）、
+      `result.format ∉ viewable_formats`（→ 双方 refuse，
+      `tools.upload.format.unsupported`）、产物格式可查看且大小合规（→ 双方
+      allow）；
+    - **观察面 B（副作用）**：同一组输入下断言双方**都没有**
+      `POST /api/ingestions`（refuse 路径）；allow 路径的对照只在面板侧断言
+      `createUpload` 被调用且 `createBody` 形状符合 §4.3（工具页侧的
+      ingestion 创建已由既有 `tools-upload-*` 测试覆盖，不重复）。
+
+    **明确不做**：账号 mismatch / 孤儿 / 已发布重放（`runLocked` ⓪①b④ 的分支）
+    不纳入本对照——它们是工具页特有的交互语义，面板按 §7 自己的处置走；
+    两侧在这些分支上**允许**不同。这条边界写进测试注释，避免后来者误解
+    「等价」的范围。
 13. 申请支持：按钮 → `POST /api/format-requests`，body 含预填 `format_ext` 与
     带机器码的 `message`；202 显示编号；429 → 今日上限文案；413 → 样本超限。
 14. i18n：新键 zh/en 成对存在（静态扫描 `i18n.js`），`_EXTRA_I18N` 同步；
@@ -810,9 +878,18 @@ ingestion** 还是**重新创建**。修正：
     断言 `window.open` 收到 `/tools/slides`（与 `r1-convert-upload.test.ts`
     现有断言同形）。
 16. bundle：`classifyFile` 给 `bundle:true` 的**散文件**（单 `.mrxs` / 单
-    `.vms`）→ 类型化说明 + 「选择文件夹」按钮，**零 fetch / 零转换**；
-    文件夹形态 → `prepareBundle` 被调用、`progress.unit==='stage-bundle'`
-    映射到行文案（§4.1.1）。
+    `.vms`）→ 类型化说明 + 「选择文件夹」按钮，**零 fetch / 零转换**
+    （且说明文本是**静态**的、不依赖读目录）；文件夹形态 → `prepareBundle`
+    被调用、`progress.unit==='stage-bundle'` 映射到行文案（§4.1.1）。
+    另断言：**含 `.vmu` 的文件夹仍走逐成员直传**（不被划进 bundle 分支，
+    保护今天可用的 VMU 直传）。
+17. `beforeunload`（§6.2 第 7 点）：对 `converting` / **`need_disk_confirm`** /
+    `upload_queued` / `uploading` / `requeue_convert` 五个状态逐一断言注册了
+    提醒；对 `done` / `rejected` 等终态断言**未**注册（评审 J3 —— 防按状态名
+    枚举再漏项）。
+18. `need_disk_confirm`（§7.3）：`disk_precheck_failed` + `uncertain:true` →
+    行内确认按钮；确认后以 `confirmUncertainDisk:true` 重试同一
+    `probe`/`prepareBundle`（断言调用参数，不重建任务）。
 
 ### 9.3 pytest（新增 `tests/test_upload_inline_convert_capability.py`）
 
@@ -914,8 +991,12 @@ export TEST_RUN_DIR=/mnt/ssd2/tests/run-inline-convert-Mwpad1 \
      r1-convert-upload,slide-sniff}.test.ts` → **5 files / 112 passed, 2 skipped**。
    - **评审后复跑**（本文件修改后、未改仓库代码）：
      `python3 -m pytest tests/test_upload_direct_class.py tests/test_r1_conversion_gate.py
-     -q -p no:cacheprovider --basetemp=$TEST_RUN_DIR/pytest-recheck` →
-     **39 passed in 14.97s**。
+     -q -p no:cacheprovider --basetemp=$TEST_RUN_DIR/pytest-r3` →
+     **39 passed in 14.98s**；
+     `npx vitest run tests/js/{workbench-direct-class,cos-upload,cos-upload-liveness,
+     r1-convert-upload,slide-sniff,tools-u2-page,tools-upload-limit,tools-upload-feedback}.test.ts`
+     → **8 files / 179 passed, 2 skipped**（后三个文件即 §9.2 第 12 项对照测试的
+     既有先例与 `bundleRoute` 纯函数用例）。
 6. `CosConfig` 签名含 `Endpoint` / `VerifySSL`（假 COS 的可行性依据）。
 7. **`run_workbench.js` 的 64 B 假 `.tif` 在真实工作台里被 fail-fast 拒**（既有
    回归，非本设计引入）：照 `tests/browser/slide_tools_c4/server.py` 的假 COS env
@@ -993,6 +1074,31 @@ export TEST_RUN_DIR=/mnt/ssd2/tests/run-inline-convert-Mwpad1 \
     `open_slide` 终审）；只有 `tools-slides-direct-upload.js:401` 的直传路径发
     `createBody: { direct_class: directClass }`。这解释了为什么既有工具页转换
     上传不受 R1 影响，而面板一旦「主动声明」就会踩到。
+13. **VMU 今天的受理状态（§4.1.1 的 `.vmu` 决策依据）**：`python3` +
+    `app._cos_upload_capability_payload(False)` 与
+    `slide_format_registry.lookup` 实测 ——
+
+    ```
+    vmu 在 direct_upload 受理集: True
+    vmu 在 browser_convert 集:   False
+    vmu 注册表 capability:       native-single-file
+    ```
+
+    即 VMU 是「今天就能直传的 native 单文件」，不是转换输入。把 `.vmu` 划进
+    文件夹 bundle 分支会把含 `.vmu` 的文件夹变成 planner 的 `unsupported_input`
+    拒绝（`engine.js:1358-1362`）——那是收紧能力，故 §4.1.1 明确不对齐 `.vmu`。
+14. **本轮四条评审的复核动作**：J1 用 `grep -c 删除本地产物` 分别对
+    工作树 / `d2b56235` / `897c7830` 的第 107 行计数（结果 1 / 1 / 0）；
+    J2 读 `app.js:11109-11111` 的正则与 `tools-slides-bundle.js:16`、
+    `engine.js:1269-1280`（`sniffVmsBundle` 不给 tile 级 `missing`）与
+    `engine.js:1340-1345`（`planVmsBundle` 才给）；J3 读
+    `runner.js:734/772/867` 与 §6.2 第 7 点的原文；J4 读
+    `tools-slides-upload.js:1137-1141`（返回面）、`:553/:580`（交互分支）与
+    `tools-upload-limit.test.ts:19/169`、`tools-upload-feedback.test.ts:23/270`
+    （既有 import 与 `isDisabled` 断言先例），并**实跑**
+    `npx vitest run tests/js/tools-upload-limit.test.ts
+    tests/js/tools-upload-feedback.test.ts` → **16 passed**（证明该模块可在
+    vitest 里被 import 驱动）。
 
 ## 11. 风险
 
@@ -1011,7 +1117,11 @@ export TEST_RUN_DIR=/mnt/ssd2/tests/run-inline-convert-Mwpad1 \
 | R11（本轮评审新增） | **产物声明错配会静默打穿主链路**：`ome-tiff` 产物 + `converter-bigtiff` 声明 → worker `convert_in_browser`，且只在 worker 阶段才暴露（创建闸不看内容） | 「转换后上传」全链路失败（工具页因不发声明而从未暴露此坑） | §4.3 的**产物嗅探**算法 + §9.2 第 6 项的反向断言 + §9.4 用例 A 的创建体断言，三道锁 |
 | R12（本轮评审新增） | **门禁过严把直传杀光**：把 `viewable_formats` 套到直传条目 | 所有直传格式不可上传（与 §4.2 矛盾） | §5.1 的作用域表 + §9.2 第 5 项两条断言（转换产物受限、直传不受限） |
 | R13（本轮评审新增） | **面板与工具页双标签互相破坏**：面板不持 `uploadLockName` 时，工具页可删掉正在上传的唯一本地产物 | 产物不可恢复 | §5 的「上传阶段持两把锁」（`pt:upload-slot:<acct>` + `engine.uploadLockName(jobId)`） |
-| R14（本轮评审新增） | **散落 bundle 无归宿**（单 `.mrxs`/`.vms`） | 开关默认开时用户拖入后无定义行为 | §4.1.1 的类型化说明 + 「选择文件夹」按钮 |
+| R14（上轮评审新增） | **散落 bundle 无归宿**（单 `.mrxs`/`.vms`） | 开关默认开时用户拖入后无定义行为 | §4.1.1 的类型化说明 + 「选择文件夹」按钮 |
+| R15（本轮评审新增） | **纯 VMS 文件夹被逐成员上传**：`app.js:11109` 的成员正则不含 `.vms`（既有缺口） | `.vms` 入口被当普通文件上传 → 服务端按内容拒，且丢掉整包转换机会；用户看到逐文件失败而不是「选文件夹」 | §4.1.1：`app.js` 成员正则补 `.vms`（**不加 `.vmu`**——那会把今天可用的 VMU 文件夹变成 planner 拒绝）+ §9.1 的源码级防漂移断言 |
+| R16（本轮评审新增） | **`need_disk_confirm` 不在 beforeunload 覆盖内**：该状态源副本已在 OPFS 且不可重建 | 用户在这唯一需要他确认的状态下刷新/关闭 → 丢掉唯一副本（大文件重来） | §6.2 第 7 点改为按语义判据（「产物或源副本只在 OPFS 且未收口」）并显式点名 `need_disk_confirm`；§3.2 补注 |
+| R17（本轮评审新增） | **对照测试范围被高估**：`runLocked` 含交互分支，无法逐例比对 | 测试写不出来，或写成假的「等价」断言 | §9.2 第 12 项把对照面限定为 `isDisabled` 结论 + 零创建副作用，并明确列出**不纳入**的分支 |
+| R18（本轮评审新增） | **按钮清单在 §2.2 与 §6.3 两处维护会漂移** | 实施者只读改动清单会漏掉唯一的 OPFS 清理入口（本轮 J1 的实例） | §2.2④ 改为「以 §6.3 为唯一权威」的指针，不再复制清单 |
 
 ## 12. 实施顺序建议
 
@@ -1028,7 +1138,7 @@ export TEST_RUN_DIR=/mnt/ssd2/tests/run-inline-convert-Mwpad1 \
 7. e2e 基建（假 COS + project + spec）。
 8. 旧测试按 §9.1 调整。
 
-## 13. 本轮评审处置一览
+## 13. 评审处置一览
 
 | 评审项 | 严重度 | 处置 |
 | --- | --- | --- |
@@ -1042,4 +1152,18 @@ export TEST_RUN_DIR=/mnt/ssd2/tests/run-inline-convert-Mwpad1 \
 | 8a 「零 runner 调用」表述矛盾 | low | **接受**——§9.2 第 9 项与 §9.4 用例 C 的断言口径改为「零 `/api/` + 零 probe/startJob/resumeJob/createUpload」，并注明 `_init()` 的 OPFS cleanup/sweep 与 worker 启动不算「开始」 |
 | 8b 「对照测试」悬空承诺 | low | **接受**——§9.2 新增第 12 项（真 import `tools-slides-upload.js` 的 `runLocked` 判定序列与面板 `decide()` 逐例比对） |
 
+### 13.1 第一轮九条（R1–R8b）
+
 无不同意项；九条全部按评审意见修正（8b 是「补上缺失的测试项」，不是改结论）。
+
+### 13.2 第二轮四条（J1–J4）
+
+| 评审项 | 严重度 | 处置 |
+| --- | --- | --- |
+| J1 §2.2④ 按钮清单漏「删除本地产物」，与 §3.2/§6.3 不一致 | medium | **接受**——§2.2④ 改为「按钮全集以 §6.3 为唯一权威（含「删除本地产物」）」的**指针**，不再复制清单（避免两处维护漂移，新增 R18）；**并说明一处与评审描述的差异**：评审称第 107 行「不含『删除本地产物』」，实测在**当前工作树与 HEAD（`d2b56235`）**该行**已含**该项（`grep -c 删除本地产物` = 1）——缺项存在于**上一切（`897c7830`）**，即上轮评审读的是旧版。因此本条的**实质要求在上一轮已被满足**，本轮只做「单一权威指针」的加固，不留双份清单 |
+| J2 §4.1.1 文件夹分流 vs 散文件判定职责不清（纯 VMS 目录被逐成员上传；.vms 缺成员只有 planner 知道） | low | **接受**——§4.1.1 重写：明确「完整包/缺成员的判定**只归 planner**」（`prepareBundle`→`planBundle`→`sniffMrxBundle`/`sniffVmsBundle`/`planVmsBundle`；`sniffVmsBundle` 实测**不报缺 tile**，逐 tile 核对在 `planVmsBundle:1340-1345`）；面板侧散文件只给**静态**说明（不预取实际缺成员，因那要 `File[]`，与 §6.1 隐私口径冲突）；同时**修既有缺口**：`app.js:11109` 的成员正则补 `.vms`（**不加 `.vmu`**，避免把今天可直传的 VMU 文件夹变成 planner 拒绝——实测 VMU 在 `direct_upload` 受理集内），并加源码级防漂移断言（新增 R15） |
+| J3 `need_disk_confirm` 不在 beforeunload 覆盖内 | low | **接受**——§6.2 第 7 点改为**按语义判据**（「产物或源副本只在 OPFS 且未收口」）并显式列出 `need_disk_confirm`；补理由链（`runner.js:734` 写 `staging` → `:772` 写 `prepared` → `:867` 无 File 即 `io_recoverable: 缺少输入文件`）+ §3.2 补注（新增 R16） |
+| J4 §9.2 第 12 项「`new Function` 加载 app.js + `import` ES module」形态未说明拆分，且 `runLocked` 含交互分支无法逐例比对 | low | **接受**——§9.2 前言新增「两种加载面」段落（`app.js`/`inline-convert.js` 走 `new Function`；`tools-slides-upload.js` 走顶层 `import`，vitest 单文件内可并存，禁止把 ES module 塞进 `new Function`）；第 12 项改为**限定对照面**：用真 `createUploadController` 注入假依赖，只比对 `ctl.isDisabled(jobId)` 的判定结论与「零创建」副作用（可自动化、且既有 `tools-upload-*` 测试正是这样驱动它），并明确列出**不纳入**的分支（账号 mismatch / 孤儿 / 已发布重放）（新增 R17） |
+
+无不同意项；J1 的实质内容在上一轮已满足（评审读的是旧修订版），本轮按评审意图
+改为单一权威指针；J2–J4 为实质修正。

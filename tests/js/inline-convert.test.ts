@@ -276,6 +276,9 @@ function mkOrch(over: {
 	const rows: Entry[] = [];
 	const buttons: Entry[] = [];
 	const toasts: string[] = [];
+	// 有序事件日志：钉住「行元素先建、阶段文案后写」这一时序（app.js 的
+	// inlineRowSetStage 按 entry.id 查行并提前 return——顺序错了状态文案为空）
+	const order: string[] = [];
 	let removed = 0;
 	const locks = over.locks ?? fakeLocks();
 	const orch = I.createOrchestrator({
@@ -285,8 +288,11 @@ function mkOrch(over: {
 		cos,
 		caps: { ...CAPS, ...(over.caps || {}) },
 		ui: {
-			row: (e: Entry) => rows.push(e),
-			setStage: (e: Entry, k: string) => stages.push([e.id, k]),
+			row: (e: Entry) => { rows.push(e); order.push("row:" + e.id); },
+			setStage: (e: Entry, k: string) => {
+				stages.push([e.id, k]);
+				order.push("stage:" + e.id);
+			},
 			markError() { },
 			buttons: (e: Entry) => buttons.push(e),
 			toast: (k: string) => toasts.push(k),
@@ -300,7 +306,7 @@ function mkOrch(over: {
 		locks,
 		setTimer: (fn: () => void, ms: number) => setTimeout(fn, ms),
 	});
-	return { I, orch, runner, cos, stages, rows, buttons, toasts, locks,
+	return { I, orch, runner, cos, stages, rows, buttons, toasts, locks, order,
 		removed: () => removed };
 }
 
@@ -752,6 +758,38 @@ describe("刷新恢复（§6.2，不自动开始）", () => {
 			]) },
 		});
 		expect(await h.orch.restore()).toHaveLength(0);
+	});
+
+	it("恢复行先建行元素再写阶段文案（顺序错则行内状态恒为空）", async () => {
+		// 回归（e2e 实测）：restore() 原先把 setStage 放在 ui.row 之前，而
+		// app.js 的 inlineRowSetStage 按 entry.id 查行、查不到就 **提前
+		// return**——于是刷新后的恢复行状态文案为空，用户只看到一个按钮
+		// （「继续」），不知道它在说什么。设计 §6.2 第 3 点要求显示
+		// 「未完成的转换」。
+		const h = mkOrch({
+			runner: { listJobs: () => Promise.resolve([jobOf({ id: "j_order" })]) },
+		});
+		await h.orch.restore();
+		const rowAt = h.order.indexOf("row:j_order");
+		const stageAt = h.order.indexOf("stage:j_order");
+		expect(rowAt).toBeGreaterThanOrEqual(0);
+		expect(stageAt).toBeGreaterThan(rowAt);
+		// 该行确实带上了「未完成的转换」那一档文案
+		expect(h.stages.find(([id]) => id === "j_order")?.[1])
+			.toBe("upload.inline.stage.resumable");
+	});
+
+	it("已收口记录同样先建行（删除入口的按钮宿主必须先存在）", async () => {
+		const h = mkOrch({
+			runner: { listJobs: () => Promise.resolve([
+				jobOf({ id: "j_pub", state: "ready",
+					upload: { ingestionId: "inj_x", state: "published" } }),
+			]) },
+		});
+		await h.orch.restore();
+		expect(h.order.indexOf("row:j_pub"))
+			.toBeLessThan(h.order.indexOf("stage:j_pub"));
+		expect(h.order).toContain("row:j_pub");
 	});
 
 	it("续传语义：点「继续」传 resumeJobId 等于记录里的 id（§6.4 第 10 项）", async () => {
@@ -1431,6 +1469,45 @@ describe("上传行按钮（§6.3 是按钮全集的唯一权威）", () => {
 			.not.toContain("不受影响");
 	});
 
+	it("done 只给一个「删除本地产物」（终态集已含 done，不得再单列）", () => {
+		// 回归（e2e 实测）：`done` 既属 isTerminal 集合又被单列一条 discard 分支，
+		// 行上因此渲染出**两个**同名按钮——终态唯一的 OPFS 清理入口重复出现。
+		const h = loadApp(inlineCaps(true));
+		const up = h.w.HP_UPLOAD as unknown as {
+			inlineButtonKinds(e: unknown): string[];
+		};
+		expect(up.inlineButtonKinds({ state: "done", jobId: "j1" })
+			.filter((k) => k === "discard")).toHaveLength(1);
+		// 反向：没有 jobId 的 done（散文件路径）不给删除按钮
+		expect(up.inlineButtonKinds({ state: "done", jobId: null }))
+			.not.toContain("discard");
+		// 其它终态不受本次修改影响（各恰好一个清理入口）
+		for (const st of ["convert_failed", "upload_failed", "cancelled", "rejected"]) {
+			expect(up.inlineButtonKinds({ state: st, jobId: "j1" })
+				.filter((k) => k === "discard"), st).toHaveLength(1);
+		}
+	});
+
+	it("启动期装配刷新恢复：init() 在开关开时调 ensureInlineOrch()", () => {
+		// 回归（e2e 实测）：restore() 只挂在 ensureInlineOrch() 里，而此前
+		// **没有任何启动期入口**调它——刷新后恢复行永不出现，§6.3 唯一的
+		// OPFS 清理入口可达性归零（源副本 + 产物永久残留；
+		// `_sweepIncompleteStaging` 显式跳过带 upload 记录的 ready/published
+		// 任务，不兜底）。
+		//
+		// app.js 是 classic IIFE，__PT_TEST_HOOKS 驱动面里没有 init()；这里用
+		// 源码级断言钉住「init() 体内存在该调用且被 inlineEnabled() 守卫」——
+		// 比调一次 mock 化的 init() 更贴近失败模式（漏接线恰恰是「代码里根本
+		// 没有这一句」）。
+		const initStart = appSrc.indexOf("  function init() {");
+		expect(initStart).toBeGreaterThan(0);
+		const initBody = appSrc.slice(
+			initStart, appSrc.indexOf("function openSlideFromLocation"));
+		expect(initBody).toContain("if (inlineEnabled()) ensureInlineOrch();");
+		// restore() 仍只由 ensureInlineOrch() 触发（不在别处偷偷启动转换）
+		expect(appSrc.split("inlineOrch.restore()").length - 1).toBe(1);
+	});
+
 	it("开关开：KFB 不再给弹窗交接入口，也不弹窗（零 window.open）", async () => {
 		const h = loadApp(inlineCaps(true));
 		const up = h.w.HP_UPLOAD as unknown as { inlineEnabled(): boolean };
@@ -1502,6 +1579,35 @@ describe("上传行按钮（§6.3 是按钮全集的唯一权威）", () => {
 		expect(fd.get("format_ext")).toBe("jpg");
 		expect(String(fd.get("message"))).toContain("code=content_ext_mismatch");
 		expect(String(fd.get("message"))).toContain("detected=png");
+	});
+
+	it("申请支持的结果回执落在**行**上（抽屉默认关闭，行内按钮是主入口）", async () => {
+		// 回归（e2e 实测）：结果原只写抽屉里的 #fr-result（import-drawer 默认
+		// hidden），用户点完行内按钮看不到任何回执——设计 §7.1 要求行内显示
+		// 申请编号 + 业务状态。
+		const h = loadApp(inlineCaps(true));
+		const up = h.w.HP_UPLOAD as unknown as { openSupportForEntry(e: unknown): void };
+		h.fetch.mockImplementation((url: string, init?: { body?: unknown }) => {
+			if (String(url) === "/api/format-requests" && init && init.body) {
+				return Promise.resolve({
+					ok: true, status: 202, clone() { return this; },
+					json: () => Promise.resolve({ request_id: "fr_row1", business_status: "submitted" }),
+				});
+			}
+			return Promise.resolve({ ok: true, status: 200, clone() { return this; },
+				json: () => Promise.resolve({}) });
+		});
+		// 面板行：需要 entry.id 与 inlineRowEls 里已登记的行（renderRow 建）
+		const entry = { id: "ic_row_support", name: "shot.jpg", state: "rejected",
+			error: { code: "content_ext_mismatch", detectedType: "png" } };
+		up.openSupportForEntry(entry);
+		await flush(10);
+		// 编号回执记在 entry 上（inlineRowNoteText 据此渲染行附注）
+		expect((entry as { supportRequestId?: string }).supportRequestId).toBe("fr_row1");
+		// toast 也说了「已登记」（本 harness 未加载 i18n.js → tt 走 _EXTRA_I18N
+		// 或回显键；只断言它带上了编号，不锁具体措辞）
+		expect((entry as { supportBusinessStatus?: string }).supportBusinessStatus)
+			.toBe("submitted");
 	});
 	it("续传语义：未收口的 ingestionId 作为 resumeJobId 复用（§6.4）", () => {
 		const h = loadApp(inlineCaps(true));

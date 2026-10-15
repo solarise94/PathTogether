@@ -11176,7 +11176,7 @@
   }
 
   /// 行附注：进行中 → 「请保持页面打开」；磁盘待确认 → need/available 数字；
-  /// 其余不显示（设计 §3 / §7.3）。
+  /// 已提交格式申请 → 编号回执；其余不显示（设计 §3 / §7.1 / §7.3）。
   function inlineRowNoteText(entry) {
     if (entry.state === "need_disk_confirm" && entry.diskInfo) {
       return tt("upload.inline.needDisk", {
@@ -11187,6 +11187,12 @@
     if (entry.state === "converting" || entry.state === "uploading" ||
         entry.state === "upload_queued" || entry.state === "convert_queued") {
       return tt("upload.inline.note.keepopen");
+    }
+    // 申请支持的**行内回执**（§7.1）：编号 + 业务状态。抽屉默认关闭，行内
+    // 按钮是主入口——只写抽屉的话用户点完看不到任何结果。
+    if (entry.supportRequestId) {
+      return tt("fr.ok.registered", { id: entry.supportRequestId }) + " · " +
+        frBusinessStatusLabel(entry.supportBusinessStatus);
     }
     return "";
   }
@@ -11283,11 +11289,15 @@
       }
     }
     if (st === "upload_failed") out.push("support");
+    // 终态（含 `done`——`isTerminal` 已把它计入）：本地产物仍在 OPFS，这是
+    // 唯一的清理入口（§6.3）。**不得**再单列 `done` 分支——那会把
+    // 「删除本地产物」重复渲染两次（同 kinds 序列里出现两个 discard；
+    // `done` 既属终态集又被单列，实测行上出现两个同名按钮）。文案已由
+    // `inlineButtonLabel` 按 `uploadState==='published'` 区分「已上传的
+    // 平台切片不受影响」。
     if (window.HP_INLINE_CONVERT && window.HP_INLINE_CONVERT.isTerminal(st)) {
-      // 终态：本地产物仍在 OPFS（唯一清理入口，§6.3）
       if (entry.jobId) out.push("discard");
     }
-    if (st === "done" && entry.jobId) out.push("discard");
     return out;
   }
 
@@ -11336,6 +11346,9 @@
   }
 
   /// 申请支持（§7.1）：复用既有抽屉的表单提交内核（format_ext + message 预填）。
+  /// 结果**同时**落在两处：抽屉的 `#fr-result`（既有语义）与**该行**——
+  /// 面板行不在抽屉里，只写 drawer 的话用户点完什么都看不到（抽屉默认关闭，
+  /// 行内按钮却是主入口）。
   function openSupportForEntry(entry) {
     var pre;
     try {
@@ -11351,9 +11364,28 @@
     submitFormatRequestCore({
       ext: pre.format_ext,
       message: pre.message,
-      onResult: function (rec) { renderFormatRequestResult(rec); loadRecentFormatRequests(); },
+      onResult: function (rec) {
+        renderFormatRequestResult(rec);
+        loadRecentFormatRequests();
+        // 行内回执：申请编号 + 业务状态（沿用同一键与「只说已登记、不说已
+        // 兼容」的口径）。
+        var rid = (rec && (rec.request_id || rec.id)) || "";
+        if (entry && rid) {
+          entry.supportRequestId = rid;
+          entry.supportBusinessStatus = (rec && rec.business_status) || "";
+          inlineRowRefreshNote(entry);
+        }
+        toast(tt("fr.ok.registered", { id: rid }), "success");
+      },
       onError: function (msg) { toast(msg, "error"); },
     });
+  }
+
+  /// 只重画某行的附注（不触碰阶段/进度——申请支持与转换阶段无关）。
+  function inlineRowRefreshNote(entry) {
+    var rec = inlineRowEls[entry.id];
+    if (!rec || !rec.note || rec.note.textContent === undefined) return;
+    rec.note.textContent = inlineRowNoteText(entry);
   }
 
   /// 上传产物（转换条目：由 onArtifact 提供后走既有 uploadFileCos 语义）。
@@ -14499,6 +14531,15 @@
     // COS 直传 Phase 4：capability 可用时渲染手动开关，并恢复未完任务的
     // 只读进度行（off 时均为无操作，上传管线行为不变）
     initCosUploadUi();
+    // 上传面板内转换（设计 §6.2 第 1/2 步）：启动期**只列出**带
+    // `intent.channel === 'workbench-inline'` 的未完成任务 → 行 + 「继续转换」
+    // /「继续上传」/「删除本地产物」；绝不自动开始转换或上传。
+    // 必须在这里显式调用：restore() 只挂在 ensureInlineOrch() 里，而此前
+    // **没有任何启动期入口**调它——刷新后恢复行永不出现，§6.3 唯一的 OPFS
+    // 清理入口随之不可达（`_sweepIncompleteStaging` 显式跳过带 upload 记录的
+    // ready/published 任务，不兜底 → 源副本 + 产物永久残留）。开关关闭时不
+    // 加载运行器（回退路径与「加载期零面板请求」语义均不变）。
+    if (inlineEnabled()) ensureInlineOrch();
     initAuth();
     // P3 研究采集装配（capabilities.research_collection 开启才工作）
     initResearchTelemetry();

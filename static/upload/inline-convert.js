@@ -1168,6 +1168,11 @@
           e.committedBytes = job.committedBytes || 0;
           e.hasUpload = !!(job.upload && job.upload.ingestionId);
           e.uploadState = (job.upload && job.upload.state) || null;
+          // 行元素必须先建：`ui.setStage` 的实现（app.js 的
+          // inlineRowSetStage）按 entry.id 查行并**提前 return**——先 setStage
+          // 后建行会让恢复行的状态文案永远为空（设计 §6.2 第 3 点要求显示
+          // 「未完成的转换」，这也是「继续」按钮唯一的解释性文案）。
+          if (ui.row) ui.row(e);
           if (unfinished && (job.state === "ready" || job.state === "exported")) {
             // 产物已就绪 → 直接「继续上传」（跳过转换；设计 §6.2 第 3 点）
             e.mode = null;
@@ -1184,7 +1189,6 @@
             e.state = "done";
             setStage(e, "upload.inline.stage.settled");
           }
-          if (ui.row) ui.row(e);
           if (ui.buttons) ui.buttons(e);
           made.push(e);
         });

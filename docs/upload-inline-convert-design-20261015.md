@@ -1129,16 +1129,50 @@ vitest 单文件内两者**可以并存**（`import` 提升到模块顶，`new F
   - 设 `COS_BUCKET`/`COS_REGION`/`COS_SECRET_ID`/`COS_SECRET_KEY`、
     `COS_UPLOAD_CAPABILITY=on`、池容量 > 产品上限（照
     `tests/browser/slide_tools_c4/server.py:110-118` 的假 COS 配置与
-    `app_mod.UPLOAD_PRODUCT_MAX_BYTES = 900_000_000`）；
-  - **进程内假 COS**：一个真实本地 HTTPS 端点实现 `InitiateMultipartUpload` /
-    `UploadPart` / `CompleteMultipartUpload` / `ListParts` / `GET(Range)`，
-    对象落临时目录（这两条既有实现可直接照抄 c4 `lib.js:285-345` 的
-    `startLocalCos`，只需扩出 multipart 与 GET）；
-  - 新增测试专用只读端点 `GET /__test/slide-probe?slide_id=<id>` 返回
-    `{reader, levels, width, height, mpp}`（内部 `slide_io.open_slide` 真读）。
-- `playwright.config.ts`：新增 project `chromium-cos`（`testMatch:
-  'upload-inline-convert.spec.ts'`、带上述 launch args），并在默认 project 上
-  `testIgnore` 该文件，避免其余 **16** 个 spec 被 launch args 影响或重复跑。
+    `app_mod.UPLOAD_PRODUCT_MAX_BYTES = 900_000_000`）；另把
+    `COS_PART_BYTES` 与 `COS_SIGN_BATCH_MAX_PARTS` 调小，让几 MB 的合成夹具
+    也真的走「多分块 + 分批签名」两条路径；
+  - **进程内假 COS**（实现见 `tests/e2e/e2e_fake_cos.py`）：真实 COS REST
+    子集 `InitiateMultipartUpload` / `UploadPart` / `CompleteMultipartUpload`
+    / `ListParts` / `Abort` / `HEAD` / `GET(Range)` / `ListObjectVersions` /
+    `ListMultipartUploads`，对象按**版本**保存（`Complete` 回
+    `x-cos-version-id`——`cos_client.complete_multipart` 缺它即失败，假桶
+    必须同形，否则该分支永远测不到）。字节只在该进程内存里，不落仓库/临时盘；
+  - 该假 COS 起在**独立随机端口**、用 **HTTP**（不是设计稿原先写的本地
+    HTTPS + 自签证书）：scheme 由客户端 `CosConfig(Scheme="http")` 决定
+    （注入点即下一条的假客户端工厂），HTTP 因此不需要
+    `--ignore-certificate-errors`、不需要 `--host-resolver-rules`、也不需要
+    自签证书；「字节真的经过网络往返」这一被测语义与 scheme 无关。浏览器
+    分块 PUT 是**跨源**（页面在另一个端口），故假 COS 必须回 CORS 头并放行
+    预检（`File.slice` 继承 MIME → 浏览器会带 Content-Type，非简单请求），
+    并把 `ETag` 放进 `Access-Control-Expose-Headers`；
+  - **真实 worker 推进**：`cos_ingest_worker.run_cycle` 在 daemon 线程里每
+    秒跑一轮（把 `COS_SCHEDULER_INTERVAL_SECONDS` / `COS_WORKER_INTERVAL_
+    SECONDS` 调到 1），任务走完 preparing→…→completed 的全部真实 duty
+    （含 `slide_io.open_slide` 校验与 readiness 瓦片探针）；
+  - 新增两个**测试专用只读端点**（同 env 门控，默认不注册——CI 现有 spec
+    行为不变）：
+      `GET /api/__test/slide-probe?slide_id=<id>` → 用真实读取器打开**已
+      发布**资产，返回 `{reader, level_count, level_dimensions, width,
+      height, pixels_rgb, properties, size_bytes, sha256}`；
+      `GET /api/__test/stitch?ingestion=<job_id>` → 把浏览器 PUT 上来的分块
+      **拼回**成一个文件（`received` 快照；`Complete` 会消耗 uploadId，
+      `ListParts` 随后 404，不能拿它当证据），用 `slide_io.open_slide` 打开，
+      并回报 `plan`/`parts` 逐块对照、`stitched_sha256`、
+      `published_sha256`（=已发布资产字节）、`direct_class` 与
+      `declaration_matches`（服务端 `upload_direct_class` 对创建体声明的
+      真实裁定）。
+  - **关态载荷不需要改页面注入**：`/app?__inline_convert=0` 时服务端在
+    **同一次请求内**把 `INLINE_CONVERT_ENABLED` 置假（before_request 置、
+    after_request 还原，spec 串行无并发窗口），页面拿到的是真关态 bootstrap
+    ——比在页面侧改 HTML 更贴近真实回退。
+- `playwright.config.ts`：新增 project `chromium-inline-convert`
+  （`testMatch: /upload-inline-convert\.spec\.ts$/`），并在默认 project 上
+  `testIgnore` 该文件，避免其余 **16** 个 spec 被它的长超时/夹具影响或重复跑。
+  没有 launch args：假 COS 是同机 HTTP，无需证书开关或 DNS 映射。
+  配置另按 CLI 是否点名该 spec 自动开 `E2E_INLINE_CONVERT`（显式设该 env 时
+  以调用方为准），因此「只跑这一个 spec」的命令不必额外带 env，而其余 spec
+  的默认路径仍是「不配 COS」。
 - `e2e_server.py` 的假 COS 与 HTTP 端点只在该 env 打开时装配，默认路径
   （CI 现有 spec）行为不变。
 
@@ -1484,3 +1518,16 @@ export TEST_RUN_DIR=/mnt/ssd2/tests/run-inline-convert-Mwpad1 \
 无不同意项；六条全部按评审意见修正。A4 是一处**与评审建议不同的技术结论**：
 评审建议用 `Endpoint` 注入，实测它产出坏主机（把 endpoint 当域名后缀拼在 bucket 后），
 真正可用的旋钮是 `Domain`（path-style）；这一条我按实测写，并给出了备选的 virtual-hosted 方案。
+
+### 13.5 E2E 首跑发现并修复的四处产品缺陷（本次指令的副产物）
+
+按本次指令「测出产品缺陷就直接修复产品代码并补单元测试」执行。以下四处都是
+**在真实 Chromium + 真实 WASM 的 e2e 首跑中红出来的**，不是读码推测；每处都在
+`tests/js/inline-convert.test.ts` 补了会红的回归断言（已实测：把修复回退即红）。
+
+| # | 现象（e2e 实测） | 根因 | 处置 |
+| --- | --- | --- | --- |
+| D1 | 转换中刷新后**恢复行永不出现**：`restore()` 从未被执行（`window.HP_UPLOAD.inlineOrch()` 为 null、OPFS 里 `intent.channel='workbench-inline'` 的任务无行） | `restore()` 只挂在 `ensureInlineOrch()` 内，而**没有任何启动期入口**调它（`init()` 里没有；`uploadFile`/`importBundleRows` 才调，均在用户操作之后） | `init()` 增加 `if (inlineEnabled()) ensureInlineOrch();`（`static/app.js`）。开关关闭时不加载运行器、加载期仍零面板请求；§6.3 唯一的 OPFS 清理入口由此恢复可达（`_sweepIncompleteStaging` 显式跳过带 upload 记录的 ready/published 任务，不兜底） |
+| D2 | 「未完成的转换」文案**恒为空**：恢复行只显示一个孤立的「继续」按钮 | `restore()` 先 `setStage` 后 `ui.row`，而 app.js 的 `inlineRowSetStage` 按 `entry.id` 查行、查不到即 **提前 return** | `restore()` 把 `ui.row(e)` 提到状态分支之前（`static/upload/inline-convert.js`），并加「顺序」断言 |
+| D3 | 终态行出现**两个**「删除本地产物」按钮 | `done` 既属 `isTerminal` 集合（`inline-convert.js:211 TERMINAL_STATES` 含 `done`）又被单列一条 `st === 'done'` 分支 | 删掉单列的 `done` 分支（`static/app.js`），终态统一由 `isTerminal` 给一次；已发布文案区分不受影响 |
+| D4 | 点「申请支持该格式」后**看不到任何回执**（提交成功但无编号可读） | `openSupportForEntry` 只写抽屉里的 `#fr-result`，而 `#import-drawer` 默认 `hidden`，行内按钮却是本设计的主入口 | 回执同时落到**该行**（`entry.supportRequestId` + `inlineRowNoteText` 渲染「申请已登记，等待评估（编号 …）· 已登记」）并补一条 toast（`static/app.js`）；抽屉侧既有语义保留 |

@@ -213,15 +213,19 @@ function loadApp(fetchImpl?: typeof fetch, bootstrap?: unknown) {
 		confirm: vi.fn(() => true),
 	};
 	if (bootstrap !== undefined) w.HP_APP_BOOTSTRAP = bootstrap;
+	const docListeners: Record<string, Array<(ev?: unknown) => void>> = {};
 	const doc = {
 		readyState: "loading",
 		cookie: "csrf_token=tok",
+		visibilityState: "visible",
 		getElementById(id: string) {
 			if (!els[id]) els[id] = el();
 			return els[id];
 		},
 		createElement(tag: string) { return el(tag); },
-		addEventListener() {},
+		addEventListener(type: string, fn: (ev?: unknown) => void) {
+			(docListeners[type] = docListeners[type] || []).push(fn);
+		},
 		querySelector() { return el(); },
 		querySelectorAll() { return []; },
 	};
@@ -267,6 +271,7 @@ function loadApp(fetchImpl?: typeof fetch, bootstrap?: unknown) {
 		toastMessages: toast.messages,
 		storage,
 		confirmMock: w.confirm as ReturnType<typeof vi.fn>,
+		docListeners, doc,
 	};
 }
 
@@ -784,6 +789,58 @@ describe("刷新恢复：只读进度行与终态清理", () => {
 		expect(JSON.parse(h.storage.getItem("pt.cos.jobs") || "[]")).toEqual([]);
 	});
 
+	// 回归（复核修复，low）：刷新恢复的终态分支必须像实时错误分支一样消费
+	// b.fail_code / b.fail_detail——否则「用户离开后重新进来」（本次事故
+	// 场景）只能看到通用「上传失败」，client_gone / client_idle_timeout /
+	// raster_format_mismatch 的针对性指引全部丢失。
+	it("恢复行终态：fail_code/fail_detail 映射为针对性文案（非通用「上传失败」）", async () => {
+		vi.useFakeTimers();
+		const cases: Array<[Record<string, unknown>, string]> = [
+			[{ fail_code: "client_gone" }, "无活动已自动取消"],
+			[{ fail_code: "client_idle_timeout" }, "长时间无进展已自动取消"],
+			[{ fail_code: "validation_failed", fail_detail: "raster_format_mismatch" },
+				"文件内容与扩展名不符"],
+		];
+		for (const [body, want] of cases) {
+			const fetchImpl = vi.fn((url: string) => {
+				if (url === "/api/ingestions/inj_x") {
+					return Promise.resolve(resp({ stage: "terminal", ...body }));
+				}
+				return Promise.resolve(resp({}));
+			}) as unknown as typeof fetch;
+			const h = loadApp(fetchImpl, { mode: "official", capabilities: { cos_upload: cosCaps() } });
+			h.storage.setItem("pt.cos.jobs", JSON.stringify([
+				{ job_id: "inj_x", filename: "a.svs", size: 30, confirmed: [] },
+			]));
+			h.up.restoreCosJobs();
+			await vi.advanceTimersByTimeAsync(0);
+			const row = h.container.appendChildren[0];
+			const txt = String(row.children[2].textContent);
+			expect(txt, JSON.stringify(body)).toContain(want);
+			expect(txt, JSON.stringify(body)).not.toBe("上传失败");
+			h.container.appendChildren.length = 0;
+		}
+	});
+
+	// 未知码保留机器码原文（不猜测语义，排障不丢信息）
+	it("恢复行终态未知 fail_code：回落到通用「上传失败」并保留机器码", async () => {
+		vi.useFakeTimers();
+		const fetchImpl = vi.fn((url: string) => {
+			if (url === "/api/ingestions/inj_x") {
+				return Promise.resolve(resp({ stage: "terminal", fail_code: "some_new_code" }));
+			}
+			return Promise.resolve(resp({}));
+		}) as unknown as typeof fetch;
+		const h = loadApp(fetchImpl, { mode: "official", capabilities: { cos_upload: cosCaps() } });
+		h.storage.setItem("pt.cos.jobs", JSON.stringify([
+			{ job_id: "inj_x", filename: "a.svs", size: 30, confirmed: [] },
+		]));
+		h.up.restoreCosJobs();
+		await vi.advanceTimersByTimeAsync(0);
+		const row = h.container.appendChildren[0];
+		expect(String(row.children[2].textContent)).toContain("上传失败");
+	});
+
 	it("重选同名同大小文件 + 存在未完任务 → 询问后续传（跳过已确认分块）", async () => {
 		const parts = [
 			{ part_number: 1, length: 8 }, { part_number: 2, length: 8 },
@@ -942,5 +999,64 @@ describe("upload-liveness：终态机器码 → 可读文案", () => {
 			fail_detail: "not-in-whitelist" }))
 			.toBe("文件校验失败：内容不是有效的切片文件");
 		expect(msg(0, { code: "some_unknown_code" })).toBe("some_unknown_code");
+	});
+});
+
+// ----------------------------------------------------------------------- //
+// upload-liveness（复核修复）：可见性恢复 → 心跳补拍（pokeLifecycle 接线）
+// ----------------------------------------------------------------------- //
+describe("心跳生命周期触点：visibilitychange → pokeLifecycle", () => {
+	it("上传行在传时注册 visibilitychange；重新可见补一拍、隐藏时不发", async () => {
+		// sha256（WebCrypto）不受假计时器控制 → 用真实计时器 + 可控 Date.now
+		// 驱动心跳节流窗。
+		let now = 1_000_000;
+		const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+		const parts = [
+			{ part_number: 1, length: 8 }, { part_number: 2, length: 8 },
+			{ part_number: 3, length: 8 }, { part_number: 4, length: 6 },
+		];
+		const fetchImpl = vi.fn((url: string, opts?: RequestInit) => {
+			const method = String((opts && opts.method) || "GET");
+			if (url === "/api/ingestions" && method === "POST") {
+				return Promise.resolve(resp({ job_id: "inj_v", stage: "uploading" }, 202));
+			}
+			if (url === "/api/ingestions/inj_v" && method === "GET") {
+				// 恒 uploading：悬置在途（心跳是可观测的在场证据）
+				return Promise.resolve(resp({ stage: "uploading", parts }));
+			}
+			if (url.endsWith("/parts/sign") && method === "POST") {
+				const nums = JSON.parse(String(opts!.body)).part_numbers as number[];
+				return Promise.resolve(resp({
+					urls: nums.map((n) => ({ url: "https://cos.example/o?partNumber=" + n, part_number: n })),
+				}));
+			}
+			return Promise.resolve(resp({}));
+		}) as unknown as typeof fetch;
+		const h = loadApp(fetchImpl, { mode: "official", capabilities: { cos_upload: cosCaps() } });
+		expect((h.docListeners["visibilitychange"] || []).length).toBe(0);   // 上传前无监听
+		FakeXHR.onSend = () => { /* PUT 悬置：心跳由 visibilitychange 驱动 */ };
+		h.up.uploadFile(cosFile(30));
+		// 行在传 → 注册可见性触点（真实异步：等注册出现）
+		await vi.waitFor(() =>
+			expect((h.docListeners["visibilitychange"] || []).length).toBe(1),
+			{ timeout: 5000, interval: 20 });
+		const ls = h.docListeners["visibilitychange"];
+		const beatGets = () => h.fetchCalls().filter(
+			(c) => c.url === "/api/ingestions/inj_v" && c.method === "GET").length;
+		const c0 = beatGets();
+		// 隐藏：不补拍
+		h.doc.visibilityState = "hidden";
+		ls[0]();
+		expect(beatGets()).toBe(c0);
+		// 重新可见且节流窗外（时钟 +61s）：恰好补一拍
+		now += 61_000;
+		h.doc.visibilityState = "visible";
+		ls[0]();
+		await Promise.resolve();
+		expect(beatGets()).toBe(c0 + 1);
+		// 节流窗内再点：不叠加
+		ls[0]();
+		expect(beatGets()).toBe(c0 + 1);
+		nowSpy.mockRestore();
 	});
 });

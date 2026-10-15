@@ -240,7 +240,12 @@ describe("HP_SLIDE_SNIFF.headerMismatch（上传前置魔数校验）", () => {
 
 	it("非 TIFF 内容改名 .tif → 指出检测到的类型；真实 TIFF/BigTIFF 放行", async () => {
 		const { sniff } = loadEngine(happyFetch());
-		const bigtiff = [0x4D, 0x4D, 0x00, 0x2A, 0, 0, 0, 8];
+		// 真 BigTIFF：魔数 43（小端 II+\0 / 大端 MM\0+），不是经典 42。
+		// 回归（复核修复）：本机转换器产物恒为 43（bigtiff.rs 写 43u16），
+		// 旧夹具写成 MM\0*（经典 42）从未构造 43 —— 于是「BigTIFF 放行」
+		// 的用例在 detectBytesKind 漏认 43 时仍是绿的，缺陷被掩盖。
+		const bigtiffLE = [0x49, 0x49, 0x2B, 0x00, 8, 0, 0, 0, 0, 0, 0, 0];
+		const bigtiffBE = [0x4D, 0x4D, 0x00, 0x2B, 0, 8, 0, 0, 0, 0, 0, 0];
 		expect(sniff.headerMismatch("a.tif", Uint8Array.from(JPEG_HEAD)))
 			.toEqual({ ext: ".tif", expected: "tiff", detected: "jpeg" });
 		// 复合后缀按最后一段（.ome.tif → extOf=".tif"，同为 TIFF 族）
@@ -250,8 +255,20 @@ describe("HP_SLIDE_SNIFF.headerMismatch（上传前置魔数校验）", () => {
 			.toEqual({ ext: ".svs", expected: "tiff", detected: "png" });
 		expect(sniff.headerMismatch("a.tif", Uint8Array.from(TIFF_HEAD)))
 			.toBeNull();
-		expect(sniff.headerMismatch("a.ome.tiff", Uint8Array.from(bigtiff)))
+		// 经典大端 42（原夹具的真实身份，保留为普通 TIFF 放行样本）
+		expect(sniff.headerMismatch(
+			"a.ome.tiff", Uint8Array.from([0x4D, 0x4D, 0x00, 0x2A, 0, 0, 0, 8])))
 			.toBeNull();
+		// BigTIFF 43 两种字节序都必须放行（转换器产出 .tif/.ome.tif 的形态）
+		expect(sniff.detectBytesKind(Uint8Array.from(bigtiffLE))).toBe("tiff");
+		expect(sniff.detectBytesKind(Uint8Array.from(bigtiffBE))).toBe("tiff");
+		for (const name of ["a.tif", "a.tiff", "a.ome.tif", "b.ome.tiff",
+			"a.bif", "a.scn", "a.ndpi", "a.svs"]) {
+			expect(sniff.headerMismatch(name, Uint8Array.from(bigtiffLE)))
+				.toBeNull();
+			expect(sniff.headerMismatch(name, Uint8Array.from(bigtiffBE)))
+				.toBeNull();
+		}
 	});
 
 	it("真实 JPEG/BMP 放行；不校验的扩展名恒放行；短/读不到 → null", async () => {
@@ -339,6 +356,41 @@ describe("createUpload sniffGuard（upload-liveness fail-fast）", () => {
 		await expect(upload.done).resolves.toMatchObject({ ok: true });
 		expect(FakeXHR.instances.length).toBe(4);
 	});
+
+	// 回归（复核修复，high）：本机转换器「转换后上传」主链路的产物是
+	// BigTIFF（魔数 43），旧 detectBytesKind 只认经典 42 → 这些文件在创建
+	// ingestion **之前**被 mock 成 {magicMismatch detected:"unknown"} 拒掉，
+	// 零网络请求，而服务端 open_slide 本会接受它们。夹具字节头取真实产物：
+	// slide-transform gen-kfb + convert --profile bf-classic 产出
+	// `49 49 2B 00 08 00 00 00`（bigtiff.rs:110 写 43u16）。
+	const BIGTIFF_ARTIFACT_HEAD = [
+		0x49, 0x49, 0x2B, 0x00, 0x08, 0x00, 0x00, 0x00,
+		0x76, 0xDC, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00];
+
+	it("引擎产出（真实 engine.outputFileName 名）的 BigTIFF 产物走完整上传链路", async () => {
+		// 页面生产路径（tools-slides-upload.js:797-803）：产物名经引擎
+		// outputFileName 生成，.tif / .ome.tif / .bif / .ndpi 都属 TIFF 族。
+		for (const name of ["bf-580x300.tif", "bf-580x300.ome.tif",
+			"sample.bif", "sample.ndpi"]) {
+			const fetchImpl = happyFetch();   // 每轮独立状态（completes 计数器）
+			const { engine } = loadEngine(fetchImpl);
+			const src = bytesSource(name, BIGTIFF_ARTIFACT_HEAD, 32);
+			FakeXHR.instances = [];
+			FakeXHR.onSend = (xhr) => { xhr.respond(200, '"etag-ok"'); };
+			const upload = engine.createUpload({
+				source: src.view, apiFetch: fetchImpl, config: CFG,
+				storage: fakeStorage().adapter, onEvent: () => {},
+			});
+			await expect(upload.done).resolves.toMatchObject({ ok: true },
+				`BigTIFF 产物 ${name} 被误拒（回归：漏认魔数 43）`);
+			// 放行 = 真的建了任务并传完全部分块（而非零请求 fail-fast）
+			expect((fetchImpl as unknown as vi.Mock).mock.calls.filter(
+				([u, i]: [string, RequestInit?]) =>
+					u === "/api/ingestions" && (i && i.method) === "POST").length)
+				.toBe(1);
+			expect(FakeXHR.instances.length).toBe(4);
+		}
+	});
 });
 
 // ----------------------------------------------------------------------- //
@@ -388,6 +440,90 @@ describe("createUpload 心跳（upload-liveness）", () => {
 			{ loaded: 7, lengthComputable: true });
 		expect(statusGets()).toBe(c0 + 2);
 		upload.cancel();
+	});
+
+	// 回归（复核修复，low）：心跳是活性探测，绝不能触发工作台 apiFetch 的
+	// 401 → location.href="/login"（那会在分块上传中途导航走、丢掉在传行与
+	// 本地产物）。心跳必须走 opts.heartbeatFetch（页面注入的不跳转 fetch）。
+	it("心跳走 heartbeatFetch（不跳转 fetch），401 不触发 location.href 导航", async () => {
+		vi.useFakeTimers();
+		const primary = happyFetch();
+		const beat = vi.fn((url: string) => {
+			if (url === "/api/ingestions/inj_x") {
+				// 401 auth_required：注入的「不跳转」fetch 原样返回，不读 body、
+				// 不写 location（工作台 apiFetch 才会跳）。
+				return Promise.resolve(resp({ error: "auth_required" }, 401));
+			}
+			return Promise.resolve(resp({}));
+		}) as unknown as typeof fetch;
+		const loc = { href: "http://local/app", pathname: "/app" };
+		const w: Record<string, unknown> = { fetch: primary, location: loc };
+		(globalThis as { window?: unknown }).window = w;
+		new Function("window", sniffSrc)(w);
+		vi.stubGlobal("XMLHttpRequest", FakeXHR);
+		new Function("window", "fetch", "location", engineSrc)(w, primary, loc);
+		const engine = w.HP_COS_UPLOAD as {
+			createUpload: (o: Record<string, unknown>) => {
+				cancel: () => void; done: Promise<Record<string, unknown>>;
+			};
+		};
+		const src = bytesSource("slow.tif", TIFF_HEAD);
+		const upload = engine.createUpload({
+			source: src.view, apiFetch: primary, heartbeatFetch: beat,
+			config: CFG, storage: fakeStorage().adapter, onEvent: () => {},
+			progressTimeoutMs: 3_600_000, partTimeoutMs: 3_600_000,
+		});
+		const held: FakeXHR[] = [];
+		FakeXHR.onSend = (xhr) => { held.push(xhr); };   // PUT 永不响应
+		await advYield(0);
+		expect(beat.mock.calls.length).toBeGreaterThanOrEqual(1);   // 首拍走注入面
+		await advYield(61_000);
+		(held[0].upload.onprogress as (ev: unknown) => void)(
+			{ loaded: 5, lengthComputable: true });
+		// 心跳只经 heartbeatFetch；主 apiFetch 收到的心跳 GET 为 0
+		const primaryBeatGets = (primary as unknown as vi.Mock).mock.calls
+			.filter(([u, i]: [string, RequestInit?]) =>
+				u === "/api/ingestions/inj_x" &&
+				String((i && i.method) || "GET") === "GET").length;
+		// 首轮 drive 的状态查询经 apiFetch（1 次）；心跳不该再叠加
+		expect(primaryBeatGets).toBe(1);
+		expect(loc.href).toBe("http://local/app");   // 从未被导航
+		upload.cancel();
+	});
+
+	// 回归（复核修复，low）：页面可见性恢复 → pokeLifecycle() 补一拍在场
+	// 证据（心跳驱动源只有 JS 事件循环，挂起期间停摆）。
+	it("pokeLifecycle()：节流窗外补一拍心跳；取消后是空操作", async () => {
+		vi.useFakeTimers();
+		const fetchImpl = happyFetch();
+		const { engine } = loadEngine(fetchImpl);
+		const src = bytesSource("slow.tif", TIFF_HEAD);
+		const upload = engine.createUpload({
+			source: src.view, apiFetch: fetchImpl, config: CFG,
+			storage: fakeStorage().adapter, onEvent: () => {},
+			progressTimeoutMs: 3_600_000, partTimeoutMs: 3_600_000,
+		}) as unknown as { pokeLifecycle: () => void; cancel: () => void;
+			done: Promise<Record<string, unknown>> };
+		const held: FakeXHR[] = [];
+		FakeXHR.onSend = (xhr) => { held.push(xhr); };
+		const statusGets = () => (fetchImpl as unknown as vi.Mock).mock.calls
+			.filter(([u, i]: [string, RequestInit?]) =>
+				u === "/api/ingestions/inj_x" &&
+				String((i && i.method) || "GET") === "GET").length;
+		await advYield(0);
+		const c0 = statusGets();
+		// 节流窗内：poke 不叠加
+		upload.pokeLifecycle();
+		expect(statusGets()).toBe(c0);
+		// 61s 后：poke 恰好补一拍（无需进度事件）
+		await advYield(61_000);
+		upload.pokeLifecycle();
+		expect(statusGets()).toBe(c0 + 1);
+		// 取消后：不再发任何拍
+		upload.cancel();
+		await advYield(120_000);
+		upload.pokeLifecycle();
+		expect(statusGets()).toBe(c0 + 1);
 	});
 });
 

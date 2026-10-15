@@ -48,22 +48,34 @@ async function currentJobId(page) {
   return page.$eval('.job-row', (r) => r.dataset.jobId);
 }
 
-/// 磁盘 OME-TIFF 夹具（最小 classic TIFF + OME-XML 描述；场景 p/q 共用，
-/// 测试内自生成——不依赖任何 .gate-tmp 既有文件）。
+/// 磁盘 OME-TIFF 夹具（真 BigTIFF，魔数 43 + OME-XML 描述标签 270；场景
+/// p/q/r/s 共用，测试内自生成——不依赖任何 .gate-tmp 既有文件）。
+///
+/// 复核修复（low）：原夹具写经典 TIFF 魔数 42，而本机转换器与 openslide 侧
+/// 的 OME-TIFF 产出恒为 BigTIFF（bigtiff.rs 写 43u16）；夹具用 42 就等于给
+/// 「上传前置魔数校验漏认 43」的缺陷留了盲区——直传上传的对象在真实场景里
+/// 是 43，夹具却永远是浏览器本来就认的 42。这里改用 BigTIFF 头
+/// （II + 43 + offsetsize=8 + reserved=0 + 8 字节首 IFD 偏移，见
+/// slide-sniff.js readTiffHeader 的 BigTIFF 分支），IFD 条目按 BigTIFF
+/// 20 字节布局（u64 count / u64 值域）。
 function directOmeFixture(name = 'direct-ome.tif') {
   const omeXml = '<?xml version="1.0"?><OME xmlns=' +
     '"http://www.openmicroscopy.org/Schemas/OME/2016-06"></OME>\0';
   const desc = Buffer.from(omeXml, 'utf8');
-  const ifd = Buffer.alloc(2 + 12 + 4);
-  ifd.writeUInt16LE(1, 0);            // entry count
-  ifd.writeUInt16LE(270, 2);          // ImageDescription
-  ifd.writeUInt16LE(2, 4);            // ASCII
-  ifd.writeUInt32LE(desc.length, 6);  // count
-  ifd.writeUInt32LE(8 + ifd.length, 10);  // heap offset
-  const head = Buffer.alloc(8);
+  const HDR = 16;                  // BigTIFF 头：8 字节 magic/offset-size + u64 IFD 偏移
+  // BigTIFF IFD：u64 entry count(8) + 1×20 字节条目 + u64 next IFD(8)
+  const ifd = Buffer.alloc(8 + 20 + 8);
+  ifd.writeBigUInt64LE(1n, 0);            // entry count
+  ifd.writeUInt16LE(270, 8);              // ImageDescription
+  ifd.writeUInt16LE(2, 10);               // ASCII
+  ifd.writeBigUInt64LE(BigInt(desc.length), 12);  // count
+  ifd.writeBigUInt64LE(BigInt(HDR + ifd.length), 20);  // heap offset（外联值）
+  const head = Buffer.alloc(HDR);
   head.write('II', 0, 'ascii');
-  head.writeUInt16LE(42, 2);
-  head.writeUInt32LE(8, 4);
+  head.writeUInt16LE(43, 2);              // 43 = BigTIFF（不得写 42）
+  head.writeUInt16LE(8, 4);               // offset size
+  head.writeUInt16LE(0, 6);               // reserved
+  head.writeBigUInt64LE(BigInt(HDR), 8);  // 首 IFD 偏移
   const fixture = path.join(L.GATE, 'fixtures', name);
   fs.mkdirSync(path.dirname(fixture), { recursive: true });
   fs.writeFileSync(fixture, Buffer.concat([head, ifd, desc]));

@@ -233,6 +233,25 @@
     });
   }
 
+  // 活性探测专用 fetch：与 apiFetch 同 CSRF 语义，但 401 **绝不跳转**。
+  // upload-liveness 复核：心跳是分块在途期间的在场证据，不是状态推进请求；
+  // 用 apiFetch 会在分块上传中途因 401 触发 location.href="/login"，把页面
+  // 导航走并丢掉在传的上传行/本地产物。授权问题由分块签名这一必经控制请求
+  // 暴露（工具页 pageApiFetch 从一开始就是不跳转语义）。
+  function apiFetchNoRedirect(url, opts) {
+    opts = opts || {};
+    var method = (opts.method || "GET").toUpperCase();
+    if (method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
+      var tok = csrfToken();
+      if (tok) {
+        var headers = Object.assign({}, opts.headers || {});
+        if (!headers["X-CSRF-Token"]) { headers["X-CSRF-Token"] = tok; }
+        opts.headers = headers;
+      }
+    }
+    return fetch(url, opts);
+  }
+
   // ---------- 用户反馈记录器桥（改版第四轮 §3） ----------
   // window.HP_FEEDBACK 由 static/feedback-recorder.js 在本脚本之前装载
   // （fetch/console/error 包装必须尽早）。记录器缺失（demo 页等）时全部
@@ -10551,6 +10570,21 @@
     return code || status || tt("upload.stage.failed");
   }
 
+  // 终态失败码/细节 → 文案键（实时错误分支与刷新恢复分支**共用同一映射**：
+  // 复核修复前恢复路径一律显示通用「上传失败」，client_gone /
+  // client_idle_timeout / raster_format_mismatch 的针对性文案只在实时分支
+  // 存在——刷新恢复恰是「用户离开后重新进来」的事故场景，正是最需要它）。
+  // 未知码返回 null（调用方保留原码或通用文案，不猜测语义）。
+  function cosFailStageKey(code, detail) {
+    if (code === "client_gone") return "upload.cos.err.client_gone";
+    if (code === "client_idle_timeout") return "upload.cos.err.client_idle_timeout";
+    if (code === "validation_failed") {
+      if (detail === "raster_format_mismatch") return "upload.cos.err.raster_mismatch";
+      return "upload.cos.err.validation";
+    }
+    return null;
+  }
+
   // 阶段名 → 文案键（§5 固定六段 + terminal/未知兜底）
   function cosStageKey(stage) {
     var known = { waiting_space: 1, uploading: 1, awaiting_server: 1,
@@ -10632,6 +10666,25 @@
     }
     var jobId = opts.resumeJobId || null;   // created 事件回填（重试按钮用）
     var upload = null;
+    // 复核修复：页面可见性恢复时补一拍在场证据（心跳的驱动源只有 JS 事件
+    // 循环，标签被挂起期间停摆——重新可见即刷新 client_seen_at，缩小服务端
+    // 活性 sweep 误杀「XHR 仍在传但 JS 被冻结」中间态的窗口）。监听随本行
+    // 的 upload 收口注销；引擎缺失/取消后 pokeLifecycle 是空操作。
+    var onVisPoke = function () {
+      if (typeof document !== "undefined" && document.visibilityState &&
+          document.visibilityState !== "visible") return;
+      if (upload && typeof upload.pokeLifecycle === "function") {
+        try { upload.pokeLifecycle(); } catch (e) {}
+      }
+    };
+    if (typeof document !== "undefined" && document.addEventListener) {
+      document.addEventListener("visibilitychange", onVisPoke);
+    }
+    function dropVisPoke() {
+      if (typeof document !== "undefined" && document.removeEventListener) {
+        document.removeEventListener("visibilitychange", onVisPoke);
+      }
+    }
     // U1 字节级进度：上传阶段百分比按已发送/已确认字节（不是分片数）；
     // 重试期间显示「正在重试」，body 全部发出且未确认时显示
     // 「数据已发送，等待确认」——绝不显示「完成」。
@@ -10711,6 +10764,9 @@
         // 重选同名文件续传）；工具页才开 retryCompleteOnNetworkError。
         retryCompleteOnNetworkError: false,
         useResumeEndpoint: false,
+        // 复核修复：心跳（活性探测）走不跳转 fetch——与分块签名/状态推进
+        // 不同，401 不得在上传中途把页面导航去 /login。
+        heartbeatFetch: apiFetchNoRedirect,
         onEvent: function (ev) {
           if (ev.type === "status") {
             cosShowStage(row, ev.body);
@@ -10776,8 +10832,11 @@
       });
       settled.then(function () { lk.release(); },
                    function () { lk.release(); });
+      settled.then(dropVisPoke, dropVisPoke);   // 行收口即注销可见性触点
     }, function () {
       // 等锁被取消（AbortError）：取消按钮已把行切到「已取消」，无需再动
+      // （引擎从未创建；注销可见性触点，别留下悬空监听）
+      dropVisPoke();
     });
   }
 
@@ -10870,8 +10929,19 @@
             cosJobsDrop(job.job_id);   // 任务记录立即清理（§5：终态即清理）
             var r1 = ensureRow();
             r1.markError();
-            r1.setStage("upload.stage.failed");
+            // 复核修复：终态恢复行必须消费 b.fail_code / b.fail_detail——与
+            // 实时错误分支同一映射（cosFailStageKey）。通用「上传失败」会
+            // 把 client_gone / client_idle_timeout / raster_format_mismatch
+            // 的针对性指引丢在刷新恢复路径上（用户离开后回来恰是本次事故
+            // 场景）。toast 与实时路径同形（upload.fail {e}）：行 10s 后自
+            // 行移除，原因不能只留在行里。
+            var failMsg = cosErrorMessage(0, {
+              code: b.fail_code || "", fail_detail: b.fail_detail,
+            });
+            r1.setStage(cosFailStageKey(b.fail_code, b.fail_detail) ||
+                        "upload.stage.failed");
             r1.finish(10000);
+            toast(t("upload.fail", { e: failMsg }), "error");
             // 快照清理同恢复完成路径：等身份就绪后按本号域消费（与轮询、
             // auth/info 谁先返回无关）；取消/终态绝不保留遗留快照。
             fbIdentityReady().then(function () {

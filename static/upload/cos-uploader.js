@@ -75,7 +75,10 @@
      注册，settle/取消后注销；abortController.abort() 停止全部在途 XHR；
    - 客户端活性心跳（0084 upload-liveness）：分块在途/批间空隙按至多 60s
      一次 GET 任务状态（fire-and-forget）——服务端将其作为 owner 在场触点
-     （client_seen_at），vanish 的浏览器由服务端失活 sweep 终止；
+     （client_seen_at），vanish 的浏览器由服务端失活 sweep 终止。心跳走
+     opts.heartbeatFetch（页面注入的**不跳转** apiFetch），响应体不看：
+     授权问题由分块签名暴露，活性探测绝不在上传中途把页面跳去 /login；
+     页面可见性恢复时经 pokeLifecycle() 补一拍（可见性/挂起间隙的在场证据）；
    - 上传前置魔数校验（0084）：创建 ingestion 之前经
      window.HP_SLIDE_SNIFF.verifyUploadHeader 按扩展名核对首部魔数，
      不符以 {magicMismatch} 拒绝（零网络请求；嗅探缺席/失败放行）；
@@ -643,14 +646,41 @@
     // 端在场的触点（client_seen_at 节流刷新），慢分块/长传不再依赖服务端
     // ListParts 回退活性证据。fire-and-forget：响应/错误全部吞掉（终态/
     // 授权问题由签名与状态机的既有合同处理），取消后立即停发。
+    //
+    // 复核修复（upload-liveness）：心跳是**活性探测**，不是状态推进请求，
+    // 因此绝不能触发工作台 apiFetch 的 401 → location.href="/login" 跳转
+    //（那会在分块上传中途卸载页面、丢掉本地产物）。心跳改走 opts.heartbeat
+    // Fetch（页面注入的「不跳转」apiFetch；未注入则退回 apiFetch——旧调用
+    // 方行为不变），响应体一律不看：授权问题交给分块签名这一必经控制请求
+    // 去暴露，本拍只是被动在场证据。
     var HEARTBEAT_MIN_MS = 60000;
     var lastHeartbeatAt = -HEARTBEAT_MIN_MS;   // 首拍立即发（上传一开始即在场证据）
+    function heartbeatFetch() {
+      return (typeof opts.heartbeatFetch === "function")
+        ? opts.heartbeatFetch : apiFetch;
+    }
     function heartbeat() {
       if (stopped || !jobId) return;
       var now = Date.now();
       if (now - lastHeartbeatAt < HEARTBEAT_MIN_MS) return;
       lastHeartbeatAt = now;
-      quiet(fetchStatus());
+      // 同步发起（测试与生产都以「调用即发」为可观测语义）；fetch 自身的
+      // 同步抛出按 quiet 语义吞掉——活性探测绝不打断上传。
+      try {
+        quiet(heartbeatFetch()("/api/ingestions/" + encodeURIComponent(jobId)));
+      } catch (e) { /* 探测失败不是上传失败 */ }
+    }
+
+    // pokeLifecycle() —— 页面生命周期触点（document 可见性/URL 活跃度）。
+    // 页面被隐藏或标签被浏览器挂起时，分块进度事件与 JS 定时器都可能停摆，
+    // 心跳只能靠服务端 ListParts 回退证据兜底（30 分钟 sweep 窗口内对
+    // 「XHR 仍在传但 JS 被冻结」的中间态无覆盖）。页面在可见性变化/重新
+    // 可见时主动补一拍，等价于把在场证据的刷新点提前到 JS 恢复执行的瞬间。
+    // 仅刷新 client_seen_at：不推进状态机、不改分块计划、响应/错误全部吞
+    // 掉；取消后是空操作。节流窗内同样不发（与进度拍共用 lastHeartbeatAt）。
+    function pokeLifecycle() {
+      if (stopped || !jobId) return;
+      heartbeat();
     }
 
     // review 2026-10-07 #9：状态轮询容忍瞬时失败——429/5xx/网络层失败按
@@ -753,7 +783,12 @@
         }
         if (st === "terminal") {
           // 等待超时/过期/失败：终态任务不再恢复
-          quiet(storage.complete(jobId, { terminal: true, fail_code: b.fail_code }));
+          // 复核修复：fail_detail（安全白名单细节，如 raster_format_mismatch）
+          // 随终态一起落到记录——刷新/恢复行才能给出针对性文案，而不是只
+          // 回显 fail_code 原始机器码。
+          quiet(storage.complete(jobId, {
+            terminal: true, fail_code: b.fail_code, fail_detail: b.fail_detail,
+          }));
           throw { terminal: true, data: b };
         }
         return delay(2000).then(drive);   // 未知 stage：以服务端为准再查
@@ -1152,6 +1187,9 @@
     return {
       cancel: cancel,
       done: done,
+      // 页面生命周期触点（可见性恢复/URL 活跃）：刷新在场证据的补充入口
+      //（tests/js/cos-upload-liveness.test.ts 驱动面）
+      pokeLifecycle: pokeLifecycle,
     };
   }
 

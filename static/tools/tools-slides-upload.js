@@ -111,6 +111,23 @@ export function magicTypeName(detected) {
   return e[lang] || e.zh;
 }
 
+/// 终态 fail_code/fail_detail → 文案键（即时失败 handleFailure 与刷新恢复
+/// 行**共用**）。复核修复：恢复行原样只回显 fail_code，client_gone /
+/// client_idle_timeout / raster_format_mismatch 的针对性指引在恢复路径上
+/// 丢失。未知码返回 null（调用方回显机器码，不猜测语义）。
+export function failCodeMsgKey(code, detail) {
+  if (code === 'client_gone') return 'tools.upload.failed.client_gone';
+  if (code === 'client_idle_timeout') return 'tools.upload.failed.client_idle';
+  if (code === 'validation_failed') {
+    // 仅白名单细节有针对性文案；其余校验失败回落到「终态失败（code）」，
+    // 与即时失败路径同语义（failCodeMsgKey 返回 null → 调用方显示机器码）。
+    return detail === 'raster_format_mismatch'
+      ? 'tools.upload.failed.raster_mismatch'
+      : null;
+  }
+  return null;
+}
+
 export function describeUploadError(err) {
   const data = err && typeof err.data === 'object' && err.data ? err.data : null;
   // upload-liveness（0084）：引擎的 terminal 拒绝把 fail_code/fail_detail
@@ -118,16 +135,8 @@ export function describeUploadError(err) {
   if (err && err.terminal) {
     const failCode = data && typeof data.fail_code === 'string'
       ? data.fail_code : '';
-    if (failCode === 'client_gone') {
-      return { key: 'tools.upload.failed.client_gone' };
-    }
-    if (failCode === 'client_idle_timeout') {
-      return { key: 'tools.upload.failed.client_idle' };
-    }
-    if (failCode === 'validation_failed' &&
-        data.fail_detail === 'raster_format_mismatch') {
-      return { key: 'tools.upload.failed.raster_mismatch' };
-    }
+    const key = failCodeMsgKey(failCode, data && data.fail_detail);
+    if (key) return { key: key };
   }
   if (err && err.magicMismatch) {
     return { key: 'tools.upload.failed.magic',
@@ -345,6 +354,9 @@ export function createUploadController({
         return queueWrite(() => runner.setJobUpload(jobId, {
           ingestionId: id, filename, size, state: 'failed',
           error: (outcome && outcome.fail_code) || 'terminal',
+          // 复核修复：终态细节一并落记录——刷新/恢复行消费它给出针对性文案
+          //（与即时失败路径 handleFailure 同一组文案键，不再只回显机器码）。
+          errorDetail: (outcome && outcome.fail_detail) || null,
         }));
       },
       remove(id) {
@@ -803,6 +815,9 @@ export function createUploadController({
       const upload = window.HP_COS_UPLOAD.createUpload({
         source,
         apiFetch: pageApiFetch,
+        // 复核修复：心跳（活性探测）同样走不跳转的 pageApiFetch（契约明写
+        // 「401 不重定向：上传中断不能丢本地产物」），显式注入以免将来被改。
+        heartbeatFetch: pageApiFetch,
         config: cfg,
         storage: opfsStorage(jobId, name, file.size, acct),
         // review #1：记录/候选按授权账号绑定（capability 端点 account；
@@ -987,9 +1002,16 @@ export function createUploadController({
         const p = document.createElement('p');
         p.className = 'job-upload-state err';
         p.dataset.uploadState = up.state;
-        p.textContent = t(up.state === 'failed'
-          ? 'tools.upload.row.failed' : 'tools.upload.row.cancelled',
-        { err: up.error || '' });
+        // 复核修复：failed 行走同一 fail_code/fail_detail → 文案键映射（与
+        // 即时失败 handleFailure 一致）。已知码给针对性指引；未知码沿用
+        // 「上传失败（机器码）」原文（排障不丢信息）。
+        const key = up.state === 'failed'
+          ? failCodeMsgKey(up.error || '', up.errorDetail || null) : null;
+        p.textContent = key
+          ? t(key)
+          : t(up.state === 'failed'
+            ? 'tools.upload.row.failed' : 'tools.upload.row.cancelled',
+            { err: up.error || '' });
         actionsEl.parentNode.insertBefore(p, actionsEl);
       }
       // R1：待执行的自动上传意图（转换后停止/刷新恢复）→「继续上传」，

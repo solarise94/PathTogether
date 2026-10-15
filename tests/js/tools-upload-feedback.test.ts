@@ -282,6 +282,34 @@ describe("结构化服务端错误 → 可读文案（不出现 [object Object]�
 			.toEqual({ key: "tools.upload.failed", vars: { e: "boom" } });
 		expect(describeUploadError({ weird: {} })).toEqual({ key: "tools.upload.err.unknown" });
 	});
+
+	// 回归（复核修复，low）：恢复/刷新后的失败行必须消费 fail_code 与
+	// fail_detail，给出与即时失败 handleFailure 同一组针对性文案——旧实现
+	// 只把它当 {err} 形参回显原始机器码（"上传失败（client_gone）"）。
+	it("刷新恢复的失败行：fail_code/fail_detail → 针对性文案（不再只回显机器码）", async () => {
+		const cases: Array<[Record<string, unknown>, string]> = [
+			[{ error: "client_gone" }, "tools.upload.failed.client_gone"],
+			[{ error: "client_idle_timeout" }, "tools.upload.failed.client_idle"],
+			[{ error: "validation_failed", errorDetail: "raster_format_mismatch" },
+				"tools.upload.failed.raster_mismatch"],
+		];
+		const { ctl, jobs } = await setup({});
+		for (const [upload, want] of cases) {
+			const row = new FakeEl("article");
+			const act = row.appendChild(new FakeEl());
+			jobs["job-a"].upload = { ingestionId: "inj_1", state: "failed", ...upload };
+			ctl.renderRowSegment(jobs["job-a"], act, null);
+			const txt = act.parentNode!.textContent;
+			expect(txt, JSON.stringify(upload)).toContain(want);
+		}
+		// 未知码：保留原码（排障不丢信息），仍走通用行文案
+		const row = new FakeEl("article");
+		const act = row.appendChild(new FakeEl());
+		jobs["job-a"].upload = { ingestionId: "inj_1", state: "failed", error: "some_new_code" };
+		ctl.renderRowSegment(jobs["job-a"], act, null);
+		expect(act.parentNode!.textContent).toContain("tools.upload.row.failed");
+		expect(act.parentNode!.textContent).toContain("some_new_code");
+	});
 });
 
 // --------------------------------------------------------------------------- //

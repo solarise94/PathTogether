@@ -518,7 +518,13 @@
   //     PIL 识别（JPEG=FF D8 FF、BMP="BM"），伪装字节必被拒
   //     （invalid_slide / RasterFormatMismatch）；
   //   - TIFF 族（.tif/.tiff/.ome.*/.svs/.scn/.ndpi/.bif）：openslide/
-  //     tifffile 都要求 II*\0 / MM\0* 魔数，非 TIFF 内容必被拒。
+  //     tifffile 都要求 TIFF 容器魔数，非 TIFF 内容必被拒。**经典 TIFF
+  //     与 BigTIFF 都算 TIFF**：这是本机转换器的产出格式——BigTIFF 魔数
+  //     43（II+\0 / MM\0+）见 slide-transform-core/crates/core/src/bigtiff.rs
+  //     与 服务端 upload_direct_class.py（`elif magic == 43: bigtiff`），
+  //     同仓 static/tools/slide-transform/engine.js 的 TIFF_HEADER_PREFIXES
+  //     与 readTiffHeader（:116）也同时认 42/43。漏认 43 会把「转换后上传」
+  //     主链路的产物在零网络请求下拒掉——正是本闸要避免的误拒。
   // 因此「魔数不符」的拒绝绝不会拒绝服务端本会接受的文件；嗅探读失败
   // 一律放行（服务端 open_slide 终审）。其余扩展名不校验（服务端受理
   // 词表闸负责）。
@@ -535,6 +541,11 @@
   };
 
   /** 首部字节 → 已知内容类别；认不出返回 null（不当证据）。 */
+  // TIFF 判据：经典 42 与 BigTIFF 43 **都必须认**（同一 "tiff" 类别）。
+  // 只认 42 会让本机转换器的全部 BigTIFF 产物（.tif/.ome.tif/.bif/.scn）
+  // 在创建 ingestion 之前被误拒（回归：upload-liveness 复核）。字节序
+  // 决定魔数位置：II 小端 u16=0x2A/0x2B 落在 u8[2]；MM 大端 u16 落在
+  // u8[2..3]，即 00 2A / 00 2B。
   function detectBytesKind(u8) {
     if (!u8 || u8.length < 4) return null;
     if (u8[0] === 0xFF && u8[1] === 0xD8 && u8[2] === 0xFF) return "jpeg";
@@ -547,10 +558,12 @@
         u8[3] === 0x46 && u8.length >= 12 &&
         u8[8] === 0x57 && u8[9] === 0x45 && u8[10] === 0x42 &&
         u8[11] === 0x50) return "webp";
-    if ((u8[0] === 0x49 && u8[1] === 0x49 && u8[2] === 0x2A &&
-         u8[3] === 0x00) ||
+    // 经典 TIFF（42）与 BigTIFF（43）同归 "tiff"：本机转换器产物、openslide
+    // 与 tifffile 接受的对象都覆盖这两者（漏认 43 = 误拒转换产物）。
+    if ((u8[0] === 0x49 && u8[1] === 0x49 &&
+         (u8[2] === 0x2A || u8[2] === 0x2B) && u8[3] === 0x00) ||
         (u8[0] === 0x4D && u8[1] === 0x4D && u8[2] === 0x00 &&
-         u8[3] === 0x2A)) return "tiff";
+         (u8[3] === 0x2A || u8[3] === 0x2B))) return "tiff";
     if (u8[4] === 0x66 && u8[5] === 0x74 && u8[6] === 0x79 &&
         u8[7] === 0x70 && u8.length >= 12) {
       // ISOBMFF（ftyp 盒）：HEIC/HEIF 品牌点名，其余容器（MP4 等）不猜。

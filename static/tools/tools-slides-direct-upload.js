@@ -394,6 +394,9 @@ export function createDirectUploadController({ t, onStatus, onPublished,
       const upload = window.HP_COS_UPLOAD.createUpload({
         source: file,
         apiFetch: pageApiFetch,
+        // 复核修复：心跳（活性探测）走同一不跳转 fetch（契约：上传中断不能
+        // 丢本地产物；401 不在上传中途导航走）。
+        heartbeatFetch: pageApiFetch,
         config: cfg,
         createBody: { direct_class: directClass },
         resumeJobId: resume ? resume.job_id : null,

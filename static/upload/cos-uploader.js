@@ -73,6 +73,12 @@
      请求头（Content-Length 与签名绑定值一致，手动设置会被 CORS 拒绝）、
      绝不输出预签名 URL；upload.onprogress 提供字节级进度，监听先于 send
      注册，settle/取消后注销；abortController.abort() 停止全部在途 XHR；
+   - 客户端活性心跳（0084 upload-liveness）：分块在途/批间空隙按至多 60s
+     一次 GET 任务状态（fire-and-forget）——服务端将其作为 owner 在场触点
+     （client_seen_at），vanish 的浏览器由服务端失活 sweep 终止；
+   - 上传前置魔数校验（0084）：创建 ingestion 之前经
+     window.HP_SLIDE_SNIFF.verifyUploadHeader 按扩展名核对首部魔数，
+     不符以 {magicMismatch} 拒绝（零网络请求；嗅探缺席/失败放行）；
    - 分批签名（sign_batch_max_parts，429/503 退避 ≤3 次同批重试）+ 批内并发
      （max_concurrent_parts）；单片同 URL 重试 ≤3 → 重新签名一次 → 再 ≤3；
    - upload-complete 幂等：409 ingestion_state_conflict = 已完成过，转轮询。
@@ -462,6 +468,7 @@
     function onPartProgress(n, attemptId, loaded, computable) {
       var a = activeAttempts[n];
       if (!a || a.id !== attemptId) return;   // 旧尝试的迟到回调无效
+      heartbeat();                            // 分块在途：在场触点（≤60s 一次）
       if (computable) computableSeen = true;
       var clamped = Math.max(0, Math.min(
         typeof loaded === "number" ? loaded : 0, a.length));
@@ -631,6 +638,21 @@
       return api("/api/ingestions/" + encodeURIComponent(jobId)).then(jsonBody);
     }
 
+    // —— 客户端活性心跳（upload-liveness 0084）——
+    // 分块在途期间按至多 60s 一次 GET 任务状态：服务端把它作为 owner 客户
+    // 端在场的触点（client_seen_at 节流刷新），慢分块/长传不再依赖服务端
+    // ListParts 回退活性证据。fire-and-forget：响应/错误全部吞掉（终态/
+    // 授权问题由签名与状态机的既有合同处理），取消后立即停发。
+    var HEARTBEAT_MIN_MS = 60000;
+    var lastHeartbeatAt = -HEARTBEAT_MIN_MS;   // 首拍立即发（上传一开始即在场证据）
+    function heartbeat() {
+      if (stopped || !jobId) return;
+      var now = Date.now();
+      if (now - lastHeartbeatAt < HEARTBEAT_MIN_MS) return;
+      lastHeartbeatAt = now;
+      quiet(fetchStatus());
+    }
+
     // review 2026-10-07 #9：状态轮询容忍瞬时失败——429/5xx/网络层失败按
     // 退避重查（指数退避 1s/2s/4s/8s，封顶 8s；连续失败上限 5 次），超界
     // 后以 recheck 标记失败（UI 提供「重新检查状态」= 以同 job 重入状态机
@@ -786,6 +808,7 @@
         if (stopped) return Promise.reject({ cancelled: true });
         attempt++;
         if (!url) return Promise.reject({ status: 0, data: null });
+        heartbeat();   // 重试/重签循环同样是分块在途（在场触点，≤60s 一次）
         // 重新签名分支递归出的新闭包 attempt 从 1 重新计数，但它是真实的
         // 重试（新 URL）——同样发 retry 事件，消费者显示「正在重试」
         if (attempt > 1 || freshUrl) {
@@ -850,6 +873,7 @@
       function nextBatch() {
         if (stopped) return Promise.reject({ cancelled: true });
         if (failure) return Promise.resolve();   // 已有终局失败：不再签新批
+        heartbeat();   // 批间空隙同样是在场触点（≤60s 一次）
         var batch = pending.slice(i, i + cfg.sign_batch_max_parts);
         i += batch.length;
         if (!batch.length) return requestComplete();
@@ -1071,8 +1095,34 @@
       return loadConfirmedFromStorage();
     }
 
+    // —— 上传前置魔数校验（upload-liveness 0084：fail-fast）——
+    // 创建 ingestion 之前按扩展名核对首部魔数（slide-sniff.verifyUpload
+    // Header，两页共用）：PNG/WebP 改名 .jpg、非 TIFF 内容改名 .tif 等在
+    // 任何网络请求之前被拒绝（typed error {magicMismatch}，页面映射为说
+    // 出检测类型的可读文案）。嗅探模块缺席/读失败一律放行（服务端
+    // open_slide 终审）；续传不走本闸（内容身份另有分片摘要合同）。
+    function sniffGuard() {
+      var sniff = (typeof window !== "undefined" && window.HP_SLIDE_SNIFF &&
+                   typeof window.HP_SLIDE_SNIFF.verifyUploadHeader ===
+                     "function")
+        ? window.HP_SLIDE_SNIFF.verifyUploadHeader(source.name, source)
+        : null;
+      if (!sniff || typeof sniff.then !== "function") {
+        return Promise.resolve(null);
+      }
+      return sniff.then(function (bad) {
+        if (bad) throw { magicMismatch: bad };
+        return null;
+      }, function () {
+        return null;   // 嗅探失败不阻塞上传（服务端终审）
+      });
+    }
+
     var main = Promise.resolve().then(function () {
       return prepareResume();
+    }).then(function () {
+      if (jobId) return null;
+      return sniffGuard();
     }).then(function () {
       if (jobId) return null;
       return createNewJob();

@@ -289,8 +289,10 @@ function cosFile(size = 30, name = "big.svs") {
 		slice(s: number, e: number) {
 			// PUT body = Blob 切片（流式）；摘要按 4 MiB 子块流式另读
 			//（sha256-chunked-4MiB-v1）——假源切片带 Blob 语义（size + 再
-			// slice），零字节内容
+			// slice）。头 16 字节给真实 TIFF 魔数：引擎创建 ingestion 前
+			// 的前置魔数校验（upload-liveness）按扩展名核对首部。
 			const len = Math.max(0, e - s);
+			const magic = [0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00];
 			return {
 				_offset: s,
 				_end: e,
@@ -302,7 +304,15 @@ function cosFile(size = 30, name = "big.svs") {
 						arrayBuffer: async () => new ArrayBuffer(sub),
 					};
 				},
-				arrayBuffer: async () => new ArrayBuffer(len),
+				arrayBuffer: async () => {
+					const buf = new ArrayBuffer(len);
+					const u8 = new Uint8Array(buf);
+					for (let i = 0; i < len; i++) {
+						const idx = s + i;
+						u8[i] = idx < magic.length ? magic[idx] : 0;
+					}
+					return buf;
+				},
 			};
 		},
 	};
@@ -424,7 +434,11 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 		];
 		const afterComplete = ["awaiting_server", "downloading", "viewable"];
 		let getStatus = 0;
+		let completeSeen = false;
+		let postCompleteGets = 0;
 		// complete 后第一次 GET 挂起：先断言上传阶段 100% 中间态再放行
+		//（按 complete 后计数——分块在途心跳（upload-liveness）的 GET 不
+		// 推移阶段序列）
 		let releaseServerStage: (() => void) | null = null;
 		// 签名（fetch）与分块 PUT（XHR）的跨载体顺序：批 1 的两个 PUT 都在
 		// 批 2 签名之前
@@ -438,12 +452,14 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 				if (getStatus++ === 0) {
 					return Promise.resolve(resp({ job_id: "inj_9", stage: "uploading", declared_size: 30, total_parts: 4, parts }));
 				}
-				if (getStatus === 2) {
-					return new Promise((resolve) => {
-						releaseServerStage = () => resolve(resp({ job_id: "inj_9", stage: "awaiting_server", declared_size: 30 }));
-					});
-				}
-				const idx = Math.min(getStatus - 2, afterComplete.length - 1);
+				if (completeSeen) {
+					if (postCompleteGets++ === 0) {
+						return new Promise((resolve) => {
+							releaseServerStage = () => resolve(resp({ job_id: "inj_9", stage: "awaiting_server", declared_size: 30 }));
+						});
+					}
+					const idx = Math.min(postCompleteGets - 1,
+						afterComplete.length - 1);
 				const stage = afterComplete[idx];
 				const body: Record<string, unknown> = { job_id: "inj_9", stage, declared_size: 30 };
 				if (stage === "downloading") body.downloaded_bytes = 15;
@@ -453,6 +469,10 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 					body.slide_id = "sld_cos00000001";
 				}
 				return Promise.resolve(resp(body));
+				}
+				// complete 之前的非首 GET：只有分块在途心跳（响应被引擎吞掉，
+				// 不驱动状态机）——给 uploading 快照即可
+				return Promise.resolve(resp({ job_id: "inj_9", stage: "uploading", declared_size: 30 }));
 			}
 			if (url === "/api/ingestions/inj_9/parts/sign" && method === "POST") {
 				seq.push("sign");
@@ -466,6 +486,7 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 				}));
 			}
 			if (url === "/api/ingestions/inj_9/upload-complete" && method === "POST") {
+				completeSeen = true;
 				return Promise.resolve(resp({ job_id: "inj_9", state: "completing", stage: "awaiting_server" }, 202));
 			}
 			// U1：COS PUT 不再走 fetch——落到这里即判错（防回归到 fetch 载体）
@@ -712,7 +733,8 @@ describe("waiting_capacity：排队展示与轮询推进", () => {
 		await vi.advanceTimersByTimeAsync(1);
 		await vi.waitFor(() => expect(h.toastMessages.some(m => m.includes("upload.done"))).toBe(true),
 			{ timeout: 5000, interval: 10 });
-		expect(h.fetchCalls().filter(c => c.url === "/api/ingestions/inj_w" && c.method === "GET")).toHaveLength(3);
+		// waiting → uploading → 分块在途心跳（upload-liveness）→ viewable
+		expect(h.fetchCalls().filter(c => c.url === "/api/ingestions/inj_w" && c.method === "GET")).toHaveLength(4);
 		expect(h.fetchCalls().some(c => c.url === "/api/ingestions/inj_w/parts/sign")).toBe(true);
 		expect(FakeXHR.instances).toHaveLength(2);
 	});
@@ -835,6 +857,10 @@ describe("i18n：upload.cos.* 键（zh/en）与 stage 映射", () => {
 		// U1 字节级进度
 		"upload.cos.bytes", "upload.cos.sent_all", "upload.cos.retrying",
 		"upload.cos.err.plan",
+		// upload-liveness（0084）：vanish client 终态与校验细节文案
+		"upload.cos.err.client_gone", "upload.cos.err.client_idle_timeout",
+		"upload.cos.err.validation", "upload.cos.err.raster_mismatch",
+		"upload.cos.err.magic",
 	];
 
 	function loadI18n() {
@@ -888,5 +914,33 @@ describe("i18n：upload.cos.* 键（zh/en）与 stage 映射", () => {
 		for (const key of [...STAGE_KEYS.map((s) => "upload.cos.stage." + s), ...OTHER_KEYS]) {
 			expect(appSrc).toContain(`"${key}"`);
 		}
+	});
+});
+
+// ----------------------------------------------------------------------- //
+// upload-liveness（0084）：终态机器码/fail_detail → 可读文案映射
+// ----------------------------------------------------------------------- //
+describe("upload-liveness：终态机器码 → 可读文案", () => {
+	it("client_gone / client_idle_timeout / validation_failed(+fail_detail) 映射", () => {
+		const h = loadApp();
+		const msg = (h.up as unknown as {
+			cosErrorMessage: (s: number, d: unknown) => string;
+		}).cosErrorMessage;
+		// 幻影客户端终态：给出「重新发起上传」指引（_EXTRA_I18N/i18n.js zh 兜底）
+		expect(msg(0, { code: "client_gone" }))
+			.toBe("该上传任务因长时间无活动已自动取消：请重新发起上传");
+		expect(msg(0, { code: "client_idle_timeout" }))
+			.toBe("该上传长时间无进展已自动取消：请重新发起上传");
+		// 校验失败 + 白名单细节 → 针对性文案（PNG/WebP 改名 .jpg）
+		expect(msg(0, { code: "validation_failed",
+			fail_detail: "raster_format_mismatch" }))
+			.toBe("文件内容与扩展名不符（例如 PNG/WebP 被存成了 .jpg）：请用正确格式重新保存或改名后再上传");
+		expect(msg(0, { code: "validation_failed" }))
+			.toBe("文件校验失败：内容不是有效的切片文件");
+		// 未知 fail_detail 不影响 validation_failed 兜底文案；未知码保留原文
+		expect(msg(0, { code: "validation_failed",
+			fail_detail: "not-in-whitelist" }))
+			.toBe("文件校验失败：内容不是有效的切片文件");
+		expect(msg(0, { code: "some_unknown_code" })).toBe("some_unknown_code");
 	});
 });

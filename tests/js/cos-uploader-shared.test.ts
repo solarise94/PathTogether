@@ -1578,7 +1578,9 @@ describe("createUpload：状态轮询容忍瞬时失败（review #9）", () => {
 		void up.done.then((r) => { settled = r as { ok?: boolean }; });
 		for (let i = 0; i < 200 && !settled; i++) await advYield(700);
 		expect(settled && settled.ok).toBe(true);
-		expect(h.statusGets()).toBe(4);   // 2 次失败 + uploading + viewable
+		// 2 次失败 + uploading + 分块在途心跳（upload-liveness，≤60s 一次）
+		// + viewable
+		expect(h.statusGets()).toBe(5);
 	});
 
 	it("连续失败超界（>5 次）→ reject {recheck:true}；同 job 重新查询可收口", async () => {

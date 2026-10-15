@@ -83,6 +83,12 @@
     "upload.cos.err.state": { zh: "任务状态冲突，请刷新页面后重试", en: "Job state conflict; please refresh and retry" },
     "upload.cos.err.rate": { zh: "签名请求过于频繁，请稍后重试", en: "Signing rate limited; please retry later" },
     "upload.cos.err.reconcile": { zh: "云端容量对账中，暂不可继续，请稍后重试", en: "Cloud capacity reconciliation in progress; retry later" },
+    // upload-liveness（0084）：vanish client 终态与校验细节文案（i18n.js 为主源，此处兜底）
+    "upload.cos.err.client_gone": { zh: "该上传任务因长时间无活动已自动取消：请重新发起上传", en: "This upload was cancelled automatically after prolonged inactivity; please start the upload again" },
+    "upload.cos.err.client_idle_timeout": { zh: "该上传长时间无进展已自动取消：请重新发起上传", en: "This upload was cancelled after a long idle period; please start the upload again" },
+    "upload.cos.err.validation": { zh: "文件校验失败：内容不是有效的切片文件", en: "Validation failed: the content is not a valid slide file" },
+    "upload.cos.err.raster_mismatch": { zh: "文件内容与扩展名不符（例如 PNG/WebP 被存成了 .jpg）：请用正确格式重新保存或改名后再上传", en: "File content does not match its extension (e.g. a PNG/WebP saved as .jpg); re-save or rename it correctly and upload again" },
+    "upload.cos.err.magic": { zh: "文件内容与扩展名不符（检测到 {type}）：请用正确格式重新保存后再上传", en: "File content does not match its extension (detected {type}); re-save it in the correct format and upload again" },
     // 复核 8428f7f0：跨标签内容锁等待（另一标签正在上传同一文件；i18n.js 为主源，此处兜底）
     "upload.cos.other.tab": { zh: "另一个标签页正在上传同一文件，等待中…（可取消）", en: "Another tab is uploading this file — waiting… (you can cancel)" },
     // U1 字节级上传进度（i18n.js 为主源，此处兜底）
@@ -10488,6 +10494,26 @@
   // COS PUT 绝不经 apiFetch（CSRF 对 COS 是污染头），mode:"cors" +
   // credentials:"omit"；控制 API 经 apiFetch 带双提交头。
 
+  // 检测到的文件内容类型 → 本地化名称（upload-liveness：魔数不符文案的
+  // {type} 形参；i18n.js 不收机器枚举，页面侧小映射）。
+  var MAGIC_TYPE_NAMES = {
+    png: { zh: "PNG 图片", en: "a PNG image" },
+    webp: { zh: "WebP 图片", en: "a WebP image" },
+    gif: { zh: "GIF 图片", en: "a GIF image" },
+    heic: { zh: "HEIC/HEIF 图片", en: "a HEIC/HEIF image" },
+    jpeg: { zh: "JPEG 图片", en: "a JPEG image" },
+    tiff: { zh: "TIFF 图像", en: "a TIFF image" },
+    bmp: { zh: "BMP 图片", en: "a BMP image" },
+    zip: { zh: "ZIP 压缩包", en: "a ZIP archive" },
+    unknown: { zh: "无法识别的内容", en: "unrecognized content" },
+  };
+
+  function magicTypeName(detected) {
+    var lang = (window.HP_I18N && window.HP_I18N.getLang()) || "zh";
+    var e = MAGIC_TYPE_NAMES[detected] || MAGIC_TYPE_NAMES.unknown;
+    return e[lang] || e.zh;
+  }
+
   // ---------- 稳定机器码 → 可读文案（未知码保留原文的兜底模式） ----------
   function cosErrorMessage(status, data) {
     var code = (data && (data.code || data.error)) || "";
@@ -10507,6 +10533,19 @@
     if (code === "name_unavailable") return tt("upload.err.name");
     if (code === "invalid_declared_size") return tt("upload.err.size_mismatch");
     if (code === "cos_unavailable") return tt("upload.cos.err.unavailable");
+    // upload-liveness（0084）：vanished client 的终态收口给出明确指引。
+    if (code === "client_gone") return tt("upload.cos.err.client_gone");
+    if (code === "client_idle_timeout") {
+      return tt("upload.cos.err.client_idle_timeout");
+    }
+    // 校验失败：fail_detail（白名单细节）在时给针对性文案——最常见的是
+    // PNG/WebP 改名 .jpg（raster_format_mismatch）。
+    if (code === "validation_failed") {
+      if (data && data.fail_detail === "raster_format_mismatch") {
+        return tt("upload.cos.err.raster_mismatch");
+      }
+      return tt("upload.cos.err.validation");
+    }
     if (status === 403) return tt("upload.err.csrf");
     // 未知码保留原文（排障需要机器码，不猜测语义）
     return code || status || tt("upload.stage.failed");
@@ -10703,8 +10742,15 @@
         cosUploadSucceeded(row, r.body, file, opts.assocTarget);
       }, function (err) {
         var msg;
-        if (err && err.terminal) {
-          msg = cosErrorMessage(0, { code: (err.data && err.data.fail_code) || "" });
+        if (err && err.magicMismatch) {
+          // 前置魔数校验拒绝（零网络请求）：说出检测到的内容类型
+          msg = tt("upload.cos.err.magic",
+                   { type: magicTypeName(err.magicMismatch.detected) });
+        } else if (err && err.terminal) {
+          msg = cosErrorMessage(0, {
+            code: (err.data && err.data.fail_code) || "",
+            fail_detail: err.data && err.data.fail_detail,
+          });
         } else if (err && err.network) {
           // 网络层失败：任务与已确认分块保留，重选同名文件可续传（§5）
           msg = tt("upload.cos.resume_hint");
@@ -10855,6 +10901,8 @@
     uploadFileCos: uploadFileCos,
     resolveCosConfig: resolveCosConfig,
     cosStageKey: cosStageKey,
+    // upload-liveness：稳定机器码/fail_detail → 可读文案（测试驱动面）
+    cosErrorMessage: cosErrorMessage,
     initCosUploadUi: initCosUploadUi,
     restoreCosJobs: restoreCosJobs,
     // R1 一键转换并上传（工作台入口的驱动面）

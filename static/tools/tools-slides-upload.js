@@ -91,8 +91,48 @@ export function toolStageText(t, body) {
 /// 与 HTTP 状态，绝不把原始对象/响应体拼进文案（[object Object]、内部细节）。
 const STABLE_CODE_RE = /^[a-z][a-z0-9_]{0,63}$/;
 
+/// upload-liveness（0084）：检测到的文件内容类型 → 本地化名称
+/// （tools.upload.failed.magic 的 {type} 形参；i18n.js 不收机器枚举）。
+export function magicTypeName(detected) {
+  const names = {
+    png: { zh: 'PNG 图片', en: 'a PNG image' },
+    webp: { zh: 'WebP 图片', en: 'a WebP image' },
+    gif: { zh: 'GIF 图片', en: 'a GIF image' },
+    heic: { zh: 'HEIC/HEIF 图片', en: 'a HEIC/HEIF image' },
+    jpeg: { zh: 'JPEG 图片', en: 'a JPEG image' },
+    tiff: { zh: 'TIFF 图像', en: 'a TIFF image' },
+    bmp: { zh: 'BMP 图片', en: 'a BMP image' },
+    zip: { zh: 'ZIP 压缩包', en: 'a ZIP archive' },
+    unknown: { zh: '无法识别的内容', en: 'unrecognized content' },
+  };
+  const lang = (window.HP_I18N && typeof window.HP_I18N.getLang === 'function')
+    ? (window.HP_I18N.getLang() || 'zh') : 'zh';
+  const e = names[detected] || names.unknown;
+  return e[lang] || e.zh;
+}
+
 export function describeUploadError(err) {
   const data = err && typeof err.data === 'object' && err.data ? err.data : null;
+  // upload-liveness（0084）：引擎的 terminal 拒绝把 fail_code/fail_detail
+  // 放在 data 上（直传面板也经这里收口）——给出明确指引而非「未知错误」。
+  if (err && err.terminal) {
+    const failCode = data && typeof data.fail_code === 'string'
+      ? data.fail_code : '';
+    if (failCode === 'client_gone') {
+      return { key: 'tools.upload.failed.client_gone' };
+    }
+    if (failCode === 'client_idle_timeout') {
+      return { key: 'tools.upload.failed.client_idle' };
+    }
+    if (failCode === 'validation_failed' &&
+        data.fail_detail === 'raster_format_mismatch') {
+      return { key: 'tools.upload.failed.raster_mismatch' };
+    }
+  }
+  if (err && err.magicMismatch) {
+    return { key: 'tools.upload.failed.magic',
+             vars: { type: magicTypeName(err.magicMismatch.detected) } };
+  }
   const rawCode = data && typeof data.code === 'string' ? data.code : '';
   const code = STABLE_CODE_RE.test(rawCode) ? rawCode : '';
   const status = err && Number.isInteger(err.status) ? err.status : 0;
@@ -373,8 +413,28 @@ export function createUploadController({
       setMsg(jobId, 'tools.upload.resume.hint');
       return;
     }
+    if (err && err.magicMismatch) {
+      // 上传前置魔数校验拒绝（引擎在创建 ingestion 前判定，零网络请求）：
+      // 说出检测到的内容类型，指引重新保存（upload-liveness 0084）。
+      setMsg(jobId, 'tools.upload.failed.magic',
+             { type: magicTypeName(err.magicMismatch.detected) });
+      return;
+    }
     if (err && err.terminal) {
       const code = (err.data && err.data.fail_code) || '';
+      const detail = (err.data && err.data.fail_detail) || '';
+      // upload-liveness（0084）：vanished client 的终态与校验细节给出
+      // 明确指引，不再只透出机器码。
+      if (code === 'client_gone' || code === 'client_idle_timeout') {
+        setMsg(jobId, code === 'client_gone'
+          ? 'tools.upload.failed.client_gone'
+          : 'tools.upload.failed.client_idle');
+        return;
+      }
+      if (code === 'validation_failed' && detail === 'raster_format_mismatch') {
+        setMsg(jobId, 'tools.upload.failed.raster_mismatch');
+        return;
+      }
       setMsg(jobId, 'tools.upload.failed.terminal', {
         code: (typeof code === 'string' && STABLE_CODE_RE.test(code)) ? code : '—',
       });

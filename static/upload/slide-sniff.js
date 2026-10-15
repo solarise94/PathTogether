@@ -509,6 +509,103 @@
     return bad;
   }
 
+  // ---- 上传前置魔数校验（upload-liveness：fail-fast） ----------------
+  // 生产事故：WeChat/手机导出的 PNG/WebP 改名 .jpg、或非 TIFF 内容改名
+  // .tif，浏览器不再先建任务/先传分块，而是在**创建 ingestion 之前**按
+  // 扩展名核对首部魔数——不符立即拒绝（明确说出检测到的类型），不再浪费
+  // 一次排队/上传。与服务端同一权威镜像：
+  //   - 普通图片族（.jpg/.jpeg/.bmp）：raster_slide.RasterSlide 按
+  //     PIL 识别（JPEG=FF D8 FF、BMP="BM"），伪装字节必被拒
+  //     （invalid_slide / RasterFormatMismatch）；
+  //   - TIFF 族（.tif/.tiff/.ome.*/.svs/.scn/.ndpi/.bif）：openslide/
+  //     tifffile 都要求 II*\0 / MM\0* 魔数，非 TIFF 内容必被拒。
+  // 因此「魔数不符」的拒绝绝不会拒绝服务端本会接受的文件；嗅探读失败
+  // 一律放行（服务端 open_slide 终审）。其余扩展名不校验（服务端受理
+  // 词表闸负责）。
+  var VERIFY_HEAD_BYTES = 16;
+
+  // 普通图片扩展名 → 期望魔数类别（服务端 raster 分支白名单同集）。
+  var RASTER_EXPECTED = { ".jpg": "jpeg", ".jpeg": "jpeg", ".bmp": "bmp" };
+
+  // TIFF 族扩展名（容器恒为 classic TIFF / BigTIFF 魔数；.ome.* 复合
+  // 后缀按其 .tif/.tiff 尾段同样归入）。
+  var TIFF_FAMILY_EXTS = {
+    ".tif": 1, ".tiff": 1, ".ome.tif": 1, ".ome.tiff": 1,
+    ".svs": 1, ".scn": 1, ".ndpi": 1, ".bif": 1,
+  };
+
+  /** 首部字节 → 已知内容类别；认不出返回 null（不当证据）。 */
+  function detectBytesKind(u8) {
+    if (!u8 || u8.length < 4) return null;
+    if (u8[0] === 0xFF && u8[1] === 0xD8 && u8[2] === 0xFF) return "jpeg";
+    if (u8[0] === 0x89 && u8[1] === 0x50 && u8[2] === 0x4E &&
+        u8[3] === 0x47) return "png";
+    if (u8[0] === 0x47 && u8[1] === 0x49 && u8[2] === 0x46 &&
+        u8[3] === 0x38) return "gif";
+    if (u8[0] === 0x42 && u8[1] === 0x4D) return "bmp";
+    if (u8[0] === 0x52 && u8[1] === 0x49 && u8[2] === 0x46 &&
+        u8[3] === 0x46 && u8.length >= 12 &&
+        u8[8] === 0x57 && u8[9] === 0x45 && u8[10] === 0x42 &&
+        u8[11] === 0x50) return "webp";
+    if ((u8[0] === 0x49 && u8[1] === 0x49 && u8[2] === 0x2A &&
+         u8[3] === 0x00) ||
+        (u8[0] === 0x4D && u8[1] === 0x4D && u8[2] === 0x00 &&
+         u8[3] === 0x2A)) return "tiff";
+    if (u8[4] === 0x66 && u8[5] === 0x74 && u8[6] === 0x79 &&
+        u8[7] === 0x70 && u8.length >= 12) {
+      // ISOBMFF（ftyp 盒）：HEIC/HEIF 品牌点名，其余容器（MP4 等）不猜。
+      var brand = String.fromCharCode(u8[8], u8[9], u8[10], u8[11]);
+      if (/^hei/.test(brand) || brand === "mif1" || brand === "msf1" ||
+          brand === "heim" || brand === "heis" || brand === "hevx") {
+        return "heic";
+      }
+      return null;
+    }
+    return null;
+  }
+
+  /** 扩展名 → 期望类别（"jpeg"|"bmp"|"tiff"）；不校验的扩展名返回 null。 */
+  function expectedKindForExt(ext) {
+    if (RASTER_EXPECTED[ext]) return RASTER_EXPECTED[ext];
+    if (TIFF_FAMILY_EXTS[ext]) return "tiff";
+    return null;
+  }
+
+  /**
+   * headerMismatch(name, headBytes) — 同步判定（注入首部字节，vitest 直
+   * 用）。扩展名可校验且首部魔数不符 → {ext, expected, detected}
+   * （detected = 已识别类型或 "unknown"）；否则 null（放行，服务端终审）。
+   * 首部不足以识别（< 4 字节）→ null（证据不足不当拒绝依据——嗅探绝不
+   * 阻塞上传）。
+   */
+  function headerMismatch(name, headBytes) {
+    var ext = extOf(name);
+    var expected = expectedKindForExt(ext);
+    if (!expected) return null;
+    if (!headBytes || headBytes.length < 4) return null;
+    var detected = detectBytesKind(headBytes);
+    if (detected === expected) return null;
+    return { ext: ext, expected: expected,
+             detected: detected || "unknown" };
+  }
+
+  /**
+   * verifyUploadHeader(name, sliceable) — 生产入口（创建 ingestion 之前
+   * 调用）：有界读首部 VERIFY_HEAD_BYTES 字节做魔数核对。读失败/不足 →
+   * null（放行，服务端终审——嗅探绝不阻塞上传）。
+   */
+  function verifyUploadHeader(name, sliceable) {
+    return Promise.resolve().then(function () {
+      if (!sliceable || typeof sliceable.slice !== "function") return null;
+      return sliceable.slice(0, VERIFY_HEAD_BYTES).arrayBuffer();
+    }).then(function (buf) {
+      if (!buf || buf.byteLength < 4) return null;
+      return headerMismatch(name, new Uint8Array(buf));
+    }, function () {
+      return null;   // 读失败：降级到服务端终审
+    });
+  }
+
   /**
    * classifyTiffReadable(file, ext) — TIFF 生产路径（review 2026-10-07 #2）。
    * 有界随机读取：头 16B → 首 IFD 偏移 → IFD 表（≤ SNIFF_IFD_WINDOW）→
@@ -736,5 +833,11 @@
     classifyRasterHead: classifyRasterHead,
     classifyFile: classifyFile,
     extOf: extOf,
+    // 上传前置魔数校验（upload-liveness：创建任务前 fail-fast）
+    VERIFY_HEAD_BYTES: VERIFY_HEAD_BYTES,
+    detectBytesKind: detectBytesKind,
+    expectedKindForExt: expectedKindForExt,
+    headerMismatch: headerMismatch,
+    verifyUploadHeader: verifyUploadHeader,
   };
 })();

@@ -3579,7 +3579,18 @@ def _landing_response(**overrides):
 
 
 def _workbench_response():
-    """完整 PathTogether 工作台（登录后 /app；AUTH_ENABLED=False 时也用于 /）。"""
+    """完整 PathTogether 工作台（登录后 /app；AUTH_ENABLED=False 时也用于 /）。
+
+    上传面板内转换（docs/upload-inline-convert-design-20261015.md §1.1）：
+    本页当前**不下发** Content-Security-Policy（与 /tools/slides 不同，见
+    _slide_tools_csp）。面板会在本页动态 import 运行器、起 module worker 并
+    编译 WASM；**将来若给 /app 加 CSP，必须包含** `script-src … 'wasm-unsafe-eval'`
+    与 `worker-src 'self'`，否则面板内转换整体不可用（该回归由
+    tests/test_upload_inline_convert_capability.py 的
+    test_app_csp_must_not_block_wasm_or_worker 钉住）。内联
+    window.HP_APP_BOOTSTRAP / 内联样式（templates/index.html）也需要
+    'unsafe-inline' 或 nonce。
+    """
     sample = sample_plugin_context()
     # histopilot index 注入 = feature flag 与来源策略**与**逻辑（Stage 5-3）：
     # 来源策略拒绝时不加载 bundle（与 flag=0 同等静默降级）。

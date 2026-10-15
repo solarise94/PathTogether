@@ -29,6 +29,10 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
+// §9.2 第 12 项：对照对象是 ES module，只能顶层 import（设计 §9.2 前言的
+// 「两种加载面」——classic script 用 new Function，ES module 用 import，
+// 同一文件内并存）。生产代码**不** import 它（它是工具页 DOM 依赖）。
+import { createUploadController } from "../../static/tools/tools-slides-upload.js";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -1125,5 +1129,148 @@ describe("i18n（§8 / §9.2 第 14、22 项）", () => {
 			appSrc.indexOf("function cosErrorMessage"),
 			appSrc.indexOf("function cosFailStageKey"));
 		expect(msg).toContain("convertInBrowserMessage()");
+	});
+});
+
+// --------------------------------------------------------------------- //
+// 12. 门禁等价性对照（§2.3 承诺 / §9.2 第 12 项）
+//
+// 对照面**不是** runLocked 全序列：它含人工交互分支（chooseAccountAction 的
+// dialog、signOutForOriginal 的登录跳转）与孤儿结算（settleOrphan），无法逐例
+// 自动比对。这里只比对两点可自动化的观察面：
+//   A 判定结论：面板纯函数 artifactGate 与工具页控制器 ctl.isDisabled 对同一
+//     组输入必须同判（工具页既有测试正是用 isDisabled 断言，
+//     tools-upload-limit.test.ts:169 / tools-upload-feedback.test.ts:270）；
+//   B 副作用：refuse 路径双方都**没有** POST /api/ingestions。
+// 明确**不做**：账号 mismatch / 孤儿 / 已发布重放——它们是工具页特有的交互
+// 语义，面板按设计 §7 自己的处置走，两侧在这些分支上允许不同。
+// --------------------------------------------------------------------- //
+describe("门禁等价性对照（§9.2 第 12 项）", () => {
+	const VIEWABLE = ["ome-bigtiff-subifd-rgb-jpeg-pyramid", "classic-bigtiff-jpeg-pyramid"];
+	const cosCaps = (maxSize: number) => ({
+		available: true, max_size_bytes: maxSize, part_bytes: 100,
+		url_ttl_seconds: 600, max_concurrent_parts: 2, sign_batch_max_parts: 4,
+		policy_version: "v1-manual", formats: ["tif", "tiff"],
+	});
+
+	/// 驱动工具页上传控制器（真模块 + 假 runner/fetch），返回 isDisabled + 是否
+	/// 建过 ingestion。形态照 tools-upload-limit.test.ts。
+	async function toolsPageVerdict(maxSize: number, job: unknown) {
+		const fetchLog: Array<{ method: string; url: string }> = [];
+		const cap = {
+			cos_upload: cosCaps(maxSize), viewable_formats: VIEWABLE,
+			account: "u1", account_label: "u1@x",
+		};
+		const resp = (body: unknown, status = 200) => ({
+			ok: status >= 200 && status < 300, status,
+			clone() { return this; },
+			json: () => Promise.resolve(body),
+		});
+		const els: Record<string, { hidden: boolean; disabled: boolean; textContent: string }> = {};
+		const doc = {
+			getElementById(id: string) {
+				if (!els[id]) els[id] = { hidden: false, disabled: false, textContent: "" };
+				return els[id];
+			},
+			createElement() { return { style: {}, appendChild() { }, addEventListener() { } }; },
+			addEventListener() { },
+		};
+		const fetchImpl = vi.fn((url: string, opts?: { method?: string }) => {
+			const method = (opts?.method || "GET").toUpperCase();
+			fetchLog.push({ method, url: String(url) });
+			if (String(url) === "/api/tools/slides/upload-capability") {
+				return Promise.resolve(resp(cap));
+			}
+			if (method === "POST" && String(url) === "/api/ingestions") {
+				return Promise.resolve(resp(
+					{ job_id: "inj_t1", state: "preparing", stage: "uploading" }, 202));
+			}
+			return Promise.resolve(resp({}));
+		}) as unknown as typeof fetch;
+		const w: Record<string, unknown> = { HP_COS_UPLOAD: null };
+		new Function("window", "document", "fetch", "location",
+			readFileSync(resolve(root, "static/upload/cos-uploader.js"), "utf8"))(
+			w, doc, fetchImpl, { href: "http://local/tools/slides", origin: "http://local" });
+		vi.stubGlobal("window", w);
+		vi.stubGlobal("document", doc);
+		vi.stubGlobal("fetch", fetchImpl);
+		vi.stubGlobal("localStorage", { getItem: () => null, setItem() { }, removeItem() { } });
+		vi.stubGlobal("navigator", {
+			locks: { request: (_n: string, _o: unknown, fn: (l: unknown) => Promise<unknown>) =>
+				Promise.resolve(fn({ name: "lock" })) },
+		});
+		const runner = {
+			async getJob() { return job; },
+			async setJobUpload() { return undefined; },
+			async setJobIntent() { return undefined; },
+			async artifactView() { return { size: 1, slice: () => null }; },
+		};
+		const ctl = createUploadController({
+			runner: runner as never,
+			t: (k: string) => k,
+			onJobsRefresh: null, onPublished: null,
+		}) as unknown as {
+			startOrContinue(id: string): Promise<unknown>;
+			setResultJob(id: string): Promise<unknown>;
+			isDisabled(id: string): boolean;
+		};
+		await ctl.setResultJob("job-1");
+		await ctl.startOrContinue("job-1");
+		const created = fetchLog.some(
+			(f) => f.method === "POST" && f.url === "/api/ingestions");
+		return { disabled: ctl.isDisabled("job-1"), created };
+	}
+
+	const cases: Array<{ label: string; max: number; job: unknown }> = [
+		{
+			label: "产物超上限",
+			max: 1000,
+			job: { id: "job-1", state: "ready",
+				result: { outputBytes: 5000, format: VIEWABLE[0] } },
+		},
+		{
+			label: "产物格式不可查看",
+			max: 1_000_000,
+			job: { id: "job-1", state: "ready",
+				result: { outputBytes: 100, format: "something-else" } },
+		},
+		{
+			label: "格式可查看且大小合规",
+			max: 1_000_000,
+			job: { id: "job-1", state: "ready",
+				result: { outputBytes: 100, format: VIEWABLE[0] } },
+		},
+	];
+
+	for (const c of cases) {
+		it(`${c.label}：面板 artifactGate 与工具页 isDisabled 同判（观察面 A/B）`, async () => {
+			const tools = await toolsPageVerdict(c.max, c.job);
+			const I = IC();
+			const cfg = { max_size_bytes: c.max, part_bytes: 100 };
+			const panel = I.artifactGate(cfg, c.job, VIEWABLE);
+			// 观察面 A：判定结论等价（工具页 disabled ⇔ 面板 !ok）
+			expect(panel.ok, `${c.label}: tools.disabled=${tools.disabled}`)
+				.toBe(!tools.disabled);
+			// 观察面 B：refuse 路径双方都零创建
+			if (!panel.ok) expect(tools.created, `${c.label} 不应建 ingestion`).toBe(false);
+			vi.unstubAllGlobals();
+		});
+	}
+
+	it("viewable_formats 字段缺失：面板 fail-closed，与工具页 (cap.viewable_formats || []) 同语义", () => {
+		const job = { id: "job-1", state: "ready",
+			result: { outputBytes: 100, format: VIEWABLE[0] } };
+		const I = IC();
+		// 面板：字段缺失显式 fail-closed（缺字段绝不等于通过，§8）
+		const missing = I.artifactGate({ max_size_bytes: 1_000_000 }, job, undefined);
+		expect(missing.ok).toBe(false);
+		expect(missing.code).toBe("viewable_formats_missing");
+		// 有该字段且格式在集内 → 面板放行
+		expect(I.artifactGate({ max_size_bytes: 1_000_000 }, job, VIEWABLE).ok).toBe(true);
+		// 工具页同语义的**源码级**证据：它对该字段取 `(cap.viewable_formats || [])`，
+		// 缺失即空集 → 空集的 indexOf 判定必落空 → 同样拒绝（与面板一致）。
+		const uploadSrc = readFileSync(
+			resolve(root, "static/tools/tools-slides-upload.js"), "utf8");
+		expect(uploadSrc).toContain("!(cap.viewable_formats || []).includes(fmt)");
 	});
 });

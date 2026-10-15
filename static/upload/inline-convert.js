@@ -113,6 +113,34 @@
     return null;
   }
 
+  /// 转换产物门禁（设计 §5.1）——纯函数，与工具页
+  /// tools-slides-upload.js:772-789 的判定序列等价：
+  ///   ② 最终文件大小（job.result.outputBytes）↔ cfg.max_size_bytes
+  ///   ③ 核心 result.format ∈ viewable_formats
+  /// 字段缺失 = fail-closed（与工具页 `(cap.viewable_formats || [])` 落空同义）。
+  /// §9.2 第 12 项的对照测试直接用它比对工具页控制器的 isDisabled 结论。
+  function artifactGate(cfg, job, viewableFormats) {
+    if (!cfg) {
+      return { ok: false, code: "cos_unavailable",
+               stageKey: "upload.cos.unavailable" };
+    }
+    var outBytes = (job && job.result && job.result.outputBytes) || 0;
+    if (outBytes > cfg.max_size_bytes) {
+      return { ok: false, code: "upload_too_large",
+               stageKey: "upload.cos.err.too_large" };
+    }
+    var fmt = (job && job.result && job.result.format) || "";
+    if (!Array.isArray(viewableFormats)) {
+      return { ok: false, code: "viewable_formats_missing",
+               stageKey: "upload.inline.err.notViewable" };
+    }
+    if (!fmt || viewableFormats.indexOf(fmt) < 0) {
+      return { ok: false, code: "format_not_viewable",
+               stageKey: "upload.inline.err.notViewable" };
+    }
+    return { ok: true, code: null, stageKey: null };
+  }
+
   // ------------------------------------------------------------- 失败文案 --
 
   /// 引擎错误码 / 服务端码 → 行内文案键（设计 §7.3 + §7.4）。未知码 null
@@ -823,7 +851,7 @@
         .then(function (j) {
           job = j;
           // 门禁（设计 §5.1）：能力 + 账号 + **最终产物**大小 + viewable_formats
-          var gate = artifactGate(e, job);
+          var gate = entryArtifactGate(e, job);
           if (!gate.ok) {
             markError(e, gate.code, null, {});
             e.state = "convert_failed";
@@ -883,30 +911,12 @@
       settle(e, "done");
     }
 
-    /// 转换产物的门禁（设计 §5.1）：只有这里用 viewable_formats。
-    function artifactGate(e, job) {
-      var cfg = caps.cosConfig;
-      if (!cfg) {
-        return { ok: false, code: "cos_unavailable",
-                 stageKey: "upload.cos.unavailable" };
-      }
-      var outBytes = (job && job.result && job.result.outputBytes) || 0;
-      if (outBytes > cfg.max_size_bytes) {
-        return { ok: false, code: "upload_too_large",
-                 stageKey: "upload.cos.err.too_large" };
-      }
-      var fmt = (job && job.result && job.result.format) || "";
-      var vf = caps.inlineConvert ? caps.inlineConvert.viewableFormats : null;
-      if (!Array.isArray(vf)) {
-        // 字段缺失（旧后端/缓存 JS）→ fail-closed（设计 §8）
-        return { ok: false, code: "viewable_formats_missing",
-                 stageKey: "upload.inline.err.notViewable" };
-      }
-      if (!fmt || vf.indexOf(fmt) < 0) {
-        return { ok: false, code: "format_not_viewable",
-                 stageKey: "upload.inline.err.notViewable" };
-      }
-      return { ok: true };
+    /// 转换产物的门禁（设计 §5.1）：只有本机产物走这里（直传条目**不适用**）。
+    /// 实现是下面的纯函数 artifactGate（与工具页 tools-slides-upload.js:772-789
+    /// 的判定序列等价）；这里只负责取出本条目的 cfg 与 viewable_formats。
+    function entryArtifactGate(e, job) {
+      return artifactGate(caps.cosConfig, job,
+        caps.inlineConvert ? caps.inlineConvert.viewableFormats : null);
     }
 
     function uploadArtifact(e, artifact, job) {
@@ -1217,6 +1227,7 @@
     routeFor: routeFor,
     artifactDeclaration: artifactDeclaration,
     directDeclaration: directDeclaration,
+    artifactGate: artifactGate,
     failureStageKey: failureStageKey,
     prefillFormatRequest: prefillFormatRequest,
     shouldWarn: shouldWarn,

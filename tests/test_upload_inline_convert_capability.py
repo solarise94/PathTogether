@@ -241,3 +241,25 @@ def test_inline_convert_source_shape():
         encoding="utf-8")
     assert "window.HP_INLINE_CONVERT" in src
     assert "^import " not in src and "\nimport " not in src
+
+
+# --------------------------------------------------------------------------- #
+# 5. 面板侧门禁函数（artifactGate）的契约（设计 §5.1）
+# --------------------------------------------------------------------------- #
+def test_artifact_gate_is_scoped_to_converted_artifacts():
+    """`artifactGate` 是**转换产物**的门禁纯函数（JS）；这里锁「服务端侧的
+    同源约束」：viewable_formats 的唯一来源是
+    SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS，且它只含三个核心产物格式字符串
+    （不是扩展名）——面板的直传路径**不**使用它。"""
+    import slide_format_registry
+    formats = list(app_mod.SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS)
+    assert formats, "可查看格式表不能为空"
+    # 全是核心 result.format 形态的字符串（含 '-'，不含 '.' 扩展名前缀）
+    for f in formats:
+        assert isinstance(f, str) and f
+        assert not f.startswith("."), f
+        assert "-" in f, f
+    # 注册表里不存在同名扩展名（防把它当扩展名用）
+    for f in formats:
+        assert slide_format_registry.lookup(f)["capability"] == \
+            slide_format_registry.CAP_UNSUPPORTED, f

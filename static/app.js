@@ -10147,21 +10147,17 @@
     // 面板内转换（设计 §3.5 第 1 点）：快照必须在**入队之前**取——这条既
     // 有语义与源码级断言（viewer-folders.test.ts）都由本次接线保持。
     opts.assocTarget = importTargetSnapshot();
-    // 上传面板内转换（设计 §2.2①）：开关开 → 全部交给面板队列；关闭 →
-    // 逐字节保持既有分流（弹窗交接 + 直传）。
-    if (inlineEnabled() && ensureInlineOrch()) {
-      var orch = inlineOrch;
-      if (orch) {
-        orch.enqueue(file, { assocTarget: opts.assocTarget });
-        return;
-      }
-      ensureInlineOrch().then(function (o) {
-        if (o) o.enqueue(file, { assocTarget: opts.assocTarget });
-        else legacyUploadFile(file, opts);
-      });
+    if (!inlineEnabled()) {          // 开关关闭 → 回退路径（控制流不变）
+      legacyUploadFile(file, opts);
       return;
     }
-    legacyUploadFile(file, opts);
+    // 面板内转换（设计 §2.2①）：全部交给面板队列（含散文件 bundle 的
+    // 「需要完整包」类型化说明，§4.1.1）。运行器懒加载；加载失败 → 回退
+    // 到既有分流（绝不静默丢弃用户的选择）。
+    ensureInlineOrch().then(function (orch) {
+      if (orch) orch.enqueue(file, { assocTarget: opts.assocTarget });
+      else legacyUploadFile(file, opts);
+    });
   }
 
   /// 既有分流路径（开关关闭 / 面板初始化失败时的回退；控制流不变）。
@@ -11559,8 +11555,8 @@
   }
 
   /// 拖入目录的遍历（readEntries 每批 ≤100，循环到空批；成员数封顶）。
-  /// MRXS 完整包（含 .mrxs/.dat 成员）→ 弹窗交接（转换工具按文件夹接收）；
-  /// 普通目录 → 成员文件逐个 uploadFile。无法遍历给明确提示。
+  /// bundle 成员（`.mrxs`/`.dat`/`.vms`）→ 开关开时进面板队列（整包转换），
+  /// 关闭时弹窗交接；普通目录 → 成员文件逐个 uploadFile。无法遍历给明确提示。
   function importDroppedDirectory(dirEntry) {
     var MAX_MEMBERS = 8192;
     function collect(entry, prefix, rows) {
@@ -11639,7 +11635,9 @@
     handoffBundleFolder(rows, folderName);
   }
 
-  /// MRXS 完整包 → 本机转换交接（弹窗 + 抽屉待操作入口，可重试）。
+  /// bundle 完整包 → 本机转换交接（弹窗 + 抽屉待操作入口，可重试）。
+  /// 仅在开关关闭（或面板初始化失败）时使用；开关开时由 importBundleRows
+  /// 进面板队列（设计 §2.2⑩b）。
   function handoffBundleFolder(rows, folderName) {
     var total = rows.reduce(function (a, r) {
       return a + ((r.file && r.file.size) || 0);

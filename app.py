@@ -18098,9 +18098,11 @@ def _validate_ai_attachments(body, slide):
                     return None, (jsonify(
                         error="revision_conflict",
                         current_revision=current), 409)
-        rec["annotation_id"] = aid
-        rec["revision"] = int(roi.get("revision") or 1)
-        rec["type"] = roi.get("type")
+            # marker 专属键只在 marker 分支写入——此前 aid/roi 在 viewport
+            # 分支未定义，rec 赋值行会让「添加视野」类请求 500 NameError。
+            rec["annotation_id"] = aid
+            rec["revision"] = int(roi.get("revision") or 1)
+            rec["type"] = roi.get("type")
         out.append(rec)
     return out, None
 

@@ -1822,6 +1822,94 @@ def test_run_by_slide_id_target_asset_revision(monkeypatch):
     assert fake.calls[-1]["body"]["target"]["asset_revision"] == cur
 
 
+def test_run_interpret_marker_attachment_passes_validator(monkeypatch):
+    """「✨ 让 AI 解读」（标记 ⋯ 菜单）的发送链路：插件按
+    applyPendingAttachesToBody + viewer.getSkillTarget 冻结出的精确 body 形态
+    ——slide_id run + marker 附件（冻结 bbox、annotation_id/revision/type）+
+    viewport=标注包围盒 + target(kind=annotation, asset_revision,
+    annotation_revision) → 200 透传 fake sidecar（附件与 target 双校验全过）。
+    附件 revision / 资产 revision / 标注 revision 过期 → 409 且零 sidecar 调用。"""
+    fake = _setup_run_env(monkeypatch)
+    _touch()
+    sid = share_store.get_slide_id("demo.svs")
+    roi = share_store.add_roi(share_store.ADMIN_TOKEN, "demo.svs", "待解读标记",
+                              x=100, y=100, w=200, h=100)
+    aid = roi["annotation_id"]
+    rev = int(roi["revision"])
+    cur_asset_rev = app_mod._slide_revision(
+        app_mod.slide_store.resolve_slide_id(sid))
+    c = _browser_client(app_mod.app)
+    bbox = {"x": 100, "y": 100, "w": 200, "h": 100}
+    # HP main.js applyPendingAttachesToBody 构建的附件记录（逐键同形）
+    attachment = {"kind": "marker", "bbox": dict(bbox), "slide": sid,
+                  "annotation_id": aid, "revision": rev, "type": "rect"}
+    # HP main.js normalizeSkillTarget 冻结的 target（发送时该标注仍选中）
+    target = {"kind": "annotation", "bbox": dict(bbox), "slide_id": sid,
+              "asset_revision": cur_asset_rev,
+              "annotation_id": aid, "annotation_revision": rev}
+
+    def _post(att_rev=None, tgt=None):
+        att = dict(attachment)
+        if att_rev is not None:
+            att["revision"] = att_rev
+        body = {"slide_id": sid, "task": "这个标记区域是什么？请解读。",
+                "fresh": True, "request_id": "req_interpret_1",
+                "viewport": dict(bbox), "attachments": [att]}
+        if tgt is not None:
+            body["target"] = tgt
+        return c.post("/api/ai/run?fresh=1", json=body)
+
+    # 过期附件 revision → 409 revision_conflict（零 sidecar 调用）
+    r = _post(att_rev=rev + 1)
+    assert r.status_code == 409, r.get_data(as_text=True)
+    assert r.get_json()["error"] == "revision_conflict"
+    # 过期资产 revision 的 target → 409 slide_revision_conflict
+    r2 = _post(tgt=dict(target, asset_revision="rev-stale"))
+    assert r2.status_code == 409, r2.get_data(as_text=True)
+    assert r2.get_json()["error"] == "slide_revision_conflict"
+    # 过期标注 revision 的 target → 409 revision_conflict
+    r3 = _post(tgt=dict(target, annotation_revision=rev + 3))
+    assert r3.status_code == 409, r3.get_data(as_text=True)
+    assert fake.calls == []
+
+    # 全新冻结 → 200；附件与 target 白名单重建后原样透传
+    _register_run_sse(fake, "sess-interpret-1")
+    r4 = _post(tgt=dict(target))
+    assert r4.status_code == 200, r4.get_data(as_text=True)
+    sent = fake.calls[-1]["body"]
+    atts = sent["attachments"]
+    assert len(atts) == 1
+    assert atts[0]["kind"] == "marker"
+    assert atts[0]["annotation_id"] == aid
+    assert atts[0]["revision"] == rev
+    assert atts[0]["bbox"] == bbox
+    assert sent["viewport"] == bbox
+    assert sent["target"]["annotation_id"] == aid
+    assert sent["target"]["annotation_revision"] == rev
+    assert sent["target"]["asset_revision"] == cur_asset_rev
+    assert sent["task"] == "这个标记区域是什么？请解读。"
+
+
+def test_run_viewport_attachment_clean_record(monkeypatch):
+    """回归：viewport 附件（composer「添加视野」路径）此前在
+    _validate_ai_attachments 里因 aid/roi 未定义 500 NameError——现在干净
+    重建（无 marker 专属键）并 200 透传。"""
+    fake = _setup_run_env(monkeypatch)
+    _touch()
+    c = _browser_client(app_mod.app)
+    _register_run_sse(fake, "sess-att-vp")
+    bbox = {"x": 10, "y": 20, "w": 500, "h": 400}
+    r = c.post("/api/ai/run?fresh=1", json={
+        "slide": "demo.svs", "task": "看这个视野",
+        "attachments": [{"kind": "viewport", "bbox": dict(bbox),
+                         "slide": "demo.svs"}]})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    atts = fake.calls[-1]["body"]["attachments"]
+    assert atts == [{"kind": "viewport", "bbox": bbox, "slide": "demo.svs"}]
+    # 无附件 bbox 时冻结视野回落到最后一个附件
+    assert fake.calls[-1]["body"]["viewport"] == bbox
+
+
 def test_run_target_annotation_kind_validated(monkeypatch):
     """kind=annotation：存在/归属/revision 匹配；不符 409，合法则白名单透传。"""
     fake = _setup_run_env(monkeypatch)

@@ -2945,27 +2945,6 @@ button {
   align-items: flex-end;
   gap: 8px;
 }
-/* 左侧 + 圆钮（iMessage 的加号位，这里承载「判读当前选区」） */
-.ai-plus-btn {
-  flex: 0 0 auto;
-  width: 26px;
-  height: 26px;
-  margin-bottom: 2px;
-  border: none;
-  border-radius: 50%;
-  background: var(--seg-bg);
-  color: var(--text-2);
-  font-size: 16px;
-  font-weight: 400;
-  line-height: 1;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  transition: background 0.12s ease, color 0.12s ease;
-}
-.ai-plus-btn:hover { background: var(--separator-strong); color: var(--text); }
-.ai-plus-btn:active { background: var(--accent-fill); color: var(--accent); }
 /* 输入 pill：白底细灰描边，iMessage 输入框形制 */
 .ai-task {
   flex: 1;
@@ -5128,7 +5107,7 @@ html, body { font-size: 14px; }
 .sidebar-bottom .logout-link { display: flex; align-items: center; min-height: var(--control-h); padding: 6px; margin: 0; text-align: left; font-size: 13px; border-radius: 6px; overflow-wrap: anywhere; }
 .sidebar-bottom .logout-link:hover { background: var(--hover); }
 .sidebar-bottom .logout-link[hidden] { display: none; }
-.ai-plus-btn, .ai-send-btn { width: var(--control-h); height: var(--control-h); }
+.ai-send-btn { width: var(--control-h); height: var(--control-h); }
 .ai-send-btn svg { width: 20px; height: 20px; }
 .ai-task { font-size: 15px; min-height: 44px; padding: 10px 12px; }
 .ai-session-select { font-size: 14px; min-height: var(--control-h); }

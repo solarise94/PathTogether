@@ -8209,8 +8209,9 @@
     if (!el) return;
     var menu = document.createElement("div");
     menu.className = "aot-menu";
-    function addItem(label, title, onClick, disabled) {
-      menu.appendChild(annoToolbarButton("aot-menu-item", label, title, onClick, disabled));
+    function addItem(label, title, onClick, disabled, cls) {
+      menu.appendChild(annoToolbarButton(
+        "aot-menu-item" + (cls ? " " + cls : ""), label, title, onClick, disabled));
     }
     if (target === "draft") {
       addItem(t("anno.solo.off"), "", function () {
@@ -8222,6 +8223,22 @@
       return;
     }
     var it = target;
+    // ✨ 让 AI 解读（首项）：与右键菜单共用同一冻结实现 freezeMarkerAttachPayload
+    // （菜单打开时刻冻结，绝不复制字段逻辑），点击经 emitConversationAttachIntent
+    // 以 intent=interpret 进会话草稿——不自动发送、不启动 AI。插件未加载 → 禁用
+    // 并给与右键一致的说明；几何不支持（freeze 失败）→ 禁用并说明，不伪造几何。
+    var frozenInterpret = null;
+    try { frozenInterpret = freezeMarkerAttachPayload(it, null); } catch (e) { frozenInterpret = null; }
+    if (!hpReady()) {
+      addItem("✨ " + t("anno.menu.askai"), t("ctxmenu.attach.plugin.missing"), null, true, "aot-askai");
+    } else if (!frozenInterpret) {
+      addItem("✨ " + t("anno.menu.askai"), t("anno.menu.askai.unavailable"), null, true, "aot-askai");
+    } else {
+      addItem("✨ " + t("anno.menu.askai"), t("anno.menu.askai.tip"), function () {
+        frozenInterpret.intent = "interpret";
+        emitConversationAttachIntent(frozenInterpret);
+      }, null, "aot-askai");
+    }
     // 定位（始终可用）
     addItem("⌖ " + t("anno.menu.locate"), t("anno.menu.locate.tip"), function () {
       jumpToAnno(it);

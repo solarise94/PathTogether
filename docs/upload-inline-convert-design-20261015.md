@@ -104,7 +104,7 @@
 
 | 文件 | 改动 |
 | --- | --- |
-| `static/app.js` | ① `uploadFile`（:10104）→ 交 `HP_INLINE_CONVERT.enqueue`；② `uploadFileClassified`（:10128）→ 判定表驱动（直传 / 转换 / 当场拒绝）；③ `offerBrowserConvert`（:10326）/`openConvertHandoff`（:10247）/`handoffBundleFolder`（:11123）保留但**仅在 `inline_convert.enabled=false` 时可达**（回滚路径，零删除）；④ 新增面板内行的渲染与**按钮组**——按钮全集以 **§6.3 为唯一权威**（含「删除本地产物」这一唯一的 OPFS 清理入口）；⑤ 新增 runner 动态 import 与生命周期（`beforeunload`）；⑥ 新增刷新恢复：`listJobs()` 里带 `intent.channel==='workbench-inline'` 的未完成任务 → 行 + 「继续」；⑦ `HP_UPLOAD` 导出面补新入口（测试驱动）；⑧ `submitFormatRequest`（:11530）抽出可复用内核 `submitFormatRequestCore({ext,message,contact,sampleFile})`；⑨ `importDroppedDirectory`（:11109）的 bundle 成员正则补 `.vms`（`.mrxs|dat|vms`，**不加 `.vmu`**——理由见 §4.1.1 note）；⑩ `handleWorkbenchDrop`（:11041）的散文件路径把 `cls.bundle===true` 交给新的「需完整包」分支（§4.1.1）而不是 `uploadFile`；⑪ **目标关联链路必须原样保留**（§3.5）：`enqueue` 之前仍先取 `importTargetSnapshot()`（`app.js:10109`，源码级断言 `tests/js/viewer-folders.test.ts:1095` 不许失效），完成时 `loadAll()` → `importAssociateUploaded(…, entry.target, row)` → `openSlide(...)`（`:10862-10865`）、`created` → `fbUpAssocSave(ingestionId, target)`（`:10789`）；⑫ 磁盘门确认后的重试**带原始输入重新起**（`probe(entry.file,…)` / `prepareBundle(entry.bundle.rows,…)`，§6.2.1）——因此 `entry.file`/`entry.bundle.rows` 必须在内存保留到收口 |
+| `static/app.js` | ① `uploadFile`（:10104）→ 交 `HP_INLINE_CONVERT.enqueue`；② `uploadFileClassified`（:10128）→ 判定表驱动（直传 / 转换 / 当场拒绝）；③ `offerBrowserConvert`（:10326）/`openConvertHandoff`（:10247）/`handoffBundleFolder`（:11123）保留但**仅在 `inline_convert.enabled=false` 时可达**（回滚路径，零删除）；④ 新增面板内行的渲染与**按钮组**——按钮全集以 **§6.3 为唯一权威**（含「删除本地产物」这一唯一的 OPFS 清理入口）；⑤ 新增 runner 动态 import 与生命周期（`beforeunload`）；⑥ 新增刷新恢复：`listJobs()` 里带 `intent.channel==='workbench-inline'` 的未完成任务 → 行 + 「继续」；⑦ `HP_UPLOAD` 导出面补新入口（测试驱动）；⑧ `submitFormatRequest`（:11530）抽出可复用内核 `submitFormatRequestCore({ext,message,contact,sampleFile})`；⑨ `importDroppedDirectory`（:11105-11120）的 bundle 成员正则补 `.vms`（`.mrxs|dat|vms`，**不加 `.vmu`**——理由见 §4.1.1 note）；⑩ `handleWorkbenchDrop`（:11041）的散文件路径把 `cls.bundle===true` 交给新的「需完整包」分支（§4.1.1）而不是 `uploadFile`；**⑩b 开关开时 bundle 一律进面板队列，绝不再弹 `/tools/slides`**（第四轮复审 A3 修正）：`importDroppedDirectory` 命中 bundle 时的 `handoffBundleFolder(rows, dirEntry.name)`（`:11112-11114`）与 `importPickFolder`（`:11137-11151`，**原改动清单从未提及它**）里的 `handoffBundleFolder(rows, first)` 都要改为交给 `HP_INLINE_CONVERT.enqueueBundle(rows, folderName)`——它们**无条件**调用交接（不看开关），不改就会在开关默认开时仍弹窗，与 §0 目标及 §4.1.1 动作表冲突；开关关闭时才走 `handoffBundleFolder`（回退路径保留）；⑪ **目标关联链路：一处保留 + 一处必须修**（§3.5，第四轮 A1）：保留——`enqueue` 之前仍先取 `importTargetSnapshot()`（`app.js:10109`，源码级断言 `tests/js/viewer-folders.test.ts:1095` 不许失效）、完成时 `loadAll()` → `importAssociateUploaded(…, entry.target, row)` → `openSlide(...)`（`:10862-10865`）、`created` → `fbUpAssocSave(ingestionId, target)`（`:10789`）；**必须修**——`uploadFileCos(file, row, {…})` 的实参字面量（`:10164-10170`）要**补上 `assocTarget`**（否则冻结快照从未被消费：`:10789` 被守卫吞掉、`:10864` 落到当前文件夹，属既有缺陷）；⑫ 磁盘门确认后的重试**带原始输入重新起**（`probe(entry.file,…)` / `prepareBundle(entry.bundle.rows,…)`，§6.2.1）——因此 `entry.file`/`entry.bundle.rows` 必须在内存保留到收口 |
 | `templates/index.html` | 在 `cos-uploader.js` / `slide-sniff.js` 之后、`app.js` 之前加载 `/static/upload/inline-convert.js?v=20261015` |
 | `static/i18n.js` | 新增上传面板内转换文案（zh/en 同步）；**改写**两条指向 `/tools/slides` 的旧文案（`upload.cos.err.convert_in_browser` @:1025/2686、`upload.err.unsupported` @:1026/2687）——见 §7 |
 | `static/app.js` 的 `_EXTRA_I18N`（:30 起） | 同步兜底键（`cos-upload.test.ts:964` 那条断言会检查 `_EXTRA_I18N` 与 stage 映射同步） |
@@ -235,10 +235,23 @@ bundle 任务另接 `progress.unit==='stage-bundle'`（`worker.js:994`）显示
    ——**必须在 `HP_INLINE_CONVERT.enqueue` 之前取**，保持 `app.js:10109` 的
    「上传开始即冻结」语义与源码级断言（`tests/js/viewer-folders.test.ts:1095`
    `expect(appSrc).toContain("opts.assocTarget = importTargetSnapshot()")`）。
-2. 走直传的 entry：把 `entry.target` 作为 `assocTarget` 传给现有
-   `uploadFileCos(file, row, {assocTarget})` 同一路径，`created` 事件仍调
-   `fbUpAssocSave`。**不重写这条链路**——`uploadFileCos` 已经做对了，面板只是
-   在它外面多包了一层队列。
+2. 走直传的 entry：把 `entry.target` 作为 `assocTarget` **显式转发**给
+   `uploadFileCos(file, row, {assocTarget: entry.target, …})`，`created` 事件仍调
+   `fbUpAssocSave`。**这是一处必须改的既有缺陷，不是「已做对」**（第四轮复审
+   A1 修正）：`app.js:10164-10170` 的实参是新对象字面量
+   `{resumeJobId, skipConfirm, directClass}`，**没有 `assocTarget`**——全仓
+   `assocTarget` 只有 5 处（`:10109` 写入、`:10789`/`:10798` 读、`:10843`/`:10864`
+   传参）。后果：
+   - `fbUpAssocSave(jobId, opts.assocTarget)`（`:10789`）收到 `undefined`，被
+     守卫 `if (!jobId || !target || (!target.pid && !target.newProjectName))
+     return;`（`:4029`）吞掉 → **刷新恢复拿不到快照**；
+   - 完成时 `cosUploadSucceeded(row, r.body, file, opts.assocTarget)`（`:10798`）
+     → `importAssociateUploaded(target.id, target.name, assocTarget || null, row)`
+     （`:10864`）的 `snap` 为 null → 落到 `var st = snap || importTargetState;`
+     （`:11284`）即**完成时刻的当前文件夹**——正是本条第 5 点禁止的漂移。
+   `git show 766214ad` 与 `3cd08792` 显示该字面量在历史版本里同样不含该键：
+   属既有缺陷，但**面板必须在同一批接线里补上**（否则「冻结快照」只生成、
+   从未被消费）。§2.2⑪ 与 §9.2 第 19 项据此改写。
 3. 走转换的 entry：**转换前的 `setJobIntent` 也要带目标**
    （`record.intent.target`，`runner.js:634`），这样刷新后 intent 里也有归属；
    上传阶段的 `fbUpAssocSave` 照旧按 **ingestion id** 落盘（恢复轮询靠它）。
@@ -315,7 +328,7 @@ bundle:true}`、`a.mrxs` / `x/a.dat` 同形）。同时原设计§2.2③ 又把�
 
 | 输入形态 | 判定 | 动作 |
 | --- | --- | --- |
-| 拖入/选择**文件夹**（`webkitGetAsEntry` 目录遍历，`app.js:11066`；`webkitdirectory` 选择同路径）含 `.mrxs`/`.dat`/`.vms` 成员 | 成员行 `[{name, relPath, file}]` **原样交给** `runner.prepareBundle`，由 `engine.planBundle`（`engine.js:1353`）判定：`sniffMrxBundle`（`:1096`）/ `sniffVmsBundle`（`:1257`） | **整包转换**（`stage-bundle`，`progress.unit==='stage-bundle'`）。"缺哪个成员"的类型化信息（`unsupported_input` + `missing`）**由 planner 产出**——面板不预判（见下）。开关开：进面板队列；开关关：仍走 `handoffBundleFolder` 交接 |
+| 拖入/选择**文件夹**（`webkitGetAsEntry` 目录遍历，`app.js:11066`；`webkitdirectory` 选择同路径）含 `.mrxs`/`.dat`/`.vms` 成员 | 成员行 `[{name, relPath, file}]` **原样交给** `runner.prepareBundle`，由 `engine.planBundle`（`engine.js:1353`）判定：`sniffMrxBundle`（`:1096`）/ `sniffVmsBundle`（`:1257`） | **整包转换**（`stage-bundle`，`progress.unit==='stage-bundle'`）。"缺哪个成员"的类型化信息（`unsupported_input` + `missing`）**由 planner 产出**——面板不预判（见下）。**开关开：进面板队列**（由 `enqueueBundle` 接；**两条既有入口都要改**：`importDroppedDirectory` 的 `handoffBundleFolder`（`app.js:11112-11114`）与 `importPickFolder`（`:11137-11151`）——**两者目前都无条件交接、不看开关**，第四轮复审 A3）；开关关：仍走 `handoffBundleFolder` 交接 |
 | **散文件**（单文件拖入/选择）`.mrxs` / `.dat` | `classifyFile` 给 `bundle:true`，但**手上没有伴随成员**，且浏览器不允许读取同目录其他文件 | 行内**类型化说明**：「该格式需要完整包（主文件 + 同名目录及其全部数据文件）；请用『选择文件夹』或拖入整个文件夹」。**面板不列出具体缺哪个成员**——那要跑 `planBundle`，而它需要 `File[]`（跨目录取文件），与 §6.1「不新增本地句柄」的隐私口径相悖。文案列举「需要什么」用**静态**文案（`sniffMrxBundle` 的必需成员名规则：`{stem}.mrxs` + `{stem}/Slidedat.ini` + `{stem}/<INDEXFILE>` + 每个 `FILE_i`，`engine.js:1178` + `:1181-1188`），**不**预取实际文件列表 |
 | **散文件** `.vms` | 同上（VMS 需入口 + 同目录全部 tile JPEG；tile 名只在 `.vms` 的 INI 里，见 `parseVmsMembers` 的 `ImageFile(c,r)`，`engine.js:1234-1246`） | 同上（静态文案：「`.vms` 入口 + 同目录全部 tile JPEG」）。注意 `sniffVmsBundle` 本身只对「缺 `.vms` 主入口 / 多个入口」给 `bad`，**不报缺 tile**（实测代码 `:1269-1280`）；真正逐 tile 核对的是 `planVmsBundle`（`engine.js:1340-1345` 的 `missing`）——这正是「判定归 planner」的理由 |
 | `.vmu`（单文件或文件夹成员） | `classifyFile` 给 `cls:'temporary'` + `directClass:'legacy-direct'`（**不是** bundle） | 照 §4.2 **直传**（VMU 是暂时直传的 native 单文件，今天就能上传）；面板**不**因它进 planner 而收紧（理由见上方 note） |
@@ -538,6 +551,26 @@ const directClass = (cls.cls === 'ome-tiff') ? 'ome-tiff'
 - `navigator.locks` 不可用（旧浏览器/非安全上下文）→ `held:false` 照常执行
   （与既有 `acquireContentLock` 的退化语义一致，绝不阻塞）。
 
+**`<account>` 的取值来源（第四轮复审 A6 修正）**：工作台 bootstrap 的
+`cos_upload` 载荷**没有** `account` 字段（实测键集 = `available` /
+`browser_convert` / `direct_upload` / `formats` / `manual_only`；带 `account`
+的是工具页端点 `/api/tools/slides/upload-capability`，它不走 bootstrap），而本设计
+又承诺加载期零网络请求，所以**唯一可用来源是页面既有的 `currentUserId`**
+（`app.js:275`，由 `/api/auth/info` 填充；既有代码已在同一语义下使用它——
+`uploadFileCos` 的 `storage.account` 与 `contentLockName`，`app.js:10757`）。
+口径统一为：
+
+```
+const acct = String(window.currentUserId || "");   // 免认证/未就绪 = 空串
+lockName = "pt:upload-slot:" + acct;
+```
+
+即与 `cos-uploader.js:1203 contentLockName(account, …)` 同一取值、同一退化语义
+（空串 = 「同一（唯一）账号」）。**不得**为此新增网络请求或读 bootstrap 的
+`account`（不存在）；`currentUserId` 未就绪时按空串处理（此时也还没有任何
+entry 能进入 `uploading`——上传必然晚于 `/api/auth/info`，且即便抢先，
+`/api/ingestions` 会以 401/403 暴露授权问题）。
+
 **ingestion 创建时机**：只有拿到上传槽 + 本条目适用的门禁全部通过后才
 POST `/api/ingestions`（`cos-uploader.js:1033`）。转换期间（含刷新、崩溃）
 服务端零任务。
@@ -582,11 +615,21 @@ POST `/api/ingestions`（`cos-uploader.js:1033`）。转换期间（含刷新、
 
 ### 6.2 刷新后的行为（沿用现有隐私约定：不自动开始）
 
-1. 页面加载：`HP_INLINE_CONVERT` **不做任何网络请求、不自动开始转换或上传**。
-2. `runner.listJobs()`（`runner.js:1355`）→ 过滤 `intent.channel === 'workbench-inline'`
-   且 `state ∈ {prepared, planned, paused, failed}` 或
-   `state ∈ {ready, exported} && upload 未收口`的记录。
-3. 每个命中 → 行显示「未完成的转换：<名> · 已提交 X / 共 Y」+ 按钮（§6.3 的
+1. 页面加载：`HP_INLINE_CONVERT` **不做任何面板发起的新网络请求、不自动开始
+   转换或上传**（口径见 §9.2 第 9 项：页面自身的 5 个 GET 不计）。
+2. `runner.listJobs()`（`runner.js:1355`）→ 取 `intent.channel ===
+   'workbench-inline'` 的**全部**记录（第四轮复审 A2 修正：**不过滤掉已收口
+   记录**），分成两组渲染：
+   - **待继续组**：`state ∈ {prepared, planned, paused, failed}`，或
+     `state ∈ {ready, exported} && upload 未收口` → 行 + 恢复动作（第 3 步）；
+   - **待清理组**：其余（含 `record.upload.state === 'published'`，即已完成 /
+     已发布 / 终态 / 已取消）→ 行 + 「删除本地产物」（§6.3）。
+   原设计把过滤条件写成「已收口的不进恢复行」，与 §6.3 要求在同一批
+   `listJobs()` 结果上给这些记录提供删除按钮**直接矛盾**——那个按钮在刷新后
+   唯一可达的 OPFS 清理入口会变成不可达，源副本与产物永久残留（且
+   `_sweepIncompleteStaging` 显式 `if (rec && rec.upload) continue;`，
+   `runner.js:361-366`，不会兜底）。
+3. 待继续组的行显示「未完成的转换：<名> · 已提交 X / 共 Y」+ 按钮（§6.3 的
    完整按钮表）：
    - `nextAction==='resume'`（有 journal）→ 「继续转换」（`resumeJob`，不重选文件）；
    - `nextAction==='start'`（prepared，无 journal）→ 「继续转换」
@@ -681,8 +724,12 @@ POST `/api/ingestions`（`cos-uploader.js:1033`）。转换期间（含刷新、
 - `done`（已发布）行的删除**只删本地副本**，不影响已发布切片——文案必须说清
   「已上传到平台的切片不受影响」，避免用户以为会删库里的；
 - 面板启动时（§6.2 第 2 步的同一批 `listJobs()` 结果）对 `intent.channel ===
-  'workbench-inline'` 的**已收口**记录**不自动删**（删除是不可逆动作，且
-  `record.upload` 是到服务端 ingestion 的唯一线索），只在行上给按钮；
+  'workbench-inline'` 的**已收口**记录（第四轮复审 A2 修正的「待清理组」）
+  **不自动删**（删除是不可逆动作，且 `record.upload` 是到服务端 ingestion 的
+  唯一线索），只在行上给按钮——**这批记录必须有行**，否则清理入口在刷新后
+  不可达（这正是 A2 指出的矛盾）；
+- 待清理组的行是**最小形态**：无进度条、无可继续动作，只有
+  「<名> · 已上传/已失败/已取消 · 本地产物 <释放字节数>」+ **删除本地产物**；
 - 行被用户忽略/浏览器关闭后残留的，由既有 `_processPendingCleanups` /
   `_sweepIncompleteStaging`（运行器启动期）与工作台下次续转/删除入口兜底——
   本设计不新增自动删除策略。
@@ -822,7 +869,30 @@ ingestion** 还是**重新创建**。修正：
   `available:false` 时前端也要能显示明确原因）。
 - 关闭（`inline_convert.enabled=false`）→ `uploadFileClassified` 走**现有**
   `offerBrowserConvert`（`app.js:10326`）→ `openConvertHandoff`（`:10247`）
-  弹窗交接，即 upload-liveness 的行为**逐字节不变**（零删除、零改写）。
+  弹窗交接；bundle 走 `handoffBundleFolder`（§4.1.1/§2.2⑩b）。**控制流逐条
+  保留**（零删除）。
+
+  > **第四轮复审 A5 修正——「逐字节不变」的措辞收紧为「控制流不变」**：本设计
+  > **确实**要改两条文案，而它们恰恰只在回退/服务端拒绝路径上显示：
+  > `upload.cos.err.convert_in_browser`（`i18n.js:1025`/`2686`）的唯一使用点是
+  > `app.js:10545` 的 `cosErrorMessage`（服务端 422 `convert_in_browser` 时），
+  > `upload.err.unsupported`（`i18n.js:1026`/`2687`）的唯一使用点是
+  > `app.js:10148` 的 `unsupported` 分支——**开关关闭时也是这一分支**。
+  > 所以「零改写」是同一条设计里自相矛盾的承诺（原 §2.2/§8 的 R8 自己要求改写）。
+  > 收紧后的承诺：**控制流与行为不变，文案改写见下**。
+  >
+  > **改写后的文案必须对两种开关状态都成立**：关闭时用户**没有**面板内转换，
+  > 文案要指向可操作的入口（工具页）；开启时（服务端仍可能因漏判返回 422）
+  > 面板已自动处理，文案不该再让用户去别处。因此：
+  > - `upload.err.unsupported`（纯本地、`cls==='unsupported'`，与开关无关）：
+  >   改写为**说明 + 「申请支持该格式」引导**（§7.1 的按钮已在同一行），
+  >   **不再点名 `/tools/slides`**——这个分支开启时也不走工具页。
+  > - `upload.cos.err.convert_in_browser`（服务端码，开启时面板自动回队，
+  >   关闭时必须引导用户）：改写为**中性事实句 + 条件性入口**，即
+  >   「该格式需先在本机转换后上传」+（仅 `enabled===false` 时）由前端在文案
+  >   后追加 `/tools/slides` 链接（`tt()` 支持形参；链接按 `inline_convert.url`
+  >   构造）。**开启时不给链接**（面板正在自动处理，给链接反而误导）。
+  > 这条要求进 §9.2 第 14 项（i18n 断言按开关两态分别校验）。
 - 回退判定的唯一读点：`HP_INLINE_CONVERT.enabled(caps)`（纯函数）——不许在
   其它地方再读一次，避免半开半关。
 - `viewable_formats` 缺失（旧后端/缓存 JS）→ 与工具页同一 fail-closed 语义：
@@ -839,7 +909,7 @@ ingestion** 还是**重新创建**。修正：
 | 同上，MRXS bundle 交接测试（:245-275） | 同上（仅开关关闭时 reachable） | 同上处理 |
 | `tests/js/cos-upload.test.ts:421` | 「mrxs 行是『待本机转换』提示」——默认开时 mrxs 进转换队列（仍是「待本机转换」语义，文案键变） | 断言改到新文案键；或在用例里注入 enabled=false 保持原路径 |
 | `tests/js/r1-convert-upload.test.ts`（48 项，工具页 + 工作台入口） | 工具页侧全部不受影响；工作台入口侧（:293 `href === '/tools/slides'`）仅在开关关闭时成立 | 给工作台入口用例注入 enabled=false；保留 i18n 静态扫描（:333-370）并扩展到新键 |
-| `tests/js/viewer-folders.test.ts`（第三轮评审 K2 补入） | 对 `app.js` 做**源码级断言** `expect(appSrc).toContain("opts.assocTarget = importTargetSnapshot()")`（`:1095`），并驱动 `importDrawer.associate` / `snapshot` 的行为面 | **必须保持**：§2.2① 的 `uploadFile` 改写要在**调用 `enqueue` 之前**仍先取快照，断言不变；新增一条「转换条目完成时按 `entry.target` 关联」的行为断言（§3.5 覆盖要求，§9.2 第 19 项） |
+| `tests/js/viewer-folders.test.ts`（第三轮评审 K2 补入；第四轮 A1 加码） | 对 `app.js` 做**源码级断言** `expect(appSrc).toContain("opts.assocTarget = importTargetSnapshot()")`（`:1095`），并驱动 `importDrawer.associate` / `snapshot` 的行为面 | **必须保持**：§2.2① 的 `uploadFile` 改写要在**调用 `enqueue` 之前**仍先取快照，断言不变；**新增一条「`uploadFileCos` 调用字面量含 `assocTarget`」的源码级断言**（`:10164-10170`，第四轮 A1——现有断言只钉住快照被**取**，没钉住被**传**）；再加「转换条目完成时按 `entry.target` 关联」的行为断言（§9.2 第 19 项） |
 | `tests/js/cos-upload-liveness.test.ts` | 魔数 fail-fast（PNG 改名 .jpg）在面板内**同样**生效且零网络——语义不变 | 无需改；新增面板内该路径的行文案断言 |
 | `tests/js/raster-image-compat.test.ts` | 只测 `acceptFromCatalog` / fallback 目录；不涉上传分流 | 不影响 |
 | `tests/js/tools-u2-page.test.ts`（`bundleRoute` / `looksLikeBundleMember` 的用例） | §4.1.1 要求把 `app.js` 的成员正则对齐到 `.mrxs|dat|vms`（**刻意不含 `.vmu`**）——只改 `app.js` 的**调用侧**，`tools-slides-bundle.js` 里的纯函数与其既有断言不变 | 不受影响；新增一条源码级断言：`app.js` 的成员正则**覆盖** `.mrxs|dat|vms`（刻意**不含** `.vmu`，与 `looksLikeBundleMember` 的表面差异已说明理由），防再次漂移 |
@@ -893,13 +963,24 @@ vitest 单文件内两者**可以并存**（`import` 提升到模块顶，`new F
    （后者是 `discardJob` 的保护对象，§5）；同号第二次请求排队（不并发两个
    `createUpload`）。
 9. 刷新恢复**不自动开始**：`listJobs()` 返回带 `intent.channel==='workbench-inline'`
-   的 `planned+journal` / `ready` 记录 → 行 + 「继续」按钮；**加载期间零
-   `fetch`（含 runner 网络无关的控制请求）**。注意与 `SlideToolsRunner.create()`
-   自身的行为区分：`_init()`（`runner.js:146-152`）会跑
-   `_processPendingCleanups` / `_sweepIncompleteStaging` / `_spawnWorker`，
-   这是**本地 OPFS + worker 启动**，不是「开始转换或上传」——断言口径写
-   「零 `/api/` 请求、零 `probe`/`prepareBundle`/`startJob`/`resumeJob`/
-   `createUpload` 调用」，而不是含混的「零 runner 调用」（评审 R8a）。
+   的 `planned+journal` / `ready` / 已收口（待清理组）记录 → 各得一行
+   （未完成的给「继续」、已收口的给「删除本地产物」）；**面板不自动开始任何
+   转换或上传**。
+
+   断言口径（第一轮 R8a + 第四轮 A7 修正，**必须写成「无面板发起的新请求」**）：
+   真实页面加载本身就会发 5 个 GET（`/api/auth/info`、`/api/slides`、
+   `/api/projects`、`/api/share/list`、`/api/annotations`——本文件 §10.7 自己
+   记录了这一点），所以**字面的「零 `/api/` 请求」在真页面上不可能成立**。
+   正确写法：以「reload 完成后」为基准，断言
+   - **零新增** `/api/ingestions*`（含 `POST /api/ingestions` 与各 `/parts/sign`）、
+     零跨源 PUT；
+   - 零 `probe` / `prepareBundle` / `startJob` / `resumeJob` / `createUpload`
+     / `discardJob` 调用（在面板模块的 fake runner 上计数；`SlideToolsRunner
+     .create()` 内部的 `_processPendingCleanups` / `_sweepIncompleteStaging` /
+     `_spawnWorker`（`runner.js:146-152`）是**本地 OPFS + worker 启动**，
+     不是「开始转换或上传」——R8a）；
+   - 点击「继续」/「删除本地产物」**之后**才出现对应请求（正例）。
+   `tests/e2e` 用例 C 采用同一口径（§9.4）。
 10. **续传语义**（§6.4）：`record.upload` 有未收口 `ingestionId` → 「继续上传」
     传 `resumeJobId` 等于该 id 且 **零** `POST /api/ingestions`；记录为空/终态
     → 只显示按钮、**零请求**；点击后才建新任务。
@@ -935,8 +1016,10 @@ vitest 单文件内两者**可以并存**（`import` 提升到模块顶，`new F
 13. 申请支持：按钮 → `POST /api/format-requests`，body 含预填 `format_ext` 与
     带机器码的 `message`；202 显示编号；429 → 今日上限文案；413 → 样本超限。
 14. i18n：新键 zh/en 成对存在（静态扫描 `i18n.js`），`_EXTRA_I18N` 同步；
-    **反向断言**：`upload.cos.err.convert_in_browser` / `upload.err.unsupported`
-    的 zh/en 文案里不再出现 `/tools/slides`（§7 的改写）。
+    **反向断言**：`upload.err.unsupported` 的 zh/en 文案里不再出现
+    `/tools/slides`（§8 的改写）；`upload.cos.err.convert_in_browser` 的**基础
+    文案**也不再直接写死路径，路径只经 `inline_convert.url` 形参在两态下
+    有条件追加（第四轮 A5，见 §8 与第 22 项）。
 15. 回退：`inline_convert.enabled=false` → 走 `offerBrowserConvert`，
     断言 `window.open` 收到 `/tools/slides`（与 `r1-convert-upload.test.ts`
     现有断言同形）。
@@ -958,13 +1041,31 @@ vitest 单文件内两者**可以并存**（`import` 提升到模块顶，`new F
     「复用旧 jobId」的调用（旧目录已被运行器自己删掉——`runner.js:759`/`:534`
     的 `_discardNow`，`:682` 的 `removeEntryRecursive`）。原稿「重试同一
     `probe`（不重建任务）」的说法**已删除**。
-19. **目标关联（§3.5，第三轮评审 K2）**：`uploadFile`/`enqueue` 入口冻结快照
-    （源码级断言 `opts.assocTarget = importTargetSnapshot()` 仍成立）；
+19. **目标关联（§3.5，第三轮 K2 + 第四轮 A1）**：`uploadFile`/`enqueue` 入口冻结
+    快照（源码级断言 `opts.assocTarget = importTargetSnapshot()` 仍成立）；
+    **源码级断言 `uploadFileCos` 的调用字面量含 `assocTarget`**（`:10164-10170`
+    ——现有断言只钉住「被取」，第四轮 A1 实测它没钉住「被传」）；
     转换条目完成后 `importAssociateUploaded(slideId, name, entry.target, row)`
     被调用且**第三参是入队时冻结的 target**（用假 `snapshot` 值 + 中途改
     `importTargetState` 驱动，断言关联用冻结值而非当前文件夹）；随后
     `loadAll()` 与 `openSlide(slideId)` 被调用；直传条目走 `uploadFileCos`
-    的同一路径（`created` → `fbUpAssocSave(ingestionId, target)`）。
+    的同一路径且 `created` 事件调 `fbUpAssocSave(ingestionId, <冻结 target>)`
+    （断言第二参非 `undefined`）。
+20. **恢复行两组渲染（§6.2 第 2 步，第四轮 A2）**：`listJobs()` 返回三条记录
+    ——`planned+journal`、`ready`（upload 未收口）、`ready`（upload
+    `state:'published'`）→ 断言**三条各得一行**；前两条给「继续转换」/
+    「继续上传」，第三条给「**删除本地产物**」且**不应有**继续动作
+    （反向断言：已收口记录不得被过滤掉）。
+21. **bundle 两个入口（§4.1.1/§2.2⑩b，第四轮 A3）**：开关开时
+    `importDroppedDirectory`（目录拖入含 `.vms`）与 `importPickFolder`
+    （`#import-folder-input` change）**都**调 `enqueueBundle` 且断言
+    **`window.open` 零调用**、`handoffBundleFolder` 零调用；开关关时两者都调
+    `handoffBundleFolder`（回退行为）。
+22. **回退文案两态（§8，第四轮 A5）**：`enabled===false` 时
+    `tt('upload.cos.err.convert_in_browser')` 的结果**含** `/tools/slides`
+    链接（取自 `inline_convert.url`）；`enabled===true` 时**不含**（面板自行
+    处理）。`upload.err.unsupported` 两态都**不含** `/tools/slides`，且同行的
+    申请支持按钮存在。
 
 ### 9.3 pytest（新增 `tests/test_upload_inline_convert_capability.py`）
 
@@ -992,10 +1093,38 @@ vitest 单文件内两者**可以并存**（`import` 提升到模块顶，`new F
 | --- | --- | --- |
 | A | 「转换后上传且上传字节能被平台读取器 `slide_io.open_slide` 打开」 | 真 KFB 夹具（`kfb.fixture.build_synthetic_kfb`，或 CLI `gen-kfb`）→ 工作台拖入 → 面板内转换（真 wasm）→ 上传 → 行到「入库完成」→ 服务端用 `slide_io.open_slide` 打开**已发布**资产并读到层级/尺寸/区域像素。**另断言创建体里的 `direct_class` 与产物字节一致**（`bf-ome` 默认 → `'ome-tiff'`；写死 `converter-bigtiff` 会让 worker `declaration_matches=False` → 终态 `convert_in_browser`，用例 A 必红——这正是评审 R1 的缺陷） |
 | B | 「PNG 改名 `.jpg` 当场被拒且申请支持提交成功」 | 真 PNG 字节 named `x.jpg` → 行内出现检测类型 + 申请支持按钮 → 点击 → `POST /api/format-requests` 202 → 行内出现申请编号；**全程零 `/api/ingestions`、零跨源 PUT** |
-| C | 「刷新后点继续能把转换做完」 | 转换进行中 `page.reload()` → 行显示「继续转换」且**不自动开始**（断言 reload 后若干秒内零 `/api/`、零 `probe`/`startJob`/`resumeJob`/`createUpload`；`SlideToolsRunner.create()` 的 OPFS cleanup/sweep 与 worker 启动不算「开始」）→ 点「继续」→ 转换完成 → 产物 sha256 与 OPFS 产物一致 → 上传完成 |
+| C | 「刷新后点继续能把转换做完」 | 转换进行中 `page.reload()` → 行显示「继续转换」且**不自动开始**（第四轮 A7：断言口径是「无**面板发起的新**请求」——reload 后零新增 `/api/ingestions*`、零跨源 PUT、零 `probe`/`startJob`/`resumeJob`/`createUpload`/`discardJob`；页面自身的 5 个 GET 与 `SlideToolsRunner.create()` 的本地 OPFS cleanup/sweep 及 worker 启动都不算）→ 点「继续」→ 转换完成 → 产物 sha256 与 OPFS 产物一致 → 上传完成 |
 
-为让 A 的「上传字节被平台读取器打开」真成立，需要（**本设计的关键新增测试基建**）：
+为让 A 的「上传字节被平台读取器打开」真成立，需要（**本设计的关键新增测试基建**；
+接线方式已按第四轮复审 A4 实测修正）：
 
+- **服务端指向假 COS：只能靠测试侧 monkeypatch `cos_client._client`，`Endpoint`
+  是错的旋钮**（实测，见 §10.16）：
+  - 生产构造在 `cos_client.py:60-64` 写死
+    `CosConfig(Region=…, SecretId=…, SecretKey=…, Scheme="https")`——**没有**
+    `Endpoint`，也没有任何 env 读取（`grep -rn "COS_ENDPOINT" --include=*.py .`
+    = 0 命中），所以「服务端指向本地假 COS」**在生产代码里没有落点**。本设计
+    **不改 `cos_client.py`**（生产路径零改动），由 e2e 进程在 import 后
+    `monkeypatch.setattr(cos_client, "_client", fake_factory)` 并清
+    `_client_cache`；已实测该替换同时影响 `presign_upload_part` 与控制 API
+    （两者都走 `_client()`），且签出的 URL 主机随替换变化；
+  - **`Endpoint=<host:port>` 会产出坏主机**：实测
+    `CosConfig(Endpoint="127.0.0.1:9443")` 的预签名 URL 是
+    `https://probe-1250000000.127.0.0.1:9443/…`（把 endpoint 当成域名后缀拼在
+    bucket 后），`Endpoint="http://127.0.0.1:9443"` 更退化成
+    `probe-1250000000.http:`。**正确旋钮是 `Domain="127.0.0.1:<port>"`**
+    （path-style：`https://127.0.0.1:9443/incoming/<job>/data.tif`，
+    `Content-Length` 仍在签名 query 里）配 `VerifySSL=False`；
+  - 因此**浏览器侧不需要、也不该用 `--host-resolver-rules`**：预签名 URL 已经是
+    `https://127.0.0.1:<port>/…`，直接命中本地 HTTPS 假 COS 即可（自签证书 →
+    仍需 `--ignore-certificate-errors`）。原稿写「MAP
+    `<bucket>.cos.<region>.myqcloud.com 127.0.0.1`」是**基于错误的
+    `Endpoint` 假设**；那条映射只在 C4 的 virtual-hosted 形态下成立
+    （`slide_tools_c4/lib.js:295-296` 的证书 SAN 也是那个域名）；
+  - 备选（若坚持 virtual-hosted 形态以便复用 C4 的自签证书与映射）：
+    monkeypatch 仍用 `Domain=<bucket>.cos.<region>.myqcloud.com`，并用
+    `--host-resolver-rules=MAP <那个域名>:443 127.0.0.1:<port>` 把它指到本地
+    HTTPS 假 COS（C4 已验证过的手法）。两条路都**不在生产代码里加注入点**；
 - `tests/e2e/e2e_server.py` 增加 COS 支持（默认关，`E2E_INLINE_CONVERT=1` 时开）：
   - 设 `COS_BUCKET`/`COS_REGION`/`COS_SECRET_ID`/`COS_SECRET_KEY`、
     `COS_UPLOAD_CAPABILITY=on`、池容量 > 产品上限（照
@@ -1003,14 +1132,8 @@ vitest 单文件内两者**可以并存**（`import` 提升到模块顶，`new F
     `app_mod.UPLOAD_PRODUCT_MAX_BYTES = 900_000_000`）；
   - **进程内假 COS**：一个真实本地 HTTPS 端点实现 `InitiateMultipartUpload` /
     `UploadPart` / `CompleteMultipartUpload` / `ListParts` / `GET(Range)`，
-    对象落临时目录；服务端 `cos_client._client()` 的 `CosConfig` 以
-    `Endpoint=127.0.0.1:<port>` + `VerifySSL=False` 指向它（`CosConfig` 接受
-    这两个参数，已核实签名含 `Endpoint`/`VerifySSL`）；
-  - 浏览器侧用 Chromium `--host-resolver-rules=MAP <bucket>.cos.<region>.myqcloud.com 127.0.0.1`
-    + `--ignore-certificate-errors`（**已在 C4 套件验证过的手法**，
-    `tests/browser/slide_tools_c4/lib.js:285` 与 `run_workbench.js:129-131`），
-    于是分块 PUT 走真实 socket、真实字节，服务端 worker 从同一个假 COS
-    下载后 `open_slide` 校验——**不用 `page.route` 造字节**；
+    对象落临时目录（这两条既有实现可直接照抄 c4 `lib.js:285-345` 的
+    `startLocalCos`，只需扩出 multipart 与 GET）；
   - 新增测试专用只读端点 `GET /__test/slide-probe?slide_id=<id>` 返回
     `{reader, levels, width, height, mpp}`（内部 `slide_io.open_slide` 真读）。
 - `playwright.config.ts`：新增 project `chromium-cos`（`testMatch:
@@ -1072,6 +1195,11 @@ export TEST_RUN_DIR=/mnt/ssd2/tests/run-inline-convert-Mwpad1 \
      r1-convert-upload,slide-sniff,tools-u2-page,tools-upload-limit,tools-upload-feedback}.test.ts`
      → **8 files / 179 passed, 2 skipped**（后三个文件即 §9.2 第 12 项对照测试的
      既有先例与 `bundleRoute` 纯函数用例）；
+     **第四轮复审后复跑**（`pytest-a4`，仓库代码仍未动）：
+     `python3 -m pytest tests/test_upload_direct_class.py
+     tests/test_r1_conversion_gate.py -q -p no:cacheprovider
+     --basetemp=$TEST_RUN_DIR/pytest-a4` → **39 passed in 15.09s**；
+     同一 9 个 vitest 文件 → **9 files / 222 passed, 2 skipped**（1.19s）。
      **第三轮评审后复跑**（`pytest-k1`，并加入 `viewer-folders`）：
      `python3 -m pytest tests/test_upload_direct_class.py
      tests/test_r1_conversion_gate.py -q -p no:cacheprovider
@@ -1207,6 +1335,51 @@ export TEST_RUN_DIR=/mnt/ssd2/tests/run-inline-convert-Mwpad1 \
       —— 证实原设计确实缺这条链路。已新增 §3.5。
     - J3（spec 计数）：`ls tests/e2e/*.spec.ts | wc -l` → **16**（本 worktree
       HEAD `ec9ee180`）；文档原写 15，已改（§9.1 与 §9.4）。
+16. **第四轮六条复审的实测证据**（命令与输出，均在本 worktree `ec9ee180` 基线上跑）：
+    - **A1（`assocTarget` 未转发）**：`grep -n assocTarget static/app.js` →
+      **5 处**（`10109` 写入、`10789`/`10798` 读、`10843`/`10864` 传参）；
+      `sed -n '10164,10170p' static/app.js` 的实参字面量是
+      `{resumeJobId, skipConfirm, directClass}`——**无 `assocTarget`**。
+      历史对照：`git show 766214ad:static/app.js`（:9798-9804）与
+      `git show 3cd08792:static/app.js`（:9866-9872）的同一字面量同样不含该键
+      → 属既有缺陷。守卫在 `app.js:4029`，回落点在 `:11284`（`snap || importTargetState`）。
+    - **A2（清理入口被过滤掉）**：doc §6.2 第 2 步原文的过滤条件与 §6.3
+      「已收口记录也只在行上给按钮」矛盾；旁证
+      `static/tools/tools-slides-upload.js:350`（`complete` 写
+      `state:'published'`）与 `runner.js:361-366`（`_sweepIncompleteStaging`
+      显式 `if (rec && rec.upload) continue;`，不兜底）。已改为两组渲染。
+    - **A3（文件夹两个入口未进清单）**：`grep -c importPickFolder
+      docs/…md` = **0**；`static/app.js:11137-11151` 的 `importPickFolder`
+      无条件 `handoffBundleFolder(rows, first)`；`:11109-11114` 的目录拖入命中
+      `/\.(mrxs|dat)$/i` 时无条件 `handoffBundleFolder`。已在 §2.2⑩b/§4.1.1 补上。
+    - **A4（假 COS 接线）**：`grep -rn "COS_ENDPOINT" --include=*.py .` = **0**；
+      `cos_client.py:60-64` 的 `CosConfig(...)` 无 `Endpoint`/`VerifySSL`。
+      用 `qcloud_cos` 实测 `get_presigned_url` 的主机：
+      ```
+      无 Endpoint                              -> probe-1250000000.cos.ap-probe.myqcloud.com
+      Endpoint="127.0.0.1:9443"                -> probe-1250000000.127.0.0.1:9443   ← 坏主机
+      Endpoint="http://127.0.0.1:9443"         -> probe-1250000000.http:             ← 更坏
+      Endpoint + IP=127.0.0.1                  -> 127.0.0.1（域名丢失）
+      Domain="127.0.0.1:9443"                  -> 127.0.0.1:9443, path=/incoming/…  ← 正确
+      Domain + VerifySSL=False（测试 monkeypatch `_client`）-> 127.0.0.1:9443
+      ```
+      即 **`Endpoint` 是错的旋钮**（评审建议的注入项会产生坏主机），正确做法是
+      测试侧 `monkeypatch.setattr(cos_client, "_client", …)` +
+      `CosConfig(Domain="127.0.0.1:<port>", VerifySSL=False)`；
+      因预签名 URL 已指向 `127.0.0.1`，**不需要 `--host-resolver-rules`**。
+    - **A5（回退路径文案自相矛盾）**：`i18n.js:1025`/`1026`（zh）与
+      `:2686`/`:2687`（en）四处现文都含 `/tools/slides`；唯一使用点分别是
+      `app.js:10545`（`cosErrorMessage`）与 `:10148`（`unsupported` 分支）。
+      已把 §8 的承诺收紧为「控制流不变」并规定按开关两态的两套文案。
+    - **A6（上传槽 account 来源未定义）**：`_cos_upload_capability_payload(False)
+      .keys()` = `['available','browser_convert','direct_upload','formats',
+      'manual_only']`（**无** account；带 account 的是工具页端点）；已定为页面
+      既有的 `currentUserId`（`app.js:275`，与 `:10757` 的 `contentLockName`
+      同一取值）。
+    - **A7（零请求口径）**：doc §10.7 自己记录真工作台加载发 5 个 GET
+      （`/api/auth/info`、`/api/slides`、`/api/projects`、`/api/share/list`、
+      `/api/annotations`）→ 字面「零 `/api/` 请求」不可能；已改为
+      「零面板发起的新请求」（§9.2 第 9 项 + §9.4 用例 C）。
 
 ## 11. 风险
 
@@ -1233,6 +1406,13 @@ export TEST_RUN_DIR=/mnt/ssd2/tests/run-inline-convert-Mwpad1 \
 | R19（第三轮评审新增） | **磁盘门确认后误走「复用旧任务」路线**：原稿把 `need_disk_confirm` 的理由写成「副本已在 OPFS」，据此会实现成 `startJob(null,{jobId})` 或复用旧目录 | 复现 `io_recoverable: 缺少输入文件`（`runner.js:867`），确认按钮永远失败 | §6.2 纠正理由 + 新 §6.2.1（带原始输入重新起、会重新复制）+ §7.3 表 + §9.2 第 18 项反向断言 |
 | R20（第三轮评审新增） | **目标关联链路在改写中丢失**：`uploadFile` → `enqueue` 时若不再先取快照，或完成时不按冻结快照关联 | 静默未归类，或落到完成时刻的当前文件夹（正是 folder-experience §1.3 要避免的漂移），且既有源码级断言 `viewer-folders.test.ts:1095` 会红 | 新 §3.5（全链路表 + 5 条接线要求）+ §2.2⑪ + §9.1 新增 `viewer-folders` 行 + §9.2 第 19 项 |
 | R21（第三轮评审新增） | **磁盘门提醒覆盖不足**：`need_disk_confirm` 若漏注册 `beforeunload` | 用户的选择只在本页内存（`entry.file`/`bundle.rows`），刷新后要重新选择并重新复制（大切片分钟级） | §6.2 第 7 点的语义判据（含 `need_disk_confirm`）+ §9.2 第 17 项（五态逐一断言） |
+| R22（第四轮复审新增） | **冻结快照从未被消费**：`uploadFileCos` 调用字面量不含 `assocTarget`（既有缺陷） | 直传条目静默关联到完成时刻的当前文件夹；刷新恢复拿不到快照（`app.js:10789` 被守卫吞、`:10864` 回落 `:11284`） | §3.5 第 2 点改写 + §2.2⑪ + §9.1 新增源码级断言（钉「被传」不只钉「被取」）（第四轮 A1） |
+| R23（第四轮复审新增） | **终态行的清理入口不可达**：恢复过滤排除已收口记录，而清理按钮只在那些行上 | OPFS 源副本 + 产物永久残留 → 撞 `quota_exceeded_recoverable`（`_sweepIncompleteStaging` 不兜底） | §6.2 第 2 步改为「取全部、分两组渲染」，§6.3 定义待清理组的最小行（第四轮 A2） |
+| R24（第四轮复审新增） | **文件夹两个入口仍弹工具页**：`importPickFolder`（清单从未提及）与目录拖入都无条件 `handoffBundleFolder` | 开关默认开时选/拖文件夹仍弹 `/tools/slides`，与 §0 目标冲突 | §2.2⑩b + §4.1.1 动作表（两处都改为 `enqueueBundle`，开关关闭才交接）（第四轮 A3） |
+| R25（第四轮复审新增） | **假 COS 接线写错旋钮**：`Endpoint=<host:port>` 产出坏主机（`probe-…127.0.0.1:9443`），且 `cos_client` 无注入点 | e2e 用例 A 的测试基建做不出来（或做出一个连不上的假 COS） | §9.4 改为测试侧 monkeypatch `cos_client._client` + `CosConfig(Domain=127.0.0.1:<port>, VerifySSL=False)`，并说明不再需要 host-resolver 映射；生产代码零改动（第四轮 A4，实测见 §10.16） |
+| R26（第四轮复审新增） | **回退承诺自相矛盾**：「逐字节不变（零改写）」vs 同一设计要改写回退路径用的两条文案，且改后文案在两态下都不成立 | 开关关闭时用户看到「本页面板内自动完成」这类不成立的说明，且无入口 | §8 收紧为「控制流不变」+ 按开关两态的两套文案（`unsupported` 去点名工具页、`convert_in_browser` 仅关闭时追加链接）（第四轮 A5） |
+| R27（第四轮复审新增） | **上传槽 account 来源未定义**（bootstrap 无该字段，面板又承诺零网络） | 两个实现分叉（空串 / currentUserId / 自行请求） | §5 明确 `String(window.currentUserId)` 加空串兜底，与 `contentLockName`/`storage.account` 同一取值与退化语义（第四轮 A6） |
+| R28（第四轮复审新增） | **「零 /api/ 请求」字面不可满足**（页面自身 5 个 GET） | 新 spec 天生为红 | §9.2 第 9 项与 §9.4 用例 C 改为「零面板发起的新请求」（第四轮 A7） |
 
 ## 12. 实施顺序建议
 
@@ -1288,3 +1468,19 @@ export TEST_RUN_DIR=/mnt/ssd2/tests/run-inline-convert-Mwpad1 \
 无不同意项；三条全部按评审意见修正。K1 的理由确实与我上一轮的论证相反——上一轮
 我把「`staging` 记录先写、复制随后」的顺序当成了「副本已在」，漏看了前置门在写记录
 **之前**、后置门的 catch 立即 `_discardNow`，故本轮改正（这是实质错误，不是表述问题）。
+
+### 13.4 第四轮六条（A1–A7）
+
+| 评审项 | 严重度 | 处置 |
+| --- | --- | --- |
+| A1 `assocTarget` 未转发给 `uploadFileCos` | medium | **接受，并升级为「必须修」**——原 §3.5 第 2 点把它写成「已做对、不重写」，实测 `app.js:10164-10170` 的字面量无该键（全仓仅 5 处 `assocTarget`），冻结快照被 `:4029` 守卫吞掉、完成时回落 `:11284` 的当前文件夹。§3.5 第 2 点改写为实测说明 + 「面板必须在同一批接线里补上」，§2.2⑪ 标为「一处保留 + 一处必须修」，§9.1 的 `viewer-folders` 行加码为「钉『被传』不只钉『被取』」（新增 R22） |
+| A2 恢复过滤与清理入口矛盾 | medium | **接受**——§6.2 第 2 步改为「取全部、分两组渲染」（待继续组 / 待清理组），§6.3 定义待清理组的最小行形态；引 `runner.js:361-366` 说明不会兜底（新增 R23） |
+| A3 `importPickFolder` / 目录拖入仍无条件交接 | medium | **接受**——`grep -c importPickFolder` 在原文为 0；两处都改为 `enqueueBundle`（开关关闭才 `handoffBundleFolder`）。§2.2⑩b + §4.1.1 补齐；连带 §9.2 第 16 项的可测性（新增 R24） |
+| A4 假 COS 的 `Endpoint` 注入 | low | **接受，但纠正评审的建议项**——`Endpoint=<host:port>` 实测产出坏主机（`probe-1250000000.127.0.0.1:9443`；带 scheme 更退化为 `probe-1250000000.http:`），**正确旋钮是 `Domain`**（path-style，签名与 `Content-Length` 均正常）；注入点只能靠测试侧 monkeypatch `cos_client._client`（生产 `cos_client.py:60-64` 无该参数、无 env，`grep COS_ENDPOINT` = 0），故**生产代码零改动**；且预签名 URL 已指向 `127.0.0.1`，不需要 `--host-resolver-rules`。§9.4 已按此重写（新增 R25，实测见 §10.16） |
+| A5 回退承诺与文案改写自相矛盾 | low | **接受**——§8 的「逐字节不变（零删除、零改写）」收紧为「控制流不变」；并规定两条文案按开关两态分写：`upload.err.unsupported`（`app.js:10148`）去点名工具页 + 走申请支持；`upload.cos.err.convert_in_browser`（`app.js:10545`）用中性事实句，仅 `enabled===false` 时追加 `/tools/slides` 链接（新增 R26） |
+| A6 上传槽 account 来源未定义 | low | **接受**——§5 明确 `String(window.currentUserId)` 加空串兜底（`app.js:275`），与既有 `contentLockName`（`:10757`）同一取值与退化语义；明确不得为此新增网络请求或读 bootstrap 的 `account`（不存在）（新增 R27） |
+| A7 「零 `/api/` 请求」字面不可满足 | low | **接受**——§9.2 第 9 项与 §9.4 用例 C 改为「零**面板发起的**新请求」（页面自身 5 个 GET 与 `SlideToolsRunner.create()` 的本地 OPFS/worker 启动不计），并加「点击后才出现对应请求」的正例（新增 R28） |
+
+无不同意项；六条全部按评审意见修正。A4 是一处**与评审建议不同的技术结论**：
+评审建议用 `Endpoint` 注入，实测它产出坏主机（把 endpoint 当域名后缀拼在 bucket 后），
+真正可用的旋钮是 `Domain`（path-style）；这一条我按实测写，并给出了备选的 virtual-hosted 方案。

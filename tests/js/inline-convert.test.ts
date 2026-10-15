@@ -1274,3 +1274,233 @@ describe("门禁等价性对照（§9.2 第 12 项）", () => {
 		expect(uploadSrc).toContain("!(cap.viewable_formats || []).includes(fmt)");
 	});
 });
+
+// --------------------------------------------------------------------- //
+// 6.3 按钮全集 + §9.2 第 15/22 项：开关两态与回退（真 app.js，DOM 级）
+// --------------------------------------------------------------------- //
+describe("上传行按钮（§6.3 是按钮全集的唯一权威）", () => {
+	/// 真 app.js 的 DOM harness（形态照 workbench-direct-class.test.ts），
+	/// 用 __PT_TEST_HOOKS 挂载 HP_PROJECT_UI / HP_UPLOAD 驱动面。
+	function el(tag?: string) {
+		const children: unknown[] = [];
+		const listeners: Record<string, Array<(ev?: unknown) => void>> = {};
+		const node: Record<string, unknown> = {
+			tagName: (tag || "div").toUpperCase(),
+			hidden: true, textContent: "", innerHTML: "", value: "", disabled: false,
+			checked: false, type: "", title: "", name: "", className: "",
+			style: {}, children,
+			classList: { add() { }, remove() { }, contains() { return false; } },
+			parentNode: null,
+			appendChild(c: unknown) { children.push(c); return c; },
+			removeChild(c: unknown) {
+				const i = children.indexOf(c);
+				if (i >= 0) children.splice(i, 1);
+				return c;
+			},
+			insertBefore(c: unknown) { children.push(c); return c; },
+			addEventListener(type: string, fn: (ev?: unknown) => void) {
+				(listeners[type] = listeners[type] || []).push(fn);
+			},
+			removeEventListener() { },
+			setAttribute() { }, getAttribute() { return null; },
+			removeAttribute() { },
+			focus() { },
+			click() { (listeners["click"] || []).forEach((f) => f({ preventDefault() { } })); },
+		};
+		(node as { _listeners: typeof listeners })._listeners = listeners;
+		return node as ReturnType<typeof el> & {
+			_listeners: Record<string, Array<(ev?: unknown) => void>>;
+		};
+	}
+
+	function loadApp(caps: unknown) {
+		const store = new Map<string, string>();
+		const els: Record<string, ReturnType<typeof el>> = {};
+		const doc = {
+			readyState: "loading",
+			cookie: "csrf_token=tok",
+			getElementById(id: string) { if (!els[id]) els[id] = el(); return els[id]; },
+			createElement(tag: string) { return el(tag); },
+			addEventListener() { },
+			querySelector() { return el(); },
+			querySelectorAll() { return []; },
+			body: el("body"),
+			documentElement: el("html"),
+		};
+		const theFetch = vi.fn(() => Promise.resolve({
+			ok: true, status: 200, clone() { return this; },
+			json: () => Promise.resolve({}),
+		}));
+		const w: Record<string, unknown> = {
+			__PT_TEST_HOOKS: true,
+			HP_I18N: {
+				t: (k: string, vars?: Record<string, unknown>) =>
+					vars && Object.keys(vars).length ? `${k}:${Object.values(vars).join(",")}` : k,
+				getLang: () => "zh",
+			},
+			HP_APP_BOOTSTRAP: { mode: "official", capabilities: caps },
+			fetch: theFetch,
+			location: { href: "http://local/", pathname: "/", origin: "http://local" },
+			confirm: vi.fn(() => true),
+			open: vi.fn(() => null),
+			addEventListener: vi.fn(),
+			innerWidth: 1280,
+			setTimeout: (fn: () => void, ms?: number) => setTimeout(fn, ms),
+			clearTimeout: (h: unknown) => clearTimeout(h as number),
+		};
+		(globalThis as { document?: unknown }).document = doc;
+		(globalThis as { window?: unknown }).window = w;
+		(globalThis as { fetch?: unknown }).fetch = theFetch;
+		(globalThis as { location?: unknown }).location = w.location;
+		(globalThis as { localStorage?: unknown }).localStorage = {
+			getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+			setItem: (k: string, v: string) => void store.set(k, String(v)),
+			removeItem: (k: string) => void store.delete(k),
+		};
+		// 加载顺序与模板一致（templates/index.html）：cos-uploader → slide-sniff
+		// → inline-convert → app.js
+		new Function("window", "document", "fetch", "location",
+			readFileSync(resolve(root, "static/upload/cos-uploader.js"), "utf8"))(
+			w, doc, theFetch, w.location);
+		new Function("window", "document", "fetch", "location", sniffSrc)(w, doc, theFetch, w.location);
+		new Function("window", "document", "fetch", "location", inlineSrc)(w, doc, theFetch, w.location);
+		new Function("window", "document", "fetch", "location", appSrc)(w, doc, theFetch, w.location);
+		return { w, els, fetch: theFetch };
+	}
+
+	const inlineCaps = (enabled: boolean) => ({
+		cos_upload: {
+			available: true, manual_only: true, max_size_bytes: 1000,
+			part_bytes: 100, url_ttl_seconds: 600, max_concurrent_parts: 2,
+			sign_batch_max_parts: 8,
+			formats: ["svs", "tif", "tiff", "ndpi", "vms", "vmu", "scn", "bif",
+				"svslide", "bmp", "jpg", "jpeg", "zip"],
+			browser_convert: { formats: ["kfb", "kfbf", "svs", "mrxs"], url: "/tools/slides" },
+			direct_upload: { formats: ["tif", "tiff", "ome.tif", "ndpi", "vms",
+				"scn", "bif", "bmp", "jpg", "jpeg", "vmu", "svslide"] },
+			inline_convert: {
+				enabled,
+				url: "/tools/slides",
+				viewable_formats: ["classic-bigtiff-jpeg-pyramid",
+					"ome-bigtiff-subifd-rgb-jpeg-pyramid"],
+			},
+		},
+	});
+
+	it("按钮全集：终态给「删除本地产物」；need_bundle 给「选择文件夹」；rejected 给申请支持", () => {
+		const h = loadApp(inlineCaps(true));
+		const up = h.w.HP_UPLOAD as unknown as {
+			inlineButtonKinds(e: unknown): string[];
+			inlineButtonLabel(kind: string, e: unknown): string;
+		};
+		const kinds = (state: string, extra: Record<string, unknown> = {}) =>
+			up.inlineButtonKinds({ state, jobId: "j1", ...extra });
+
+		// 终态：唯一清理入口必须在（§6.3）
+		expect(kinds("done")).toContain("discard");
+		expect(kinds("convert_failed")).toContain("discard");
+		expect(kinds("upload_failed")).toContain("discard");
+		expect(kinds("cancelled")).toContain("discard");
+		expect(kinds("rejected")).toContain("discard");
+		// 转换失败另有申请支持与保存到本机
+		expect(kinds("convert_failed")).toEqual(
+			expect.arrayContaining(["support", "saveLocal"]));
+		// 散文件 bundle：类型化说明 → 选择文件夹（不是重选文件）；无 jobId
+		// → 也不会有「删除本地产物」（散文件从未建任务，无可删产物）
+		expect(up.inlineButtonKinds({ state: "convert_failed", jobId: null,
+			error: { code: "need_bundle" } })).toEqual(["chooseFolder"]);
+		expect(kinds("convert_failed", { error: { code: "need_bundle" } }))
+			.toEqual(["chooseFolder", "discard"]);
+		// 拒绝：申请支持
+		expect(kinds("rejected")).toEqual(expect.arrayContaining(["support"]));
+		// 进行中：取消
+		expect(kinds("converting")).toEqual(["cancel"]);
+		expect(kinds("uploading")).toEqual(["cancel"]);
+		// 磁盘门：确认 + 取消
+		expect(kinds("need_disk_confirm")).toEqual(["confirmDisk", "cancel"]);
+		// 恢复行：继续 / 继续上传
+		expect(up.inlineButtonKinds({ state: "convert_queued", viaRestore: true, jobId: "j" }))
+			.toEqual(["continue"]);
+		expect(up.inlineButtonKinds({ state: "upload_queued", viaRestore: true, jobId: "j" }))
+			.toEqual(["continueUpload"]);
+		// 已发布的删除按钮文案要说明「平台上的不受影响」（本 harness 未加载
+		// i18n.js → tt 回落 app.js _EXTRA_I18N 的真实中文文案）
+		expect(String(up.inlineButtonLabel("discard", { uploadState: "published" })))
+			.toContain("不受影响");
+		expect(String(up.inlineButtonLabel("discard", { uploadState: "uploading" })))
+			.not.toContain("不受影响");
+	});
+
+	it("开关开：KFB 不再给弹窗交接入口，也不弹窗（零 window.open）", async () => {
+		const h = loadApp(inlineCaps(true));
+		const up = h.w.HP_UPLOAD as unknown as { inlineEnabled(): boolean };
+		expect(up.inlineEnabled()).toBe(true);
+		// 面板入口存在；行渲染由编排器驱动（真运行器未加载 → 回退交接，
+		// 但开关开的判定与 capacity 读取必须是「开」）
+		const caps = (h.w.HP_UPLOAD as unknown as {
+			inlineConvertCaps(): { enabled: boolean; url: string } | null;
+		}).inlineConvertCaps();
+		expect(caps?.enabled).toBe(true);
+		expect(caps?.url).toBe("/tools/slides");
+	});
+
+	it("开关关：inlineEnabled=false，走既有弹窗交接（§9.2 第 15 项）", () => {
+		const h = loadApp(inlineCaps(false));
+		const up = h.w.HP_UPLOAD as unknown as { inlineEnabled(): boolean };
+		expect(up.inlineEnabled()).toBe(false);
+	});
+
+	it("inline_convert 字段缺失：inlineEnabled=false（旧后端 fail-closed，不假设开启）", () => {
+		const h = loadApp({ cos_upload: { available: true, manual_only: true, formats: ["tif"] } });
+		const up = h.w.HP_UPLOAD as unknown as { inlineEnabled(): boolean };
+		expect(up.inlineEnabled()).toBe(false);
+	});
+
+	it("两态文案：开关关闭时 convert_in_browser 带工具页链接，开启时不带", () => {
+		// 关闭态（无 inline_convert 字段 → enabled=false）
+		const off = loadApp({ cos_upload: { available: true, manual_only: true, formats: ["tif"] } });
+		const msgOff = (off.w.HP_UPLOAD as unknown as {
+			cosErrorMessage(s: number, d: unknown): string;
+		}).cosErrorMessage(0, { code: "convert_in_browser" });
+		expect(msgOff).toContain("/tools/slides");
+		// 开启态
+		const on = loadApp(inlineCaps(true));
+		const msgOn = (on.w.HP_UPLOAD as unknown as {
+			cosErrorMessage(s: number, d: unknown): string;
+		}).cosErrorMessage(0, { code: "convert_in_browser" });
+		expect(msgOn).not.toContain("/tools/slides");
+	});
+
+	it("申请支持内核：预填 format_ext/message 并 POST /api/format-requests（§9.2 第 13 项）", async () => {
+		const h = loadApp(inlineCaps(true));
+		const up = h.w.HP_UPLOAD as unknown as {
+			submitFormatRequestCore(o: Record<string, unknown>): void;
+			openSupportForEntry(e: unknown): void;
+		};
+		let posted: { url: string; body: unknown } | null = null;
+		// 注入的 fetch 记录 (url, init)；apiFetchNoRedirect 直接转发它们。
+		// 只记**第一条**带 body 的 /api/format-requests（后续调用无 body）。
+		h.fetch.mockImplementation((url: string, init?: { body?: unknown }) => {
+			if (String(url) === "/api/format-requests" && init && init.body) {
+				posted = { url: String(url), body: init.body };
+				return Promise.resolve({
+					ok: true, status: 202, clone() { return this; },
+					json: () => Promise.resolve({ request_id: "fr_1", business_status: "submitted" }),
+				});
+			}
+			return Promise.resolve({ ok: true, status: 200, clone() { return this; }, json: () => Promise.resolve({}) });
+		});
+		up.openSupportForEntry({
+			name: "shot.jpg", error: { code: "content_ext_mismatch", detectedType: "png" },
+		});
+		await flush(10);
+		expect(posted, "未发起带 body 的 /api/format-requests").toBeTruthy();
+		expect(posted!.url).toBe("/api/format-requests");
+		// FormData：断言字段已带上（test 环境有真 FormData）
+		const fd = posted!.body as FormData;
+		expect(typeof fd.get).toBe("function");
+		expect(fd.get("format_ext")).toBe("jpg");
+		expect(String(fd.get("message"))).toContain("code=content_ext_mismatch");
+		expect(String(fd.get("message"))).toContain("detected=png");
+	});
+});

@@ -54,6 +54,10 @@
        提供 window.HP_COS_UPLOAD（无 DOM/无 i18n，依赖全部注入） -->
   <script src="/static/upload/cos-uploader.js?v=20261015"></script>
   <script src="/static/upload/slide-sniff.js?v=20261015"></script>
+  <!-- 上传面板内转换编排器（设计 docs/upload-inline-convert-design-20261015.md）：
+       classic script，与共享引擎同风格；必须晚于 cos-uploader/slide-sniff、
+       早于 app.js（app.js 初始化时读 window.HP_INLINE_CONVERT） -->
+  <script src="/static/upload/inline-convert.js?v=20261016"></script>
   <!-- 用户反馈客户端记录器（改版第四轮 §3）：先于 app.js 尽早装载——包装
        window.fetch / console / onerror 并记录点击控件标识。只在内存环形缓冲
        （300 条 / 15 分钟），不落盘、不上传；用户主动发送反馈时才随

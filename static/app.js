@@ -105,6 +105,44 @@
     "upload.kfb.dismiss": { zh: "忽略", en: "Dismiss" },
     "upload.kfb.drawer.title": { zh: "以下文件需在本机转换后上传：", en: "These files must be converted on this machine before uploading:" },
     "upload.kfb.done": { zh: "本机转换并上传完成：{name} 已按目标位置入库", en: "Local convert-and-upload finished: {name} stored under the chosen target" },
+    // 上传面板内转换（docs/upload-inline-convert-design-20261015.md；i18n.js 为主源，
+    // 此处兜底：app.js 的 tt() 在无 HP_I18N 词条时回落到本表）
+    "upload.inline.stage.queued": { zh: "排队中…", en: "Queued…" },
+    "upload.inline.stage.rejected": { zh: "已拒绝：内容或格式不受支持", en: "Rejected: content or format not supported" },
+    "upload.inline.stage.notAccepted": { zh: "上传词表不含该格式", en: "This format is not in the upload vocabulary" },
+    "upload.inline.stage.resumable": { zh: "未完成的转换", en: "Unfinished conversion" },
+    "upload.inline.stage.settled": { zh: "已收口（本地产物仍占用空间）", en: "Settled (local artifacts still use space)" },
+    "upload.inline.stage.disk": { zh: "等待确认磁盘空间", en: "Waiting for disk confirmation" },
+    "upload.inline.stage.convertFailed": { zh: "转换未完成", en: "Conversion not finished" },
+    "upload.inline.stage.engineUnsupported": { zh: "该变体暂不支持转换", en: "This variant cannot be converted yet" },
+    "upload.inline.stage.requeue": { zh: "识别修正：该文件需先在本机转换", en: "Correction: convert this file on this machine first" },
+    "upload.inline.note.keepopen": { zh: "请保持页面打开", en: "keep this page open" },
+    "upload.inline.note.committed": { zh: "已提交的进度可在刷新后继续", en: "Committed progress can be resumed after a refresh" },
+    "upload.inline.rejected.magic": { zh: "内容与扩展名不符（检测到 {type}）", en: "Content does not match the extension (detected {type})" },
+    "upload.inline.needBundle.mrxs": { zh: "MRXS 需要完整包：.mrxs 主文件 + 同名目录（Slidedat.ini 与全部数据文件）。请用「选择文件夹」或拖入整个文件夹", en: "MRXS needs the whole bundle: the .mrxs entry plus the same-named folder (Slidedat.ini and all data files). Use 'Select folder' or drop the whole folder" },
+    "upload.inline.needBundle.vms": { zh: "VMS 需要完整包：.vms 入口 + 同目录全部 tile JPEG。请用「选择文件夹」或拖入整个文件夹", en: "VMS needs the whole bundle: the .vms entry plus every sibling tile JPEG. Use 'Select folder' or drop the whole folder" },
+    "upload.inline.err.disk": { zh: "磁盘空间预检未通过", en: "Disk space precheck failed" },
+    "upload.inline.err.quota": { zh: "浏览器存储配额不足：请腾出空间，或改在转换器页转换后本地保存", en: "Browser storage quota is insufficient: free some space, or convert on the converter page and save locally" },
+    "upload.inline.err.profile": { zh: "当前资源档位内存预算不足", en: "This resource profile's memory budget is too small" },
+    "upload.inline.err.unsupported": { zh: "该文件不支持本机转换（已按原样上传或见下方说明）", en: "This file cannot be converted on this machine (uploaded as-is or see the note below)" },
+    "upload.inline.err.busy": { zh: "另一个标签页正在执行本机转换，请稍后重试", en: "Another tab is running a local conversion; please retry shortly" },
+    "upload.inline.err.evicted": { zh: "本地任务目录已被浏览器清理，请重新选择文件", en: "The local job directory was evicted by the browser; please re-select the file" },
+    "upload.inline.err.resume": { zh: "本地任务与当前设置不符，请重新选择文件后重试", en: "The local job no longer matches the current settings; please re-select the file" },
+    "upload.inline.err.io": { zh: "本地读写错误：请重试", en: "Local I/O error: please retry" },
+    "upload.inline.err.magic": { zh: "内容与扩展名不符：请用正确格式重新保存后再上传", en: "Content does not match the extension: re-save it in the correct format" },
+    "upload.inline.err.notViewable": { zh: "平台暂不支持查看该转换产物：请改用「保存到本机」", en: "The platform cannot view this converted artifact yet: use 'Save to this machine'" },
+    "upload.inline.err.needs.convert": { zh: "该格式需先在本机转换后上传", en: "This format must be converted on this machine before uploading" },
+    "upload.inline.disk.confirm": { zh: "继续（我已确认）", en: "Continue (I understand)" },
+    "upload.inline.action.continue": { zh: "继续", en: "Continue" },
+    "upload.inline.action.continueUpload": { zh: "继续上传", en: "Continue upload" },
+    "upload.inline.action.reselect": { zh: "重新选择文件", en: "Re-select file" },
+    "upload.inline.action.chooseFolder": { zh: "选择文件夹", en: "Select folder" },
+    "upload.inline.action.discard": { zh: "删除本地产物", en: "Delete local artifacts" },
+    "upload.inline.action.discard.published": { zh: "删除本地产物（平台已上传的切片不受影响）", en: "Delete local artifacts (uploaded slides are unaffected)" },
+    "upload.inline.action.requestSupport": { zh: "申请支持该格式", en: "Request support for this format" },
+    "upload.inline.action.saveLocal": { zh: "保存到本机", en: "Save to this machine" },
+    "upload.inline.freed": { zh: "释放 {bytes}", en: "frees {bytes}" },
+    "upload.inline.needDisk": { zh: "浏览器只报告了 ~{available} 可用，本任务预计需要 ~{need}", en: "The browser reports only ~{available} available; this job needs ~{need}" },
 
     // 升级 C（§6.1）：矩形工具文案（i18n.js 为主源；此处兜底）
     "roi.rect.tip": { zh: "矩形工具：在视野中拖出矩形，或输入宽高后点击中心放置；拖内部平移、边/角调整大小；Escape 取消",
@@ -10106,7 +10144,29 @@
     opts = opts || {};
     // folder-experience §1.3：上传开始即冻结目标快照——之后侧栏切换目录、
     // 抽屉重开/下拉改动不影响本次任务的关联归属（含失败重试的目标与幂等键）
+    // 面板内转换（设计 §3.5 第 1 点）：快照必须在**入队之前**取——这条既
+    // 有语义与源码级断言（viewer-folders.test.ts）都由本次接线保持。
     opts.assocTarget = importTargetSnapshot();
+    // 上传面板内转换（设计 §2.2①）：开关开 → 全部交给面板队列；关闭 →
+    // 逐字节保持既有分流（弹窗交接 + 直传）。
+    if (inlineEnabled() && ensureInlineOrch()) {
+      var orch = inlineOrch;
+      if (orch) {
+        orch.enqueue(file, { assocTarget: opts.assocTarget });
+        return;
+      }
+      ensureInlineOrch().then(function (o) {
+        if (o) o.enqueue(file, { assocTarget: opts.assocTarget });
+        else legacyUploadFile(file, opts);
+      });
+      return;
+    }
+    legacyUploadFile(file, opts);
+  }
+
+  /// 既有分流路径（开关关闭 / 面板初始化失败时的回退；控制流不变）。
+  function legacyUploadFile(file, opts) {
+    opts = opts || {};
     // 先转换后上传阶段 1（docs/slide-tools/upload-convert-first-phase1.md）：
     // 先按文件头嗅探直传类别（slide-sniff.js 共享模块，只读 ≤128KB 头），
     // 按类别分流——直传类（OME-TIFF/转换器 BigTIFF）与暂时直传类立即上传
@@ -10168,6 +10228,12 @@
       // legacy-direct/unconverted-variant:svs-jp2k；服务端词表校验 + worker
       // 头级核验）
       directClass: cls ? (cls.directClass || null) : null,
+      // 复核（设计 §3.5 / 第四轮复审 A1）：**必须把冻结的目标快照转发下去**。
+      // 此前这里的字面量不含该键，uploadFileCos 内的
+      // `fbUpAssocSave(jobId, opts.assocTarget)`（:10789 区）被其守卫吞掉、
+      // 完成时 `cosUploadSucceeded(..., opts.assocTarget)` 收到 undefined →
+      // 关联回落到「完成时刻的当前文件夹」（folder-experience §1.3 明令避免）。
+      assocTarget: opts.assocTarget || null,
     });
   }
 
@@ -10959,6 +11025,401 @@
     }
     tick();
   }
+
+  // =========================================================================
+  // 上传面板内转换（docs/upload-inline-convert-design-20261015.md）
+  //
+  // 编排器本体在 static/upload/inline-convert.js（window.HP_INLINE_CONVERT，
+  // classic script、无 DOM/无网络、可 vitest 直测）；这里只做工作台侧的粘合：
+  // 行渲染与按钮（§6.3 是按钮全集的唯一权威）、运行器动态 import、目标快照、
+  // 完成时的关联与打开、申请支持、beforeunload。
+  //
+  // 开关关闭（inline_convert.enabled=false）→ 完全退回既有弹窗交接路径
+  // （offerBrowserConvert / openConvertHandoff / handoffBundleFolder），
+  // 控制流不变（§8）。
+  // =========================================================================
+
+  //: 运行器动态 import 的 URL（唯一常量；生产/测试共用）
+  var RUNNER_URL = "/static/tools/slide-transform/runner.js";
+  var inlineRunner = null;        // SlideToolsRunner 实例（懒创建）
+  var inlineEngine = null;        // engine.js 命名空间（懒 import）
+  var inlineOrch = null;          // 面板编排器
+  var inlineInitP = null;         // 初始化 promise（并发去重）
+
+  /// inline_convert 能力（app.py _inline_convert_payload 唯一权威）。
+  function inlineConvertCaps() {
+    try {
+      var caps = window.HP_APP_BOOTSTRAP && window.HP_APP_BOOTSTRAP.capabilities;
+      var cfg = window.HP_INLINE_CONVERT
+        ? window.HP_INLINE_CONVERT.normalizeConfig(caps) : null;
+      return cfg;
+    } catch (e) { return null; }
+  }
+
+  function inlineEnabled() {
+    var cfg = inlineConvertCaps();
+    return !!(cfg && cfg.enabled);
+  }
+
+  /// 懒初始化：动态 import 运行器 + 引擎（classic script 里可以 import；
+  /// /app 的 CSP 实测放行 wasm/worker，见设计 §10.2）。失败 → 行内说明 +
+  /// 回退到弹窗交接（§11 R3）。
+  function ensureInlineOrch() {
+    if (inlineOrch) return Promise.resolve(inlineOrch);
+    if (inlineInitP) return inlineInitP;
+    if (!window.HP_INLINE_CONVERT) return Promise.resolve(null);
+    inlineInitP = Promise.all([
+      import(RUNNER_URL),
+      import("/static/tools/slide-transform/engine.js"),
+    ]).then(function (mods) {
+      var runnerMod = mods[0];
+      inlineEngine = mods[1];
+      return runnerMod.SlideToolsRunner.create();
+    }).then(function (runner) {
+      inlineRunner = runner;
+      inlineOrch = window.HP_INLINE_CONVERT.createOrchestrator({
+        runner: runner,
+        engine: inlineEngine,
+        sniff: window.HP_SLIDE_SNIFF,
+        cos: window.HP_COS_UPLOAD,
+        caps: inlineCaps(),
+        ui: {
+          row: inlineRowRender,
+          setStage: inlineRowSetStage,
+          markError: inlineRowMarkError,
+          buttons: inlineRowButtons,
+          toast: function (key, vars, kind) { toast(tt(key, vars), kind || "info"); },
+          refresh: function () { applyBeforeunload(); },
+          remove: inlineRowRemove,
+        },
+        account: function () { return String(currentUserId || ""); },
+        target: function () { return importTargetSnapshot(); },
+        onArtifact: uploadEntryArtifact,
+        onUploaded: inlineUploaded,
+        apiFetch: apiFetch,
+        apiFetchNoRedirect: apiFetchNoRedirect,
+        setTimer: function (fn, ms) { setTimeout(fn, ms); },
+      });
+      // 刷新恢复：只列出、不自动开始（§6.2）
+      inlineOrch.restore();
+      applyBeforeunload();
+      return inlineOrch;
+    }).catch(function (e) {
+      console.error("[inline-convert] 初始化失败（回退到弹窗交接）:", e);
+      inlineInitP = null;
+      return null;
+    });
+    return inlineInitP;
+  }
+
+  function inlineCaps() {
+    var caps = (window.HP_APP_BOOTSTRAP && window.HP_APP_BOOTSTRAP.capabilities) || {};
+    var cos = caps.cos_upload || {};
+    return {
+      inlineConvert: window.HP_INLINE_CONVERT
+        ? window.HP_INLINE_CONVERT.normalizeConfig(caps) : null,
+      directUploadFormats: (cos.direct_upload && cos.direct_upload.formats) || null,
+      browserConvertFormats: (cos.browser_convert && cos.browser_convert.formats) || null,
+      cosConfig: resolveCosConfig(),
+    };
+  }
+
+  // ---------- 行渲染（复用 makeUploadRow 的四段 + 按钮组） ----------
+
+  var inlineRowEls = {};   // entry.id -> {row, note, btnHost, kinds}
+
+  function inlineRowRender(entry) {
+    if (!entry || inlineRowEls[entry.id]) return;
+    var row = makeUploadRow({ name: entry.name, size: entry.size });
+    var host = row._row;
+    var note = null;
+    var btnHost = null;
+    if (host && host.appendChild) {
+      note = document.createElement("div");
+      note.className = "upload-item-status";
+      note.textContent = tt("upload.inline.note.keepopen");
+      host.appendChild(note);
+      btnHost = document.createElement("div");
+      btnHost.className = "upload-item-actions";
+      host.appendChild(btnHost);
+    }
+    inlineRowEls[entry.id] = { row: row, note: note, btnHost: btnHost, kinds: {} };
+  }
+
+  function inlineRowSetStage(entry, key, frac, noteText, indeterminate) {
+    var rec = inlineRowEls[entry.id];
+    if (!rec) return;
+    var extra = noteText ? " · " + tt(noteText) : "";
+    rec.row.setStage(key, frac, extra, indeterminate);
+  }
+
+  function inlineRowMarkError(entry) {
+    var rec = inlineRowEls[entry.id];
+    if (rec) rec.row.markError();
+  }
+
+  function inlineRowRemove(entry) {
+    var rec = inlineRowEls[entry.id];
+    if (!rec) return;
+    if (rec.row._row && rec.row._row.parentNode &&
+        rec.row._row.parentNode.removeChild) {
+      rec.row._row.parentNode.removeChild(rec.row._row);
+    }
+    delete inlineRowEls[entry.id];
+  }
+
+  /// 终态 / 恢复态按钮（§6.3 的完整表；每种只挂一次，按 state 重算）
+  function inlineRowButtons(entry) {
+    var rec = inlineRowEls[entry.id];
+    if (!rec || !rec.btnHost || !rec.btnHost.appendChild) return;
+    var st = entry.state;
+    var kinds = inlineButtonKinds(entry);
+    var key = kinds.join("|");
+    if (rec.renderedFor === key) return;
+    rec.renderedFor = key;
+    rec.btnHost.textContent = "";
+    kinds.forEach(function (kind) {
+      if (kind === "support") {
+        var sup = document.createElement("button");
+        sup.type = "button";
+        sup.className = "upload-item-btn";
+        sup.textContent = tt("upload.inline.action.requestSupport");
+        sup.addEventListener("click", function (e) {
+          if (e && e.preventDefault) e.preventDefault();
+          openSupportForEntry(entry);
+        });
+        rec.btnHost.appendChild(sup);
+        return;
+      }
+      if (kind === "saveLocal") {
+        var sv = document.createElement("a");
+        sv.className = "upload-item-btn";
+        sv.href = inlineConvertCaps() && inlineConvertCaps().url
+          ? inlineConvertCaps().url : CONVERT_HANDOFF_URL;
+        sv.target = "_blank";
+        sv.rel = "noopener";
+        sv.textContent = tt("upload.inline.action.saveLocal");
+        rec.btnHost.appendChild(sv);
+        return;
+      }
+      var b = document.createElement("button");
+      b.type = "button";
+      b.className = "upload-item-btn";
+      var label = inlineButtonLabel(kind, entry);
+      b.textContent = label;
+      b.addEventListener("click", function (e) {
+        if (e && e.preventDefault) e.preventDefault();
+        inlineAction(entry, kind);
+      });
+      rec.btnHost.appendChild(b);
+    });
+  }
+
+  /// 按钮全集（唯一权威表）：按 entry 状态给出动作序列。
+  function inlineButtonKinds(entry) {
+    var st = entry.state;
+    var out = [];
+    if (st === "convert_queued" || st === "requeue_convert") {
+      if (entry.viaRestore) out.push("continue");
+    }
+    if (st === "upload_queued" && entry.viaRestore) out.push("continueUpload");
+    if (st === "need_disk_confirm") out.push("confirmDisk", "cancel");
+    if (st === "converting") out.push("cancel");
+    if (st === "uploading") out.push("cancel");
+    if (st === "rejected") out.push("support");
+    if (st === "convert_failed") {
+      if (entry.error && entry.error.code === "need_bundle") {
+        out.push("chooseFolder");
+      } else {
+        out.push("support", "saveLocal");
+      }
+    }
+    if (st === "upload_failed") out.push("support");
+    if (window.HP_INLINE_CONVERT && window.HP_INLINE_CONVERT.isTerminal(st)) {
+      // 终态：本地产物仍在 OPFS（唯一清理入口，§6.3）
+      if (entry.jobId) out.push("discard");
+    }
+    if (st === "done" && entry.jobId) out.push("discard");
+    return out;
+  }
+
+  function inlineButtonLabel(kind, entry) {
+    if (kind === "continue") return tt("upload.inline.action.continue");
+    if (kind === "continueUpload") return tt("upload.inline.action.continueUpload");
+    if (kind === "confirmDisk") return tt("upload.inline.disk.confirm");
+    if (kind === "cancel") return tt("upload.cos.cancel");
+    if (kind === "chooseFolder") return tt("upload.inline.action.chooseFolder");
+    if (kind === "reselect") return tt("upload.inline.action.reselect");
+    if (kind === "discard") {
+      return (entry.uploadState === "published")
+        ? tt("upload.inline.action.discard.published")
+        : tt("upload.inline.action.discard");
+    }
+    return tt("upload.inline.action.continue");
+  }
+
+  function inlineAction(entry, kind) {
+    if (!inlineOrch) return;
+    if (kind === "chooseFolder") {
+      if (els.importFolderInput) els.importFolderInput.click();
+      return;
+    }
+    if (kind === "support") {
+      openSupportForEntry(entry);
+      return;
+    }
+    if (kind === "continueUpload") {
+      inlineOrch.act(entry.id, "continue");
+      return;
+    }
+    if (kind === "discard") {
+      inlineOrch.act(entry.id, "discard");
+      return;
+    }
+    if (kind === "cancel") { inlineOrch.act(entry.id, "cancel"); return; }
+    if (kind === "confirmDisk") { inlineOrch.act(entry.id, "confirmDisk"); return; }
+    inlineOrch.act(entry.id, "continue");
+  }
+
+  /// 申请支持（§7.1）：复用既有抽屉的表单提交内核（format_ext + message 预填）。
+  function openSupportForEntry(entry) {
+    var pre;
+    try {
+      pre = window.HP_INLINE_CONVERT
+        ? window.HP_INLINE_CONVERT.prefillFormatRequest(entry, {
+            inlineConvert: inlineConvertCaps(),
+          })
+        : { format_ext: "", message: "" };
+    } catch (e) {
+      pre = { format_ext: "", message: "" };
+    }
+    if (typeof submitFormatRequestCore !== "function") return;
+    submitFormatRequestCore({
+      ext: pre.format_ext,
+      message: pre.message,
+      onResult: function (rec) { renderFormatRequestResult(rec); loadRecentFormatRequests(); },
+      onError: function (msg) { toast(msg, "error"); },
+    });
+  }
+
+  /// 上传产物（转换条目：由 onArtifact 提供后走既有 uploadFileCos 语义）。
+  /// 面板自己不做传输：把 source 交给共享引擎 createUpload，工作台侧的
+  /// 记录适配与直传完全一致。
+  function uploadEntryArtifact(entry, artifact) {
+    if (!artifact) {
+      return Promise.reject({ data: { code: "cos_unavailable" } });
+    }
+    return new Promise(function (resolve, reject) {
+      var name = entry.artifactName || entry.name;
+      var declaration = window.HP_INLINE_CONVERT
+        ? window.HP_INLINE_CONVERT.artifactDeclaration(entry.artifactCls) : null;
+      var cfg = resolveCosConfig();
+      if (!cfg) { reject({ data: { code: "cos_unavailable" } }); return; }
+      var upload = window.HP_COS_UPLOAD.createUpload({
+        source: {
+          name: name, size: artifact.size,
+          slice: function (s, e) { return artifact.slice(s, e); },
+        },
+        apiFetch: apiFetch,
+        heartbeatFetch: apiFetchNoRedirect,
+        config: cfg,
+        createBody: declaration ? { direct_class: declaration } : null,
+        storage: {
+          save: function (rec) {
+            if (!rec || !rec.job_id) return undefined;
+            return inlineRunner.setJobUpload(entry.jobId, {
+              ingestionId: rec.job_id, filename: name, size: artifact.size,
+              state: "uploading", confirmedParts: rec.confirmed || [],
+              partDigests: rec.digests || {},
+              digestScheme: rec.digest_scheme || "",
+              account: String(currentUserId || ""),
+            });
+          },
+          complete: function (id, outcome) {
+            return inlineRunner.setJobUpload(entry.jobId, {
+              ingestionId: id, filename: name, size: artifact.size,
+              state: (outcome && outcome.succeeded) ? "published" : "failed",
+              slideId: (outcome && outcome.slide_id) || null,
+              error: (outcome && outcome.fail_code) || null,
+              errorDetail: (outcome && outcome.fail_detail) || null,
+            });
+          },
+          remove: function (id) {
+            return inlineRunner.setJobUpload(entry.jobId, {
+              ingestionId: id, filename: name, size: artifact.size,
+              state: "cancelled",
+            });
+          },
+          readConfirmed: function (id) {
+            return inlineRunner.getJob(entry.jobId).then(function (j) {
+              var up = j && j.upload;
+              return (up && up.ingestionId === id) ? (up.confirmedParts || []) : [];
+            });
+          },
+          readRecord: function (id) {
+            return inlineRunner.getJob(entry.jobId).then(function (j) {
+              var up = j && j.upload;
+              if (!up || up.ingestionId !== id) return null;
+              return { confirmed: up.confirmedParts || [],
+                       digests: up.partDigests || null,
+                       digest_scheme: up.digestScheme || "",
+                       account: typeof up.account === "string" ? up.account : "" };
+            });
+          },
+        },
+        account: String(currentUserId || ""),
+        resumeJobId: null,
+        skipConfirm: true,
+        confirmResume: function () { return true; },
+        retryCompleteOnNetworkError: false,
+        useResumeEndpoint: false,
+        onEvent: function (ev) {
+          if (ev.type === "progress") {
+            inlineRowSetStage(entry, "upload.cos.stage.uploading",
+              ev.determinate === false ? null : ev.frac,
+              ev.determinate === false ? "" : "upload.cos.bytes", !!ev.determinate === false);
+          } else if (ev.type === "status" && ev.body) {
+            inlineRowSetStage(entry, "upload.cos.stage." + (ev.body.stage || "uploading"));
+          } else if (ev.type === "created") {
+            entry.uploadJobId = ev.jobId;
+          }
+        },
+      });
+      entry._upload = upload;
+      upload.done.then(resolve, reject);
+    });
+  }
+
+  /// 完成收口（§3.5）：刷新列表 → 按**入队时冻结的**目标快照关联 → 打开。
+  function inlineUploaded(entry, body) {
+    var sid = entry.slideId || null;
+    var name = entry.artifactName || entry.name;
+    loadAll();
+    importAssociateUploaded(sid || null, name, entry.target || null, null);
+    if (sid) openSlide(sid);
+    applyBeforeunload();
+  }
+
+  // ---------- beforeunload（§6.2 第 7 点） ----------
+  // 惰性注册：只在**确有**需要提醒的 entry 时才挂监听（IIFE 期零副作用——
+  // 极简 window stub 的测试 harness 没有 addEventListener）。
+  var inlineUnloadOn = false;
+  var inlineUnloadBound = false;
+  function applyBeforeunload() {
+    var need = !!(inlineOrch && inlineOrch.warnNeeded && inlineOrch.warnNeeded());
+    inlineUnloadOn = need;
+    if (need && !inlineUnloadBound &&
+        typeof window.addEventListener === "function") {
+      inlineUnloadBound = true;
+      window.addEventListener("beforeunload", function (ev) {
+        if (inlineUnloadOn) {
+          ev.preventDefault();
+          ev.returnValue = "";
+        }
+      });
+    }
+  }
+
   // 供测试（tests/js/*.test.ts loadApp harness）驱动真实上传路径；
   // 与 HP_AUTH 同风格的命名空间导出，不进业务调用面
   window.HP_UPLOAD = {
@@ -10985,6 +11446,22 @@
     offerBrowserConvert: offerBrowserConvert,
     handoffBundleFolder: handoffBundleFolder,
     importDroppedDirectory: importDroppedDirectory,
+    // 上传面板内转换（docs/upload-inline-convert-design-20261015.md §2.2⑦；
+    // 测试驱动面——面板本体在 window.HP_INLINE_CONVERT）
+    inlineEnabled: inlineEnabled,
+    inlineConvertCaps: inlineConvertCaps,
+    ensureInlineOrch: ensureInlineOrch,
+    inlineOrch: function () { return inlineOrch; },
+    inlineRunner: function () { return inlineRunner; },
+    inlineButtonKinds: inlineButtonKinds,
+    inlineButtonLabel: inlineButtonLabel,
+    inlineRowEls: inlineRowEls,
+    inlineWarnNeeded: function () { return inlineUnloadOn; },
+    uploadEntryArtifact: uploadEntryArtifact,
+    legacyUploadFile: legacyUploadFile,
+    importBundleRows: importBundleRows,
+    submitFormatRequestCore: submitFormatRequestCore,
+    openSupportForEntry: openSupportForEntry,
   };
   // 供测试（升级 A）：侧栏开合控制器与偏好存取的真实逻辑入口
   window.HP_SIDEBAR = {
@@ -11106,17 +11583,39 @@
     }
     var rows = [];
     collect(dirEntry, "", rows).then(function () {
+      // bundle 判定（设计 §4.1.1）：正则对齐到 `.mrxs|dat|vms`（**不含 `.vmu`**
+      // ——VMU 今天在直传受理集内，划进 bundle 分支会把它从「可用」变成
+      // planner 拒绝，属收紧能力）。「是不是完整包 / 缺哪个成员」只由
+      // 运行器的 planner 判，这里只做**分流**。
       var members = rows.filter(function (r) {
-        return /\.(mrxs|dat)$/i.test(r.name);
+        return /\.(mrxs|dat|vms)$/i.test(r.name);
       });
       if (members.length) {
-        handoffBundleFolder(rows, dirEntry.name);
+        importBundleRows(rows, dirEntry.name);
         return;
       }
       rows.forEach(function (r) { uploadFile(r.file); });
     }).catch(function () {
       toast(tt("imp.drop.dir.unreadable"), "error");
     });
+  }
+
+  /// bundle 分流（设计 §2.2⑩b / §4.1.1）：开关开 → 进面板队列（绝不弹
+  /// /tools/slides）；关闭 → 既有弹窗交接（控制流不变）。
+  function importBundleRows(rows, folderName) {
+    if (inlineEnabled()) {
+      ensureInlineOrch().then(function (orch) {
+        if (orch) {
+          orch.enqueueBundle(rows, folderName, {
+            assocTarget: importTargetSnapshot(),
+          });
+        } else {
+          handoffBundleFolder(rows, folderName);   // 面板不可用 → 回退交接
+        }
+      });
+      return;
+    }
+    handoffBundleFolder(rows, folderName);
   }
 
   /// MRXS 完整包 → 本机转换交接（弹窗 + 抽屉待操作入口，可重试）。
@@ -11147,7 +11646,8 @@
     });
     var first = rows[0].relPath.split("/")[0] || rows[0].name;
     els.importFolderInput.value = "";   // 允许再次选择同一目录触发 change
-    handoffBundleFolder(rows, first);
+    // 与拖入目录同一分流（设计 §2.2⑩b）：开关开 → 面板队列；关闭 → 交接
+    importBundleRows(rows, first);
   }
 
   // =========================================================================
@@ -11527,6 +12027,54 @@
     }).catch(function () { /* 静默 */ });
   }
 
+  /// 申请支持内核（设计 §2.2⑧ / §7.1）：抽屉表单与上传行的「申请支持该格式」
+  /// 共用同一提交路径（同一端点、同一 202/413/429 语义、同一预检）。
+  /// opts: {ext, message, contact, sampleFile, onResult, onError}
+  function submitFormatRequestCore(opts) {
+    opts = opts || {};
+    var ext = String(opts.ext || "").trim();
+    if (!ext) {
+      if (opts.onError) opts.onError(t("fr.need.ext"));
+      else toast(t("fr.need.ext"), "error");
+      return;
+    }
+    var sample = opts.sampleFile || null;
+    // 前端预检样本大小（服务端仍权威校验）
+    if (sample && sample.size > importDrawerState.maxSampleBytes) {
+      var tooBig = t("fr.sample.too.large", {
+        size: fmtSize(importDrawerState.maxSampleBytes),
+      });
+      if (opts.onError) opts.onError(tooBig);
+      else toast(tooBig, "error");
+      return;
+    }
+    var fd = new FormData();
+    fd.append("format_ext", ext);
+    fd.append("message", String(opts.message || "").trim());
+    fd.append("contact", String(opts.contact || "").trim());
+    if (sample) fd.append("sample", sample);
+    // 401 不跳转（设计 §7.1）：申请支持不属状态推进请求，不把页面导航走
+    apiFetchNoRedirect("/api/format-requests", { method: "POST", body: fd })
+      .then(jsonBody)
+      .then(function (res) {
+        if (res.status === 202) {
+          // 202 只表示登记成功：展示申请编号 + 业务状态（不说「已发送/已兼容」）
+          if (opts.onResult) opts.onResult(res.body);
+          else renderFormatRequestResult(res.body);
+          loadRecentFormatRequests();
+        } else {
+          // 413/429/其他失败：保留草稿（输入不清空），就地提示
+          var msg = (res.body && res.body.error) || t("fr.fail");
+          if (opts.onError) opts.onError(msg);
+          else toast(msg, "error");
+        }
+      })
+      .catch(function () {
+        if (opts.onError) opts.onError(t("fr.fail"));
+        else toast(t("fr.fail"), "error");
+      });
+  }
+
   function submitFormatRequest() {
     if (!els.frExt || !els.frSubmit) return;
     var ext = (els.frExt.value || "").trim();
@@ -11539,30 +12087,20 @@
       }), "error");
       return;
     }
-    var fd = new FormData();
-    fd.append("format_ext", ext);
-    fd.append("message", (els.frMessage.value || "").trim());
-    fd.append("contact", (els.frContact.value || "").trim());
-    if (els.frSample.files && els.frSample.files[0]) {
-      fd.append("sample", els.frSample.files[0]);
-    }
     els.frSubmit.disabled = true;
-    apiFetch("/api/format-requests", { method: "POST", body: fd })
-      .then(jsonBody)
-      .then(function (res) {
-        if (res.status === 202) {
-          // 202 只表示登记成功：展示申请编号 + 业务状态（不说「已发送/已兼容」）
-          renderFormatRequestResult(res.body);
-          els.frExt.value = ""; els.frMessage.value = "";
-          els.frContact.value = ""; els.frSample.value = "";
-          loadRecentFormatRequests();
-        } else {
-          // 413/429/其他失败：保留草稿（输入不清空），就地提示
-          toast((res.body && res.body.error) || t("fr.fail"), "error");
-        }
-      })
-      .catch(function () { toast(t("fr.fail"), "error"); })
-      .finally(function () { els.frSubmit.disabled = false; });
+    submitFormatRequestCore({
+      ext: ext,
+      message: els.frMessage.value,
+      contact: els.frContact.value,
+      sampleFile: (els.frSample.files && els.frSample.files[0]) || null,
+      onResult: function (rec) {
+        renderFormatRequestResult(rec);
+        els.frExt.value = ""; els.frMessage.value = "";
+        els.frContact.value = ""; els.frSample.value = "";
+      },
+      onError: function (msg) { toast(msg, "error"); },
+    });
+    if (els.frSubmit) els.frSubmit.disabled = false;
   }
 
   // ---------- 后台任务列表（GET /api/conversions?group=…；轮询） ----------

@@ -3178,6 +3178,29 @@ def _validate_direct_class(safe, kind, value):
     return declared, None
 
 
+#: 工作台上传面板内转换（docs/upload-inline-convert-design-20261015.md §8）：
+#: 默认开；`INLINE_CONVERT_ENABLED=0` 让能力载荷下发 enabled=false，前端完全
+#: 退回既有「弹窗交接 /tools/slides」行为（快速回滚；控制流零删除）。
+#: 测试用 monkeypatch 本常量覆盖（与 UPLOAD_PRODUCT_MAX_BYTES 同款：调用点读取）。
+INLINE_CONVERT_ENABLED = (os.environ.get("INLINE_CONVERT_ENABLED") or "1") \
+    .strip().lower() not in ("0", "false", "no")
+
+
+def _inline_convert_payload():
+    """上传面板内转换能力（设计 §8）：开关 + 回退目的地 + 产物可查看格式。
+
+    ``viewable_formats`` 与工具页端点同源（唯一来源
+    ``SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS``）——它是**转换产物**的门禁依据，
+    直传条目**不**使用（设计 §5.1）。``available:false`` / ``demo`` 时也随形
+    下发：前端要能显示明确原因（与 browser_convert / direct_upload 同一惯例）。
+    """
+    return {
+        "enabled": bool(INLINE_CONVERT_ENABLED),
+        "url": BROWSER_CONVERT_URL,
+        "viewable_formats": list(SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS),
+    }
+
+
 def _cos_upload_capability_payload(demo):
     """COS 直传 capability 下发（off 时零 DB 查询，静态不可用）。
 
@@ -3194,6 +3217,9 @@ def _cos_upload_capability_payload(demo):
     # 先转换后上传阶段 1：direct_upload 与 browser_convert 两张清单一起
     # 下发（静态派生，无 DB 查询；available=false 时也随形下发供前端展示）。
     payload["direct_upload"] = {"formats": sorted(_direct_upload_formats())}
+    # 上传面板内转换（设计 §8）：开关 + 回退 URL + 产物可查看格式。静态
+    # 派生、无 DB 查询；available=false / demo 时同样下发。
+    payload["inline_convert"] = _inline_convert_payload()
     if demo or cos_config.COS_UPLOAD_CAPABILITY not in ("off", "internal", "on"):
         return payload
     _sid, _skey, ok = cos_config.cos_credentials()

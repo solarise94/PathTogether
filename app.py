@@ -18200,6 +18200,17 @@ def _validate_ai_skill_request(body, slide, slide_id=None):
                 return None, (jsonify(
                     error="target.slide_id 与本次对话切片不符",
                     code="slide_ref_conflict"), 400)
+            # 与本次 run 的 slide_id 相同（调用方已解析并判权），下面的
+            # asset_revision 比对需要它的描述符
+            try:
+                t_desc = slide_store.resolve_slide_id(t_slide_id)
+            except Exception:
+                app.logger.warning("target.slide_id 解析失败（fail-closed）：%s",
+                                   t_slide_id, exc_info=True)
+                t_desc = None
+            if t_desc is None:
+                return None, (jsonify(error="target.slide_id 不存在",
+                                      code="slide_not_found"), 404)
         else:
             try:
                 t_desc = slide_store.resolve_slide_id(t_slide_id)

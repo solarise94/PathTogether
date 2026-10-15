@@ -1799,6 +1799,29 @@ def test_run_target_stale_revision_conflict(monkeypatch):
     assert fake.calls == []
 
 
+def test_run_by_slide_id_target_asset_revision(monkeypatch):
+    """Viewer 的真实形态：run 携带 slide_id + target.asset_revision。
+    过期 → 409；与当前一致 → 200 透传（此前该路径 500 UnboundLocalError）。"""
+    fake = _setup_run_env(monkeypatch)
+    _touch()
+    sid = share_store.get_slide_id("demo.svs")
+    cur = app_mod._slide_revision(app_mod.slide_store.resolve_slide_id(sid))
+    c = _browser_client(app_mod.app)
+    base = {"slide": "demo.svs", "slide_id": sid, "task": "这块是什么"}
+    target = {"slide_id": sid, "kind": "roi",
+              "bbox": {"x": 0, "y": 0, "w": 10, "h": 10}}
+    r = c.post("/api/ai/run?fresh=1", json=dict(
+        base, target=dict(target, asset_revision="rev-stale")))
+    assert r.status_code == 409, r.get_data(as_text=True)
+    assert r.get_json()["error"] == "slide_revision_conflict"
+    assert fake.calls == []
+    _register_run_sse(fake, "sess-sid-rev")
+    r2 = c.post("/api/ai/run?fresh=1", json=dict(
+        base, target=dict(target, asset_revision=cur)))
+    assert r2.status_code == 200, r2.get_data(as_text=True)
+    assert fake.calls[-1]["body"]["target"]["asset_revision"] == cur
+
+
 def test_run_target_annotation_kind_validated(monkeypatch):
     """kind=annotation：存在/归属/revision 匹配；不符 409，合法则白名单透传。"""
     fake = _setup_run_env(monkeypatch)

@@ -104,7 +104,7 @@
 
 | 文件 | 改动 |
 | --- | --- |
-| `static/app.js` | ① `uploadFile`（:10104）→ 交 `HP_INLINE_CONVERT.enqueue`；② `uploadFileClassified`（:10128）→ 判定表驱动（直传 / 转换 / 当场拒绝）；③ `offerBrowserConvert`（:10326）/`openConvertHandoff`（:10247）/`handoffBundleFolder`（:11123）保留但**仅在 `inline_convert.enabled=false` 时可达**（回滚路径，零删除）；④ 新增面板内行的渲染与**按钮组**——按钮全集以 **§6.3 为唯一权威**（含「删除本地产物」这一唯一的 OPFS 清理入口）；⑤ 新增 runner 动态 import 与生命周期（`beforeunload`）；⑥ 新增刷新恢复：`listJobs()` 里带 `intent.channel==='workbench-inline'` 的未完成任务 → 行 + 「继续」；⑦ `HP_UPLOAD` 导出面补新入口（测试驱动）；⑧ `submitFormatRequest`（:11530）抽出可复用内核 `submitFormatRequestCore({ext,message,contact,sampleFile})`；⑨ `importDroppedDirectory`（:11109）的 bundle 成员正则补 `.vms`（`.mrxs|dat|vms`，**不加 `.vmu`**——理由见 §4.1.1 note）；⑩ `handleWorkbenchDrop`（:11041）的散文件路径把 `cls.bundle===true` 交给新的「需完整包」分支（§4.1.1）而不是 `uploadFile` |
+| `static/app.js` | ① `uploadFile`（:10104）→ 交 `HP_INLINE_CONVERT.enqueue`；② `uploadFileClassified`（:10128）→ 判定表驱动（直传 / 转换 / 当场拒绝）；③ `offerBrowserConvert`（:10326）/`openConvertHandoff`（:10247）/`handoffBundleFolder`（:11123）保留但**仅在 `inline_convert.enabled=false` 时可达**（回滚路径，零删除）；④ 新增面板内行的渲染与**按钮组**——按钮全集以 **§6.3 为唯一权威**（含「删除本地产物」这一唯一的 OPFS 清理入口）；⑤ 新增 runner 动态 import 与生命周期（`beforeunload`）；⑥ 新增刷新恢复：`listJobs()` 里带 `intent.channel==='workbench-inline'` 的未完成任务 → 行 + 「继续」；⑦ `HP_UPLOAD` 导出面补新入口（测试驱动）；⑧ `submitFormatRequest`（:11530）抽出可复用内核 `submitFormatRequestCore({ext,message,contact,sampleFile})`；⑨ `importDroppedDirectory`（:11109）的 bundle 成员正则补 `.vms`（`.mrxs|dat|vms`，**不加 `.vmu`**——理由见 §4.1.1 note）；⑩ `handleWorkbenchDrop`（:11041）的散文件路径把 `cls.bundle===true` 交给新的「需完整包」分支（§4.1.1）而不是 `uploadFile`；⑪ **目标关联链路必须原样保留**（§3.5）：`enqueue` 之前仍先取 `importTargetSnapshot()`（`app.js:10109`，源码级断言 `tests/js/viewer-folders.test.ts:1095` 不许失效），完成时 `loadAll()` → `importAssociateUploaded(…, entry.target, row)` → `openSlide(...)`（`:10862-10865`）、`created` → `fbUpAssocSave(ingestionId, target)`（`:10789`）；⑫ 磁盘门确认后的重试**带原始输入重新起**（`probe(entry.file,…)` / `prepareBundle(entry.bundle.rows,…)`，§6.2.1）——因此 `entry.file`/`entry.bundle.rows` 必须在内存保留到收口 |
 | `templates/index.html` | 在 `cos-uploader.js` / `slide-sniff.js` 之后、`app.js` 之前加载 `/static/upload/inline-convert.js?v=20261015` |
 | `static/i18n.js` | 新增上传面板内转换文案（zh/en 同步）；**改写**两条指向 `/tools/slides` 的旧文案（`upload.cos.err.convert_in_browser` @:1025/2686、`upload.err.unsupported` @:1026/2687）——见 §7 |
 | `static/app.js` 的 `_EXTRA_I18N`（:30 起） | 同步兜底键（`cos-upload.test.ts:964` 那条断言会检查 `_EXTRA_I18N` 与 stage 映射同步） |
@@ -152,6 +152,7 @@
                       //   unconverted-variant:svs-jp2k / null）
   needsConvert,       // 布尔：引擎嗅探终审后的结论（§4）
   jobId,              // 转换任务（runner），直传条目恒 null
+  slideId,            // 服务端发布产物 ID（wheel 完成时回填；见 §3.5）
   uploadJobId,        // 服务端 ingestion id（uploadFileCos 的 created 事件回填）
   target,             // 上传开始时冻结的目标快照（importTargetSnapshot，app.js:11213）
   state,              // 见 3.2
@@ -216,6 +217,43 @@ bundle 任务另接 `progress.unit==='stage-bundle'`（`worker.js:994`）显示
 `viewable_formats`，则**停在 `convert_failed`**（保留本地产物 + 行内说明 +
 「保存到本机」提示，不建 ingestion）。
 
+### 3.5 目标关联与打开（第三轮评审 K2 修正：原设计缺这条，会导致静默未归类）
+
+既有链路的**完整形态**（`app.js`）：
+
+| 时点 | 现有代码 | 面板必须保持的语义 |
+| --- | --- | --- |
+| `uploadFile` 入口 | `app.js:10109` `opts.assocTarget = importTargetSnapshot()` | **入队瞬间**冻结目标快照（不是上传时、更不是完成时）——folder-experience §1.3：侧栏后续切换/重开抽屉不影响本次归属 |
+| ingestion 建成（`created` 事件） | `app.js:10789` `fbUpAssocSave(jobId, opts.assocTarget)` | 按**任务 ID** 落盘（`pt.fb.upassoc.v1:<uid>`，key 见 `app.js:4028`），刷新恢复行完成时仍按原目标关联 |
+| 完成（可查看） | `app.js:10862-10865`：`loadAll()` → `importAssociateUploaded(target.id, target.name, assocTarget, row)` → `openSlide(target.id \|\| target.name)` | 刷新列表 → 按冻结快照关联（`importAssociateUploaded`，`app.js:11282`）→ 打开新切片；关联失败进入待办 + 行内重试（`fbAssocPendingSave`/`fbAssocPendingClear`） |
+| 刷新后的恢复行 | `app.js` 的 `pollRestoredRow` viewable 分支：`fbIdentityReady()` → `fbUpAssocTake(job.job_id)` → `importAssociateUploaded(...)`（一次性消费，"恰好一次"，见 R5 复核注释） | 同上，且**身份就绪后先 Take 再关联**（`fbIdentityReady`，`app.js:3829`） |
+| 终态/取消 | 恢复行终态分支 `fbIdentityReady().then(fbUpAssocTake)` | 快照清理，不留残余 |
+
+**面板的接线要求**（设计新增，落进 §2.2 与测试）：
+
+1. `enqueue`（`uploadFile` 的第一件事）冻结 `entry.target = importTargetSnapshot()`
+   ——**必须在 `HP_INLINE_CONVERT.enqueue` 之前取**，保持 `app.js:10109` 的
+   「上传开始即冻结」语义与源码级断言（`tests/js/viewer-folders.test.ts:1095`
+   `expect(appSrc).toContain("opts.assocTarget = importTargetSnapshot()")`）。
+2. 走直传的 entry：把 `entry.target` 作为 `assocTarget` 传给现有
+   `uploadFileCos(file, row, {assocTarget})` 同一路径，`created` 事件仍调
+   `fbUpAssocSave`。**不重写这条链路**——`uploadFileCos` 已经做对了，面板只是
+   在它外面多包了一层队列。
+3. 走转换的 entry：**转换前的 `setJobIntent` 也要带目标**
+   （`record.intent.target`，`runner.js:634`），这样刷新后 intent 里也有归属；
+   上传阶段的 `fbUpAssocSave` 照旧按 **ingestion id** 落盘（恢复轮询靠它）。
+4. 完成时：`loadAll()` → `importAssociateUploaded(slideId, name, entry.target, row)`
+   → `openSlide(slideId)`；关联失败由 `importAssociateUploaded` 自身的
+   `catch` 处理（待办 + 行内重试按钮），面板不重复实现。
+5. **绝不**用「完成时刻的当前文件夹/项目」做关联——那正是 folder-experience
+   §1.3 明确要避免的漂移。
+
+> 覆盖要求（`§9.1`/`§9.2`）：把 `tests/js/viewer-folders.test.ts` 列入受影响
+> 清单（它对 `app.js` 做源码级断言），并在 §9.2 增加「冻结快照 → 完成时按快照
+> 关联」的行为断言（用 `HP_PROJECT_UI.importDrawer.snapshot` /
+> `associate` 的既有测试驱动面，`app.js:13922` 与 `:13925`；`snapshot`
+> 即 `importTargetSnapshot`，`app.js:11213`）。
+
 ## 4. 每类格式的判定表
 
 ### 4.1 判定顺序（三步，次序固定）
@@ -245,7 +283,7 @@ bundle 任务另接 `progress.unit==='stage-bundle'`（`worker.js:994`）显示
 `supported===false` → **不转换**，按 §4.2 的「引擎拒绝分支」处理
 （说出 `cap.reason`，`direct_import` 开放的重放直传，关闭的不上传 + 申请支持）。
 
-#### 4.1.1 bundle 类条目（评审 R6 修正）
+#### 4.1.1 bundle 类条目（第一轮评审 R6 修正 + 第二轮 J2 补强）
 
 原设计只定义了 TIFF/普通图片/KFB 三类魔数分派，而 `classifyFile` 对
 `.mrxs`/`.dat`/`.vms` 返回 `{cls:'convert', bundle:true}` —— **不取决于它是不是
@@ -366,7 +404,7 @@ probe 判 false 只可能因为「同一文件的字节在读取之间变化」�
   且 `directClass='unconverted-variant:svs-jp2k'`（`slide-sniff.js:256`）——
   与表一致。
 
-### 4.3 转换后上传的 `direct_class`（本轮评审修正，原设计有误）
+### 4.3 转换后上传的 `direct_class`（第一轮评审 R1 修正，原设计有误）
 
 **结论**：转换产物的声明**必须从产物字节嗅探得出**，不能假定为
 `converter-bigtiff`；在 §4.4 选定的 `bf-ome`/`fl-ome` 默认下，正确值是
@@ -504,7 +542,7 @@ const directClass = (cls.cls === 'ome-tiff') ? 'ome-tiff'
 POST `/api/ingestions`（`cos-uploader.js:1033`）。转换期间（含刷新、崩溃）
 服务端零任务。
 
-### 5.1 门禁作用域（评审 R2 修正）
+### 5.1 门禁作用域（第一轮评审 R2 修正）
 
 `viewable_formats` 是**按核心 `result.format` 字符串键控**的门禁
 （`tools-slides-upload.js:783-789`），它的语义是「**本机转换器的这个产物**平台
@@ -565,23 +603,47 @@ POST `/api/ingestions`（`cos-uploader.js:1033`）。转换期间（含刷新、
    **「重新开始转换（需重新选择文件）」**，**绝不静默改设置续跑**（理由见 §6.3）。
 6. `job_dir_missing`（目录被浏览器驱逐，`engine.js:19`）→ 行内说明 +
    「重新选择文件」（与第 5 点同一处置：**丢弃 + 重选**）。
-7. `beforeunload`：只要有 entry 处于**「产物或源副本只存在于 OPFS 且尚未收口」**
-   的状态，注册 `preventDefault()` 提醒（照 `tools-slides.js:1772` 的写法）。
-   集合（**按语义判定，不按状态名枚举**）：`converting`、**`need_disk_confirm`**、
-   `convert_queued`（若其实已有 OPFS 任务/产物）、`upload_queued`、`uploading`、
-   `requeue_convert`。写成语义判据而不是枚举状态名，正是为了避免再犯评审 J3
-   的错（按状态名枚举漏掉了 `need_disk_confirm`）。
+7. `beforeunload`：只要有 entry 处于**「未收口且本页持有用户的选择」**的状态，
+   注册 `preventDefault()` 提醒（照 `tools-slides.js:1772` 的写法）。集合
+   （**按语义判定，不按状态名枚举**）：`converting`、**`need_disk_confirm`**、
+   `convert_queued`、`upload_queued`、`uploading`、`requeue_convert`。写成语义
+   判据而不是枚举状态名，正是为了避免再犯评审 J3 的按状态名枚举漏项。
 
-   > 为什么 `need_disk_confirm` 必须在内（评审 J3 成立）：它既不属于
-   > `converting` 也不属于 `uploading`，按原设计的状态名枚举不会注册提醒；
-   > 而它恰是**唯一**「用户正在等一个需要他确认的弹层」的状态——此刻源副本
-   > **已经写进 OPFS 且是唯一一份**（`_prepare` 先把任务记录写成 `staging`
-   > `runner.js:734`，复制完成后才写 `prepared` `:772`，随后 probe 与
-   > `_diskGate` 抛 `disk_precheck_failed`）。这份副本无法重建：`_prepare`
-   > 的重试路径在 `file` 为 null 时抛 `io_recoverable: 缺少输入文件`
-   > （`runner.js:867`），刷新后也没有 File 句柄（§6.1）。离开页面即丢掉它。
+   > `need_disk_confirm` 为何要在内（**理由已按本轮评审 J1 修正**）：它既不属于
+   > `converting` 也不属于 `uploading`，按状态名枚举会漏；但原稿写的理由是
+   > **错的**——原稿说「源副本已经写进 OPFS 且是唯一一份」，而运行器在任一
+   > `disk_precheck_failed` 抛出**之前**就已把 job 目录删掉了：
+   > - 前置门（`runner.js:732`，`_prepare`；`:463`，`prepareBundle`）在
+   >   `_writeJobRecord(…, {state:'staging'})`（`:734`/`:465`）**之前**——
+   >   此刻 `slide-jobs/<jobId>/` 根本还没创建（目录由 `_writeJobRecordNow`
+   >   → `_jobDir(jobId, true)` 建，`runner.js:285-288`/`:250-253`）；
+   > - 后置门（`:755`/`:496`）在 `try` 内，其 `catch` 立即
+   >   `await this._discardNow(jobId)` 再 `throw`（`:759`/`:534`），而
+   >   `_discardNow`（`runner.js:674-686`）就是 `E.removeEntryRecursive(jobs, jobId)`（`:682`）。
+   >
+   > 所以此刻 **OPFS 里没有可丢的副本**。提醒的正确理由是：**用户的选择只在
+   > 本页内存里**（`entry.file` / `entry.bundle.rows`），刷新后没有 File 句柄
+   > （§6.1 不新增本地句柄），要重新选择并**重新复制**（大切片是分钟级 I/O，
+   > 见 §6.3 的 5 GiB 例）；对已经在等的用户来说这是实打实的返工。
 
-### 6.3 终态 / 恢复态按钮表与清理（评审 R4 + R5 修正）
+### 6.2.1 磁盘门失败后的重试语义（第三轮评审 K1 修正）
+
+`disk_precheck_failed`（含 `uncertain:true`）**不是**「就地确认继续」：
+
+- 运行器已丢弃 job（见上），**必须带着原始输入重新起一次**
+  `probe(file, {confirmUncertainDisk:true, …})` /
+  `prepareBundle(rows, {confirmUncertainDisk:true, …})`——这会分配**新 jobId、
+  重新复制**（`_prepare` 的 `opts.jobId || E.newJobId()`，`runner.js:728-729`）。
+  这与工具页的既有正确形态逐条一致（`tools-slides.js:298-322` 的
+  `probeWithDiskFlow` 明确把 `file` 再传一次；`:564-578` 的
+  `prepareBundleWithDiskFlow` 把 `rows` 再传一次）。
+- 因此面板**必须在内存里保留** `entry.file` / `entry.bundle.rows` 直到收口
+  （这不是持久化，不违反 §6.1：刷新后它们就是没了，所以才要
+  `beforeunload`）。
+- **不得**走 `startJob(null, {jobId})` / 复用旧 job 目录的路线——那会复现上一轮
+  评审 R4 的失败模式（`io_recoverable: 缺少输入文件`，`runner.js:867`）。
+
+### 6.3 终态 / 恢复态按钮表与清理（第一轮评审 R4 + R5 修正）
 
 刷新后**没有原始 `File`**（§6.1 明确不新增本地句柄，隐私约定不自动开始），
 这一点决定了哪些按钮可实现。运行器侧的两条硬约束：
@@ -625,7 +687,7 @@ POST `/api/ingestions`（`cos-uploader.js:1033`）。转换期间（含刷新、
   `_sweepIncompleteStaging`（运行器启动期）与工作台下次续转/删除入口兜底——
   本设计不新增自动删除策略。
 
-### 6.4 「继续上传」的续传语义（评审 R7 修正）
+### 6.4 「继续上传」的续传语义（第一轮评审 R7 修正）
 
 原设计 §6.1 的持久化表只列了 `intent`，没说清「继续上传」是**续传同一个
 ingestion** 还是**重新创建**。修正：
@@ -724,7 +786,7 @@ ingestion** 还是**重新创建**。修正：
 
 | 错误码（`engine.ERROR_CODES`，`engine.js:11`） | 行内文案 | 可用动作 |
 | --- | --- | --- |
-| `disk_precheck_failed` + `uncertain:true` | 「浏览器只报告了 ~X 可用，本任务预计需要 ~Y」 | **「继续（我已确认）」/「取消」**（`confirmUncertainDisk:true` 重试；`runner.js:692-699` 语义）。用户确认后重启 `probe` |
+| `disk_precheck_failed` + `uncertain:true` | 「浏览器只报告了 ~X 可用，本任务预计需要 ~Y」 | **「继续（我已确认）」/「取消」**——确认后**带原始输入重新起**（`probe(entry.file, {confirmUncertainDisk:true})` / `prepareBundle(entry.bundle.rows, {confirmUncertainDisk:true})`，会分配新 jobId 并**重新复制**；`runner.js:688-699` 的门语义 + §6.2.1）。**不得**复用旧 job 目录（它已被运行器删掉） |
 | `disk_precheck_failed` + `uncertain:false` | 「空间不足」 | 取消（换更小文件） |
 | `quota_exceeded_recoverable` | 「浏览器存储配额不足」 | 「改用转换器页转换并本地保存」链接 + 取消（用户确认口径） |
 | `unsupported_input` | 引擎 `cap.reason` 原文 | 申请支持（`direct_import` 开放时先提示「已按原样上传」可选） |
@@ -777,6 +839,7 @@ ingestion** 还是**重新创建**。修正：
 | 同上，MRXS bundle 交接测试（:245-275） | 同上（仅开关关闭时 reachable） | 同上处理 |
 | `tests/js/cos-upload.test.ts:421` | 「mrxs 行是『待本机转换』提示」——默认开时 mrxs 进转换队列（仍是「待本机转换」语义，文案键变） | 断言改到新文案键；或在用例里注入 enabled=false 保持原路径 |
 | `tests/js/r1-convert-upload.test.ts`（48 项，工具页 + 工作台入口） | 工具页侧全部不受影响；工作台入口侧（:293 `href === '/tools/slides'`）仅在开关关闭时成立 | 给工作台入口用例注入 enabled=false；保留 i18n 静态扫描（:333-370）并扩展到新键 |
+| `tests/js/viewer-folders.test.ts`（第三轮评审 K2 补入） | 对 `app.js` 做**源码级断言** `expect(appSrc).toContain("opts.assocTarget = importTargetSnapshot()")`（`:1095`），并驱动 `importDrawer.associate` / `snapshot` 的行为面 | **必须保持**：§2.2① 的 `uploadFile` 改写要在**调用 `enqueue` 之前**仍先取快照，断言不变；新增一条「转换条目完成时按 `entry.target` 关联」的行为断言（§3.5 覆盖要求，§9.2 第 19 项） |
 | `tests/js/cos-upload-liveness.test.ts` | 魔数 fail-fast（PNG 改名 .jpg）在面板内**同样**生效且零网络——语义不变 | 无需改；新增面板内该路径的行文案断言 |
 | `tests/js/raster-image-compat.test.ts` | 只测 `acceptFromCatalog` / fallback 目录；不涉上传分流 | 不影响 |
 | `tests/js/tools-u2-page.test.ts`（`bundleRoute` / `looksLikeBundleMember` 的用例） | §4.1.1 要求把 `app.js` 的成员正则对齐到 `.mrxs|dat|vms`（**刻意不含 `.vmu`**）——只改 `app.js` 的**调用侧**，`tools-slides-bundle.js` 里的纯函数与其既有断言不变 | 不受影响；新增一条源码级断言：`app.js` 的成员正则**覆盖** `.mrxs|dat|vms`（刻意**不含** `.vmu`，与 `looksLikeBundleMember` 的表面差异已说明理由），防再次漂移 |
@@ -785,7 +848,7 @@ ingestion** 还是**重新创建**。修正：
 | `tests/test_ingestion_api.py:483` / `test_r1_conversion_gate.py:77` | 断言 `_cos_upload_capability_payload` 的字段/词表 | 只新增键，现有断言（含 `browser_convert` 集合 `:93`、`direct_upload` 集合 `:98`）不变；**无**测试断言精确键集合（已核） |
 | `tests/test_slide_tools_upload_capability.py:235/276/315` | 读 `body["cos_upload"]`，无键集合断言 | 不变 |
 | `tests/test_slide_tools_page.py:72-113` | `/tools/slides` 的 CSP 逐 token 精确匹配 | **不受影响**（本设计不改 `_slide_tools_csp`） |
-| `tests/e2e/*`（现有 15 个 spec） | 都不断言工作台上传行为；`e2e_server.py` 不配置 COS（capability off） | 不受影响；新增 spec 需要 COS 配置，见 §9.4 |
+| `tests/e2e/*`（现有 **16** 个 spec——实测计数见 §10.15） | 都不断言工作台上传行为；`e2e_server.py` 不配置 COS（capability off） | 不受影响；新增 spec 需要 COS 配置，见 §9.4 |
 
 ### 9.2 vitest（新增 `tests/js/inline-convert.test.ts`）
 
@@ -885,11 +948,23 @@ vitest 单文件内两者**可以并存**（`import` 提升到模块顶，`new F
     保护今天可用的 VMU 直传）。
 17. `beforeunload`（§6.2 第 7 点）：对 `converting` / **`need_disk_confirm`** /
     `upload_queued` / `uploading` / `requeue_convert` 五个状态逐一断言注册了
-    提醒；对 `done` / `rejected` 等终态断言**未**注册（评审 J3 —— 防按状态名
-    枚举再漏项）。
-18. `need_disk_confirm`（§7.3）：`disk_precheck_failed` + `uncertain:true` →
-    行内确认按钮；确认后以 `confirmUncertainDisk:true` 重试同一
-    `probe`/`prepareBundle`（断言调用参数，不重建任务）。
+    提醒；对 `done` / `rejected` 等终态断言**未**注册（第二轮评审 J3 —— 防按
+    状态名枚举再漏项）。
+18. `need_disk_confirm`（§7.3 + §6.2.1，**第三轮评审 K1 修正**）：
+    `disk_precheck_failed` + `uncertain:true` → 行内确认按钮；确认后断言
+    **带着原始输入重新起**：`probe`/`prepareBundle` 被再次调用且**第一个实参
+    是同一个 `entry.file` / `entry.bundle.rows`**，`confirmUncertainDisk:true`
+    出现在选项里；**反向断言**绝不出现 `startJob(null, {jobId})` 或任何
+    「复用旧 jobId」的调用（旧目录已被运行器自己删掉——`runner.js:759`/`:534`
+    的 `_discardNow`，`:682` 的 `removeEntryRecursive`）。原稿「重试同一
+    `probe`（不重建任务）」的说法**已删除**。
+19. **目标关联（§3.5，第三轮评审 K2）**：`uploadFile`/`enqueue` 入口冻结快照
+    （源码级断言 `opts.assocTarget = importTargetSnapshot()` 仍成立）；
+    转换条目完成后 `importAssociateUploaded(slideId, name, entry.target, row)`
+    被调用且**第三参是入队时冻结的 target**（用假 `snapshot` 值 + 中途改
+    `importTargetState` 驱动，断言关联用冻结值而非当前文件夹）；随后
+    `loadAll()` 与 `openSlide(slideId)` 被调用；直传条目走 `uploadFileCos`
+    的同一路径（`created` → `fbUpAssocSave(ingestionId, target)`）。
 
 ### 9.3 pytest（新增 `tests/test_upload_inline_convert_capability.py`）
 
@@ -940,7 +1015,7 @@ vitest 单文件内两者**可以并存**（`import` 提升到模块顶，`new F
     `{reader, levels, width, height, mpp}`（内部 `slide_io.open_slide` 真读）。
 - `playwright.config.ts`：新增 project `chromium-cos`（`testMatch:
   'upload-inline-convert.spec.ts'`、带上述 launch args），并在默认 project 上
-  `testIgnore` 该文件，避免其余 15 个 spec 被 launch args 影响或重复跑。
+  `testIgnore` 该文件，避免其余 **16** 个 spec 被 launch args 影响或重复跑。
 - `e2e_server.py` 的假 COS 与 HTTP 端点只在该 env 打开时装配，默认路径
   （CI 现有 spec）行为不变。
 
@@ -996,7 +1071,18 @@ export TEST_RUN_DIR=/mnt/ssd2/tests/run-inline-convert-Mwpad1 \
      `npx vitest run tests/js/{workbench-direct-class,cos-upload,cos-upload-liveness,
      r1-convert-upload,slide-sniff,tools-u2-page,tools-upload-limit,tools-upload-feedback}.test.ts`
      → **8 files / 179 passed, 2 skipped**（后三个文件即 §9.2 第 12 项对照测试的
-     既有先例与 `bundleRoute` 纯函数用例）。
+     既有先例与 `bundleRoute` 纯函数用例）；
+     **第三轮评审后复跑**（`pytest-k1`，并加入 `viewer-folders`）：
+     `python3 -m pytest tests/test_upload_direct_class.py
+     tests/test_r1_conversion_gate.py -q -p no:cacheprovider
+     --basetemp=$TEST_RUN_DIR/pytest-k1` → **39 passed in 15.10s**；
+     `npx vitest run tests/js/viewer-folders.test.ts
+     tests/js/workbench-direct-class.test.ts tests/js/cos-upload.test.ts
+     tests/js/cos-upload-liveness.test.ts tests/js/r1-convert-upload.test.ts
+     tests/js/slide-sniff.test.ts tests/js/tools-u2-page.test.ts
+     tests/js/tools-upload-limit.test.ts tests/js/tools-upload-feedback.test.ts`
+     → **9 files / 222 passed, 2 skipped**（含 §3.5 依赖的
+     `viewer-folders.test.ts` 全绿——它的源码级断言在当前代码上成立）。
 6. `CosConfig` 签名含 `Endpoint` / `VerifySSL`（假 COS 的可行性依据）。
 7. **`run_workbench.js` 的 64 B 假 `.tif` 在真实工作台里被 fail-fast 拒**（既有
    回归，非本设计引入）：照 `tests/browser/slide_tools_c4/server.py` 的假 COS env
@@ -1099,6 +1185,28 @@ export TEST_RUN_DIR=/mnt/ssd2/tests/run-inline-convert-Mwpad1 \
     `npx vitest run tests/js/tools-upload-limit.test.ts
     tests/js/tools-upload-feedback.test.ts` → **16 passed**（证明该模块可在
     vitest 里被 import 驱动）。
+15. **第三轮三条评审的复核动作**：
+    - J1（磁盘门后重试）：读 `runner.js:732`（前置门）与 `:734`
+      （`_writeJobRecord(state:'staging')`）的相对次序、`:755`（后置门）与
+      `:759`（catch 里的 `_discardNow`）、`:674-686`（`_discardNow` =
+      `removeEntryRecursive`，`:682`）、`:285-288`（`_jobDir(jobId, true)` 建目录）、
+      `:867`（`缺少输入文件`）与 `:729`（新 jobId —— 即重试会**重新复制**）；
+      并对照工具页的既有正确形态 `tools-slides.js:298-322`（`probeWithDiskFlow`
+      把 `file` 再传一次）/ `:564-578`（`prepareBundleWithDiskFlow` 把 `rows`
+      再传一次）。原稿「副本已在 OPFS」的理由**被推翻**，已按实测改写
+      （§6.2 第 7 点 + 新 §6.2.1）。
+    - J2（目标关联）：读 `app.js:10109`（`opts.assocTarget =
+      importTargetSnapshot()`）、`:10789`（`created` → `fbUpAssocSave`）、
+      `:10859-10865`（`loadAll()` → `importAssociateUploaded` → `openSlide`）、
+      `:4028`（`fbUpAssocSave`）、`:11282`（`importAssociateUploaded`）、
+      `:3829`（`fbIdentityReady`）、`pollRestoredRow` 的 viewable 分支
+      （`fbIdentityReady` → `fbUpAssocTake` → `importAssociateUploaded`），
+      以及源码级断言 `tests/js/viewer-folders.test.ts:1095`；并核对文档
+      `grep -c "关联" = 0`、`grep -c
+      "importAssociateUploaded\|loadAll\|openSlide\|fbUpAssocSave\|fbAssocPendingSave" = 0`
+      —— 证实原设计确实缺这条链路。已新增 §3.5。
+    - J3（spec 计数）：`ls tests/e2e/*.spec.ts | wc -l` → **16**（本 worktree
+      HEAD `ec9ee180`）；文档原写 15，已改（§9.1 与 §9.4）。
 
 ## 11. 风险
 
@@ -1122,6 +1230,9 @@ export TEST_RUN_DIR=/mnt/ssd2/tests/run-inline-convert-Mwpad1 \
 | R16（本轮评审新增） | **`need_disk_confirm` 不在 beforeunload 覆盖内**：该状态源副本已在 OPFS 且不可重建 | 用户在这唯一需要他确认的状态下刷新/关闭 → 丢掉唯一副本（大文件重来） | §6.2 第 7 点改为按语义判据（「产物或源副本只在 OPFS 且未收口」）并显式点名 `need_disk_confirm`；§3.2 补注 |
 | R17（本轮评审新增） | **对照测试范围被高估**：`runLocked` 含交互分支，无法逐例比对 | 测试写不出来，或写成假的「等价」断言 | §9.2 第 12 项把对照面限定为 `isDisabled` 结论 + 零创建副作用，并明确列出**不纳入**的分支 |
 | R18（本轮评审新增） | **按钮清单在 §2.2 与 §6.3 两处维护会漂移** | 实施者只读改动清单会漏掉唯一的 OPFS 清理入口（本轮 J1 的实例） | §2.2④ 改为「以 §6.3 为唯一权威」的指针，不再复制清单 |
+| R19（第三轮评审新增） | **磁盘门确认后误走「复用旧任务」路线**：原稿把 `need_disk_confirm` 的理由写成「副本已在 OPFS」，据此会实现成 `startJob(null,{jobId})` 或复用旧目录 | 复现 `io_recoverable: 缺少输入文件`（`runner.js:867`），确认按钮永远失败 | §6.2 纠正理由 + 新 §6.2.1（带原始输入重新起、会重新复制）+ §7.3 表 + §9.2 第 18 项反向断言 |
+| R20（第三轮评审新增） | **目标关联链路在改写中丢失**：`uploadFile` → `enqueue` 时若不再先取快照，或完成时不按冻结快照关联 | 静默未归类，或落到完成时刻的当前文件夹（正是 folder-experience §1.3 要避免的漂移），且既有源码级断言 `viewer-folders.test.ts:1095` 会红 | 新 §3.5（全链路表 + 5 条接线要求）+ §2.2⑪ + §9.1 新增 `viewer-folders` 行 + §9.2 第 19 项 |
+| R21（第三轮评审新增） | **磁盘门提醒覆盖不足**：`need_disk_confirm` 若漏注册 `beforeunload` | 用户的选择只在本页内存（`entry.file`/`bundle.rows`），刷新后要重新选择并重新复制（大切片分钟级） | §6.2 第 7 点的语义判据（含 `need_disk_confirm`）+ §9.2 第 17 项（五态逐一断言） |
 
 ## 12. 实施顺序建议
 
@@ -1131,7 +1242,8 @@ export TEST_RUN_DIR=/mnt/ssd2/tests/run-inline-convert-Mwpad1 \
 2. `app.py` capability 两个新字段 + `tests/js`/pytest（§9.2/§9.3）——此时开关
    仍可 close。
 3. `app.js` 接线：面板行渲染 + 按钮表（§6.3）、单文件路径、两把锁（§5）、
-   刷新恢复（§6.2）、`beforeunload`、终态清理；回退路径保留不动。
+   刷新恢复（§6.2）、`beforeunload`（§6.2 第 7 点）、终态清理、**目标关联链路（§3.5，五项逐条对）**；回退路径保留不动。
+   同一批要落 **§6.2.1 的磁盘门重试语义**（带原始输入重新起）。
 4. bundle（MRXS/VMS）路径 + 拖入文件夹（§4.1.1 两种形态）。
 5. 失败/申请支持/回队（§7）。
 6. i18n（zh/en 同步 + 旧文案改写）。
@@ -1165,5 +1277,14 @@ export TEST_RUN_DIR=/mnt/ssd2/tests/run-inline-convert-Mwpad1 \
 | J3 `need_disk_confirm` 不在 beforeunload 覆盖内 | low | **接受**——§6.2 第 7 点改为**按语义判据**（「产物或源副本只在 OPFS 且未收口」）并显式列出 `need_disk_confirm`；补理由链（`runner.js:734` 写 `staging` → `:772` 写 `prepared` → `:867` 无 File 即 `io_recoverable: 缺少输入文件`）+ §3.2 补注（新增 R16） |
 | J4 §9.2 第 12 项「`new Function` 加载 app.js + `import` ES module」形态未说明拆分，且 `runLocked` 含交互分支无法逐例比对 | low | **接受**——§9.2 前言新增「两种加载面」段落（`app.js`/`inline-convert.js` 走 `new Function`；`tools-slides-upload.js` 走顶层 `import`，vitest 单文件内可并存，禁止把 ES module 塞进 `new Function`）；第 12 项改为**限定对照面**：用真 `createUploadController` 注入假依赖，只比对 `ctl.isDisabled(jobId)` 的判定结论与「零创建」副作用（可自动化、且既有 `tools-upload-*` 测试正是这样驱动它），并明确列出**不纳入**的分支（账号 mismatch / 孤儿 / 已发布重放）（新增 R17） |
 
-无不同意项；J1 的实质内容在上一轮已满足（评审读的是旧修订版），本轮按评审意图
-改为单一权威指针；J2–J4 为实质修正。
+### 13.3 第三轮三条（K1–K3）
+
+| 评审项 | 严重度 | 处置 |
+| --- | --- | --- |
+| K1 §6.2 第 7 点「need_disk_confirm 时副本已在 OPFS」的理由与 §9.2 第 18 项「重试不重建任务」 | medium | **接受**——理由**确实错了**（实测 `runner.js:732` 前置门在 `:734` 写 `staging` 之前、`:755` 后置门的 catch 在 `:759` 立即 `_discardNow`，而 `_discardNow` = `:682 removeEntryRecursive`；`:285-288` 的 `_jobDir(jobId,true)` 说明前置门时目录尚未创建）→ 任一磁盘门失败时 **OPFS 里没有可丢的副本**。§6.2 理由改为「用户的选择只在本页内存」，新增 §6.2.1（重试**带原始输入重新起**、分配新 jobId、**重新复制**，与 `tools-slides.js:298-322`/`:564-578` 同形），§7.3 表同步，§9.2 第 18 项改为「重传同一 `entry.file`/`bundle.rows` + 反向断言不得 `startJob(null,{jobId})`」（新增 R19） |
+| K2 §2.2① 改 `uploadFile` → `enqueue` 后目标关联链路无落脚点；§9.1 未列 `viewer-folders.test.ts` | medium | **接受**——实测文档 `grep -c "关联" = 0`、同文 grep（关联/importAssociateUploaded/loadAll/openSlide/fbUpAssocSave/fbAssocPendingSave 任一关键词）= 0，而源码链路完整（`app.js:10109`/`:10789`/`:10859-10865`/`:11282`/`:4028`/`:3829`）。新增 §3.5（全链路时点表 + 5 条接线要求：入队前冻结快照、直传沿用 `uploadFileCos`、转换前把目标写进 `record.intent.target`、完成时按冻结快照 `importAssociateUploaded` + `openSlide`、绝不用完成时刻的当前文件夹）；§2.2⑪；§9.1 新增 `viewer-folders.test.ts` 行（`app.js` 源码级断言 `:1095` 不许失效）；§9.2 第 19 项行为断言（新增 R20） |
+| K3 §9.1/§9.4 写「现有 15 个 spec」，实际 16 | low | **接受**——`ls tests/e2e/*.spec.ts` 计数为 16（本 worktree HEAD `ec9ee180`，命令见 §10.15），已改两处 |
+
+无不同意项；三条全部按评审意见修正。K1 的理由确实与我上一轮的论证相反——上一轮
+我把「`staging` 记录先写、复制随后」的顺序当成了「副本已在」，漏看了前置门在写记录
+**之前**、后置门的 catch 立即 `_discardNow`，故本轮改正（这是实质错误，不是表述问题）。

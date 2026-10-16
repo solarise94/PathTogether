@@ -9,6 +9,9 @@ store 级（默认全跑；内嵌 PostgreSQL）：
   - 口径门：非 2xx-3xx 不落；非 HTML 不落；query 含 token/资源 ID 键整条
     拒绝；utm_source 白名单外丢弃；其余 query 全丢弃；
   - referrer 只取 hostname；同站（统计白名单/PUBLIC_*/本机）归 direct；
+    裸 IP 字面量 referrer（IPv4/IPv6/IPv4-mapped/带端口）同样归 direct
+    （2026-10-15 口径修正：合法外部来源几乎不会是裸 IP），历史 IP 字面量行
+    不改写但被 top_referrers 聚合排除、recent 读取口径映射 direct；
   - 入口域名（review 2026-09-15）：SITE_STATS_ENTRY_HOSTS 独立白名单
     fail-closed——未配置/含非法项停止采集并告警；Host 缺失（None/空）或
     未命中（同机其它站点/裸 IP）静默拒绝；命中后 request_host 规范化
@@ -330,6 +333,36 @@ def test_referrer_hostname_only_and_same_site_direct(secret, monkeypatch):
     # 统计白名单域名也在"同站"集合里：两入口互跳不当外部来源
     assert _ev(referrer="https://pt.solarise94.fun/login", host="pt.solarise94.fun")[
         "referrer_domain"] == "direct"
+
+
+def test_ip_literal_referrer_is_direct(secret):
+    """裸 IP referrer 一律归 direct，不当外部来源（2026-10-15 口径修正）。
+
+    理由（生产实例 2026-10-16）：合法外部来源几乎不会是裸 IP——referrer 为
+    裸 IP 只可能来自互联网扫描器（直访边缘机裸 IP 后把该地址塞进 Referer，
+    如 tencentfast 中转机 43.142.130.199 收到的 zgrab 扫描流量）或本服务
+    自己的边缘/回源节点 IP，两者都不是「外部来源」，与同站跳转同口径归
+    direct。覆盖 IPv4 / IPv6 / [::1] / IPv4-mapped / 带端口；正常域名
+    referrer 不受影响（IPv6 不得被按冒号截断成 "2001" 之类的假来源）。"""
+    cases = (
+        "https://43.142.130.199/",            # 生产实际出现的扫描器来源（IPv4）
+        "http://192.0.2.1:8443/a?b=c#f",      # IPv4 带端口
+        "https://[2001:db8::1]/x",            # IPv6
+        "https://[::1]:8443/",                # IPv6 [::1] 带端口
+        "https://[::ffff:203.0.113.7]/",      # IPv4-mapped IPv6
+        "https://[::FFFF:203.0.113.7]/",      # IPv4-mapped（大写十六进制）
+    )
+    for referrer in cases:
+        ev = _ev(referrer=referrer)
+        assert ev is not None, referrer
+        assert ev["referrer_domain"] == "direct", referrer
+    # 正常域名 referrer 不受影响；搜索来源照常保留（R5 口径不变）
+    assert _ev(referrer="https://news.example.com/a?x=1")[
+        "referrer_domain"] == "news.example.com"
+    assert _ev(referrer="https://www.google.com/search?q=x")[
+        "referrer_domain"] == "www.google.com"
+    assert _ev(referrer="HTTP://News.Example.COM:8443/x")[
+        "referrer_domain"] == "news.example.com"
 
 
 def test_foreign_host_on_same_server_is_not_recorded(secret):
@@ -1008,6 +1041,77 @@ def test_dashboard_restricts_entry_hosts_and_isolates_legacy(secret):
     by_page = {r["page_key"]: r["request_host"] for r in stats["recent"]}
     assert by_page["home"] == "histopilot.com"
     assert by_page["login"] == "pt.solarise94.fun"
+
+
+def test_top_referrers_exclude_ip_literal_history_rows(secret, monkeypatch):
+    """外部来源榜排除 IP 字面量 referrer（历史行不改写，只在聚合/展示层排除）。
+
+    生产实例（2026-10-16）：扫描器直访 tencentfast 裸 IP 后带
+    ``Referer: https://43.142.130.199/`` 落库 referrer_domain=
+    '43.142.130.199'（histopilot.cn，13 行）。采集口径修正不回写历史行
+    （不做数据迁移）；top_referrers 聚合固定排除 IPv4 四段数字与含冒号
+    （IPv6）形态，使存量行立即从来源榜消失；recent 明细保留行本身但
+    referrer_domain 读取口径映射为 direct；真实外部来源不受影响。"""
+    # 生产实例的入口是 histopilot.cn（当时在白名单内）——纳入白名单，
+    # 使历史行进入主口径，证明排除靠的是 referrer 规则而非 host 隔离
+    monkeypatch.setenv("SITE_STATS_ENTRY_HOSTS",
+                       ENTRY_HOSTS_DEFAULT + ",histopilot.cn")
+    human = _ev(remote_addr="198.51.100.5", path="/demo",
+                referrer="https://news.example.com/real")
+    _flush([human])
+    # 手工落历史形态行（绕开 build_event，模拟口径修正前的存量数据）；
+    # 3 条 IP 行若不排除，合计将反超唯一的真实来源，证明排除与排序无关
+    conn = _conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO site_visit_events (event_id, occurred_at,"
+                " expires_at, dedup_bucket, page_key, request_host,"
+                " referrer_domain, country_code, daily_visitor_hash,"
+                " visitor_kind) VALUES"
+                # 生产实例同款：IPv4 字面量（扫描器）
+                " ('sve_iphist0000000000000001', %s, %s, %s, 'home',"
+                "  'histopilot.cn', '43.142.130.199', 'unknown', %s,"
+                "  'anonymous_human'),"
+                # IPv6 字面量（含冒号）
+                " ('sve_iphist0000000000000002', %s, %s, %s, 'home',"
+                "  'histopilot.cn', '::1', 'unknown', %s,"
+                "  'anonymous_human'),"
+                # IPv4-mapped 形态（同样含冒号）
+                " ('sve_iphist0000000000000003', %s, %s, %s, 'home',"
+                "  'histopilot.cn', '::ffff:203.0.113.9', 'unknown', %s,"
+                "  'anonymous_human')",
+                (BASE_TIME, BASE_TIME + timedelta(days=90),
+                 int(BASE_TIME.timestamp() // 600) + 0, "d" * 64,
+                 BASE_TIME, BASE_TIME + timedelta(days=90),
+                 int(BASE_TIME.timestamp() // 600) + 1, "e" * 64,
+                 BASE_TIME, BASE_TIME + timedelta(days=90),
+                 int(BASE_TIME.timestamp() // 600) + 2, "f" * 64))
+        conn.commit()
+    finally:
+        conn.close()
+    assert _site_count() == 4
+
+    stats = sss.dashboard_stats(now=BASE_TIME)
+    # 来源榜只剩真实外部来源；IP 字面量历史行（3 条）不出现
+    assert stats["top_referrers"] == [
+        {"domain": "news.example.com", "visits": 1}]
+    # 总览计数是「访问量」口径，与 referrer 无关：历史行照常计入
+    assert stats["today"]["visits"] == 4
+    # recent 明细不隐藏行（4 条都在），但 IP 字面量 referrer 读取口径
+    # 映射为 direct，真实来源原样保留
+    assert len(stats["recent"]) == 4
+    by_hash = {r["referrer_domain"]: r for r in stats["recent"]
+               if r["referrer_domain"] != "direct"}
+    assert set(by_hash) == {"news.example.com"}
+    # 历史行不改写：IP 字面量仍原样在库（只删自己造的数据由夹具负责）
+    counts = _sql_all(
+        "SELECT referrer_domain, count(*) AS n FROM site_visit_events"
+        " WHERE position(':' in referrer_domain) > 0"
+        " OR referrer_domain ~ '^[0-9]+(\\.[0-9]+){3}$'"
+        " GROUP BY 1 ORDER BY 1")
+    assert {(r["referrer_domain"], r["n"]) for r in counts} == {
+        ("43.142.130.199", 1), ("::1", 1), ("::ffff:203.0.113.9", 1)}
 
 
 def test_dashboard_fail_closed_when_allowlist_unconfigured(

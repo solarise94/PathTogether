@@ -701,14 +701,24 @@
 
     /// 转换前的预检：能力可用 + 账号绑定 + 把目标写进 record.intent
     /// （设计 §3.5 第 3 点）。intent 落盘让刷新后 intent 里也有归属。
+    /// 复核 #4：写归属字段（intent.account）之前等 identityReady——身份
+    /// 未就绪绝不写空串（空 = 无归属证据，之后换账号可绕过归属闸无确认
+    /// 续传）；身份落定后仍为空（免认证部署）才写空串（免认证本就无归属
+    /// 语义）。bindIntent 是 startJob 的前置（startConvert 顺序 await），
+    /// 所以转换的实际启动同样等身份——/api/auth/info 通常毫秒级返回，对
+    /// 用户无感；相比「先写空串再补写」少一次记录改写，也绝无窗口期。
     function bindIntent(e) {
       if (!e.jobId || !runner.setJobIntent) return Promise.resolve();
-      return Promise.resolve(runner.setJobIntent(e.jobId, {
-        state: "pending",
-        account: String(account() || ""),
-        target: e.target || null,
-        channel: "workbench-inline",
-      })).then(null, function () { /* 记录写失败不阻塞转换 */ });
+      return identityReady().then(function () {
+        // 等待期间被取消：不写（运行器可能已丢弃该任务）
+        if (e.cancelled) return undefined;
+        return Promise.resolve(runner.setJobIntent(e.jobId, {
+          state: "pending",
+          account: String(account() || ""),
+          target: e.target || null,
+          channel: "workbench-inline",
+        }));
+      }).then(null, function () { /* 记录写失败不阻塞转换 */ });
     }
 
     /// 转换执行（设计 §6.2 第 3 点 + §6.2.1）：四种进入方式，**按记录状态选**：
@@ -1260,91 +1270,98 @@
     }
 
     function uploadArtifact(e, artifact, job) {
-      var cfg = caps.cosConfig;
-      var name = e.artifactName || e.name;
-      var declaration = artifactDeclaration(e.artifactCls);
-      var source = {
-        name: name,
-        size: artifact.size,
-        slice: function (s, len) { return artifact.slice(s, len); },
-      };
-      var upload = cos.createUpload({
-        source: source,
-        apiFetch: deps.apiFetch,
-        heartbeatFetch: deps.apiFetchNoRedirect || deps.apiFetch,
-        config: cfg,
-        createBody: declaration ? { direct_class: declaration } : null,
-        storage: {
-          save: function (rec) {
-            if (!rec || !rec.job_id) return undefined;
-            return runner.setJobUpload(e.jobId, {
-              ingestionId: rec.job_id, filename: name, size: artifact.size,
-              state: "uploading",
-              confirmedParts: rec.confirmed || [],
-              partDigests: rec.digests || {},
-              digestScheme: rec.digest_scheme || "",
-              account: String(account() || ""),
-            });
+      // 复核 #4：与 app.js 的 uploadEntryArtifact 同口径——建引擎（引擎
+      // opts.account 与 storage.save 的 upload.account 都是归属写入）之前
+      // 等身份落定；身份未知绝不写空归属。app.js 注入 onArtifact 时本函数
+      // 不参与（app.js 侧有自己的身份闸），这里是模块自身兜底的同一保证。
+      return identityReady().then(function () {
+        if (e.cancelled) return { cancelled: true };
+        var cfg = caps.cosConfig;
+        var name = e.artifactName || e.name;
+        var declaration = artifactDeclaration(e.artifactCls);
+        var source = {
+          name: name,
+          size: artifact.size,
+          slice: function (s, len) { return artifact.slice(s, len); },
+        };
+        var upload = cos.createUpload({
+          source: source,
+          apiFetch: deps.apiFetch,
+          heartbeatFetch: deps.apiFetchNoRedirect || deps.apiFetch,
+          config: cfg,
+          createBody: declaration ? { direct_class: declaration } : null,
+          storage: {
+            save: function (rec) {
+              if (!rec || !rec.job_id) return undefined;
+              return runner.setJobUpload(e.jobId, {
+                ingestionId: rec.job_id, filename: name, size: artifact.size,
+                state: "uploading",
+                confirmedParts: rec.confirmed || [],
+                partDigests: rec.digests || {},
+                digestScheme: rec.digest_scheme || "",
+                account: String(account() || ""),
+              });
+            },
+            complete: function (id, outcome) {
+              return runner.setJobUpload(e.jobId, {
+                ingestionId: id, filename: name, size: artifact.size,
+                state: (outcome && outcome.succeeded) ? "published" : "failed",
+                slideId: (outcome && outcome.slide_id) || null,
+                error: (outcome && outcome.fail_code) || null,
+                errorDetail: (outcome && outcome.fail_detail) || null,
+              });
+            },
+            remove: function (id) {
+              return runner.setJobUpload(e.jobId, {
+                ingestionId: id, filename: name, size: artifact.size,
+                state: "cancelled",
+              });
+            },
+            readConfirmed: function (id) {
+              return runner.getJob(e.jobId).then(function (j) {
+                var up = j && j.upload;
+                return (up && up.ingestionId === id) ? (up.confirmedParts || []) : [];
+              });
+            },
+            readRecord: function (id) {
+              return runner.getJob(e.jobId).then(function (j) {
+                var up = j && j.upload;
+                if (!up || up.ingestionId !== id) return null;
+                return {
+                  confirmed: up.confirmedParts || [],
+                  digests: up.partDigests || null,
+                  digest_scheme: up.digestScheme || "",
+                  account: typeof up.account === "string" ? up.account : "",
+                };
+              });
+            },
           },
-          complete: function (id, outcome) {
-            return runner.setJobUpload(e.jobId, {
-              ingestionId: id, filename: name, size: artifact.size,
-              state: (outcome && outcome.succeeded) ? "published" : "failed",
-              slideId: (outcome && outcome.slide_id) || null,
-              error: (outcome && outcome.fail_code) || null,
-              errorDetail: (outcome && outcome.fail_detail) || null,
-            });
+          account: String(account() || ""),
+          resumeJobId: (job && job.upload && job.upload.ingestionId &&
+                        job.upload.state !== "published" &&
+                        job.upload.state !== "failed" &&
+                        job.upload.state !== "cancelled")
+            ? job.upload.ingestionId : null,
+          skipConfirm: true,
+          confirmResume: function () { return true; },
+          retryCompleteOnNetworkError: false,
+          useResumeEndpoint: false,
+          onEvent: function (ev) {
+            if (ev.type === "progress") {
+              setStage(e, "upload.cos.stage.uploading",
+                       ev.determinate === false ? null : ev.frac, "", ev.determinate === false);
+            } else if (ev.type === "status" && ev.body) {
+              setStage(e, "upload.cos.stage." + (ev.body.stage || "uploading"), null, "", true);
+            } else if (ev.type === "retry") {
+              setStage(e, "upload.cos.stage.uploading", null, "upload.cos.retrying", true);
+            } else if (ev.type === "created") {
+              e.uploadJobId = ev.jobId;
+            }
           },
-          remove: function (id) {
-            return runner.setJobUpload(e.jobId, {
-              ingestionId: id, filename: name, size: artifact.size,
-              state: "cancelled",
-            });
-          },
-          readConfirmed: function (id) {
-            return runner.getJob(e.jobId).then(function (j) {
-              var up = j && j.upload;
-              return (up && up.ingestionId === id) ? (up.confirmedParts || []) : [];
-            });
-          },
-          readRecord: function (id) {
-            return runner.getJob(e.jobId).then(function (j) {
-              var up = j && j.upload;
-              if (!up || up.ingestionId !== id) return null;
-              return {
-                confirmed: up.confirmedParts || [],
-                digests: up.partDigests || null,
-                digest_scheme: up.digestScheme || "",
-                account: typeof up.account === "string" ? up.account : "",
-              };
-            });
-          },
-        },
-        account: String(account() || ""),
-        resumeJobId: (job && job.upload && job.upload.ingestionId &&
-                      job.upload.state !== "published" &&
-                      job.upload.state !== "failed" &&
-                      job.upload.state !== "cancelled")
-          ? job.upload.ingestionId : null,
-        skipConfirm: true,
-        confirmResume: function () { return true; },
-        retryCompleteOnNetworkError: false,
-        useResumeEndpoint: false,
-        onEvent: function (ev) {
-          if (ev.type === "progress") {
-            setStage(e, "upload.cos.stage.uploading",
-                     ev.determinate === false ? null : ev.frac, "", ev.determinate === false);
-          } else if (ev.type === "status" && ev.body) {
-            setStage(e, "upload.cos.stage." + (ev.body.stage || "uploading"), null, "", true);
-          } else if (ev.type === "retry") {
-            setStage(e, "upload.cos.stage.uploading", null, "upload.cos.retrying", true);
-          } else if (ev.type === "created") {
-            e.uploadJobId = ev.jobId;
-          }
-        },
+        });
+        e._upload = upload;
+        return upload.done;
       });
-      e._upload = upload;
-      return upload.done;
     }
 
     function failUpload(e, err) {
@@ -1478,6 +1495,13 @@
         return e;
       }
       if (action === "rebind") {
+        // 复核 #4：身份未知时空串改绑 = 把归属写成「无归属证据」，之后
+        // 他人账号可绕过归属闸无确认续传——拒绝改绑、行保持原状；身份
+        // 落定（recheckOwnership 重判 / 再点一次）后再改绑。
+        if (String(account() || "") === "") {
+          if (ui.buttons) ui.buttons(e);
+          return e;
+        }
         rebindAccount(e);
         return e;
       }

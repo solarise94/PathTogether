@@ -11528,10 +11528,10 @@
   /// 记录适配与直传完全一致。
   function uploadEntryArtifact(entry, artifact) {
     // 取消边界（独立复核 #3 问题 1）：编排器的取消（orch.cancel →
-    // entry.cancelled）可能落在下面任何一个异步窗口里（getJob 读取、直传
-    // 内容锁等待）。已取消的条目绝不新建 ingestion——各入口就地早返回
-    // {cancelled:true}，编排器 completeUpload 据此收口（槽位/锁照常释放、
-    // 行保持「已取消」、不弹失败 toast）。
+    // entry.cancelled）可能落在下面任何一个异步窗口里（身份等待、getJob
+    // 读取、直传内容锁等待）。已取消的条目绝不新建 ingestion——各入口就
+    // 地早返回 {cancelled:true}，编排器 completeUpload 据此收口（槽位/锁
+    // 照常释放、行保持「已取消」、不弹失败 toast）。
     if (entry.cancelled) return Promise.resolve({ cancelled: true });
     if (!artifact) {
       // 直传条目（无本机产物）：复用既有直传状态机 uploadFileCos——它的
@@ -11539,21 +11539,27 @@
       // 保留；结果经 onOutcome 交回编排器收口（设计 §5.1 直传口径不变）。
       // isCancelled：内容锁等待期间被取消 → uploadFileCos 不建引擎、不 POST，
       // 直接以取消回执收口（与行按钮的 lockAbort 同一窗口的编排器侧覆盖）。
-      return new Promise(function (resolve, reject) {
-        uploadFileCos(entry.file, inlineEntryRow(entry), {
-          directClass: entry.directClass,
-          assocTarget: entry.target,
-          isCancelled: function () { return !!entry.cancelled; },
-          onEngine: function (upload) {
-            // 取消按钮据此真正停传（设计 §5 / §6.3 的「取消」语义）
-            entry._upload = upload;
-          },
-          onOutcome: function (body, err) {
-            entry._upload = null;
-            if (err && err.__cancelled) resolve({ cancelled: true });
-            else if (err) reject(err);
-            else resolve({ body: body || {} });
-          },
+      // 复核 #4：建引擎（记录持久化的 upload.account、跨标签内容锁名的
+      // 账号段都按身份写入）之前等身份落定——未知身份绝不写空归属；落定
+      // 后仍为空（免认证部署）才按空串继续（免认证本就无归属语义）。
+      return authInfoReady().then(function () {
+        if (entry.cancelled) return { cancelled: true };
+        return new Promise(function (resolve, reject) {
+          uploadFileCos(entry.file, inlineEntryRow(entry), {
+            directClass: entry.directClass,
+            assocTarget: entry.target,
+            isCancelled: function () { return !!entry.cancelled; },
+            onEngine: function (upload) {
+              // 取消按钮据此真正停传（设计 §5 / §6.3 的「取消」语义）
+              entry._upload = upload;
+            },
+            onOutcome: function (body, err) {
+              entry._upload = null;
+              if (err && err.__cancelled) resolve({ cancelled: true });
+              else if (err) reject(err);
+              else resolve({ body: body || {} });
+            },
+          });
         });
       });
     }
@@ -11562,36 +11568,45 @@
       ? window.HP_INLINE_CONVERT.artifactDeclaration(entry.artifactCls) : null;
     var cfg = resolveCosConfig();
     if (!cfg) return Promise.reject({ data: { code: "cos_unavailable" } });
+    // 复核 #4：建引擎之前等身份落定——createEntryUpload 的 storage.save
+    // （upload.account）、引擎 opts.account、getJob 后的归属复核 `me` 都以
+    // 真实身份执行；身份未知绝不写空归属（那等于留下「无归属证据」的记录，
+    // 之后换账号可绕过归属闸无确认续传）。落定后仍为空（免认证部署）才按
+    // 空串继续（免认证本就无归属语义）。
     // 续传语义（设计 §6.4）：先读回 record.upload，再决定续传还是新建。
     // 归属复核（独立复核 #2 的上传入口）：记录的进行中 upload / pending
     // intent 属于另一账号时，绝不新建 ingestion（那会把产物入库到新账号
     // 名下）也绝不改写原记录——直接拒绝；行上的归属处置（显式改绑 /
     // 删除本地产物）由面板编排器的 account_mismatch 态提供。编排器在
     // runUpload 入口已查过一次，这里是真正 POST 前的最后一道闸。
-    var me = String(currentUserId || "");
-    return inlineRunner.getJob(entry.jobId).then(function (job) {
-      // 取消边界：这次 getJob 读取挂起期间被取消 → 绝不 createEntryUpload
-      // （那会新建/续传 ingestion，行却已是「已取消」）；取消早返回值交回
-      // 编排器 completeUpload 收口。
+    return authInfoReady().then(function () {
+      // 取消边界：身份等待期间被取消 → 不读记录、不建引擎
       if (entry.cancelled) return { cancelled: true };
-      var up = job && job.upload;
-      var it = job && job.intent;
-      var inflight = !!(up && up.ingestionId &&
-        up.state !== "published" && up.state !== "failed" &&
-        up.state !== "cancelled");
-      var owner = null;
-      if (inflight && up.account) owner = String(up.account);
-      else if (!inflight && it && it.state === "pending" && it.account) {
-        owner = String(it.account);
-      }
-      if (owner !== null && owner !== me) {
-        return Promise.reject({ data: { code: "account_mismatch" } });
-      }
-      return createEntryUpload(entry, artifact, job, name, declaration, cfg);
-    }, function () {
-      // 取消边界：读取失败的回调同样不得在取消后新建 ingestion
-      if (entry.cancelled) return { cancelled: true };
-      return createEntryUpload(entry, artifact, null, name, declaration, cfg);
+      var me = String(currentUserId || "");
+      return inlineRunner.getJob(entry.jobId).then(function (job) {
+        // 取消边界：这次 getJob 读取挂起期间被取消 → 绝不 createEntryUpload
+        // （那会新建/续传 ingestion，行却已是「已取消」）；取消早返回值交回
+        // 编排器 completeUpload 收口。
+        if (entry.cancelled) return { cancelled: true };
+        var up = job && job.upload;
+        var it = job && job.intent;
+        var inflight = !!(up && up.ingestionId &&
+          up.state !== "published" && up.state !== "failed" &&
+          up.state !== "cancelled");
+        var owner = null;
+        if (inflight && up.account) owner = String(up.account);
+        else if (!inflight && it && it.state === "pending" && it.account) {
+          owner = String(it.account);
+        }
+        if (owner !== null && owner !== me) {
+          return Promise.reject({ data: { code: "account_mismatch" } });
+        }
+        return createEntryUpload(entry, artifact, job, name, declaration, cfg);
+      }, function () {
+        // 取消边界：读取失败的回调同样不得在取消后新建 ingestion
+        if (entry.cancelled) return { cancelled: true };
+        return createEntryUpload(entry, artifact, null, name, declaration, cfg);
+      });
     });
   }
 

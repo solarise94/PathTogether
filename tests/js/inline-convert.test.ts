@@ -268,6 +268,7 @@ function mkOrch(over: {
 	onArtifact?: unknown;
 	onUploaded?: unknown;
 	account?: () => string;
+	identityReady?: () => Promise<void>;
 } = {}) {
 	const w = loadInline();
 	const I = w.HP_INLINE_CONVERT as ReturnType<typeof IC>;
@@ -313,6 +314,10 @@ function mkOrch(over: {
 			remove() { removed += 1; },
 		},
 		account: over.account || (() => "u1"),
+		// 复核 #4：身份就绪信号（bindIntent/uploadArtifact 的写归属闸）。
+		// 缺省 = 立即落定（与既有用例行为一致，等价于 app.js 的 auth/info
+		// 已返回）；身份引导用例注入可手动放行的 Deferred。
+		identityReady: over.identityReady || (() => Promise.resolve()),
 		target: () => ({ pid: "p1" }),
 		onArtifact: over.onArtifact ?? null,
 		onUploaded: over.onUploaded ?? null,
@@ -1205,16 +1210,19 @@ describe("独立评审复现：账号归属 / 取消边界 / 磁盘门 reject（
 				: { stage: "viewable", slide_id: "sld-new" } };
 		};
 		// app.js 的真 uploadEntryArtifact 切片（同 repro；t/humanSize 只是
-		// 进度事件的渲染依赖，注入桩避免未定义引用）
+		// 进度事件的渲染依赖，注入桩避免未定义引用；authInfoReady 是复核
+		// #4 的身份闸——harness 注入立即落定，归属语义由专属用例覆盖）
 		const artifactCode = appSrc.slice(
 			appSrc.indexOf("  function uploadEntryArtifact("),
 			appSrc.indexOf("  /// 完成收口（§3.5）"));
 		const actualOnArtifact = new Function(
 			"window", "inlineRunner", "currentUserId", "resolveCosConfig",
 			"apiFetch", "apiFetchNoRedirect", "inlineRowSetStage", "t", "humanSize",
+			"authInfoReady",
 			artifactCode + ";return uploadEntryArtifact;")(
 			w, runner, current, () => ({ max_size_bytes: 1000000 }), api, api,
-			() => {}, (k: string) => k, (n: number) => String(n)) as
+			() => {}, (k: string) => k, (n: number) => String(n),
+			() => Promise.resolve()) as
 			(e: Entry, a: unknown) => Promise<unknown>;
 		const orch = (w.HP_INLINE_CONVERT as {
 			createOrchestrator: (d: Record<string, unknown>) => Orch;
@@ -1357,7 +1365,12 @@ describe("独立复核 #3 复现移植（check-edges.mjs）：取消最后异步
 	/// app.js 的真 uploadEntryArtifact 切片 + 假 runner（第二次 getJob 可推迟）+
 	/// 假 api。current 模拟 app.js 的 currentUserId 活闭包（切片每次调用时
 	/// 重新编译以读取当前值；setCurrent 对应身份落定/账号变化）。
-	function setup(opts: { deferFinalGet?: boolean; current?: string } = {}) {
+	/// owner：记录 intent.account（null = 无归属证据——升级窗口/空归属记录）；
+	/// holdIdentity：身份闸保持未落定（#5 用它验证「写归属前等身份」）。
+	function setup(opts: {
+		deferFinalGet?: boolean; current?: string;
+		owner?: string | null; holdIdentity?: boolean;
+	} = {}) {
 		const deferFinalGet = opts.deferFinalGet ?? false;
 		let current = opts.current ?? "user-A";
 		const w = loadClassic();
@@ -1369,7 +1382,11 @@ describe("独立复核 #3 复现移植（check-edges.mjs）：取消最后异步
 		} = {
 			id: "job-patient", state: "ready",
 			source: { name: "patient.kfb", size: 100 },
-			intent: { channel: "workbench-inline", state: "pending", account: "user-A" },
+			intent: {
+				channel: "workbench-inline", state: "pending",
+				...(opts.owner === undefined ? { account: "user-A" }
+					: opts.owner === null ? {} : { account: opts.owner }),
+			},
 			result: { outputBytes: artifact.size, format: fmt },
 		};
 		let gets = 0;
@@ -1397,18 +1414,33 @@ describe("独立复核 #3 复现移植（check-edges.mjs）：取消最后异步
 		};
 		// app.js 的真 uploadEntryArtifact 切片（同 check-edges；t/humanSize 是
 		// 进度事件的渲染依赖——翻转后的用例会真正跑完引擎上传，需要注入桩，
-		// 与上一轮 repro 移植同一处理）
+		// 与上一轮 repro 移植同一处理）。authInfoReady：复核 #4 的身份闸，
+		// holdIdentity 时用可手动放行的 Deferred，#5 用它验证写归属等身份。
+		// currentUserId 必须是**活闭包变量**（外层 Function 的 var，经
+		// setUserId 改写）——真实 app.js 里 storage.save 在身份落定后才读它；
+		// 按值绑参数会把等待期间的旧值带进迟到回调，仿真不出生产行为。
 		const artifactCode = appSrc.slice(
 			appSrc.indexOf("  function uploadEntryArtifact("),
 			appSrc.indexOf("  /// 完成收口（§3.5）"));
-		const onArtifact = (e: Entry, a: unknown): Promise<unknown> =>
-			(new Function(
-				"window", "inlineRunner", "currentUserId", "resolveCosConfig",
-				"apiFetch", "apiFetchNoRedirect", "inlineRowSetStage", "t", "humanSize",
-				artifactCode + ";return uploadEntryArtifact;")(
-				w, runner, current, () => ({ max_size_bytes: 1000000 }), api, api,
-				() => {}, (k: string) => k, (n: number) => String(n)) as
-				(e: Entry, a: unknown) => Promise<unknown>)(e, a);
+		let resolveIdentity: (() => void) | null = null;
+		const identityP: Promise<void> = opts.holdIdentity
+			? new Promise<void>((r) => { resolveIdentity = () => r(); })
+			: Promise.resolve();
+		const slice = new Function(
+			"window", "inlineRunner", "initialUserId", "resolveCosConfig",
+			"apiFetch", "apiFetchNoRedirect", "inlineRowSetStage", "t", "humanSize",
+			"authInfoReady",
+			"var currentUserId = initialUserId;\n" +
+			artifactCode +
+			";return { setUserId: function (v) { currentUserId = v; }," +
+			" run: uploadEntryArtifact };")(
+			w, runner, current, () => ({ max_size_bytes: 1000000 }), api, api,
+			() => {}, (k: string) => k, (n: number) => String(n),
+			() => identityP) as {
+				setUserId: (v: string) => void;
+				run: (e: Entry, a: unknown) => Promise<unknown>;
+			};
+		const onArtifact = (e: Entry, a: unknown): Promise<unknown> => slice.run(e, a);
 		const orch = (w.HP_INLINE_CONVERT as {
 			createOrchestrator: (d: Record<string, unknown>) => Orch;
 		}).createOrchestrator({
@@ -1426,7 +1458,8 @@ describe("独立复核 #3 复现移植（check-edges.mjs）：取消最后异步
 		return { orch, calls, job,
 			getCount: () => gets,
 			resolveRead: () => { if (resolveRead) resolveRead(); },
-			setCurrent: (a: string) => { current = a; },
+			resolveIdentity: () => { if (resolveIdentity) resolveIdentity(); },
+			setCurrent: (a: string) => { current = a; slice.setUserId(a); },
 			kindsOf: (e: Entry) => kindsFn(w)(e) };
 	}
 
@@ -1492,6 +1525,105 @@ describe("独立复核 #3 复现移植（check-edges.mjs）：取消最后异步
 		await until(() => h.calls.some((c) =>
 			c.url === "/api/ingestions" && c.method === "POST"));
 		await until(() => e.state === "done");
+	});
+
+	it("#5 upload.account：身份未就绪绝不写空归属；落定后引擎才建、归属写成真实账号", async () => {
+		// 无归属证据的记录（旧缺陷写出的空归属 / 升级窗口旧行）：编排器的
+		// 归属闸不拦（owner null），但 app.js 的 uploadEntryArtifact 在建
+		// 引擎（storage.save 写 upload.account、POST /api/ingestions）之前
+		// 等身份落定——空归属记录也会在下一次上传时被改写成真实账号。
+		const h = setup({ current: "", owner: null, holdIdentity: true });
+		const [e] = await h.orch.restore();
+		h.orch.act(e.id, "continue");
+		await flush(40);
+		expect(h.calls.length).toBe(0);          // 引擎未建、零请求
+		h.setCurrent("user-A");                  // 身份落定：user-A
+		h.resolveIdentity();
+		await until(() => e.state === "done");
+		expect(h.job.upload && h.job.upload.account).toBe("user-A");
+		expect(h.calls.some((c) =>
+			c.url === "/api/ingestions" && c.method === "POST")).toBe(true);
+	});
+});
+
+// --------------------------------------------------------------------- //
+// 独立复核 #4：归属字段写入等身份就绪（写空串 = 无归属证据 → 换账号后
+// 他人可绕过归属闸无确认续传，绕过复核 #2）。覆盖三处写点：
+//   bindIntent 的 intent.account（转换启动前置 → 转换启动等身份）
+//   rebindAccount 的 account: cur（身份未知时 act('rebind') 拒绝改绑）
+//   app.js uploadEntryArtifact 的 upload.account（见上方 #5）
+// --------------------------------------------------------------------- //
+describe("独立复核 #4：归属字段写入等身份就绪", () => {
+	const KFB = Uint8Array.from([0xF1, 0x01, 0xEE, 0xEE, 0x4B, 0x46, 0x42, 0x00, 0, 0, 0, 0]);
+	async function until(f: () => boolean) {
+		for (let i = 0; i < 300; i++) {
+			if (f()) return;
+			await flush(1);
+		}
+		throw new Error("condition timed out");
+	}
+
+	it("身份未就绪入队（需转换）：不写 intent.account、不启动转换；身份落定后写 user-A 并继续", async () => {
+		let current = "";
+		let resolveIdentity!: () => void;
+		const h = mkOrch({
+			account: () => current,
+			identityReady: () => new Promise<void>((r) => { resolveIdentity = () => r(); }),
+			onArtifact: () => Promise.resolve({ body: { slide_id: "sld_x" } }),
+		});
+		const e = h.orch.enqueue(fakeFile("a.kfb", KFB))!;
+		await flush(25);
+		// 本地探测照常（转换可先排队），但写归属（bindIntent）与转换启动
+		// （bindIntent 是 startJob 的前置）都不发生——绝不先把 account 写空
+		const kinds = h.runner.calls.map((c) => (c as unknown[])[0]);
+		expect(kinds).toContain("probe");
+		expect(kinds).not.toContain("setJobIntent");
+		expect(kinds).not.toContain("startJob");
+		// 身份落定：bindIntent 以真实账号写归属，转换随即启动并走完
+		current = "user-A";
+		resolveIdentity();
+		await until(() => e.state === "done");
+		const intent = h.runner.calls.find((c) => (c as unknown[])[0] === "setJobIntent")![2] as
+			{ account: string };
+		expect(intent.account).toBe("user-A");
+	});
+
+	it("身份未知时 act('rebind')：不写任何归属（保持 account_mismatch）；身份落定后改绑到真实账号", async () => {
+		let current = "user-B";
+		const job = {
+			id: "j_own", state: "ready",
+			source: { name: "a.kfb", size: 100 },
+			result: { outputBytes: 100, format: "ome-bigtiff-subifd-rgb-jpeg-pyramid" },
+			upload: null,
+			intent: { channel: "workbench-inline", state: "pending", account: "user-A" },
+		};
+		const h = mkOrch({
+			account: () => current,
+			runner: {
+				listJobs: () => Promise.resolve([job]),
+				getJob: () => Promise.resolve(job),
+			},
+			onArtifact: () => Promise.resolve({ body: { slide_id: "sld_x" } }),
+		});
+		const [e] = await h.orch.restore();
+		expect(e.state).toBe("account_mismatch");   // 复核 #2：确属他人
+		current = "";                               // 身份转为未知（登出/未就绪窗口）
+		h.orch.act(e.id, "rebind");
+		await flush(20);
+		// 绝不把归属写成空串：intent/upload 记录零写入，行保持原状
+		const writes = h.runner.calls.filter((c) => {
+			const k = (c as unknown[])[0];
+			return k === "setJobIntent" || k === "setJobUpload";
+		});
+		expect(writes).toHaveLength(0);
+		expect(e.state).toBe("account_mismatch");
+		// 身份落定为本人才放行改绑：归属写到真实账号，之后继续走完
+		current = "user-A";
+		h.orch.act(e.id, "rebind");
+		await until(() => e.state === "done");
+		const intent = h.runner.calls.find((c) => (c as unknown[])[0] === "setJobIntent")![2] as
+			{ account: string };
+		expect(intent.account).toBe("user-A");
 	});
 });
 

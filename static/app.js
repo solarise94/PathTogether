@@ -11321,6 +11321,9 @@
       if (entry.viaRestore) out.push("continue");
     }
     if (st === "upload_queued" && entry.viaRestore) out.push("continueUpload");
+    // 等上传槽的普通行（另一标签正持有跨标签槽）：给取消入口——否则该行
+    // 只能靠关闭页面终止（设计 §5 的「排队等待」必须有出路）。
+    if (st === "upload_queued" && !entry.viaRestore) out.push("cancel");
     if (st === "need_disk_confirm") out.push("confirmDisk", "cancel");
     if (st === "converting") out.push("cancel");
     // uploading 态的「取消」**按来源分派**，避免行上出现两个同名按钮：
@@ -12162,7 +12165,17 @@
     if (!els.importFormatCatalog) return Promise.resolve();
     if (importDrawerState.formatsLoaded) return Promise.resolve();
     els.importFormatCatalog.textContent = t("imp.formats.loading");
-    return apiFetch("/api/slide-formats").then(jsonBody).then(function (res) {
+    return apiFetch("/api/slide-formats").then(function (resp) {
+      // 需要响应头（样本上限下发），故不用 jsonBody——自取 body 与 headers。
+      // 兼容两种响应形态：真 Response（有 headers.get）与测试替身（无 headers）。
+      var headers = (resp && resp.headers && typeof resp.headers.get === "function")
+        ? resp.headers : null;
+      return resp.json().then(function (b) {
+        return { ok: resp.ok, status: resp.status, body: b, headers: headers };
+      }, function () {
+        return { ok: resp.ok, status: resp.status, body: null, headers: headers };
+      });
+    }).then(function (res) {
       var body = res.body;
       var items = body && (body.formats || body.items);
       if (!Array.isArray(items) && Array.isArray(body)) items = body;
@@ -12171,7 +12184,12 @@
         return;
       }
       importDrawerState.formatCatalog = items;
-      var maxSample = Number(body && body.max_sample_bytes);
+      // 样本上限：优先响应头（服务端 FORMAT_REQUEST_MAX_SAMPLE_BYTES 的
+      // 权威下发；响应体是裸列表，没有该字段），其次兼容包封形状
+      //（body.max_sample_bytes，旧/替身形态）。两者都缺才保留 64 MiB 初值。
+      var maxSample = Number(res.headers &&
+                             res.headers.get("X-Format-Request-Max-Sample-Bytes"));
+      if (!(maxSample > 0)) maxSample = Number(body && body.max_sample_bytes);
       if (maxSample > 0) importDrawerState.maxSampleBytes = maxSample;
       importDrawerState.formatsLoaded = true;
       renderFormatCatalog(items);

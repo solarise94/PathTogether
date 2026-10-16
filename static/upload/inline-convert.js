@@ -922,14 +922,21 @@
             activeUpload = null;
             e.state = "upload_queued";
             if (ui.buttons) ui.buttons(e);
+            // 排队等待（设计 §5：排队而非失败）。退避按指数增长并封顶——
+            // 固定 1.5s 无上限地在后台空转既浪费唤醒，也让「已等待多久」不可
+            // 表达；行上给**取消**入口，用户始终有出路（该行原先是死路）。
+            e.waitRetries = (e.waitRetries || 0) + 1;
+            var backoff = Math.min(1500 * Math.pow(2, e.waitRetries - 1), 30000);
+            if (ui.buttons) ui.buttons(e);
             if (deps.setTimer) {
-              deps.setTimer(function () { schedule(); }, 1500);
+              deps.setTimer(function () { schedule(); }, backoff);
             }
             return;
           }
           // navigator.locks 不可用：照常执行（退化语义，绝不阻塞）
           return runUpload(e).then(null, function () { /* failUpload 已收口 */ });
         }
+        e.waitRetries = 0;
         e._releaseLocks = locks.release;
         return runUpload(e).then(function () {
           locks.release();

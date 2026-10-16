@@ -2487,4 +2487,20 @@ describe("产物锁来源与进度订阅（独立审查）", () => {
 		expect(h.toasts.some((m) => m.includes("T:png"))).toBe(true);
 	});
 
+
+	it("样本上限：优先读响应头（响应体是裸列表，没有 max_sample_bytes）", () => {
+		// 目录加载的取值链：X-Format-Request-Max-Sample-Bytes →
+		// body.max_sample_bytes（兼容包封）→ 模板初值。
+		const fn = appSrc.slice(
+			appSrc.indexOf('apiFetch("/api/slide-formats")'),
+			appSrc.indexOf('apiFetch("/api/slide-formats")') + 1200);
+		expect(fn).toContain("X-Format-Request-Max-Sample-Bytes");
+		expect(fn).toContain("body.max_sample_bytes");
+		// 裸列表形态：body 是数组时 items=body（既有行为不回归）
+		expect(fn).toContain("if (!Array.isArray(items) && Array.isArray(body)) items = body;");
+		// 服务端侧：端点保留裸列表并附加响应头
+		const py = readFileSync(resolve(root, "app.py"), "utf8");
+		expect(py).toContain('resp.headers["X-Format-Request-Max-Sample-Bytes"]');
+		expect(py).toContain("jsonify(slide_format_registry.public_catalog())");
+	});
 });

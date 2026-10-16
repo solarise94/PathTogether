@@ -12164,11 +12164,21 @@ def api_format_request_get(request_id):
 
 @app.route("/api/slide-formats", methods=["GET"])
 def api_slide_formats():
-    """产品向格式能力目录（W4）。"""
+    """产品向格式能力目录（W4）。
+
+    响应体保持**裸列表**（`public_catalog()`；既有消费方与测试都按列表解析）。
+    申请支持的样本上限另经响应头 `X-Format-Request-Max-Sample-Bytes` 下发：
+    此前前端读 `body.max_sample_bytes`（列表上不存在）→ 永远回落 64 MiB 初值，
+    `FORMAT_REQUEST_MAX_SAMPLE_BYTES` 被调过时前端会先拒合法样本、或放行必被
+    服务端 413 的样本。用响应头而不是改响应形状，是为了不动既有契约。
+    """
     import slide_format_registry
     if not can_upload():
         return jsonify(error="无权限"), 403
-    return jsonify(slide_format_registry.public_catalog())
+    resp = jsonify(slide_format_registry.public_catalog())
+    resp.headers["X-Format-Request-Max-Sample-Bytes"] = str(
+        int(FORMAT_REQUEST_MAX_SAMPLE_BYTES))
+    return resp
 
 
 def _baidu_ident_or_403():

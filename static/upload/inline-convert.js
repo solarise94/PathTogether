@@ -313,13 +313,19 @@
   ///                 resumeJob/cancelJob/listJobs/getJob/artifactView/
   ///                 setJobIntent/setJobUpload/discardJob）
   ///   engine        动态 import 的 engine.js 命名空间（sniff*/OUTPUT_PROFILES/
-  ///                 ENCODING_PROFILES/outputFileName/errCode/errText/...）
+  ///                 ENCODING_PROFILES/outputFileName/errCode/**uploadLockName**/…）
   ///   sniff         HP_SLIDE_SNIFF（classifyFile/verifyUploadHeader/extOf）
-  ///   cos           HP_COS_UPLOAD（createUpload/uploadLockName/...）
+  ///   cos           HP_COS_UPLOAD（createUpload/…）——**该命名空间没有**
+  ///                 uploadLockName（见 cos-uploader.js 的导出表）；产物锁名
+  ///                 以 engine.uploadLockName 为准，cos 面只作兼容回退。
+  ///   t             (key, vars) → 文案（app.js 传 tt；模块自己不做 i18n）
+  ///   typeName      (detected) → 本地化内容类型名（app.js 传 magicTypeName）
+  ///   cancelArtifact(entry) → 取消该直传条目的底层传输（引擎句柄在
+  ///                 app.js 的 uploadFileCos 闭包里，模块拿不到）
   ///   caps          {inlineConvert, directUploadFormats, browserConvertFormats,
   ///                  cosConfig}
   ///   ui            {row(entry), setStage(entry,key,frac,note,indeterminate),
-  ///                  toast(key,vars,kind), buttons(entry), refresh()}
+  ///                  toast(key,vars,kind), buttons(entry), refresh(), remove(entry)}
   ///   account()     当前账号（String(currentUserId) 加空串兜底，设计 §5 A6）
   ///   target()      入队时冻结的目标快照
   ///   onUploaded(entry)  完成回调（app.js 用它做 loadAll/关联/打开）

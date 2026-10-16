@@ -2503,4 +2503,14 @@ describe("产物锁来源与进度订阅（独立审查）", () => {
 		expect(py).toContain('resp.headers["X-Format-Request-Max-Sample-Bytes"]');
 		expect(py).toContain("jsonify(slide_format_registry.public_catalog())");
 	});
+	it("拒绝行的附注不互相覆盖：检测类型与申请支持回执同时可见（§7.1 + §9.4 B）", () => {
+		const fn = appSrc.slice(
+			appSrc.indexOf("function inlineRowNoteText"),
+			appSrc.indexOf("function inlineRowSetStage"));
+		// 两条信息各自 push 到 lines，join 后同显——不是 if/else 互斥
+		expect(fn).toContain("var lines = []");
+		expect(fn).toContain("lines.push(tt(\"upload.inline.rejected.magic\"");
+		expect(fn).toContain("lines.push(tt(\"fr.ok.registered\"");
+		expect(fn).toContain('lines.join(" · ")');
+	});
 });

@@ -313,9 +313,12 @@ test("B PNG 内容改名 .jpg 当场被拒（零 ingestion），「申请支持�
   // 当场拒绝：零 ingestion 请求、零跨源 PUT（§4.1 步 2 的零网络闸）
   expect(ingestionCalls).toEqual([]);
   expect(crossOriginPuts).toEqual([]);
-  // 行内出现检测类型（文案带 {type} 形参 → MAGIC_TYPE_NAMES 的 PNG 名称）
+  // 行内出现检测类型：**本地化名**（MAGIC_TYPE_NAMES 的「PNG 图片」），
+  // 不是裸枚举 png——toast 3 秒即逝，行内是唯一持久证据（§9.4 用例 B）。
   await expect(row.locator(".upload-item-status").first())
     .toContainText("已拒绝");
+  await expect(row)
+    .toContainText("检测到 PNG 图片");
 
   // 「申请支持该格式」→ POST /api/format-requests 202 → **行内**出现申请编号
   //（设计 §7.1：面板行是主入口，抽屉默认关闭——回执必须落到行上）

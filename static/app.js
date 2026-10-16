@@ -11222,18 +11222,20 @@
         entry.state === "upload_queued" || entry.state === "convert_queued") {
       return tt("upload.inline.note.keepopen");
     }
-    // 内容与扩展名不符：把**检测到的类型**留在行上（toast 3 秒即逝，行内是
-    // 唯一持久证据；设计 §9.4 用例 B 要求「行内出现检测类型」）。
+    // 行内附注可叠加：检测类型（拒绝原因，toast 3 秒即逝 → 行内是唯一持久
+    // 证据）与申请支持回执（编号 + 业务状态）**都要**留在行上——二者是同一
+    // 行的两条独立信息，谁也不能盖掉谁（设计 §7.1 + §9.4 用例 B）。
+    var lines = [];
     if (entry.state === "rejected" && entry.detectedTypeName) {
-      return tt("upload.inline.rejected.magic", { type: entry.detectedTypeName });
+      lines.push(tt("upload.inline.rejected.magic", { type: entry.detectedTypeName }));
     }
-    // 申请支持的**行内回执**（§7.1）：编号 + 业务状态。抽屉默认关闭，行内
-    // 按钮是主入口——只写抽屉的话用户点完看不到任何结果。
+    // 申请支持的**行内回执**（§7.1）：抽屉默认关闭，行内按钮是主入口——
+    // 只写抽屉的话用户点完看不到任何结果。
     if (entry.supportRequestId) {
-      return tt("fr.ok.registered", { id: entry.supportRequestId }) + " · " +
-        frBusinessStatusLabel(entry.supportBusinessStatus);
+      lines.push(tt("fr.ok.registered", { id: entry.supportRequestId }) + " · " +
+        frBusinessStatusLabel(entry.supportBusinessStatus));
     }
-    return "";
+    return lines.join(" · ");
   }
 
   /// noteText 约定：**已渲染的文案**（调用方用 t/tt + 形参渲染），或空串。

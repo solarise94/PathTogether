@@ -345,6 +345,12 @@ def test_schema_migrations_recorded(conn):
         # run_grants 加 allow_ai_drawing / drawing_bound_at / drawing_intent。
         "0082_run_grant_drawing_skill.sql",
         "0083_site_visit_dedup_dimensions.sql",
+        # upload-liveness 生产事故修复（与本次面板内转换无关，属基线
+        # upload-liveness 的 3bc02711）：ingestion_jobs 加
+        # client_seen_at（归属客户端在场时刻，NULL=升级窗口旧行按
+        # fail-safe 不参与失活判定）与 fail_detail（终态失败的安全白名单
+        # 细节），幂等 ADD COLUMN IF NOT EXISTS + audit_events 记录。
+        "0084_ingestion_client_seen.sql",
     ]
 
 

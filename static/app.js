@@ -316,10 +316,15 @@
   // effective subject（预览中为被预览用户）；actorRole 永远是真实管理员。
   var currentRole = null;
   var currentUserId = null;
-  // 身份就绪信号（独立复核 #3 问题 2）：initAuth 的 /api/auth/info 无论
-  // 成功、失败还是未登录都算落定。面板编排器在落定前不做归属判定
-  // （未知身份 ≠ 他人）：restore 等它、上传入口的归属检查在身份未知时
-  // 停车等待。落定后编排器 recheckOwnership() 按真实账号重判一次。
+  // 身份三态（独立复核 #5）：ok（已认证：auth_enabled=true 且有 user_id）/
+  // local（服务端明确免认证：auth_enabled=false）/ failed（网络错误、5xx、
+  // 响应缺字段、auth_enabled=true 却无 user_id 等）。**只有 ok/local 算
+  // 「身份落定」**（authInfoReadyP resolve）；failed 绝不落定——面板的归属
+  // 写入（intent.account / upload.account / rebind）与依赖它们的转换启动/
+  // 上传全部等待，自动退避重试 + 行上手动「重试」入口，落定后
+  // recheckOwnership 重判、等待中的条目继续。401 由 apiFetch 跳 /login。
+  // 除面板归属相关路径外，工作台其他功能不等待本信号。
+  var authInfoEnabled = false;   // 服务端明确启用认证（auth_enabled=true）
   var authInfoReadyResolve = null;
   var authInfoReadyP = new Promise(function (resolve) {
     authInfoReadyResolve = resolve;
@@ -332,9 +337,86 @@
     }
     // 身份落定（或变化）→ 编排器重判恢复行/停车行的归属。编排器尚未
     // 初始化时无需补调：ensureInlineOrch 的 restore 同样等这个信号。
-    if (inlineOrch && typeof inlineOrch.recheckOwnership === "function") {
-      inlineOrch.recheckOwnership();
-    }
+    // 微任务延迟：让编排器侧 identityReady 的等待回调先把 identitySettled
+    // 翻转，recheckOwnership 才能正确处理各类等待行。
+    Promise.resolve().then(function () {
+      if (inlineOrch && typeof inlineOrch.recheckOwnership === "function") {
+        inlineOrch.recheckOwnership();
+      }
+    });
+  }
+
+  // —— 失败退避重试（复核 #5）：2s/5s/10s/20s/30s 封顶；页面隐藏时暂停 ——
+  var AUTH_RETRY_DELAYS_MS = [2000, 5000, 10000, 20000, 30000];
+  var authRetryTimer = null;
+  var authRetryAttempt = 0;
+  function clearAuthRetry() {
+    if (authRetryTimer) { clearTimeout(authRetryTimer); authRetryTimer = null; }
+    authRetryAttempt = 0;
+  }
+  function retryAuthInfoNow() {
+    // 手动「重试」入口（面板 identity_wait 行）：立即重拉并重置退避
+    clearAuthRetry();
+    fetchAuthInfo();
+  }
+  function scheduleAuthRetry() {
+    if (authRetryTimer) return;
+    var delay = AUTH_RETRY_DELAYS_MS[
+      Math.min(authRetryAttempt, AUTH_RETRY_DELAYS_MS.length - 1)];
+    authRetryAttempt += 1;
+    authRetryTimer = setTimeout(function () {
+      authRetryTimer = null;
+      if (typeof document !== "undefined" && document.visibilityState &&
+          document.visibilityState !== "visible") {
+        // 页面隐藏：暂停重试，回到可见再继续（退避档位保留）
+        document.addEventListener("visibilitychange", function onVisible() {
+          document.removeEventListener("visibilitychange", onVisible);
+          if (document.visibilityState === "visible" && !authRetryTimer) {
+            scheduleAuthRetry();
+          }
+        });
+        return;
+      }
+      fetchAuthInfo();
+    }, delay);
+  }
+  /// /api/auth/info 响应三态判定（复核 #5；服务端契约 app.py:7628：顶层
+  /// auth_enabled 恒为布尔；auth_enabled=true 时顶层 user_id 为登录用户
+  /// id）。缺字段 / auth_enabled=true 却无 user_id 一律 failed。
+  function classifyAuthInfo(info) {
+    if (!info || typeof info !== "object") return "failed";
+    if (info.auth_enabled === false) return "local";   // 服务端明确免认证
+    if (info.auth_enabled !== true) return "failed";
+    if (!info.user_id) return "failed";
+    return "ok";
+  }
+  function fetchAuthInfo() {
+    apiFetch("/api/auth/info").then(function (r) {
+      // 401(auth_required) 已在 apiFetch 内跳 /login（页面随即离开，无重试
+      // 循环）；其余非 2xx = 身份获取失败
+      if (!r || !r.ok) {
+        throw new Error("auth/info HTTP " + ((r && r.status) || "?"));
+      }
+      return r.json();
+    }).then(function (info) {
+      if (classifyAuthInfo(info) === "failed") {
+        // 响应形态异常：绝不落定身份闸（面板绝不写空归属），退避重试。
+        // 反馈身份照常落定（与旧链路同：失败路径也不阻塞反馈模块）。
+        fbIdentitySettle();
+        scheduleAuthRetry();
+        return;
+      }
+      clearAuthRetry();
+      applyAuthInfo(info);
+      if (sidebarCtrl) sidebarCtrl.onScopeReady();
+      markAuthInfoSettled();
+      fbIdentitySettle();
+    }).catch(function () {
+      // 网络错误 / JSON 解析失败：不落定身份闸，退避重试（不影响主功能）；
+      // 反馈身份照常落定（同上）
+      fbIdentitySettle();
+      scheduleAuthRetry();
+    });
   }
 
   var actorRole = null;
@@ -342,6 +424,9 @@
   var previewState = null;
 
   function applyAuthInfo(info) {
+    // 复核 #5：服务端是否明确启用认证（面板「空归属记录 = 归属未知」哨兵
+    // 只在启用认证的部署生效；免认证部署空归属即无归属）
+    authInfoEnabled = !!(info && info.auth_enabled);
     if (!info || !info.auth_enabled) return info;
     var previousScope = userScope();
     var actor = info.actor || {};
@@ -457,19 +542,10 @@
   // folder-experience §2：无论成功与否都放行身份就绪闸——位置记忆的恢复/
   // 持久化以 currentUserId 为准（无可信身份 = 不持久化，见 fbMemoryKey）。
   function initAuth() {
-    apiFetch("/api/auth/info").then(function (r) { return r.json(); }).then(function (info) {
-      applyAuthInfo(info);
-      // 升级 A：身份到位后按「站点:账号」重读侧栏偏好（无偏好保持默认收起）
-      if (sidebarCtrl) sidebarCtrl.onScopeReady();
-    }).catch(function () { /* 忽略，不影响主功能 */ }).then(function () {
-      fbIdentitySettle();
-      // 独立复核 #3 问题 2：身份信号落定（成功/失败/未登录都算）→ 面板
-      // 恢复行/停车行按真实账号重判归属。未登录（auth_enabled 时 401 →
-      // apiFetch 跳 /login）页面随即离开，不存在「卡在等待身份」；免认证
-      // 部署 auth_enabled=false → currentUserId 保持空，恢复行不判他人
-      // （免认证记录本就不带归属账号）。
-      markAuthInfoSettled();
-    });
+    // 复核 #5：/api/auth/info 的拉取/三态判定/退避重试都在 fetchAuthInfo。
+    // 成功（ok/local）才落定身份闸；失败不落定、退避重试 + 行上手动重试，
+    // 不影响工作台其他功能。
+    fetchAuthInfo();
     if (els.previewStopBtn) {
       els.previewStopBtn.addEventListener("click", stopIdentityPreview);
     }
@@ -11172,10 +11248,15 @@
           remove: inlineRowRemove,
         },
         account: function () { return String(currentUserId || ""); },
-        // 独立复核 #3 问题 2：身份就绪信号——恢复行的归属分类等它（未知
-        // 身份 ≠ 他人）；落定/账号变化时 markAuthInfoSettled 也会调
-        // recheckOwnership 重判既有行。
+        // 独立复核 #3/#5：身份就绪信号——恢复行的归属分类等它（未知身份
+        // ≠ 他人；获取失败不落定）；落定/账号变化时 markAuthInfoSettled
+        // 也会调 recheckOwnership 重判既有行。
         identityReady: authInfoReady,
+        // 复核 #5：服务端是否明确启用认证（空归属记录 = 归属未知哨兵只在
+        // 启用认证的部署生效）
+        authEnabled: function () { return authInfoEnabled; },
+        // 复核 #5：identity_wait 行的手动「重试」→ 立即重拉 auth/info
+        retryIdentity: retryAuthInfoNow,
         t: function (key, vars) { return tt(key, inlineResolveVars(vars)); },
         typeName: function (detected) { return magicTypeName(detected); },
         target: function () { return importTargetSnapshot(); },
@@ -11383,6 +11464,9 @@
     // 归属不符（独立复核 #2）：只有显式改绑（工具页 chooseAccountAction
     // 的 'separate' 同语义）与删除本地产物——绝无「继续」。
     if (st === "account_mismatch") out.push("rebindAccount", "discard");
+    // 复核 #5：身份确认中的行（auth/info 失败重试期间）——手动「重试」
+    // 与取消；绝不静默开始任何会写归属的动作。
+    if (st === "identity_wait") out.push("retryIdentity", "cancel");
     if (st === "converting") out.push("cancel");
     // uploading 态的「取消」**按来源分派**，避免行上出现两个同名按钮：
     //   - 直传条目（无 jobId）：uploadFileCos 自己 addRowButton 挂一个，
@@ -11429,6 +11513,7 @@
     if (kind === "continueUpload") return tt("upload.inline.action.continueUpload");
     if (kind === "confirmDisk") return tt("upload.inline.disk.confirm");
     if (kind === "rebindAccount") return tt("upload.inline.action.rebindAccount");
+    if (kind === "retryIdentity") return tt("upload.inline.identity.retry");
     if (kind === "cancel") return tt("upload.cos.cancel");
     if (kind === "chooseFolder") return tt("upload.inline.action.chooseFolder");
     if (kind === "reselect") return tt("upload.inline.action.reselect");
@@ -11467,6 +11552,10 @@
     if (kind === "cancel") { inlineOrch.act(entry.id, "cancel"); return; }
     if (kind === "confirmDisk") { inlineOrch.act(entry.id, "confirmDisk"); return; }
     if (kind === "rebindAccount") { inlineOrch.act(entry.id, "rebind"); return; }
+    if (kind === "retryIdentity") {
+      inlineOrch.act(entry.id, "retryIdentity");
+      return;
+    }
     if (kind === "reselect") {
       // 「重新选择文件」：复用同一个隐藏 file input；选中的文件作为**新条目**
       // 入队（旧条目留在行上供清理，绝不静默替换用户看不到的东西）。
@@ -11597,9 +11686,21 @@
         if (inflight && up.account) owner = String(up.account);
         else if (!inflight && it && it.state === "pending" && it.account) {
           owner = String(it.account);
+        } else if (authInfoEnabled &&
+                   (inflight || (it && it.state === "pending"))) {
+          // 复核 #5 纵深防御：启用认证的部署中，进行中/pending 的记录却没
+          // 有任何归属账号（旧数据或任何漏网写入）→ 归属未知（空串哨兵，
+          // 与编排器 recordOwner 同口径），绝不视为可直接上传。
+          owner = "";
         }
         if (owner !== null && owner !== me) {
-          return Promise.reject({ data: { code: "account_mismatch" } });
+          // __account：与编排器自身的归属检查同一收口（failAccountMismatch
+          // → account_mismatch 行态，只认改绑/删除）；owner 空串哨兵由其
+          // 映射为「此记录没有归属账号」行注。
+          return Promise.reject({
+            __account: true, owner: owner,
+            data: { code: "account_mismatch" },
+          });
         }
         return createEntryUpload(entry, artifact, job, name, declaration, cfg);
       }, function () {

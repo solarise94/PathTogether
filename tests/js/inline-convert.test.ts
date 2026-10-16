@@ -269,6 +269,7 @@ function mkOrch(over: {
 	onUploaded?: unknown;
 	account?: () => string;
 	identityReady?: () => Promise<void>;
+	authEnabled?: () => boolean;
 } = {}) {
 	const w = loadInline();
 	const I = w.HP_INLINE_CONVERT as ReturnType<typeof IC>;
@@ -315,9 +316,12 @@ function mkOrch(over: {
 		},
 		account: over.account || (() => "u1"),
 		// 复核 #4：身份就绪信号（bindIntent/uploadArtifact 的写归属闸）。
-		// 缺省 = 立即落定（与既有用例行为一致，等价于 app.js 的 auth/info
-		// 已返回）；身份引导用例注入可手动放行的 Deferred。
-		identityReady: over.identityReady || (() => Promise.resolve()),
+		// 缺省不注入 = 立即落定（与既有用例行为一致，等价于 app.js 的
+		// auth/info 已返回）；身份引导用例注入可手动放行的 Deferred。
+		identityReady: over.identityReady,
+		// 复核 #5：服务端是否明确启用认证（空归属哨兵）；缺省 false
+		//（免认证语义，与既有用例一致）
+		authEnabled: over.authEnabled,
 		target: () => ({ pid: "p1" }),
 		onArtifact: over.onArtifact ?? null,
 		onUploaded: over.onUploaded ?? null,
@@ -1218,11 +1222,11 @@ describe("独立评审复现：账号归属 / 取消边界 / 磁盘门 reject（
 		const actualOnArtifact = new Function(
 			"window", "inlineRunner", "currentUserId", "resolveCosConfig",
 			"apiFetch", "apiFetchNoRedirect", "inlineRowSetStage", "t", "humanSize",
-			"authInfoReady",
+			"authInfoReady", "authInfoEnabled",
 			artifactCode + ";return uploadEntryArtifact;")(
 			w, runner, current, () => ({ max_size_bytes: 1000000 }), api, api,
 			() => {}, (k: string) => k, (n: number) => String(n),
-			() => Promise.resolve()) as
+			() => Promise.resolve(), false) as
 			(e: Entry, a: unknown) => Promise<unknown>;
 		const orch = (w.HP_INLINE_CONVERT as {
 			createOrchestrator: (d: Record<string, unknown>) => Orch;
@@ -1369,7 +1373,7 @@ describe("独立复核 #3 复现移植（check-edges.mjs）：取消最后异步
 	/// holdIdentity：身份闸保持未落定（#5 用它验证「写归属前等身份」）。
 	function setup(opts: {
 		deferFinalGet?: boolean; current?: string;
-		owner?: string | null; holdIdentity?: boolean;
+		owner?: string | null; holdIdentity?: boolean; authEnabled?: boolean;
 	} = {}) {
 		const deferFinalGet = opts.deferFinalGet ?? false;
 		let current = opts.current ?? "user-A";
@@ -1427,17 +1431,22 @@ describe("独立复核 #3 复现移植（check-edges.mjs）：取消最后异步
 			? new Promise<void>((r) => { resolveIdentity = () => r(); })
 			: Promise.resolve();
 		const slice = new Function(
-			"window", "inlineRunner", "initialUserId", "resolveCosConfig",
+			"window", "inlineRunner", "initialUserId", "initialAuthEnabled",
+			"resolveCosConfig",
 			"apiFetch", "apiFetchNoRedirect", "inlineRowSetStage", "t", "humanSize",
 			"authInfoReady",
 			"var currentUserId = initialUserId;\n" +
+			"var authInfoEnabled = initialAuthEnabled;\n" +
 			artifactCode +
 			";return { setUserId: function (v) { currentUserId = v; }," +
+			" setAuthEnabled: function (v) { authInfoEnabled = v; }," +
 			" run: uploadEntryArtifact };")(
-			w, runner, current, () => ({ max_size_bytes: 1000000 }), api, api,
+			w, runner, current, opts.authEnabled ?? false,
+			() => ({ max_size_bytes: 1000000 }), api, api,
 			() => {}, (k: string) => k, (n: number) => String(n),
 			() => identityP) as {
 				setUserId: (v: string) => void;
+				setAuthEnabled: (v: boolean) => void;
 				run: (e: Entry, a: unknown) => Promise<unknown>;
 			};
 		const onArtifact = (e: Entry, a: unknown): Promise<unknown> => slice.run(e, a);
@@ -1517,8 +1526,9 @@ describe("独立复核 #3 复现移植（check-edges.mjs）：取消最后异步
 		h.orch.act(e.id, "continue");            // 身份仍未知
 		await flush(30);
 		// runUpload 的归属检查：记录归属 user-A ≠ 未知（''）→ 既不 mismatch
-		// 也不上传——停车在 upload_queued，零请求
-		expect(e.state).toBe("upload_queued");
+		// 也不上传。复核 #5 起停车进**可见的等待态** identity_wait（行注
+		// 「正在确认登录身份…」+ 手动重试；原为不可见的 upload_queued 停放）
+		expect(e.state).toBe("identity_wait");
 		expect(h.calls.length).toBe(0);
 		h.setCurrent("user-A");                  // 身份落定：确是本人
 		await h.orch.recheckOwnership();
@@ -1575,6 +1585,7 @@ describe("独立复核 #4：归属字段写入等身份就绪", () => {
 		await flush(25);
 		// 本地探测照常（转换可先排队），但写归属（bindIntent）与转换启动
 		// （bindIntent 是 startJob 的前置）都不发生——绝不先把 account 写空
+		console.log("STATE:", (e as { state: string }).state, "CALLS:", JSON.stringify(h.runner.calls), "ERR:", JSON.stringify((e as { error: unknown }).error), "PARKED:", (e as { parked?: boolean }).parked);
 		const kinds = h.runner.calls.map((c) => (c as unknown[])[0]);
 		expect(kinds).toContain("probe");
 		expect(kinds).not.toContain("setJobIntent");
@@ -3043,5 +3054,308 @@ describe("产物锁来源与进度订阅（独立审查）", () => {
 		expect(fn).toContain("lines.push(tt(\"upload.inline.rejected.magic\"");
 		expect(fn).toContain("lines.push(tt(\"fr.ok.registered\"");
 		expect(fn).toContain('lines.join(" · ")');
+	});
+});
+
+// --------------------------------------------------------------------- //
+// 独立复核 #5（用户复核 1263a3ec 的 P1）：auth/info **失败**不再落定身份。
+// 原缺陷（复现脚本 run-verify5-review-KoKB63/auth-failure.mjs）：
+//   ① initAuth 的 auth/info 异常被 catch 吞掉后仍 markAuthInfoSettled →
+//      identityReady 以 currentUserId="" 落定；
+//   ② 转换照常启动，bindIntent 持久化 intent.account=""（空归属）；
+//   ③ 关页后 B 登录恢复该产物，无账号变更确认直接上传到 B（POST 发生、
+//      upload.account=user-B）。
+// 三态：ok（auth_enabled=true 且有 user_id）/ local（服务端明确
+// auth_enabled=false）/ failed（网络错误、5xx、缺字段、true 却无 id）。
+// 只有 ok/local 落定；failed 不落定（退避重试 + 行上手动重试）。纵深防御：
+// 启用认证部署中空归属的进行中/pending 记录 =「归属未知」（空串哨兵）→
+// 恢复/上传入口都进 account_mismatch 同类的显式确认。
+// 移植口径（与前几轮相同）：复现脚本「演示缺陷已发生」的断言翻转为正确
+// 行为，其余检查点保留；翻转明细见各 it 注释。
+// --------------------------------------------------------------------- //
+describe("独立复核 #5：auth/info 失败不落定身份，空归属需确认", () => {
+	const KFB = Uint8Array.from([241, 1, 238, 238, 75, 70, 66, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+	const FMT = "ome-bigtiff-subifd-rgb-jpeg-pyramid";
+	async function until(f: () => boolean) {
+		for (let i = 0; i < 300; i++) {
+			if (f()) return;
+			await flush(1);
+		}
+		throw new Error("condition timed out");
+	}
+
+	/// auth-failure.mjs 第 2 段的夹具：KFB 入队转换（probe → startJob →
+	/// ready），同一 runner 记录随后可被 restore/上传。账号是**活闭包**
+	/// （setAccount 对应身份落定后的 currentUserId）。
+	function mkConversion(over: {
+		identityReady?: () => Promise<void>;
+		authEnabled?: () => boolean;
+	} = {}) {
+		const state = { account: "" };
+		const calls: Array<[string, ...unknown[]]> = [];
+		const job: {
+			id: string; state: string; source: unknown; result?: unknown;
+			upload?: Record<string, unknown>; intent?: Record<string, unknown>;
+		} = { id: "job-A", state: "prepared", source: { name: "patient.kfb", size: 16 } };
+		const h = mkOrch({
+			identityReady: over.identityReady,
+			authEnabled: over.authEnabled,
+			account: () => state.account,
+			onArtifact: () => {
+				// 模拟 app.js uploadEntryArtifact 的 storage.save：upload.account
+				// 在上传时刻按身份写入（生产中该写入在身份闸之后）
+				job.upload = { ...(job.upload || {}), account: state.account };
+				return Promise.resolve({ body: { slide_id: "sld_x" } });
+			},
+			runner: {
+				// 覆盖方法自带调用记录（fakeRunner 的 base.calls 只记 base 方法）
+				probe: async () => {
+					calls.push(["probe"]);
+					return { jobId: job.id,
+						probe: { document: { modality: "brightfield" } } };
+				},
+				setJobIntent: async (_id: string, patch: Record<string, unknown>) => {
+					calls.push(["setJobIntent", patch]);
+					job.intent = { ...(job.intent || {}), ...patch };
+					return undefined;
+				},
+				startJob: async () => {
+					calls.push(["startJob"]);
+					job.state = "ready";
+					job.result = { outputBytes: 8, format: FMT };
+					return { jobId: job.id, done: Promise.resolve({ ok: true, result: job.result }) };
+				},
+				setJobUpload: async (_id: string, patch: Record<string, unknown>) => {
+					calls.push(["setJobUpload", patch]);
+					job.upload = { ...(job.upload || {}), ...patch };
+					return undefined;
+				},
+			},
+		});
+		return { h, job, calls, setAccount: (v: string) => { state.account = v; } };
+	}
+
+	it("①② auth/info 失败（闸未落定）→ 转换停在可见 identity_wait：不写 intent.account、不启动转换（翻转：repro 断言走到 uploading 且 intent.account=''）", async () => {
+		const identity = { resolve: () => {} };
+		const { h, job, calls } = mkConversion({
+			identityReady: () => new Promise<void>((r) => { identity.resolve = () => r(); }),
+		});
+		const e = h.orch.enqueue(fakeFile("patient.kfb", KFB))!;
+		await flush(25);
+		// 复核 #5：本地产物探测照常（转换可先排队），但写归属（bindIntent）
+		// 与转换启动（等 bindIntent）都不发生——绝不先把 account 写成空串
+		const kinds = calls.map((c) => c[0]);
+		expect(kinds).toContain("probe");
+		expect(kinds).not.toContain("setJobIntent");
+		expect(kinds).not.toContain("startJob");
+		console.log("STATE:", e.state, "CALLS:", JSON.stringify(h.runner.calls), "ERR:", JSON.stringify(e.error));
+		expect(e.state).toBe("identity_wait");   // 可见等待（行注 + 手动重试）
+		expect(job.intent).toBeUndefined();      // 翻转：repro 是 intent.account === ""
+		void identity;
+	});
+
+	it("②→重试成功：身份落定 user-A 后转换继续，intent.account 与 upload.account 写 user-A", async () => {
+		const identity = { resolve: () => {} };
+		const { h, job, calls, setAccount } = mkConversion({
+			identityReady: () => new Promise<void>((r) => { identity.resolve = () => r(); }),
+		});
+		const e = h.orch.enqueue(fakeFile("patient.kfb", KFB))!;
+		await flush(25);
+		expect(e.state).toBe("identity_wait");
+		// 重试成功：账号闭包翻转（applyAuthInfo 写 currentUserId）+ 闸落定
+		//（app.js：markAuthInfoSettled → resolve → recheckOwnership → 等待链继续）
+		setAccount("user-A");
+		identity.resolve();
+		await until(() => e.state === "done");
+		const intent = calls.find((c) => c[0] === "setJobIntent")![1] as { account: string };
+		expect(intent.account).toBe("user-A");
+		expect(job.upload && job.upload.account).toBe("user-A");
+	});
+
+	it("③ 明确免认证（闸落定、账号空串）：转换与上传照常，空归属允许", async () => {
+		const { h, job, calls } = mkConversion();
+		const e = h.orch.enqueue(fakeFile("patient.kfb", KFB))!;
+		await until(() => e.state === "done");
+		const intent = calls.find((c) => c[0] === "setJobIntent")![1] as { account: string };
+		expect(intent.account).toBe("");        // 免认证：空归属即无归属，放行
+		expect(job.upload && job.upload.account).toBe("");
+	});
+
+	it("④ 启用认证：空归属旧记录恢复 → account_mismatch（归属未知行注）、无 POST；显式改绑后才以当前账号继续（翻转：repro 断言 upload_queued→直接 done→POST）", async () => {
+		const job: {
+			id: string; state: string; source: unknown; result: unknown;
+			upload?: Record<string, unknown>; intent: Record<string, unknown>;
+		} = {
+			id: "job-A", state: "ready",
+			source: { name: "patient.kfb", size: 16 },
+			// 旧缺陷写出的记录：pending intent 却没有任何归属账号
+			intent: { channel: "workbench-inline", state: "pending" },
+			result: { outputBytes: 8, format: FMT },
+		};
+		const h = mkOrch({
+			account: () => "user-B",
+			authEnabled: () => true,   // B 所在的部署启用认证
+			runner: {
+				listJobs: async () => [job],
+				getJob: async () => job,
+				setJobIntent: async (_id: string, patch: Record<string, unknown>) => {
+					job.intent = { ...job.intent, ...patch };
+				},
+				setJobUpload: async (_id: string, patch: Record<string, unknown>) => {
+					job.upload = { ...(job.upload || {}), ...patch };
+				},
+			},
+			onArtifact: () => {
+				// 模拟 storage.save：upload.account 在上传时刻按身份写入
+				job.upload = { ...(job.upload || {}), account: "user-B" };
+				return Promise.resolve({ body: { slide_id: "sld_B" } });
+			},
+		});
+		const [restored] = await h.orch.restore();
+		// 翻转：repro 断言 restored.state === "upload_queued"（无确认直接续传）
+		expect(restored.state).toBe("account_mismatch");
+		// 行注「此记录没有归属账号」（t 桩返回键本身）
+		expect(restored.accountOwner).toBe("upload.inline.account.unknown");
+		expect(job.upload).toBeUndefined();   // 恢复阶段零归属写入
+		// 「继续」被守卫：仍 mismatch、零写入
+		h.orch.act(restored.id, "continue");
+		await flush(20);
+		expect(restored.state).toBe("account_mismatch");
+		// 显式改绑（复核 #2 语义）：归属写当前账号，随后继续并入库
+		h.orch.act(restored.id, "rebind");
+		await until(() => restored.state === "done");
+		expect(job.intent.account).toBe("user-B");
+		expect(job.upload && job.upload.account).toBe("user-B");
+	});
+
+	it("⑤ 注入的 identityReady reject ≠ 放行：保持等待、零写入（复核 #5 要求移除 .catch→null）", async () => {
+		const { h, job, calls } = mkConversion({
+			account: () => "",
+			identityReady: () => Promise.reject(new Error("identity probe failed")),
+		});
+		const e = h.orch.enqueue(fakeFile("patient.kfb", KFB))!;
+		await flush(40);
+		const kinds = calls.map((c) => c[0]);
+		expect(kinds).not.toContain("setJobIntent");
+		expect(kinds).not.toContain("startJob");
+		expect(e.state).toBe("identity_wait");
+		expect(job.intent).toBeUndefined();
+	});
+
+	/// auth-failure.mjs 第 1 段的 harness（原样 + 只加桩）：真 app.js 的
+	/// 身份信号块与 initAuth 切片；applyAuthInfo 以桩注入（repro 的失败场景
+	/// 不会调用它；重试成功/免认证用例用它写 currentUserId）。
+	function mkAuthHarness(payload: () => Promise<unknown>) {
+		const timers: Array<{ delay: number; fn: () => void }> = [];
+		const readyCode = appSrc.slice(
+			appSrc.indexOf("  var authInfoReadyResolve ="), appSrc.indexOf("  var actorRole ="));
+		const initCode = appSrc.slice(
+			appSrc.indexOf("  function initAuth()"), appSrc.indexOf("  function doLogout()"));
+		const auth = new Function(
+			"apiFetch", "fbIdentitySettle", "setTimeout", "clearTimeout",
+			"var currentUserId=null, inlineOrch=null, sidebarCtrl=null, els={};\n" +
+			// 只加桩：applyAuthInfo 不在切片内——镜像它的身份写入
+			//（applyAuthInfo: currentUserId = info.user_id || null）
+			"function applyAuthInfo(info) { currentUserId = (info && info.user_id) || null; }\n" +
+			readyCode + "\n" + initCode +
+			"\nreturn {init:initAuth,ready:authInfoReady,account:()=>currentUserId};")(
+			() => Promise.resolve({ ok: true, status: 200, json: payload }),
+			() => {},
+			(fn: () => void, delay: number) => {
+				timers.push({ delay, fn });
+				return timers.length as unknown as ReturnType<typeof setTimeout>;
+			},
+			() => {}) as {
+				init: () => void;
+				ready: () => Promise<void>;
+				account: () => string | null;
+			};
+		return { auth, timers };
+	}
+
+	it("⑥ 真 initAuth：auth/info 网络失败 → 身份闸不落定（翻转：repro await auth.ready() 以 null 落定）+ 首次退避 2s；重试成功 → 落定并写入账号", async () => {
+		let fail = true;
+		const { auth, timers } = {
+			...(() => {
+				const inner = mkAuthHarness(() => fail
+					? Promise.reject(new Error("one transient auth/info network failure"))
+					: Promise.resolve({ auth_enabled: true, user_id: "user-A", role: "user" }));
+				return inner;
+			})(),
+		};
+		auth.init();
+		// 翻转：repro 的 `await auth.ready(); assert.equal(account(), null)`
+		//（失败也落定）。固定行为：闸**不**落定——与一个必然先完成的标记
+		// 竞速，标记赢 = 仍在等待
+		const settledFirst = await Promise.race([
+			auth.ready().then(() => true),
+			flush(6).then(() => false),
+		]);
+		expect(settledFirst).toBe(false);
+		expect(auth.account()).toBeNull();
+		// 首次退避 2s（2s/5s/10s/20s/30s 封顶）
+		expect(timers.length).toBeGreaterThanOrEqual(1);
+		expect(timers[0].delay).toBe(2000);
+		// 重试成功：网络恢复 + 服务端返回已认证身份 → 闸落定、账号写入
+		fail = false;
+		timers[0].fn();
+		await auth.ready();
+		expect(auth.account()).toBe("user-A");
+	});
+
+	function loadI18nLocal() {
+		if (typeof (globalThis as { CustomEvent?: unknown }).CustomEvent === "undefined") {
+			(globalThis as { CustomEvent?: unknown }).CustomEvent = class {
+				constructor(public type: string, public detail?: unknown) { }
+			};
+		}
+		const w: Record<string, unknown> = {
+			localStorage: { getItem: () => null, setItem() { }, removeItem() { } },
+			navigator: { language: "zh-CN" },
+		};
+		const doc = {
+			readyState: "complete",
+			querySelectorAll: () => [],
+			addEventListener() { },
+			dispatchEvent() { },
+			documentElement: { setAttribute() { }, getAttribute() { return null; } },
+		};
+		new Function("window", "document", "localStorage", "navigator", i18nSrc)(
+			w, doc, w.localStorage, w.navigator);
+		return w.HP_I18N as {
+			t: (k: string, vars?: Record<string, unknown>) => string;
+			setLang: (l: string) => void;
+		};
+	}
+
+	it("⑧ 复核 #5 新增 i18n 键 zh/en 成对存在（身份等待 / 重试 / 无归属账号）", () => {
+		const t = loadI18nLocal();
+		const keys = ["upload.inline.identity.waiting", "upload.inline.identity.retry",
+			"upload.inline.account.unknown"];
+		for (const lang of ["zh", "en"]) {
+			t.setLang(lang);
+			for (const k of keys) {
+				expect(t.t(k), lang + ":" + k).not.toBe(k);   // 不回落键本身
+			}
+		}
+		t.setLang("zh");
+		expect(t.t("upload.inline.identity.waiting")).toContain("正在确认登录身份");
+		t.setLang("en");
+		expect(t.t("upload.inline.identity.waiting")).toContain("Confirming your sign-in");
+	});
+
+	it("⑦ 真 initAuth 三态：明确免认证（auth_enabled=false）落定且账号为空；启用认证却无 user_id → 不落定", async () => {
+		const local = mkAuthHarness(async () => ({ auth_enabled: false }));
+		local.auth.init();
+		await local.auth.ready();
+		expect(local.auth.account()).toBeNull();
+		// 启用认证却无 user_id：响应形态异常 → 不落定（与网络失败同口径）
+		const anomalous = mkAuthHarness(async () => ({ auth_enabled: true, user_id: null }));
+		anomalous.auth.init();
+		const settledFirst = await Promise.race([
+			anomalous.auth.ready().then(() => true),
+			flush(6).then(() => false),
+		]);
+		expect(settledFirst).toBe(false);
 	});
 });

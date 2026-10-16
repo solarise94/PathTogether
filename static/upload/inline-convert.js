@@ -257,6 +257,9 @@
     uploading: 1,
     requeue_convert: 1,
     converted: 1,
+    // 复核 #5：身份确认中——本页持有用户的选择（已入队/已点继续），关闭
+    // 页面前应提醒
+    identity_wait: 1,
   };
   function shouldWarn(state) {
     return !!WARN_STATES[state];
@@ -328,10 +331,17 @@
   ///                  toast(key,vars,kind), buttons(entry), refresh(), remove(entry)}
   ///   account()     当前账号（String(currentUserId) 加空串兜底，设计 §5 A6）
   ///   identityReady()  身份就绪信号（可省）：Promise，/api/auth/info 落定
-  ///                 （成功/失败/未登录都算）后 resolve。身份未知（空串）
-  ///                 ≠ 他人（独立复核 #3 问题 2）：restore 等它再分类，
+  ///                 （成功且已认证，或服务端明确免认证）后 resolve。身份
+  ///                 未知（空串）≠ 他人（独立复核 #3）：restore 等它再分类，
   ///                 runUpload 的归属检查在身份未知时停车等待而非放行。
   ///                 未注入时按「账号闭包即权威」处理（测试/嵌入面）。
+  ///                 注入 Promise reject ≠ 放行（复核 #5）：保持等待。
+  ///   authEnabled()  服务端是否明确启用认证（复核 #5，可省，缺省 false）：
+  ///                 启用时进行中/pending 记录没有归属账号 → 归属未知
+  ///                 （空归属绝不直接上传，进显式确认）；免认证部署空
+  ///                 归属即无归属。
+  ///   retryIdentity() identity_wait 行的「重试」入口（复核 #5）：通知
+  ///                 注入方立即重拉身份（app.js 重置退避并 fetch auth/info）。
   ///   target()      入队时冻结的目标快照
   ///   onUploaded(entry)  完成回调（app.js 用它做 loadAll/关联/打开）
   ///   onArtifact(entry)  需要「上传产物」时由 app.js 提供（复用 uploadFileCos
@@ -350,15 +360,35 @@
     var locks = deps.locks ||
       (typeof navigator !== "undefined" ? navigator.locks : null);
     var account = typeof deps.account === "function" ? deps.account : function () { return ""; };
-    // 身份就绪信号（独立复核 #3 问题 2）：app.js 注入 /api/auth/info 的落定
-    // Promise。未注入 → 视为「身份已就绪」（账号闭包即权威；restore/runUpload
-    // 对空串身份的保守处理仍然生效——见各检查点）。
+    // 服务端是否明确启用认证（复核 #5）：app.js 注入 auth_enabled 的实时
+    // 读数。启用认证的部署中，进行中/pending 记录却没有任何归属账号 →
+    // 「归属未知」（recordOwner 空串哨兵 → account_mismatch 同类的显式
+    // 确认），绝不视为可直接上传；免认证部署（false/未注入）保持「空归属
+    // 即无归属」的既有语义。
+    var authEnabled = typeof deps.authEnabled === "function"
+      ? deps.authEnabled : function () { return false; };
+    // 身份落定信号（独立复核 #3/#5）：app.js 注入 /api/auth/info 的就绪
+    // Promise（成功且已认证，或服务端明确免认证，才算落定——失败态绝不
+    // resolve，由注入方退避重试后 resolve 同一 Promise）。
+    // identitySettled：信号是否已落定。未注入 identityReady 的嵌入面/
+    // 测试 = 立即落定（账号闭包即权威，原语义不变；app.js 生产路径恒
+    // 注入）。注入后：等待期间 bindIntent/上传入口把行停在可见的
+    // identity_wait（不写归属、不启动转换）；注入 Promise reject ≠ 放行
+    // ——保持等待（见 identityReady 的注释）。
+    var identitySettled = typeof deps.identityReady !== "function";
     var identityReady = typeof deps.identityReady === "function"
       ? function () {
-          return Promise.resolve(deps.identityReady()).catch(function () {
-            // 身份获取失败也放行（页面本就不因 auth/info 失败不可用）；
-            // 空串身份的保守语义由各检查点自行保证。
-            return null;
+          if (identitySettled) return Promise.resolve();
+          return Promise.resolve(deps.identityReady()).then(function (v) {
+            identitySettled = true;
+            return v;
+          }, function () {
+            // 复核 #5：注入的 Promise reject 绝不 .catch→null 放行——那
+            // 会把「身份获取失败」转成「身份已落定」。返回永不 resolve 的
+            // Promise 保持等待；重试成功后注入方 resolve 同一 Promise 时，
+            // 后续 identityReady() 调用照常落定（app.js 的重试正是这个
+            // 形态：失败态不 resolve、不 reject）。
+            return new Promise(function () { /* 未落定：保持等待 */ });
           });
         }
       : function () { return Promise.resolve(); };
@@ -707,9 +737,24 @@
     /// 语义）。bindIntent 是 startJob 的前置（startConvert 顺序 await），
     /// 所以转换的实际启动同样等身份——/api/auth/info 通常毫秒级返回，对
     /// 用户无感；相比「先写空串再补写」少一次记录改写，也绝无窗口期。
+    /// 复核 #5：身份获取失败（重试中）不算落定 → 行停在**可见的等待态**
+    /// （identity_wait：行注「正在确认登录身份…」+ 手动「重试」入口），
+    /// 落定后恢复「转换中」继续启动。
     function bindIntent(e) {
       if (!e.jobId || !runner.setJobIntent) return Promise.resolve();
+      var waits = !identitySettled && !e.cancelled;
+      if (waits) {
+        e.state = "identity_wait";
+        setStage(e, "upload.inline.identity.waiting", null, "", true);
+        if (ui.buttons) ui.buttons(e);
+      }
       return identityReady().then(function () {
+        if (waits && !e.cancelled && e.state === "identity_wait") {
+          // 身份落定：恢复「转换中」的行状态，继续启动
+          e.state = "converting";
+          setStage(e, "tools.phase.probing", null, "", true);
+          if (ui.buttons) ui.buttons(e);
+        }
         // 等待期间被取消：不写（运行器可能已丢弃该任务）
         if (e.cancelled) return undefined;
         return Promise.resolve(runner.setJobIntent(e.jobId, {
@@ -780,6 +825,9 @@
             ? engine.ENCODING_PROFILES.PRESERVE : undefined,
         };
         return bindIntent(e).then(function () {
+          // 复核 #5：身份等待期间被取消 → 不启动转换（onConverted 对取消
+          // 行是空操作，链就地结束）
+          if (e.cancelled) return null;
           return runner.startJob(mode === "probe" ? e.file : null, startOpts);
         }).then(function (started) { return started && started.done; });
       }).then(function (result) {
@@ -1025,6 +1073,17 @@
         }
         // 取消边界：直传条目进入引擎（= 新建 ingestion）前复查
         if (e.cancelled) { releaseUploadSlot(e); return Promise.resolve(); }
+        // 复核 #5：直传条目同口径——身份未落定（获取失败重试中）不进入
+        // 上传入口。行停在可见的 identity_wait（可手动重试）；直传条目无
+        // jobId、无归属可判，落定后解除停放重新调度即可。
+        if (!identitySettled) {
+          holdForIdentity(e);
+          return identityReady().then(function () {
+            if (e.cancelled) return null;
+            releaseIdentityHold(e);
+            return null;
+          });
+        }
         return Promise.resolve(deps.onArtifact(e, null)).then(function (outcome) {
           return completeUpload(e, outcome);
         }, function (err) {
@@ -1125,13 +1184,20 @@
         });
     }
 
+    /// 归属标签（复核 #5）：空串哨兵 = 归属未知（启用认证部署中的空归属
+    /// 记录）→ 行注「此记录没有归属账号」；其余原样（空 → null）。
+    function ownerLabel(owner) {
+      if (owner === "") return t("upload.inline.account.unknown");
+      return owner || null;
+    }
+
     /// 归属不符的行收口（复核 #2）：停在 account_mismatch（行注明归属
     /// 账号），只给「改绑当前账号（显式确认，rebind）」与「删除本地产物」
     /// （discard）；原记录一律不改写，绝不静默新建 ingestion。
     function failAccountMismatch(e, owner) {
       releaseUploadSlot(e);
       if (e.cancelled) return;
-      e.accountOwner = owner || null;
+      e.accountOwner = ownerLabel(owner);
       e.mode = null;
       e.state = "account_mismatch";
       markError(e, "account_mismatch", null, {});
@@ -1505,6 +1571,15 @@
         rebindAccount(e);
         return e;
       }
+      if (action === "retryIdentity") {
+        // 复核 #5：identity_wait 行的「重试」——通知注入方立即重拉身份
+        // （app.js：重置退避并 fetch /api/auth/info）；身份闸落定后由
+        // recheckOwnership / 各等待链继续。
+        if (typeof deps.retryIdentity === "function") {
+          try { deps.retryIdentity(); } catch (err) { /* 回调失败不翻行 */ }
+        }
+        return e;
+      }
       if (action === "cancel") {
         cancel(e);
         return e;
@@ -1568,6 +1643,11 @@
     /// 进行中的上传属于创建它的账号（服务端 ingestion 的归属与容量记账都在
     /// 那个账号上），未收口的自动上传意图同样绑定授权账号。返回归属账号，
     /// 无归属证据（升级窗口旧行）→ null——绝不据空值误判。
+    /// 复核 #5 纵深防御：**启用认证**的部署中，进行中/pending 的记录却
+    /// 没有任何归属账号（旧数据或任何漏网写入）→ 返回空串哨兵 =「归属
+    /// 未知」：恢复与上传入口都不得视为可直接上传，进 account_mismatch
+    /// 同类的显式确认（改绑 / 删除本地产物）。免认证部署（authEnabled
+    /// =false）保持「空归属即无归属」的既有语义。
     function recordOwner(job) {
       var up = job && job.upload;
       var it = job && job.intent;
@@ -1578,11 +1658,16 @@
       if (!inflight && it && it.state === "pending" && it.account) {
         return String(it.account);
       }
+      if (authEnabled() &&
+          (inflight || (it && it.state === "pending"))) {
+        return "";
+      }
       return null;
     }
 
     /// 是否归属他人（owner !== null 且与当前账号不同；空串当前账号与
-    /// 工具页同口径：owner 非空即不符）。
+    /// 工具页同口径：owner 非空即不符）。owner 为空串哨兵（启用认证下的
+    /// 「归属未知」记录）对任何非空当前账号都算「不符」→ 显式确认。
     function ownedByOther(job, cur) {
       var owner = recordOwner(job);
       return (owner !== null && owner !== cur) ? owner : null;
@@ -1672,8 +1757,11 @@
       var other = (cur === "") ? null : ownedByOther(job, cur);
       e._identityPending = false;
       if (other !== null) {
-        e.accountOwner = (intent && intent.accountLabel) ||
-          (job.upload && job.upload.accountLabel) || other;
+        // 复核 #5：空串哨兵（归属未知）→ 行注「此记录没有归属账号」
+        e.accountOwner = other === ""
+          ? t("upload.inline.account.unknown")
+          : (intent && intent.accountLabel) ||
+            (job.upload && job.upload.accountLabel) || other;
         e.mode = null;
         e.state = "account_mismatch";
         setStage(e, "upload.inline.account.mismatch");
@@ -1710,17 +1798,29 @@
       return e;
     }
 
-    /// 复核 #3 问题 2：上传入口的归属等待（身份未知且记录确有归属）。
-    /// 行退出调度与上传槽（锁由 releaseUploadSlot 一并释放）、停放进
-    /// upload_queued；身份就绪后 recheckOwnership() 重判——本人则解除停放
+    /// 复核 #3/#5：上传入口的归属等待（身份未知且记录确有归属；复核 #5
+    /// 起含直传条目的身份未落定等待）。行退出调度与上传槽（锁由
+    /// releaseUploadSlot 一并释放）、停在**可见的等待态**：行注「正在确认
+    /// 登录身份…」+ 手动「重试」入口（act('retryIdentity') → 注入方重拉
+    /// auth/info）。身份落定后 recheckOwnership() 重判——本人则解除停放
     /// 继续用户显式的「继续」，他人才收口 account_mismatch。
     function holdForIdentity(e) {
       releaseUploadSlot(e);
       e.parked = true;
       e._identityHold = true;
-      e.state = "upload_queued";
-      setStage(e, "upload.inline.stage.queued", null, "", true);
+      e.state = "identity_wait";
+      setStage(e, "upload.inline.identity.waiting", null, "", true);
       if (ui.buttons) ui.buttons(e);
+    }
+
+    /// 身份落定后解除一条「上传等待」行（recheckOwnership 重判路径与直传
+    /// 条目的自动续链共用）：回到待上传队列继续用户的显式意图。
+    function releaseIdentityHold(e) {
+      e._identityHold = false;
+      e.parked = false;
+      e.state = "upload_queued";
+      if (ui.buttons) ui.buttons(e);
+      schedule();
     }
 
     /// 复核 #3 问题 2：身份就绪/变化后的归属重判入口（app.js 在
@@ -1731,56 +1831,67 @@
     /// 当前身份仍未知（空串）时整体不动：未知 ≠ 他人，绝不据此新增
     /// mismatch，也绝不把 mismatch 翻回可继续（守恒，绝不误伤）。
     function recheckOwnership() {
-      var cur = String(account() || "");
-      if (cur === "") return Promise.resolve([]);
-      var targets = [];
-      for (var i = 0; i < entries.length; i++) {
-        var e = entries[i];
-        if (e && e.jobId && !e.cancelled &&
-            (e._identityPending || e._identityHold ||
-             e.state === "account_mismatch")) {
-          targets.push(e);
+      // 复核 #5：身份未落定（获取失败/重试中）时整体不动——identityReady
+      // 在落定前不 resolve，本调用随之等待；app.js 在落定（含重试成功）后
+      // 调用。落定后 cur==="" = 明确免认证部署：按既有语义重判（空归属即
+      // 无归属；authEnabled=false 时空归属哨兵不生效）。
+      return identityReady().then(function () {
+        var cur = String(account() || "");
+        var targets = [];
+        var looseHolds = [];   // 直传条目（无 jobId）的身份停车：无归属可判
+        for (var i = 0; i < entries.length; i++) {
+          var e = entries[i];
+          if (!e || e.cancelled) continue;
+          if (e._identityHold && !e.jobId) { looseHolds.push(e); continue; }
+          if (e.jobId && (e._identityPending || e._identityHold ||
+              e.state === "account_mismatch")) {
+            targets.push(e);
+          }
         }
-      }
-      if (!targets.length) return Promise.resolve([]);
-      return Promise.all(targets.map(function (e) {
-        var wasHold = !!e._identityHold;
-        return Promise.resolve(runner.getJob(e.jobId))
-          .catch(function () { return null; })
-          .then(function (job) {
-            // 等待期间被取消 / 记录读不到：保持现状（取消行绝不动；
-            // 停车行仍可被用户「继续」——runUpload 会按新身份再判）
-            e._identityPending = false;
-            e._identityHold = false;
-            if (e.cancelled || !job) return e;
-            var owner = recordOwner(job);
-            if (owner !== null && owner !== cur) {
-              // 确属他人：account_mismatch（只认 rebind/discard，复核 #2
-              // 语义不变；failAccountMismatch 对 cancelled 行是空操作）
-              failAccountMismatch(e,
-                (job.intent && job.intent.accountLabel) ||
-                (job.upload && job.upload.accountLabel) || owner);
+        looseHolds.forEach(function (e) { releaseIdentityHold(e); });
+        if (!targets.length) return Promise.resolve([]);
+        return Promise.all(targets.map(function (e) {
+          var wasHold = !!e._identityHold;
+          return Promise.resolve(runner.getJob(e.jobId))
+            .catch(function () { return null; })
+            .then(function (job) {
+              // 等待期间被取消 / 记录读不到：保持现状（取消行绝不动；
+              // 停车行仍可被用户「继续」——runUpload 会按新身份再判）
+              e._identityPending = false;
+              e._identityHold = false;
+              if (e.cancelled || !job) return e;
+              var owner = recordOwner(job);
+              if (owner !== null && owner !== cur) {
+                // 确属他人 / 归属未知（空归属哨兵）：account_mismatch（只
+                // 认 rebind/discard，复核 #2 语义不变；cancelled 行是空操作；
+                // 空串哨兵由 failAccountMismatch 映射为「无归属账号」行注）
+                failAccountMismatch(e,
+                  owner === "" ? owner : (job.intent && job.intent.accountLabel) ||
+                  (job.upload && job.upload.accountLabel) || owner);
+                return e;
+              }
+              if (e.state === "account_mismatch") {
+                // 曾判他人、现在归属本人（或归属证据已消失）：记录本来就
+                // 属于本人，无需任何改绑写——复位为恢复分类（仍停放，等
+                // 用户「继续」）
+                e.accountOwner = null;
+                e.error = null;
+                e.parked = true;
+                classifyResumed(e, job);
+                if (ui.buttons) ui.buttons(e);
+                return e;
+              }
+              if (wasHold) {
+                // 上传入口曾因身份未知停车：本人 → 解除停放，继续用户显式「继续」
+                e.parked = false;
+                e.state = "upload_queued";
+                if (ui.buttons) ui.buttons(e);
+                schedule();
+              }
               return e;
-            }
-            if (e.state === "account_mismatch") {
-              // 曾判他人、现在归属本人（或归属证据已消失）：记录本来就
-              // 属于本人，无需任何改绑写——复位为恢复分类（仍停放，等
-              // 用户「继续」）
-              e.accountOwner = null;
-              e.error = null;
-              e.parked = true;
-              classifyResumed(e, job);
-              if (ui.buttons) ui.buttons(e);
-              return e;
-            }
-            if (wasHold) {
-              // 上传入口曾因身份未知停车：本人 → 解除停放，继续用户显式「继续」
-              e.parked = false;
-              schedule();
-            }
-            return e;
-          });
-      })).then(function (rs) {
+            });
+        }));
+      }).then(function (rs) {
         if (ui.refresh) ui.refresh(null);
         return rs;
       });

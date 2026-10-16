@@ -157,6 +157,57 @@ test.beforeEach(async ({ page }) => {
 });
 
 // --------------------------------------------------------------------------- //
+// 复核 #5：auth/info 持续失败（503，route 拦截，手动放行前一直失败——
+// 自动退避重试同样被拦）→ 身份闸不落定，条目停在可见的 identity_wait
+//（行注「正在确认登录身份」+「重试身份确认」入口）；点手动重试放行后
+// 身份落定，转换 → 上传走完，归属按真实登录账号写入。放在文件最前：
+// 与服务端 COS 池准入（FIFO/身份活跃上限）无顺序耦合。
+// --------------------------------------------------------------------------- //
+test("auth/info 失败期间条目停在身份等待（可见 + 手动重试），放行后自动继续并完成上传", async ({ page }) => {
+  test.setTimeout(240_000);
+  const kfb = ensureKfb(KFB_W, KFB_H);
+
+  // auth/info 持续 503，直到测试观察完等待态后放行（页面加载即失败，
+  // 自动退避重试也全部失败——确保身份等待窗口在拖入文件之后仍存在）
+  let authHold = true;
+  let authInfoCalls = 0;
+  await page.route("**/api/auth/info", (route) => {
+    authInfoCalls += 1;
+    if (authHold) {
+      return route.fulfill({ status: 503, body: "transient upstream failure" });
+    }
+    return route.continue();
+  });
+
+  await openWorkbench(page);
+  expect(await page.evaluate(() => (window as any).HP_UPLOAD.inlineEnabled())).toBe(true);
+
+  const before = await panelRows(page).count();
+  await page.setInputFiles("#file-input", kfb);
+  await expect(panelRows(page)).toHaveCount(before + 1, { timeout: 30_000 });
+
+  // 身份未落定：行停在可见的等待态（不写归属、不启动转换），行注给出
+  // 「正在确认登录身份」与「重试身份确认」入口
+  await expect.poll(async () => (await entryOf(page))?.state, {
+    timeout: 15_000, intervals: [250],
+  }).toBe("identity_wait");
+  const row = panelRows(page).last();
+  await expect(row).toContainText("正在确认登录身份");
+  await expect(row).toContainText("重试身份确认");
+
+  // 手动「重试身份确认」→ 立即重拉 auth/info（放行）→ 身份落定 → 转换、
+  // 上传自动继续直到收口，归属按真实登录账号写入
+  authHold = false;
+  await row.locator(".upload-item-btn", { hasText: "重试身份确认" }).click();
+  await waitSettled(page);
+  await expect.poll(async () => (await entryOf(page))?.state, {
+    timeout: 30_000, intervals: [250],
+  }).toBe("done");
+  expect(authInfoCalls).toBeGreaterThanOrEqual(2);
+});
+
+
+// --------------------------------------------------------------------------- //
 // 用例 A：面板内转换 → 上传 → 分块拼回 → 平台读取器打开
 // --------------------------------------------------------------------------- //
 test("A 小合成 KFB 在工作台面板内转换并上传，拼回的分块被 slide_io.open_slide 打开", async ({ page }) => {
@@ -533,3 +584,4 @@ test("开关关闭 + 直传类文件（.tif）：仍走既有直传状态机（�
   // 关态回退路径不经过面板编排器
   expect(await page.evaluate(() => (window as any).HP_UPLOAD.inlineOrch())).toBeNull();
 });
+

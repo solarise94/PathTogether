@@ -316,6 +316,27 @@
   // effective subject（预览中为被预览用户）；actorRole 永远是真实管理员。
   var currentRole = null;
   var currentUserId = null;
+  // 身份就绪信号（独立复核 #3 问题 2）：initAuth 的 /api/auth/info 无论
+  // 成功、失败还是未登录都算落定。面板编排器在落定前不做归属判定
+  // （未知身份 ≠ 他人）：restore 等它、上传入口的归属检查在身份未知时
+  // 停车等待。落定后编排器 recheckOwnership() 按真实账号重判一次。
+  var authInfoReadyResolve = null;
+  var authInfoReadyP = new Promise(function (resolve) {
+    authInfoReadyResolve = resolve;
+  });
+  function authInfoReady() { return authInfoReadyP; }
+  function markAuthInfoSettled() {
+    if (authInfoReadyResolve) {
+      authInfoReadyResolve(null);
+      authInfoReadyResolve = null;
+    }
+    // 身份落定（或变化）→ 编排器重判恢复行/停车行的归属。编排器尚未
+    // 初始化时无需补调：ensureInlineOrch 的 restore 同样等这个信号。
+    if (inlineOrch && typeof inlineOrch.recheckOwnership === "function") {
+      inlineOrch.recheckOwnership();
+    }
+  }
+
   var actorRole = null;
   var actorUserId = null;
   var previewState = null;
@@ -442,6 +463,12 @@
       if (sidebarCtrl) sidebarCtrl.onScopeReady();
     }).catch(function () { /* 忽略，不影响主功能 */ }).then(function () {
       fbIdentitySettle();
+      // 独立复核 #3 问题 2：身份信号落定（成功/失败/未登录都算）→ 面板
+      // 恢复行/停车行按真实账号重判归属。未登录（auth_enabled 时 401 →
+      // apiFetch 跳 /login）页面随即离开，不存在「卡在等待身份」；免认证
+      // 部署 auth_enabled=false → currentUserId 保持空，恢复行不判他人
+      // （免认证记录本就不带归属账号）。
+      markAuthInfoSettled();
     });
     if (els.previewStopBtn) {
       els.previewStopBtn.addEventListener("click", stopIdentityPreview);
@@ -10822,6 +10849,15 @@
             } })
       : Promise.resolve({ held: false, release: function () {} });
     locked.then(function (lk) {
+      // 取消边界（独立复核 #3 问题 1 的顺查）：内容锁等待期间被面板取消
+      // （编排器 cancel → entry.cancelled，此刻引擎尚未创建、无处停传）→
+      // 不建引擎、不 POST /api/ingestions，释放刚拿到的锁并以取消回执收口。
+      if (opts.isCancelled && opts.isCancelled()) {
+        if (lk && lk.release) { try { lk.release(); } catch (e) {} }
+        dropVisPoke();
+        if (opts.onOutcome) opts.onOutcome(null, { cancelled: true, __cancelled: true });
+        return;
+      }
       upload = window.HP_COS_UPLOAD.createUpload({
         source: file,
         apiFetch: apiFetch,
@@ -11136,6 +11172,10 @@
           remove: inlineRowRemove,
         },
         account: function () { return String(currentUserId || ""); },
+        // 独立复核 #3 问题 2：身份就绪信号——恢复行的归属分类等它（未知
+        // 身份 ≠ 他人）；落定/账号变化时 markAuthInfoSettled 也会调
+        // recheckOwnership 重判既有行。
+        identityReady: authInfoReady,
         t: function (key, vars) { return tt(key, inlineResolveVars(vars)); },
         typeName: function (detected) { return magicTypeName(detected); },
         target: function () { return importTargetSnapshot(); },
@@ -11150,9 +11190,13 @@
         apiFetchNoRedirect: apiFetchNoRedirect,
         setTimer: function (fn, ms) { setTimeout(fn, ms); },
       });
-      // 刷新恢复：只列出、不自动开始（§6.2）
-      inlineOrch.restore();
-      applyBeforeunload();
+      // 刷新恢复：只列出、不自动开始（§6.2）。等身份信号落定再恢复——
+      // 恢复行的归属判定需要真实账号（独立复核 #3 问题 2：与 /api/auth/info
+      // 并行启动时，身份未就绪绝不把自己的记录判成 account_mismatch）。
+      authInfoReady().then(function () {
+        inlineOrch.restore();
+        applyBeforeunload();
+      });
       return inlineOrch;
     }).catch(function (e) {
       console.error("[inline-convert] 初始化失败（回退到弹窗交接）:", e);
@@ -11483,14 +11527,23 @@
   /// 面板自己不做传输：把 source 交给共享引擎 createUpload，工作台侧的
   /// 记录适配与直传完全一致。
   function uploadEntryArtifact(entry, artifact) {
+    // 取消边界（独立复核 #3 问题 1）：编排器的取消（orch.cancel →
+    // entry.cancelled）可能落在下面任何一个异步窗口里（getJob 读取、直传
+    // 内容锁等待）。已取消的条目绝不新建 ingestion——各入口就地早返回
+    // {cancelled:true}，编排器 completeUpload 据此收口（槽位/锁照常释放、
+    // 行保持「已取消」、不弹失败 toast）。
+    if (entry.cancelled) return Promise.resolve({ cancelled: true });
     if (!artifact) {
       // 直传条目（无本机产物）：复用既有直传状态机 uploadFileCos——它的
       // 门禁（能力/账号/源大小/词表）、记录持久化、跨标签内容锁与心跳全部
       // 保留；结果经 onOutcome 交回编排器收口（设计 §5.1 直传口径不变）。
+      // isCancelled：内容锁等待期间被取消 → uploadFileCos 不建引擎、不 POST，
+      // 直接以取消回执收口（与行按钮的 lockAbort 同一窗口的编排器侧覆盖）。
       return new Promise(function (resolve, reject) {
         uploadFileCos(entry.file, inlineEntryRow(entry), {
           directClass: entry.directClass,
           assocTarget: entry.target,
+          isCancelled: function () { return !!entry.cancelled; },
           onEngine: function (upload) {
             // 取消按钮据此真正停传（设计 §5 / §6.3 的「取消」语义）
             entry._upload = upload;
@@ -11517,6 +11570,10 @@
     // runUpload 入口已查过一次，这里是真正 POST 前的最后一道闸。
     var me = String(currentUserId || "");
     return inlineRunner.getJob(entry.jobId).then(function (job) {
+      // 取消边界：这次 getJob 读取挂起期间被取消 → 绝不 createEntryUpload
+      // （那会新建/续传 ingestion，行却已是「已取消」）；取消早返回值交回
+      // 编排器 completeUpload 收口。
+      if (entry.cancelled) return { cancelled: true };
       var up = job && job.upload;
       var it = job && job.intent;
       var inflight = !!(up && up.ingestionId &&
@@ -11532,6 +11589,8 @@
       }
       return createEntryUpload(entry, artifact, job, name, declaration, cfg);
     }, function () {
+      // 取消边界：读取失败的回调同样不得在取消后新建 ingestion
+      if (entry.cancelled) return { cancelled: true };
       return createEntryUpload(entry, artifact, null, name, declaration, cfg);
     });
   }
@@ -11560,6 +11619,10 @@
   }
 
   function createEntryUpload(entry, artifact, job, name, declaration, cfg) {
+    // 取消边界：建引擎（随后 createUpload 的链上就是 POST /api/ingestions）
+    // 前的最后一道闸。引擎句柄（entry._upload）在下一行同步挂上，此后编排
+    // 器的取消经 e._upload.cancel() 停掉引擎内部一切在途/后续请求。
+    if (entry.cancelled) return Promise.resolve({ cancelled: true });
     return new Promise(function (resolve, reject) {
       var upload = window.HP_COS_UPLOAD.createUpload({
         source: {

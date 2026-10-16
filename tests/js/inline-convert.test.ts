@@ -94,6 +94,7 @@ interface Orch {
 	cancel(e: Entry): void;
 	discard(e: Entry): Promise<boolean>;
 	restore(): Promise<Entry[]>;
+	recheckOwnership(): Promise<Entry[]>;
 	list(): Entry[];
 	get(id: string): Entry | null;
 	busy(): { converting: boolean; uploading: boolean };
@@ -1312,6 +1313,185 @@ describe("独立评审复现：账号归属 / 取消边界 / 磁盘门 reject（
 		const kinds = kindsFn(w)(e);
 		expect(kinds).toContain("confirmDisk");               // repro 断言的是不含
 		expect(kinds).toContain("cancel");
+	});
+});
+
+// --------------------------------------------------------------------- //
+// 独立复核 #3 复现移植（/mnt/ssd2/tests/run-verify4-review-QT3xyP/check-edges.mjs）
+//   #1 取消漏了最后一个异步窗口：uploadEntryArtifact 的第二次 getJob 挂起
+//      期间取消，读回后成功回调仍 createEntryUpload → POST /api/ingestions，
+//      行却显示「已取消」。
+//   #2 身份引导：ensureInlineOrch 与 /api/auth/info 并行，account() 仍为
+//      空串时 restore 用 ownedByOther(job,'') 把自己的记录判为
+//      account_mismatch；身份返回后 continue 又被 mismatch 守卫拒绝。
+// 移植口径（与上一轮 repro-inline 相同）：repro 里「演示缺陷已发生」的断言
+// 翻转为正确行为，其余检查点逐字保留。翻转明细见各 it 的注释。
+// --------------------------------------------------------------------- //
+describe("独立复核 #3 复现移植（check-edges.mjs）：取消最后异步窗口 / 身份引导", () => {
+	const fmt = "ome-bigtiff-subifd-rgb-jpeg-pyramid";
+	// 与 check-edges 相同的产物夹具（classic TIFF 头，bytes 原样）
+	const artifactBytes = Uint8Array.from([73, 73, 43, 0, 8, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0]);
+	async function until(f: () => boolean) {
+		for (let i = 0; i < 300; i++) {
+			if (f()) return;
+			await flush(1);
+		}
+		throw new Error("condition timed out");
+	}
+	function loadClassic() {
+		const w: W = {};
+		for (const name of ["inline-convert", "slide-sniff", "cos-uploader"]) {
+			new Function("window",
+				readFileSync(resolve(root, "static/upload/" + name + ".js"), "utf8"))(w);
+		}
+		return w;
+	}
+	function kindsFn(w: W) {
+		const buttonFn = appSrc.slice(
+			appSrc.indexOf("  function inlineButtonKinds("),
+			appSrc.indexOf("  function inlineButtonLabel("));
+		return new Function("window", buttonFn + ";return inlineButtonKinds;")(w) as
+			(e: Entry) => string[];
+	}
+	/// check-edges.mjs 的 setup：真 inline-convert/slide-sniff/cos-uploader +
+	/// app.js 的真 uploadEntryArtifact 切片 + 假 runner（第二次 getJob 可推迟）+
+	/// 假 api。current 模拟 app.js 的 currentUserId 活闭包（切片每次调用时
+	/// 重新编译以读取当前值；setCurrent 对应身份落定/账号变化）。
+	function setup(opts: { deferFinalGet?: boolean; current?: string } = {}) {
+		const deferFinalGet = opts.deferFinalGet ?? false;
+		let current = opts.current ?? "user-A";
+		const w = loadClassic();
+		const calls: Array<{ url: string; method: string }> = [];
+		const artifact = fakeFile("patient.ome.tif", artifactBytes);
+		const job: {
+			id: string; state: string; source: unknown; result: unknown;
+			upload?: Record<string, unknown>; intent: Record<string, unknown>;
+		} = {
+			id: "job-patient", state: "ready",
+			source: { name: "patient.kfb", size: 100 },
+			intent: { channel: "workbench-inline", state: "pending", account: "user-A" },
+			result: { outputBytes: artifact.size, format: fmt },
+		};
+		let gets = 0;
+		let resolveRead: (() => void) | null = null;
+		const runner = {
+			listJobs: async () => [job],
+			getJob: () => {
+				gets += 1;
+				if (deferFinalGet && gets === 2) {
+					return new Promise<void>((r) => { resolveRead = () => r(); })
+						.then(() => job);
+				}
+				return Promise.resolve(job);
+			},
+			artifactView: async () => artifact,
+			setJobUpload: async (_id: string, p: Record<string, unknown>) => {
+				job.upload = { ...(job.upload || {}), ...p };
+			},
+		};
+		const api = async (url: string, init: { method?: string } = {}) => {
+			calls.push({ url, method: init.method || "GET" });
+			return { ok: true, status: 200, json: async () => url === "/api/ingestions"
+				? { job_id: "inj-new", stage: "preparing" }
+				: { stage: "viewable", slide_id: "sld-new" } };
+		};
+		// app.js 的真 uploadEntryArtifact 切片（同 check-edges；t/humanSize 是
+		// 进度事件的渲染依赖——翻转后的用例会真正跑完引擎上传，需要注入桩，
+		// 与上一轮 repro 移植同一处理）
+		const artifactCode = appSrc.slice(
+			appSrc.indexOf("  function uploadEntryArtifact("),
+			appSrc.indexOf("  /// 完成收口（§3.5）"));
+		const onArtifact = (e: Entry, a: unknown): Promise<unknown> =>
+			(new Function(
+				"window", "inlineRunner", "currentUserId", "resolveCosConfig",
+				"apiFetch", "apiFetchNoRedirect", "inlineRowSetStage", "t", "humanSize",
+				artifactCode + ";return uploadEntryArtifact;")(
+				w, runner, current, () => ({ max_size_bytes: 1000000 }), api, api,
+				() => {}, (k: string) => k, (n: number) => String(n)) as
+				(e: Entry, a: unknown) => Promise<unknown>)(e, a);
+		const orch = (w.HP_INLINE_CONVERT as {
+			createOrchestrator: (d: Record<string, unknown>) => Orch;
+		}).createOrchestrator({
+			runner,
+			engine: { outputFileName: () => artifact.name },
+			sniff: w.HP_SLIDE_SNIFF,
+			cos: w.HP_COS_UPLOAD,
+			caps: { inlineConvert: { viewableFormats: [fmt] },
+				cosConfig: { max_size_bytes: 1000000 } },
+			account: () => current,
+			apiFetch: api,
+			onArtifact,
+			ui: {},
+		});
+		return { orch, calls, job,
+			getCount: () => gets,
+			resolveRead: () => { if (resolveRead) resolveRead(); },
+			setCurrent: (a: string) => { current = a; },
+			kindsOf: (e: Entry) => kindsFn(w)(e) };
+	}
+
+	it("#1 取消：uploadEntryArtifact 的最后一次 getJob 挂起期间取消，读回后绝不 POST，行保持已取消", async () => {
+		const h = setup({ deferFinalGet: true });
+		const [e] = await h.orch.restore();
+		h.orch.act(e.id, "continue");
+		await until(() => h.getCount() === 2);   // 与 repro 相同
+		expect(h.calls.length).toBe(0);          // 与 repro 相同
+		h.orch.cancel(e);
+		expect(e.state).toBe("cancelled");       // 与 repro 相同
+		h.resolveRead();
+		// 翻转断言（1 条）：repro 在这里 until 等 POST /api/ingestions 出现
+		//（演示「取消后仍新建入库」的缺陷）；固定行为是**绝不** POST，且行
+		// 保持已取消、上传槽已随取消早返回收口释放
+		await flush(80);
+		expect(h.calls.some((c) => c.url === "/api/ingestions")).toBe(false);
+		expect(e.state).toBe("cancelled");       // 与 repro 相同
+	});
+
+	it("#2 身份引导：/api/auth/info 未返回（account=''）时恢复不判他人；身份落定后「继续」能走到 POST 并完成", async () => {
+		const h = setup({ current: "" });
+		const [e] = await h.orch.restore();
+		// 翻转断言（2 条）：repro 断言 restore 后 state==='account_mismatch'
+		//（把自己的记录误判为他人）且 setCurrent('user-A') 后 continue 仍是
+		// account_mismatch、calls 为 0（身份返回后无重新判定）；固定行为：
+		// 未知身份 ≠ 他人——行按原分类停放（upload_queued）且零请求；
+		// 「继续」按当前身份通过归属复核，走到 POST 并完成。
+		expect(e.state).not.toBe("account_mismatch");
+		expect(e.state).toBe("upload_queued");
+		expect(h.calls.length).toBe(0);          // 与 repro 相同（零请求）
+		h.setCurrent("user-A");
+		h.orch.act(e.id, "continue");
+		await until(() => h.calls.some((c) =>
+			c.url === "/api/ingestions" && c.method === "POST"));
+		await until(() => e.state === "done");
+	});
+
+	it("#3 身份为空时恢复，随后身份变为他人（user-B）→ recheckOwnership 重判为 account_mismatch，无 POST；真他人的语义不回退", async () => {
+		const h = setup({ current: "" });
+		const [e] = await h.orch.restore();
+		expect(e.state).not.toBe("account_mismatch");   // 身份未知不判他人
+		expect(h.calls.length).toBe(0);
+		h.setCurrent("user-B");                  // 身份落定：确是他人
+		await h.orch.recheckOwnership();
+		expect(e.state).toBe("account_mismatch");
+		expect(h.calls.some((c) => c.url === "/api/ingestions")).toBe(false);
+		// 复核 #2 语义不回退：真他人的行只给显式改绑与删除本地产物
+		expect(h.kindsOf(e)).toEqual(["rebindAccount", "discard"]);
+	});
+
+	it("#4 身份未知时点「继续」：不判他人也不放行（停车等待）；身份落定重判为本人后自动续到 POST", async () => {
+		const h = setup({ current: "" });
+		const [e] = await h.orch.restore();
+		h.orch.act(e.id, "continue");            // 身份仍未知
+		await flush(30);
+		// runUpload 的归属检查：记录归属 user-A ≠ 未知（''）→ 既不 mismatch
+		// 也不上传——停车在 upload_queued，零请求
+		expect(e.state).toBe("upload_queued");
+		expect(h.calls.length).toBe(0);
+		h.setCurrent("user-A");                  // 身份落定：确是本人
+		await h.orch.recheckOwnership();
+		await until(() => h.calls.some((c) =>
+			c.url === "/api/ingestions" && c.method === "POST"));
+		await until(() => e.state === "done");
 	});
 });
 

@@ -327,6 +327,11 @@
   ///   ui            {row(entry), setStage(entry,key,frac,note,indeterminate),
   ///                  toast(key,vars,kind), buttons(entry), refresh(), remove(entry)}
   ///   account()     当前账号（String(currentUserId) 加空串兜底，设计 §5 A6）
+  ///   identityReady()  身份就绪信号（可省）：Promise，/api/auth/info 落定
+  ///                 （成功/失败/未登录都算）后 resolve。身份未知（空串）
+  ///                 ≠ 他人（独立复核 #3 问题 2）：restore 等它再分类，
+  ///                 runUpload 的归属检查在身份未知时停车等待而非放行。
+  ///                 未注入时按「账号闭包即权威」处理（测试/嵌入面）。
   ///   target()      入队时冻结的目标快照
   ///   onUploaded(entry)  完成回调（app.js 用它做 loadAll/关联/打开）
   ///   onArtifact(entry)  需要「上传产物」时由 app.js 提供（复用 uploadFileCos
@@ -345,6 +350,18 @@
     var locks = deps.locks ||
       (typeof navigator !== "undefined" ? navigator.locks : null);
     var account = typeof deps.account === "function" ? deps.account : function () { return ""; };
+    // 身份就绪信号（独立复核 #3 问题 2）：app.js 注入 /api/auth/info 的落定
+    // Promise。未注入 → 视为「身份已就绪」（账号闭包即权威；restore/runUpload
+    // 对空串身份的保守处理仍然生效——见各检查点）。
+    var identityReady = typeof deps.identityReady === "function"
+      ? function () {
+          return Promise.resolve(deps.identityReady()).catch(function () {
+            // 身份获取失败也放行（页面本就不因 auth/info 失败不可用）；
+            // 空串身份的保守语义由各检查点自行保证。
+            return null;
+          });
+        }
+      : function () { return Promise.resolve(); };
     // 文案格式化（app.js 注入 tt）：模块只持有键与形参，不自己实现 i18n。
     var t = typeof deps.t === "function" ? deps.t : function (k) { return String(k); };
     // 机器枚举（png/webp/…）→ 本地化类型名（app.js 传 magicTypeName）。
@@ -1017,12 +1034,20 @@
           // 归属复核（复核 #2 的上传入口）：记录的归属（进行中的 upload 或
           // pending intent）不是当前账号 → 绝不创建/续传 ingestion，也绝不
           // 改写原记录；行收口为 account_mismatch（只认 rebind/discard）。
-          var other = ownedByOther(job, String(account() || ""));
-          if (other !== null) {
+          // 复核 #3 问题 2：当前身份未知（空串，/api/auth/info 未返回）≠ 他人
+          // ——既不判 mismatch，也**不放行**（那会在未知账号名下新建/续传
+          // ingestion）：停车等 recheckOwnership() 在身份就绪后重判。
+          var cur = String(account() || "");
+          var owner = recordOwner(job);
+          if (owner !== null && owner !== cur) {
+            if (cur === "") {
+              holdForIdentity(e);
+              return Promise.reject({ __identityHold: true });
+            }
             return Promise.reject({
               __account: true,
               owner: (job.intent && job.intent.accountLabel) ||
-                (job.upload && job.upload.accountLabel) || other,
+                (job.upload && job.upload.accountLabel) || owner,
             });
           }
           // 门禁（设计 §5.1）：能力 + 账号 + **最终产物**大小 + viewable_formats
@@ -1069,6 +1094,11 @@
           return completeUpload(e, outcome);
         })
         .then(null, function (err) {
+          // 复核 #3：身份未知停车——行已由 holdForIdentity 收口（upload_queued
+          // + 停放，身份就绪后 recheckOwnership 重判），不走失败路径
+          if (err && err.__identityHold) {
+            return;
+          }
           if (err && err.__account) {
             failAccountMismatch(e, err.owner);
             return;
@@ -1396,11 +1426,18 @@
     function act(id, action) {
       var e = find(id);
       if (!e) return null;
-      // 归属不符的行只认显式改绑 / 删除本地产物：「继续」绝不绕过归属
-      // 复核（那会在当前账号下静默新建 ingestion，复核 #2）。
-      if (e.state === "account_mismatch" &&
-          (action === "continue" || action === "confirmDisk")) {
-        return e;
+      // 归属不符的行：磁盘门确认与归属无关，保持拒绝；「继续」先按**当前**
+      // 身份重判一次（复核 #3 问题 2——身份就绪/切换后 mismatch 可能已过期；
+      // rejudgeMismatch 确属本人才放行，确属他人/身份未知都保持拒绝，复核
+      // #2 的「继续绝不绕过归属复核」语义不回退）。rebind/discard 照旧。
+      if (e.state === "account_mismatch") {
+        if (action === "continue") {
+          rejudgeMismatch(e);
+          return e;
+        }
+        if (action === "confirmDisk") {
+          return e;
+        }
       }
       if (action === "continue") {
         e.parked = false;            // 用户显式继续 → 解除停放，允许入队
@@ -1531,98 +1568,229 @@
     ///   待继续组：prepared/planned/paused/failed，或 ready/exported 且 upload 未收口
     ///   待清理组：其余（含 upload.state==='published'）——也要有行，否则
     ///             「删除本地产物」在刷新后不可达（第四轮 A2）
+    /// 复核 #3 问题 2：注入了 identityReady 时先等身份落定再分类（恢复行的
+    /// 归属判定需要真实账号）；未注入时下方 classifyResumed 对空串身份的
+    /// 保守处理（未知 ≠ 他人 + _identityPending 挂起）兜底。
     function restore() {
       if (!runner || !runner.listJobs) return Promise.resolve([]);
-      return Promise.resolve(runner.listJobs()).then(function (jobs) {
-        var made = [];
-        (jobs || []).forEach(function (job) {
-          var intent = job && job.intent;
-          if (!intent || intent.channel !== "workbench-inline") return;
-          if (resumed[job.id]) return;
-          resumed[job.id] = true;
-          var hasSettledUpload = job.upload && (job.upload.state === "published" ||
-            job.upload.state === "failed" || job.upload.state === "cancelled");
-          var unfinished = job.state === "prepared" || job.state === "planned" ||
-            job.state === "paused" || job.state === "failed" ||
-            ((job.state === "ready" || job.state === "exported") &&
-             !hasSettledUpload);
-          var e = newEntry({
-            id: job.id,
-            name: (job.source && (job.source.folderName || job.source.name)) || job.id,
-            size: (job.source && job.source.size) || 0,
-            jobId: job.id,
-            target: intent.target || null,
-            viaRestore: true,
+      return identityReady().then(function () {
+        return Promise.resolve(runner.listJobs()).then(function (jobs) {
+          var made = [];
+          (jobs || []).forEach(function (job) {
+            var intent = job && job.intent;
+            if (!intent || intent.channel !== "workbench-inline") return;
+            if (resumed[job.id]) return;
+            resumed[job.id] = true;
+            var e = newEntry({
+              id: job.id,
+              name: (job.source && (job.source.folderName || job.source.name)) || job.id,
+              size: (job.source && job.source.size) || 0,
+              jobId: job.id,
+              target: intent.target || null,
+              viaRestore: true,
+            });
+            e.cls = intent.cls || null;
+            e.modality = job.modality || null;
+            e.committedBytes = job.committedBytes || 0;
+            // 行元素必须先建：`ui.setStage` 的实现（app.js 的
+            // inlineRowSetStage）按 entry.id 查行并**提前 return**——先 setStage
+            // 后建行会让恢复行的状态文案永远为空（设计 §6.2 第 3 点要求显示
+            // 「未完成的转换」，这也是「继续」按钮唯一的解释性文案）。
+            if (ui.row) ui.row(e);
+            // 恢复行一律**停放**（parked）：建行但绝不参与调度，直到用户点
+            // 「继续」（设计 §6.2 第 1 点）。否则后续任何 schedule（例如用户又
+            // 拖入一个无关文件）都会把它自动续跑并自动上传，与「不自动开始」
+            // 及 §9.2 第 9 项的正例口径冲突。
+            e.parked = true;
+            classifyResumed(e, job);
+            if (ui.buttons) ui.buttons(e);
+            made.push(e);
           });
-          e.cls = intent.cls || null;
-          e.modality = job.modality || null;
-          e.committedBytes = job.committedBytes || 0;
-          e.hasUpload = !!(job.upload && job.upload.ingestionId);
-          e.uploadState = (job.upload && job.upload.state) || null;
-          // 行元素必须先建：`ui.setStage` 的实现（app.js 的
-          // inlineRowSetStage）按 entry.id 查行并**提前 return**——先 setStage
-          // 后建行会让恢复行的状态文案永远为空（设计 §6.2 第 3 点要求显示
-          // 「未完成的转换」，这也是「继续」按钮唯一的解释性文案）。
-          if (ui.row) ui.row(e);
-          // 恢复行一律**停放**（parked）：建行但绝不参与调度，直到用户点
-          // 「继续」（设计 §6.2 第 1 点）。否则后续任何 schedule（例如用户又
-          // 拖入一个无关文件）都会把它自动续跑并自动上传，与「不自动开始」
-          // 及 §9.2 第 9 项的正例口径冲突。
-          e.parked = true;
-          // 先算「本来的」分类并暂存：归属不符的行在显式改绑后按同一分类
-          // 继续（rebind 不重新listJobs，避免与已有行重复）。
-          if (job.state === "failed") {
-            e.resumeKind = "reselect";
-          } else if (unfinished && (job.state === "ready" || job.state === "exported")) {
-            e.resumeKind = "upload";
-          } else if (unfinished) {
-            e.resumeKind = "convert";
-            e.resumeMode = job.nextAction === "resume" ? "resume" : "start";
-          } else {
-            e.resumeKind = "settled";
-          }
-          // 归属复核（复核 #2 的恢复入口）：换账号后别人的记录绝不给
-          // 「继续」、绝不静默续传或改写——行标为 account_mismatch（注明
-          // 归属账号），只给显式改绑（工具页 chooseAccountAction 同语义）
-          // 或「删除本地产物」。
-          var other = ownedByOther(job, String(account() || ""));
-          if (other !== null) {
-            e.accountOwner = (intent && intent.accountLabel) ||
-              (job.upload && job.upload.accountLabel) || other;
-            e.mode = null;
-            e.state = "account_mismatch";
-            setStage(e, "upload.inline.account.mismatch");
-          } else if (job.state === "failed") {
-            // 非 bundle 的 failed 记录 reusable=false：startJob(null) 必抛
-            // 「缺少输入文件」；bundle 记录虽可复用，但「失败后直接重跑」
-            // 不是用户可预期的动作。两者统一给「重新开始转换（重新选择
-            // 文件）」——与设计 §6.3 的 resume_refused/job_dir_missing 同处置。
-            e.mode = "reselect";
-            e.state = "convert_failed";
-            markError(e, "resume_refused", "job_failed", {});
-            setStage(e, "upload.inline.stage.convertFailed");
-          } else if (unfinished && (job.state === "ready" || job.state === "exported")) {
-            // 产物已就绪 → 用户点「继续」后直接「继续上传」（跳过转换）
-            e.mode = null;
-            e.state = "upload_queued";
-            setStage(e, "upload.inline.stage.resumable");
-          } else if (unfinished) {
-            // 运行器给的 nextAction 决定 resume / start（设计 §6.2 第 3 点）
-            e.mode = job.nextAction === "resume" ? "resume" : "start";
-            e.state = "convert_queued";
-            setStage(e, "upload.inline.stage.resumable",
-                     null, "upload.inline.note.committed", true);
-          } else {
-            e.mode = null;
-            e.state = "done";
-            setStage(e, "upload.inline.stage.settled");
-          }
-          if (ui.buttons) ui.buttons(e);
-          made.push(e);
-        });
+          if (ui.refresh) ui.refresh(null);
+          return made;
+        }, function () { return []; });
+      });
+    }
+
+    /// 恢复行的分类（restore 与 recheckOwnership/rejudgeMismatch 共用）：
+    /// 暂存 resumeKind（归属不符的行在显式改绑后按同一分类继续，rebind 不
+    /// 重新 listJobs，避免与已有行重复），再按归属与记录状态收口。
+    /// 复核 #3 问题 2：当前身份未知（空串）≠ 他人——绝不判 account_mismatch；
+    /// 记录确有归属时行挂 _identityPending，由 recheckOwnership() 在身份
+    /// 就绪后重判（app.js 在 /api/auth/info 返回或账号变化时调用）。
+    function classifyResumed(e, job) {
+      var intent = job && job.intent;
+      var hasSettledUpload = job.upload && (job.upload.state === "published" ||
+        job.upload.state === "failed" || job.upload.state === "cancelled");
+      var unfinished = job.state === "prepared" || job.state === "planned" ||
+        job.state === "paused" || job.state === "failed" ||
+        ((job.state === "ready" || job.state === "exported") &&
+         !hasSettledUpload);
+      e.hasUpload = !!(job.upload && job.upload.ingestionId);
+      e.uploadState = (job.upload && job.upload.state) || null;
+      // 先算「本来的」分类并暂存。
+      if (job.state === "failed") {
+        e.resumeKind = "reselect";
+      } else if (unfinished && (job.state === "ready" || job.state === "exported")) {
+        e.resumeKind = "upload";
+      } else if (unfinished) {
+        e.resumeKind = "convert";
+        e.resumeMode = job.nextAction === "resume" ? "resume" : "start";
+      } else {
+        e.resumeKind = "settled";
+      }
+      // 归属复核（复核 #2 的恢复入口 + 复核 #3 的身份未知口径）：换账号后
+      // 别人的记录绝不给「继续」、绝不静默续传或改写——行标为
+      // account_mismatch（注明归属账号），只给显式改绑（工具页
+      // chooseAccountAction 同语义）或「删除本地产物」。身份未知（空串）
+      // 绝不进这个分支。
+      var cur = String(account() || "");
+      var other = (cur === "") ? null : ownedByOther(job, cur);
+      e._identityPending = false;
+      if (other !== null) {
+        e.accountOwner = (intent && intent.accountLabel) ||
+          (job.upload && job.upload.accountLabel) || other;
+        e.mode = null;
+        e.state = "account_mismatch";
+        setStage(e, "upload.inline.account.mismatch");
+        return e;
+      }
+      if (cur === "" && recordOwner(job) !== null) {
+        e._identityPending = true;
+      }
+      if (job.state === "failed") {
+        // 非 bundle 的 failed 记录 reusable=false：startJob(null) 必抛
+        // 「缺少输入文件」；bundle 记录虽可复用，但「失败后直接重跑」
+        // 不是用户可预期的动作。两者统一给「重新开始转换（重新选择
+        // 文件）」——与设计 §6.3 的 resume_refused/job_dir_missing 同处置。
+        e.mode = "reselect";
+        e.state = "convert_failed";
+        markError(e, "resume_refused", "job_failed", {});
+        setStage(e, "upload.inline.stage.convertFailed");
+      } else if (unfinished && (job.state === "ready" || job.state === "exported")) {
+        // 产物已就绪 → 用户点「继续」后直接「继续上传」（跳过转换）
+        e.mode = null;
+        e.state = "upload_queued";
+        setStage(e, "upload.inline.stage.resumable");
+      } else if (unfinished) {
+        // 运行器给的 nextAction 决定 resume / start（设计 §6.2 第 3 点）
+        e.mode = job.nextAction === "resume" ? "resume" : "start";
+        e.state = "convert_queued";
+        setStage(e, "upload.inline.stage.resumable",
+                 null, "upload.inline.note.committed", true);
+      } else {
+        e.mode = null;
+        e.state = "done";
+        setStage(e, "upload.inline.stage.settled");
+      }
+      return e;
+    }
+
+    /// 复核 #3 问题 2：上传入口的归属等待（身份未知且记录确有归属）。
+    /// 行退出调度与上传槽（锁由 releaseUploadSlot 一并释放）、停放进
+    /// upload_queued；身份就绪后 recheckOwnership() 重判——本人则解除停放
+    /// 继续用户显式的「继续」，他人才收口 account_mismatch。
+    function holdForIdentity(e) {
+      releaseUploadSlot(e);
+      e.parked = true;
+      e._identityHold = true;
+      e.state = "upload_queued";
+      setStage(e, "upload.inline.stage.queued", null, "", true);
+      if (ui.buttons) ui.buttons(e);
+    }
+
+    /// 复核 #3 问题 2：身份就绪/变化后的归属重判入口（app.js 在
+    /// /api/auth/info 返回或账号变化时调用）。三类行：
+    ///   _identityPending   恢复分类时身份未知 → 按当前身份重判
+    ///   _identityHold      上传入口因身份未知停车 → 本人恢复入队 / 他人 mismatch
+    ///   account_mismatch   已判他人的行 → 身份变化后可能已属本人 → 复位重判
+    /// 当前身份仍未知（空串）时整体不动：未知 ≠ 他人，绝不据此新增
+    /// mismatch，也绝不把 mismatch 翻回可继续（守恒，绝不误伤）。
+    function recheckOwnership() {
+      var cur = String(account() || "");
+      if (cur === "") return Promise.resolve([]);
+      var targets = [];
+      for (var i = 0; i < entries.length; i++) {
+        var e = entries[i];
+        if (e && e.jobId && !e.cancelled &&
+            (e._identityPending || e._identityHold ||
+             e.state === "account_mismatch")) {
+          targets.push(e);
+        }
+      }
+      if (!targets.length) return Promise.resolve([]);
+      return Promise.all(targets.map(function (e) {
+        var wasHold = !!e._identityHold;
+        return Promise.resolve(runner.getJob(e.jobId))
+          .catch(function () { return null; })
+          .then(function (job) {
+            // 等待期间被取消 / 记录读不到：保持现状（取消行绝不动；
+            // 停车行仍可被用户「继续」——runUpload 会按新身份再判）
+            e._identityPending = false;
+            e._identityHold = false;
+            if (e.cancelled || !job) return e;
+            var owner = recordOwner(job);
+            if (owner !== null && owner !== cur) {
+              // 确属他人：account_mismatch（只认 rebind/discard，复核 #2
+              // 语义不变；failAccountMismatch 对 cancelled 行是空操作）
+              failAccountMismatch(e,
+                (job.intent && job.intent.accountLabel) ||
+                (job.upload && job.upload.accountLabel) || owner);
+              return e;
+            }
+            if (e.state === "account_mismatch") {
+              // 曾判他人、现在归属本人（或归属证据已消失）：记录本来就
+              // 属于本人，无需任何改绑写——复位为恢复分类（仍停放，等
+              // 用户「继续」）
+              e.accountOwner = null;
+              e.error = null;
+              e.parked = true;
+              classifyResumed(e, job);
+              if (ui.buttons) ui.buttons(e);
+              return e;
+            }
+            if (wasHold) {
+              // 上传入口曾因身份未知停车：本人 → 解除停放，继续用户显式「继续」
+              e.parked = false;
+              schedule();
+            }
+            return e;
+          });
+      })).then(function (rs) {
         if (ui.refresh) ui.refresh(null);
-        return made;
-      }, function () { return []; });
+        return rs;
+      });
+    }
+
+    /// 复核 #3 问题 2：「继续」撞上 account_mismatch 时先按**当前**身份重判
+    /// 一次——身份就绪/切换后 mismatch 可能已过期（那时行还没来得及重判）。
+    /// 确属本人（或归属证据已消失）→ 复位为恢复分类并按 resumeKind 直接
+    /// 继续；确属他人 → 保持拒绝（复核 #2：只认 rebind/discard）。身份未知
+    /// （空串）→ 不放行（等待，与 runUpload 同口径）。
+    function rejudgeMismatch(e) {
+      var cur = String(account() || "");
+      if (cur === "") return Promise.resolve(e);
+      var readJob = (e.jobId && runner.getJob)
+        ? Promise.resolve(runner.getJob(e.jobId)).catch(function () { return null; })
+        : Promise.resolve(null);
+      return readJob.then(function (job) {
+        if (e.cancelled || e.state !== "account_mismatch") return e;
+        if (!job) return e;
+        var owner = recordOwner(job);
+        if (owner !== null && owner !== cur) return e;   // 确属他人：保持拒绝
+        e._identityPending = false;
+        e._identityHold = false;
+        e.accountOwner = null;
+        e.error = null;
+        classifyResumed(e, job);
+        if (ui.buttons) ui.buttons(e);
+        // 用户点的是「继续」：复位后按分类直接继续（rebindAccount 同款；
+        // 只对可继续的分类自动续，failed/settled 保持复位后的行状态）
+        if (e.state === "upload_queued" || e.state === "convert_queued") {
+          act(e.id, "continue");
+        }
+        return e;
+      });
     }
 
     /// 订阅运行器事件（设计 §3.3）：把 runner 的 state / progress / phase
@@ -1676,6 +1844,7 @@
       cancel: cancel,
       discard: discard,
       restore: restore,
+      recheckOwnership: recheckOwnership,
       list: list,
       get: get,
       busy: busy,

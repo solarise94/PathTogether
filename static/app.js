@@ -145,6 +145,9 @@
     "upload.inline.action.saveLocal": { zh: "保存到本机", en: "Save to this machine" },
     "upload.inline.freed": { zh: "释放 {bytes}", en: "frees {bytes}" },
     "upload.inline.needDisk": { zh: "浏览器只报告了 ~{available} 可用，本任务预计需要 ~{need}", en: "The browser reports only ~{available} available; this job needs ~{need}" },
+    "upload.inline.account.mismatch": { zh: "归属另一账号，等待确认", en: "Belongs to another account — awaiting confirmation" },
+    "upload.inline.account.owner": { zh: "此记录由 {owner} 创建，当前登录是另一账号。可确认后改用当前账号继续（原上传仍归 {owner}），或删除本地产物", en: "This record was created by {owner}; you are signed in as a different account. Confirm to continue with the current account (the original upload stays with {owner}), or delete the local artifacts" },
+    "upload.inline.action.rebindAccount": { zh: "改用当前账号继续", en: "Continue with the current account" },
 
     // 升级 C（§6.1）：矩形工具文案（i18n.js 为主源；此处兜底）
     "roi.rect.tip": { zh: "矩形工具：在视野中拖出矩形，或输入宽高后点击中心放置；拖内部平移、边/角调整大小；Escape 取消",
@@ -11218,6 +11221,12 @@
         need: humanSize((entry.diskInfo.need && entry.diskInfo.need.total) || 0),
       });
     }
+    // 归属不符（独立复核 #2）：行注明归属账号与两条出路（显式改绑 /
+    // 删除本地产物），绝不静默续传或新建。
+    if (entry.state === "account_mismatch") {
+      return tt("upload.inline.account.owner",
+        { owner: entry.accountOwner || tt("tools.account.unknown") });
+    }
     if (entry.state === "converting" || entry.state === "uploading" ||
         entry.state === "upload_queued" || entry.state === "convert_queued") {
       return tt("upload.inline.note.keepopen");
@@ -11327,6 +11336,9 @@
     // 只能靠关闭页面终止（设计 §5 的「排队等待」必须有出路）。
     if (st === "upload_queued" && !entry.viaRestore) out.push("cancel");
     if (st === "need_disk_confirm") out.push("confirmDisk", "cancel");
+    // 归属不符（独立复核 #2）：只有显式改绑（工具页 chooseAccountAction
+    // 的 'separate' 同语义）与删除本地产物——绝无「继续」。
+    if (st === "account_mismatch") out.push("rebindAccount", "discard");
     if (st === "converting") out.push("cancel");
     // uploading 态的「取消」**按来源分派**，避免行上出现两个同名按钮：
     //   - 直传条目（无 jobId）：uploadFileCos 自己 addRowButton 挂一个，
@@ -11372,6 +11384,7 @@
     if (kind === "continue") return tt("upload.inline.action.continue");
     if (kind === "continueUpload") return tt("upload.inline.action.continueUpload");
     if (kind === "confirmDisk") return tt("upload.inline.disk.confirm");
+    if (kind === "rebindAccount") return tt("upload.inline.action.rebindAccount");
     if (kind === "cancel") return tt("upload.cos.cancel");
     if (kind === "chooseFolder") return tt("upload.inline.action.chooseFolder");
     if (kind === "reselect") return tt("upload.inline.action.reselect");
@@ -11409,6 +11422,7 @@
     }
     if (kind === "cancel") { inlineOrch.act(entry.id, "cancel"); return; }
     if (kind === "confirmDisk") { inlineOrch.act(entry.id, "confirmDisk"); return; }
+    if (kind === "rebindAccount") { inlineOrch.act(entry.id, "rebind"); return; }
     if (kind === "reselect") {
       // 「重新选择文件」：复用同一个隐藏 file input；选中的文件作为**新条目**
       // 入队（旧条目留在行上供清理，绝不静默替换用户看不到的东西）。
@@ -11495,8 +11509,27 @@
       ? window.HP_INLINE_CONVERT.artifactDeclaration(entry.artifactCls) : null;
     var cfg = resolveCosConfig();
     if (!cfg) return Promise.reject({ data: { code: "cos_unavailable" } });
-    // 续传语义（设计 §6.4）：先读回 record.upload，再决定续传还是新建
+    // 续传语义（设计 §6.4）：先读回 record.upload，再决定续传还是新建。
+    // 归属复核（独立复核 #2 的上传入口）：记录的进行中 upload / pending
+    // intent 属于另一账号时，绝不新建 ingestion（那会把产物入库到新账号
+    // 名下）也绝不改写原记录——直接拒绝；行上的归属处置（显式改绑 /
+    // 删除本地产物）由面板编排器的 account_mismatch 态提供。编排器在
+    // runUpload 入口已查过一次，这里是真正 POST 前的最后一道闸。
+    var me = String(currentUserId || "");
     return inlineRunner.getJob(entry.jobId).then(function (job) {
+      var up = job && job.upload;
+      var it = job && job.intent;
+      var inflight = !!(up && up.ingestionId &&
+        up.state !== "published" && up.state !== "failed" &&
+        up.state !== "cancelled");
+      var owner = null;
+      if (inflight && up.account) owner = String(up.account);
+      else if (!inflight && it && it.state === "pending" && it.account) {
+        owner = String(it.account);
+      }
+      if (owner !== null && owner !== me) {
+        return Promise.reject({ data: { code: "account_mismatch" } });
+      }
       return createEntryUpload(entry, artifact, job, name, declaration, cfg);
     }, function () {
       return createEntryUpload(entry, artifact, null, name, declaration, cfg);

@@ -1070,31 +1070,248 @@ describe("beforeunload 与磁盘门（§6.2 第 7 点 / §6.2.1）", () => {
 		expect(startWithNull).toHaveLength(0);
 	});
 
-	it("磁盘门确认路径带 confirmUncertainDisk:true", async () => {
+	it("磁盘门确认路径带 confirmUncertainDisk:true（真实协议：probe 直接 reject）", async () => {
+		// 真实运行器的 _diskGate 从 probe()/prepareBundle() **reject**（stError：
+		// uncertain/need/available/stage 挂在 error 上，runner.js:688-698），不是
+		// started.done 的 {ok:false}。此前本用例伪造的是 done 协议，盖不住
+		// 「reject 出口被吞成 convert_failed」的真实缺陷（复核 #4）。
+		const probed: Array<Record<string, unknown> | undefined> = [];
 		let n = 0;
 		const h = mkOrch({
 			runner: {
 				probe: (_f: unknown, opts: Record<string, unknown>) => {
 					h.runner.calls.push(["probe", null, opts]);
+					probed.push(opts);
 					n += 1;
+					if (n === 1) {
+						return Promise.reject({
+							error: {
+								code: "disk_precheck_failed",
+								message: "浏览器只报告了 ~50 MiB 可用额度（报告上限），本任务预计需要 ~100 MiB；需用户确认后继续（pre-stage）",
+								need: { total: 100 },
+								available: 50,
+								uncertain: true,
+								stage: "pre-stage",
+							},
+						});
+					}
 					return Promise.resolve({ jobId: "j" + n, probe: { document: { modality: "brightfield" } } });
 				},
 				startJob: (_f: unknown, o: Record<string, unknown>) => Promise.resolve({
 					jobId: o.jobId,
-					done: n === 1
-						? Promise.resolve({ ok: false, error: { code: "disk_precheck_failed" } })
-						: Promise.resolve({ ok: true, result: { output_bytes: 1, format: "ome-bigtiff-subifd-rgb-jpeg-pyramid" } }),
+					done: Promise.resolve({ ok: true, result: { output_bytes: 1, format: "ome-bigtiff-subifd-rgb-jpeg-pyramid" } }),
 				}),
 			},
 		});
 		const kfb = Uint8Array.from([0xF1, 0x01, 0xEE, 0xEE, 0x4B, 0x46, 0x42, 0x00, 0, 0, 0, 0]);
 		const e = h.orch.enqueue(fakeFile("a.kfb", kfb))!;
 		await flush(20);
+		// reject 出口与 done 出口同一收口：need_disk_confirm + 确认 UI 字段保留
+		expect(e.state).toBe("need_disk_confirm");
+		expect(e.error!.code).toBe("disk_precheck_failed");
+		expect((e.diskInfo as { uncertain?: boolean }).uncertain).toBe(true);
+		expect(e.diskInfo).toMatchObject({ need: { total: 100 }, available: 50 });
 		h.orch.act(e.id, "confirmDisk");
 		await flush(30);
+		// 确认后带 confirmUncertainDisk:true 重新 probe（同一 file），跑通全链
 		const confirms = h.runner.calls.filter(
 			(c) => c[0] === "probe" && (c[2] as { confirmUncertainDisk?: boolean })?.confirmUncertainDisk === true);
 		expect(confirms.length).toBeGreaterThanOrEqual(1);
+		expect(probed[0]?.confirmUncertainDisk).toBe(false);
+		expect(probed[1]?.confirmUncertainDisk).toBe(true);
+		expect(e.state).toBe("done");
+		// 运行器在抛错前可能已建并丢弃 job 目录：确认后绝不复用旧 jobId
+		expect(e.jobId).toBe("j2");
+	});
+});
+
+// --------------------------------------------------------------------- //
+// 独立评审复现（run-inline-review-hIbEgV/repro-inline.mjs；场景与夹具
+// 原样移植，只把「演示缺陷已发生」的断言翻转为固定行为——原样保留会
+// 变成「修前绿、修后红」，与回归测试的目的相反）。三项：
+//   #2 换账号后静默把他人产物入库（app.js uploadEntryArtifact / 恢复入口）
+//   #3 artifactView 挂起期间取消仍新建 ingestion（inline-convert.js 边界）
+//   #4 真运行器磁盘门从 probe reject，到不了确认流（协议修正）
+// --------------------------------------------------------------------- //
+describe("独立评审复现：账号归属 / 取消边界 / 磁盘门 reject（repro-inline.mjs）", () => {
+	const fmt = "ome-bigtiff-subifd-rgb-jpeg-pyramid";
+	// 与 repro 相同的产物夹具（classic TIFF 头，bytes 原样）
+	const artifactBytes = Uint8Array.from([73, 73, 43, 0, 8, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0]);
+	async function until(f: () => boolean) {
+		for (let i = 0; i < 300; i++) {
+			if (f()) return;
+			await flush(1);
+		}
+		throw new Error("condition timed out");
+	}
+	/// repro 的 classic script 加载面：inline-convert + slide-sniff + cos-uploader
+	function loadClassic() {
+		const w: W = {};
+		for (const name of ["inline-convert", "slide-sniff", "cos-uploader"]) {
+			new Function("window",
+				readFileSync(resolve(root, "static/upload/" + name + ".js"), "utf8"))(w);
+		}
+		return w;
+	}
+	function kindsFn(w: W) {
+		const buttonFn = appSrc.slice(
+			appSrc.indexOf("  function inlineButtonKinds("),
+			appSrc.indexOf("  function inlineButtonLabel("));
+		return new Function("window", buttonFn + ";return inlineButtonKinds;")(w) as
+			(e: Entry) => string[];
+	}
+	/// repro 的 scenario 夹具：假 runner（可推迟 artifactView）+ 假 api +
+	/// app.js 的真 uploadEntryArtifact 切片
+	function scenario(opts: { deferArtifact?: boolean; owner?: string; current?: string } = {}) {
+		const deferArtifact = opts.deferArtifact ?? false;
+		const owner = opts.owner ?? "user-A";
+		const current = opts.current ?? "user-A";
+		const w = loadClassic();
+		const calls: Array<{ url: string; method: string; account: string }> = [];
+		let fileResolve: ((f: unknown) => void) | null = null;
+		let artifactRequested = false;
+		const artifact = fakeFile("patient.ome.tif", artifactBytes);
+		const job: {
+			id: string; state: string; source: unknown; result: unknown;
+			upload?: Record<string, unknown>; intent: Record<string, unknown>;
+		} = {
+			id: "job-patient", state: "ready",
+			source: { name: "patient.kfb", size: 100 },
+			intent: { channel: "workbench-inline", state: "pending",
+				account: owner, target: { pid: "original-project" } },
+			result: { outputBytes: artifact.size, format: fmt },
+		};
+		const runner = {
+			listJobs: async () => [job],
+			getJob: async () => job,
+			setJobUpload: async (_id: string, patch: Record<string, unknown>) => {
+				job.upload = { ...(job.upload || {}), ...patch };
+			},
+			setJobIntent: async (_id: string, patch: Record<string, unknown>) => {
+				job.intent = { ...job.intent, ...patch };
+			},
+			artifactView: () => {
+				artifactRequested = true;
+				return deferArtifact
+					? new Promise((r) => { fileResolve = r as (f: unknown) => void; })
+					: Promise.resolve(artifact);
+			},
+		};
+		const api = async (url: string, init: { method?: string } = {}) => {
+			calls.push({ url, method: init.method || "GET", account: current });
+			return { ok: true, status: 200, json: async () => url === "/api/ingestions"
+				? { job_id: "inj-new", stage: "preparing" }
+				: { stage: "viewable", slide_id: "sld-new" } };
+		};
+		// app.js 的真 uploadEntryArtifact 切片（同 repro；t/humanSize 只是
+		// 进度事件的渲染依赖，注入桩避免未定义引用）
+		const artifactCode = appSrc.slice(
+			appSrc.indexOf("  function uploadEntryArtifact("),
+			appSrc.indexOf("  /// 完成收口（§3.5）"));
+		const actualOnArtifact = new Function(
+			"window", "inlineRunner", "currentUserId", "resolveCosConfig",
+			"apiFetch", "apiFetchNoRedirect", "inlineRowSetStage", "t", "humanSize",
+			artifactCode + ";return uploadEntryArtifact;")(
+			w, runner, current, () => ({ max_size_bytes: 1000000 }), api, api,
+			() => {}, (k: string) => k, (n: number) => String(n)) as
+			(e: Entry, a: unknown) => Promise<unknown>;
+		const orch = (w.HP_INLINE_CONVERT as {
+			createOrchestrator: (d: Record<string, unknown>) => Orch;
+		}).createOrchestrator({
+			runner,
+			engine: { outputFileName: () => artifact.name },
+			sniff: w.HP_SLIDE_SNIFF,
+			cos: w.HP_COS_UPLOAD,
+			caps: { inlineConvert: { viewableFormats: [fmt] },
+				cosConfig: { max_size_bytes: 1000000 } },
+			account: () => current,
+			apiFetch: api,
+			onArtifact: actualOnArtifact,
+			ui: {},
+		});
+		return { orch, calls, job,
+			requested: () => artifactRequested,
+			resolveArtifact: () => fileResolve!(artifact),
+			kindsOf: (e: Entry) => kindsFn(w)(e) };
+	}
+
+	it("#2 换账号：他人待传记录恢复后不给「继续」、绝不静默入库；显式改绑后才继续", async () => {
+		const h = scenario({ owner: "original-user", current: "different-user" });
+		const [e] = await h.orch.restore();
+		h.orch.act(e.id, "continue");
+		await flush(40);
+		// 行标为他人归属；原记录原封不动；零 /api/ 调用（repro 演示的是
+		// 「POST 已发生且账号是 different-user」，这里断言其反面）
+		expect(e.state).toBe("account_mismatch");
+		expect(h.job.upload).toBeUndefined();
+		expect(h.calls.some((c) => c.url === "/api/ingestions")).toBe(false);
+		// 行上只有显式改绑与删除本地产物——没有「继续」
+		expect(h.kindsOf(e)).toEqual(["rebindAccount", "discard"]);
+		// 「继续」被守卫，不解锁、仍零调用
+		h.orch.act(e.id, "continue");
+		await flush(20);
+		expect(e.state).toBe("account_mismatch");
+		expect(h.calls.some((c) => c.url === "/api/ingestions")).toBe(false);
+		// 显式确认（工具页 chooseAccountAction 'separate' 同语义）：intent 改绑
+		// 到当前账号并盖 reconfirmedAt，然后才创建 ingestion（归属=当前账号）
+		h.orch.act(e.id, "rebind");
+		await until(() => e.state === "done");
+		expect(h.job.intent.account).toBe("different-user");
+		expect(h.job.intent.reconfirmedAt).toBeTruthy();
+		expect(h.calls.some((c) => c.url === "/api/ingestions" && c.method === "POST")).toBe(true);
+	});
+
+	it("#3 取消：artifactView 挂起期间取消，稍后回调绝不新建 ingestion，行保持已取消", async () => {
+		const h = scenario({ deferArtifact: true });
+		const [e] = await h.orch.restore();
+		h.orch.act(e.id, "continue");
+		await until(h.requested);
+		h.orch.cancel(e);
+		expect(e.state).toBe("cancelled");     // 与 repro 相同
+		expect(h.calls.length).toBe(0);        // 与 repro 相同
+		h.resolveArtifact();
+		// repro 在这里等 POST 发生（演示缺陷）；固定行为是绝不 POST，且
+		// 上传槽已释放（后续条目可再入队——释放正确性由锁用例覆盖）
+		await flush(80);
+		expect(h.calls.some((c) => c.url === "/api/ingestions")).toBe(false);
+		expect(e.state).toBe("cancelled");     // 与 repro 相同
+	});
+
+	it("#4 真 runner 磁盘门（uncertain estimate）从 probe reject → need_disk_confirm（非 convert_failed）+ 确认按钮", async () => {
+		const w = loadClassic();
+		const stub = {
+			storage: { estimate: async () => ({}) },
+			locks: { request: (_n: string, _o: unknown, cb: (l: unknown) => unknown) =>
+				Promise.resolve(cb({ name: "test-lock" })) },
+		};
+		try {
+			Object.defineProperty(globalThis, "navigator", { configurable: true, value: stub });
+		} catch {
+			Object.assign((globalThis as { navigator: object }).navigator, stub);
+		}
+		const engine = await import("../../static/tools/slide-transform/engine.js");
+		const { SlideToolsRunner } = await import("../../static/tools/slide-transform/runner.js");
+		const runner = new SlideToolsRunner({ spawnWorker: false });
+		const file = fakeFile("small.kfb",
+			Uint8Array.from([241, 1, 238, 238, 75, 70, 66, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+		const orch = (w.HP_INLINE_CONVERT as {
+			createOrchestrator: (d: Record<string, unknown>) => Orch;
+		}).createOrchestrator({
+			runner, engine, sniff: w.HP_SLIDE_SNIFF,
+			caps: { cosConfig: { max_size_bytes: 1000000, formats: ["kfb", "tif"] },
+				inlineConvert: { viewableFormats: [fmt] } },
+			ui: {},
+		});
+		const e = orch.enqueue(file)!;
+		// repro 等的是 convert_failed || need_disk_confirm 且断言 convert_failed；
+		// 固定行为：reject 出口直达 need_disk_confirm
+		await until(() => e.state === "need_disk_confirm");
+		expect(e.error!.code).toBe("disk_precheck_failed");   // 与 repro 相同
+		expect(e.state).toBe("need_disk_confirm");
+		expect((e.diskInfo as { uncertain?: boolean }).uncertain).toBe(true);
+		const kinds = kindsFn(w)(e);
+		expect(kinds).toContain("confirmDisk");               // repro 断言的是不含
+		expect(kinds).toContain("cancel");
 	});
 });
 
@@ -1186,6 +1403,8 @@ describe("i18n（§8 / §9.2 第 14、22 项）", () => {
 			"upload.inline.action.discard", "upload.inline.action.discard.published",
 			"upload.inline.action.requestSupport", "upload.inline.action.saveLocal",
 			"upload.inline.freed", "upload.inline.needDisk",
+			"upload.inline.account.mismatch", "upload.inline.account.owner",
+			"upload.inline.action.rebindAccount",
 		];
 		for (const k of keys) {
 			for (const lang of ["zh", "en"] as const) {

@@ -777,6 +777,25 @@
       return undefined;   // 未知（新文件）：交给运行器按探测结果决定
     }
 
+    /// 磁盘门未过的**唯一**收口（§6.2.1）。两条失败出口——started.done 的
+    /// {ok:false, error:…} 与 probe()/prepareBundle() 的 **reject**（真实运行器
+    /// 的 _diskGate 同步抛 stError，uncertain/need/available 挂在 error 上）——
+    /// 走同一分支：need_disk_confirm + 字段原样保留给确认 UI（行附注的
+    /// need/available 数字）。此前 reject 出口被 failConvert 吞成
+    /// convert_failed，真实磁盘预检失败永远到不了确认流。
+    function enterNeedDiskConfirm(e, info) {
+      info = info || {};
+      e.state = "need_disk_confirm";
+      e._confirmDisk = false;
+      e.diskInfo = info;
+      markError(e, "disk_precheck_failed", info.detail || null,
+        { engineReason: info.message || null });
+      setStage(e, "upload.inline.stage.disk");
+      if (ui.buttons) ui.buttons(e);
+      if (ui.refresh) ui.refresh(e);
+      schedule();
+    }
+
     function onConverted(e, result) {
       releaseConvertSlot(e);
       if (e.cancelled) return;   // 用户已取消：迟到回执不改状态
@@ -791,14 +810,7 @@
         var info = (result && result.error) || {};
         var code = info.code || "io_recoverable";
         if (code === "disk_precheck_failed") {
-          e.state = "need_disk_confirm";
-          e._confirmDisk = false;
-          e.diskInfo = info;
-          markError(e, code, info.detail || null, {});
-          setStage(e, "upload.inline.stage.disk");
-          if (ui.buttons) ui.buttons(e);
-          if (ui.refresh) ui.refresh(e);
-          schedule();
+          enterNeedDiskConfirm(e, info);
           return;
         }
         return failConvert(e, result);
@@ -817,6 +829,9 @@
 
     function failConvert(e, err) {
       releaseConvertSlot(e);
+      // 用户已取消：迟到的失败回执不改状态（与 onConverted 的取消早返回
+      // 同款——否则 cancel 会被静默翻回 convert_failed，同类边界缺陷）。
+      if (e.cancelled) return;
       var code = (err && (err.error ? err.error.code : err.code)) || "io_recoverable";
       var detail = (err && (err.error ? err.error.detail : err.detail)) || null;
       var reason = (err && (err.error ? err.error.message : err.message)) || null;
@@ -824,17 +839,20 @@
         var c2 = engine.errCode(err);
         if (c2) code = c2;
       }
+      // 真实运行器的磁盘门从 probe()/prepareBundle() reject（stError）：
+      // 与 started.done 的错误同一收口（enterNeedDiskConfirm），绝不落
+      // convert_failed（那样确认按钮不可达）。
+      if (code === "disk_precheck_failed") {
+        enterNeedDiskConfirm(e, (err && err.error) || {});
+        return;
+      }
       markError(e, code, detail, { engineReason: reason });
-      e.state = isTerminalCode(code) ? "convert_failed" : "convert_failed";
+      e.state = "convert_failed";
       setStage(e, "upload.inline.stage.convertFailed");
       toast("upload.fail", { e: failureStageKey(code, detail)
         ? msgKey(failureStageKey(code, detail)) : code }, "error");
       if (ui.buttons) ui.buttons(e);
       settle(e, "convert_failed");
-    }
-
-    function isTerminalCode(code) {
-      return code !== "disk_precheck_failed";
     }
 
     /// 释放槽位（带身份守卫）：只在当前槽位仍属于该条目时才清空。
@@ -942,6 +960,13 @@
           // navigator.locks 不可用：照常执行（退化语义，绝不阻塞）
           return runUpload(e).then(null, function () { /* failUpload 已收口 */ });
         }
+        // 取消边界（§5 复核修复）：等锁期间被取消 → 释放**刚拿到**的锁并
+        // 收口，绝不进入 runUpload（否则取消后的行仍会新建 ingestion）。
+        if (e.cancelled) {
+          locks.release();
+          releaseUploadSlot(e);
+          return;
+        }
         e.waitRetries = 0;
         e._releaseLocks = locks.release;
         return runUpload(e).then(function () {
@@ -971,6 +996,8 @@
           failUpload(e, { data: { code: "cos_unavailable" } });
           return Promise.resolve();
         }
+        // 取消边界：直传条目进入引擎（= 新建 ingestion）前复查
+        if (e.cancelled) { releaseUploadSlot(e); return Promise.resolve(); }
         return Promise.resolve(deps.onArtifact(e, null)).then(function (outcome) {
           return completeUpload(e, outcome);
         }, function (err) {
@@ -985,6 +1012,19 @@
         })
         .then(function (j) {
           job = j;
+          // 取消边界：读回记录期间被取消 → 不再取产物
+          if (e.cancelled) return null;
+          // 归属复核（复核 #2 的上传入口）：记录的归属（进行中的 upload 或
+          // pending intent）不是当前账号 → 绝不创建/续传 ingestion，也绝不
+          // 改写原记录；行收口为 account_mismatch（只认 rebind/discard）。
+          var other = ownedByOther(job, String(account() || ""));
+          if (other !== null) {
+            return Promise.reject({
+              __account: true,
+              owner: (job.intent && job.intent.accountLabel) ||
+                (job.upload && job.upload.accountLabel) || other,
+            });
+          }
           // 门禁（设计 §5.1）：能力 + 账号 + **最终产物**大小 + viewable_formats
           var gate = entryArtifactGate(e, job);
           if (!gate.ok) {
@@ -998,6 +1038,9 @@
           return runner.artifactView(e.jobId);
         })
         .then(function (file) {
+          // 取消边界：artifactView 是慢操作（OPFS 大产物视图）；取消后绝不
+          // 继续（file 为 null 只会来自上一步的取消短路）
+          if (e.cancelled) return null;
           artifact = file;
           e.artifactSize = file.size;
           e.artifactName = engine && engine.outputFileName
@@ -1011,6 +1054,11 @@
           }, function () { e.artifactCls = null; return null; });
         })
         .then(function () {
+          // 取消边界（复核修复的关键一处）：产物嗅探期间被取消 → 绝不进入
+          // onArtifact / uploadArtifact（那会 POST /api/ingestions 新建入库，
+          // 行却已是「已取消」）；null 交给 completeUpload 的取消早返回收口
+          // （槽位与产物锁在那一并释放）。
+          if (e.cancelled) return null;
           if (typeof deps.onArtifact === "function") {
             // app.js 提供上传实现（复用 uploadFileCos 的直传语义与记录适配）
             return deps.onArtifact(e, artifact);
@@ -1021,6 +1069,10 @@
           return completeUpload(e, outcome);
         })
         .then(null, function (err) {
+          if (err && err.__account) {
+            failAccountMismatch(e, err.owner);
+            return;
+          }
           if (err && err.__gate) {
             markError(e, err.code, null, {});
             setStage(e, err.stageKey);
@@ -1031,6 +1083,101 @@
           }
           failUpload(e, err);
         });
+    }
+
+    /// 归属不符的行收口（复核 #2）：停在 account_mismatch（行注明归属
+    /// 账号），只给「改绑当前账号（显式确认，rebind）」与「删除本地产物」
+    /// （discard）；原记录一律不改写，绝不静默新建 ingestion。
+    function failAccountMismatch(e, owner) {
+      releaseUploadSlot(e);
+      if (e.cancelled) return;
+      e.accountOwner = owner || null;
+      e.mode = null;
+      e.state = "account_mismatch";
+      markError(e, "account_mismatch", null, {});
+      setStage(e, "upload.inline.account.mismatch");
+      if (ui.buttons) ui.buttons(e);
+      settle(e, "account_mismatch");
+    }
+
+    /// 显式确认后的改绑（复核 #2；工具页 chooseAccountAction 的 'separate'
+    /// 同语义，tools-slides-upload.js:734-767）：**只有用户点确认才到这里**。
+    /// 进行中的旧 ingestion 原样记入 superseded（归属不变，由原账号取消或
+    /// 服务端到期清理），本地上传记录改绑当前账号（ingestionId 清空 → 之后
+    /// 的新建是当前账号的新 ingestion）；pending intent 一并重绑。失败时行
+    /// 停在 account_mismatch（不半改绑——记录写失败就不能继续）。
+    function rebindAccount(e) {
+      var cur = String(account() || "");
+      var readJob = (e.jobId && runner.getJob)
+        ? Promise.resolve(runner.getJob(e.jobId)).catch(function () { return null; })
+        : Promise.resolve(null);
+      return readJob.then(function (job) {
+        var up = job && job.upload;
+        var it = job && job.intent;
+        var writes = [];
+        if (up && up.ingestionId && up.state !== "published" &&
+            up.state !== "failed" && up.state !== "cancelled") {
+          var superseded = (up.superseded || []).concat([{
+            ingestionId: up.ingestionId,
+            account: typeof up.account === "string" ? up.account : "",
+            accountLabel: up.accountLabel || "",
+            state: "open",
+            supersededAt: new Date().toISOString(),
+          }]);
+          writes.push(runner.setJobUpload(e.jobId, {
+            ingestionId: null, state: null, confirmedParts: [],
+            slideId: null, error: null, account: cur,
+            superseded: superseded,
+          }));
+        }
+        if (it && it.state === "pending" && runner.setJobIntent) {
+          writes.push(runner.setJobIntent(e.jobId, {
+            state: "pending", account: cur,
+            accountLabel: "", target: it.target || e.target || null,
+            channel: "workbench-inline",
+            reconfirmedAt: new Date().toISOString(),
+          }));
+        }
+        if (!writes.length) return null;
+        return Promise.all(writes);
+      }).then(function () {
+        e.accountOwner = null;
+        e.hasUpload = false;
+        e.uploadState = null;
+        e.error = null;
+        e.parked = false;
+        // 与刷新恢复同一分类（restore 暂存的 resumeKind/resumeMode）：
+        // 改绑即用户对「继续」的显式确认，就绪行直接进上传队列。
+        if (e.resumeKind === "upload") {
+          e.mode = null;
+          e.state = "upload_queued";
+          setStage(e, "upload.inline.stage.queued");
+          if (ui.buttons) ui.buttons(e);
+          schedule();
+        } else if (e.resumeKind === "convert") {
+          e.mode = e.resumeMode || "start";
+          e.state = "convert_queued";
+          setStage(e, "upload.inline.stage.queued");
+          if (ui.buttons) ui.buttons(e);
+          schedule();
+        } else if (e.resumeKind === "reselect") {
+          e.mode = "reselect";
+          e.state = "convert_failed";
+          markError(e, "resume_refused", "job_failed", {});
+          setStage(e, "upload.inline.stage.convertFailed");
+          if (ui.buttons) ui.buttons(e);
+          settle(e, "convert_failed");
+        } else {
+          e.mode = null;
+          e.state = "done";
+          setStage(e, "upload.inline.stage.settled");
+          if (ui.buttons) ui.buttons(e);
+        }
+        return e;
+      }, function () {
+        // 改绑写失败：停在原状（account_mismatch），下次可再确认
+        return e;
+      });
     }
 
     /// 成功/取消收口（转换产物与直传共用）。
@@ -1244,10 +1391,17 @@
 
     // ------------------------------------------------------ 动作（§6.3） --
 
-    /// 用户动作：continue（继续转换 / 继续上传）、confirmDisk、cancel、discard
+    /// 用户动作：continue（继续转换 / 继续上传）、confirmDisk、cancel、
+    /// discard、rebind（归属不符行的显式改绑确认）
     function act(id, action) {
       var e = find(id);
       if (!e) return null;
+      // 归属不符的行只认显式改绑 / 删除本地产物：「继续」绝不绕过归属
+      // 复核（那会在当前账号下静默新建 ingestion，复核 #2）。
+      if (e.state === "account_mismatch" &&
+          (action === "continue" || action === "confirmDisk")) {
+        return e;
+      }
       if (action === "continue") {
         e.parked = false;            // 用户显式继续 → 解除停放，允许入队
         if (e.state === "upload_queued" || e.state === "upload_failed") {
@@ -1284,6 +1438,10 @@
         setStage(e, "upload.inline.stage.queued");
         if (ui.buttons) ui.buttons(e);
         schedule();
+        return e;
+      }
+      if (action === "rebind") {
+        rebindAccount(e);
         return e;
       }
       if (action === "cancel") {
@@ -1345,6 +1503,30 @@
 
     // ------------------------------------------------- 刷新恢复（§6.2） --
 
+    /// 记录归属（复核 #2；与工具页 tools-slides-upload.js:711-724 同语义）：
+    /// 进行中的上传属于创建它的账号（服务端 ingestion 的归属与容量记账都在
+    /// 那个账号上），未收口的自动上传意图同样绑定授权账号。返回归属账号，
+    /// 无归属证据（升级窗口旧行）→ null——绝不据空值误判。
+    function recordOwner(job) {
+      var up = job && job.upload;
+      var it = job && job.intent;
+      var inflight = !!(up && up.ingestionId &&
+        up.state !== "published" && up.state !== "failed" &&
+        up.state !== "cancelled");
+      if (inflight && up.account) return String(up.account);
+      if (!inflight && it && it.state === "pending" && it.account) {
+        return String(it.account);
+      }
+      return null;
+    }
+
+    /// 是否归属他人（owner !== null 且与当前账号不同；空串当前账号与
+    /// 工具页同口径：owner 非空即不符）。
+    function ownedByOther(job, cur) {
+      var owner = recordOwner(job);
+      return (owner !== null && owner !== cur) ? owner : null;
+    }
+
     /// 只**列出**，绝不自动开始（设计 §6.2 第 1 点）。分两组渲染：
     ///   待继续组：prepared/planned/paused/failed，或 ready/exported 且 upload 未收口
     ///   待清理组：其余（含 upload.state==='published'）——也要有行，否则
@@ -1387,7 +1569,30 @@
           // 拖入一个无关文件）都会把它自动续跑并自动上传，与「不自动开始」
           // 及 §9.2 第 9 项的正例口径冲突。
           e.parked = true;
+          // 先算「本来的」分类并暂存：归属不符的行在显式改绑后按同一分类
+          // 继续（rebind 不重新listJobs，避免与已有行重复）。
           if (job.state === "failed") {
+            e.resumeKind = "reselect";
+          } else if (unfinished && (job.state === "ready" || job.state === "exported")) {
+            e.resumeKind = "upload";
+          } else if (unfinished) {
+            e.resumeKind = "convert";
+            e.resumeMode = job.nextAction === "resume" ? "resume" : "start";
+          } else {
+            e.resumeKind = "settled";
+          }
+          // 归属复核（复核 #2 的恢复入口）：换账号后别人的记录绝不给
+          // 「继续」、绝不静默续传或改写——行标为 account_mismatch（注明
+          // 归属账号），只给显式改绑（工具页 chooseAccountAction 同语义）
+          // 或「删除本地产物」。
+          var other = ownedByOther(job, String(account() || ""));
+          if (other !== null) {
+            e.accountOwner = (intent && intent.accountLabel) ||
+              (job.upload && job.upload.accountLabel) || other;
+            e.mode = null;
+            e.state = "account_mismatch";
+            setStage(e, "upload.inline.account.mismatch");
+          } else if (job.state === "failed") {
             // 非 bundle 的 failed 记录 reusable=false：startJob(null) 必抛
             // 「缺少输入文件」；bundle 记录虽可复用，但「失败后直接重跑」
             // 不是用户可预期的动作。两者统一给「重新开始转换（重新选择

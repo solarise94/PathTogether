@@ -369,7 +369,9 @@ def sweep_client_idle_uploads(cos=None):
         upload_id = job.get("upload_id") or ""
         if not key or not upload_id:
             # 从未发起远端会话：无任何远端活性证据可查 → 直接终止。
-            if ist.terminate_client_idle_job(jid) is not None:
+            # idle_seconds 同阈值透传：store 在锁内重验失活条件（0084 复核
+            # 修复）——选行到终止之间的心跳不因跳过 ListParts 而被绕过。
+            if ist.terminate_client_idle_job(jid, idle_seconds=idle) is not None:
                 terminated.append(jid)
                 _log.info("失活终止（无远端会话，job=%s）", jid)
             continue
@@ -390,7 +392,9 @@ def sweep_client_idle_uploads(cos=None):
             _log.info("失活复核判定在场（job=%s parts=%d）——刷新在场时刻",
                       jid, len(parts))
             continue
-        if ist.terminate_client_idle_job(jid) is not None:
+        # 锁内重验失活（0084 复核修复）：ListParts 等待期间落库的心跳使行
+        # 不再失活 → terminate 幂等返回 None（未终止），不把它计入 terminated。
+        if ist.terminate_client_idle_job(jid, idle_seconds=idle) is not None:
             terminated.append(jid)
             _log.info("失活终止（job=%s parts=%d idle>%ds）",
                       jid, len(parts), idle)

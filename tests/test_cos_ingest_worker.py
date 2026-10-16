@@ -1254,3 +1254,25 @@ def test_scheduler_tick_no_idle_jobs_makes_no_cos_calls():
             raise AssertionError("无失活候选时不应触碰 COS：%s" % name)
     assert ciw.scheduler_tick(cos=_ExplodingCos(), state=st, force=True) \
         is True
+
+
+# 独立评审复现用例（run-inline-review-hIbEgV/test_idle_race.py，断言原样
+# 移植——只随本模块的既有夹具运行）：ListParts 等待期间落库的心跳必须
+# 阻止失活终止（terminate_client_idle_job 锁内重验失活条件）。
+
+def test_review_heartbeat_during_listparts_must_prevent_idle_cancel(monkeypatch):
+    monkeypatch.setattr(cos_config, "COS_UPLOADING_CLIENT_IDLE_SECONDS", 1800)
+    fake, state = FakeCos(), {}
+    job = _idle_uploading(fake, state)
+    jid = job["job_id"]
+    original_list_parts = fake.list_parts
+    def heartbeat_then_respond(key, upload_id):
+        # COS request is pending while the owner wakes the tab / signs new parts.
+        assert ist.touch_client_seen(jid, throttle_seconds=0)
+        assert ist.get_job(jid)["client_seen_at"] > job["client_seen_at"]
+        return original_list_parts(key, upload_id)
+    fake.list_parts = heartbeat_then_respond
+    terminated = ciw.sweep_client_idle_uploads(fake)
+    current = ist.get_job(jid)
+    assert terminated == [], (terminated, current["state"], current["fail_code"])
+    assert current["state"] == ist.UPLOADING

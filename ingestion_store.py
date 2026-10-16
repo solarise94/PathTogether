@@ -1550,7 +1550,7 @@ def list_idle_uploading_jobs(idle_seconds, *, limit=20):
         conn.close()
 
 
-def terminate_client_idle_job(job_id):
+def terminate_client_idle_job(job_id, *, idle_seconds=None):
     """失活上传任务的终止短事务 + 本地清理编排（cancel 同款收口路径）。
 
     uploading → cancelled（fail_code=client_idle_timeout）：同事务置远端/
@@ -1558,7 +1558,17 @@ def terminate_client_idle_job(job_id):
     finalize 释放池预约）、staging 资产行 CAS → failed；事务提交后执行
     本地暂存清理（确认后释放本地预约，R12 §3.2 与取消同序）。非
     uploading（并发终态/推进先赢）幂等返回 None。
+
+    锁内**重验失活条件**（0084 复核修复）：sweep 选行到本函数之间隔着
+    ListParts 网络等待，owner 心跳（touch_client_seen）可能恰在等待中落库
+    ——只检查 state 会把「复核期间回到现场」的客户端误杀（TOCTOU）。
+    ``idle_seconds`` 与 sweep 选行同一阈值（缺省读
+    COS_UPLOADING_CLIENT_IDLE_SECONDS）；锁内重读 ``client_seen_at`` 仍静默
+    超阈值才终止，否则什么都不做并返回 None（= 未终止；NULL 与
+    list_idle_uploading_jobs 同口径——无在场证据绝不按失活终止）。
     """
+    idle = (int(cos_config.COS_UPLOADING_CLIENT_IDLE_SECONDS)
+            if idle_seconds is None else max(0, int(idle_seconds)))
     conn = _connect()
     out = None
     try:
@@ -1567,6 +1577,14 @@ def terminate_client_idle_job(job_id):
                 job = get_job_locked(cur, job_id)
                 if job is None or job["state"] != UPLOADING:
                     return None
+                if idle > 0:
+                    cur.execute(
+                        "SELECT (client_seen_at IS NOT NULL AND "
+                        "client_seen_at <= now() - make_interval(secs => %s)) "
+                        "AS idle FROM ingestion_jobs WHERE job_id=%s",
+                        (idle, job_id))
+                    if not cur.fetchone()["idle"]:
+                        return None
                 local_pending = _needs_local_cleanup(job)
                 _abandon_staging_asset(cur, job)
                 cur.execute(

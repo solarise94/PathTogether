@@ -1535,3 +1535,33 @@ export TEST_RUN_DIR=/mnt/ssd2/tests/run-inline-convert-Mwpad1 \
 | D2 | 「未完成的转换」文案**恒为空**：恢复行只显示一个孤立的「继续」按钮 | `restore()` 先 `setStage` 后 `ui.row`，而 app.js 的 `inlineRowSetStage` 按 `entry.id` 查行、查不到即 **提前 return** | `restore()` 把 `ui.row(e)` 提到状态分支之前（`static/upload/inline-convert.js`），并加「顺序」断言 |
 | D3 | 终态行出现**两个**「删除本地产物」按钮 | `done` 既属 `isTerminal` 集合（`inline-convert.js:211 TERMINAL_STATES` 含 `done`）又被单列一条 `st === 'done'` 分支 | 删掉单列的 `done` 分支（`static/app.js`），终态统一由 `isTerminal` 给一次；已发布文案区分不受影响 |
 | D4 | 点「申请支持该格式」后**看不到任何回执**（提交成功但无编号可读） | `openSupportForEntry` 只写抽屉里的 `#fr-result`，而 `#import-drawer` 默认 `hidden`，行内按钮却是本设计的主入口 | 回执同时落到**该行**（`entry.supportRequestId` + `inlineRowNoteText` 渲染「申请已登记，等待评估（编号 …）· 已登记」）并补一条 toast（`static/app.js`）；抽屉侧既有语义保留 |
+
+### 13.6 独立审查确认的缺陷（复核修复，各带一条会红的回归）
+
+第三方独立审查在 `6f306933` 上确认了 34 条发现。去重后的**根因**与处置如下；
+每条都在 `tests/js/inline-convert.test.ts` 补了回归，且都做过**反事实核对**
+（把修复回退即红、恢复即绿，实测命令见提交信息）。
+
+| 根因 | 影响 | 处置 |
+| --- | --- | --- |
+| `completeUpload` 不清 `activeUpload` | 一次上传成功后 `pump` 的 `if (!activeUpload)` 永不放行 → 同页后续条目永久停在「排队中…」，`busy().uploading` 恒 true，且 `upload_queued` 在 `WARN_STATES` 里 → beforeunload 永久提示 | 抽出 `releaseUploadSlot(entry)`（带身份守卫）在成功/取消/失败三条路统一释放；实测 3 条条目全部 done |
+| 产物门禁失败走 `{__handled:true}` reject | 被 catch 吞掉 → 既不释放上传槽也不释放两把锁；而设计 §5.1 把「停在 convert_failed」列为**常见结局** | 改为经 `failUpload` 收口（`__skipStage` 保留门禁自己的文案） |
+| 槽位释放无身份守卫 | 取消后迟到的转换回执会清掉**新**条目的槽 → 两个转换并发（运行器 heavy lock 因 `if (this._lock) return true` 短路，挡不住同实例） | `releaseConvertSlot` / `releaseUploadSlot` 均带 `=== e` 守卫 |
+| 直传条目的引擎句柄不外露 | 点「取消」只改行文案，后台照传并最终翻回「入库完成」+ 关联/打开；行上还出现**两个**同名取消按钮 | `uploadFileCos` 加 `onEngine` 回填 `entry._upload`；模块加 `deps.cancelArtifact` 通道；`uploading` 态的取消按来源分派（直传交给引擎那个能真 abort+POST /cancel 的，产物由面板给） |
+| 取消后迟到回执翻状态 | 取消被静默撤销（→ done 并触发 `onUploaded`） | `entry.cancelled` 标记 + `completeUpload`/`onConverted`/`failUpload` 三处早返回 |
+| 恢复行直接置队列态 | 「刷新后不自动开始」只到用户下一次入队为止——拖入一个**无关**文件就会把上一个任务自动续跑并自动上传 | 恢复行 `parked=true`，`pick()` 跳过停放行；只有用户点「继续」才解除 |
+| 恢复的 `failed` 行给 `mode='start'` | 非 bundle 的 failed 记录 `reusable=false` → `startJob(null)` 必抛 `io_recoverable`「缺少输入文件」，且该行没有「重新选择文件」出路 | failed 行 → `mode='reselect'`（设计 §6.3 的处置），行上给 reselect |
+| 回队（`convert_in_browser`）不清 `mode` | 恢复行 `mode=null` → `probe(null)` TypeError，被归因成「本地读写错误」 | 回队置 `mode=probe`/`bundle`；无原始 File 时停为 `convert_failed` + reselect |
+| 荧光（KFBF）硬塞 `bf-ome` | `checkedOutputProfile` 必拒 → 荧光新文件 100% 无法转换且重试不自愈 | 模态未知时**不传** `outputProfile`（与工具页 `outputProfileForModality` 同口径），由运行器按探测结果取 `fl-ome`；实测真页面 KFBF 不再报 output-profile |
+| `uploadLockName` 从 `cos` 取 | `HP_COS_UPLOAD` 的导出表**没有**该方法（真函数在 engine.js）→ §5 的第二把锁在生产中从未请求，`discardJob` 的保护静默失效 | 以 `engine.uploadLockName` 为准、`cos` 面作兼容回退；构造器 docstring 同步更正 |
+| toast 形参传 i18n 键 | `{e: "upload.inline.err.disk"}` 被当字面量插值 → 用户看到键原文 | 模块 `msgKey()` 显式包装 `{__i18n: key}`，app.js 的 toast/note 适配器解析（`inlineResolveVars`） |
+| 失败码映射覆盖不足 | 服务端/核心的多数码落到通用「上传失败」+ 机器码（相对既有 `cosErrorMessage` 是能力回退）；network 丢掉续传指引 | 按三处**真实词表**（engine ERROR_CODES / core ErrorCode / worker `_fail`）补齐，并给面板专用网络/分块文案（「继续上传」是续传同一 ingestion，不重选文件） |
+| 转换阶段进度未接线 | `progressStage`/`PHASE_KEYS` 只有定义与单测、零生产调用点 → 长转换全程一个不定态文案，bundle 的「第 m/n 个成员」不显示 | 订阅 `runner.on('state'/'progress'/'phase')`（注入 `t` 渲染文案），附件百分比与成员进度 |
+| reselect 是死代码 | 设计 §6.3/§6.4/§7.3 要求的「重新选择文件」入口不可达 | `inlineButtonKinds` 按失败码 push `reselect`（`resume_refused`/`job_dir_missing`/`io_recoverable`），`inlineAction` 接文件选择器 |
+| 申请支持重复提交 | 抽屉「先 `disabled=true` 再同步 `disabled=false`」→ 在途期按钮始终可点，连点吃掉每日额度；行内入口无守卫 | `submitFormatRequestCore` 返回 Promise（收口后解锁）+ `entry.supportInFlight`；429/413 用本地化键而非回显中文 |
+| bundle 的 `format_ext` 取文件夹名末段 | 填出 `v2`/`01`/`c`，无扩展名时为空 → 服务端「缺少格式/扩展名」而用户无输入框可补 | bundle 用入口扩展名（`.mrxs`/`.vms`）并在 message 标 `bundle=1` |
+| `playwright.config.ts` 的 spec 探测 | 本 worktree 目录名就叫 `upload-inline-convert`，`.bin/playwright` 路径命中 `includes()` → **任意** spec 都装假 COS 基建；env 里残留的 `=1` 同样会改变别的 spec 的默认路径 | 只看测试选择参数（`argv[2..]`）；env 只能**关**（0/false/no） |
+| 已收口行的删除文案 | 页内完成的 `done` 行缺「平台上的切片不受影响」（只有刷新恢复路径有） | 完成时写 `uploadState='published'`；zip 多结果回填 `body.items` 首个已发布 item（与 `cosUploadSucceeded` 同口径） |
+| 样本上限链路断 | `/api/slide-formats` 返回裸列表 → `body.max_sample_bytes` 恒 undefined → 前端恒 64 MiB，env 调过时会先拒合法样本或放行必被 413 的样本 | 端点附加响应头 `X-Format-Request-Max-Sample-Bytes`（**不动响应形状**），前端优先读头、兼容旧包封 |
+| 等上传槽的固定轮询 | 1.5s 无上限重试；且该行**没有取消按钮**，唯一出路是关页 | 指数退避（封顶 30s）+ 等待行给取消入口 |
+| 内容与扩展名不符只在 toast 里 | toast 3 秒即逝、且是裸枚举（`png`）而非本地化名 | 行附注常驻显示本地化类型名（真页面实测「检测到 PNG 图片」），与申请回执**叠加**不互相覆盖 |

@@ -666,4 +666,90 @@ test.describe("viewer 标注交互（§5.4/§6，真实后端）", () => {
 		expect(items.find((it) => it.annotation_id === annoId))
 			.toMatchObject({ ...body, geometry_locked: true });
 	});
+
+	// ------------------------------------------------------------------
+	// annotation_moved（dogfood BUG-1 2026-10-17）：标注面板连删两条必须按
+	// annotation_id（稳定 id 路由）寻址。index 是 token 下全体用户共享的插入
+	// 序位置：面板缓存形成后服务端再插入一条、并先删掉前面一条，缓存的
+	// index 就会指向别的行——旧实现按缓存 index 发 DELETE（非 owner 403、
+	// 同 owner 时静默删错）。跨用户挤位的服务端语义由
+	// tests/test_annotation_stale_index.py 权威覆盖（e2e 以同用户插行构造
+	// 同形的 index 漂移）。
+	// ------------------------------------------------------------------
+	test("面板连删两条：按 annotation_id 寻址，index 漂移后仍删对的两条", async ({ page }) => {
+		const SID = CREDS.rasterSlides.workbench.slide_id;
+		await initSession(page);
+		await login(page, CREDS.userLogin, CREDS.userPassword);
+		await wipeAnnotations(page, SID);
+		const r1 = await pageApi(page, "POST", "/api/annotation", {
+			slide_id: SID, type: "rect", x: 60, y: 50, w: 80, h: 60,
+			label: "e2e-del-seq-1", shared: true,
+		});
+		const r2 = await pageApi(page, "POST", "/api/annotation", {
+			slide_id: SID, type: "rect", x: 400, y: 420, w: 60, h: 50,
+			label: "e2e-del-seq-2", shared: true,
+		});
+		expect(r1.status, JSON.stringify(r1.j)).toBe(200);
+		expect(r2.status, JSON.stringify(r2.j)).toBe(200);
+		const aid1 = r1.j.annotation_id as string;
+		const aid2 = r2.j.annotation_id as string;
+
+		await openSlideWithAnnos(page, SID);
+
+		// 打开标注面板（行内 🗑 走 deleteAnnoItem——缺陷修复的主路径）
+		const annoBtn = page.locator("#anno-btn");
+		await expect(annoBtn).toBeEnabled({ timeout: 10_000 });
+		await annoBtn.click();
+
+		// 面板打开（客户端缓存已形成）后服务端再插入第三条 → 列表变动
+		const r3 = await pageApi(page, "POST", "/api/annotation", {
+			slide_id: SID, type: "rect", x: 700, y: 250, w: 50, h: 40,
+			label: "e2e-del-seq-C", shared: true,
+		});
+		expect(r3.status, JSON.stringify(r3.j)).toBe(200);
+		const aidC = r3.j.annotation_id as string;
+
+		const delPaths: string[] = [];
+		page.on("request", (req) => {
+			if (req.method() === "DELETE" && req.url().includes("/api/annotation/")) {
+				delPaths.push(new URL(req.url()).pathname);
+			}
+		});
+
+		/** 点某 label 组行内的删除钮，并等该标注从服务端消失 */
+		async function panelDelete(label: string, aid: string) {
+			const row = page.locator(".anno-item").filter({
+				has: page.locator(".ai-label", { hasText: label }),
+			});
+			await expect(row).toBeVisible({ timeout: 10_000 });
+			await row.locator(".ai-del").click();
+			await expect.poll(async () => {
+				const listing = await pageApi(page, "GET",
+					`/api/annotations?slide_id=${encodeURIComponent(SID)}`);
+				const items: Array<Record<string, unknown>> = [];
+				((listing.j.annotations || []) as Array<{ items?: Array<Record<string, unknown>> }>)
+					.forEach((grp) => (grp.items || []).forEach((it) => items.push(it)));
+				return items.some((it) => it.annotation_id === aid);
+			}, { timeout: 10_000 }).toBe(false);
+		}
+
+		// 先删第一条：删除后 A2/C 整体前移，缓存的 A2 index 漂移
+		await panelDelete("e2e-del-seq-1", aid1);
+		// 再删第二条：缓存的 index 现在指向别的行——必须仍删掉 aid2 本尊，绝不碰 C
+		await panelDelete("e2e-del-seq-2", aid2);
+
+		// 两次删除都走稳定 id 路由（index 路径仅缺 annotation_id 的历史行回退）
+		expect(delPaths, "两次删除都应按 annotation_id 寻址").toEqual([
+			`/api/annotation/id/${aid1}`,
+			`/api/annotation/id/${aid2}`,
+		]);
+		// 服务端最终态：只留下第三条（C 完好）
+		const after = await pageApi(page, "GET",
+			`/api/annotations?slide_id=${encodeURIComponent(SID)}`);
+		const items: Array<Record<string, unknown>> = [];
+		((after.j.annotations || []) as Array<{ items?: Array<Record<string, unknown>> }>)
+			.forEach((grp) => (grp.items || []).forEach((it) => items.push(it)));
+		expect(items.map((it) => it.annotation_id)).toEqual([aidC]);
+		await page.screenshot({ path: `${EVIDENCE_DIR}/e2e-del-by-id-sequence.png` });
+	});
 });

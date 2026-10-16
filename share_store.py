@@ -75,6 +75,7 @@ _PUBLIC_NAMES = (
     "annotation_grants_for_subject",
     "annotation_visibility_report",
     "review_roi",
+    "review_roi_by_annotation_id",
     "add_comment",
     "list_comments",
     "resolve_comment",

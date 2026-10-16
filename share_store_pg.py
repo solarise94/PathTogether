@@ -2178,6 +2178,41 @@ def review_roi(token, index, action):
         conn.close()
 
 
+def review_roi_by_annotation_id(annotation_id, action):
+    """按稳定 annotation_id 审核（review_roi 的 by-id 版，语义逐项一致）。
+
+    仅 source=ai 可审；否则 ValueError。成功返回更新后的 roi dict（含
+    review_status/revision，不含 index——id 寻址不需要）；id 无效或已删返回
+    False。bump revision + updated_at（不 bump change_seq）。
+    """
+    if action not in ("accept", "reject"):
+        raise ValueError("action 需为 accept 或 reject")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT id, data FROM rois "
+                    "WHERE annotation_id=%s AND NOT deleted FOR UPDATE",
+                    (annotation_id,))
+                row = cur.fetchone()
+                if row is None:
+                    return False
+                rid = row["id"]
+                roi = dict(row["data"])
+                if roi.get("source") != "ai":
+                    raise ValueError("仅 AI 标注可审核")
+                roi["review_status"] = "accepted" if action == "accept" else "rejected"
+                roi["revision"] = int(roi.get("revision") or 1) + 1
+                roi["updated_at"] = time.time()
+                _update_roi_row(cur, rid, roi)
+                out = _roi_out(roi)
+                out["shared"] = _roi_shared_compat(roi)
+                return out
+    finally:
+        conn.close()
+
+
 def roi_count_by_token():
     """返回 {token: count} 计数表（跳过 tombstone）。"""
     conn = _connect()

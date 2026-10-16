@@ -67,13 +67,30 @@ describe("§6.3 锁切换（app.js）", () => {
 });
 
 describe("§6.3 锁切换（share.js）", () => {
-	it("toggleItemGeometryLocked：PATCH /s/<token>/api/roi/<index>，单独请求不夹带 geom", () => {
+	it("toggleItemGeometryLocked：PATCH /s/<token>/api/roi/<id|index>，单独请求不夹带 geom", () => {
 		const fn = extractFn(shareSrc, "toggleItemGeometryLocked");
-		expect(fn).toMatch(/api\/roi\/" \+ it\.index/);
+		// annotation_moved 2026-10-15：寻址键优先 annotation_id（稳定 id 通道），
+		// 缺 id 历史行回退 index（roiOpUrl 统一构造）
+		expect(fn).toMatch(/roiOpUrl\(it\)/);
+		expect(fn).toMatch(/it\.index == null && !it\.annotation_id/);
 		expect(fn).toMatch(/geometry_locked:\s*!!lockTarget/);
 		expect(fn).toMatch(/expected_revision/);
 		expect(fn).not.toMatch(/buildEditGeom/);
 		expect(fn).toMatch(/j\.error === "annotation_locked"/);
+	});
+
+	it("roiOpUrl：有 annotation_id 走 id 通道，否则回退 index", () => {
+		const fn = extractFn(shareSrc, "roiOpUrl");
+		expect(fn).toMatch(/\/api\/roi\/id\//);
+		expect(fn).toMatch(/encodeURIComponent\(it\.annotation_id\)/);
+		expect(fn).toMatch(/it \? it\.index : ""/);
+	});
+
+	it("commitEdit / deleteRoi 均按 annotation_id 寻址（index 仅历史行回退）", () => {
+		expect(extractFn(shareSrc, "commitEdit")).toMatch(/fetch\(roiOpUrl\(it\)/);
+		const del = extractFn(shareSrc, "deleteRoi");
+		expect(del).toMatch(/\/api\/roi\/id\//);
+		expect(del).toMatch(/it\.annotation_id === aid/);
 	});
 
 	it("锁定标记无手柄（editHandles 返回空）且删除入口禁用", () => {

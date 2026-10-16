@@ -9320,19 +9320,28 @@
 
   // 切换某标注的「公开」状态（策展）
   // Stage 3c-1：AI 标注审核（接受/驳回）。POST review → 刷新当前切片标注。
+  // 寻址键优先 annotation_id（稳定 id 路由——index 是 token 下全体用户共享
+  // 的插入序位置，他人增删后缓存的 index 会指向另一条标注）；缺
+  // annotation_id 的历史行回退旧 index 路径（旧插件/旧缓存兼容）。
   function reviewAnnotation(it, action) {
     var token = it.token;
-    if (!token) { toast(t("anno.no.src.token"), "error"); return; }
-    resolveIndexFast(it)
-      .then(function (index) {
-        return apiFetch(
-          "/api/annotation/" + encodeURIComponent(token) + "/" + index + "/review",
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ action: action }),
-          }
-        ).then(function (r) {
+    if (!it.annotation_id && !token) {
+      toast(t("anno.no.src.token"), "error");
+      return;
+    }
+    var urlP = it.annotation_id
+      ? Promise.resolve(annoIdUrl(it.annotation_id, "/review"))
+      : resolveIndexFast(it).then(function (index) {
+          return "/api/annotation/" + encodeURIComponent(token) + "/" +
+            index + "/review";
+        });
+    urlP
+      .then(function (url) {
+        return apiFetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: action }),
+        }).then(function (r) {
           if (!r.ok) return r.json().then(function (j) {
             throw new Error(j.error || (t("anno.update.fail") + " " + r.status));
           });
@@ -9697,14 +9706,19 @@
   }
 
   // 删除标注（管理员，任意来源）：
-  // 幂等 + 过期自动重试。后端 index 是该 token 下按插入序的序号，数据变动后
-  // 本地缓存 index（it.index）可能过期 → 后端 404「标注不存在」。处理：
-  //   1) 先按 resolveIndexFast（优先 it.index）发 DELETE；
-  //   2) 若 404：改用 resolveAnnoIndex（重新拉 /api/share/rois 按 slide+ts+几何
-  //      反推最新 index）重试 DELETE 一次；
-  //   3) 若 resolveAnnoIndex 也找不到（抛"未找到对应标注"）或重试仍 404 → 说明
-  //      该标注在服务端已不存在，删除本就幂等，视为成功，走乐观移除 + toast；
-  //   4) 非 404 错误（网络/403 等）按原逻辑 toast「删除失败」并刷新恢复。
+  // 寻址键优先 annotation_id（稳定 id 路由 DELETE /api/annotation/id/<id>）。
+  // index 是该 token 下按插入序的位置（工作台全体用户共享同一列表）：数据
+  // 变动后本地缓存 index（it.index）可能指向另一条标注——非 owner 403「只能
+  // 修改自己创建的标注」（dogfood BUG-1 2026-10-17：连删 3 个自己的标记，
+  // 第 3 个 403），owner 甚至静默删错任何人的。按 id 删除不受列表变动影响：
+  //   1) 带 annotation_id（现役数据一律有）→ id 路由；
+  //   2) 404 → 该标注服务端已不存在，删除幂等，视为成功（乐观移除 + toast）；
+  //   3) 409 annotation_locked → 锁定对象说明原因并刷新恢复；
+  //   4) 其他错误（网络/403 等）toast「删除失败」并刷新恢复；
+  //   5) 仅缺 annotation_id 的历史行回退旧 index 路径（幂等 + 过期重试）：
+  //      先按 resolveIndexFast（优先 it.index）发 DELETE；404 时用
+  //      resolveAnnoIndex 反推最新 index 重试一次；仍 404 或反推不到 →
+  //      视为已不存在（幂等成功）。
   function deleteAnnoItem(it) {
     // 发 DELETE，返回 { ok, status }：成功 ok=true；失败携带 HTTP status 供上层
     // 区分 404（幂等可放过）与其他错误（需报错恢复）。
@@ -9718,6 +9732,17 @@
           return { ok: false, status: r.status, errorCode: j && j.error };
         });
       });
+    }
+
+    // by-id DELETE：寻址不依赖 index（列表增删安全）
+    function sendDeleteById() {
+      return apiFetch(annoIdUrl(it.annotation_id), { method: "DELETE" })
+        .then(function (r) {
+          if (r.ok) return { ok: true, status: r.status };
+          return r.json().catch(function () { return {}; }).then(function (j) {
+            return { ok: false, status: r.status, errorCode: j && j.error };
+          });
+        });
     }
 
     // 乐观更新：成功路径与"视为已删除"路径共用，立即反馈 + 后台异步同步。
@@ -9767,9 +9792,8 @@
       });
     }
 
-    resolveIndexFast(it)
-      .then(function (index) {
-        return sendDelete(index).then(function (res) {
+    var chain = it.annotation_id
+      ? sendDeleteById().then(function (res) {
           if (res.ok) return { treated: true };
           // §6.3：锁定对象的删除被服务端 409 annotation_locked 拒绝——
           // 不当幂等成功，说明原因并恢复服务端状态
@@ -9777,29 +9801,44 @@
             toast(t("anno.lock.delete.denied"), "error");
             return { blocked: true };
           }
-          // 第一次 404：index 可能过期，用 resolveAnnoIndex 反推最新 index 重试一次
-          if (res.status === 404) {
-            return resolveAnnoIndex(it)
-              .then(function (freshIndex) { return sendDelete(freshIndex); })
-              .then(function (res2) {
-                if (res2.ok) return { treated: true };
-                // 重试仍 404 → 服务端已无此标注，删除幂等，视为成功
-                if (res2.status === 404) return { treated: true, alreadyGone: true };
-                // 其他错误冒泡到 catch
-                throw new Error(t("del.fail") + " (" + res2.status + ")");
-              })
-              .catch(function (e) {
-                // resolveAnnoIndex 抛"未找到对应标注"/"Annotation not found" → 服务端已无此标注，视为成功
-                if (e && /未找到对应标注|Annotation not found|not found/i.test(e.message)) {
-                  return { treated: true, alreadyGone: true };
-                }
-                throw e; // 其余错误继续冒泡
-              });
-          }
-          // 非 404 错误：报错并在 catch 中刷新恢复
+          // 404：该标注服务端已不存在，删除幂等，视为成功
+          if (res.status === 404) return { treated: true, alreadyGone: true };
           throw new Error(t("del.fail") + " (" + res.status + ")");
-        });
-      })
+        })
+      : resolveIndexFast(it)
+          .then(function (index) {
+            return sendDelete(index).then(function (res) {
+              if (res.ok) return { treated: true };
+              // §6.3：锁定对象的删除被服务端 409 annotation_locked 拒绝——
+              // 不当幂等成功，说明原因并恢复服务端状态
+              if (res.status === 409 && res.errorCode === "annotation_locked") {
+                toast(t("anno.lock.delete.denied"), "error");
+                return { blocked: true };
+              }
+              // 第一次 404：index 可能过期，用 resolveAnnoIndex 反推最新 index 重试一次
+              if (res.status === 404) {
+                return resolveAnnoIndex(it)
+                  .then(function (freshIndex) { return sendDelete(freshIndex); })
+                  .then(function (res2) {
+                    if (res2.ok) return { treated: true };
+                    // 重试仍 404 → 服务端已无此标注，删除幂等，视为成功
+                    if (res2.status === 404) return { treated: true, alreadyGone: true };
+                    // 其他错误冒泡到 catch
+                    throw new Error(t("del.fail") + " (" + res2.status + ")");
+                  })
+                  .catch(function (e) {
+                    // resolveAnnoIndex 抛"未找到对应标注"/"Annotation not found" → 服务端已无此标注，视为成功
+                    if (e && /未找到对应标注|Annotation not found|not found/i.test(e.message)) {
+                      return { treated: true, alreadyGone: true };
+                    }
+                    throw e; // 其余错误继续冒泡
+                  });
+              }
+              // 非 404 错误：报错并在 catch 中刷新恢复
+              throw new Error(t("del.fail") + " (" + res.status + ")");
+            });
+          });
+    chain
       .then(function (outcome) {
         // 成功或"已不存在视为成功"，统一走乐观移除；锁定拒绝只刷新恢复
         if (outcome && outcome.blocked) {

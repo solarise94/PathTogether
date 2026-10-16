@@ -296,7 +296,18 @@ function mkOrch(over: {
 			},
 			markError() { },
 			buttons: (e: Entry) => buttons.push(e),
-			toast: (k: string) => toasts.push(k),
+			toast: (k: string, vars?: Record<string, unknown>) => {
+				let out = k;
+				if (vars) {
+					for (const [name, v] of Object.entries(vars)) {
+						const val = (v && typeof v === "object" &&
+							typeof (v as { __i18n?: string }).__i18n === "string")
+							? (v as { __i18n: string }).__i18n : String(v);
+						out += `|${name}=${val}`;
+					}
+				}
+				toasts.push(out);
+			},
 			refresh() { },
 			remove() { removed += 1; },
 		},
@@ -324,6 +335,7 @@ function mkOrch(over: {
 			}
 			return out;
 		},
+		typeName: (detected: string) => "T:" + String(detected),
 		locks,
 		setTimer: (fn: () => void, ms: number) => setTimeout(fn, ms),
 	});
@@ -2460,4 +2472,19 @@ describe("产物锁来源与进度订阅（独立审查）", () => {
 		// 非 bundle 仍取真实扩展名
 		expect(I.prefillFormatRequest({ name: "shot.JPG" }, null).format_ext).toBe("jpg");
 	});
+	it("内容与扩展名不符：检测类型留在行上（本地化名，不是裸枚举）", async () => {
+		const h = mkOrch();
+		// PNG 真字节改名 .jpg
+		const png = new Uint8Array(32);
+		png.set([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A], 0);
+		const e = h.orch.enqueue(fakeFile("photo.jpg", png))!;
+		await flush(20);
+		expect(e.state).toBe("rejected");
+		expect(e.error?.detectedType).toBe("png");
+		// 本地化类型名（注入的 typeName）——绝不透出裸枚举 "png"
+		expect(e.detectedTypeName).toBe("T:png");
+		expect(e.detectedTypeName).not.toBe("png");
+		expect(h.toasts.some((m) => m.includes("T:png"))).toBe(true);
+	});
+
 });

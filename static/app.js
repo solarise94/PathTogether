@@ -11134,6 +11134,7 @@
         },
         account: function () { return String(currentUserId || ""); },
         t: function (key, vars) { return tt(key, inlineResolveVars(vars)); },
+        typeName: function (detected) { return magicTypeName(detected); },
         target: function () { return importTargetSnapshot(); },
         onArtifact: uploadEntryArtifact,
         cancelArtifact: function (entry) {
@@ -11220,6 +11221,11 @@
     if (entry.state === "converting" || entry.state === "uploading" ||
         entry.state === "upload_queued" || entry.state === "convert_queued") {
       return tt("upload.inline.note.keepopen");
+    }
+    // 内容与扩展名不符：把**检测到的类型**留在行上（toast 3 秒即逝，行内是
+    // 唯一持久证据；设计 §9.4 用例 B 要求「行内出现检测类型」）。
+    if (entry.state === "rejected" && entry.detectedTypeName) {
+      return tt("upload.inline.rejected.magic", { type: entry.detectedTypeName });
     }
     // 申请支持的**行内回执**（§7.1）：编号 + 业务状态。抽屉默认关闭，行内
     // 按钮是主入口——只写抽屉的话用户点完看不到任何结果。

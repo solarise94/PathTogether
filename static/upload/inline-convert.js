@@ -341,6 +341,10 @@
     var account = typeof deps.account === "function" ? deps.account : function () { return ""; };
     // 文案格式化（app.js 注入 tt）：模块只持有键与形参，不自己实现 i18n。
     var t = typeof deps.t === "function" ? deps.t : function (k) { return String(k); };
+    // 机器枚举（png/webp/…）→ 本地化类型名（app.js 传 magicTypeName）。
+    // 面板绝不把裸枚举当文案。
+    var uitypeName = typeof deps.typeName === "function"
+      ? deps.typeName : function (d) { return String(d || ""); };
 
     var entries = [];          // 队列（含终态，供行渲染与清理）
     var seq = 0;
@@ -485,10 +489,15 @@
         if (mismatch) {
           markError(e, "content_ext_mismatch", null,
             { detectedType: mismatch.detected });
+          // 检测到的类型名（本地化）：行内 note 与 toast 都用它——toast 3 秒
+          // 即逝，行内是唯一持久证据；类型名走注入的 typeName（app.js 传
+          // magicTypeName，与既有 cosErrorMessage 同一词表），绝不透出
+          // png/unknown 这类机器枚举。
+          e.detectedTypeName = uitypeName(mismatch.detected);
           e.state = "rejected";
           setStage(e, "upload.inline.stage.rejected");
           if (ui.markError) ui.markError(e);
-          toast("upload.inline.rejected.magic", { type: mismatch.detected }, "error");
+          toast("upload.inline.rejected.magic", { type: e.detectedTypeName }, "error");
           settle(e, "rejected");
           if (ui.buttons) ui.buttons(e);
           return e;

@@ -280,6 +280,7 @@ function mkOrch(over: {
 	// inlineRowSetStage 按 entry.id 查行并提前 return——顺序错了状态文案为空）
 	const order: string[] = [];
 	let removed = 0;
+	const cancelCalls: string[] = [];
 	const locks = over.locks ?? fakeLocks();
 	const orch = I.createOrchestrator({
 		runner,
@@ -303,11 +304,31 @@ function mkOrch(over: {
 		target: () => ({ pid: "p1" }),
 		onArtifact: over.onArtifact ?? null,
 		onUploaded: over.onUploaded ?? null,
+		cancelArtifact: (e: Entry) => {
+			cancelCalls.push(e.id);
+			if (e._upload && (e._upload as { cancel?: () => void }).cancel) {
+				(e._upload as { cancel: () => void }).cancel();
+			}
+		},
+		// t/tt：测试环境用「键 + 形参」的可读渲染（与 app.js 的 tt 同语义，
+		// 含 {__i18n} 包装解析）
+		t: (k: string, vars?: Record<string, unknown>) => {
+			let out = k;
+			if (vars) {
+				for (const [name, v] of Object.entries(vars)) {
+					const val = (v && typeof v === "object" &&
+						typeof (v as { __i18n?: string }).__i18n === "string")
+						? (v as { __i18n: string }).__i18n : String(v);
+					out += `|${name}=${val}`;
+				}
+			}
+			return out;
+		},
 		locks,
 		setTimer: (fn: () => void, ms: number) => setTimeout(fn, ms),
 	});
 	return { I, orch, runner, cos, stages, rows, buttons, toasts, locks, order,
-		removed: () => removed };
+		cancelCalls, removed: () => removed };
 }
 
 // --------------------------------------------------------------------- //
@@ -399,6 +420,39 @@ describe("inline-convert 纯函数", () => {
 		expect(I.failureStageKey("validation_failed")).toBe("upload.cos.err.validation");
 		expect(I.failureStageKey("client_gone")).toBe("upload.cos.err.client_gone");
 		expect(I.failureStageKey("who_knows")).toBeNull();
+	});
+
+	it("failureStageKey：覆盖三处真实词表（复核修复的覆盖面）", () => {
+		const I = IC();
+		// 服务端控制面（与既有 cosErrorMessage 同一批文案键）
+		expect(I.failureStageKey("cos_waiting_limit")).toBe("upload.cos.err.waiting_limit");
+		expect(I.failureStageKey("cos_waiting_capacity")).toBe("upload.cos.err.waiting_limit");
+		expect(I.failureStageKey("ingestion_state_conflict")).toBe("upload.cos.err.state");
+		expect(I.failureStageKey("cos_sign_rate_limited")).toBe("upload.cos.err.rate");
+		expect(I.failureStageKey("cos_capacity_reconcile_required"))
+			.toBe("upload.cos.err.reconcile");
+		expect(I.failureStageKey("plan_size_mismatch")).toBe("upload.cos.err.plan");
+		expect(I.failureStageKey("name_unavailable")).toBe("upload.err.name");
+		expect(I.failureStageKey("invalid_declared_size")).toBe("upload.err.size_mismatch");
+		expect(I.failureStageKey("cos_unavailable")).toBe("upload.cos.err.unavailable");
+		expect(I.failureStageKey("cos_format_unsupported"))
+			.toBe("upload.cos.err.format_unsupported");
+		expect(I.failureStageKey("hash_mismatch")).toBe("upload.err.hash_mismatch");
+		// wasm 核心的类型化码
+		expect(I.failureStageKey("unsupported_kfb_variant")).toBe("upload.inline.err.unsupported");
+		expect(I.failureStageKey("invalid_kfb_header")).toBe("upload.inline.err.unsupported");
+		// worker 终态码
+		for (const c of ["part_missing", "local_size_mismatch",
+			"download_budget_exceeded", "source_not_pinned", "reservation_expired",
+			"publish_conflict", "commit_recovery_failed", "zip_items_failed",
+			"slide_binding_missing"]) {
+			expect(I.failureStageKey(c), c).toBe("upload.cos.err.validation");
+		}
+		// 网络/分块：面板措辞（「继续上传」= 续传同一 ingestion，不重选文件）
+		expect(I.failureStageKey("network")).toBe("upload.inline.err.network");
+		expect(I.failureStageKey("part_failed")).toBe("upload.inline.err.part");
+		// 未知码仍保留机器码（排障）
+		expect(I.failureStageKey("brand_new_unknown_code")).toBeNull();
 	});
 
 	it("progressStage：stage / stage-bundle / level 三形态（§3.3）", () => {
@@ -1666,7 +1720,7 @@ describe("上传行按钮（§6.3 是按钮全集的唯一权威）", () => {
 		const mod = readFileSync(resolve(root, "static/upload/inline-convert.js"), "utf8");
 		const at = mod.indexOf("e.requeueCount < 1");
 		expect(at).toBeGreaterThan(-1);
-		const requeue = mod.slice(at, at + 800);
+		const requeue = mod.slice(at, at + 1400);
 		expect(requeue).toContain("e.directClass = null");
 		expect(requeue).toContain("e.uploadJobId = null");
 		expect(requeue).toContain("requeue_convert");
@@ -1707,4 +1761,703 @@ describe("上传行按钮（§6.3 是按钮全集的唯一权威）", () => {
 			.not.toContain("upload.inline.freed");
 	});
 
+});
+
+// --------------------------------------------------------------------- //
+// 队列与并发回归（独立审查确认的一批缺陷；每条都先红后绿）
+// --------------------------------------------------------------------- //
+describe("队列与并发：槽位释放（独立审查）", () => {
+	const kfb = () => Uint8Array.from([0xF1, 0x01, 0xEE, 0xEE, 0x4B, 0x46, 0x42,
+		0x00, 0, 0, 0, 0]);
+	const ome = (name = "a.ome.tif") => fakeFile(name, classicTiff(
+		'<?xml version="1.0"?><OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06"></OME>\x00'));
+
+	it("上传成功后必须释放上传槽：第 2/3 个条目照常上传（「1 个上传」不是「一辈子 1 个」）", async () => {
+		const h = mkOrch();
+		h.orch.enqueue(fakeFile("a.kfb", kfb()));
+		h.orch.enqueue(fakeFile("b.kfb", kfb()));
+		h.orch.enqueue(fakeFile("c.kfb", kfb()));
+		await flush(60);
+		const states = h.orch.list().map((e) => `${e.name}=${e.state}`);
+		expect(states).toEqual(["a.kfb=done", "b.kfb=done", "c.kfb=done"]);
+		expect(h.cos.uploads).toHaveLength(3);
+		expect(h.orch.busy()).toEqual({ converting: false, uploading: false });
+	});
+
+	it("直传条目同样逐个顶上（3 条只传第 1 条是缺陷）", async () => {
+		const uploaded: string[] = [];
+		const h = mkOrch({
+			onArtifact: (e: Entry) => {
+				uploaded.push(e.name);
+				return Promise.resolve({ body: { slide_id: "sld_" + e.name } });
+			},
+		});
+		h.orch.enqueue(ome("a.ome.tif"));
+		h.orch.enqueue(ome("b.ome.tif"));
+		h.orch.enqueue(ome("c.ome.tif"));
+		await flush(60);
+		expect(uploaded).toEqual(["a.ome.tif", "b.ome.tif", "c.ome.tif"]);
+		expect(h.orch.busy().uploading).toBe(false);
+	});
+
+	it("取消（引擎回执 cancelled）后的条目同样不占槽：后续条目照常", async () => {
+		let first = true;
+		const h = mkOrch({
+			onArtifact: () => {
+				if (first) { first = false; return Promise.resolve({ cancelled: true }); }
+				return Promise.resolve({ body: { slide_id: "sld_ok" } });
+			},
+		});
+		h.orch.enqueue(ome("a.ome.tif"));
+		h.orch.enqueue(ome("b.ome.tif"));
+		await flush(60);
+		expect(h.orch.list()[0].state).toBe("cancelled");
+		expect(h.orch.list()[1].state).toBe("done");
+	});
+
+	it("产物门禁失败也必须释放上传槽（设计 §5.1 的常见结局，不是罕见错误）", async () => {
+		const h = mkOrch({
+			runner: {
+				getJob: () => Promise.resolve({
+					id: "job1", state: "ready",
+					result: { outputBytes: 100, format: "not-viewable" },
+					upload: null,
+				}),
+			},
+		});
+		h.orch.enqueue(fakeFile("a.kfb", kfb()));
+		h.orch.enqueue(fakeFile("b.kfb", kfb()));
+		await flush(60);
+		expect(h.orch.list()[0].state).toBe("convert_failed");
+		expect(h.orch.list()[0].error?.code).toBe("format_not_viewable");
+		// 第二条不受影响（槽已释放）
+		expect(h.orch.list()[1].state).toBe("convert_failed");
+		expect(h.orch.busy().uploading).toBe(false);
+		// 两把锁都不残留（真浏览器里 held 集必须清空）
+	});
+
+	it("能力不可用时直传条目：不 POST、进终态、不占槽（后续条目不被堵）", async () => {
+		const h = mkOrch({ caps: { cosConfig: null } });
+		let artifacts = 0;
+		const h2 = mkOrch({
+			caps: { cosConfig: null },
+			onArtifact: () => { artifacts += 1; return Promise.resolve({ body: {} }); },
+		});
+		h2.orch.enqueue(ome("a.ome.tif"));
+		h2.orch.enqueue(ome("b.ome.tif"));
+		await flush(60);
+		expect(artifacts).toBe(0);
+		expect(h2.orch.busy().uploading).toBe(false);
+		void h;
+	});
+
+	it("迟到的转换回执不清新条目的转换槽（取消后两个转换不得并发）", async () => {
+		// 第一条：probe 永不 resolve（模拟在途），取消后其 done 迟到
+		let resolveFirst: ((v: unknown) => void) | null = null;
+		let firstStarted = false;
+		const h = mkOrch({
+			runner: {
+				probe: (f: { name?: string }) => {
+					if (!firstStarted) {
+						firstStarted = true;
+						return new Promise((res) => { resolveFirst = res; });
+					}
+					// 第二条也慢：留在 converting 才能观察「槽被迟到回执清掉」
+					return new Promise((res) => setTimeout(() => res({
+						jobId: "job_" + f.name,
+						probe: { document: { modality: "brightfield" } },
+					}), 200));
+				},
+			},
+		});
+		const a = h.orch.enqueue(fakeFile("a.kfb", kfb()))!;
+		await flush(10);
+		expect(a.state).toBe("converting");
+		// 第二条排队（转换槽被 a 占着）
+		const b = h.orch.enqueue(fakeFile("b.kfb", kfb()))!;
+		await flush(10);
+		expect(b.state).toBe("convert_queued");
+		// 取消 a → 槽释放 → pump 启动 b
+		h.orch.cancel(a);
+		await flush(30);
+		expect(b.state).toBe("converting");
+		// a 的迟到 probe 回执到达：绝不能把 b 的槽清掉
+		if (resolveFirst) {
+			(resolveFirst as (v: unknown) => void)({
+				jobId: "job_a", probe: { document: { modality: "brightfield" } },
+			});
+		}
+		await flush(30);
+		// b 仍在转换（槽未被迟到回执清掉）→ pump 不得再启动第三个
+		const converting = h.orch.list().filter((e) => e.state === "converting");
+		expect(converting.map((e) => e.name)).toEqual(["b.kfb"]);
+	});
+
+	it("并发上限：任一时刻至多 1 个 converting + 1 个 uploading（§9.2 第 4 项）", async () => {
+		let maxConvert = 0;
+		let maxUpload = 0;
+		let convertNow = 0;
+		let uploadNow = 0;
+		const h = mkOrch({
+			runner: {
+				probe: () => {
+					convertNow += 1;
+					maxConvert = Math.max(maxConvert, convertNow);
+					return new Promise((res) => setTimeout(() => {
+						convertNow -= 1;
+						res({ jobId: "j" + Math.random(), probe: { document: { modality: "brightfield" } } });
+					}, 20));
+				},
+			},
+		});
+		const h2 = mkOrch({
+			runner: {
+				probe: () => new Promise((res) => setTimeout(() => res({
+					jobId: "j" + Math.random(), probe: { document: { modality: "brightfield" } },
+				}), 20)),
+			},
+			onArtifact: () => {
+				uploadNow += 1;
+				maxUpload = Math.max(maxUpload, uploadNow);
+				return new Promise((res) => setTimeout(() => {
+					uploadNow -= 1;
+					res({ body: { slide_id: "sld" } });
+				}, 20));
+			},
+		});
+		for (const n of ["a", "b", "c", "d"]) h.orch.enqueue(fakeFile(n + ".kfb", kfb()));
+		for (const n of ["a", "b", "c", "d"]) h2.orch.enqueue(ome(n + ".ome.tif"));
+		await flush(200);
+		expect(maxConvert).toBe(1);
+		expect(maxUpload).toBe(1);
+		expect(h.orch.list().every((e) => e.state === "done")).toBe(true);
+		expect(h2.orch.list().every((e) => e.state === "done")).toBe(true);
+	});
+});
+
+describe("取消语义（独立审查）", () => {
+	const kfb = () => Uint8Array.from([0xF1, 0x01, 0xEE, 0xEE, 0x4B, 0x46, 0x42,
+		0x00, 0, 0, 0, 0]);
+
+	it("直传条目取消：引擎句柄（entry._upload）存在时直接停传，迟到回执不翻状态", async () => {
+		let resolveArtifact: ((v: unknown) => void) | null = null;
+		const h = mkOrch({
+			onArtifact: (e: Entry) => {
+				// 引擎句柄（app.js 的 onEngine 会写 entry._upload）
+				e._upload = { cancel: () => { cancelCount += 1; } };
+				return new Promise((res) => { resolveArtifact = res; });
+			},
+		});
+		let cancelCount = 0;
+		const a = h.orch.enqueue(ome(undefined, "a.ome.tif"))!;
+		await flush(20);
+		expect(a.state).toBe("uploading");
+		h.orch.act(a.id, "cancel");
+		expect(a.state).toBe("cancelled");
+		expect(cancelCount).toBe(1);       // 真的停了传输
+		// 迟到的成功回执不得把它翻回 done 并触发关联/打开
+		if (resolveArtifact) (resolveArtifact as (v: unknown) => void)({ body: { slide_id: "sld_late" } });
+		await flush(30);
+		expect(a.state).toBe("cancelled");
+		expect(a.slideId).toBeNull();
+	});
+
+	it("直传条目取消：句柄未回填时走 deps.cancelArtifact 通道（app.js 侧转达）", async () => {
+		const h = mkOrch({
+			// 故意**不**设 entry._upload：模拟 app.js 尚未回填句柄的窗口
+			onArtifact: () => new Promise(() => { /* 永不 settle */ }),
+		});
+		const a = h.orch.enqueue(ome(undefined, "a.ome.tif"))!;
+		await flush(20);
+		expect(a._upload).toBeUndefined();
+		h.orch.act(a.id, "cancel");
+		expect(h.cancelCalls).toContain(a.id);
+		expect(a.state).toBe("cancelled");
+	});
+
+	it("取消后立即释放上传槽：第二个条目可以顶上", async () => {
+		const h = mkOrch({
+			onArtifact: (e: Entry) => {
+				e._upload = { cancel: () => { /* */ } };
+				return new Promise(() => { /* 永不 settle：模拟在途 */ });
+			},
+		});
+		const a = h.orch.enqueue(ome(undefined, "a.ome.tif"))!;
+		await flush(20);
+		h.orch.act(a.id, "cancel");
+		await flush(20);
+		expect(h.orch.busy().uploading).toBe(false);
+		const b = h.orch.enqueue(ome(undefined, "b.ome.tif"))!;
+		await flush(20);
+		expect(b.state).toBe("uploading");
+	});
+
+	it("音频型迟到 cancelled 回执不当失败（取消回声 → cancelled 而非 upload_failed）", async () => {
+		const h = mkOrch({
+			onArtifact: () => Promise.resolve({ cancelled: true }),
+		});
+		const a = h.orch.enqueue(ome(undefined, "a.ome.tif"))!;
+		await flush(30);
+		expect(a.state).toBe("cancelled");
+		expect(a.error).toBeNull();
+	});
+
+	function ome(_x: unknown, name: string) {
+		return fakeFile(name, classicTiff(
+			'<?xml version="1.0"?><OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06"></OME>\x00'));
+	}
+});
+
+describe("荧光 / 恢复行 / 回队（独立审查）", () => {
+	it("KFBF（荧光）新文件：不给 probe 硬塞 bf-ome（否则必被 checkedOutputProfile 拒）", async () => {
+		const seen: Array<Record<string, unknown>> = [];
+		const h = mkOrch({
+			engine: {
+				// 引擎按源文件给出荧光模态
+				sniffTiffSlideCapability: () => Promise.resolve({
+					supported: true, modality: "fluorescence",
+				}),
+			},
+			runner: {
+				probe: (_f: unknown, opts: Record<string, unknown>) => {
+					seen.push(opts);
+					// 真 runner 对荧光 + bf-ome 会抛 unsupported_input
+					if (opts.outputProfile === "bf-ome") {
+						return Promise.reject({
+							error: { code: "unsupported_input",
+								message: "输出格式 bf-ome 不适用于荧光切片" },
+						});
+					}
+					return Promise.resolve({
+						jobId: "job_fl", probe: { document: { modality: "fluorescence" } },
+					});
+				},
+				getJob: () => Promise.resolve({
+					id: "job_fl", state: "ready",
+					result: { outputBytes: 100, format: "ome-bigtiff-subifd-rgb-jpeg-pyramid" },
+					upload: null,
+				}),
+			},
+		});
+		const fl = fakeFile("fl.kfbf", Uint8Array.from(
+			[0xF1, 0x01, 0xEE, 0xEE, 0x4B, 0x46, 0x42, 0x46, 0, 0, 0, 0]));
+		const e = h.orch.enqueue(fl)!;
+		await flush(40);
+		// 新文件模态未知 → **不传** outputProfile（交给运行器按探测结果决定）
+		expect(seen[0].outputProfile).toBeUndefined();
+		expect(e.state).toBe("done");
+		expect(e.modality).toBe("fluorescence");
+	});
+
+	it("荧光转换后的上传用 fl-ome 的产物门禁（result.format 在 viewable_formats 内）", async () => {
+		const h = mkOrch();
+		const fl = fakeFile("fl.kfbf", Uint8Array.from(
+			[0xF1, 0x01, 0xEE, 0xEE, 0x4B, 0x46, 0x42, 0x46, 0, 0, 0, 0]));
+		const e = h.orch.enqueue(fl)!;
+		await flush(40);
+		expect(e.state).toBe("done");
+	});
+
+	it("恢复行一律停放：随后入队无关文件不会把它自动续跑/自动上传", async () => {
+		const jobOf = (over: Record<string, unknown>) => ({
+			id: "jobR", state: "planned", nextAction: "resume", committedBytes: 7,
+			source: { name: "big.kfb", size: 100 }, modality: "brightfield",
+			upload: null,
+			intent: { channel: "workbench-inline", target: { pid: "p1" } },
+			...over,
+		});
+		const h = mkOrch({
+			runner: { listJobs: () => Promise.resolve([jobOf({})]) },
+		});
+		const made = await h.orch.restore();
+		expect(made).toHaveLength(1);
+		expect(made[0].state).toBe("convert_queued");
+		// 拖入一个**无关**新文件（这会触发 schedule）
+		h.orch.enqueue(fakeFile("other.ome.tif", classicTiff(
+			'<?xml version="1.0"?><OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06"></OME>\x00')));
+		await flush(40);
+		// 恢复行必须**没有**被自动推进
+		const kinds = h.runner.calls.map((c) => c[0]);
+		expect(kinds).not.toContain("resumeJob");
+		expect(made[0].state).toBe("convert_queued");
+		// 用户显式点「继续」才动
+		h.orch.act(made[0].id, "continue");
+		await flush(40);
+		expect(h.runner.calls.map((c) => c[0])).toContain("resumeJob");
+	});
+
+	it("恢复行的 failed 记录：mode=reselect（startJob(null) 必抛「缺少输入文件」）", async () => {
+		const h = mkOrch({
+			runner: {
+				listJobs: () => Promise.resolve([{
+					id: "jobF", state: "failed", nextAction: "discard",
+					source: { name: "a.kfb", size: 10 }, upload: null,
+					intent: { channel: "workbench-inline", target: null },
+				}]),
+				startJob: () => Promise.reject({
+					error: { code: "io_recoverable", message: "缺少输入文件" },
+				}),
+			},
+		});
+		const made = await h.orch.restore();
+		expect(made[0].mode).toBe("reselect");
+		expect(made[0].state).toBe("convert_failed");
+		// 点「继续」不得去调 startJob(null)
+		h.orch.act(made[0].id, "continue");
+		await flush(20);
+		expect(h.runner.calls.map((c) => c[0])).not.toContain("startJob");
+	});
+
+	it("恢复行的 ready 行回队（convert_in_browser）：mode 必须是 probe/bundle，不得 probe(null)", async () => {
+		let firstDone = true;
+		const h = mkOrch({
+			runner: {
+				listJobs: () => Promise.resolve([{
+					id: "jobR", state: "ready", nextAction: "export",
+					source: { name: "a.ome.tif", size: 10 },
+					upload: { ingestionId: "inj_1", state: "uploading" },
+					intent: { channel: "workbench-inline", target: null },
+				}]),
+				probe: (f: unknown) => {
+					if (f === null) {
+						// 真 runner._prepare 的第一句就是 file.slice(0,8)
+						return Promise.reject(new TypeError(
+							"Cannot read properties of null (reading 'slice')"));
+					}
+					return Promise.resolve({
+						jobId: "job_new", probe: { document: { modality: "brightfield" } },
+					});
+				},
+			},
+			onArtifact: () => {
+				if (firstDone) {
+					firstDone = false;
+					return Promise.reject({ data: { code: "convert_in_browser" } });
+				}
+				return Promise.resolve({ body: { slide_id: "sld_ok" } });
+			},
+		});
+		const made = await h.orch.restore();
+		made[0].file = null;              // 恢复行没有原始 File
+		h.orch.act(made[0].id, "continue");
+		await flush(60);
+		// 不得调用 probe(null)；应停下并说明需要重新选文件（reselect）
+		const probes = h.runner.calls.filter((c) => c[0] === "probe");
+		expect(probes.every((c) => c[1] !== null)).toBe(true);
+		expect(["convert_failed", "done"]).toContain(made[0].state);
+	});
+});
+
+// --------------------------------------------------------------------- //
+// 失败提示与入口（独立审查）：toast 文案、reselect、取消去重、申请去重
+// --------------------------------------------------------------------- //
+describe("失败提示与入口（独立审查）", () => {
+	function el(tag?: string) {
+		const children: unknown[] = [];
+		const listeners: Record<string, Array<(ev?: unknown) => void>> = {};
+		const node: Record<string, unknown> = {
+			tagName: (tag || "div").toUpperCase(),
+			hidden: true, textContent: "", innerHTML: "", value: "", disabled: false,
+			checked: false, type: "", title: "", name: "", href: "",
+			style: {}, children,
+			classList: { add() { }, remove() { }, contains() { return false; } },
+			parentNode: null,
+			appendChild(c: unknown) { children.push(c); return c; },
+			removeChild(c: unknown) {
+				const i = children.indexOf(c);
+				if (i >= 0) children.splice(i, 1);
+				return c;
+			},
+			insertBefore(c: unknown) { children.push(c); return c; },
+			addEventListener(type: string, fn: (ev?: unknown) => void) {
+				(listeners[type] = listeners[type] || []).push(fn);
+			},
+			removeEventListener() { }, setAttribute() { }, removeAttribute() { },
+			getAttribute() { return null; }, focus() { },
+			click() { (listeners["click"] || []).forEach((f) => f({ preventDefault() { } })); },
+		};
+		(node as { _listeners: typeof listeners })._listeners = listeners;
+		return node as ReturnType<typeof el> & {
+			_listeners: Record<string, Array<(ev?: unknown) => void>>;
+		};
+	}
+
+	function loadApp(caps: unknown) {
+		const store = new Map<string, string>();
+		const els: Record<string, ReturnType<typeof el>> = {};
+		const doc = {
+			readyState: "loading", cookie: "csrf_token=tok",
+			getElementById(id: string) { if (!els[id]) els[id] = el(); return els[id]; },
+			createElement(tag: string) { return el(tag); },
+			addEventListener() { }, querySelector() { return el(); },
+			querySelectorAll() { return []; }, body: el("body"), documentElement: el("html"),
+		};
+		const toasts: string[] = [];
+		const theFetch = vi.fn(() => Promise.resolve({
+			ok: true, status: 200, clone() { return this; },
+			json: () => Promise.resolve({}),
+		}));
+		const w: Record<string, unknown> = {
+			__PT_TEST_HOOKS: true,
+			// 真 i18n 语义：t(key, vars) 把 {x} 替换成 vars.x（含 {__i18n} 解析
+			// 由 app.js 的 inlineResolveVars 负责，这里模拟 tt 的替换）
+			HP_I18N: {
+				t: (k: string, vars?: Record<string, unknown>) => {
+					if (!vars) return k;
+					let out = k;
+					for (const [name, v] of Object.entries(vars)) {
+						out += `|${name}=${String(v)}`;
+					}
+					return out;
+				},
+				getLang: () => "zh",
+			},
+			HP_APP_BOOTSTRAP: { mode: "official", capabilities: caps },
+			fetch: theFetch,
+			location: { href: "http://local/", pathname: "/", origin: "http://local" },
+			confirm: vi.fn(() => true), open: vi.fn(() => null),
+			addEventListener: vi.fn(), innerWidth: 1280,
+			setTimeout: (fn: () => void, ms?: number) => setTimeout(fn, ms),
+			clearTimeout: (h: unknown) => clearTimeout(h as number),
+		};
+		(globalThis as { document?: unknown }).document = doc;
+		(globalThis as { window?: unknown }).window = w;
+		(globalThis as { fetch?: unknown }).fetch = theFetch;
+		(globalThis as { location?: unknown }).location = w.location;
+		(globalThis as { localStorage?: unknown }).localStorage = {
+			getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+			setItem: (k: string, v: string) => void store.set(k, String(v)),
+			removeItem: (k: string) => void store.delete(k),
+		};
+		// 捕获 toast 的实际文本（app.js 的 toast() 写 textContent）
+		new Function("window", "document", "fetch", "location",
+			readFileSync(resolve(root, "static/upload/cos-uploader.js"), "utf8"))(
+			w, doc, theFetch, w.location);
+		new Function("window", "document", "fetch", "location", sniffSrc)(w, doc, theFetch, w.location);
+		new Function("window", "document", "fetch", "location", inlineSrc)(w, doc, theFetch, w.location);
+		new Function("window", "document", "fetch", "location", appSrc)(w, doc, theFetch, w.location);
+		const toastEl = els["toast-container"] || doc.getElementById("toast-container");
+		return { w, els, doc, toasts, toastEl, fetch: theFetch };
+	}
+
+	const capsOn = () => ({
+		cos_upload: {
+			available: true, manual_only: true, max_size_bytes: 1000000,
+			part_bytes: 100, url_ttl_seconds: 600, max_concurrent_parts: 2,
+			sign_batch_max_parts: 8,
+			formats: ["tif", "tiff", "svs", "kfb", "zip"],
+			browser_convert: { formats: ["kfb"], url: "/tools/slides" },
+			direct_upload: { formats: ["tif", "tiff"] },
+			inline_convert: {
+				enabled: true, url: "/tools/slides",
+				viewable_formats: ["classic-bigtiff-jpeg-pyramid",
+					"ome-bigtiff-subifd-rgb-jpeg-pyramid"],
+			},
+		},
+	});
+
+	it("toast 形参里的 i18n 键被解析：不把 upload.inline.err.* 原文显示给用户", () => {
+		const h = loadApp(capsOn());
+		const up = h.w.HP_UPLOAD as unknown as {
+			inlineResolveVars?(v: unknown): unknown;
+			cosErrorMessage(s: number, d: unknown): string;
+		};
+		// 模块导出 msgKey（包装）+ app.js 的解析器
+		const ICx = h.w.HP_INLINE_CONVERT as { msgKey(k: string): unknown };
+		expect(ICx.msgKey("upload.inline.err.disk")).toEqual({ __i18n: "upload.inline.err.disk" });
+		// app.js 的适配器：_EXTRA_I18N 里 upload.inline.err.disk 是中文文案
+		expect(appSrc).toContain("inlineResolveVars");
+		// 面板的失败 toast 都经 msgKey 包装（不再传裸键）。
+		// 只看**代码行**：注释里会引用反例写法，不该影响断言。
+		const codeLines = inlineSrc.split("\n").filter(
+			(l) => !l.trim().startsWith("//") && !l.trim().startsWith("*"));
+		expect(codeLines.some((l) => /e:\s*msgKey\(/.test(l))).toBe(true);
+		expect(codeLines.some((l) => /\{\s*e:\s*"upload\./.test(l))).toBe(false);
+		void up;
+	});
+
+	it("reselect 按钮：resume_refused / job_dir_missing / io_recoverable 失败行给「重新选择文件」", () => {
+		const h = loadApp(capsOn());
+		const up = h.w.HP_UPLOAD as unknown as {
+			inlineButtonKinds(e: unknown): string[];
+			inlineButtonLabel(k: string, e: unknown): string;
+		};
+		const k = (code: string) => up.inlineButtonKinds({
+			state: "convert_failed", jobId: "j1", error: { code },
+		});
+		expect(k("resume_refused")).toContain("reselect");
+		expect(k("job_dir_missing")).toContain("reselect");
+		expect(k("io_recoverable")).toContain("reselect");
+		// 其它失败不误给（避免「重选文件」在无意义时出现）
+		expect(k("unsupported_input")).not.toContain("reselect");
+		expect(String(up.inlineButtonLabel("reselect", {}))).toBeTruthy();
+	});
+
+	it("uploading 态的取消按钮不重复：直传条目交给引擎那个，产物条目由面板给", () => {
+		const h = loadApp(capsOn());
+		const up = h.w.HP_UPLOAD as unknown as {
+			inlineButtonKinds(e: unknown): string[];
+		};
+		// 直传（无 jobId）：引擎自己 addRowButton，面板不再重复渲染
+		expect(up.inlineButtonKinds({ state: "uploading", jobId: null })).not.toContain("cancel");
+		// 产物（有 jobId）：引擎不给按钮，面板必须提供
+		expect(up.inlineButtonKinds({ state: "uploading", jobId: "j1" })).toContain("cancel");
+	});
+
+	it("终态不重复渲染 discard（done 既属终态集又被单列的历史缺陷）", () => {
+		const h = loadApp(capsOn());
+		const up = h.w.HP_UPLOAD as unknown as {
+			inlineButtonKinds(e: unknown): string[];
+		};
+		const kinds = up.inlineButtonKinds({ state: "done", jobId: "j1" });
+		expect(kinds.filter((x) => x === "discard")).toHaveLength(1);
+		expect(kinds.filter((x) => x === "support")).toHaveLength(0);
+	});
+
+	it("申请支持：在途期不重复提交（抽屉与行内两条入口都有守卫）", async () => {
+		const h = loadApp(capsOn());
+		const posts: unknown[] = [];
+		let resolvePost: (() => void) | null = null;
+		h.fetch.mockImplementation((url: string, init?: unknown) => {
+			if (String(url) === "/api/format-requests") {
+				posts.push(init);
+				return new Promise((res) => {
+					resolvePost = () => res({
+						ok: true, status: 202, clone() { return this; },
+						json: () => Promise.resolve({ request_id: "fr_1" }),
+					});
+				});
+			}
+			return Promise.resolve({
+				ok: true, status: 200, clone() { return this; }, json: () => Promise.resolve({}),
+			});
+		});
+		// 抽屉路径：在途期按钮保持 disabled
+		const submitBtn = h.els["fr-submit"] || h.doc.getElementById("fr-submit");
+		h.els["fr-ext"] = h.els["fr-ext"] || h.doc.getElementById("fr-ext");
+		(h.els["fr-ext"] as { value: string }).value = "xyz";
+		const drawerSubmit = (h.w.HP_PROJECT_UI as unknown as {
+			submitFormatRequest(): void;
+		}).submitFormatRequest;
+		// 按**浏览器语义**点击：disabled 时控件不派发 click（直接调函数会绕过
+		// 这层，正是原缺陷在人工点击下才暴露的原因）。
+		const clickIfEnabled = () => { if (!submitBtn.disabled) drawerSubmit(); };
+		clickIfEnabled();
+		await flush(4);
+		expect(posts.length).toBe(1);
+		expect(submitBtn.disabled).toBe(true);   // 在途期仍禁用（不是「先 true 再立刻 false」）
+		clickIfEnabled();
+		await flush(4);
+		expect(posts.length).toBe(1);            // 第二次点击被禁用档住
+		if (resolvePost) (resolvePost as () => void)();
+		await flush(10);
+		expect(submitBtn.disabled).toBe(false);  // 收口后恢复
+	});
+});
+
+// --------------------------------------------------------------------- //
+// 产物锁来源 / 已发布文案 / 转换进度订阅（独立审查）
+// --------------------------------------------------------------------- //
+describe("产物锁来源与进度订阅（独立审查）", () => {
+	const kfb = () => Uint8Array.from([0xF1, 0x01, 0xEE, 0xEE, 0x4B, 0x46, 0x42,
+		0x00, 0, 0, 0, 0]);
+
+	it("uploadLockName 取自 **engine**（HP_COS_UPLOAD 没有该方法）", async () => {
+		// 生产接线形态：cos 面**不带** uploadLockName（cos-uploader.js:1272-1282
+		// 的导出表里确实没有），只有 engine.js:38 有。
+		const locks = fakeLocks();
+		const h = mkOrch({
+			locks,
+			cos: { uploadLockName: undefined },
+			engine: {
+				uploadLockName: (id: string) => "slide-transform:upload:" + id,
+			},
+		});
+		h.orch.enqueue(fakeFile("a.kfb", kfb()));
+		await flush(30);
+		expect(locks.names).toContain("slide-transform:upload:job1");
+		expect(locks.names).toContain("pt:upload-slot:u1");
+	});
+
+	it("cos 面仍有该方法时也兼容（两个注入面都查）", async () => {
+		const locks = fakeLocks();
+		const h = mkOrch({ locks });
+		h.orch.enqueue(fakeFile("a.kfb", kfb()));
+		await flush(30);
+		expect(locks.names).toContain("slide-transform:upload:job1");
+	});
+
+	it("页内完成的行带上发布标记：删除文案说明「平台上的切片不受影响」（§6.3）", async () => {
+		const h = mkOrch({
+			onArtifact: () => Promise.resolve({ body: { slide_id: "sld_x" } }),
+		});
+		const ome = fakeFile("a.ome.tif", classicTiff(
+			'<?xml version="1.0"?><OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06"></OME>\x00'));
+		const e = h.orch.enqueue(ome)!;
+		await flush(30);
+		expect(e.state).toBe("done");
+		expect(e.uploadState).toBe("published");
+	});
+
+	it("多结果（zip）：从 body.items 取首个已发布 item 的 slide_id（job 级为 NULL）", async () => {
+		const h = mkOrch({
+			onArtifact: () => Promise.resolve({
+				body: {
+					kind: "zip", stage: "viewable", slide: "pack.zip",
+					items: [
+						{ item_key: "a.tif", slide_id: "sld_a", state: "published" },
+						{ item_key: "b.tif", slide_id: "sld_b", state: "published" },
+					],
+				},
+			}),
+		});
+		const e = h.orch.enqueue(fakeFile("pack.zip", new Uint8Array(16)))!;
+		await flush(30);
+		expect(e.state).toBe("done");
+		expect(e.slideId).toBe("sld_a");
+	});
+
+	it("转换阶段订阅 runner 事件：state/progress 驱动行文案与百分比（§3.3）", async () => {
+		// 带事件总线的假 runner（runner.js 的 on/_emit 同形）
+		const cbs: Record<string, Array<(p: unknown) => void>> = {};
+		const emit = (k: string, p: unknown) => (cbs[k] || []).forEach((f) => f(p));
+		const h = mkOrch({
+			runner: {
+				on: (k: string, f: (p: unknown) => void) => {
+					(cbs[k] = cbs[k] || []).push(f);
+					return undefined;
+				},
+				probe: () => new Promise((res) => setTimeout(() => res({
+					jobId: "job1", probe: { document: { modality: "brightfield" } },
+				}), 60)),
+			},
+		});
+		h.orch.enqueue(fakeFile("a.kfb", kfb()));
+		await flush(10);
+		// 订阅已建立
+		expect(Object.keys(cbs).sort()).toEqual(["phase", "progress", "state"]);
+		// 运行器发进度：行文案切到 running 且带百分比
+		emit("state", { to: "running" });
+		emit("progress", { unit: "level", done: 2, total: 8 });
+		await flush(4);
+		const keys = h.stages.map((x) => x[1]);
+		expect(keys).toContain("tools.phase.running");
+		// bundle 成员进度
+		emit("progress", { unit: "stage-bundle", done: 5, total: 10, member: 2, members: 4 });
+		await flush(4);
+		expect(h.stages.map((x) => x[1])).toContain("tools.phase.probing");
+	});
+
+	it("申请支持预填：bundle 条目不取文件夹名的「点后缀」（v2/01/c 之类）", () => {
+		const I = IC();
+		const pre = I.prefillFormatRequest({
+			name: "sample.2024.01", bundle: { rows: [], folderName: "sample.2024.01" },
+			cls: { ext: ".mrxs" },
+			error: { code: "need_bundle" },
+		}, null);
+		expect(pre.format_ext).toBe("mrxs");
+		expect(pre.message).toContain("bundle=1");
+		// 非 bundle 仍取真实扩展名
+		expect(I.prefillFormatRequest({ name: "shot.JPG" }, null).format_ext).toBe("jpg");
+	});
 });

@@ -1170,9 +1170,13 @@ vitest 单文件内两者**可以并存**（`import` 提升到模块顶，`new F
   （`testMatch: /upload-inline-convert\.spec\.ts$/`），并在默认 project 上
   `testIgnore` 该文件，避免其余 **16** 个 spec 被它的长超时/夹具影响或重复跑。
   没有 launch args：假 COS 是同机 HTTP，无需证书开关或 DNS 映射。
-  配置另按 CLI 是否点名该 spec 自动开 `E2E_INLINE_CONVERT`（显式设该 env 时
-  以调用方为准），因此「只跑这一个 spec」的命令不必额外带 env，而其余 spec
-  的默认路径仍是「不配 COS」。
+  配置另按 **测试选择参数**（argv[2..]，跳过 node 与 CLI 脚本路径）是否点名
+  该 spec 自动开 `E2E_INLINE_CONVERT`；env 里的该变量**只能关**
+  （0/false/no），不能把别的 spec 强行切成装配态（复核修复：本 worktree 的
+  目录名就叫 `upload-inline-convert`，`.bin/playwright` 的路径会误命中
+  `includes()`；且上一次验收留在 shell 里的 `=1` 会把「其余 spec 默认路径
+  完全不变」这条承诺悄悄打破）。因此「只跑这一个 spec」的命令不必额外带
+  env，而其余 spec 的默认路径仍是「不配 COS」。
 - `e2e_server.py` 的假 COS 与 HTTP 端点只在该 env 打开时装配，默认路径
   （CI 现有 spec）行为不变。
 

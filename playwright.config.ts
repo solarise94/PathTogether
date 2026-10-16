@@ -30,14 +30,31 @@ const PG_MARKER =
 /**
  * 上传面板内转换 E2E（docs/upload-inline-convert-design-20261015.md §9.4）需要
  * 被 server 侧装配的假 COS 基建（e2e_server.py 的 E2E_INLINE_CONVERT 门控）。
- * 仅当本次运行**确实**点名该 spec 时才自动打开：其余 spec 的默认路径完全不变
- * （既有的「默认不配 COS」语义保住）。显式设 `E2E_INLINE_CONVERT=0/1` 时以
- * 调用方为准。
+ *
+ * 两条硬约束（复核修复）：
+ *  1. `argv` 只看**测试选择参数**，不看 argv[0]/argv[1]（node 与 CLI 脚本
+ *     路径）。本 worktree 的目录名本身就叫 `upload-inline-convert`，`.bin/
+ *     playwright` 的路径因此天然命中 `includes(INLINE_SPEC)`——那会让**任意**
+ *     spec 都误开假 COS 基建。
+ *  2. 环境里的 `E2E_INLINE_CONVERT` **只能关**（"0"/"false"/"no"），不能把
+ *     其它 spec 强行切成装配态：上一次手动验收留在 shell 里的 =1 不该改变
+ *     别人的默认路径（「其余 spec 默认路径完全不变」是本次改动的承诺）。
+ *     需要带着基建跑别的 spec 时，显式点名本 spec 或临时清掉该变量。
  */
 const INLINE_SPEC = "upload-inline-convert";
-const RUNS_INLINE_SPEC = process.argv.some((a) => a.includes(INLINE_SPEC));
-const E2E_INLINE_CONVERT =
-	process.env.E2E_INLINE_CONVERT ?? (RUNS_INLINE_SPEC ? "1" : "");
+/** 只看测试选择参数（argv[2..]），跳过 node 与 playwright CLI 自身的路径。 */
+function selectsInlineSpec(argv: string[]): boolean {
+	return argv.slice(2).some((a) => a.includes(INLINE_SPEC));
+}
+const RUNS_INLINE_SPEC = selectsInlineSpec(process.argv);
+const INLINE_OFF = ["0", "false", "no"];
+const E2E_INLINE_CONVERT = INLINE_OFF.includes(
+	String(process.env.E2E_INLINE_CONVERT ?? "").trim().toLowerCase(),
+)
+	? ""
+	: RUNS_INLINE_SPEC
+		? "1"
+		: "";
 
 interface PgMarker {
 	pgdata?: string;

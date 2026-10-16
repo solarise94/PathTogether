@@ -144,7 +144,13 @@
   // ------------------------------------------------------------- 失败文案 --
 
   /// 引擎错误码 / 服务端码 → 行内文案键（设计 §7.3 + §7.4）。未知码 null
-  /// （调用方回落原文，不猜语义）。
+  /// （调用方回落原文机器码——排障需要它，绝不猜语义）。
+  ///
+  /// 覆盖面按三处**真实词表**对齐（复核修复：此前只有 16 个分支，落空的服务端
+  /// 码一律显示通用「上传失败」+ 机器码，相对既有 cosErrorMessage 是能力回退）：
+  ///   - engine.js ERROR_CODES（前端运行器自己的码）
+  ///   - slide-transform-core 的 `ErrorCode`（wasm 核心的类型化码，经运行器透出）
+  ///   - cos_ingest_worker 的 `_fail("...")`（服务端终态码）
   function failureStageKey(code, detail) {
     if (code === "disk_precheck_failed") return "upload.inline.err.disk";
     if (code === "quota_exceeded_recoverable") return "upload.inline.err.quota";
@@ -165,6 +171,36 @@
     if (code === "convert_in_browser") return "upload.inline.err.needs.convert";
     if (code === "client_gone") return "upload.cos.err.client_gone";
     if (code === "client_idle_timeout") return "upload.cos.err.client_idle_timeout";
+    // —— 上传控制面/服务端（与既有 cosErrorMessage 同一批文案键）——
+    if (code === "cos_waiting_limit" || code === "cos_waiting_capacity") {
+      return "upload.cos.err.waiting_limit";
+    }
+    if (code === "ingestion_state_conflict") return "upload.cos.err.state";
+    if (code === "cos_sign_rate_limited") return "upload.cos.err.rate";
+    if (code === "cos_capacity_reconcile_required") return "upload.cos.err.reconcile";
+    if (code === "plan_size_mismatch") return "upload.cos.err.plan";
+    if (code === "name_unavailable") return "upload.err.name";
+    if (code === "invalid_declared_size") return "upload.err.size_mismatch";
+    if (code === "cos_unavailable") return "upload.cos.err.unavailable";
+    if (code === "cos_format_unsupported") return "upload.cos.err.format_unsupported";
+    if (code === "hash_mismatch") return "upload.err.hash_mismatch";
+    // —— wasm 核心的类型化码（经运行器透出）——
+    if (code === "unsupported_kfb_variant" || code === "invalid_kfb_header" ||
+        code === "invalid_tile_index") {
+      return "upload.inline.err.unsupported";
+    }
+    if (code === "part_missing" || code === "local_size_mismatch" ||
+        code === "download_budget_exceeded" || code === "source_not_pinned" ||
+        code === "reservation_expired" || code === "publish_conflict" ||
+        code === "commit_recovery_failed" || code === "zip_items_failed" ||
+        code === "slide_binding_missing") {
+      return "upload.cos.err.validation";
+    }
+    // 网络层/分块级失败：面板的「继续上传」是**续传同一 ingestion**（不需要
+    // 重选文件），所以用面板自己的措辞——工具页的 upload.cos.resume_hint
+    //（「重新选择同名文件可续传」）在这里会误导。
+    if (code === "network") return "upload.inline.err.network";
+    if (code === "part_failed") return "upload.inline.err.part";
     return null;
   }
 
@@ -173,13 +209,23 @@
     var e = entry || {};
     var ext = "";
     var name = String(e.name || "");
-    var dot = name.lastIndexOf(".");
-    if (dot >= 0) ext = name.slice(dot + 1).toLowerCase();
+    // bundle 条目的 name 是**文件夹名**（enqueueBundle 的 folderName）：对它
+    // 取「最后一个点后的段」会填出 v2 / 01 / c 这类无意义值，或（无点时）
+    // 留空 → 服务端「缺少格式/扩展名」而用户没有输入框可补。故 bundle 用
+    // 其**必然的入口扩展名**（.mrxs / .vms）作为声明值。
+    if (e.bundle) {
+      ext = (e.cls && e.cls.ext) ? String(e.cls.ext).replace(/^\./, "")
+        : "mrxs";
+    } else {
+      var dot = name.lastIndexOf(".");
+      if (dot >= 0) ext = name.slice(dot + 1).toLowerCase();
+    }
     var code = (e.error && e.error.code) || "unsupported";
     var parts = ["code=" + code];
     if (e.error && e.error.detectedType) {
       parts.push("detected=" + e.error.detectedType);
     }
+    if (e.bundle) parts.push("bundle=1");
     if (ext) parts.push("declared=." + ext);
     if (e.error && e.error.engineReason) {
       parts.push("engine_reason=" + String(e.error.engineReason).slice(0, 300));
@@ -189,6 +235,15 @@
       parts.push("panel=" + caps.inlineConvert.url);
     }
     return { format_ext: ext, message: parts.join("; ") };
+  }
+
+  /// i18n 键的**显式包装**：形参值若是文案键，必须包成 `{__i18n: key}`——
+  /// 否则 `tt("upload.fail", {e: "upload.inline.err.disk"})` 会把键原文插进
+  /// `{e}` 显示给用户（工作台适配器只翻译外层键，不做嵌套解析；设计 §7.1
+  /// 要求「服务端返回的机器码不再原样透出」）。非键的值（文件名、机器码、
+  /// 数字）原样传，未知码保留原文（排障需要机器码）。
+  function msgKey(key) {
+    return { __i18n: String(key || "") };
   }
 
   /// 哪些状态必须注册 beforeunload（设计 §6.2 第 7 点）：按**语义**判据
@@ -284,6 +339,8 @@
     var locks = deps.locks ||
       (typeof navigator !== "undefined" ? navigator.locks : null);
     var account = typeof deps.account === "function" ? deps.account : function () { return ""; };
+    // 文案格式化（app.js 注入 tt）：模块只持有键与形参，不自己实现 i18n。
+    var t = typeof deps.t === "function" ? deps.t : function (k) { return String(k); };
 
     var entries = [];          // 队列（含终态，供行渲染与清理）
     var seq = 0;
@@ -291,6 +348,7 @@
     var activeUpload = null;   // 当前上传中的 entry
     var resumed = {};          // jobId -> true（已恢复的行，避免重复）
     var pumpScheduled = false;
+    var attached = false;   // runner 事件只订阅一次
 
     function uuid() {
       if (deps.uuid) return deps.uuid();
@@ -331,9 +389,14 @@
       return null;
     }
 
+    /// note 若是**文案键**，用 msgKey 包装（app.js 的适配器解析后渲染）；
+    /// 已渲染的字符串原样传。这样模块不必自己持有 i18n。
     function setStage(e, key, frac, note, indeterminate) {
-      e.stage = { key: key, frac: frac, note: note || "", indeterminate: !!indeterminate };
-      if (ui.setStage) ui.setStage(e, key, frac, note, indeterminate);
+      var n = "";
+      if (typeof note === "string" && note) n = msgKey(note);
+      else if (note) n = note;
+      e.stage = { key: key, frac: frac, note: n, indeterminate: !!indeterminate };
+      if (ui.setStage) ui.setStage(e, key, frac, n, indeterminate);
     }
 
     function markError(e, code, detail, extra) {
@@ -448,7 +511,7 @@
         markError(e, "unsupported_ext", null, {});
         e.state = "rejected";
         setStage(e, "upload.inline.stage.rejected");
-        toast("upload.fail", { e: "upload.err.unsupported" }, "error");
+        toast("upload.fail", { e: msgKey("upload.err.unsupported") }, "error");
         if (ui.buttons) ui.buttons(e);
         settle(e, "rejected");
         return Promise.resolve(e);
@@ -581,6 +644,9 @@
       for (var i = 0; i < entries.length; i++) {
         var e = entries[i];
         if (states.indexOf(e.state) < 0) continue;
+        // 停放中的恢复行不参与调度（设计 §6.2 第 1 点「不自动开始」）：
+        // 刷新恢复只建行，只有用户点「继续」才解除停放入队。
+        if (e.parked) continue;
         if (!best || e.seq < best.seq) best = e;
       }
       return best;
@@ -626,6 +692,7 @@
       e.state = "converting";
       if (ui.buttons) ui.buttons(e);
       setStage(e, "tools.phase.probing", null, "", true);
+      attachRunnerEvents();
       var jobOpts = {
         confirmUncertainDisk: !!e._confirmDisk,
         outputProfile: defaultOutputProfile(e),
@@ -633,6 +700,10 @@
           ? engine.ENCODING_PROFILES.PRESERVE : undefined,
       };
       var mode = e.mode || (e.bundle ? "bundle" : "probe");
+      if (mode === "probe") {
+        // 新文件：模态未知，绝不复用上一次（失败重试/换文件）留下的值
+        e.modality = null;
+      }
       var first;
       try {
         if (mode === "resume") {
@@ -676,16 +747,24 @@
       });
     }
 
-    /// 输出格式默认（设计 §4.4）：明场 bf-ome / 荧光 fl-ome；旧记录优先。
+    /// 输出格式默认（设计 §4.4）：明场 bf-ome / 荧光 fl-ome。
+    /// **模态未知时不传**（undefined）——让运行器按源文件自己的 modality
+    /// 取默认（`_prepare` 的 `opts.outputProfile || defaultOutputProfile(
+    /// doc.modality)`）。绝不能对未知模态硬塞 BF_OME：荧光 KFBF 会被
+    /// checkedOutputProfile 以 unsupported_input 拒绝，且重试永不自愈。
+    /// 与工具页同一口径（tools-slides.js:983 outputProfileForModality 只对
+    /// brightfield 传选择）。
     function defaultOutputProfile(e) {
       var O = engine && engine.OUTPUT_PROFILES;
       if (!O) return undefined;
       if (e.modality === "fluorescence") return O.FL_OME;
-      return O.BF_OME;
+      if (e.modality === "brightfield") return O.BF_OME;
+      return undefined;   // 未知（新文件）：交给运行器按探测结果决定
     }
 
     function onConverted(e, result) {
-      activeConvert = null;
+      releaseConvertSlot(e);
+      if (e.cancelled) return;   // 用户已取消：迟到回执不改状态
       if (!result || result.type === "cancelled" || (result && result.cancelled)) {
         e.state = "cancelled";
         setStage(e, "tools.phase.cancelled");
@@ -722,7 +801,7 @@
     }
 
     function failConvert(e, err) {
-      activeConvert = null;
+      releaseConvertSlot(e);
       var code = (err && (err.error ? err.error.code : err.code)) || "io_recoverable";
       var detail = (err && (err.error ? err.error.detail : err.detail)) || null;
       var reason = (err && (err.error ? err.error.message : err.message)) || null;
@@ -733,13 +812,25 @@
       markError(e, code, detail, { engineReason: reason });
       e.state = isTerminalCode(code) ? "convert_failed" : "convert_failed";
       setStage(e, "upload.inline.stage.convertFailed");
-      toast("upload.fail", { e: failureStageKey(code, detail) || code }, "error");
+      toast("upload.fail", { e: failureStageKey(code, detail)
+        ? msgKey(failureStageKey(code, detail)) : code }, "error");
       if (ui.buttons) ui.buttons(e);
       settle(e, "convert_failed");
     }
 
     function isTerminalCode(code) {
       return code !== "disk_precheck_failed";
+    }
+
+    /// 释放槽位（带身份守卫）：只在当前槽位仍属于该条目时才清空。
+    /// 迟到的转换回调（取消后 onConverted / resumeJob 的 done）绝不能清掉
+    /// **新**条目的槽位——否则两个转换会并发（设计 §5「至多 1 个」）。
+    function releaseConvertSlot(e) {
+      if (activeConvert === e) activeConvert = null;
+    }
+    function releaseUploadSlot(e) {
+      if (activeUpload === e) activeUpload = null;
+      if (e && e._releaseLocks) { e._releaseLocks(); e._releaseLocks = null; }
     }
 
     // ----------------------------------------------------- 上传执行 --
@@ -761,7 +852,20 @@
       }
       var acct = String(account() || "");
       var names = [];
-      if (e.jobId && cos && cos.uploadLockName) names.push(cos.uploadLockName(e.jobId));
+      // 产物锁名：`uploadLockName` 是 **engine.js 的导出**（engine.js:38），
+      // HP_COS_UPLOAD 没有它（cos-uploader.js:1272-1282 的导出表可核）。
+      // 两个注入面都查、engine 优先——只查 cos 会让这把锁在生产中永不请求，
+      // 于是 runner.discardJob / 工具页的 startOrContinue 都不受它保护
+      // （设计 §5 的 R3 修正会静默失效）。
+      var lockName = null;
+      if (e.jobId) {
+        if (engine && typeof engine.uploadLockName === "function") {
+          lockName = engine.uploadLockName(e.jobId);
+        } else if (cos && typeof cos.uploadLockName === "function") {
+          lockName = cos.uploadLockName(e.jobId);
+        }
+      }
+      if (lockName) names.push(lockName);
       names.push("pt:upload-slot:" + acct);
       var releases = [];
       function take(name) {
@@ -832,6 +936,15 @@
       // 直接交给 app.js 的直传实现（设计 §5.1：viewable_formats 不适用于直传）。
       // 有 = 本机产物（转换产物 / 刷新恢复的 ready 行）→ 走产物门禁。
       if (!e.jobId) {
+        if (!caps.cosConfig) {
+          // 能力不可用：不进入 onArtifact（也就不会 POST /api/ingestions）
+          markError(e, "cos_unavailable", null, {});
+          setStage(e, "upload.cos.unavailable");
+          toast("upload.fail", { e: msgKey("upload.cos.unavailable") }, "error");
+          if (ui.buttons) ui.buttons(e);
+          failUpload(e, { data: { code: "cos_unavailable" }, __skipStage: true });
+          return Promise.resolve();
+        }
         if (typeof deps.onArtifact !== "function") {
           failUpload(e, { data: { code: "cos_unavailable" } });
           return Promise.resolve();
@@ -853,12 +966,12 @@
           // 门禁（设计 §5.1）：能力 + 账号 + **最终产物**大小 + viewable_formats
           var gate = entryArtifactGate(e, job);
           if (!gate.ok) {
-            markError(e, gate.code, null, {});
-            e.state = "convert_failed";
-            setStage(e, gate.stageKey);
-            toast("upload.fail", { e: gate.stageKey }, "error");
-            if (ui.buttons) ui.buttons(e);
-            return Promise.reject({ __handled: true });
+            // 终态收口（设计 §5.1「停在 convert_failed」是常见结局）：
+            // 由 failUpload 统一释放上传槽与锁——绝不用 __handled 直接
+            // reject（那条路径绕开 failUpload，槽位与锁都不释放）。
+            return Promise.reject({
+              __gate: true, code: gate.code, stageKey: gate.stageKey,
+            });
           }
           return runner.artifactView(e.jobId);
         })
@@ -886,13 +999,26 @@
           return completeUpload(e, outcome);
         })
         .then(null, function (err) {
-          if (err && err.__handled) return;
+          if (err && err.__gate) {
+            markError(e, err.code, null, {});
+            setStage(e, err.stageKey);
+            toast("upload.fail", { e: msgKey(err.stageKey) }, "error");
+            if (ui.buttons) ui.buttons(e);
+            failUpload(e, { data: { code: err.code }, __skipStage: true });
+            return;
+          }
           failUpload(e, err);
         });
     }
 
     /// 成功/取消收口（转换产物与直传共用）。
     function completeUpload(e, outcome) {
+      // 用户已取消：迟到的成功回执不得把行翻回「入库完成」并触发关联/打开
+      if (e.cancelled) { releaseUploadSlot(e); return; }
+      // 释放上传槽（成功/取消都走这里）——不释放的话 pump 的 `if (!activeUpload)`
+      // 永不放行，同页后续条目会永久停在 upload_queued（§5「1 个上传」退化成
+      // 「一辈子 1 个」）。
+      releaseUploadSlot(e);
       if (outcome && outcome.cancelled) {
         e.state = "cancelled";
         setStage(e, "upload.cos.cancelled");
@@ -901,8 +1027,23 @@
         return;
       }
       var body = (outcome && outcome.body) || {};
-      e.slideId = body.slide_id ||
-        (body.conversion && body.conversion.slide_id) || null;
+      // 多结果（zip）：job 级 slide_id 恒为 NULL（ingestion_store 只给 native
+      // 预分配），服务端把逐 item 结果放在 body.items —— 取首个已发布的
+      // slide_id 作为打开/关联目标（与既有 cosUploadSucceeded 同一口径）。
+      e.slideId = body.slide_id || null;
+      if (!e.slideId && body.items && body.items.length) {
+        for (var i = 0; i < body.items.length; i++) {
+          if (body.items[i] && body.items[i].state === "published") {
+            e.slideId = body.items[i].slide_id || null;
+            break;
+          }
+        }
+      }
+      if (!e.slideId && body.conversion && body.conversion.slide_id) {
+        e.slideId = body.conversion.slide_id;
+      }
+      // 已发布标记：删除本地产物的文案据此说明「平台上的切片不受影响」（§6.3）
+      e.uploadState = "published";
       e.state = "done";
       setStage(e, "upload.stage.done", 1);
       if (ui.buttons) ui.buttons(e);
@@ -1008,8 +1149,8 @@
     }
 
     function failUpload(e, err) {
-      activeUpload = null;
-      if (e._releaseLocks) { e._releaseLocks(); e._releaseLocks = null; }
+      releaseUploadSlot(e);
+      if (e.cancelled) return;   // 用户已取消：取消回声不当失败处理
       var code = "";
       var detail = null;
       if (err && err.magicMismatch) {
@@ -1038,6 +1179,22 @@
         e.directClass = null;
         e.jobId = null;
         e.uploadJobId = null;
+        // 回队 = **重新转换**：mode 必须落到 probe/bundle，否则恢复行
+        // （mode=null）会走 probe(null) → TypeError（"Cannot read properties
+        // of null"）。包条目走 bundle，其余走 probe（需要原始 File）。
+        e.mode = e.bundle ? "bundle" : "probe";
+        e._resume = false;
+        if (!e.bundle && !e.file) {
+          // 恢复行没有原始 File：无法在面板内重转，明确要求重选文件
+          // （设计 §6.3：重新选择文件）。
+          e.mode = "reselect";
+          markError(e, "resume_refused", "no_source_file", {});
+          e.state = "convert_failed";
+          setStage(e, "upload.inline.stage.convertFailed");
+          if (ui.buttons) ui.buttons(e);
+          settle(e, "convert_failed");
+          return;
+        }
         e.state = "requeue_convert";
         setStage(e, "upload.inline.stage.requeue");
         if (ui.buttons) ui.buttons(e);
@@ -1046,9 +1203,19 @@
         return;
       }
       markError(e, code || "upload_failed", detail, {});
+      // 门禁分支已自行决定终态文案（convert_failed + 具体原因），不覆盖
+      if (err && err.__skipStage) {
+        e.state = "convert_failed";
+        if (ui.buttons) ui.buttons(e);
+        settle(e, "convert_failed");
+        return;
+      }
       e.state = "upload_failed";
       setStage(e, failureStageKey(code, detail) || "upload.stage.failed");
-      toast("upload.fail", { e: failureStageKey(code, detail) || code || "—" }, "error");
+      toast("upload.fail", {
+        e: failureStageKey(code, detail)
+          ? msgKey(failureStageKey(code, detail)) : (code || "—"),
+      }, "error");
       if (ui.buttons) ui.buttons(e);
       settle(e, "upload_failed");
     }
@@ -1060,6 +1227,7 @@
       var e = find(id);
       if (!e) return null;
       if (action === "continue") {
+        e.parked = false;            // 用户显式继续 → 解除停放，允许入队
         if (e.state === "upload_queued" || e.state === "upload_failed") {
           e.state = "upload_queued";
           setStage(e, "upload.inline.stage.queued");
@@ -1067,7 +1235,14 @@
           schedule();
           return e;
         }
-        e._resume = !!e.jobId;
+        // 恢复行的 mode 由 restore 按运行器的 nextAction 定；用户新入队的
+        // 条目恒为 'probe'（有原始 File）。
+        if (e.mode === "reselect") {
+          // 运行器对 failed 记录 reusable=false，startJob(null) 只会抛
+          // io_recoverable「缺少输入文件」——必须重新选文件（设计 §6.3）。
+          return e;
+        }
+        e._resume = e.mode === "resume";
         e.state = "convert_queued";
         setStage(e, "upload.inline.stage.queued");
         if (ui.buttons) ui.buttons(e);
@@ -1076,11 +1251,13 @@
       }
       if (action === "confirmDisk") {
         // 确认后**带原始输入重新起**（设计 §6.2.1）：运行器已丢弃旧 job，
-        // 因此绝不复用旧 jobId。
+        // 因此绝不复用旧 jobId。模态随之重新探测。
         e._confirmDisk = true;
         e.jobId = null;
         e._resume = false;
         e.error = null;
+        e.modality = null;
+        e.mode = e.bundle ? "bundle" : "probe";
         e.state = "convert_queued";
         setStage(e, "upload.inline.stage.queued");
         if (ui.buttons) ui.buttons(e);
@@ -1099,14 +1276,24 @@
     }
 
     function cancel(e) {
+      // 取消是**用户意图**：先打标记，随后的迟到回执（转换 done / 上传
+      // 成功或 cancelled）不得把它翻回 done/upload_failed。
+      e.cancelled = true;
       if (e.state === "converting" && runner.cancelJob) {
         Promise.resolve(runner.cancelJob()).then(null, function () { /* */ });
-      } else if (e.state === "uploading" && e._upload && e._upload.cancel) {
-        e._upload.cancel();
       }
-      activeConvert = activeConvert === e ? null : activeConvert;
-      activeUpload = activeUpload === e ? null : activeUpload;
-      if (e._releaseLocks) { e._releaseLocks(); e._releaseLocks = null; }
+      // 停传：产物条目走 e._upload（本模块 uploadArtifact 设的引擎句柄）；
+      // 直传条目的引擎在 app.js 的 uploadFileCos 闭包里 —— 由注入的
+      // deps.cancelArtifact(entry) 转达（app.js 侧取消其引擎并 POST /cancel）。
+      if (e.state === "uploading") {
+        if (e._upload && e._upload.cancel) {
+          try { e._upload.cancel(); } catch (err) { /* */ }
+        } else if (typeof deps.cancelArtifact === "function") {
+          try { deps.cancelArtifact(e); } catch (err) { /* */ }
+        }
+      }
+      releaseConvertSlot(e);
+      releaseUploadSlot(e);
       setStage(e, "upload.cos.cancelled");
       settle(e, "cancelled");
     }
@@ -1173,8 +1360,22 @@
           // 后建行会让恢复行的状态文案永远为空（设计 §6.2 第 3 点要求显示
           // 「未完成的转换」，这也是「继续」按钮唯一的解释性文案）。
           if (ui.row) ui.row(e);
-          if (unfinished && (job.state === "ready" || job.state === "exported")) {
-            // 产物已就绪 → 直接「继续上传」（跳过转换；设计 §6.2 第 3 点）
+          // 恢复行一律**停放**（parked）：建行但绝不参与调度，直到用户点
+          // 「继续」（设计 §6.2 第 1 点）。否则后续任何 schedule（例如用户又
+          // 拖入一个无关文件）都会把它自动续跑并自动上传，与「不自动开始」
+          // 及 §9.2 第 9 项的正例口径冲突。
+          e.parked = true;
+          if (job.state === "failed") {
+            // 非 bundle 的 failed 记录 reusable=false：startJob(null) 必抛
+            // 「缺少输入文件」；bundle 记录虽可复用，但「失败后直接重跑」
+            // 不是用户可预期的动作。两者统一给「重新开始转换（重新选择
+            // 文件）」——与设计 §6.3 的 resume_refused/job_dir_missing 同处置。
+            e.mode = "reselect";
+            e.state = "convert_failed";
+            markError(e, "resume_refused", "job_failed", {});
+            setStage(e, "upload.inline.stage.convertFailed");
+          } else if (unfinished && (job.state === "ready" || job.state === "exported")) {
+            // 产物已就绪 → 用户点「继续」后直接「继续上传」（跳过转换）
             e.mode = null;
             e.state = "upload_queued";
             setStage(e, "upload.inline.stage.resumable");
@@ -1195,6 +1396,37 @@
         if (ui.refresh) ui.refresh(null);
         return made;
       }, function () { return []; });
+    }
+
+    /// 订阅运行器事件（设计 §3.3）：把 runner 的 state / progress / phase
+    /// 映射到**当前转换中条目**的行文案与进度。此前 progressStage/PHASE_KEYS
+    /// 只有定义与单测、生产零调用点，长转换全程只有一个不定态文案。
+    /// 只认 activeConvert（至多 1 个转换），其它事件的入口不属于本面板时不画。
+    function attachRunnerEvents() {
+      if (!runner || typeof runner.on !== "function" || attached) return;
+      attached = true;
+      runner.on("state", function (st) {
+        var e = activeConvert;
+        if (!e || !st || !st.to) return;
+        var key = PHASE_KEYS[st.to];
+        if (key) setStage(e, key, null, "", true);
+      });
+      runner.on("progress", function (pr) {
+        var e = activeConvert;
+        if (!e) return;
+        var mapped = progressStage(pr);
+        if (!mapped) return;
+        setStage(e, mapped.key, mapped.frac,
+                 mapped.noteKey ? t(mapped.noteKey, mapped.noteVars) : "",
+                 mapped.frac === null || mapped.frac === undefined);
+      });
+      runner.on("phase", function (ph) {
+        var e = activeConvert;
+        if (!e || !ph || !ph.phase) return;
+        if (ph.phase === "stage-bundle") {
+          setStage(e, "tools.phase.probing", null, "", true);
+        }
+      });
     }
 
     function list() { return entries.slice(); }
@@ -1233,6 +1465,7 @@
     directDeclaration: directDeclaration,
     artifactGate: artifactGate,
     failureStageKey: failureStageKey,
+    msgKey: msgKey,
     prefillFormatRequest: prefillFormatRequest,
     shouldWarn: shouldWarn,
     isTerminal: isTerminal,

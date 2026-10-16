@@ -131,6 +131,8 @@
     "upload.inline.err.io": { zh: "本地读写错误：请重试", en: "Local I/O error: please retry" },
     "upload.inline.err.magic": { zh: "内容与扩展名不符：请用正确格式重新保存后再上传", en: "Content does not match the extension: re-save it in the correct format" },
     "upload.inline.err.notViewable": { zh: "平台暂不支持查看该转换产物：请改用「保存到本机」", en: "The platform cannot view this converted artifact yet: use 'Save to this machine'" },
+    "upload.inline.err.network": { zh: "网络中断：产物已保留，点「继续上传」续传（已传分块会跳过）", en: "Network interrupted: the artifact is kept; click 'Continue upload' to resume (uploaded parts are skipped)" },
+    "upload.inline.err.part": { zh: "部分分块上传失败：点「继续上传」续传（已确认分块会跳过）", en: "Some parts failed to upload: click 'Continue upload' to resume (confirmed parts are skipped)" },
     "upload.inline.err.needs.convert": { zh: "该格式需先在本机转换后上传", en: "This format must be converted on this machine before uploading" },
     "upload.inline.disk.confirm": { zh: "继续（我已确认）", en: "Continue (I understand)" },
     "upload.inline.action.continue": { zh: "继续", en: "Continue" },
@@ -10876,9 +10878,16 @@
 
       // done 收口（成功/失败/取消）后立刻释放内容锁：等待标签随后重读
       // 回执/记录（工具页）或续传候选（工作台）。
+      if (opts.onEngine) {
+        // 面板直传条目：把引擎句柄交回调用方（取消按钮才能真正停传 +
+        // POST /cancel；否则「取消」只改行文案，后台传输照跑并最终翻回完成）。
+        try { opts.onEngine(upload); } catch (e) { /* 回调失败不影响上传 */ }
+      }
       var settled = upload.done.then(function (r) {
         if (!r || r.cancelled) {
-          if (opts.onOutcome) opts.onOutcome(null, { cancelled: true });
+          if (opts.onOutcome) {
+            opts.onOutcome(null, { cancelled: true, __cancelled: true });
+          }
           return;
         }
         if (opts.onOutcome) {
@@ -11115,13 +11124,23 @@
           setStage: inlineRowSetStage,
           markError: inlineRowMarkError,
           buttons: inlineRowButtons,
-          toast: function (key, vars, kind) { toast(tt(key, vars), kind || "info"); },
+          toast: function (key, vars, kind) {
+            // 形参值可能是 {__i18n: key} 包装（面板把文案键作为值传递的
+            // 唯一合法形式）：先解析内层键再翻译外层，避免把键原文显示给用户。
+            toast(tt(key, inlineResolveVars(vars)), kind || "info");
+          },
           refresh: function () { applyBeforeunload(); },
           remove: inlineRowRemove,
         },
         account: function () { return String(currentUserId || ""); },
+        t: function (key, vars) { return tt(key, inlineResolveVars(vars)); },
         target: function () { return importTargetSnapshot(); },
         onArtifact: uploadEntryArtifact,
+        cancelArtifact: function (entry) {
+          if (entry && entry._upload && entry._upload.cancel) {
+            try { entry._upload.cancel(); } catch (e) { /* */ }
+          }
+        },
         onUploaded: inlineUploaded,
         apiFetch: apiFetch,
         apiFetchNoRedirect: apiFetchNoRedirect,
@@ -11149,6 +11168,20 @@
       browserConvertFormats: (cos.browser_convert && cos.browser_convert.formats) || null,
       cosConfig: resolveCosConfig(),
     };
+  }
+
+  /// toast/文案形参里的 i18n 键包装（{__i18n: key}）→ 已翻译文本。
+  /// 非包装值原样保留（文件名、机器码、数字）；未提供 i18n 词条时 tt 回落
+  /// key 本身，与既有语义一致。
+  function inlineResolveVars(vars) {
+    if (!vars || typeof vars !== "object") return vars;
+    var out = {};
+    Object.keys(vars).forEach(function (k) {
+      var v = vars[k];
+      out[k] = (v && typeof v === "object" && typeof v.__i18n === "string")
+        ? tt(v.__i18n) : v;
+    });
+    return out;
   }
 
   // ---------- 行渲染（复用 makeUploadRow 的四段 + 按钮组） ----------
@@ -11197,10 +11230,15 @@
     return "";
   }
 
+  /// noteText 约定：**已渲染的文案**（调用方用 t/tt + 形参渲染），或空串。
+  /// 不在这里二次 tt——那会把已经渲染好的字节串当键去查表。
   function inlineRowSetStage(entry, key, frac, noteText, indeterminate) {
     var rec = inlineRowEls[entry.id];
     if (!rec) return;
-    var extra = noteText ? " · " + tt(noteText) : "";
+    var resolved = (noteText && typeof noteText === "object" &&
+                    typeof noteText.__i18n === "string")
+      ? tt(noteText.__i18n) : noteText;
+    var extra = resolved ? " · " + resolved : "";
     rec.row.setStage(key, frac, extra, indeterminate);
     if (rec.note && rec.note.textContent !== undefined) {
       rec.note.textContent = inlineRowNoteText(entry);
@@ -11279,23 +11317,41 @@
     if (st === "upload_queued" && entry.viaRestore) out.push("continueUpload");
     if (st === "need_disk_confirm") out.push("confirmDisk", "cancel");
     if (st === "converting") out.push("cancel");
-    if (st === "uploading") out.push("cancel");
+    // uploading 态的「取消」**按来源分派**，避免行上出现两个同名按钮：
+    //   - 直传条目（无 jobId）：uploadFileCos 自己 addRowButton 挂一个，
+    //     它走引擎 cancel()（真 abort + POST /cancel）——面板不再重复渲染；
+    //   - 产物条目（有 jobId）：走面板 cancel 通道（e._upload / cancelArtifact），
+    //     引擎不会为它挂按钮，必须由面板提供。
+    if (st === "uploading" && entry.jobId) out.push("cancel");
     if (st === "rejected") out.push("support");
     if (st === "convert_failed") {
       if (entry.error && entry.error.code === "need_bundle") {
         out.push("chooseFolder");
+      } else if (entry.error && (entry.error.code === "resume_refused" ||
+                                 entry.error.code === "job_dir_missing" ||
+                                 entry.error.code === "io_recoverable")) {
+        // 设计 §6.3：失败记录的续跑前提已不成立（版本/设置不符、目录被驱逐、
+        // 本地读写错误）→ 必须**重新选择文件**才有出路；另给申请支持。
+        out.push("reselect", "support", "saveLocal");
       } else {
         out.push("support", "saveLocal");
       }
+      if (entry.jobId) out.push("discard");
     }
-    if (st === "upload_failed") out.push("support");
+    if (st === "upload_failed") {
+      // §6.4/§7.3：记录在案时给「重新上传」（新建 ingestion 只由显式点击
+      // 触发，绝不自动重建）；网络/分块失败另给重试。
+      if (entry.jobId) out.push("continueUpload");
+      out.push("support");
+    }
     // 终态（含 `done`——`isTerminal` 已把它计入）：本地产物仍在 OPFS，这是
     // 唯一的清理入口（§6.3）。**不得**再单列 `done` 分支——那会把
     // 「删除本地产物」重复渲染两次（同 kinds 序列里出现两个 discard；
     // `done` 既属终态集又被单列，实测行上出现两个同名按钮）。文案已由
     // `inlineButtonLabel` 按 `uploadState==='published'` 区分「已上传的
     // 平台切片不受影响」。
-    if (window.HP_INLINE_CONVERT && window.HP_INLINE_CONVERT.isTerminal(st)) {
+    if (window.HP_INLINE_CONVERT && window.HP_INLINE_CONVERT.isTerminal(st) &&
+        out.indexOf("discard") < 0) {
       if (entry.jobId) out.push("discard");
     }
     return out;
@@ -11342,6 +11398,12 @@
     }
     if (kind === "cancel") { inlineOrch.act(entry.id, "cancel"); return; }
     if (kind === "confirmDisk") { inlineOrch.act(entry.id, "confirmDisk"); return; }
+    if (kind === "reselect") {
+      // 「重新选择文件」：复用同一个隐藏 file input；选中的文件作为**新条目**
+      // 入队（旧条目留在行上供清理，绝不静默替换用户看不到的东西）。
+      if (els.fileInput) els.fileInput.click();
+      return;
+    }
     inlineOrch.act(entry.id, "continue");
   }
 
@@ -11361,6 +11423,8 @@
       pre = { format_ext: "", message: "" };
     }
     if (typeof submitFormatRequestCore !== "function") return;
+    if (entry && entry.supportInFlight) return;   // 行内在途守卫（连点不去重）
+    if (entry) entry.supportInFlight = true;
     submitFormatRequestCore({
       ext: pre.format_ext,
       message: pre.message,
@@ -11378,6 +11442,8 @@
         toast(tt("fr.ok.registered", { id: rid }), "success");
       },
       onError: function (msg) { toast(msg, "error"); },
+    }).then(function () {
+      if (entry) entry.supportInFlight = false;
     });
   }
 
@@ -11400,8 +11466,14 @@
         uploadFileCos(entry.file, inlineEntryRow(entry), {
           directClass: entry.directClass,
           assocTarget: entry.target,
+          onEngine: function (upload) {
+            // 取消按钮据此真正停传（设计 §5 / §6.3 的「取消」语义）
+            entry._upload = upload;
+          },
           onOutcome: function (body, err) {
-            if (err) reject(err);
+            entry._upload = null;
+            if (err && err.__cancelled) resolve({ cancelled: true });
+            else if (err) reject(err);
             else resolve({ body: body || {} });
           },
         });
@@ -11505,9 +11577,22 @@
         useResumeEndpoint: false,
         onEvent: function (ev) {
           if (ev.type === "progress") {
+            // 字节副文必须**先渲染**（key + 形参）再交给行：把裸键交给
+            // inlineRowSetStage 会显示「已传输 {done} / {total}」占位
+            // （与既有 cosProgressNote 同一口径）。
+            var bytesNote = "";
+            if (ev.determinate !== false &&
+                typeof ev.loadedBytes === "number" &&
+                typeof ev.totalBytes === "number" && ev.totalBytes > 0) {
+              bytesNote = t("upload.cos.bytes", {
+                done: humanSize(ev.loadedBytes), total: humanSize(ev.totalBytes),
+              });
+            } else if (ev.sentAll) {
+              bytesNote = t("upload.cos.sent_all");
+            }
             inlineRowSetStage(entry, "upload.cos.stage.uploading",
               ev.determinate === false ? null : ev.frac,
-              ev.determinate === false ? "" : "upload.cos.bytes", !!ev.determinate === false);
+              bytesNote, ev.determinate === false);
           } else if (ev.type === "status" && ev.body) {
             inlineRowSetStage(entry, "upload.cos.stage." + (ev.body.stage || "uploading"));
           } else if (ev.type === "created") {
@@ -12163,13 +12248,17 @@
   /// 申请支持内核（设计 §2.2⑧ / §7.1）：抽屉表单与上传行的「申请支持该格式」
   /// 共用同一提交路径（同一端点、同一 202/413/429 语义、同一预检）。
   /// opts: {ext, message, contact, sampleFile, onResult, onError}
+  /// 返回 Promise<boolean>（true=已登记）：调用方据此在在途期禁用提交按钮
+  /// 并恢复——不返回 Promise 会让「先 disabled=true 再同步 disabled=false」
+  /// 变成永不生效的抑制（重复点击即多次 POST，直接吃掉每日额度）。
   function submitFormatRequestCore(opts) {
     opts = opts || {};
     var ext = String(opts.ext || "").trim();
     if (!ext) {
-      if (opts.onError) opts.onError(t("fr.need.ext"));
-      else toast(t("fr.need.ext"), "error");
-      return;
+      var need = t("fr.need.ext");
+      if (opts.onError) opts.onError(need);
+      else toast(need, "error");
+      return Promise.resolve(false);
     }
     var sample = opts.sampleFile || null;
     // 前端预检样本大小（服务端仍权威校验）
@@ -12179,7 +12268,7 @@
       });
       if (opts.onError) opts.onError(tooBig);
       else toast(tooBig, "error");
-      return;
+      return Promise.resolve(false);
     }
     var fd = new FormData();
     fd.append("format_ext", ext);
@@ -12187,7 +12276,7 @@
     fd.append("contact", String(opts.contact || "").trim());
     if (sample) fd.append("sample", sample);
     // 401 不跳转（设计 §7.1）：申请支持不属状态推进请求，不把页面导航走
-    apiFetchNoRedirect("/api/format-requests", { method: "POST", body: fd })
+    return apiFetchNoRedirect("/api/format-requests", { method: "POST", body: fd })
       .then(jsonBody)
       .then(function (res) {
         if (res.status === 202) {
@@ -12195,17 +12284,30 @@
           if (opts.onResult) opts.onResult(res.body);
           else renderFormatRequestResult(res.body);
           loadRecentFormatRequests();
-        } else {
-          // 413/429/其他失败：保留草稿（输入不清空），就地提示
-          var msg = (res.body && res.body.error) || t("fr.fail");
-          if (opts.onError) opts.onError(msg);
-          else toast(msg, "error");
+          return true;
         }
+        // 413/429/其他失败：保留草稿（输入不清空），就地提示。
+        // 这两类**不**回显服务端的中文原文——英文界面下也应是英文（§9.2 第 13 项）。
+        var msg = frFailureText(res.status, res.body);
+        if (opts.onError) opts.onError(msg);
+        else toast(msg, "error");
+        return false;
       })
       .catch(function () {
-        if (opts.onError) opts.onError(t("fr.fail"));
-        else toast(t("fr.fail"), "error");
+        var msg = t("fr.fail");
+        if (opts.onError) opts.onError(msg);
+        else toast(msg, "error");
+        return false;
       });
+  }
+
+  /// 服务端失败 → 本地化文案（429 每日上限 / 413 样本超限 / 其余通用；
+  /// 未知码保留原始 error 文本供排障）。
+  function frFailureText(status, body) {
+    var code = (body && body.code) || "";
+    if (status === 429 || code === "rate_limited") return t("fr.err.rate");
+    if (status === 413 || code === "request_too_large") return t("fr.err.too_large");
+    return (body && body.error) || t("fr.fail");
   }
 
   function submitFormatRequest() {
@@ -12232,8 +12334,10 @@
         els.frContact.value = ""; els.frSample.value = "";
       },
       onError: function (msg) { toast(msg, "error"); },
+    }).then(function () {
+      // 收口后才解锁（在途期保持禁用：重复点击不再各发一条请求）
+      if (els.frSubmit) els.frSubmit.disabled = false;
     });
-    if (els.frSubmit) els.frSubmit.disabled = false;
   }
 
   // ---------- 后台任务列表（GET /api/conversions?group=…；轮询） ----------

@@ -24570,22 +24570,59 @@ def api_annotation_add():
                    can_edit=True, can_delete=True)
 
 
-def _check_annotation_owner(token, index):
-    """资源级鉴权（docs §5.1.1 × 工单 A/0056）：owner 任意；否则仅本人创建
-    的标注或持有 can_edit 授权的可改/删。
+def _check_annotation_owner_row(roi):
+    """资源级写鉴权（docs §5.1.1 × 工单 A/0056）：owner 任意；否则仅本人
+    创建的标注或持有 can_edit 授权的可改/删。入参是**已解析行**——旧 index
+    路由先 get_roi(token, index) 一次性解析出行，再对本函数传入该行完成
+    鉴权，之后写入一律按该行 annotation_id 执行，绝不再按 index 二次定位。
 
-    无权返回 (resp, None)（resp 为 403 JSON）；有权返回 (None, roi_or_None)。
-    roi 为 None 表示标注不存在（owner 放行后续 store 调用自行 404）。
-    写判定与 annotation_access.can_write_annotation 同源：创建者（AI 溯源
-    归属优先）∪ annotation_grants(can_edit)；「能看切片」不授予写他人标注。
+    返回 None（放行）或 403 resp。roi 为 None 表示该 index 无行：owner 放行
+    （后续写入侧按 404 处理），非 owner 返回 403（与旧口径一致，不向非
+    owner 泄露该 index 是否有行）。写判定与
+    annotation_access.can_write_annotation 同源：创建者（AI 溯源归属优先）
+    ∪ annotation_grants(can_edit)；「能看切片」不授予写他人标注。
     """
     if _is_owner():
-        return None, None
-    roi = share_store.get_roi(token, index)
+        return None
     subject = annotation_access.subject_from_request()
     if roi is None or not annotation_access.can_write_annotation(subject, roi):
-        return _denied("只能修改自己创建的标注"), None
-    return None, roi
+        return _denied("只能修改自己创建的标注")
+    return None
+
+
+def _request_annotation_id(body):
+    """旧 index 路由可选携带的 annotation_id（body 优先，query 兜底）。"""
+    aid = (body or {}).get("annotation_id")
+    if isinstance(aid, str) and aid:
+        return aid
+    aid = request.args.get("annotation_id")
+    if isinstance(aid, str) and aid:
+        return aid
+    return None
+
+
+def _guard_index_annotation_id(token, index, expected_aid):
+    """旧 index 路由的 annotation_id 一致性防护（annotation_moved）。
+
+    index 是「token 下非 tombstone 行的插入序位置」：他人增删后，客户端缓存
+    的 index 会指向另一条标注（可能 403、更坏是删/审错）。真正旧的客户端
+    （不带 annotation_id）维持旧行为做兼容；带了 id 的请求在此拦截——该
+    index 当前指向行的 annotation_id 与请求不一致 → 409 annotation_moved，
+    绝不删/改/审错。在调用方完成鉴权（403 优先）之后调用，不向未授权者
+    泄露该 index 处的 annotation_id。返回 error_resp 或 None。
+
+    2026-10-17 P1 竞态修复后本防护仍保留：调用方必须**先**一次性
+    get_roi(token, index) 解析出行并对该行鉴权，本防护紧随其后，写入则
+    一律绑定该已解析行的 annotation_id（by-id 行锁原语）——防护自身与
+    写入之间列表再漂移也不会换行（写入不再按 index 定位）。
+    """
+    if not expected_aid:
+        return None
+    cur = share_store.get_roi(token, index)
+    if cur is not None and (cur.get("annotation_id") or "") != expected_aid:
+        return jsonify(error="annotation_moved",
+                       annotation_id=cur.get("annotation_id")), 409
+    return None
 
 
 def _resolve_anno_by_id(annotation_id, require_write=False, allow_deleted=False):
@@ -24801,16 +24838,37 @@ def api_annotation_delete_admin(index):
     Stage 3a-2a：owner 任意；否则仅本人创建（owner_user_id 判定）。
     Stage 3c-1：body 可带 expected_revision（CAS），不符 → 409 revision_conflict。
     §6.3：geometry_locked=true → 409 annotation_locked。
+    兼容防护（annotation_moved 2026-10-15）：请求可带 annotation_id（body 或
+    query）——与该 index 当前指向行不一致 → 409 annotation_moved（index 在
+    列表变动后会指向另一条标注，绝不删错）。客户端已改用 by-id 路由。
+
+    2026-10-17 P1 竞态修复（鉴权/ID 校验/写入绑定同一条记录）：index 只在
+    此解析**一次**行——对该行鉴权 → annotation_id 比对 → 删除一律按该行的
+    annotation_id 走 delete_roi_by_annotation_id（by-id 行锁），绝不按 index
+    二次定位。解析与写入之间列表再漂移（并发删了前面的行）不换行；写入时
+    该行已被并发删除 → 404。无论请求是否携带 annotation_id 均如此。
     """
-    denied, _roi = _check_annotation_owner(share_store.ADMIN_TOKEN, index)
+    body = request.get_json(silent=True) or {}
+    roi = share_store.get_roi(share_store.ADMIN_TOKEN, index)  # index 只解析这一次
+    denied = _check_annotation_owner_row(roi)
     if denied:
         return denied
-    body = request.get_json(silent=True) or {}
+    moved = _guard_index_annotation_id(
+        share_store.ADMIN_TOKEN, index, _request_annotation_id(body))
+    if moved is not None:
+        return moved
+    if roi is None:
+        return jsonify(error="标注不存在"), 404
+    annotation_id = roi.get("annotation_id")
+    if not annotation_id:
+        # PG 后端建行即生成 annotation_id（add_roi），此分支防御历史/异常
+        # 数据：没有可绑定的稳定 id 就 fail-closed 拒绝写入，绝不回退按
+        # index 二次定位（那正是本缺陷的根因）。
+        return jsonify(error="annotation_id_missing"), 409
     expected = body.get("expected_revision")
     try:
-        # delete_roi 返回 (bool, annotation_id|None)；直接当 bool 用会让 404 分支永不触发
-        ok, _aid = share_store.delete_roi(
-            share_store.ADMIN_TOKEN, index, expected_revision=expected)
+        ok = share_store.delete_roi_by_annotation_id(
+            annotation_id, expected_revision=expected)
     except share_store.AnnotationLocked as e:
         return _annotation_locked_response(e)
     except share_store.RevisionConflict as e:
@@ -24818,7 +24876,8 @@ def api_annotation_delete_admin(index):
                        current_revision=e.current_revision), 409
     if not ok:
         return jsonify(error="标注不存在"), 404
-    _audit("annotation.delete", target_type="annotation", target_id=_aid, slide=None)
+    _audit("annotation.delete", target_type="annotation", target_id=annotation_id,
+           slide=None)
     return jsonify(ok=True)
 
 
@@ -24829,17 +24888,35 @@ def api_annotation_delete(token, index):
     Stage 3a-2a：owner 任意；否则仅本人创建（owner_user_id 判定）。
     Stage 3c-1：body 可带 expected_revision（CAS），不符 → 409 revision_conflict。
     §6.3：geometry_locked=true → 409 annotation_locked。
+    兼容防护：可带 annotation_id（body/query），与该 index 当前指向行不一致
+    → 409 annotation_moved（见 _guard_index_annotation_id）。
+
+    2026-10-17 P1 竞态修复（同 api_annotation_delete_admin）：index 只解析
+    一次行，鉴权/annotation_id 比对绑定该行，删除按该行 annotation_id 走
+    delete_roi_by_annotation_id，绝不按 index 二次定位；写入时该行已被并发
+    删除 → 404。无论请求是否携带 annotation_id 均如此。
     """
     if not isinstance(token, str) or not token:
         return jsonify(error="缺少 token"), 400
-    denied, _roi = _check_annotation_owner(token, index)
+    body = request.get_json(silent=True) or {}
+    roi = share_store.get_roi(token, index)  # index 只解析这一次
+    denied = _check_annotation_owner_row(roi)
     if denied:
         return denied
-    body = request.get_json(silent=True) or {}
+    moved = _guard_index_annotation_id(
+        token, index, _request_annotation_id(body))
+    if moved is not None:
+        return moved
+    if roi is None:
+        return jsonify(error="标注不存在"), 404
+    annotation_id = roi.get("annotation_id")
+    if not annotation_id:
+        # 同 api_annotation_delete_admin：无可绑定的稳定 id → fail-closed。
+        return jsonify(error="annotation_id_missing"), 409
     expected = body.get("expected_revision")
     try:
-        # delete_roi 返回 (bool, annotation_id|None)，需解包
-        ok, _aid = share_store.delete_roi(token, index, expected_revision=expected)
+        ok = share_store.delete_roi_by_annotation_id(
+            annotation_id, expected_revision=expected)
     except share_store.AnnotationLocked as e:
         return _annotation_locked_response(e)
     except share_store.RevisionConflict as e:
@@ -24847,7 +24924,8 @@ def api_annotation_delete(token, index):
                        current_revision=e.current_revision), 409
     if not ok:
         return jsonify(error="标注不存在"), 404
-    _audit("annotation.delete", target_type="annotation", target_id=_aid, slide=None)
+    _audit("annotation.delete", target_type="annotation", target_id=annotation_id,
+           slide=None)
     return jsonify(ok=True)
 
 
@@ -24876,14 +24954,34 @@ def api_annotation_set_shared(token, index):
     成功返回 {"ok": true, "shared": <更新后值>, "note": <更新后值>,
     "geometry_locked": <更新后值>, "grants": [...]}。
     Stage 3a-2a × 0056：owner 任意；否则仅本人创建或持有 can_edit 授权
-    （_check_annotation_owner），无权 403。
+    （_check_annotation_owner_row），无权 403。
+    兼容防护：可带 annotation_id（body/query），与该 index 当前指向行不一致
+    → 409 annotation_moved（见 _guard_index_annotation_id）。
+
+    2026-10-17 P1 竞态修复（鉴权/ID 校验/写入绑定同一条记录）：index 只解析
+    一次行（get_roi），鉴权与 annotation_id 比对都绑定该行；授权/shared/
+    几何锁/geom+note 四段写入一律按该行 annotation_id 的 by-id 行锁原语
+    （grant_*、set_roi_shared_by_annotation_id、set_roi_geometry_locked、
+    update_roi_by_annotation_id），绝不按 index 二次定位；写入时该行已被
+    并发删除 → 404。无论请求是否携带 annotation_id 均如此。
     """
     if not isinstance(token, str) or not token:
         return jsonify(error="缺少 token"), 400
-    denied, roi = _check_annotation_owner(token, index)
+    body = request.get_json(silent=True) or {}
+    roi = share_store.get_roi(token, index)  # index 只解析这一次
+    denied = _check_annotation_owner_row(roi)
     if denied:
         return denied
-    body = request.get_json(silent=True) or {}
+    moved = _guard_index_annotation_id(
+        token, index, _request_annotation_id(body))
+    if moved is not None:
+        return moved
+    if roi is None:
+        return jsonify(error="标注不存在"), 404
+    aid = roi.get("annotation_id")
+    if not aid:
+        # 同 api_annotation_delete_admin：无可绑定的稳定 id → fail-closed。
+        return jsonify(error="annotation_id_missing"), 409
     expected = body.get("expected_revision")
     ident = current_identity()
     # §6.3：权限验证之后解析锁字段
@@ -24905,10 +25003,6 @@ def api_annotation_set_shared(token, index):
             return jsonify(error="grantee_kind 需为 user/share_token 且 "
                                  "grantee_id 非空"), 400
         revoke = bool(body.get("revoke_grant", False))
-        aid_roi = roi or share_store.get_roi(token, index)
-        aid = (aid_roi or {}).get("annotation_id")
-        if not aid:
-            return jsonify(error="标注不存在"), 404
         try:
             if revoke:
                 share_store.revoke_grant(aid, gk, gid)
@@ -24930,8 +25024,9 @@ def api_annotation_set_shared(token, index):
         grantee_kind = body.get("grantee_kind")
         grantee_id = body.get("grantee_id")
         try:
-            ok = share_store.set_roi_shared(
-                token, index, shared_target, expected_revision=expected,
+            # by-id 行锁写入（绑定已解析行），绝不按 index 二次定位
+            ok = share_store.set_roi_shared_by_annotation_id(
+                aid, shared_target, expected_revision=expected,
                 grantee_kind=grantee_kind, grantee_id=grantee_id,
                 can_edit=bool(body.get("can_edit", False)),
                 actor_user_id=ident.get("user_id"))
@@ -24947,10 +25042,7 @@ def api_annotation_set_shared(token, index):
     lock_revision = None
     lock_aid = None
     if lock_value is not None:
-        aid_roi = roi or share_store.get_roi(token, index)
-        lock_aid = (aid_roi or {}).get("annotation_id")
-        if not lock_aid:
-            return jsonify(error="标注不存在"), 404
+        lock_aid = aid
         try:
             locked = share_store.set_roi_geometry_locked(
                 lock_aid, lock_value, expected_revision=expected,
@@ -24973,7 +25065,7 @@ def api_annotation_set_shared(token, index):
         # 升级 C（§6.3-4）：rect 几何更新入口先做生效几何合并与真实切片
         # 边界校验；旧客户端只给 side_px 编辑 v2 非正方形在此拒绝。
         if geom is not None:
-            roi_for_geom = share_store.get_roi(token, index)
+            roi_for_geom = roi  # 绑定已解析行（不按 index 重读）
             if roi_for_geom is not None and \
                     (roi_for_geom.get("type") or "rect") == "rect":
                 try:
@@ -24987,8 +25079,9 @@ def api_annotation_set_shared(token, index):
                 if msg:
                     return jsonify(error=msg), 400
         try:
-            updated = share_store.update_roi(
-                token, index, geom=geom, note=note,
+            # by-id 行锁写入（绑定已解析行），绝不按 index 二次定位
+            updated = share_store.update_roi_by_annotation_id(
+                aid, geom=geom, note=note,
                 expected_revision=chained_expected)
         except share_store.AnnotationLocked as e:
             return _annotation_locked_response(e)
@@ -25006,14 +25099,10 @@ def api_annotation_set_shared(token, index):
         if shared_after is None:
             shared_after = updated.get("shared")
 
-    # 仅 shared / lock 时回填 note 与锁状态（读当前值）
+    # 仅 shared / lock 时回填 note 与锁状态（读当前值；按已解析行的
+    # annotation_id 读回，不按 index 重扫列表）
     if note_after is None or locked_state is None:
-        rois = share_store.list_rois(token)
-        cur = None
-        for r in rois:
-            if r.get("index") == index:
-                cur = r
-                break
+        cur = share_store.get_roi_by_annotation_id(aid)
         if note_after is None:
             note_after = cur.get("note", "") if cur else ""
         if locked_state is None:
@@ -25065,6 +25154,41 @@ def _resolve_anno(token, index, require_annotate):
     return roi, None
 
 
+def _resolve_anno_by_id_view(annotation_id, require_annotate):
+    """按稳定 annotation_id 解析评论/审核/历史目标：切片级 × 标注级双层鉴权。
+
+    与 index 版 `_resolve_anno` 同口径（require_annotate=True → 切片 annotate
+    档 + 标注可读；False → 切片可读 + 标注可读；不可读统一 404 不泄露），
+    仅切片层走 ID 通道（与 `_resolve_anno_by_id` 同款 desc 判定——id_bundle
+    资产无 legacy 名也能过）。寻址键是 annotation_id，列表增删不影响定位
+    （过期 index 缺陷的根治路径）。返回 (roi, None) 或 (None, error_resp)。
+    """
+    if not isinstance(annotation_id, str) or not annotation_id:
+        return None, (jsonify(error="缺少 annotation_id"), 400)
+    roi = share_store.get_roi_by_annotation_id(annotation_id)
+    if roi is None or roi.get("deleted"):
+        return None, (jsonify(error="标注不存在"), 404)
+    slide = roi.get("slide") or ""
+    desc = None
+    if roi.get("slide_id"):
+        try:
+            desc = slide_store.resolve_slide_id(roi.get("slide_id"))
+        except Exception:  # noqa: BLE001 - 解析失败按名通道（fail-closed 由其判定）
+            desc = None
+    by_id = desc is not None and not desc.legacy_filename
+    if require_annotate:
+        allowed = _desc_can_annotate(desc) if by_id else can_annotate_slide(slide)
+    else:
+        allowed = (_authorize_or_deny(desc, channel="session") if by_id
+                   else can_view_slide(slide))
+    if not allowed:
+        return None, _denied()
+    subject = annotation_access.subject_from_request()
+    if not annotation_access.can_read_annotation(subject, roi):
+        return None, (jsonify(error="标注不存在"), 404)
+    return roi, None
+
+
 def _display_label(uid):
     """身份主列快照（评论/标注 author_label 用；展示 J）。
 
@@ -25083,10 +25207,21 @@ def _display_label(uid):
 
 @app.route("/api/annotation/<token>/<int:index>/comments")
 def api_annotation_comments(token, index):
-    """列出某标注的评论。鉴权同查看（can_view_slide × 标注可见性）。"""
+    """列出某标注的评论。鉴权同查看（can_view_slide × 标注可见性）。
+
+    兼容防护：可带 annotation_id（query/body），与该 index 当前指向行不一致
+    → 409 annotation_moved。
+    2026-10-17 P1 竞态修复：`_resolve_anno` 一次性解析出的行即读写绑定对象
+    ——评论列表按该行 annotation_id 查询，不按 index 二次定位。
+    """
     roi, err = _resolve_anno(token, index, require_annotate=False)
     if err:
         return err
+    body = request.get_json(silent=True) or {}
+    moved = _guard_index_annotation_id(
+        token, index, _request_annotation_id(body))
+    if moved is not None:
+        return moved
     aid = roi.get("annotation_id")
     subject = annotation_access.subject_from_request()
     comments = share_store.list_comments(annotation_id=aid, subject=subject)
@@ -25098,11 +25233,20 @@ def api_annotation_comment_add(token, index):
     """在某标注下新增评论。鉴权同标注（can_annotate_slide）。
 
     JSON: {body, parent_id?}。author_user_id 取当前 session，author_label 取展示名快照。
+    兼容防护：可带 annotation_id（body/query），与该 index 当前指向行不一致
+    → 409 annotation_moved（index 漂移后绝不评论到另一条上）。
+    2026-10-17 P1 竞态修复：`_resolve_anno` 一次性解析出的行即写入绑定对象
+    ——add_comment 挂到该行 annotation_id 下，不按 index 二次定位；写入时该
+    行已被并发删除/并发改挂 → 落在原行，绝不触及其他行。
     """
     roi, err = _resolve_anno(token, index, require_annotate=True)
     if err:
         return err
     body = request.get_json(silent=True) or {}
+    moved = _guard_index_annotation_id(
+        token, index, _request_annotation_id(body))
+    if moved is not None:
+        return moved
     text = body.get("body")
     parent_id = body.get("parent_id")
     ident = current_identity()
@@ -25176,21 +25320,36 @@ def api_annotation_review(token, index):
     """AI 标注审核（接受/驳回）。鉴权同标注（can_annotate_slide）。
 
     JSON: {action: accept|reject}。仅 source=ai 的标注可审（人工 → 400）。
+    兼容防护：可带 annotation_id（body/query），与该 index 当前指向行不一致
+    → 409 annotation_moved（index 漂移后绝不审错另一条）。
+
+    2026-10-17 P1 竞态修复：`_resolve_anno` 已一次性解析出该 index 的行，
+    审核写入按该行 annotation_id 走 review_roi_by_annotation_id（by-id 行
+    锁）——防护与写入之间列表再漂移（并发删了前面的行）也不换行；写入时
+    该行已被并发删除 → 404。无论请求是否携带 annotation_id 均如此。
     """
     roi, err = _resolve_anno(token, index, require_annotate=True)
     if err:
         return err
     body = request.get_json(silent=True) or {}
+    moved = _guard_index_annotation_id(
+        token, index, _request_annotation_id(body))
+    if moved is not None:
+        return moved
     action = body.get("action")
     if action not in ("accept", "reject"):
         return jsonify(error="action 需为 accept 或 reject"), 400
+    annotation_id = (roi or {}).get("annotation_id")
+    if not annotation_id:
+        # 同 api_annotation_delete_admin：无可绑定的稳定 id → fail-closed。
+        return jsonify(error="annotation_id_missing"), 409
     try:
-        updated = share_store.review_roi(token, index, action)
+        updated = share_store.review_roi_by_annotation_id(annotation_id, action)
     except ValueError as e:
         return jsonify(error=str(e)), 400
     if updated is False:
         return jsonify(error="标注不存在"), 404
-    _audit("review", target_type="annotation", target_id=roi.get("annotation_id"),
+    _audit("review", target_type="annotation", target_id=annotation_id,
            slide=roi.get("slide"), detail={"action": action,
                                             "review_status": updated.get("review_status")})
     return jsonify(ok=True, review_status=updated.get("review_status"),
@@ -25202,8 +25361,97 @@ def api_annotation_history(token, index):
     """返回某标注的修改历史（geom/note/label/revision/ts 快照，上限 20）。
 
     鉴权同查看（can_view_slide）。
+    兼容防护：可带 annotation_id（query/body），与该 index 当前指向行不一致
+    → 409 annotation_moved。
+    2026-10-17 P1 竞态修复：历史读自 `_resolve_anno` 一次性解析出的那行
+    （roi["history"]），不按 index 二次定位。
     """
     roi, err = _resolve_anno(token, index, require_annotate=False)
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    moved = _guard_index_annotation_id(
+        token, index, _request_annotation_id(body))
+    if moved is not None:
+        return moved
+    return jsonify({"history": roi.get("history", [])})
+
+
+# --------------------------------------------------------------------------- #
+# by-id 单条操作（annotation_moved 2026-10-15）：评论 / 审核 / 历史。
+# 寻址键 = annotation_id（稳定，列表增删不漂移）；鉴权与上面 index 版
+# `_resolve_anno` 完全同口径（require_annotate 分档 × can_read_annotation，
+# 切片层走 ID 通道）。工作台客户端已全部改用这一组。
+# --------------------------------------------------------------------------- #
+@app.route("/api/annotation/id/<annotation_id>/comments")
+def api_annotation_comments_by_id(annotation_id):
+    """列出某标注的评论（by-id）。鉴权同查看（切片可读 × 标注可见）。"""
+    roi, err = _resolve_anno_by_id_view(annotation_id, require_annotate=False)
+    if err:
+        return err
+    subject = annotation_access.subject_from_request()
+    comments = share_store.list_comments(
+        annotation_id=annotation_id, subject=subject)
+    return jsonify({"comments": comments})
+
+
+@app.route("/api/annotation/id/<annotation_id>/comments", methods=["POST"])
+def api_annotation_comment_add_by_id(annotation_id):
+    """在某标注下新增评论（by-id）。鉴权同标注（切片 annotate 档）。
+
+    JSON: {body, parent_id?}。与 index 版 `api_annotation_comment_add` 同语义。
+    """
+    roi, err = _resolve_anno_by_id_view(annotation_id, require_annotate=True)
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    text = body.get("body")
+    parent_id = body.get("parent_id")
+    ident = current_identity()
+    try:
+        cmt = share_store.add_comment(
+            annotation_id, roi.get("slide"), roi.get("token"), text,
+            author_user_id=ident.get("user_id"),
+            author_label=_display_label(ident.get("user_id")),
+            parent_id=parent_id)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    _audit("comment.add", target_type="comment", target_id=cmt.get("comment_id"),
+           slide=roi.get("slide"), detail={"parent_id": parent_id or None})
+    return jsonify(ok=True, comment=cmt)
+
+
+@app.route("/api/annotation/id/<annotation_id>/review", methods=["POST"])
+def api_annotation_review_by_id(annotation_id):
+    """AI 标注审核（接受/驳回，by-id）。鉴权同标注（切片 annotate 档）。
+
+    JSON: {action: accept|reject}。仅 source=ai 可审（人工 → 400）——与
+    index 版 `api_annotation_review` 同口径（无 CAS；store 内 bump revision）。
+    """
+    roi, err = _resolve_anno_by_id_view(annotation_id, require_annotate=True)
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    action = body.get("action")
+    if action not in ("accept", "reject"):
+        return jsonify(error="action 需为 accept 或 reject"), 400
+    try:
+        updated = share_store.review_roi_by_annotation_id(annotation_id, action)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    if updated is False:
+        return jsonify(error="标注不存在"), 404
+    _audit("review", target_type="annotation", target_id=annotation_id,
+           slide=roi.get("slide"), detail={"action": action,
+                                            "review_status": updated.get("review_status")})
+    return jsonify(ok=True, review_status=updated.get("review_status"),
+                   revision=updated.get("revision"))
+
+
+@app.route("/api/annotation/id/<annotation_id>/history")
+def api_annotation_history_by_id(annotation_id):
+    """返回某标注的修改历史（by-id）。鉴权同查看（切片可读 × 标注可见）。"""
+    roi, err = _resolve_anno_by_id_view(annotation_id, require_annotate=False)
     if err:
         return err
     return jsonify({"history": roi.get("history", [])})

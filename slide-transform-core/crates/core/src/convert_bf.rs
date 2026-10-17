@@ -226,8 +226,9 @@ fn select_levels(doc: &KfbDocument) -> CoreResult<Vec<&KfbLevel>> {
 }
 
 /// Strict-policy precheck: fail with `pixel_policy_violation` BEFORE writing
-/// anything if any selected level has an edge tile (jpeg dims ≠ full tile)
-/// or a grid cell whose jpeg is smaller than its cell.
+/// anything if any selected level has an edge tile (jpeg dims ≠ full tile),
+/// a grid cell whose jpeg is smaller than its cell, or a boundary-fill tile
+/// overrunning the level canvas (decode+crop re-encode required).
 fn strict_lossless_precheck(
     src: &dyn ByteSource,
     doc: &KfbDocument,
@@ -237,7 +238,11 @@ fn strict_lossless_precheck(
         let mut edge = 0u64;
         doc.grids.for_each_cell(lv.level, |_cell, rec| {
             if let Some(rec) = rec {
-                if rec.jpeg_w as u32 != TILE || rec.jpeg_h as u32 != TILE {
+                if rec.jpeg_w as u32 != TILE
+                    || rec.jpeg_h as u32 != TILE
+                    || rec.x as u64 + TILE as u64 > lv.width as u64
+                    || rec.y as u64 + TILE as u64 > lv.height as u64
+                {
                     edge += 1;
                 }
             } else {
@@ -347,15 +352,17 @@ fn reconstruct_cells_bf(
                 )));
             }
         };
-        if rec.jpeg_w as u32 > want_w || rec.jpeg_h as u32 > want_h {
-            return Err(CoreError::validation(format!(
-                "层 {} tile({row},{col}) 尺寸 {}×{} 超出网格 {want_w}×{want_h}",
-                lv.level, rec.jpeg_w, rec.jpeg_h
-            )));
-        }
+        // 边缘填充瓦片允许比网格单元多出若干像素（vendor 边缘越界）：
+        // 与 write 路径同判——只有"完整且不越界"的 256×256 才走原样拷贝，
+        // 其余（含越界裁剪）都归入重编码/边缘统计。
+        let boundary_cropped =
+            rec.jpeg_w as u32 > want_w || rec.jpeg_h as u32 > want_h;
         if compact {
             stats.tiles_reencoded += 1;
-            if rec.jpeg_w as u32 != TILE || rec.jpeg_h as u32 != TILE {
+            if rec.jpeg_w as u32 != TILE
+                || rec.jpeg_h as u32 != TILE
+                || boundary_cropped
+            {
                 edge_regions.push(EdgeRegion {
                     level: lv.level,
                     channel: None,
@@ -370,7 +377,7 @@ fn reconstruct_cells_bf(
             }
             return Ok(());
         }
-        if rec.is_full_tile() {
+        if rec.is_full_tile() && !boundary_cropped {
             stats.tiles_raw_copied += 1;
         } else {
             let payload = src.read_at(rec.payload_offset, rec.payload_length as usize)?;
@@ -584,12 +591,12 @@ fn convert_inner(
                     )));
                 }
             };
-            if rec.jpeg_w as u32 > want_w || rec.jpeg_h as u32 > want_h {
-                return Err(CoreError::validation(format!(
-                    "层 {} tile({row},{col}) 尺寸 {}×{} 超出网格 {want_w}×{want_h}",
-                    lv.level, rec.jpeg_w, rec.jpeg_h
-                )));
-            }
+            // vendor 边缘填充瓦片可比网格单元多出若干像素（头表舍入差）；
+            // 贴合区域 = 网格单元 ∩ 瓦片，越界部分解码但不写入。
+            let paste_w = want_w.min(rec.jpeg_w as u32);
+            let paste_h = want_h.min(rec.jpeg_h as u32);
+            let boundary_cropped =
+                rec.jpeg_w as u32 > want_w || rec.jpeg_h as u32 > want_h;
             let payload = src.read_at(rec.payload_offset, rec.payload_length as usize)?;
             let data: Vec<u8>;
             if let Some(cfg) = &compact_cfg {
@@ -597,8 +604,18 @@ fn convert_inner(
                 // re-encoded with the locked parameters. Full source
                 // resolution and coordinates are preserved (no crop/scale);
                 // geometry-padded tiles are counted and listed.
-                let encoded = reencode_tile_on_canvas(payload, rec.jpeg_w, rec.jpeg_h, cfg)?;
-                if rec.jpeg_w as u32 != TILE || rec.jpeg_h as u32 != TILE {
+                let encoded = reencode_tile_on_canvas(
+                    payload,
+                    rec.jpeg_w,
+                    rec.jpeg_h,
+                    paste_w,
+                    paste_h,
+                    cfg,
+                )?;
+                if rec.jpeg_w as u32 != TILE
+                    || rec.jpeg_h as u32 != TILE
+                    || boundary_cropped
+                {
                     edge_regions.push(EdgeRegion {
                         level: lv.level,
                         channel: None,
@@ -613,7 +630,7 @@ fn convert_inner(
                 }
                 data = encoded;
                 stats.tiles_reencoded += 1;
-            } else if rec.is_full_tile() {
+            } else if rec.is_full_tile() && !boundary_cropped {
                 data = payload;
                 stats.tiles_raw_copied += 1;
             } else {
@@ -621,6 +638,8 @@ fn convert_inner(
                     &payload,
                     rec.jpeg_w,
                     rec.jpeg_h,
+                    paste_w,
+                    paste_h,
                     enc_sampling,
                 )?;
                 if !region.reused_qtables {
@@ -812,7 +831,19 @@ struct ReencodeOutcome {
 /// Decode a tile payload and paste it at (0,0) of a white 256×256 RGB
 /// canvas (row-strided paste). Shared by the preserve edge path and the
 /// compact whole-slide path.
-fn decode_tile_on_canvas(payload: &[u8], jpeg_w: u16, jpeg_h: u16) -> CoreResult<Vec<u8>> {
+///
+/// `paste_w × paste_h` is the region of the decoded tile that lands inside
+/// the level canvas (grid cell size); a vendor edge-fill tile may store a
+/// few pixel rows/cols beyond the canvas (KFB 边缘瓦片比头表高度多出整数
+/// 像素), those are decoded but NOT pasted — decoded dims must still match
+/// the index record exactly, so corrupt payloads keep failing here.
+fn decode_tile_on_canvas(
+    payload: &[u8],
+    jpeg_w: u16,
+    jpeg_h: u16,
+    paste_w: u32,
+    paste_h: u32,
+) -> CoreResult<Vec<u8>> {
     let img = crate::jpeg::decode(payload, (TILE as u64) * (TILE as u64) * 4)?;
     if img.width != jpeg_w as u32 || img.height != jpeg_h as u32 {
         return Err(CoreError::jpeg(format!(
@@ -820,12 +851,14 @@ fn decode_tile_on_canvas(payload: &[u8], jpeg_w: u16, jpeg_h: u16) -> CoreResult
             img.width, img.height
         )));
     }
+    let paste_w = paste_w.min(img.width) as usize;
+    let paste_h = paste_h.min(img.height) as usize;
     // canvas RGB 255 with the decoded pixels pasted at (0,0) — row-strided
     // paste (a w×h image onto the 256-wide canvas, NOT a packed copy)
     let mut canvas = vec![255u8; (TILE as usize) * (TILE as usize) * 3];
     if img.kind == crate::jpeg::ColorKind::Gray {
-        for y in 0..img.height as usize {
-            let src = &img.data[y * img.width as usize..(y + 1) * img.width as usize];
+        for y in 0..paste_h {
+            let src = &img.data[y * img.width as usize..y * img.width as usize + paste_w];
             let dst = y * TILE as usize * 3;
             for (k, px) in src.iter().enumerate() {
                 canvas[dst + k * 3] = *px;
@@ -834,8 +867,8 @@ fn decode_tile_on_canvas(payload: &[u8], jpeg_w: u16, jpeg_h: u16) -> CoreResult
             }
         }
     } else {
-        for y in 0..img.height as usize {
-            let src = &img.data[y * img.width as usize * 3..(y + 1) * img.width as usize * 3];
+        for y in 0..paste_h {
+            let src = &img.data[y * img.width as usize * 3..y * img.width as usize * 3 + paste_w * 3];
             let dst = y * TILE as usize * 3;
             canvas[dst..dst + src.len()].copy_from_slice(src);
         }
@@ -849,9 +882,11 @@ fn reencode_tile_on_canvas(
     payload: Vec<u8>,
     jpeg_w: u16,
     jpeg_h: u16,
+    paste_w: u32,
+    paste_h: u32,
     cfg: &crate::jpeg::EncoderCfg,
 ) -> CoreResult<Vec<u8>> {
-    let canvas = decode_tile_on_canvas(&payload, jpeg_w, jpeg_h)?;
+    let canvas = decode_tile_on_canvas(&payload, jpeg_w, jpeg_h, paste_w, paste_h)?;
     crate::jpeg::encode_rgb(&canvas, TILE, TILE, cfg)
 }
 
@@ -860,9 +895,11 @@ fn reencode_edge_tile(
     payload: &[u8],
     jpeg_w: u16,
     jpeg_h: u16,
+    paste_w: u32,
+    paste_h: u32,
     sampling: crate::jpeg::Sampling,
 ) -> CoreResult<(Vec<u8>, ReencodeOutcome)> {
-    let canvas = decode_tile_on_canvas(payload, jpeg_w, jpeg_h)?;
+    let canvas = decode_tile_on_canvas(payload, jpeg_w, jpeg_h, paste_w, paste_h)?;
     // Pillow im.quantization: dict of tables in id order; reuse needs ≥2
     let qtables = crate::jpeg::qtables_pillow_style(payload).unwrap_or_default();
     let (cfg, reused) = if qtables.len() >= 2 {

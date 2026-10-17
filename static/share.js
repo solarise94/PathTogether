@@ -1698,7 +1698,7 @@
       cancelB.addEventListener("click", function () { cancelEdit(it); });
       delB.addEventListener("click", function () {
         delB.disabled = true;
-        deleteRoi(it.index);
+        deleteRoi(it);
       });
       ta.addEventListener("keydown", function (e) {
         if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); commitEdit(it, ta.value); }
@@ -1726,7 +1726,7 @@
       saveB2.addEventListener("click", function () { commitEdit(it, ta.value); });
       delB2.addEventListener("click", function () {
         delB2.disabled = true;
-        deleteRoi(it.index);
+        deleteRoi(it);
       });
       ta.addEventListener("keydown", function (e) {
         if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); commitEdit(it, ta.value); }
@@ -1782,6 +1782,16 @@
            JSON.stringify(normalizeGeomForCompare(b));
   }
 
+  // 单条标注操作 URL：优先稳定 id 通道（/api/roi/id/<annotation_id>——
+  // index 是 token 内插入序位置，他人增删后缓存的 index 会指向另一条标注，
+  // 可能 403 或改/删错）；缺 annotation_id 的历史行回退旧 index 路径。
+  function roiOpUrl(it) {
+    if (it && it.annotation_id) {
+      return API + "/api/roi/id/" + encodeURIComponent(it.annotation_id);
+    }
+    return API + "/api/roi/" + (it ? it.index : "");
+  }
+
   // 提交编辑：差量 PATCH（几何没变只发 note）+ expected_revision。
   // 409 按错误码区分：annotation_locked ≠ revision_conflict（§6.4）。
   function commitEdit(it, noteVal) {
@@ -1796,7 +1806,7 @@
         state.mppX && state.mppX > 0) {
       body.geom.size_mm = Math.round(geom.w * state.mppX / 1000 * 100) / 100;
     }
-    fetch(API + "/api/roi/" + it.index, {
+    fetch(roiOpUrl(it), {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -2180,7 +2190,7 @@
     var delDisabled = itemGeometryLocked(it);
     addItem("🗑 " + t("edit.del"),
       delDisabled ? t("anno.lock.delete.denied") : t("edit.del"),
-      function () { deleteRoi(it.index); },
+      function () { deleteRoi(it); },
       delDisabled || !itemCanEdit(it));
     el.appendChild(menu);
     annoToolbarMenuEl = menu;
@@ -2275,14 +2285,14 @@
 
   // ---- geometry_locked 切换（§6.3）：单独请求，绝不夹带 geom ----
   function toggleItemGeometryLocked(it, lockTarget) {
-    if (!it || it.index == null) return;
+    if (!it || (it.index == null && !it.annotation_id)) return;
     if (!itemCanEdit(it)) {
       toast(t("anno.lock.readonly.tip"), "info");
       return;
     }
     var body = { geometry_locked: !!lockTarget };
     if (Number(it.revision) > 0) body.expected_revision = Number(it.revision);
-    fetch(API + "/api/roi/" + it.index, {
+    fetch(roiOpUrl(it), {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -2889,7 +2899,7 @@
         del.title = t("edit.del");
         del.addEventListener("click", function (ev) {
           ev.stopPropagation();
-          deleteRoi(r.index);
+          deleteRoi(r);
         });
         item.appendChild(del);
       }
@@ -2898,8 +2908,15 @@
     });
   }
 
-  function deleteRoi(index) {
-    fetch(API + "/api/roi/" + index, { method: "DELETE" })
+  // 删除标注：参数为标注条目（按 annotation_id 走稳定 id 通道；缺 id 的
+  // 历史行回退旧 index 路径）。兼容旧调用直接传 number。
+  function deleteRoi(target) {
+    var item = (target && typeof target === "object") ? target : null;
+    var index = item ? item.index : target;
+    var aid = item ? item.annotation_id : null;
+    fetch(aid ? API + "/api/roi/id/" + encodeURIComponent(aid)
+              : API + "/api/roi/" + index,
+          { method: "DELETE" })
       .then(function (r) {
         if (!r.ok) {
           return r.json().catch(function () { return {}; }).then(function (j) {
@@ -2916,11 +2933,14 @@
       .then(function (out) {
         if (out && out.blocked) { refreshRoisOnce(); return; }
         // ---- 乐观更新（同步执行，立即反馈）----
-        // 从 currentRois 移除该项（仅本人 source==="me" 的可删；
-        // 按 source 限定避免与 admin/shared 条目的 index 数值冲突误删）
+        // 从 currentRois 移除该项（仅本人 source==="me" 的可删）。
+        // 有 annotation_id 按 id 匹配（index 会漂移）；旧数据按 index+me。
         for (var i = currentRois.length - 1; i >= 0; i--) {
           var it = currentRois[i];
-          if (it.index === index && it.source === "me") {
+          var hit = aid
+            ? (it.annotation_id === aid)
+            : (it.index === index && it.source === "me");
+          if (hit) {
             if (editItem === it) { editItem = null; state.editing = false; }
             if (state.focusAnno === it) { state.focusAnno = null; }
             currentRois.splice(i, 1);

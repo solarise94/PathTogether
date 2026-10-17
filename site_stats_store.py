@@ -29,7 +29,9 @@ docs review-2026-09-02-upload-user-limits-admin-ui-cleanup.md §3.4 / §4.4 /
   历史行（request_host IS NULL = 目标域名未知）默认排除，仅在 ``legacy``
   键单独计数。**目标域名（Host）决定「是不是本服务访问」，Referer 只表示
   「从哪里跳过来」**——外部来源榜照常保留真实外站 Referer（Google 等搜索
-  引擎是有效外部来源），**固定排除疑似爬虫**（review 2026-09-19 R4：爬虫
+  引擎是有效外部来源），**排除 direct/空与裸 IP 字面量 referrer**（裸 IP
+  只来自扫描器/本服务边缘节点，2026-10-15 口径；历史存量行不做数据迁移、
+  仅在聚合与读取层排除），**固定排除疑似爬虫**（review 2026-09-19 R4：爬虫
   开关退役，含爬虫的对照口径 ``top_referrers_with_bots`` 一并移除——除该
   已退役的 UI 开关外无其他产品消费者；总览疑似爬虫计数保留）。``daily``
   每日趋势 = 近 7 天共 7 行（UTC+8 日界、缺日补 0、**严格倒序**：第 1 行
@@ -406,6 +408,24 @@ def _normalize_hostname(raw):
     return value.split(":", 1)[0].rstrip(".")
 
 
+#: 疑似裸 IPv4 hostname：四段纯数字。不校验八位组范围——999.1.1.1 这类
+#: 非法形态同样只会来自扫描器伪造，绝不是合法外部域名（全数字「TLD」不存在）。
+_IPV4ISH_RE = re.compile(r"^[0-9]+(\.[0-9]+){3}$")
+
+
+def _is_ip_literal_host(host):
+    """hostname 是否为裸 IP 字面量（IPv4 / IPv6 / IPv4-mapped / 四段纯数字）。
+
+    入参须是 ``urlparse(...).hostname`` 或 ``_normalize_hostname`` 产物
+    （无 scheme/path，IPv6 不带方括号，端口已剥）。判定与聚合层 SQL 完全
+    同构：含冒号（合法 hostname 不含冒号 → 即 IPv6 形态）或匹配四段纯数字。
+    """
+    value = (host or "").strip()
+    if not value:
+        return False
+    return ":" in value or bool(_IPV4ISH_RE.match(value))
+
+
 def _add_url_host(hosts, raw):
     value = (raw or "").strip()
     if not value:
@@ -503,8 +523,18 @@ def _admitted_request_host(host, entry_hosts):
 
 
 def _referrer_domain(referrer):
-    """只取 hostname（小写）；空/解析失败/同站 → 'direct'（同站跳转不当外部
-    来源，§2.6 mywebpage 口径）。协议、路径、query 一律丢弃。"""
+    """只取 hostname（小写）；空/解析失败/同站/裸 IP 字面量 → 'direct'（同站
+    跳转不当外部来源，§2.6 mywebpage 口径）。协议、路径、query 一律丢弃。
+
+    裸 IP referrer（IPv4、IPv6 含 ``[::1]``/IPv4-mapped、带端口等形态）同口径
+    归 direct（2026-10-15）：**合法外部来源几乎不会是裸 IP**——referrer 为裸
+    IP 只可能来自互联网扫描器（直访边缘机裸 IP 后把该地址塞进 Referer；生产
+    实例 2026-10-16：tencentfast 中转机 43.142.130.199 上的 zgrab 扫描流量
+    伪装 Chrome UA 批量打点）或本服务自己的边缘/回源节点 IP，两者都不是
+    「外部来源」。IP 判定在 ``_normalize_hostname`` **之前**做——后者按冒号
+    截断，会把 IPv6 字面量截成 ``2001`` 之类的假 hostname 反而落成外部来源。
+    历史存量行不改写，聚合/展示层排除见 ``dashboard_stats``（top_referrers）
+    与 ``_recent``。"""
     raw = (referrer or "").strip()
     if not raw:
         return "direct"
@@ -513,6 +543,8 @@ def _referrer_domain(referrer):
     except ValueError:
         return "direct"
     if not host:
+        return "direct"
+    if _is_ip_literal_host(host):
         return "direct"
     host = _normalize_hostname(host)
     if not host:
@@ -939,9 +971,11 @@ def _daily_series(start_utc, end_utc, days, entry_hosts):
 def _top_list(start_utc, end_utc, column, output_key, extra_where,
               entry_hosts, limit=10):
     """Top-N（只计白名单入口；column/extra_where 均为模块内字面常量，不经
-    外部输入）。top_referrers 排除 direct/空——同站跳转不是外部来源；来源
-    是浏览器声明的 Referer（可伪造），**固定排除疑似爬虫**（R4 2026-09-19：
-    爬虫开关退役，含爬虫的对照口径 top_referrers_with_bots 一并移除）；
+    外部输入）。top_referrers 排除 direct/空/裸 IP 字面量——同站跳转不是
+    外部来源，裸 IP referrer 也只来自扫描器/本服务边缘节点（口径见
+    ``_referrer_domain``；历史存量行不改写、仅在聚合层排除）；来源是浏览器
+    声明的 Referer（可伪造），**固定排除疑似爬虫**（R4 2026-09-19：爬虫
+    开关退役，含爬虫的对照口径 top_referrers_with_bots 一并移除）；
     top_countries 排除 unknown——UI 据此隐藏国家块。"""
     sql = (
         "SELECT %s AS value, count(*) AS visits"
@@ -964,7 +998,11 @@ def _top_list(start_utc, end_utc, column, output_key, extra_where,
 
 def _recent(entry_hosts, limit=20):
     """最近访问（只计白名单入口；迁移前 request_host IS NULL 的历史行天然
-    排除）。request_host 即「访问域名」，供面板展示本次访问命中的入口。"""
+    排除）。request_host 即「访问域名」，供面板展示本次访问命中的入口。
+
+    referrer_domain 读取口径（2026-10-15）：历史 IP 字面量行（采集口径修正
+    前落库）不改写、照常出现在明细里，但读取时映射为 'direct'——与来源榜
+    同口径，「来源」列不再展示裸 IP；真实外部域名原样返回。"""
     conn = pg_store.connect()
     conn.row_factory = _dict_row()
     try:
@@ -983,7 +1021,9 @@ def _recent(entry_hosts, limit=20):
         "occurred_at": r["occurred_at"].isoformat(),
         "page_key": r["page_key"],
         "request_host": r["request_host"],
-        "referrer_domain": r["referrer_domain"],
+        "referrer_domain": "direct"
+        if _is_ip_literal_host(r["referrer_domain"])
+        else r["referrer_domain"],
         "country_code": r["country_code"],
         "visitor_kind": r["visitor_kind"],
         "bot_name": r["bot_name"],
@@ -1068,10 +1108,18 @@ def dashboard_stats(*, now=None):
         # 者）。referrer spam 基本是爬虫，与 unique_visitors 的「爬虫不进
         # 人类指标」口径一致；总览疑似爬虫计数（d30.bots /
         # visitor_kinds.suspected_bot）保留不受影响。
+        # 裸 IP 字面量 referrer（2026-10-15）也不当外部来源：采集口径已改
+        # （_referrer_domain），历史存量行不做数据迁移、仅在聚合层排除——
+        # SQL 与 _is_ip_literal_host 同构（含冒号 = IPv6 形态，合法 hostname
+        # 不含冒号；四段纯数字 = IPv4 形态）。NULL 已被 IS NOT NULL 排除，
+        # 正则作用于 NULL 得 NULL 亦不入选，空值安全。
         "top_referrers": _top_list(
             d30_start, today_end, "referrer_domain", "domain",
             "AND referrer_domain IS NOT NULL"
             " AND referrer_domain <> 'direct'"
+            " AND referrer_domain <> ''"
+            " AND referrer_domain !~ ':'"
+            " AND referrer_domain !~ '^[0-9]+(\\.[0-9]+){3}$'"
             " AND visitor_kind <> 'suspected_bot'", hosts),
         "top_pages": _top_list(
             d30_start, today_end, "page_key", "page_key", "", hosts),

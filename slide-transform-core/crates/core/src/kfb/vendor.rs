@@ -138,11 +138,14 @@ pub fn parse_vendor(
                 "tile[{i}] jpeg 尺寸 {jpeg_w}×{jpeg_h} 非法"
             )));
         }
-        if x_px as u64 + jpeg_w as u64 > lv.width as u64
-            || y_px as u64 + jpeg_h as u64 > lv.height as u64
-        {
+        // 边缘越界瓦片（真实样本：L0 末行整行 jpeg_h 比头表高度多 1px，
+        // 扫描仪边缘填充与头表舍入差）：只要 tile 与层画布相交、且坐标
+        // 仍网格对齐，就按合法边缘瓦片收下——记录里保留原始 jpeg 尺寸，
+        // 转换侧按网格单元裁剪贴合（见 convert_bf::decode_tile_on_canvas）。
+        // 完全在画布之外的 tile 无法用边缘填充解释，仍视为索引损坏。
+        if x_px >= lv.width || y_px >= lv.height {
             return Err(CoreError::index(format!(
-                "tile[{i}] 越出层 {} 边界",
+                "tile[{i}] 完全越出层 {} 边界",
                 lv.level
             )));
         }

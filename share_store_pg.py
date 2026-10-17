@@ -1909,6 +1909,67 @@ def set_roi_shared(token, index, shared, expected_revision=None,
         conn.close()
 
 
+def set_roi_shared_by_annotation_id(annotation_id, shared,
+                                    expected_revision=None, grantee_kind=None,
+                                    grantee_id=None, can_edit=False,
+                                    actor_user_id=None):
+    """set_roi_shared 的 by-id 版（旧 index 路由写入绑定原语，2026-10-17）。
+
+    与 set_roi_shared 语义逐项一致（含 0056 授权维护与「分享到本链接」，
+    token 取该行自身 token），区别仅在定位：行锁内
+    ``WHERE annotation_id=%s AND NOT deleted``——绝不按位置 index 二次定位
+    （解析与写入之间列表漂移的 TOCTOU）。目标不存在/已删 → False；CAS 不符
+    → RevisionConflict。返回 True（沿用 set_roi_shared 的 bool 契约；授权
+    明细经 list_grants 另查）。
+    """
+    if not annotation_id:
+        raise ValueError("缺少 annotation_id")
+    shared_b = bool(shared)
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT id, data FROM rois WHERE annotation_id=%s "
+                    "AND NOT deleted FOR UPDATE",
+                    (annotation_id,))
+                row = cur.fetchone()
+                if row is None:
+                    return False
+                rid = row["id"]
+                roi = dict(row["data"])
+                token = roi.get("token") or ""
+                _check_cas(roi, expected_revision)
+                roi["shared"] = shared_b
+                _update_roi_row(cur, rid, roi)
+                # —— 授权维护（同事务；aid 缺失的旧行不授权，仅记标志）——
+                aid = roi.get("annotation_id")
+                if aid:
+                    if grantee_kind is not None or grantee_id is not None:
+                        if grantee_kind not in ("user", "share_token"):
+                            raise ValueError("grantee_kind 需为 user 或 share_token")
+                        if not grantee_id:
+                            raise ValueError("缺少 grantee_id")
+                        if shared_b:
+                            _grant_annotation_tx(
+                                cur, aid, grantee_kind, grantee_id,
+                                can_edit=bool(can_edit),
+                                created_by=actor_user_id)
+                        else:
+                            _revoke_annotation_grant_tx(
+                                cur, aid, grantee_kind, grantee_id)
+                    elif shared_b and token != ADMIN_TOKEN:
+                        # 「分享到本链接」：token 是真实分享 → 授予该 token 只读
+                        _grant_annotation_tx(
+                            cur, aid, "share_token", token, can_edit=False,
+                            created_by=actor_user_id)
+                    elif not shared_b and token != ADMIN_TOKEN:
+                        _revoke_annotation_grant_tx(cur, aid, "share_token", token)
+                return True
+    finally:
+        conn.close()
+
+
 # --------------------------------------------------------------------------- #
 # 标注级授权（annotation_grants，0056 工单 A / P0）
 #

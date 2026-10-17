@@ -65,6 +65,7 @@ _PUBLIC_NAMES = (
     "list_changes",
     "current_change_seq",
     "set_roi_shared",
+    "set_roi_shared_by_annotation_id",
     "roi_count_by_token",
     "list_shared_rois_for_slides",
     # —— 标注级授权 + 可见性（0056 工单 A / P0）——

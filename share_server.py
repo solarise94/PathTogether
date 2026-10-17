@@ -2093,6 +2093,13 @@ def share_roi_update(token, index):
     权限三档（docs §5.4）：无 annotate 权限的 token 写标注 403（旧链接默认含 annotate）。
     兼容防护：可带 annotation_id（body/query），与该 index 当前指向行不一致
     → 409 annotation_moved（绝不改错另一条）。客户端已改用 by-id 路由。
+
+    2026-10-17 P1 竞态修复（鉴权/ID 校验/写入绑定同一条记录）：index 只在
+    此解析**一次**行（get_roi），归属/防护都绑定该行；写入按该行
+    annotation_id 走 update_roi_by_annotation_id / set_roi_geometry_locked
+    （by-id 行锁），绝不按 index 二次定位——解析与写入之间列表再漂移也不
+    换行；写入时该行已被并发删除 → 404。无论请求是否携带 annotation_id
+    均如此。
     """
     share = _require_share(token)
     _log_share_access(token, detail={"via": "api_roi_update"})
@@ -2132,16 +2139,18 @@ def share_roi_update_by_id(token, annotation_id):
     r = _share_roi_by_id_in_token(token, annotation_id)
     if not isinstance(r, dict):
         return r
-    return _share_roi_patch(share, token, r, body, use_id=True)
+    return _share_roi_patch(share, token, r, body)
 
 
-def _share_roi_patch(share, token, r, body, use_id=False):
+def _share_roi_patch(share, token, r, body):
     """share_roi_update(id) 共用主体：归属/归档校验后的 PATCH 语义。
 
     r 已解析（index 版来自 get_roi(token,index)，id 版来自
-    _share_roi_by_id_in_token）。use_id=True 时 geom/note 走
-    update_roi_by_annotation_id（按 id 行锁，不走位置 index——避免 fetch 与
-    更新之间列表漂移的 TOCTOU）。返回 Flask 响应。
+    _share_roi_by_id_in_token）。geom/note 一律走
+    update_roi_by_annotation_id（按 r 的 annotation_id 行锁——2026-10-17 P1
+    竞态修复：index 版此前在 fetch 与更新之间按位置 index 二次定位，列表
+    漂移会改到别的行；现绑定已解析行，绝不换行）。r 无 annotation_id 的
+    历史/异常行 fail-closed → 404（不回退按 index 定位）。返回 Flask 响应。
     """
     geom = body.get("geom")
     note = body.get("note")
@@ -2182,10 +2191,11 @@ def _share_roi_patch(share, token, r, body, use_id=False):
     # §6.3 锁切换（行锁事务内 CAS；操作者只记主体种类，不落访客哈希）
     chained_expected = expected
     lock_result = None
+    aid = r.get("annotation_id")
+    if not aid:
+        # 无可绑定的稳定 id → fail-closed（PG 建行即生成 aid，此为防御分支）
+        return jsonify(error="选区不存在"), 404
     if lock_value is not None:
-        aid = r.get("annotation_id")
-        if not aid:
-            return jsonify(error="选区不存在"), 404
         try:
             lock_result = share_store.set_roi_geometry_locked(
                 aid, lock_value, expected_revision=expected, actor="visitor")
@@ -2197,14 +2207,9 @@ def _share_roi_patch(share, token, r, body, use_id=False):
         chained_expected = lock_result.get("revision")
     if geom is not None or note is not None:
         try:
-            if use_id:
-                updated = share_store.update_roi_by_annotation_id(
-                    r.get("annotation_id"), geom=geom, note=note,
-                    expected_revision=chained_expected)
-            else:
-                updated = share_store.update_roi(
-                    token, r["index"], geom=geom, note=note,
-                    expected_revision=chained_expected)
+            updated = share_store.update_roi_by_annotation_id(
+                aid, geom=geom, note=note,
+                expected_revision=chained_expected)
         except share_store.AnnotationLocked as e:
             return jsonify(
                 error="annotation_locked",
@@ -2295,6 +2300,11 @@ def share_roi_delete(token, index):
     权限三档（docs §5.4）：无 annotate 权限的 token 写标注 403（旧链接默认含 annotate）。
     兼容防护：可带 annotation_id（body/query），与该 index 当前指向行不一致
     → 409 annotation_moved（绝不删错另一条）。客户端已改用 by-id 路由。
+
+    2026-10-17 P1 竞态修复（同 share_roi_update）：index 只解析一次行，删除
+    按该行 annotation_id 走 delete_roi_by_annotation_id，绝不按 index 二次
+    定位；写入时该行已被并发删除 → 404。无论请求是否携带 annotation_id 均
+    如此。
     """
     share = _require_share(token)
     _log_share_access(token, detail={"via": "api_roi_delete"})
@@ -2326,27 +2336,29 @@ def share_roi_delete_by_id(token, annotation_id):
     r = _share_roi_by_id_in_token(token, annotation_id)
     if not isinstance(r, dict):
         return r
-    return _share_roi_delete(share, token, r, body, use_id=True)
+    return _share_roi_delete(share, token, r, body)
 
 
-def _share_roi_delete(share, token, r, body, use_id=False):
+def _share_roi_delete(share, token, r, body):
     """share_roi_delete(id) 共用主体：归属/归档校验后的 tombstone 删除。
 
-    use_id=True（id 版）直接按 annotation_id 行锁删除——不走位置 index，
-    避免 fetch 与删除之间列表漂移的 TOCTOU；index 版维持原 store 调用。
+    一律按 r 的 annotation_id 行锁删除（delete_roi_by_annotation_id）——
+    2026-10-17 P1 竞态修复：index 版此前在 fetch 与删除之间按位置 index
+    二次定位（delete_roi(token, r["index"])），列表漂移会删到别的行；现
+    绑定已解析行，绝不换行。r 无 annotation_id 的历史/异常行 fail-closed
+    → 404（不回退按 index 定位）。
     """
     expected = body.get("expected_revision")
     if not _roi_owned_by(r, _visitor_id()):
         return jsonify(error="只能编辑自己创建的标记"), 403
     if _reject_archived_slide(share, r.get("slide")):
         return jsonify(error="切片已归档只读"), 403
+    aid = r.get("annotation_id")
+    if not aid:
+        return jsonify(error="选区不存在"), 404
     try:
-        if use_id:
-            ok = share_store.delete_roi_by_annotation_id(
-                r.get("annotation_id"), expected_revision=expected)
-        else:
-            ok, _aid = share_store.delete_roi(
-                token, r["index"], expected_revision=expected)
+        ok = share_store.delete_roi_by_annotation_id(
+            aid, expected_revision=expected)
     except share_store.AnnotationLocked as e:
         return jsonify(
             error="annotation_locked",

@@ -4408,9 +4408,10 @@
 
   // 进入文件夹（翻页记忆：离开时存当前页，回来恢复；§5.3）。
   // folder-experience §2：导航结束即写位置记忆（本会话导航优先于磁盘记忆）。
-  function fbGo(folderKey, pageHint) {
+  function fbGo(folderKey, pageHint, pinKey) {
     fbState.pages[fbState.folder] = fbState.page;
     fbState.folder = folderKey || null;
+    fbState.pin = pinKey || null;
     fbState.page = (typeof pageHint === "number" && pageHint >= 0)
       ? pageHint : (fbState.pages[fbState.folder] || 0);
     renderFolderBrowser();
@@ -4452,13 +4453,31 @@
       idx -= pages[page].length;
     }
     if (page >= pages.length) page = pages.length - 1;
-    fbGo(key, page);
+    fbGo(key, page, fbEntryKey({ kind: "slide", sid: ref }));
   }
 
   var FB_FOLDER_SVG = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>';
 
+  function fbEntryKey(it) {
+    return it.kind === "folder" ? "f:" + it.key : "s:" + it.sid;
+  }
+
+  // 页码锚定：定位到的切片（pin，翻页/换目录时清除）在任何重渲后都留在
+  // 当前页；仅布局变化（relayout：可用高度变了、内容没变）时以本页首条
+  // （anchor）为准重算页码——否则同一页码在新装箱下会指向别的切片。
+  function fbAnchoredPage(pages, relayout) {
+    var key = fbState.pin || (relayout ? fbState.anchor : null);
+    if (!key) return null;
+    for (var i = 0; i < pages.length; i++) {
+      for (var j = 0; j < pages[i].length; j++) {
+        if (fbEntryKey(pages[i][j]) === key) return i;
+      }
+    }
+    return null;
+  }
+
   // 渲染当前文件夹（整格重渲；页码在渲染前钳回有效范围）
-  function renderFolderBrowser() {
+  function renderFolderBrowser(relayout) {
     if (!els.fbStack) return;
     fbPulloutOnLayoutChange(); // 重渲后命中区全部重建：抽出层立即收回（§1.1）
     // 当前文件夹被删除后回到根目录（§5.3）；临时文件夹恒可用
@@ -4473,9 +4492,14 @@
     var pages = fbPackPages(ordered, availH);
     var totalItems = ordered.length;
     var totalPages = pages.length;
+    var anchored = fbAnchoredPage(pages, relayout === true);
+    if (anchored !== null) fbState.page = anchored;
     fbState.page = Math.max(0, Math.min(fbState.page, totalPages - 1));
     fbState.totalPages = totalPages;
     var pageEntries = pages[fbState.page] || [];
+    if (relayout !== true) {
+      fbState.anchor = pageEntries.length ? fbEntryKey(pageEntries[0]) : null;
+    }
 
     els.fbStack.innerHTML = "";
     var top = 0;
@@ -5039,13 +5063,13 @@
     }
     if (els.fbPrevBtn) {
       els.fbPrevBtn.addEventListener("click", function () {
-        if (fbState.page > 0) { fbState.page -= 1; renderFolderBrowser(); fbMemorySave(); }
+        if (fbState.page > 0) { fbState.page -= 1; fbState.pin = null; renderFolderBrowser(); fbMemorySave(); }
       });
     }
     if (els.fbNextBtn) {
       els.fbNextBtn.addEventListener("click", function () {
         if (fbState.page < fbState.totalPages - 1) {
-          fbState.page += 1; renderFolderBrowser(); fbMemorySave();
+          fbState.page += 1; fbState.pin = null; renderFolderBrowser(); fbMemorySave();
         }
       });
     }
@@ -5108,7 +5132,7 @@
       fbResizePending = true;
       (window.requestAnimationFrame || function (cb) { setTimeout(cb, 16); })(function () {
         fbResizePending = false;
-        renderFolderBrowser();
+        renderFolderBrowser(true);
       });
     }
     window.addEventListener("resize", scheduleFbRelayout);

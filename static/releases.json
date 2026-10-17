@@ -3,6 +3,33 @@
   "version_scheme": "YYYY.MM.DD product release. Do not use PathTogether package.json 0.1.0 (test package) as the product version.",
   "releases": [
     {
+      "version": "2026.10.18",
+      "date": "2026-10-18",
+      "published": true,
+      "components": {
+        "histopilot": "0.4.4",
+        "pathtogether": "suite-20261018"
+      },
+      "items": {
+        "zh": [
+          "工作台上传先在浏览器识别文件格式：需要转换的切片直接在上传面板里排队转换并校验，通过后才上传，不再跳转到转换工具；扩展名与内容不符或暂不支持的格式会当场说明，并可一键申请支持该格式。",
+          "上传更稳：关闭页面或长时间无响应的上传会自动释放名额，失败时显示具体原因；换账号后不会把上一个账号的文件传到当前账号。",
+          "在已有 AI 对话里继续提问时，新问题和回答按顺序接在末尾，不再把之前的读片过程重新显示一遍。",
+          "修复连续删除或审核标记时可能作用到另一条标记的问题，现在每次操作都只针对你点的那一条。",
+          "转换工具兼容边缘瓦片略超出图像范围的 KFB 文件（此前会报「瓦片索引无效」）。",
+          "切片侧栏在展开或收起时不再偶尔变成「每页只显示一张」。"
+        ],
+        "en": [
+          "Workbench uploads now check the file format in your browser first: slides that need conversion are converted and validated right in the upload panel before uploading, with no detour to the converter. Mismatched or unsupported files are explained on the spot, with a one-click request to support the format.",
+          "More reliable uploads: uploads from closed or unresponsive pages release their slot automatically, failures show the specific reason, and switching accounts never sends the previous account’s files to the current one.",
+          "Follow-up questions in an existing AI conversation now appear in order at the end, without replaying the earlier reading steps.",
+          "Fixed deleting or reviewing markers in quick succession sometimes acting on a different marker; each action now applies only to the one you clicked.",
+          "The converter now accepts KFB files whose edge tiles slightly overrun the image (previously “invalid tile index”).",
+          "The slide sidebar no longer occasionally shows one slide per page after expanding or collapsing."
+        ]
+      }
+    },
+    {
       "version": "2026.10.15",
       "date": "2026-10-15",
       "published": true,

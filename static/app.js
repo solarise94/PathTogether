@@ -81,6 +81,9 @@
     "upload.cos.conv_state": { zh: "转换中（{s}）", en: "Converting ({s})" },
     "upload.cos.err.waiting_limit": { zh: "已有等待中的云端直传任务", en: "Another cloud upload is already waiting" },
     "upload.cos.err.state": { zh: "任务状态冲突，请刷新页面后重试", en: "Job state conflict; please refresh and retry" },
+    // 跨账号归属核对（P1 cross-account 2026-10-15）：服务端按会话核对
+    // expected_account 不符（i18n.js 为主源，此处兜底）
+    "upload.cos.err.account_mismatch": { zh: "登录账号已变化：本页身份与当前会话不一致，未创建上传任务。请刷新页面重新登录后再上传", en: "Your signed-in account changed: this page's identity no longer matches the session and no upload was created. Refresh and sign in again before uploading" },
     "upload.cos.err.rate": { zh: "签名请求过于频繁，请稍后重试", en: "Signing rate limited; please retry later" },
     "upload.cos.err.reconcile": { zh: "云端容量对账中，暂不可继续，请稍后重试", en: "Cloud capacity reconciliation in progress; retry later" },
     // upload-liveness（0084）：vanish client 终态与校验细节文案（i18n.js 为主源，此处兜底）
@@ -10725,9 +10728,21 @@
     });
   }
 
+  /// 服务端跨账号核对拒绝（P1 cross-account 2026-10-15）：POST /api/ingestions
+  /// 返回 409 account_mismatch（error / code 任一形态——旧部署只带 error）。
+  function isAccountMismatchError(err) {
+    return !!(err && err.status === 409 && err.data &&
+              (err.data.code === "account_mismatch" ||
+               err.data.error === "account_mismatch"));
+  }
+
   function cosErrorMessage(status, data) {
     var code = (data && (data.code || data.error)) || "";
     if (code === "upload_too_large") return tt("upload.cos.err.too_large");
+    // 跨账号核对拒绝（P1 cross-account）：任务未创建，明确指出登录身份变化
+    if (code === "account_mismatch") {
+      return tt("upload.cos.err.account_mismatch");
+    }
     if (code === "cos_pool_below_product_limit") return tt("upload.cos.err.pool_config");
     if (code === "cos_format_unsupported") return tt("upload.cos.err.format_unsupported");
     // 阶段 1：直传关闭格式（旧码 conversion_moved_to_browser 同文案兼容）
@@ -10855,6 +10870,14 @@
       row.finish(10000);
       return;
     }
+    // 跨账号归属绑定（P1 cross-account 2026-10-15）：本次上传开始时**冻结**
+    // 的页面身份（本页缓存、未经确认不会变）。它就是该条目的归属证据：
+    //   - 记录持久化 / 跨标签内容锁的账号段用它（下面引擎 opts.account）；
+    //   - 新任务创建体经引擎带 expected_account（服务端按当前会话核对，
+    //     不符 409 account_mismatch——前端缓存不可靠，服务器是唯一权威）。
+    // 绝不在请求发出前现读 currentUserId：身份中途被刷新而条目未重判时，
+    // 现读值会把产物静默记到新账号名下。
+    var frozenAccount = String(currentUserId || "");
     var jobId = opts.resumeJobId || null;   // created 事件回填（重试按钮用）
     var upload = null;
     // 复核修复：页面可见性恢复时补一拍在场证据（心跳的驱动源只有 JS 事件
@@ -10918,7 +10941,7 @@
     var locked = (window.HP_COS_UPLOAD.acquireContentLock &&
                   window.HP_COS_UPLOAD.contentLockName)
       ? window.HP_COS_UPLOAD.acquireContentLock(
-          window.HP_COS_UPLOAD.contentLockName(String(currentUserId || ""), file),
+          window.HP_COS_UPLOAD.contentLockName(frozenAccount, file),
           { signal: lockAbort ? lockAbort.signal : undefined,
             onWaiting: function () {
               row.setStage("upload.cos.other.tab", null, "", true);
@@ -10952,9 +10975,10 @@
           },
           readRecord: cosReadJobRecord,   // review #1：分片摘要 + 账号
         },
-        // review #1：记录/候选按登录账号绑定（本页身份 = /api/auth/info 的
-        // user_id；免认证态为空串——绑定语义退化为「同一（唯一）账号」）
-        account: String(currentUserId || ""),
+        // review #1：记录/候选按登录账号绑定（上传开始时冻结的账号——
+        // 也是创建体 expected_account 的来源；免认证态为空串——绑定语义
+        // 退化为「同一（唯一）账号」，且不带 expected_account 字段）
+        account: frozenAccount,
         resumeJobId: jobId,
         skipConfirm: !!opts.skipConfirm,
         confirmResume: function () {
@@ -11013,7 +11037,16 @@
         }
         cosUploadSucceeded(row, r.body, file, opts.assocTarget);
       }, function (err) {
-        if (opts.onOutcome) { opts.onOutcome(null, err); return; }
+        if (opts.onOutcome) {
+          if (isAccountMismatchError(err)) {
+            // 面板编排器按服务端核对结果收口 account_mismatch（改绑/删除）：
+            // 把本次创建冻结并随 expected_account 发出的账号带上——它就是
+            // 「归属账号」的证据（服务器拒绝 = 会话已不是它）。
+            err.expectedAccount = frozenAccount;
+          }
+          opts.onOutcome(null, err);
+          return;
+        }
         var msg;
         if (err && err.magicMismatch) {
           // 前置魔数校验拒绝（零网络请求）：说出检测到的内容类型
@@ -11734,11 +11767,39 @@
     return up.ingestionId;
   }
 
+  /// 条目在记录里已绑定的账号（P1 cross-account 2026-10-15）：进行中的
+  /// upload 属创建它的账号；未收口的 pending intent 同样绑定授权账号。
+  /// 无绑定证据 → null（调用方回落当前页面身份）。与编排器的 recordOwner
+  ///（static/upload/inline-convert.js）同一口径，只读归属、不判他人。
+  function inlineBoundAccount(job) {
+    var up = job && job.upload;
+    var it = job && job.intent;
+    if (up && up.ingestionId && up.state !== "published" &&
+        up.state !== "failed" && up.state !== "cancelled" &&
+        typeof up.account === "string" && up.account) {
+      return String(up.account);
+    }
+    if (it && it.state === "pending" && typeof it.account === "string" &&
+        it.account) {
+      return String(it.account);
+    }
+    return null;
+  }
+
   function createEntryUpload(entry, artifact, job, name, declaration, cfg) {
     // 取消边界：建引擎（随后 createUpload 的链上就是 POST /api/ingestions）
     // 前的最后一道闸。引擎句柄（entry._upload）在下一行同步挂上，此后编排
     // 器的取消经 e._upload.cancel() 停掉引擎内部一切在途/后续请求。
     if (entry.cancelled) return Promise.resolve({ cancelled: true });
+    // 跨账号归属绑定（P1 cross-account 2026-10-15）：expected_account 用
+    // **记录里已绑定的账号**（进行中 upload.account / pending
+    // intent.account——条目被授权时的账号），不是此刻现读的 currentUserId：
+    // 身份中途被刷新而记录未重判时，现读值等于授权把产物静默记到新账号
+    // 名下。无绑定记录（getJob 失败 / 全新产物）才用当前页面身份——
+    // uploadEntryArtifact 的归属复核刚按它通过，upload.account 的首次归属
+    // 写入（storage.save）与 expected_account 保持同一账号。
+    var acct = inlineBoundAccount(job);
+    if (acct === null) acct = String(currentUserId || "");
     return new Promise(function (resolve, reject) {
       var upload = window.HP_COS_UPLOAD.createUpload({
         source: {
@@ -11757,7 +11818,7 @@
               state: "uploading", confirmedParts: rec.confirmed || [],
               partDigests: rec.digests || {},
               digestScheme: rec.digest_scheme || "",
-              account: String(currentUserId || ""),
+              account: acct,   // 归属写入与 expected_account 同一账号
             });
           },
           complete: function (id, outcome) {
@@ -11792,7 +11853,7 @@
             });
           },
         },
-        account: String(currentUserId || ""),
+        account: acct,
         resumeJobId: resumeIdFromRecord(job),
         skipConfirm: true,
         confirmResume: function () { return true; },
@@ -11824,7 +11885,14 @@
         },
       });
       entry._upload = upload;
-      upload.done.then(resolve, reject);
+      upload.done.then(resolve, function (err) {
+        if (isAccountMismatchError(err)) {
+          // 编排器按服务端核对收口 account_mismatch（改绑/删除）：带上本次
+          // 创建声明并冻结的绑定账号——它就是「归属账号」的证据。
+          err.expectedAccount = acct;
+        }
+        reject(err);
+      });
     });
   }
 
@@ -11897,6 +11965,8 @@
     inlineWarnNeeded: function () { return inlineUnloadOn; },
     uploadEntryArtifact: uploadEntryArtifact,
     resumeIdFromRecord: resumeIdFromRecord,
+    // P1 cross-account：条目记录的绑定账号（expected_account 的来源）
+    inlineBoundAccount: inlineBoundAccount,
     legacyUploadFile: legacyUploadFile,
     importBundleRows: importBundleRows,
     submitFormatRequestCore: submitFormatRequestCore,

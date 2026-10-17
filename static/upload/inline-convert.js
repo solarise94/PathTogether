@@ -1087,6 +1087,9 @@
         return Promise.resolve(deps.onArtifact(e, null)).then(function (outcome) {
           return completeUpload(e, outcome);
         }, function (err) {
+          // 服务端跨账号核对拒绝（P1）：任务未创建，行收口 account_mismatch
+          //（重拉身份 + 只认改绑/删除），不走通用失败路径
+          if (onAccountMismatch(e, err, null)) return;
           failUpload(e, err);
         });
       }
@@ -1113,6 +1116,9 @@
               holdForIdentity(e);
               return Promise.reject({ __identityHold: true });
             }
+            // 上传阶段的条目产物已就绪：显式改绑后按「继续上传」重新发起
+            //（与 onAccountMismatch 的 resumeKind 补写同一语义）
+            if (!e.resumeKind) e.resumeKind = "upload";
             return Promise.reject({
               __account: true,
               owner: (job.intent && job.intent.accountLabel) ||
@@ -1172,6 +1178,13 @@
             failAccountMismatch(e, err.owner);
             return;
           }
+          // 服务端跨账号核对拒绝（P1 cross-account 2026-10-15）：前端归属
+          // 校验用的是本页缓存身份，转换期间另一标签页换账号后已不可信——
+          // 服务器按当前会话核对 expected_account 拒绝（任务未创建）。
+          // 重拉身份更新本页 + 行收口 account_mismatch（只认改绑/删除）。
+          if (onAccountMismatch(e, err, job)) {
+            return;
+          }
           if (err && err.__gate) {
             markError(e, err.code, null, {});
             setStage(e, err.stageKey);
@@ -1189,6 +1202,64 @@
     function ownerLabel(owner) {
       if (owner === "") return t("upload.inline.account.unknown");
       return owner || null;
+    }
+
+    // ---- 服务端跨账号核对拒绝（P1 cross-account 2026-10-15）----
+    /// POST /api/ingestions 409 account_mismatch（error / code 任一形态）：
+    /// 服务器按**当前会话**核对创建体的 expected_account 不符——本页缓存
+    /// 身份已不可信（另一标签页中途退出并换了账号），前端校验全部失效，
+    /// 只有这一步服务器核对是权威。任务未创建（零建行/零预约/零字节）。
+    function isAccountMismatchError(err) {
+      return !!(err && err.status === 409 && err.data &&
+        (err.data.code === "account_mismatch" ||
+         err.data.error === "account_mismatch"));
+    }
+
+    /// 通知注入方立即重拉 /api/auth/info 更新本页身份（app.js 的
+    /// retryAuthInfoNow：applyAuthInfo 落定后 markAuthInfoSettled 会触发
+    /// recheckOwnership 重判全部等待行）。行先就地收口 account_mismatch，
+    /// 身份落定后 recheckOwnership 复核——确仍不符保持拒绝，已切回本人则
+    /// 复位恢复分类。
+    function notifyIdentityRefresh() {
+      if (typeof deps.retryIdentity === "function") {
+        try { deps.retryIdentity(); } catch (err) { /* 回调失败不影响收口 */ }
+      }
+    }
+
+    /// mismatch 行的「归属账号」标签：优先记录里的绑定（upload.account /
+    /// intent.account——条目被授权时的账号），其次本次创建冻结并随
+    /// expected_account 发出的账号（app.js 在 409 上附带）。都拿不到时
+    /// null（行注退化为「未知账号」——不猜）。
+    function mismatchOwner(job, err) {
+      var up = job && job.upload;
+      if (up && up.ingestionId && up.state !== "published" &&
+          up.state !== "failed" && up.state !== "cancelled" &&
+          typeof up.account === "string" && up.account) {
+        return String(up.account);
+      }
+      var it = job && job.intent;
+      if (it && it.state === "pending" && typeof it.account === "string" &&
+          it.account) {
+        return String(it.account);
+      }
+      if (err && typeof err.expectedAccount === "string" &&
+          err.expectedAccount) {
+        return err.expectedAccount;
+      }
+      return null;
+    }
+
+    /// 上传入口的服务端核对拒绝收口：重拉身份 + 行进 account_mismatch
+    ///（只认显式改绑/删除）。返回 true 表示已处理（调用方不再走失败路径）。
+    function onAccountMismatch(e, err, job) {
+      if (!isAccountMismatchError(err)) return false;
+      notifyIdentityRefresh();
+      // 上传阶段的条目产物已就绪：显式改绑后按「继续上传」重新发起
+      //（rebindAccount 按 resumeKind 分派；恢复行的 resumeKind 已有值，
+      // 面板新条目在此补上）。
+      if (e.jobId && !e.resumeKind) e.resumeKind = "upload";
+      failAccountMismatch(e, mismatchOwner(job, err));
+      return true;
     }
 
     /// 归属不符的行收口（复核 #2）：停在 account_mismatch（行注明归属
@@ -1273,6 +1344,15 @@
           setStage(e, "upload.inline.stage.convertFailed");
           if (ui.buttons) ui.buttons(e);
           settle(e, "convert_failed");
+        } else if (!e.jobId) {
+          // 直传条目（无本机转换记录）：改绑即按**当前账号**重新发起直传
+          //（P1 cross-account：新 expected_account 在上传入口按刷新后的
+          // 身份冻结；服务端再按会话核对一次）
+          e.mode = null;
+          e.state = "upload_queued";
+          setStage(e, "upload.inline.stage.queued");
+          if (ui.buttons) ui.buttons(e);
+          schedule();
         } else {
           e.mode = null;
           e.state = "done";

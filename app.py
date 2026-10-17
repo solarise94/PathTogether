@@ -12465,6 +12465,11 @@ def api_ingestions_create():
     retry 410 路径）；kfb/kfbf（conversion）维持关闭。大小合同先行裁定，
     直传关闭闸其后（均不建行/不占预约/不发凭证）。声明随任务落库
     （0078），worker 在 open_slide 之前按 upload_direct_class 核验。
+
+    可选 expected_account（跨账号归属核对，P1 2026-10-15）：客户端条目
+    绑定的账号（/api/auth/info 的 user_id 同格式）。带且 ≠ 当前会话
+    user_id → 409 account_mismatch（任何写入之前——不建行/不占预约/不进
+    等待）；缺字段保持现行为；免认证部署（会话无 user_id）跳过核对。
     """
     if not can_upload():
         return jsonify(error="无上传权限"), 403
@@ -12473,6 +12478,27 @@ def api_ingestions_create():
         return err
 
     body = request.get_json(silent=True) or {}
+
+    # P1 跨账号归属核对（cross-account 2026-10-15）：浏览器转换/直传把**条目
+    # 绑定的账号**（expected_account，与 /api/auth/info 顶层 user_id 同格式、
+    # 入队/上传开始时冻结）随创建请求带来。前端缓存身份不可能可靠——转换
+    # 期间另一标签页退出并换账号登录后，本页仍以旧身份通过前端归属校验，
+    # 而请求带的是**新账号的会话 cookie**。服务器是唯一权威：同一请求内
+    # 用当前会话身份核对，不符即 409 account_mismatch。核对在任何写入之前
+    # 完成：不建行、不预分配 slide_id、不占容量预约/名额、不进等待——零
+    # 静默上传。缺字段（旧客户端）保持现行为；免认证部署（AUTH_ENABLED=
+    # False，会话无稳定 user_id）本就无归属语义可比对（任务 owner 按配置
+    # owner 解析，见 ingestion_store.asset_owner_for_job），跳过核对。
+    expected_account = body.get("expected_account")
+    if expected_account is not None:
+        if (not isinstance(expected_account, str)
+                or not expected_account.strip()):
+            return jsonify(error="expected_account 需为非空字符串"), 400
+        session_uid = (current_identity().get("user_id") or "")
+        if session_uid and expected_account != session_uid:
+            return jsonify(error="account_mismatch",
+                           code="account_mismatch"), 409
+
     filename = body.get("filename")
     if not isinstance(filename, str) or not filename.strip():
         return jsonify(error="缺少 filename 字段"), 400

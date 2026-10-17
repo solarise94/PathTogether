@@ -585,3 +585,106 @@ test("开关关闭 + 直传类文件（.tif）：仍走既有直传状态机（�
   expect(await page.evaluate(() => (window as any).HP_UPLOAD.inlineOrch())).toBeNull();
 });
 
+
+// --------------------------------------------------------------------------- //
+// 跨账号归属核对（P1 cross-account 2026-10-15）：同一 cookie 上下文开两页，
+// A 页转换期间另一页退出并登录 B——A 页缓存的 A 身份仍能过前端归属校验，
+// 但 POST /api/ingestions 带的是 B 的会话。服务端按会话核对 expected_account
+// → 409 account_mismatch（零建行）；前端重拉 auth/info 更新身份后行收口
+// account_mismatch（只认显式改绑/删除），零静默上传。
+// 场景移植自 release-review 的 cross-account.mjs（断言原样）。
+// --------------------------------------------------------------------------- //
+test("同 Cookie 两页、中途换账号：上传创建被服务器 409 拒绝，行进入 account_mismatch", async ({ page }) => {
+  test.setTimeout(300_000);
+  const kfb = ensureKfb(KFB_W, KFB_H);
+
+  const creates: Array<Record<string, unknown>> = [];
+  const crossOriginPuts: string[] = [];
+  page.on("request", (r) => {
+    const u = new URL(r.url());
+    if (u.pathname === "/api/ingestions" && r.method() === "POST") {
+      creates.push(JSON.parse(r.postData() || "{}"));
+    }
+    if (r.method() === "PUT" && u.hostname === "127.0.0.1"
+        && /\/incoming\//.test(u.pathname)) {
+      crossOriginPuts.push(u.pathname);
+    }
+  });
+  const pageErrors: string[] = [];
+  page.on("pageerror", (e) => pageErrors.push(e.message));
+
+  // ---- A 页：owner 登录，转换期间钉住产物视图 ----
+  await login(page, CREDS.ownerLogin, CREDS.ownerPassword);
+  await page.goto("/app");
+  await page.waitForLoadState("load");
+  await expandSidebar(page);
+  await page.waitForFunction(() => (window as any).HP_UPLOAD?.inlineRunner());
+  const accountA = await page.evaluate(async () => {
+    const r = await fetch("/api/auth/info");
+    return (await r.json()).user_id as string;
+  });
+  expect(accountA).toBeTruthy();
+  // 复现脚本同款：挂起 artifactView（转换完成 → 上传创建之间的窗口）
+  await page.evaluate(() => {
+    const r = (window as any).HP_UPLOAD.inlineRunner();
+    const orig = r.artifactView.bind(r);
+    r.artifactView = async function (...args: unknown[]) {
+      (window as any).__artifactHeld = true;
+      await new Promise((resolve) => { (window as any).__releaseArtifact = resolve; });
+      return orig(...args);
+    };
+  });
+  await page.setInputFiles("#file-input", kfb);
+  await page.waitForFunction(() => (window as any).__artifactHeld === true,
+    undefined, { timeout: 120_000 });
+
+  // 原脚本断言 1：挂起时记录的 intent.account 是 A
+  const intentAccount = await page.evaluate(async (idx) => {
+    const o = (window as any).HP_UPLOAD.inlineOrch();
+    const e = o.list()[idx];
+    const j = await (window as any).HP_UPLOAD.inlineRunner().getJob(e.jobId);
+    return (j.intent && j.intent.account) || null;
+  }, 0);
+  expect(intentAccount).toBe(accountA);
+
+  // ---- 另一标签页：退出 A、登录 B（同一 cookie 上下文）----
+  const pageB = await page.context().newPage();
+  await pageB.addInitScript(() => localStorage.setItem("hp_lang", "zh"));
+  await page.evaluate(async () => {
+    const m = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
+    await fetch("/logout", {
+      method: "POST",
+      headers: { "X-CSRF-Token": m ? decodeURIComponent(m[1]) : "" },
+    });
+  });
+  await login(pageB, CREDS.userLogin, CREDS.userPassword);
+  const accountB = await pageB.evaluate(async () => {
+    const r = await fetch("/api/auth/info");
+    return (await r.json()).user_id as string;
+  });
+  // 原脚本断言 2：B 的身份与 A 不同
+  expect(accountB).not.toBe(accountA);
+
+  // ---- 释放产物：A 页以缓存身份发起上传创建 → 服务器按会话核对拒绝 ----
+  await page.evaluate(() => (window as any).__releaseArtifact());
+  await expect.poll(async () => {
+    const st = (await entryOf(page, 0))?.state;
+    return ["done", "upload_failed", "account_mismatch"].includes(st as string);
+  }, { timeout: 120_000, intervals: [250] }).toBe(true);
+  const entry = await entryOf(page, 0);
+  // 原脚本断言 3（核心）：账号变化必须经确认才能上传——行收口
+  // account_mismatch，绝不静默完成
+  expect(entry!.state).toBe("account_mismatch");
+
+  // 创建体带 expected_account=A；服务器 409 后任务未创建（零建行/零分块）
+  expect(creates).toHaveLength(1);
+  expect(creates[0].expected_account).toBe(accountA);
+  expect(entry!.uploadJobId).toBeFalsy();
+  expect(crossOriginPuts).toEqual([]);
+  // 行注明归属账号与两条出路（改绑 / 删除本地产物）
+  const row = panelRows(page).last();
+  await expect(row).toContainText(accountA);
+  await expect(row).toContainText("删除本地产物");
+  expect(pageErrors, `pageerror: ${pageErrors.join(" | ")}`).toEqual([]);
+  await pageB.close();
+});

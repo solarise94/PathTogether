@@ -618,3 +618,95 @@ def test_status_body_exposes_fail_detail(owner_client):
     assert body["stage"] == "terminal"
     assert body["fail_code"] == "validation_failed"
     assert body["fail_detail"] == "raster_format_mismatch"
+
+
+# --------------------------------------------------------------------------- #
+# 跨账号归属核对（expected_account；P1 cross-account 2026-10-15）
+#
+# 缺陷：浏览器转换期间另一标签页退出并换账号登录后，A 页仍用缓存身份通过
+# 前端归属校验，而 POST /api/ingestions 带的是 B 的会话 cookie——服务器必须
+# 在同一请求内、任何写入之前按当前会话核对 expected_account（客户端条目
+# 绑定的账号，与 /api/auth/info 顶层 user_id 同格式），不符 409
+# account_mismatch：不建行、不预分配 slide_id、不占预约/名额、不进等待。
+# --------------------------------------------------------------------------- #
+
+def _ingestion_row_count():
+    def _q(cur):
+        cur.execute("SELECT COUNT(*) AS n FROM ingestion_jobs")
+        row = cur.fetchone()
+        return row["n"] if isinstance(row, dict) else row[0]
+    return _sql_api(_q)
+
+
+def test_expected_account_mismatch_409_zero_side_effects(owner_client):
+    _mkuser("user-2", "user")
+    before = _ingestion_row_count()
+    r = _create(owner_client, expected_account="user-2")
+    assert r.status_code == 409
+    assert r.get_json()["error"] == "account_mismatch"
+    # 任何写入之前核对：无新行（含 slide 预分配同事务）、无等待、无预约
+    assert _ingestion_row_count() == before
+    assert ist.waiting_and_holding_counts()["waiting"] == 0
+    assert cos_pool_store.get_pool_state()["reserved_bytes"] == 0
+
+
+def test_expected_account_match_creates_normally(owner_client):
+    r = _create(owner_client, expected_account="owner-1")
+    assert r.status_code == 202, r.get_json()
+    job = ist.get_job(r.get_json()["job_id"])
+    assert job["owner_user_id"] == "owner-1"
+
+
+def test_expected_account_missing_or_null_keeps_legacy_behavior(owner_client):
+    # 缺字段（旧客户端）与显式 null 都保持现行为
+    r = _create(owner_client)
+    assert r.status_code == 202, r.get_json()
+    r2 = _create(owner_client, expected_account=None)
+    assert r2.status_code == 202, r2.get_json()
+
+
+def test_expected_account_invalid_type_400(owner_client):
+    r = _create(owner_client, expected_account=123)
+    assert r.status_code == 400
+    r2 = _create(owner_client, expected_account="   ")
+    assert r2.status_code == 400
+
+
+def test_expected_account_mismatch_does_not_consume_idempotency_key(owner_client):
+    # 409 在幂等记账之前拒绝：同键随后可正常创建（零副作用合同的推论）
+    _mkuser("user-2", "user")
+    r = _create(owner_client, expected_account="user-2",
+                idempotency_key="idem-xacct-1")
+    assert r.status_code == 409
+    r2 = _create(owner_client, idempotency_key="idem-xacct-1")
+    assert r2.status_code == 202, r2.get_json()
+
+
+def test_expected_account_check_skipped_without_session_uid(
+        owner_client, monkeypatch):
+    # 免认证部署（AUTH_ENABLED=False，会话无稳定 user_id）：没有归属语义
+    # 可比对，跳过核对（与任务 owner 按配置 owner 解析的既有语义一致）。
+    # 这里只钉「绝不按账号拒绝」——部署形态差异（是否配置 owner）交给
+    # 各自环境测试。
+    monkeypatch.setattr(app_mod, "current_identity",
+                        lambda: {"role": "owner", "user_id": ""})
+    r = _create(owner_client, expected_account="user-2")
+    assert r.status_code != 409
+
+
+def test_other_owner_resume_rejected(owner_client):
+    # 他人任务的续传端点（/resume）：非属主 403（与 status / upload-complete /
+    # cancel / parts/sign 同一 ownership 闸），且不触碰任务归属与状态
+    job_id, _plan = _mk_uploading(owner_client, size=500_000)
+    _mkuser("user-2", "user")
+    other = csrf_client(app_mod.app.test_client())
+    with other.session_transaction() as s:
+        s["auth_user"] = "user-2@x"
+        s["user_id"] = "user-2"
+        s["role"] = "user"
+        s["auth_version"] = 1
+    r = other.post("/api/ingestions/%s/resume" % job_id)
+    assert r.status_code == 403
+    job = ist.get_job(job_id)
+    assert job["owner_user_id"] == "owner-1"
+    assert job["state"] == ist.UPLOADING

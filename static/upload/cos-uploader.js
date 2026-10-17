@@ -35,6 +35,11 @@
           resumeJobId: string | null,   // 显式续传：跳过创建与询问
           skipConfirm: bool,            // 续传不询问（重试按钮语义）
           confirmResume: () => bool,    // 发现可续传任务时询问（默认 true）
+          account: string,              // 条目绑定的账号（入队/上传开始时冻结）：
+                                        // 随记录持久化（他号记录绝不续传）+
+                                        // 新任务创建体带 expected_account（服务端
+                                        // 按当前会话核对，不符 409 account_mismatch；
+                                        // 空串 = 免认证部署，不带字段）
           createBody: object | null,    // 阶段 1：POST /api/ingestions 附加
                                         // 字段（direct_class 声明；仅新任务
                                         // 创建时合并，续传不带）
@@ -1037,6 +1042,13 @@
         filename: source.name, declared_size: source.size,
       }, (opts.createBody && typeof opts.createBody === "object")
         ? opts.createBody : {});
+      // 跨账号归属核对（P1 cross-account 2026-10-15）：expected_account =
+      // 本引擎实例冻结的绑定账号（opts.account——调用方在入队/上传开始时
+      // 冻结，不是发请求时现读的全局）。前端缓存身份不可靠（另一标签页
+      // 中途换账号后本页不知情），服务器按当前会话核对，不符 409
+      // account_mismatch（零建行，调用方按归属不符收口）。免认证部署
+      // （空账号）不带字段——旧客户端/免认证语义不变。
+      if (account) createBody.expected_account = account;
       return api("/api/ingestions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },

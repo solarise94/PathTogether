@@ -5099,15 +5099,22 @@
       if (!confirm(t("fb.del.confirm", { name: p.name || "" }))) return;
       deleteProject(p, { skipConfirm: true });
     });
-    // 窗口高度变化 → 可用高度变化 → 叠大小重算（rAF 节流，翻页不变）
-    window.addEventListener("resize", function () {
+    // 可用高度变化 → 叠大小重算（rAF 节流，翻页不变）。除窗口 resize 外，
+    // 栈自身高度也会变（侧栏收起/展开过渡中头部换行会暂时压缩 .fb-stack）：
+    // 只听 window resize 会把过渡期的瞬时高度装箱结果（每页 1 张）一直留存。
+    // 渲染只重建栈内绝对定位子节点、不改变栈自身盒尺寸，观察不会回环。
+    function scheduleFbRelayout() {
       if (fbResizePending) return;
       fbResizePending = true;
       (window.requestAnimationFrame || function (cb) { setTimeout(cb, 16); })(function () {
         fbResizePending = false;
         renderFolderBrowser();
       });
-    });
+    }
+    window.addEventListener("resize", scheduleFbRelayout);
+    if (typeof ResizeObserver === "function") {
+      new ResizeObserver(scheduleFbRelayout).observe(els.fbStack);
+    }
     // 首帧（loadAll 之前）先渲染空态，避免空白侧栏
     renderFolderBrowser();
   }

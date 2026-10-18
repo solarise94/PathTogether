@@ -370,6 +370,7 @@
     var PROGRESS_MIN_MS = 120;     // 计划 §2.2：DOM 更新 100–250ms
     var abortCtl = (typeof AbortController === "function") ? new AbortController() : null;
     var stopped = false;           // 用户取消后停一切后续动作
+    var doneSettled = false;       // done 已收口（成功/失败/取消）——终态后 cancel 空转
     var waits = new Set();         // 进行中的等待 {h, reject}：取消时立即以 cancelled 结束
     var settleCancelled = null;
     var cancelledOutcome = new Promise(function (r) { settleCancelled = r; });
@@ -1020,8 +1021,11 @@
 
     // —— 取消：结束所有等待 + abort 在途 PUT + 清记录 + POST cancel（幂等）；
     //    done 立即以 cancelled 收口（不等悬置的控制请求） ——
+    // 终态守卫（P3 复核 2026-10-18）：done 已收口（入库完成/失败/取消）后
+    // cancel 是空操作——已发布/终态资产的 cancel 请求只会被服务端拒绝；
+    // 失败行的服务端计划要留给「继续上传」复用，也不得在此误取消。
     function cancel() {
-      if (stopped) return;
+      if (stopped || doneSettled) return;
       stopped = true;
       settleCancelled({ cancelled: true });
       stopTimers();
@@ -1195,10 +1199,17 @@
       throw err;
     });
     var done = Promise.race([main, cancelledOutcome]);
+    // 终态旗标（P3 复核 2026-10-18）：done 收口即置位——handle.settled()
+    // 供行适配层（app.js uploadFileCos 的取消钮）同步判定「点击必须是空
+    // 操作」，不必等 Promise then 再摘按钮。
+    done.then(function () { doneSettled = true; },
+              function () { doneSettled = true; });
 
     return {
       cancel: cancel,
       done: done,
+      // 上传是否已收口（成功/失败/取消任一终态；含用户取消的 stopped）
+      settled: function () { return stopped || doneSettled; },
       // 页面生命周期触点（可见性恢复/URL 活跃）：刷新在场证据的补充入口
       //（tests/js/cos-upload-liveness.test.ts 驱动面）
       pokeLifecycle: pokeLifecycle,

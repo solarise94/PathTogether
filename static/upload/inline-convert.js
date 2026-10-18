@@ -162,6 +162,9 @@
     if (code === "resume_refused") return "upload.inline.err.resume";
     if (code === "source_changed_refuse_resume") return "upload.inline.err.resume";
     if (code === "io_recoverable") return "upload.inline.err.io";
+    // 上传入口读不到本机归属记录（P1 复核 2026-10-18）：绝不按现读身份
+    // 新建 ingestion——行停可重试的失败态，重试会重新读记录复核归属。
+    if (code === "owner_read_failed") return "upload.inline.err.ownerRead";
     if (code === "upload_too_large") return "upload.cos.err.too_large";
     if (code === "cos_pool_below_product_limit") return "upload.cos.err.pool_config";
     if (code === "validation_failed") {
@@ -1125,6 +1128,12 @@
                 (job.upload && job.upload.accountLabel) || owner,
             });
           }
+          // 归属冻结（P1 复核 2026-10-18）：复核**通过的时刻**把归属记在
+          // 条目上（记录绑定账号，全新产物 = 当时已核验的当前身份）。本次
+          // 上传全程（本模块兜底 uploadArtifact 的 engine account 与
+          // upload.account 首次写入）只认这个值——绝不在其后的慢操作
+          // （artifactView 等）窗口里现读 account() 兜底。
+          e.ownerAccount = owner !== null ? owner : cur;
           // 门禁（设计 §5.1）：能力 + 账号 + **最终产物**大小 + viewable_formats
           var gate = entryArtifactGate(e, job);
           if (!gate.ok) {
@@ -1425,6 +1434,19 @@
         var cfg = caps.cosConfig;
         var name = e.artifactName || e.name;
         var declaration = artifactDeclaration(e.artifactCls);
+        // 冻结归属（复核修复 P1）：engine account 与 upload.account 首次
+        // 写入都用 runUpload 归属复核通过时记在条目上的 ownerAccount——
+        // 绝不在此刻现读 account() 兜底。上传时刻身份已变（≠ 冻结值）→
+        // 不建引擎，按 account_mismatch 收口（与 app.js 上传入口同一闸；
+        // __account 由 runUpload 的收口统一映射行态）。
+        var frozenOwner = (typeof e.ownerAccount === "string")
+          ? e.ownerAccount : String(account() || "");
+        if (String(account() || "") !== frozenOwner) {
+          return Promise.reject({
+            __account: true, owner: frozenOwner,
+            data: { code: "account_mismatch" },
+          });
+        }
         var source = {
           name: name,
           size: artifact.size,
@@ -1445,7 +1467,7 @@
                 confirmedParts: rec.confirmed || [],
                 partDigests: rec.digests || {},
                 digestScheme: rec.digest_scheme || "",
-                account: String(account() || ""),
+                account: frozenOwner,
               });
             },
             complete: function (id, outcome) {
@@ -1482,7 +1504,7 @@
               });
             },
           },
-          account: String(account() || ""),
+          account: frozenOwner,
           resumeJobId: (job && job.upload && job.upload.ingestionId &&
                         job.upload.state !== "published" &&
                         job.upload.state !== "failed" &&

@@ -3,6 +3,33 @@
   "version_scheme": "YYYY.MM.DD product release. Do not use PathTogether package.json 0.1.0 (test package) as the product version.",
   "releases": [
     {
+      "version": "2026.10.19",
+      "date": "2026-10-19",
+      "published": true,
+      "components": {
+        "histopilot": "0.4.5",
+        "pathtogether": "suite-20261019"
+      },
+      "items": {
+        "zh": [
+          "选中标记后，浮条直接显示「✨ 加入 AI 对话」：标记会作为附件卡加入当前对话，不会自动发送，已输入的文字保留；可一次加入多个标记，也可随时移除。锁定位置移到「⋯」菜单。",
+          "AI 会同时看到你加入的标记和当前视野，并可结合其他区域判断；标注行内的「快速问答」「从此处深读」并入「加入 AI 对话」，历史批注对话仍可查看，并可在 AI 对话中继续。",
+          "修复拖动或缩放候选框时松开鼠标后框仍跟着鼠标移动、点不到「保存为标记」的问题；拖动被打断时框会回到原位，不会误保存。",
+          "标注面板在标记更新或删除后立即刷新，不再停留在旧列表或「暂无标注」。",
+          "已完成或失败的上传行不再显示「取消」按钮；刷新页面后切片侧栏回到上次浏览的那一页。",
+          "上传归属更严格：读取本机上传记录失败时暂停并可重试，不会改用当前登录账号继续上传。"
+        ],
+        "en": [
+          "Selecting a marker now shows “✨ Add to AI chat” on the floating bar: the marker joins the current conversation as an attachment card without sending anything, and your typed text is kept. You can add several markers and remove them any time. Lock position moved into the “⋯” menu.",
+          "The AI sees the markers you added alongside your current view and may look at other areas too. The per-annotation “Quick ask” and “Read deeper from here” entries are merged into “Add to AI chat”; past annotation chats stay readable and can be continued in the AI chat.",
+          "Fixed the candidate box sometimes following the mouse after release while moving or resizing it, which made “Save as marker” hard to click; an interrupted drag now puts the box back without saving.",
+          "The annotation panel refreshes right after a marker is updated or deleted instead of showing a stale list or “No annotations”.",
+          "Finished or failed upload rows no longer show a “Cancel” button, and the slide sidebar returns to the page you were on after a reload.",
+          "Stricter upload ownership: if the local upload record can’t be read, the upload pauses with a retry instead of continuing under the currently signed-in account."
+        ]
+      }
+    },
+    {
       "version": "2026.10.18",
       "date": "2026-10-18",
       "published": true,

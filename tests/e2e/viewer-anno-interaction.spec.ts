@@ -256,13 +256,19 @@ test.describe("viewer 标注交互（§5.4/§6，真实后端）", () => {
 		expect(Math.abs((panned!.y - before!.y) + 20),
 			`平移位移 dy=${panned!.y - before!.y}`).toBeLessThanOrEqual(4);
 
-		// --- 单击选中：就近工具条（编辑备注 / 锁定位置 / ⋯；单一蓝轮廓无黄角点） ---
+		// --- 单击选中：就近工具条（AI 入口统一 2026-10-18：编辑备注 /
+		// ✨ 加入 AI 对话 / ⋯；单一蓝轮廓无黄角点）；锁定已移入 ⋯ 菜单 ---
 		const c1 = await markerCenter(page);
 		await page.mouse.click(c1.x, c1.y);
 		const toolbar = page.locator("#anno-obj-toolbar");
 		await expect(toolbar).toBeVisible();
 		await expect(toolbar).toContainText("编辑备注");
-		await expect(toolbar).toContainText("锁定位置");
+		await expect(toolbar).toContainText("加入 AI 对话");
+		await expect(toolbar.locator(".aot-lock")).toHaveCount(0);
+		await toolbar.locator(".aot-more").click();
+		await expect(toolbar.locator(".aot-menu .aot-menu-item", { hasText: "锁定位置" })).toBeVisible();
+		await toolbar.locator(".aot-more").click();
+		await expect(toolbar.locator(".aot-menu")).toHaveCount(0);
 		await page.screenshot({ path: `${EVIDENCE_DIR}/e2e-selected-toolbar.png` });
 
 		// --- 已选中：按住拖动 = 移动整个对象（一次 PATCH；差量、带 CAS） ---
@@ -499,12 +505,17 @@ test.describe("viewer 标注交互（§5.4/§6，真实后端）", () => {
 			if (req.method() === "DELETE" && u.pathname.includes(annoId)) deleteCount.n++;
 		});
 
-		// 选中：工具条显示「解锁位置」（锁定态真实驱动 UI）
+		// 选中：锁定态在 ⋯ 菜单提供「解锁位置」（AI 入口统一后锁不在工具条）
 		const c = await markerCenter(page);
 		await page.mouse.click(c.x, c.y);
 		const toolbar = page.locator("#anno-obj-toolbar");
 		await expect(toolbar).toBeVisible();
-		await expect(toolbar).toContainText("解锁位置");
+		await expect(toolbar.locator(".aot-lock")).toHaveCount(0);
+		await toolbar.locator(".aot-more").click();
+		const unlockItem = toolbar.locator(".aot-menu .aot-menu-item", { hasText: "解锁位置" });
+		await expect(unlockItem).toBeVisible();
+		await toolbar.locator(".aot-more").click();
+		await expect(toolbar.locator(".aot-menu")).toHaveCount(0);
 		await page.screenshot({ path: `${EVIDENCE_DIR}/e2e-locked-toolbar.png` });
 
 		// 锁定对象按住拖动 → 平移切片（零几何 PATCH，绝不偷偷移动对象）
@@ -528,11 +539,12 @@ test.describe("viewer 标注交互（§5.4/§6，真实后端）", () => {
 		await page.waitForTimeout(400);
 		expect(deleteCount.n, "锁定对象 Delete 不得发 DELETE").toBe(0);
 
-		// 工具条「解锁位置」：单独 PATCH（只带 geometry_locked + CAS，无 geom 键）
+		// ⋯ 菜单「解锁位置」：单独 PATCH（只带 geometry_locked + CAS，无 geom 键）
 		const c3 = await markerCenter(page);
 		await page.mouse.click(c3.x, c3.y);
 		await expect(toolbar).toBeVisible();
-		await toolbar.locator(".aot-lock").click();
+		await toolbar.locator(".aot-more").click();
+		await toolbar.locator(".aot-menu .aot-menu-item", { hasText: "解锁位置" }).click();
 		await expect.poll(() => patchBodies.filter((b) => "geometry_locked" in b).length,
 			"解锁必须发出锁切换请求").toBe(1);
 		const lockPatch = patchBodies.find((b) => "geometry_locked" in b)!;
@@ -641,8 +653,10 @@ test.describe("viewer 标注交互（§5.4/§6，真实后端）", () => {
 			r.request().method() === "PATCH" && annoPatchUrl(new URL(r.url())));
 		expect(resp.status()).toBe(200);
 		const body = (resp.request().postDataJSON() as { geom: Record<string, number> }).geom;
-		// 真实工具条「锁定位置」：单独请求、无 geom、带 CAS，服务端 200
-		const lockBtn = page.locator("#anno-obj-toolbar .aot-lock");
+		// ⋯ 菜单「锁定位置」：单独请求、无 geom、带 CAS，服务端 200
+		const toolbar = page.locator("#anno-obj-toolbar");
+		await toolbar.locator(".aot-more").click();
+		const lockBtn = toolbar.locator(".aot-menu .aot-menu-item", { hasText: "锁定位置" });
 		await expect(lockBtn).toBeVisible();
 		const [lockResp] = await Promise.all([
 			page.waitForResponse((r) => r.request().method() === "PATCH"

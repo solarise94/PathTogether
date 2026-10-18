@@ -1,20 +1,25 @@
 /**
- * 标记 ⋯ 菜单「✨ 让 AI 解读」（2026-10-15 UX 改版：AI 解读入口在标记上，
- * 不再是 composer 的「+」按钮）。
+ * 标记工具条「✨ 加入 AI 对话」（AI 入口统一 2026-10-18：AI 加入入口从 ⋯
+ * 菜单上移到工具条主位；「让 AI 解读」interpret 预填退役；锁定/解锁移入 ⋯；
+ * fork「快速问答」/ branch「从此处深读」标注行入口退役）。
  *
  * 加载真实 static/app.js（harness 同 conversation-attach-intent.test.ts：最小
  * DOM + fetch mock + HostBridgeHost stub；container 补 addEventListener/appendChild
  * 以绑定 §6.2 捕获路由），经生产路径驱动：init → 开切片 → 显示标注层 → 容器
- * pointerdown/up 选中标注 → 工具条 ⋯ → 点击「✨ 让 AI 解读」。锁定：
- *   - 行为：真实标注的 ⋯ 菜单首项是「让 AI 解读」（aot-askai），点击 →
- *     HostBridge emit conversation.attachIntent，载荷 kind=marker +
- *     intent=interpret + annotation_id/revision/bbox/type/note（与右键
- *     「将此标注加入会话」同一冻结实现 freezeMarkerAttachPayload）；
- *   - 行为：插件未加载（hpReady=false）→ 项禁用，tooltip 为既有「插件未加载」
- *     说明；点击（无监听）不 emit；
- *   - 源契约：draft（临时框）目标不出现解读项——askai 分支位于 openAnnoToolbarMenu
- *     的 draft 早退之后；payload 冻结复用 freezeMarkerAttachPayload，不复制字段；
- *     composer 模板不再有 #ai-task-jump「+」按钮。
+ * pointerdown/up 选中标注 → 工具条。锁定：
+ *   - 行为：已保存标记工具条布局 [接受（仅 AI 待复核）] [编辑备注]
+ *     [✨ 加入 AI 对话] [⋯]；锁定按钮不再在工具条上（移入 ⋯）；
+ *   - 行为：点击 ✨（点击时刻冻结）→ HostBridge emit conversation.attachIntent，
+ *     载荷 kind=marker（无 intent=interpret）+ annotation_id/revision/bbox/
+ *     type/note（与右键「将此标注加入会话」同一冻结实现 freezeMarkerAttachPayload）；
+ *   - 行为：只读（can_edit=false）标记的 ✨ 仍可用——加入讨论不受写权限限制；
+ *   - 行为：插件未加载（hpReady=false）→ ✨ 禁用，tooltip 为「插件未加载」；
+ *     点击（无监听）不 emit；
+ *   - 行为：⋯ 菜单含「锁定/解锁位置」（带锁状态提示），定位项文案为
+ *     「居中显示此标记」；菜单不再有 AI 解读项；
+ *   - 源契约：draft（临时框）目标不出现 AI 加入项——早退分支在其之前；
+ *     标注行不再渲染 fork「快速问答」/ branch「从此处深读」，改为单个
+ *     「✨ 加入 AI 对话」chip（buildAnnoAiActions 统一入口）。
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
@@ -25,6 +30,7 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const appSrc = readFileSync(resolve(here, "../../static/app.js"), "utf8");
 const shellSrc = readFileSync(resolve(here, "../../templates/_app_shell.html"), "utf8");
+const i18nSrc = readFileSync(resolve(here, "../../static/i18n.js"), "utf8");
 const require = createRequire(import.meta.url);
 
 const SLIDE = "ctx-slide.ndpi";
@@ -180,7 +186,7 @@ interface BootResult {
   fakeViewer: { viewport: unknown; open: (url: string) => void };
 }
 
-function bootApp(opts: { pluginLoaded?: boolean; aiPending?: boolean } = {}): BootResult {
+function bootApp(opts: { pluginLoaded?: boolean; aiPending?: boolean; readOnly?: boolean } = {}): BootResult {
   const pluginLoaded = opts.pluginLoaded !== false;
   const els: Record<string, FakeEl> = {};
   const created: FakeEl[] = [];
@@ -228,7 +234,8 @@ function bootApp(opts: { pluginLoaded?: boolean; aiPending?: boolean } = {}): Bo
         items: [{ index: 0, token: "tok1", slide: SLIDE, slide_id: SLIDE_ID, type: "arrow",
                   x1: 100, y1: 100, x2: 300, y2: 200, ts: 1700000000,
                   note: "核异型区域", annotation_id: "anno-7", revision: 2,
-                  ...(opts.aiPending ? { source: "ai", review_status: "pending" } : {}) }],
+                  ...(opts.aiPending ? { source: "ai", review_status: "pending" } : {}),
+                  ...(opts.readOnly ? { can_edit: false } : {}) }],
       }] });
     }
     if (u.includes("/api/annotations")) return jsonResponse({ by_slide: {} });
@@ -333,10 +340,14 @@ function selectAnnoAt(app: BootResult, x: number, y: number) {
   app.container.fire("pointerup", ev);
 }
 
-/** 最近创建的工具条（#anno-obj-toolbar）里的 ⋯ 按钮。 */
-function moreButton(app: BootResult): FakeEl | null {
+/** 最近创建的工具条（#anno-obj-toolbar）。 */
+function toolbar(app: BootResult): FakeEl | null {
   const bars = app.created.filter((e) => e.id === "anno-obj-toolbar");
-  const bar = bars[bars.length - 1];
+  return bars[bars.length - 1] || null;
+}
+
+function moreButton(app: BootResult): FakeEl | null {
+  const bar = toolbar(app);
   if (!bar) return null;
   return (bar.children as FakeEl[]).find((b) => b.classList.contains("aot-more")) || null;
 }
@@ -364,7 +375,7 @@ afterEach(() => {
   delete (globalThis as { OpenSeadragon?: unknown }).OpenSeadragon;
 });
 
-async function bootOnSlide(opts: { pluginLoaded?: boolean; aiPending?: boolean } = {}) {
+async function bootOnSlide(opts: { pluginLoaded?: boolean; aiPending?: boolean; readOnly?: boolean } = {}) {
   const app = bootApp(opts);
   await settle();
   findSlideRow(app.created).dispatch("click");
@@ -378,29 +389,33 @@ async function bootOnSlide(opts: { pluginLoaded?: boolean; aiPending?: boolean }
   return app;
 }
 
-describe("标记 ⋯ 菜单「✨ 让 AI 解读」", () => {
-  it("选中标注 → ⋯ 菜单首项是解读项；点击 emit attachIntent（kind=marker + intent=interpret + 标注元数据）", async () => {
+describe("工具条「✨ 加入 AI 对话」（已保存标记）", () => {
+  function barButton(app: BootResult, cls: string): FakeEl | null {
+    const bar = toolbar(app);
+    if (!bar) return null;
+    return (bar.children as FakeEl[]).find((b) => b.classList.contains(cls)) || null;
+  }
+
+  it("布局 [编辑备注] [✨ 加入 AI 对话] [⋯]；锁定不在工具条上；点击 emit marker 载荷（无 intent）", async () => {
     const app = await bootOnSlide();
     selectAnnoAt(app, 150, 130);   // 到箭头线段距离 ≈ 4.5px（≤8 容差）→ 命中
-    const menu = openAnnoMenu(app);
-    expect(menu).toBeTruthy();
-    const items = menu!.children as FakeEl[];
-    expect(items.length).toBeGreaterThan(1);
-    // 首项：✨ 让 AI 解读（✨ 前缀 + 专属类；tooltip 为 tip 键）
-    expect(items[0]!.classList.contains("aot-askai")).toBe(true);
-    expect(items[0]!.textContent).toBe("✨ anno.menu.askai");
-    expect(items[0]!.title).toBe("anno.menu.askai.tip");
-    expect(items[0]!.disabled).toBe(false);
-    // 其余项里没有第二个解读项；定位项仍在
-    expect(items.filter((b) => b.classList.contains("aot-askai"))).toHaveLength(1);
-    expect(items.some((b) => b.textContent === "⌖ anno.menu.locate")).toBe(true);
+    const bar = toolbar(app)!;
+    const clsOf = (bar.children as FakeEl[]).map((b) =>
+      (b.className as string).split(/\s+/).filter((c) => c.startsWith("aot-") && c !== "aot-btn")[0]);
+    expect(clsOf).toEqual(["aot-note", "aot-askai", "aot-more"]);
+    // 锁定按钮已移入 ⋯（工具条无 aot-lock）
+    expect(barButton(app, "aot-lock")).toBeNull();
 
-    clickMenuItem(menu!, "aot-askai");
+    const askai = barButton(app, "aot-askai")!;
+    expect(askai.textContent).toBe("✨ anno.menu.askai");
+    expect(askai.title).toBe("anno.menu.askai.tip");
+    expect(askai.disabled).toBe(false);
+    askai.dispatch("click", { preventDefault() {}, stopPropagation() {} });
     const evt = app.emitted.find((e) => e.type === "conversation.attachIntent");
     expect(evt).toBeTruthy();
     const p = evt!.payload as Record<string, unknown>;
     expect(p.kind).toBe("marker");
-    expect(p.intent).toBe("interpret");
+    expect(p.intent).toBeUndefined();   // interpret 预填退役：加附件 ≠ 提问
     expect(p.slide_id).toBe(SLIDE_ID);
     expect(p.slide).toBe(SLIDE);
     expect(p.bbox).toEqual({ x: 100, y: 100, w: 200, h: 100 });
@@ -411,56 +426,119 @@ describe("标记 ⋯ 菜单「✨ 让 AI 解读」", () => {
     expect(typeof p.frozen_at).toBe("number");
   });
 
-  it("AI 待复核标注（source=ai, review_status=pending）→ 解读项仍为首项，与驳回并存，点击正常 emit", async () => {
+  it("AI 待复核：[接受] 在工具条上，✨ 仍可用；驳回仍在 ⋯ 菜单", async () => {
     const app = await bootOnSlide({ aiPending: true });
     selectAnnoAt(app, 150, 130);
-    const menu = openAnnoMenu(app);
-    const items = menu!.children as FakeEl[];
-    expect(items[0]!.classList.contains("aot-askai")).toBe(true);
-    expect(items[0]!.disabled).toBe(false);
-    // 真实待复核态：⋯ 菜单出现驳回项（证明夹具确实进入了 AI 待复核分支）
-    expect(items.some((b) => b.textContent === "anno.review.reject")).toBe(true);
-    clickMenuItem(menu!, "aot-askai");
+    const bar = toolbar(app)!;
+    const clsOf = (bar.children as FakeEl[]).map((b) =>
+      (b.className as string).split(/\s+/).filter((c) => c.startsWith("aot-") && c !== "aot-btn")[0]);
+    expect(clsOf).toEqual(["aot-accept", "aot-note", "aot-askai", "aot-more"]);
+    const askai = barButton(app, "aot-askai")!;
+    expect(askai.disabled).toBe(false);
+    askai.dispatch("click", { preventDefault() {}, stopPropagation() {} });
     const evt = app.emitted.find((e) => e.type === "conversation.attachIntent");
     expect(evt).toBeTruthy();
-    const p = evt!.payload as Record<string, unknown>;
-    expect(p.kind).toBe("marker");
-    expect(p.intent).toBe("interpret");
-    expect(p.annotation_id).toBe("anno-7");
-    expect(p.revision).toBe(2);
+    expect((evt!.payload as Record<string, unknown>).annotation_id).toBe("anno-7");
+    // ⋯ 菜单仍提供驳回
+    const menu = openAnnoMenu(app)!;
+    expect((menu.children as FakeEl[]).some((b) => b.textContent === "anno.review.reject")).toBe(true);
   });
 
-  it("插件未加载（hpReady=false）→ 解读项禁用并给「插件未加载」说明；点击不 emit", async () => {
+  it("只读（can_edit=false）：✨ 仍可用（加入讨论不受写权限限制）；只读徽章保留", async () => {
+    const app = await bootOnSlide({ readOnly: true });
+    selectAnnoAt(app, 150, 130);
+    const bar = toolbar(app)!;
+    const ro = (bar.children as FakeEl[]).find((b) => b.classList.contains("aot-readonly"))!;
+    expect(ro).toBeTruthy();
+    expect(ro.disabled).toBe(true);
+    const askai = (bar.children as FakeEl[]).find((b) => b.classList.contains("aot-askai"))!;
+    expect(askai.disabled).toBe(false);
+    askai.dispatch("click", { preventDefault() {}, stopPropagation() {} });
+    const evt = app.emitted.find((e) => e.type === "conversation.attachIntent");
+    expect(evt).toBeTruthy();
+    expect((evt!.payload as Record<string, unknown>).kind).toBe("marker");
+  });
+
+  it("插件未加载 → ✨ 禁用并给「插件未加载」说明；点击不 emit", async () => {
     const app = await bootOnSlide({ pluginLoaded: false });
     selectAnnoAt(app, 150, 130);
-    const menu = openAnnoMenu(app);
-    const items = menu!.children as FakeEl[];
-    const askai = items.find((b) => b.classList.contains("aot-askai"))!;
+    const askai = (toolbar(app)!.children as FakeEl[]).find((b) => b.classList.contains("aot-askai"))!;
     expect(askai).toBeTruthy();
     expect(askai.disabled).toBe(true);
     expect(askai.title).toBe("ctxmenu.attach.plugin.missing");
     askai.dispatch("click", { preventDefault() {}, stopPropagation() {} });
     expect(app.emitted.some((e) => e.type === "conversation.attachIntent")).toBe(false);
   });
+});
 
-  it("源契约：draft 早退后才有解读项；冻结复用 freezeMarkerAttachPayload；模板无「+」按钮", () => {
-    const fnStart = appSrc.indexOf("function openAnnoToolbarMenu");
+describe("⋯ 菜单：锁定移入 + 定位改名 + 无 AI 解读项", () => {
+  it("锁定/解锁在 ⋯ 菜单内（带状态提示），点击切换并刷新工具条", async () => {
+    const app = await bootOnSlide();
+    selectAnnoAt(app, 150, 130);
+    const menu = openAnnoMenu(app)!;
+    const items = menu.children as FakeEl[];
+    const lock = items.find((b) => b.textContent === "🔒 anno.lock.lock");
+    expect(lock).toBeTruthy();
+    expect(lock!.title).toBe("anno.lock.lock.tip");
+    // 定位项文案 = 实际行为描述（键值见 i18n 断言；此处锁键名）
+    expect(items.some((b) => b.textContent === "⌖ anno.menu.locate")).toBe(true);
+    // 菜单没有 AI 解读项（已上移工具条）
+    expect(items.some((b) => b.classList.contains("aot-askai"))).toBe(false);
+    // 点击锁定 → toggleItemGeometryLocked + 工具条重渲（菜单关）
+    lock!.dispatch("click", { preventDefault() {}, stopPropagation() {} });
+    await settle();
+    expect(app.emitted.some((e) => e.type === "conversation.attachIntent")).toBe(false);
+  });
+});
+
+describe("源契约与文案（AI 入口统一 2026-10-18）", () => {
+  it("draft（临时框）早退分支在 AI 加入之前——未保存草稿不提供加入入口", () => {
+    const fnStart = appSrc.indexOf("function renderAnnoToolbar");
     expect(fnStart).toBeGreaterThan(-1);
     const fnText = appSrc.slice(fnStart);
     const draftReturn = fnText.indexOf('if (target === "draft")');
-    const askaiIdx = fnText.indexOf("anno.menu.askai");
+    const askaiIdx = fnText.indexOf("annoAiAttachToolbarButton");
     expect(draftReturn).toBeGreaterThan(-1);
     expect(askaiIdx).toBeGreaterThan(draftReturn);
-    // 冻结与右键「将此标注加入会话」同一实现（不复制字段逻辑）
-    expect(fnText).toContain("freezeMarkerAttachPayload(it, null)");
-    expect(fnText).toContain('frozenInterpret.intent = "interpret"');
-    expect(fnText).toContain("emitConversationAttachIntent(frozenInterpret)");
-    // 插件缺失走既有说明键；不可解读形态禁用说明
-    expect(fnText).toContain("ctxmenu.attach.plugin.missing");
-    expect(fnText).toContain("anno.menu.askai.unavailable");
-    // composer 不再有「+」按钮（入口移到标记上）
+    // 冻结与右键「将此标注加入会话」同一实现；点击时刻冻结（不在菜单打开期）
+    expect(appSrc).toContain("function attachMarkerToConversation");
+    expect(appSrc).toContain("freezeMarkerAttachPayload(it, null)");
+    // interpret 专属预填退役
+    expect(appSrc).not.toContain('intent = "interpret"');
+    // 几何不可用/插件缺失的明确原因说明仍在
+    expect(appSrc).toContain("anno.menu.askai.unavailable");
+    expect(appSrc).toContain("ctxmenu.attach.plugin.missing");
+    // composer 模板不再有「+」按钮
     expect(shellSrc).not.toContain("ai-task-jump");
     expect(shellSrc).not.toContain("ai-plus-btn");
+  });
+
+  it("标注行不再渲染 fork「快速问答」/ branch「从此处深读」（统一到加入 AI 对话）", () => {
+    expect(appSrc).not.toContain('"fork.open"');
+    expect(appSrc).not.toContain('"branch.open"');
+    expect(appSrc).not.toContain("anno.fork.quick");
+    expect(appSrc).not.toContain("anno.branch.deep");
+    // 行内 AI 动作 = 单个 ✨ chip（同一 attachMarkerToConversation 入口）
+    const fnStart = appSrc.indexOf("function buildAnnoAiActions");
+    const sepAfter = appSrc.indexOf("工单 E（plan §6）：查看器右键菜单", fnStart);
+    const fn = appSrc.slice(fnStart, sepAfter);
+    expect(fn).toContain("attachMarkerToConversation");
+    expect(fn).not.toContain("ai-branch");
+  });
+
+  it("i18n：加入 AI 对话 / 居中显示此标记（zh+en），旧「让 AI 解读」与 fork/branch 键退役", () => {
+    expect(i18nSrc).toContain('"anno.menu.askai": "加入 AI 对话"');
+    expect(i18nSrc).toContain('"anno.menu.askai": "Add to AI chat"');
+    expect(i18nSrc).toContain('"anno.menu.locate": "居中显示此标记"');
+    expect(i18nSrc).toContain('"anno.menu.locate": "Center this mark"');
+    expect(i18nSrc).toContain("调整视野并高亮此标记");
+    // 旧文案与旧键退役（退役注释里不再出现旧入口名）
+    expect(i18nSrc).not.toContain("让 AI 解读");
+    expect(i18nSrc).not.toContain(": \"快速问答\"");
+    expect(i18nSrc).not.toContain(": \"从此处深读\"");
+    expect(i18nSrc).not.toContain('"anno.fork.quick"');
+    expect(i18nSrc).not.toContain('"anno.branch.deep"');
+    expect(appSrc).not.toContain("让 AI 解读");
   });
 });
 

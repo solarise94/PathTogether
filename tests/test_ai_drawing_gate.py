@@ -1823,7 +1823,7 @@ def test_run_by_slide_id_target_asset_revision(monkeypatch):
 
 
 def test_run_interpret_marker_attachment_passes_validator(monkeypatch):
-    """「✨ 让 AI 解读」（标记 ⋯ 菜单）的发送链路：插件按
+    """「✨ 加入 AI 对话」（标记工具条；原「让 AI 解读」）的发送链路：插件按
     applyPendingAttachesToBody + viewer.getSkillTarget 冻结出的精确 body 形态
     ——slide_id run + marker 附件（冻结 bbox、annotation_id/revision/type）+
     viewport=标注包围盒 + target(kind=annotation, asset_revision,
@@ -1906,8 +1906,9 @@ def test_run_viewport_attachment_clean_record(monkeypatch):
     assert r.status_code == 200, r.get_data(as_text=True)
     atts = fake.calls[-1]["body"]["attachments"]
     assert atts == [{"kind": "viewport", "bbox": bbox, "slide": "demo.svs"}]
-    # 无附件 bbox 时冻结视野回落到最后一个附件
-    assert fake.calls[-1]["body"]["viewport"] == bbox
+    # AI 入口统一（2026-10-18）：附件与视野分列——网关不再把附件 bbox 冒充
+    # viewport（真实视野由 UI 实时查询独立携带；不带即不透传）
+    assert "viewport" not in fake.calls[-1]["body"]
 
 
 def test_run_target_annotation_kind_validated(monkeypatch):

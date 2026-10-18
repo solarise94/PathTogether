@@ -50,6 +50,15 @@ def seed_viewer_assets(owner_id):
     # Each test has its own asset: failure/order of one cannot block the other.
     assets = {key: publish_asset(owner_id, 'e2e-raster-' + key + '.bmp', buf.getvalue())
               for key in ('workbench', 'share')}
+    # 框选指针手势回归（docs/rect-draft-ai-context-opus-handoff-20261018.md §3.3）：
+    # 真实 JPG（无物理标尺）与既有 BMP 各跑同一状态机场景。
+    yj, xj = np.indices((480, 640))
+    jpg_img = np.stack([(xj * 2 + yj) % 256, (yj * 3) % 256,
+                        (xj * 5 + yj * 7) % 256], axis=-1).astype(np.uint8)
+    jbuf = io.BytesIO()
+    Image.fromarray(jpg_img).save(jbuf, format='JPEG', quality=92)
+    assets['rectDraftJpg'] = publish_asset(
+        owner_id, 'e2e-rect-draft.jpg', jbuf.getvalue())
     # folder-experience E2E：10 张未归类小图——保证根目录堆叠 ≥2 页（每叠 ≤8）。
     assets['folderSlides'] = [
         publish_asset(owner_id, 'e2e-fb-%02d.bmp' % i, buf.getvalue())

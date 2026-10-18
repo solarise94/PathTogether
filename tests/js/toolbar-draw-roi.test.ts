@@ -82,9 +82,14 @@ describe("工单 D：绘制交互与撤销契约（app.js）", () => {
     expect(cancelFn).not.toMatch(/finishDraw/);
     expect(cancelFn).not.toMatch(/saveAnno\b/);
     expect(cancelFn).not.toMatch(/submitCurrentDraft/);
-    // roiBox 拖拽：取消恢复几何（startRoi），不按 pointerup 提交
+    // roiBox 拖拽：取消恢复几何（startRoi），不按 pointerup 提交。
+    // 20261018 §3.2：roiBox 的 move/up/cancel 装配收进 bindRectPointerSession
+    // （按活动 pointerId 过滤 + lostpointercapture/兜底），装配点仍在 onRoiPointerDown。
     expect(appSrc).toMatch(
-      /roiBox\.addEventListener\("pointercancel", onRoiPointerCancel\)/);
+      /bindRectPointerSession\(roiBox, dragInfo,\s*\n\s*onRoiPointerMove, onRoiPointerUp, onRoiPointerCancel\)/);
+    const bindFn = extractFn(appSrc, "bindRectPointerSession");
+    expect(bindFn).toMatch(/el\.addEventListener\("pointercancel", onCancel\)/);
+    expect(bindFn).not.toMatch(/onEnd\(e\); else onCancel/); // cancel 永不转完成
     const roiCancel = extractFn(appSrc, "onRoiPointerCancel");
     expect(roiCancel).toMatch(/startRoi/);
     expect(appSrc).not.toMatch(

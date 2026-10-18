@@ -130,8 +130,8 @@ def _inject_shift_after_guard(monkeypatch, deleted_aids):
     """
     original = app_mod._guard_index_annotation_id
 
-    def shift_after_guard(token, index, aid):
-        result = original(token, index, aid)
+    def shift_after_guard(roi, aid):
+        result = original(roi, aid)
         assert result is None
         for d_aid in deleted_aids:
             assert share_store.delete_roi_by_annotation_id(d_aid)

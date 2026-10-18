@@ -29,10 +29,6 @@
   // 缺失时按当前界面语言走本地兜底，避免回退成 key 本身。
   var _EXTRA_I18N = {
     "ai.fork.sending": { zh: "发送中…", en: "Sending…" },
-    "anno.fork.quick": { zh: "快速问答", en: "Quick Q&A" },
-    "anno.fork.quick.tip": { zh: "就此标注快速提问（轻量批注对话）", en: "Ask about this annotation (lightweight fork chat)" },
-    "anno.branch.deep": { zh: "从此处深读", en: "Deep dive" },
-    "anno.branch.deep.tip": { zh: "在 AI 面板从此标注开分支会话（全量工具深读）", en: "Open a branch session from here (full tools, deep read)" },
     "anno.private.badge": { zh: "私有", en: "Private" },
     // 上传错误码 → 可读文案（上传修复 U1：服务端返回的机器码不再原样透出；
     // U3 补充 V2 分片机器码与三段状态文案）
@@ -8381,15 +8377,17 @@
     var it = target;
     var editable = itemCanEdit(it);
     var locked = itemGeometryLocked(it);
-    // 只读：不渲染可写按钮，给一枚说明态徽章（§6.1：无可拖手柄）
+    // 只读：可写动作不渲染，但「✨ 加入 AI 对话」不受 can_edit 限制——
+    // 只读且有权查看的标记同样可以加入讨论（权限只约束写，不约束读/讨论）。
     if (!editable) {
       el.appendChild(annoToolbarButton("aot-readonly", "🔒 " + t("anno.lock.readonly"),
         t("anno.lock.readonly.tip"), null, true));
+      el.appendChild(annoAiAttachToolbarButton(it));
       el.appendChild(annoToolbarButton("aot-more", "⋯", t("anno.toolbar.more"),
         function (menuWasOpen) { if (!menuWasOpen) openAnnoToolbarMenu(it); }));
       return;
     }
-    // AI 待复核：[接受] [编辑备注] [锁定位置] [⋯]
+    // AI 待复核：[接受] [编辑备注] [✨ 加入 AI 对话] [⋯]
     if (itemIsAiPending(it)) {
       el.appendChild(annoToolbarButton("aot-accept", "✓ " + t("anno.review.accept"),
         t("anno.review.accept.tip"), function () { reviewAnnotation(it, "accept"); }));
@@ -8400,13 +8398,55 @@
         openEditCard(it);
         redrawAnnoCanvas();
       }));
-    el.appendChild(annoToolbarButton(
-      "aot-lock" + (locked ? " on" : ""),
-      locked ? "🔓 " + t("anno.lock.unlock") : "🔒 " + t("anno.lock.lock"),
-      locked ? t("anno.lock.unlock.tip") : t("anno.lock.lock.tip"),
-      function () { toggleItemGeometryLocked(it, !locked); }));
+    // ✨ 加入 AI 对话：主条目（UX 改版 2026-10-18：从 ⋯ 提到工具条；锁定
+    // 移入 ⋯）。冻结与发射在**点击时刻**执行——菜单打开不再预冻结。
+    el.appendChild(annoAiAttachToolbarButton(it));
+    // 锁定/解锁移入 ⋯ 菜单（openAnnoToolbarMenu），工具条不再占位。
     el.appendChild(annoToolbarButton("aot-more", "⋯", t("anno.toolbar.more"),
       function (menuWasOpen) { if (!menuWasOpen) openAnnoToolbarMenu(it); }));
+  }
+
+  // 工具条「✨ 加入 AI 对话」按钮（AI 入口统一 2026-10-18）：
+  //   - 插件未加载 → 禁用 + 「插件未加载」说明；几何不可冻结（如 viewer 未
+  //     就绪）→ 禁用 + 「暂无可加入的区域」说明——不假装加入成功；
+  //   - 可用时点击才冻结（freezeMarkerAttachPayload 与右键菜单同一实现），
+  //     经 emitConversationAttachIntent 进当前会话草稿：不发送、不启动模型、
+  //     不新建会话、不覆盖输入框已有文字。
+  function annoAiAttachToolbarButton(it) {
+    var disabled = false;
+    var tip = t("anno.menu.askai.tip");
+    if (!hpReady()) {
+      disabled = true;
+      tip = t("ctxmenu.attach.plugin.missing");
+    } else {
+      try {
+        if (!freezeMarkerAttachPayload(it, null)) {
+          disabled = true;
+          tip = t("anno.menu.askai.unavailable");
+        }
+      } catch (e) {
+        disabled = true;
+        tip = t("anno.menu.askai.unavailable");
+      }
+    }
+    return annoToolbarButton("aot-askai", "✨ " + t("anno.menu.askai"), tip,
+      function () { attachMarkerToConversation(it); }, disabled);
+  }
+
+  // 标记 → 当前 AI 会话草稿（点击时刻冻结；emitConversationAttachIntent 内
+  // 部再校验 hpReady 并给 toast）。右键菜单与标注行 AI 动作共用。
+  function attachMarkerToConversation(it) {
+    if (!it || !hpReady()) {
+      toast(t("ctxmenu.attach.plugin.missing"), "error");
+      return;
+    }
+    var frozen = null;
+    try { frozen = freezeMarkerAttachPayload(it, null); } catch (e) { frozen = null; }
+    if (!frozen) {
+      toast(t("anno.menu.askai.unavailable"), "error");
+      return;
+    }
+    emitConversationAttachIntent(frozen);
   }
 
   function openAnnoToolbarMenu(target) {
@@ -8429,23 +8469,9 @@
       return;
     }
     var it = target;
-    // ✨ 让 AI 解读（首项）：与右键菜单共用同一冻结实现 freezeMarkerAttachPayload
-    // （菜单打开时刻冻结，绝不复制字段逻辑），点击经 emitConversationAttachIntent
-    // 以 intent=interpret 进会话草稿——不自动发送、不启动 AI。插件未加载 → 禁用
-    // 并给与右键一致的说明；几何不支持（freeze 失败）→ 禁用并说明，不伪造几何。
-    var frozenInterpret = null;
-    try { frozenInterpret = freezeMarkerAttachPayload(it, null); } catch (e) { frozenInterpret = null; }
-    if (!hpReady()) {
-      addItem("✨ " + t("anno.menu.askai"), t("ctxmenu.attach.plugin.missing"), null, true, "aot-askai");
-    } else if (!frozenInterpret) {
-      addItem("✨ " + t("anno.menu.askai"), t("anno.menu.askai.unavailable"), null, true, "aot-askai");
-    } else {
-      addItem("✨ " + t("anno.menu.askai"), t("anno.menu.askai.tip"), function () {
-        frozenInterpret.intent = "interpret";
-        emitConversationAttachIntent(frozenInterpret);
-      }, null, "aot-askai");
-    }
-    // 定位（始终可用）
+    // 「✨ 加入 AI 对话」已上移到工具条主位（renderAnnoToolbar）；⋯ 不再重复。
+    // 「定位」动作按实际行为命名「居中显示此标记」（只导航 + 选中，不加入
+    // AI 上下文；tooltip 写明「调整视野并高亮此标记」）。
     addItem("⌖ " + t("anno.menu.locate"), t("anno.menu.locate.tip"), function () {
       jumpToAnno(it);
     });
@@ -8457,6 +8483,14 @@
         redrawAnnoCanvas();
         renderAnnoToolbar();
       });
+    // 锁定/解锁（UX 改版 2026-10-18：从工具条移入 ⋯；保留锁状态提示）。
+    // 只读身份不能改锁——不渲染该项目（只读徽章已在工具条说明）。
+    if (itemCanEdit(it)) {
+      var lk = itemGeometryLocked(it);
+      addItem(lk ? "🔓 " + t("anno.lock.unlock") : "🔒 " + t("anno.lock.lock"),
+        lk ? t("anno.lock.unlock.tip") : t("anno.lock.lock.tip"),
+        function () { toggleItemGeometryLocked(it, !lk); renderAnnoToolbar(); });
+    }
     // polygon：编辑轮廓点（§6.2：⋯ 内入口；完成后校验非自交）
     if ((it.type || "rect") === "polygon" && itemCanEdit(it) && !itemGeometryLocked(it)) {
       var inEdit = (state.polygonVertexEdit === it);
@@ -14645,39 +14679,30 @@
     };
   }
 
-  // 标注面板行内的 AI 动作按钮（fork 快速问答 / branch 从此处深读）。
-  // Stage 2：点击改为发 HostBridge 请求，由插件处理。
-  // fork.open 的 anchorEl 为该行 DOM（STAGE2-DEVIATION：信封夹带 DOM 引用，仅同窗口可用）。
+  // 标注面板行内的 AI 动作（AI 入口统一 2026-10-18）：
+  // 独立的 fork「快速问答」与 branch「从此处深读」入口已退役——不再从标注
+  // 行隐式新建批注小对话/分支会话；行内只保留「✨ 加入 AI 对话」一个入口，
+  // 与浮条/右键菜单同一冻结实现（attachMarkerToConversation）。历史 fork/
+  // branch 会话仍可在 AI 面板查看与续聊（插件侧兼容适配，有期限）。
   function buildAnnoAiActions(container, annotationId, style) {
     if (!annotationId || !container) return;
-    // 插件停用时不渲染 fork/branch 按钮（避免无功能的死按钮）
-    if (!hpReady()) return;
-    var op = (style === "op");
-    var forkBtn = document.createElement("button");
-    forkBtn.type = "button";
-    forkBtn.className = op ? "ai-op ai-fork" : "ai-action-chip ai-fork";
-    forkBtn.title = tt("anno.fork.quick.tip");
-    forkBtn.innerHTML = '<span class="ai-act-ic">💬</span><span class="ai-act-tx">' +
-      esc(tt("anno.fork.quick")) + "</span>";
-    forkBtn.addEventListener("click", function (e) {
+    var it = null;
+    var items = flatAnnoItems();
+    for (var i = 0; i < items.length; i++) {
+      if (String(items[i].annotation_id || "") === String(annotationId)) { it = items[i]; break; }
+    }
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = (style === "op") ? "ai-op ai-attach-anno" : "ai-action-chip ai-attach-anno";
+    btn.title = tt("anno.menu.askai.tip");
+    btn.innerHTML = '<span class="ai-act-ic">✨</span><span class="ai-act-tx">' +
+      esc(tt("anno.menu.askai")) + "</span>";
+    btn.addEventListener("click", function (e) {
       e.stopPropagation();
-      hpRequest("fork.open", { annotationId: annotationId, anchorEl: container })
-        .catch(function () { /* 插件未启用：静默 */ });
+      attachMarkerToConversation(it || { annotation_id: annotationId });
     });
-    container.appendChild(forkBtn);
-
-    var branchBtn = document.createElement("button");
-    branchBtn.type = "button";
-    branchBtn.className = op ? "ai-op ai-branch" : "ai-action-chip ai-branch";
-    branchBtn.title = tt("anno.branch.deep.tip");
-    branchBtn.innerHTML = '<span class="ai-act-ic">⑂</span><span class="ai-act-tx">' +
-      esc(tt("anno.branch.deep")) + "</span>";
-    branchBtn.addEventListener("click", function (e) {
-      e.stopPropagation();
-      hpRequest("branch.open", { annotationId: annotationId })
-        .catch(function () { /* 插件未启用：静默 */ });
-    });
-    container.appendChild(branchBtn);
+    if (!it) { btn.disabled = true; btn.title = tt("anno.menu.askai.unavailable"); }
+    container.appendChild(btn);
   }
 
   // =========================================================================

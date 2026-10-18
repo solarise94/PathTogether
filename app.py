@@ -22592,15 +22592,10 @@ def api_ai_run():
     atts, att_err = _validate_ai_attachments(body, slide)
     if att_err is not None:
         return att_err
-    if atts:
-        if viewport is None:
-            viewport = atts[-1]["bbox"]
-        if body.get("render_context") is None:
-            for a in reversed(atts):
-                if a.get("render_context") is not None:
-                    body = dict(body)
-                    body["render_context"] = a["render_context"]
-                    break
+    # AI 入口统一（2026-10-18）：attachments 与 viewport 分列——附件是用户
+    # 显式加入的冻结目标（自有 attachments 字段透传 sidecar），不再把最后一个
+    # 附件 bbox 冒充 body.viewport，也不再把附件的冻结 render_context 冒充
+    # 会话级渲染绑定。旧 UI（自带 viewport/render_context 兜底）不受影响。
     # 描绘技能请求键（0082 / 契约 §2）：白名单校验 + target 冻结（切片一致、
     # 资产 revision、annotation 引用）。全部是提示不是凭证——判定在 HP、
     # 执法在 grant 列。校验先于预算预占（零副作用拒绝）。
@@ -22728,15 +22723,8 @@ def api_ai_continue():
     atts, att_err = _validate_ai_attachments(body, slide)
     if att_err is not None:
         return att_err
-    if atts:
-        if viewport is None:
-            viewport = atts[-1]["bbox"]
-        if body.get("render_context") is None:
-            for a in reversed(atts):
-                if a.get("render_context") is not None:
-                    body = dict(body)
-                    body["render_context"] = a["render_context"]
-                    break
+    # AI 入口统一（2026-10-18）：同 /run——attachments 自有字段透传，不再
+    # 把最后一个附件 bbox/render_context 冒充 viewport/会话渲染绑定。
     # 描绘技能请求键（0082 / 契约 §2）：同 /run——continue 的新 grant 重新
     # 判定（裁决 6），target 同口径冻结；校验先于预算预占（零副作用拒绝）。
     skill_req, skill_err = _validate_ai_skill_request(body, slide, slide_id)
@@ -22863,15 +22851,8 @@ def api_ai_branch():
     atts, att_err = _validate_ai_attachments(body, slide)
     if att_err is not None:
         return att_err
-    if atts:
-        if viewport is None:
-            viewport = atts[-1]["bbox"]
-        if body.get("render_context") is None:
-            for a in reversed(atts):
-                if a.get("render_context") is not None:
-                    body = dict(body)
-                    body["render_context"] = a["render_context"]
-                    break
+    # AI 入口统一（2026-10-18）：同 /run——attachments 自有字段透传，不再
+    # 把最后一个附件 bbox/render_context 冒充 viewport/会话渲染绑定。
     prep = _ai_run_prepare(user_ctx, body, slide, need_grant=True,
                            slide_id=slide_id)
     if not isinstance(prep, dict):

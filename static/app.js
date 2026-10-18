@@ -3035,7 +3035,8 @@
     slideOpenActive = 0;
     updateDocTitle(null);
     updateMppSetterVisibility();
-    if (roiBox) exitRoi();
+    // 拖框/画框手势未落盘就换片：会话一并收尾，旧事件不得落到新切片
+    if (roiBox || dragInfo || rectDrawInfo) exitRoi();
     if (viewer) viewer.close();
     clearBaseThumb();
     clearBridgeThumb();
@@ -3316,6 +3317,7 @@
   }
 
   function exitRoi() {
+    cancelRectPointerSessions(); // 退出工具 = 活动手势一并收尾（幂等；§3.2）
     state.roiMode = null;
     state.roiGeometryLocked = false;  // §6.3：草稿锁只对当前草稿有效
     closeAnnoToolbar();
@@ -3465,30 +3467,99 @@
   }
 
   // ---------- 矩形拖拽：内部平移 / 四边单轴 / 四角双轴（pointer 捕获） ----------
+  // 一次手势只归属一个活动 pointerId（§3.2）：
+  //   - move/up/cancel 先校验 pointerId，其他指针的事件一律忽略；
+  //   - lostpointercapture = 手势失效 → 取消恢复拖前几何，绝不按完成提交；
+  //   - move 发现 buttons===0（真实释放已在别处丢失）→ 终止陈旧手势，
+  //     既不让悬停改写几何，也不把这条兜底当一次有效自动提交；
+  //   - 先清会话状态再 releasePointerCapture：正常释放随后触发的
+  //     lostpointercapture 回调因此找不到任何活动会话，不会错误回滚。
+
+  // 手势监听装配：捕获成功时补 lostpointercapture；捕获申请失败（或未生效）
+  // 时改挂 document 捕获阶段兜底监听，结束时移除，绝不留下只能依靠元素自身
+  // 收到 pointerup 才能收尾的拖拽。
+  // elBound=true：元素级 move/up/cancel 已由常驻路由（anno-canvas 的
+  // onAnnoPointer* → 矩形处理器）承担，这里不得重复注册/拆除常驻监听。
+  function bindRectPointerSession(el, info, onMove, onEnd, onCancel, elBound) {
+    var captured = false;
+    try {
+      el.setPointerCapture(info.pointerId);
+      captured = !!(el.hasPointerCapture && el.hasPointerCapture(info.pointerId));
+    } catch (err) { captured = false; }
+    if (captured) {
+      info.onLost = function (e) {
+        if (e.pointerId === info.pointerId) onCancel(e);
+      };
+      el.addEventListener("lostpointercapture", info.onLost);
+    } else {
+      var doc = el.ownerDocument || document;
+      info.fallback = {
+        move: function (e) { if (e.pointerId === info.pointerId) onMove(e); },
+        end: function (e) {
+          if (e.pointerId !== info.pointerId) return;
+          if (e.type === "pointercancel") onCancel(e); else onEnd(e);
+        },
+      };
+      doc.addEventListener("pointermove", info.fallback.move, true);
+      doc.addEventListener("pointerup", info.fallback.end, true);
+      doc.addEventListener("pointercancel", info.fallback.end, true);
+    }
+    if (!elBound) {
+      el.addEventListener("pointermove", onMove);
+      el.addEventListener("pointerup", onEnd);
+      el.addEventListener("pointercancel", onCancel);
+    }
+  }
+
+  // 手势监听拆除（幂等）：调用方必须已把会话状态置空——这里最后才释放捕获，
+  // 保证释放动作本身触发的 lostpointercapture 无会话可取消。
+  function unbindRectPointerSession(el, info, onMove, onEnd, onCancel, elBound) {
+    if (!el) return;
+    if (info.onLost) {
+      el.removeEventListener("lostpointercapture", info.onLost);
+      info.onLost = null;
+    }
+    if (info.fallback) {
+      var doc = el.ownerDocument || document;
+      doc.removeEventListener("pointermove", info.fallback.move, true);
+      doc.removeEventListener("pointerup", info.fallback.end, true);
+      doc.removeEventListener("pointercancel", info.fallback.end, true);
+      info.fallback = null;
+    }
+    if (!elBound) {
+      el.removeEventListener("pointermove", onMove);
+      el.removeEventListener("pointerup", onEnd);
+      el.removeEventListener("pointercancel", onCancel);
+    }
+    try { el.releasePointerCapture(info.pointerId); } catch (err) {}
+  }
+
   function onRoiPointerDown(e) {
     if (!state.slide) return;
+    if (e.button !== 0) return; // 只有主键开启拖拽；右键/中键不启动（留给菜单/平移）
+    if (dragInfo || rectDrawInfo) return; // 已有活动手势：其他指针不下场
     e.preventDefault(); e.stopPropagation();
-    try { roiBox.setPointerCapture(e.pointerId); } catch (err) {}
-    var handle = null;
-    var t = e.target;
-    if (t && t.dataset && t.dataset.handle) handle = t.dataset.handle;
     dragInfo = {
       pointerId: e.pointerId,
-      handle: handle || "move",
+      handle: (function () {
+        var t = e.target;
+        return (t && t.dataset && t.dataset.handle) || "move";
+      })(),
       startRoi: { x: state.roi.x, y: state.roi.y, w: state.roi.w, h: state.roi.h },
       startImg: viewer.viewport.viewerElementToImageCoordinates(
         new OpenSeadragon.Point(e.clientX - getViewerRect().left,
                                 e.clientY - getViewerRect().top)),
     };
     viewer.setMouseNavEnabled(false);
-    roiBox.addEventListener("pointermove", onRoiPointerMove);
-    roiBox.addEventListener("pointerup", onRoiPointerUp);
-    // 工单 D：pointercancel = 取消恢复（绝不按「完成」提交当前位移）
-    roiBox.addEventListener("pointercancel", onRoiPointerCancel);
+    bindRectPointerSession(roiBox, dragInfo,
+                           onRoiPointerMove, onRoiPointerUp, onRoiPointerCancel);
   }
 
   function onRoiPointerMove(e) {
-    if (!dragInfo) return;
+    if (!dragInfo || e.pointerId !== dragInfo.pointerId) return;
+    // 释放事件丢失（框外/浏览器外松开、捕获被夺）后只剩悬停 move：
+    // 立即按取消收尾，绝不继续用无按键的移动改写几何。
+    if (!e.buttons) { onRoiPointerCancel(e); return; }
     e.preventDefault(); e.stopPropagation();
     var rect = getViewerRect();
     var curImg = viewer.viewport.viewerElementToImageCoordinates(
@@ -3532,38 +3603,37 @@
   }
 
   function onRoiPointerUp(e) {
-    if (!dragInfo) return;
+    if (!dragInfo || e.pointerId !== dragInfo.pointerId) return;
     e.preventDefault(); e.stopPropagation();
-    try { roiBox.releasePointerCapture(dragInfo.pointerId); } catch (err) {}
-    roiBox.removeEventListener("pointermove", onRoiPointerMove);
-    roiBox.removeEventListener("pointerup", onRoiPointerUp);
-    roiBox.removeEventListener("pointercancel", onRoiPointerCancel);
-    dragInfo = null;
+    var info = dragInfo;
+    dragInfo = null; // 先清状态：随后的释放捕获/丢失捕获不得回滚已完成的几何
+    unbindRectPointerSession(roiBox, info,
+                             onRoiPointerMove, onRoiPointerUp, onRoiPointerCancel);
+    updateRoiOverlay(); // 完成态刷新：设置区/摘要/就近浮条与最终几何对齐
     viewer.setMouseNavEnabled(true);
   }
 
-  // 工单 D：拖拽被打断（pointercancel / 丢失捕获）→ 恢复拖前几何，不提交位移
+  // 工单 D：拖拽被打断（pointercancel / lostpointercapture / blur / 工具退出）
+  // → 恢复拖前几何，不提交位移。幂等：无活动会话或事件属于其他指针时直接返回。
   function onRoiPointerCancel(e) {
     if (!dragInfo) return;
+    if (e && e.pointerId != null && e.pointerId !== dragInfo.pointerId) return;
     if (e && e.preventDefault) { try { e.preventDefault(); } catch (err) {} }
-    try { roiBox.releasePointerCapture(dragInfo.pointerId); } catch (err) {}
-    roiBox.removeEventListener("pointermove", onRoiPointerMove);
-    roiBox.removeEventListener("pointerup", onRoiPointerUp);
-    roiBox.removeEventListener("pointercancel", onRoiPointerCancel);
-    var s = dragInfo.startRoi;
-    dragInfo = null;
+    var info = dragInfo;
+    dragInfo = null; // 先清状态再释放捕获（§3.2 顺序要求）
+    unbindRectPointerSession(roiBox, info,
+                             onRoiPointerMove, onRoiPointerUp, onRoiPointerCancel);
+    var s = info.startRoi;
     state.roi.x = s.x; state.roi.y = s.y; state.roi.w = s.w; state.roi.h = s.h;
-    if (roiBox && viewer && s.w > 0) {
-      try {
-        viewer.updateOverlay(
-          roiBox,
-          viewer.viewport.imageToViewportRectangle(s.x, s.y, s.w, s.h),
-          OpenSeadragon.Placement.TOP_LEFT
-        );
-      } catch (err) {}
-    }
-    syncRoiSettings();
+    updateRoiOverlay(); // 恢复拖前几何（含设置区/摘要/浮条重定位；无框时安全返回）
     viewer.setMouseNavEnabled(true);
+  }
+
+  // 矩形两类手势（拖框/画框）统一收尾：工具退出、Escape 撤稿、换片、窗口失焦
+  // 都经这里；无活动会话时是 no-op，可安全重复调用。
+  function cancelRectPointerSessions() {
+    onRoiPointerCancel();
+    onRectCanvasPointerCancel();
   }
 
   function getViewerRect() { return viewer.container.getBoundingClientRect(); }
@@ -3578,7 +3648,8 @@
 
   function onRectCanvasPointerDown(e) {
     if (!rectToolActive() || !state.slide) return false;
-    if (e.button === 2) return false; // 右键不启动绘制
+    if (e.button !== 0) return false; // 右键/中键不启动绘制（右键归工单 E 菜单）
+    if (rectDrawInfo || dragInfo) return false; // 已有活动手势：其他指针不下场
     e.preventDefault(); e.stopPropagation();
     // 新的画布交互 = 放弃失败草稿的重试（按钮/Enter 重试在此之前仍可用），
     // 否则新拖出的几何会被旧 retryDraft 顶替提交。
@@ -3587,7 +3658,6 @@
       setDrawUnsaved(false);
     }
     var c = els.annoCanvas;
-    try { c.setPointerCapture(e.pointerId); } catch (err) {}
     var img0 = screenToImg(e);
     rectDrawInfo = {
       pointerId: e.pointerId,
@@ -3598,11 +3668,16 @@
     };
     viewer.setMouseNavEnabled(false);
     setDrawPhase("drawing");
+    bindRectPointerSession(c, rectDrawInfo,
+                           onRectCanvasPointerMove, onRectCanvasPointerUp,
+                           onRectCanvasPointerCancel, true);
     return true;
   }
 
   function onRectCanvasPointerMove(e) {
-    if (!rectDrawInfo) return false;
+    if (!rectDrawInfo || e.pointerId !== rectDrawInfo.pointerId) return false;
+    // 释放事件丢失 → 后续只剩悬停 move：终止陈旧手势，不走完成/保存路径。
+    if (!e.buttons) return onRectCanvasPointerCancel(e);
     e.preventDefault(); e.stopPropagation();
     // 屏幕（CSS）像素阈值：拖动判定与缩放倍率解耦
     if (Math.hypot(e.clientX - rectDrawInfo.sx0, e.clientY - rectDrawInfo.sy0)
@@ -3631,12 +3706,14 @@
   }
 
   function onRectCanvasPointerUp(e) {
-    if (!rectDrawInfo) return false;
+    if (!rectDrawInfo || e.pointerId !== rectDrawInfo.pointerId) return false;
     e.preventDefault(); e.stopPropagation();
     var c = els.annoCanvas;
-    try { c.releasePointerCapture(rectDrawInfo.pointerId); } catch (err) {}
     var info = rectDrawInfo;
-    rectDrawInfo = null;
+    rectDrawInfo = null; // 先清状态：随后的释放捕获/丢失捕获不得再进入完成路径
+    unbindRectPointerSession(c, info,
+                             onRectCanvasPointerMove, onRectCanvasPointerUp,
+                             onRectCanvasPointerCancel, true);
     setDrawPhase("idle");
     if (!info.moved) {
       // 点击放置（预设尺寸模式）：需要设置区已给出有效宽/高
@@ -3673,15 +3750,19 @@
     return true;
   }
 
-  // 工单 D：拖动被打断（pointercancel / 丢失捕获）→ 取消并恢复拖前选区，
-  // 绝不走完成/保存路径。
+  // 工单 D：拖动被打断（pointercancel / lostpointercapture / blur / Escape / 换片）
+  // → 取消并恢复拖前选区，绝不走完成/保存路径。
+  // 幂等：无活动会话或事件属于其他指针时直接返回。
   function onRectCanvasPointerCancel(e) {
     if (!rectDrawInfo) return false;
+    if (e && e.pointerId != null && e.pointerId !== rectDrawInfo.pointerId) return false;
     if (e && e.preventDefault) { try { e.preventDefault(); } catch (err) {} }
     var c = els.annoCanvas;
-    try { c.releasePointerCapture(rectDrawInfo.pointerId); } catch (err) {}
     var info = rectDrawInfo;
-    rectDrawInfo = null;
+    rectDrawInfo = null; // 先清状态再释放捕获（§3.2 顺序要求）
+    unbindRectPointerSession(c, info,
+                             onRectCanvasPointerMove, onRectCanvasPointerUp,
+                             onRectCanvasPointerCancel, true);
     // 恢复拖前选区（工具刚激活时为空选区）
     if (info.startRoi) {
       state.roi.x = info.startRoi.x; state.roi.y = info.startRoi.y;
@@ -3691,6 +3772,7 @@
       try { if (viewer && viewer.currentOverlays) viewer.removeOverlay(roiBox); } catch (err) {}
       if (roiBox.parentNode) roiBox.parentNode.removeChild(roiBox);
       roiBox = null;
+      closeAnnoToolbar(); // 框已移除：就近浮条不能留着无主漂浮
     } else {
       updateRoiOverlay();
     }
@@ -3720,7 +3802,7 @@
       return;
     }
     if (e.key === "Enter") {
-      if (rectDrawInfo) return; // 拖动中不提交
+      if (rectDrawInfo || dragInfo) return; // 拖动中不提交（画框与拖框都算）
       if (!rectToolActive()) return;
       e.preventDefault();
       submitCurrentDraft();
@@ -3730,6 +3812,7 @@
   // 撤销当前未提交矩形草稿（选区/失败重试态）：清选区、留在工具内。
   // 返回是否真的撤掉了东西。
   function discardRectDraft() {
+    cancelRectPointerSessions(); // 撤稿 = 活动手势一并收尾（拖框/画框；幂等）
     var had = !!(retryDraft && retryDraft.kind === "rect") || state.roi.w > 0;
     if (!had) return false;
     retryDraft = null;
@@ -3738,6 +3821,7 @@
       try { if (viewer && viewer.currentOverlays) viewer.removeOverlay(roiBox); } catch (err) {}
       if (roiBox.parentNode) roiBox.parentNode.removeChild(roiBox);
       roiBox = null;
+      closeAnnoToolbar(); // 框已移除：就近浮条不能留着无主漂浮
     }
     if (els.saveBtn) els.saveBtn.disabled = true;
     if (els.saveAnnoBtn) els.saveAnnoBtn.disabled = true;
@@ -14004,6 +14088,8 @@
     c.addEventListener("pointerup", onAnnoPointerUp);
     // 工单 D：pointercancel ≠ pointerup——取消恢复，绝不触发完成/保存
     c.addEventListener("pointercancel", onAnnoPointerCancel);
+    // 矩形手势兜底：窗口失焦（切标签/最小化）= 收尾恢复，绝不按完成保存
+    window.addEventListener("blur", cancelRectPointerSessions);
     // 工单 E：查看器右键菜单（preventDefault + 冻结载荷的附件意图）
     c.addEventListener("contextmenu", onViewerContextMenu);
     // §6.2：viewer 容器「捕获阶段」对象路由——只在确认对象编辑时消费事件，

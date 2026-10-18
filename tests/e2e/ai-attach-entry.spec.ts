@@ -151,6 +151,9 @@ async function expectRealBundle(page: Page) {
 }
 
 test.describe("AI 入口统一（真实 bundle）", () => {
+	// 默认 e2e 不装真实 bundle（e2e_server 装桩）：未指定 PLUGIN_BUNDLES_DIR 时跳过；
+	// 指定了却仍落到桩，上面的 assertRealBundle 照常显式失败
+	test.skip(!process.env.PLUGIN_BUNDLES_DIR, "需要 PLUGIN_BUNDLES_DIR 指向真实 HistoPilot bundle");
 	test("工具条 ✨ 加入 AI 对话：加附件卡、不发送、保留文字、可移除", async ({ page }) => {
 		await page.addInitScript(() => {
 			try { window.localStorage.setItem("hp_lang", "zh"); } catch { /* 忽略 */ }

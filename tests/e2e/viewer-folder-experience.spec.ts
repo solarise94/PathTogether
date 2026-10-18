@@ -156,4 +156,29 @@ test.describe("folder-experience：刷新恢复 / 导入默认目标 / 深链定
     await expect(card).toBeVisible();
     await page.screenshot({ path: join(SHOT_DIR, "fx-04-deeplink-folderB.png") });
   });
+
+  test("侧栏收起时完成记忆恢复，展开后仍停在记忆页", async ({ page }) => {
+    test.setTimeout(60_000);
+    await login(page, CREDS.userLogin, CREDS.userPassword);
+    await page.goto("/app");
+    await expandSidebar(page);
+    const pageInfo = page.locator("#fb-page-info");
+    await expect(pageInfo).toContainText(/^1\/\d+/);
+    await page.locator("#fb-next-btn").click();
+    await expect(pageInfo).toContainText(/^2\//);
+    const collapsed = () => page.locator("#sidebar").evaluate((el) =>
+      el.classList.contains("collapsed"));
+    await page.locator("#menu-btn").click();
+    await expect.poll(collapsed).toBe(true);
+    await page.reload();
+    // 收起态（兜底高度装箱）下先完成恢复，再展开触发 relayout
+    await expect.poll(collapsed).toBe(true);
+    // 收起态的页码按收起布局装箱（不可见），这里只等恢复落定
+    await expect(pageInfo).not.toContainText(/^1\/1 /, { timeout: 15_000 });
+    await page.waitForLoadState("networkidle");
+    await page.waitForTimeout(500);
+    await expandSidebar(page);
+    await page.waitForTimeout(600);
+    await expect(pageInfo).toContainText(/^2\//);
+  });
 });

@@ -4020,7 +4020,10 @@
     }
     var folder = rec.folder ? String(rec.folder) : null;
     if (folder === FB_TEMP_KEY) folder = null;
-    return { v: 1, folder: folder, pages: pages, updatedAt: updatedAt };
+    var anchor = (typeof rec.anchor === "string" && rec.anchor.length <= 200)
+      ? rec.anchor : null;
+    return { v: 1, folder: folder, pages: pages, anchor: anchor,
+             updatedAt: updatedAt };
   }
 
   // 写入：导航/翻页结束调用。临时查看目录按根记录（刷新后回根，不恢复会话
@@ -4036,6 +4039,8 @@
       v: 1,
       folder: fbState.folder === FB_TEMP_KEY ? null : (fbState.folder || null),
       pages: pages,
+      // 当前页首条：页码随侧栏可用高度变化，恢复以它所在页为准
+      anchor: fbState.folder === FB_TEMP_KEY ? null : (fbState.anchor || null),
       updatedAt: Date.now(),
     };
     fbMemRecord = rec;
@@ -4076,7 +4081,15 @@
       if (folder && !fbProject(folder)) folder = null;   // 已删/撤权 → 根
       fbState.folder = folder;
       fbState.page = (typeof pages[folder] === "number") ? pages[folder] : 0;
-      renderFolderBrowser();   // 页码在此按实际页数钳回
+      var anchorKnown = !!rec.anchor && fbOrderedEntries(folder).some(function (it) {
+        return fbEntryKey(it) === rec.anchor;
+      });
+      if (anchorKnown) {
+        fbState.anchor = rec.anchor;
+        renderFolderBrowser(true);   // 按记忆首条所在页定位
+      } else {
+        renderFolderBrowser();   // 页码在此按实际页数钳回
+      }
     });
   }
 
@@ -4281,6 +4294,15 @@
       return el.clientHeight;
     }
     return FB_STACK_FALLBACK_H;
+  }
+
+  // 当前装箱是否反映可见布局：桌面收起（含收起动画中）时侧栏宽度在变、
+  // 高度仍在，装箱结果不代表展开后的分页
+  function fbStackMeasured() {
+    var el = els.fbStack;
+    if (!el || typeof el.clientHeight !== "number" || el.clientHeight <= 40) return false;
+    var sb = document.getElementById("sidebar");
+    return !(sb && sb.classList && sb.classList.contains("collapsed"));
   }
 
   function fbProject(pid) {
@@ -4502,7 +4524,8 @@
     fbState.page = Math.max(0, Math.min(fbState.page, totalPages - 1));
     fbState.totalPages = totalPages;
     var pageEntries = pages[fbState.page] || [];
-    if (relayout !== true) {
+    if (relayout !== true && fbStackMeasured()) {
+      // 侧栏收起（宽 0）时的装箱不代表真实布局：沿用原锚点，展开后据此回页
       fbState.anchor = pageEntries.length ? fbEntryKey(pageEntries[0]) : null;
     }
 

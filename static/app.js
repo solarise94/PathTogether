@@ -2081,9 +2081,14 @@
       els.annoFreeBtn.disabled = false;
       // 拉取该切片标注（P2 合同 §3.1：?slide_id= 优先，旧后端 ?slide=<名>）
       var annoQuery = annotationsQueryFor(state.slide);
+      // 迟到响应防护（P2 复核 2026-10-18）：深链直开与快速换片时，上一个
+      // open 的标注响应可能在新切片打开后才回来——按发起时的切片对象判定，
+      // 绝不让旧响应覆盖新切片的 currentAnnotations。
+      var slideAtReq = state.slide;
       apiFetch(annoQuery)
         .then(function (r) { return r.json(); })
         .then(function (data) {
+          if (state.slide !== slideAtReq) return;
           currentAnnotations = data;
           var annos = data.annotations || [];
           if (annos.length > 0) {
@@ -2096,7 +2101,7 @@
           rebuildFlatItems();
           redrawAnnoCanvas();
         })
-        .catch(function () { currentAnnotations = null; editItem = null; state.focusAnno = null; editing = false; rebuildFlatItems(); redrawAnnoCanvas(); });
+        .catch(function () { if (state.slide !== slideAtReq) return; currentAnnotations = null; editItem = null; state.focusAnno = null; editing = false; rebuildFlatItems(); redrawAnnoCanvas(); });
     } else {
       els.annoArrowBtn.disabled = true;
       els.annoFreeBtn.disabled = true;
@@ -9258,9 +9263,13 @@
   // 重新拉取当前切片标注并重绘（工单 D：返回 Promise 供「选中新标注」等待）
   function refreshCurrentAnnotations() {
     if (!state.slide) { redrawAnnoCanvas(); return Promise.resolve(); }
+    // 迟到响应防护：请求发出后用户换片（state.slide 已是另一对象）→ 丢弃
+    // 响应，绝不让旧切片的数据覆盖新切片的标注面板/画布。
+    var slideAtReq = state.slide;
     return apiFetch(annotationsQueryFor(state.slide))
       .then(function (r) { return r.json(); })
       .then(function (data) {
+        if (state.slide !== slideAtReq) return;
         // 拖动/键盘编辑进行中：不重建 flatItems（item 引用会被替换，
         // 正在进行的 applyEditDrag 会改到孤儿对象）；结束后的保存路径会再刷新
         if (editDrag || kbEditSession) return;
@@ -9290,6 +9299,27 @@
         if (editItem && flatItems.indexOf(editItem) < 0) { editItem = null; editing = false; }
         // focusAnno 引用失效（flatItems 重建）→ 清空，恢复显示全部
         if (state.focusAnno && flatItems.indexOf(state.focusAnno) < 0) { state.focusAnno = null; }
+        // 面板已开着：随数据刷新重渲——乐观更新（如删除）只画到刷新落地为
+        // 止，之后由服务端真实数据接管；新标注到达也不再滞留旧列表。
+        if (annoPanelOpen) renderAnnoPanel(annos);
+        // 侧栏徽标与面板同源（P2 复核 2026-10-18）：本切片的新鲜分组写回
+        // 标注索引的展示键（annoBadgeText 按名索引的同一解析），总数或分组
+        // 数变了才重渲侧栏——徽标计数不再滞后于面板，也不加额外请求。
+        try {
+          var sinfo = findSlideInfo(slideAtReq.id || slideAtReq.name);
+          var idxKey = (sinfo && (sinfo.name || sinfo.original_filename)) ||
+            slideAtReq.name;
+          if (allAnnotationsBySlide && idxKey) {
+            var prev = allAnnotationsBySlide[idxKey] || [];
+            var prevTotal = 0, nextTotal = 0;
+            prev.forEach(function (g) { prevTotal += g.count || 0; });
+            annos.forEach(function (g) { nextTotal += g.count || 0; });
+            allAnnotationsBySlide[idxKey] = annos;
+            if (prevTotal !== nextTotal || prev.length !== annos.length) {
+              renderFolderBrowser();
+            }
+          }
+        } catch (e) { /* 索引未就绪/解析失败：徽标按旧数据，下轮刷新再对齐 */ }
         redrawAnnoCanvas();
         updateAnnoToolbarPos();
       })
@@ -10993,13 +11023,28 @@
     // 复核 8428f7f0：等锁中取消 = abort 内容锁等待（此刻引擎尚未创建）
     var lockAbort = (typeof AbortController === "function")
       ? new AbortController() : null;
+    // 钮句柄留着：终态收口时摘除行上的「取消」（P3 复核 2026-10-18）
+    var cancelBtn =
     addRowButton(row, tt("upload.cos.cancel"), function () {
+      // 终态守卫（P3 复核 2026-10-18）：上传已收口（入库完成/失败/已取消）
+      // 后，行上残留的「取消」必须是空操作——绝不把完成行翻回「已取消」，
+      // 也绝不补发 cancel 请求（服务端对已发布资产只会拒绝）。摘除由下面的
+      // done 收口挂钩负责（三种终态同一路径）。
+      if (upload && typeof upload.settled === "function" && upload.settled()) {
+        return;
+      }
       if (lockAbort) { try { lockAbort.abort(); } catch (e) {} }
       if (!upload) return;
       row.setStage("upload.cos.cancelled");
       row.finish(10000);
       upload.cancel();
     });
+    // 摘除行上的「取消」钮（终态收口用。宿主无按钮/已摘除时空操作）。
+    function dropRowCancelBtn() {
+      if (cancelBtn && cancelBtn.parentNode && cancelBtn.parentNode.removeChild) {
+        cancelBtn.parentNode.removeChild(cancelBtn);
+      }
+    }
 
     // 复核 8428f7f0（双标签并发直传同一文件）：行/引擎没有跨标签互斥，两
     // 个工作台标签并发拖入同一文件会各建一个 ingestion。与工具页同一把跨
@@ -11023,6 +11068,7 @@
       // 不建引擎、不 POST /api/ingestions，释放刚拿到的锁并以取消回执收口。
       if (opts.isCancelled && opts.isCancelled()) {
         if (lk && lk.release) { try { lk.release(); } catch (e) {} }
+        dropRowCancelBtn();   // 终态：行上的「取消」一并摘除（引擎无从挂钩）
         dropVisPoke();
         if (opts.onOutcome) opts.onOutcome(null, { cancelled: true, __cancelled: true });
         return;
@@ -11091,6 +11137,12 @@
         // 面板直传条目：把引擎句柄交回调用方（取消按钮才能真正停传 +
         // POST /cancel；否则「取消」只改行文案，后台传输照跑并最终翻回完成）。
         try { opts.onEngine(upload); } catch (e) { /* 回调失败不影响上传 */ }
+      }
+      // 终态摘除「取消」钮（P3 复核 2026-10-18）：直传行的取消钮在面板
+      // 编排器按钮宿主之外，done 收口（入库完成/失败/取消）后残留可点会
+      // 把完成行翻回「已取消」并补发 cancel 请求——随收口一并摘除。
+      if (upload.done && typeof upload.done.then === "function") {
+        upload.done.then(dropRowCancelBtn, dropRowCancelBtn);
       }
       var settled = upload.done.then(function (r) {
         if (!r || r.cancelled) {
@@ -11774,12 +11826,14 @@
     return authInfoReady().then(function () {
       // 取消边界：身份等待期间被取消 → 不读记录、不建引擎
       if (entry.cancelled) return { cancelled: true };
-      var me = String(currentUserId || "");
       return inlineRunner.getJob(entry.jobId).then(function (job) {
         // 取消边界：这次 getJob 读取挂起期间被取消 → 绝不 createEntryUpload
         // （那会新建/续传 ingestion，行却已是「已取消」）；取消早返回值交回
         // 编排器 completeUpload 收口。
         if (entry.cancelled) return { cancelled: true };
+        // 现读身份放在读取**之后**（getJob 可能是慢操作）：归属比较与下面的
+        // 冻结都按同一时刻的身份，身份中途刷新不会被旧的缓存值放行。
+        var me = String(currentUserId || "");
         var up = job && job.upload;
         var it = job && job.intent;
         var inflight = !!(up && up.ingestionId &&
@@ -11796,6 +11850,12 @@
           // 与编排器 recordOwner 同口径），绝不视为可直接上传。
           owner = "";
         }
+        // 记录无绑定时，编排器归属复核冻结的 ownerAccount 仍是本条目归属
+        //（空串 = 复核时身份未知，不构成归属证据）
+        if (owner === null && typeof entry.ownerAccount === "string" &&
+            entry.ownerAccount) {
+          owner = entry.ownerAccount;
+        }
         if (owner !== null && owner !== me) {
           // __account：与编排器自身的归属检查同一收口（failAccountMismatch
           // → account_mismatch 行态，只认改绑/删除）；owner 空串哨兵由其
@@ -11805,11 +11865,19 @@
             data: { code: "account_mismatch" },
           });
         }
+        // 归属冻结（P1 复核 2026-10-18）：复核**通过的时刻**把归属记在
+        // 条目上（记录绑定账号，全新产物 = 当时已核验的页面身份），本次
+        // 上传全程（expected_account 与 upload.account 首次写入）只认这个
+        // 值——绝不在此后的异步窗口里现读 currentUserId 兜底。
+        entry.uploadAccount = owner !== null ? owner : me;
         return createEntryUpload(entry, artifact, job, name, declaration, cfg);
       }, function () {
         // 取消边界：读取失败的回调同样不得在取消后新建 ingestion
         if (entry.cancelled) return { cancelled: true };
-        return createEntryUpload(entry, artifact, null, name, declaration, cfg);
+        // 归属记录读不到 = 无从证明这条产物归谁——绝不按现读页面身份新建
+        // ingestion（身份中途刷新时正好把别人的产物入库到新账号）。行停
+        // upload_failed（「继续上传」可重试：重试重新读记录复核归属）。
+        return Promise.reject({ data: { code: "owner_read_failed" } });
       });
     });
   }
@@ -11862,13 +11930,15 @@
     // 器的取消经 e._upload.cancel() 停掉引擎内部一切在途/后续请求。
     if (entry.cancelled) return Promise.resolve({ cancelled: true });
     // 跨账号归属绑定（P1 cross-account 2026-10-15）：expected_account 用
-    // **记录里已绑定的账号**（进行中 upload.account / pending
-    // intent.account——条目被授权时的账号），不是此刻现读的 currentUserId：
-    // 身份中途被刷新而记录未重判时，现读值等于授权把产物静默记到新账号
-    // 名下。无绑定记录（getJob 失败 / 全新产物）才用当前页面身份——
-    // uploadEntryArtifact 的归属复核刚按它通过，upload.account 的首次归属
-    // 写入（storage.save）与 expected_account 保持同一账号。
+    // **条目上冻结的归属**（uploadEntryArtifact 归属复核通过时记下的
+    // entry.uploadAccount——记录绑定账号，或复核时刻已核验的页面身份），
+    // 不是此刻现读的 currentUserId：身份中途被刷新而记录未重判时，现读值
+    // 等于授权把产物静默记到新账号名下。冻结值缺失（理论不可达，防御）
+    // 才按记录绑定 → 当前身份的既有次序回落。
     var acct = inlineBoundAccount(job);
+    if (acct === null && typeof entry.uploadAccount === "string") {
+      acct = entry.uploadAccount;
+    }
     if (acct === null) acct = String(currentUserId || "");
     return new Promise(function (resolve, reject) {
       var upload = window.HP_COS_UPLOAD.createUpload({

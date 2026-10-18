@@ -468,8 +468,8 @@ def test_review_index_guard_must_keep_checked_target(monkeypatch):
     a2 = _anno(ca, x, "A2")
     b1 = _anno(cb, y, "B1")
     original = app_mod._guard_index_annotation_id
-    def shift_after_guard(token, index, aid):
-        result = original(token, index, aid)
+    def shift_after_guard(roi, aid):
+        result = original(roi, aid)
         assert result is None
         # Concurrent request deletes A1 after auth/ID validation, before write.
         assert share_store.delete_roi_by_annotation_id(a1["annotation_id"])

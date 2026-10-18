@@ -24601,27 +24601,30 @@ def _request_annotation_id(body):
     return None
 
 
-def _guard_index_annotation_id(token, index, expected_aid):
+def _guard_index_annotation_id(roi, expected_aid):
     """旧 index 路由的 annotation_id 一致性防护（annotation_moved）。
 
     index 是「token 下非 tombstone 行的插入序位置」：他人增删后，客户端缓存
     的 index 会指向另一条标注（可能 403、更坏是删/审错）。真正旧的客户端
-    （不带 annotation_id）维持旧行为做兼容；带了 id 的请求在此拦截——该
-    index 当前指向行的 annotation_id 与请求不一致 → 409 annotation_moved，
-    绝不删/改/审错。在调用方完成鉴权（403 优先）之后调用，不向未授权者
-    泄露该 index 处的 annotation_id。返回 error_resp 或 None。
+    （不带 annotation_id）维持旧行为做兼容；带了 id 的请求在此拦截——请求
+    的 annotation_id 与**已解析行**不一致 → 409 annotation_moved，绝不删/
+    改/审错。在调用方完成鉴权（403 优先）之后调用，不向未授权者泄露该行
+    的 annotation_id。返回 error_resp 或 None。
 
-    2026-10-17 P1 竞态修复后本防护仍保留：调用方必须**先**一次性
-    get_roi(token, index) 解析出行并对该行鉴权，本防护紧随其后，写入则
-    一律绑定该已解析行的 annotation_id（by-id 行锁原语）——防护自身与
-    写入之间列表再漂移也不会换行（写入不再按 index 定位）。
+    2026-10-17 P1 竞态修复：调用方**先**一次性 get_roi(token, index) 解析出
+    行并对该行鉴权，本防护紧随其后，写入一律绑定该已解析行的 annotation_id
+    （by-id 行锁原语）。2026-10-18 P2 修复：本防护改为只比对调用方传入的
+    已解析行 roi，自身绝不再按 index 二次 get_roi——此前防护内部的第二次
+    定位在解析与比对之间列表漂移（并发删了前面的行）时会比对到**另一行**
+    （指认 B1 的请求放行后删掉已解析的 A2），比对与鉴权/写入没有绑定同一
+    行。share_server._guard_roi_index_annotation_id(r, expected_aid) 即此
+    口径（镜像来源）。
     """
     if not expected_aid:
         return None
-    cur = share_store.get_roi(token, index)
-    if cur is not None and (cur.get("annotation_id") or "") != expected_aid:
+    if roi is not None and (roi.get("annotation_id") or "") != expected_aid:
         return jsonify(error="annotation_moved",
-                       annotation_id=cur.get("annotation_id")), 409
+                       annotation_id=roi.get("annotation_id")), 409
     return None
 
 
@@ -24854,7 +24857,7 @@ def api_annotation_delete_admin(index):
     if denied:
         return denied
     moved = _guard_index_annotation_id(
-        share_store.ADMIN_TOKEN, index, _request_annotation_id(body))
+        roi, _request_annotation_id(body))
     if moved is not None:
         return moved
     if roi is None:
@@ -24904,7 +24907,7 @@ def api_annotation_delete(token, index):
     if denied:
         return denied
     moved = _guard_index_annotation_id(
-        token, index, _request_annotation_id(body))
+        roi, _request_annotation_id(body))
     if moved is not None:
         return moved
     if roi is None:
@@ -24973,7 +24976,7 @@ def api_annotation_set_shared(token, index):
     if denied:
         return denied
     moved = _guard_index_annotation_id(
-        token, index, _request_annotation_id(body))
+        roi, _request_annotation_id(body))
     if moved is not None:
         return moved
     if roi is None:
@@ -25219,7 +25222,7 @@ def api_annotation_comments(token, index):
         return err
     body = request.get_json(silent=True) or {}
     moved = _guard_index_annotation_id(
-        token, index, _request_annotation_id(body))
+        roi, _request_annotation_id(body))
     if moved is not None:
         return moved
     aid = roi.get("annotation_id")
@@ -25244,7 +25247,7 @@ def api_annotation_comment_add(token, index):
         return err
     body = request.get_json(silent=True) or {}
     moved = _guard_index_annotation_id(
-        token, index, _request_annotation_id(body))
+        roi, _request_annotation_id(body))
     if moved is not None:
         return moved
     text = body.get("body")
@@ -25333,7 +25336,7 @@ def api_annotation_review(token, index):
         return err
     body = request.get_json(silent=True) or {}
     moved = _guard_index_annotation_id(
-        token, index, _request_annotation_id(body))
+        roi, _request_annotation_id(body))
     if moved is not None:
         return moved
     action = body.get("action")
@@ -25371,7 +25374,7 @@ def api_annotation_history(token, index):
         return err
     body = request.get_json(silent=True) or {}
     moved = _guard_index_annotation_id(
-        token, index, _request_annotation_id(body))
+        roi, _request_annotation_id(body))
     if moved is not None:
         return moved
     return jsonify({"history": roi.get("history", [])})

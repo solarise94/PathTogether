@@ -1902,7 +1902,7 @@ button {
   padding: 6px;
 }
 .anno-panel-empty { color: var(--text-3); font-size: 13px; text-align: center; padding: 20px 8px; }
-/* 列表加载失败显式错误态（P3 2026-10-18）：整块替换列表内容 */
+/* 列表加载失败显式错误态（P3 2026-10-19）：整块替换列表内容 */
 .anno-panel-error {
   display: flex;
   flex-direction: column;

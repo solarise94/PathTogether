@@ -1222,7 +1222,7 @@
   var currentAnnotations = null; // 当前切片的标注 {slide, annotations:[{label,count,items}]}
   var annoOverlays = [];   // 兼容旧引用，已不再新增（标注改画到 canvas）
   var annoPanelOpen = false;
-  // 标注列表加载失败态（P3 2026-10-18，生产误报复盘：列表接口瞬时失败曾被
+  // 标注列表加载失败态（P3 2026-10-19，生产误报复盘：列表接口瞬时失败曾被
   // 渲染成「暂无标注」，与真正的空切片不可分辨）。非 401 失败（网络断开/
   // 5xx/403/非 JSON 体）：annoListError = 当前切片列表从未成功加载（面板显
   // 示显式错误态 + 重试）；annoListStale = 刷新失败但已有上次成功数据（保留
@@ -9391,7 +9391,7 @@
     }
   }
 
-  // ---------- 标注列表加载失败态（P3 2026-10-18） ----------
+  // ---------- 标注列表加载失败态（P3 2026-10-19） ----------
   // 失败详情（anno.panel.load.error 的 {e}）：HTTP 状态优先，网络断开/
   // 响应非 JSON 等无状态失败回落网络异常文案。
   function annoLoadFailDetail(e) {
@@ -9510,6 +9510,11 @@
       })
       .then(function (data) {
         if (state.slide !== slideAtReq) return;
+        // 刷新成功即清两个失败态（先于 editDrag/kbEditSession 早退：即便
+        // 本轮数据因手势不落地，错误态也不滞留——手势结束后的保存路径会
+        // 再刷新）。否则「初始失败 → 手动新建保存成功 → 重开面板」仍会
+        // 渲染错误块（review e64acaf3 #1）。
+        annoListError = null;
         annoListStale = false;
         // 拖动/键盘编辑进行中：不重建 flatItems（item 引用会被替换，
         // 正在进行的 applyEditDrag 会改到孤儿对象）；结束后的保存路径会再刷新
@@ -9567,7 +9572,16 @@
       .catch(function (e) {
         if (e && e.annoSilent) return;          // 401：页面即将跳 /login
         if (state.slide !== slideAtReq) return; // 晚到的旧切片响应：丢弃
-        // 非 401 刷新失败（P3 2026-10-18）：currentAnnotations 保持上次
+        if (!currentAnnotations) {
+          // 仍在「从未加载成功」的错误态（无旧数据可保留）：维持错误态——
+          // 更新失败详情并重渲错误块，不标失效（stale 语义是「展示的是
+          // 上次成功数据」，此处没有上次数据，stale 条叠在错误块上只会
+          // 自相矛盾）（review e64acaf3 #2）。
+          annoListError = { status: (e && e.status) || 0 };
+          if (annoPanelOpen) renderAnnoPanelError();
+          return;
+        }
+        // 非 401 刷新失败（P3 2026-10-19）：currentAnnotations 保持上次
         // 成功数据不动（失效数据优于伪装成空/清空面板），面板打开时顶部
         // 插失效提示 + 重试；面板关着时记状态，下次打开随行渲染。
         annoListStale = true;

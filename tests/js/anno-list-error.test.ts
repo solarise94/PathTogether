@@ -1,5 +1,5 @@
 /**
- * 标注列表加载失败不再冒充「暂无标注」（P3 2026-10-18，生产误报复盘）。
+ * 标注列表加载失败不再冒充「暂无标注」（P3 2026-10-19，生产误报复盘）。
  *
  * 真实 app.js 代码切片（与 anno-panel-refresh.test.ts 同款 harness）：
  *   - 初始加载/换片（loadCurrentSlideAnnotations）：非 401 失败（网络/5xx/
@@ -7,7 +7,9 @@
  *     重试成功恢复列表。401(auth_required) 仍静默（apiFetch 跳登录契约由
  *     tests/js/api-fetch-401.test.ts 权威覆盖，此处只断言不闪错误 UI）。
  *   - 刷新失败（refreshCurrentAnnotations）：保留上次成功数据与已渲染行
- *     （renderAnnoPanel 不被清空调用），顶部插失效提示条；成功后标记清除。
+ *     （renderAnnoPanel 不被清空调用），顶部插失效提示条；成功后标记清除；
+ *     刷新成功同时清错误态（先于 editDrag 早退）；currentAnnotations 为空
+ *     （仍在错误态）时刷新失败维持错误态、不标失效（review e64acaf3 #1/#2）。
  *   - 迟到响应防护沿用 slideAtReq 对象身份判定：换片后的旧响应整体丢弃。
  *   - openAnnoPanel：错误态/失效提示的打开入口。
  */
@@ -22,7 +24,7 @@ const src = readFileSync(resolve(root, "static/app.js"), "utf8");
 
 // 切片 A：加载/刷新 + 失败态渲染（annoLoadFailDetail → refreshCurrentAnnotations）
 const code = src.slice(
-	src.indexOf("  // ---------- 标注列表加载失败态（P3 2026-10-18） ----------"),
+	src.indexOf("  // ---------- 标注列表加载失败态（P3 2026-10-19） ----------"),
 	src.indexOf("  // 把几何字段写回 item（rect/arrow/freehand/polygon；撤销/冲突恢复共用）"),
 );
 // 切片 B：openAnnoPanel 的错误态/失效提示入口
@@ -102,6 +104,7 @@ interface HarnessInit {
 	annoListError?: any;
 	annoListStale?: boolean;
 	annoPanelOpen?: boolean;
+	editDrag?: any;
 }
 
 function makeHarness(
@@ -137,7 +140,9 @@ function makeHarness(
 		 var annoListError = ("annoListError" in init) ? init.annoListError : null;
 		 var annoListStale = !!init.annoListStale;
 		 var annoPanelOpen = !!init.annoPanelOpen;
-		 var editItem=null, editing=false, editDrag=null, kbEditSession=null,
+		 var editItem=null, editing=false,
+		     editDrag=("editDrag" in init) ? init.editDrag : null,
+		     kbEditSession=null,
 		     editBeforeSnapshot=null, flatItems=[], allAnnotationsBySlide=null;
 		 function toast(m){counters.toasts.push(m);}
 		 function annotationsQueryFor(s){return "/api/annotations?slide_id=" + encodeURIComponent(s.id);}
@@ -411,6 +416,105 @@ describe("标注列表刷新失败（refreshCurrentAnnotations）", () => {
 		const r = harness.read();
 		expect(r.annoListStale).toBe(false);
 		expect(r.currentAnnotations).toBe(prev);
+	});
+});
+
+// —— review e64acaf3 回归：错误态 × 刷新结果的状态机 ——
+describe("刷新成功/失败与错误态的交互（review e64acaf3 #1/#2）", () => {
+	it("#1 初始失败后刷新成功：annoListError 清除，重开面板渲染行而非错误块", async () => {
+		// 复现路径：初始加载失败（错误态）→ 用户保存新标记触发
+		// refreshCurrentAnnotations 成功 → 关/重开面板——修复前
+		// openAnnoPanel 仍因 annoListError 渲染错误块
+		const { harness, els } = makeHarness(() => Promise.resolve(okResp(fresh)), {
+			annoListError: { status: 500 },
+			currentAnnotations: null,
+			annoPanelOpen: false,
+		});
+		await harness.refresh();
+		const r = harness.read();
+		expect(r.annoListError).toBeNull();
+		expect(r.currentAnnotations).toEqual(fresh);
+		expect(r.annoListStale).toBe(false);
+		harness.openPanel();
+		expect(harness.counters.panelRender).toBe(1);
+		expect(els.annoPanelList.querySelector(".anno-panel-error")).toBeNull();
+	});
+
+	it("#1 面板开着且在错误态时刷新成功：错误块被真实列表整表重渲替换", async () => {
+		const { harness, els } = makeHarness(() => Promise.resolve(okResp(fresh)), {
+			annoListError: { status: 500 },
+			currentAnnotations: null,
+			annoPanelOpen: true,
+		});
+		// 模拟面板当前显示的错误块（初始失败时 renderAnnoPanelError 的产物）
+		const errBox = makeEl("div");
+		errBox.className = "anno-panel-error";
+		els.annoPanelList.appendChild(errBox);
+
+		await harness.refresh();
+		const r = harness.read();
+		expect(r.annoListError).toBeNull();
+		expect(r.currentAnnotations).toEqual(fresh);
+		expect(harness.counters.panelRender).toBe(1); // 整表重渲
+		expect(els.annoPanelList.querySelector(".anno-panel-error")).toBeNull();
+	});
+
+	it("#1 editDrag 手势中的刷新成功：错误态仍清除（先于早退），数据按手势语义不落地", async () => {
+		const { harness, els } = makeHarness(() => Promise.resolve(okResp(fresh)), {
+			annoListError: { status: 500 },
+			currentAnnotations: null,
+			annoPanelOpen: true,
+			editDrag: { active: true },
+		});
+		// 面板当前显示的错误块
+		const errBox = makeEl("div");
+		errBox.className = "anno-panel-error";
+		els.annoPanelList.appendChild(errBox);
+
+		await harness.refresh();
+		const r = harness.read();
+		expect(r.annoListError).toBeNull(); // 先于早退清除，不滞留到下轮
+		expect(r.currentAnnotations).toBeNull(); // 手势中不重建（既有契约）
+		expect(harness.counters.panelRender).toBe(0);
+		// 手势中未重渲：错误块暂留 DOM，但状态已清——手势结束后的保存路径
+		// 会再刷新，届时整表重渲为真实列表
+		expect(els.annoPanelList.querySelector(".anno-panel-error")).toBe(errBox);
+	});
+
+	it("#2 错误态下刷新失败（面板开着）：保持错误态并更新状态码，不标失效", async () => {
+		// 修复前：annoListStale=true + 失效条叠在错误块上（自相矛盾：
+		// 「上次成功数据」并不存在）
+		const { harness, els } = makeHarness(() => Promise.resolve(failResp(503)), {
+			annoListError: { status: 500 },
+			currentAnnotations: null,
+			annoPanelOpen: true,
+		});
+		const errBox = makeEl("div");
+		errBox.className = "anno-panel-error";
+		els.annoPanelList.appendChild(errBox);
+
+		await harness.refresh();
+		const r = harness.read();
+		expect(r.annoListStale).toBe(false);
+		expect(r.annoListError).toEqual({ status: 503 }); // 详情更新为最新失败
+		expect(els.annoPanelList.querySelector(".anno-panel-stale")).toBeNull();
+		const box = els.annoPanelList.querySelector(".anno-panel-error");
+		expect(box).toBeTruthy();
+		expect(box!.children[0].textContent).toContain("HTTP 503");
+		expect(box!.children[1].textContent).toBe("anno.panel.load.retry");
+	});
+
+	it("#2 错误态下刷新失败（面板关着）：只更新错误状态，不标失效", async () => {
+		const { harness, els } = makeHarness(() => Promise.resolve(failResp(503)), {
+			annoListError: { status: 500 },
+			currentAnnotations: null,
+			annoPanelOpen: false,
+		});
+		await harness.refresh();
+		const r = harness.read();
+		expect(r.annoListStale).toBe(false);
+		expect(r.annoListError).toEqual({ status: 503 });
+		expect(els.annoPanelList.querySelector(".anno-panel-stale")).toBeNull();
 	});
 });
 

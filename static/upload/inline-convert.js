@@ -355,6 +355,14 @@
     return { kind: "generic", code: code, detail: null };
   }
 
+  /// 无任务时的 generic 错误码里「格式样」的子集：这类重传大概率仍因格式
+  /// 被拒，除全新重试外同排支持申请；其余（网络/容量/未知）只给重试。
+  var FORMAT_LIKE_CODES = {
+    cos_format_unsupported: 1,
+    unsupported_ext: 1,
+    invalid_slide: 1,
+  };
+
   /// 服务器终态里「重新上传（新建任务）」有意义/无意义 的划分：内容与传输
   /// 类终态重传有意义；超限/容量配置重传必然再失败 → 只说明。
   var TERMINAL_RETRYABLE = {
@@ -382,12 +390,25 @@
       case "recheck":
         return ["recheckUpload"];
       case "terminal":
+        if (err.code === "validation_failed") {
+          // 服务器判文件未通过结构校验：真不可读的文件重传只会再失败——
+          // 除「重新上传」外同排「申请支持该格式」（哈希/计划不匹配是传输
+          // 完整性问题，保持仅重传，见 TERMINAL_RETRYABLE）
+          return ["reupload", "support"];
+        }
         if (TERMINAL_RETRYABLE[err.code]) return ["reupload"];
         return [];   // 超限/容量配置：重传无意义，行内文案说明原因即可
       case "format":
         return ["support"];
       default:
-        return hasTask ? ["continueUpload"] : ["support"];
+        // 无任务（创建请求 5xx/网络失败、能力拉取失败等建任务前错误）→
+        // 全新重试是安全的（不存在可复用/可重复的任务）；格式样错误码才
+        // 追加支持申请。有任务 → 同任务续传。
+        if (!hasTask) {
+          return FORMAT_LIKE_CODES[err.code] ? ["reupload", "support"]
+                                             : ["reupload"];
+        }
+        return ["continueUpload"];
     }
   }
 

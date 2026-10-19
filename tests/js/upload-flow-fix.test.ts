@@ -78,9 +78,16 @@ describe("P2-2 uploadRecoveryKinds：按失败类型 + 服务器任务决定恢�
 			.toEqual(["recheckUpload"]);
 	});
 
-	it("明确服务器终态 → 显式重新上传；超限/容量配置类终态不给无效动作", () => {
+	it("明确服务器终态 → 显式重新上传；validation_failed 同排支持申请", () => {
+		// 服务器判文件未通过结构校验：真不可读的文件重传只会再失败 →
+		// 「重新上传」+「申请支持该格式」两条出路同排
+		expect(I.uploadRecoveryKinds({
+			uploadJobId: "ing-vf",
+			error: { kind: "terminal", code: "validation_failed" },
+		})).toEqual(["reupload", "support"]);
+		// 哈希/计划不匹配是传输完整性问题：重传即修复，保持仅重传
 		for (const code of ["client_gone", "client_idle_timeout",
-			"validation_failed", "plan_size_mismatch"]) {
+			"hash_mismatch", "plan_size_mismatch"]) {
 			expect(I.TERMINAL_RETRYABLE[code]).toBe(1);
 			expect(I.uploadRecoveryKinds({
 				uploadJobId: "ing-1",
@@ -105,12 +112,26 @@ describe("P2-2 uploadRecoveryKinds：按失败类型 + 服务器任务决定恢�
 			.toEqual(["support"]);
 	});
 
-	it("未知错误：有服务器任务 → 同任务续传；无任务 → 申请支持（现状兜底）", () => {
+	it("未知错误：有任务 → 同任务续传；无任务 → 全新重试（建任务前失败无重复风险）", () => {
+		// 有任务：安全续传同一 ingestion
 		expect(I.uploadRecoveryKinds({
 			uploadJobId: "ing-9", error: { kind: "generic", code: "weird_thing" },
 		})).toEqual(["continueUpload"]);
+		// 无任务（POST /api/ingestions 5xx/网络失败、能力拉取失败等）：
+		// 全新重试安全（没有可复用也不会重复建任务）——不再是「无恢复」
+		expect(I.uploadRecoveryKinds({ uploadJobId: null,
+			error: { kind: "generic", code: "weird_thing" } }))
+			.toEqual(["reupload"]);
 		expect(I.uploadRecoveryKinds({ error: { kind: "generic", code: "" } }))
-			.toEqual(["support"]);
+			.toEqual(["reupload"]);
+		// 格式样错误码（无任务）：重试之外同排支持申请
+		expect(I.uploadRecoveryKinds({ uploadJobId: null,
+			error: { kind: "generic", code: "cos_format_unsupported" } }))
+			.toEqual(["reupload", "support"]);
+		// 直接条目（无本机转换 jobId）同样适用
+		expect(I.uploadRecoveryKinds({ jobId: null, uploadJobId: null,
+			error: { kind: "generic", code: "some_5xx_code" } }))
+			.toEqual(["reupload"]);
 	});
 
 	it("直传条目（无本机转换 jobId）与转换产物得到同一套恢复动作", () => {

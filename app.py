@@ -18163,11 +18163,14 @@ def _attachment_label_of(roi):
 def _validate_ai_attachments(body, slide):
     """校验 run/continue/branch 的 attachments 数组；返回 (cleaned, err)。
 
-    每项须含 kind=viewport|marker 与合法 bbox。marker 须可读且 revision 匹配；
+    每项须含 kind=viewport|marker|roi 与合法 bbox。marker 须可读且 revision 匹配；
     服务端在解析授权后把权威 label（用户署名，规范化）一并写入重建记录——
     模型侧「标记名 ↔ annotation_id ↔ 区域」映射由此对齐，杜绝模型按坐标
-    猜错名字（dogfood dg19-A2/B2 调换）。非法 → 400/403/409；缺省/空 →
-    (None, None)。
+    猜错名字（dogfood dg19-A2/B2 调换）。roi 是未保存草稿区域的冻结 bbox
+    （kind 与技能 target 的 roi 同名同义）：与 viewport 同一口径严格校验
+    bbox，**不做任何标注查询**——载荷里的 annotation_id 等额外键一律不
+    透传（白名单重建），绝不因附件伪造标注引用。非法 → 400/403/409；
+    缺省/空 → (None, None)。
     """
     if not isinstance(body, dict) or "attachments" not in body:
         return None, None
@@ -18187,7 +18190,7 @@ def _validate_ai_attachments(body, slide):
             return None, (jsonify(error="attachments[%d] 需为对象" % i,
                                   code="invalid_argument"), 400)
         kind = item.get("kind")
-        if kind not in ("viewport", "marker"):
+        if kind not in ("viewport", "marker", "roi"):
             return None, (jsonify(error="attachments[%d].kind 非法" % i,
                                   code="invalid_argument"), 400)
         vp, vp_err = _validate_ai_viewport({"viewport": item.get("bbox")

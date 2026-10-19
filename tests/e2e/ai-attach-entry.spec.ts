@@ -11,7 +11,11 @@
  *    工具条不因权限误禁——由单元测试覆盖，浏览器侧锁可见入口）；
  *  - ⋯ 菜单：「居中显示此标记」（仅导航）、「锁定位置」；
  *  - 标注行内不再渲染「快速问答」/「从此处深读」；行内 chip 为
- *    「✨ 加入 AI 对话」，点击同样只加附件卡（零 /api/ai/ask|branch）。
+ *    「✨ 加入 AI 对话」，点击同样只加附件卡（零 /api/ai/ask|branch）；
+ *  - 未保存草稿（预设放置）✨ 加入 AI 对话（ROI 附件 2026-10-18）：点击
+ *    只加 roi 附件卡（零 POST /api/annotation——不落库、不伪造标注），
+ *    composer 文字保留；发送（/api/ai/run 打桩）请求体 attachments 携带
+ *    kind=roi + 冻结 bbox。
  *
  * 前置：PLUGIN_BUNDLES_DIR 指向包含真实 histopilot bundle 的目录（运行说明见
  * tests/e2e/README 或 CI cross-repo job；bundle 缺失时 e2e_server 会装桩，
@@ -253,5 +257,118 @@ test.describe("AI 入口统一（真实 bundle）", () => {
 		await expect(page.locator("#ai-panel")).toBeVisible();
 		await expect(page.locator("#ai-pending-attaches .pending-attach.marker")).toHaveCount(1);
 		expect(aiRequests, `行内加入不得发 AI 请求：${aiRequests.join(", ")}`).toEqual([]);
+	});
+
+	test("未保存草稿 ✨ 加入 AI 对话（ROI 附件）：不落库、发送体带 roi 附件", async ({ page }) => {
+		await page.addInitScript(() => {
+			try {
+				window.localStorage.setItem("hp_lang", "zh");
+				(window as { __PT_TEST_HOOKS?: boolean }).__PT_TEST_HOOKS = true;
+			} catch { /* 忽略 */ }
+		});
+		await page.setViewportSize({ width: 1600, height: 1000 });
+		await login(page, CREDS.userLogin, CREDS.userPassword);
+		// /api/ai/** 打桩（本地无 sidecar）：**先于 /app 页面加载**——HP 在
+		// 启动即拉 /api/ai/config（aiCredentialsReady 的起跑 gate；真实 e2e
+		// 服务端无凭据会把 composer 拦在「AI 尚未配置」）。记录 run 请求体并
+		// 回最小 SSE。
+		const runBodies: Array<Record<string, unknown>> = [];
+		await page.route("**/api/ai/**", async (route) => {
+			const req = route.request();
+			const path = new URL(req.url()).pathname;
+			if (path === "/api/ai/run" && req.method() === "POST") {
+				runBodies.push(req.postDataJSON() as Record<string, unknown>);
+				await route.fulfill({
+					status: 200,
+					headers: { "X-AI-Session-ID": "sess-e2e-roi" },
+					contentType: "text/event-stream",
+					body: "id: 1\nevent: session_created\ndata: {\"id\":\"sess-e2e-roi\"}\n\n"
+						+ "id: 2\nevent: session_ended\ndata: {\"id\":\"sess-e2e-roi\",\"status\":\"finished\"}\n\n",
+				});
+				return;
+			}
+			if (path === "/api/ai/config") {
+				await route.fulfill({ json: { using: "platform", platform_configured: true, base_url: "https://example.test", api_key_set: true, max_steps: 30, model: "test" } });
+				return;
+			}
+			if (path === "/api/ai/sessions") {
+				await route.fulfill({ json: { conversations: [] } });
+				return;
+			}
+			await route.fulfill({ json: {} });
+		});
+		await wipeAnnotations(page, SID);
+		// 种一个标记：标注层按钮需要至少一条标注才可用（本用例不断言其数量）
+		await pageApi(page, "POST", "/api/annotation", {
+			slide_id: SID, type: "rect", x: 20, y: 20, w: 30, h: 24,
+			label: "e2e-draft-roi-seed", shared: true,
+		});
+		await openSlideWithAnnos(page, SID);
+		await expectRealBundle(page);
+
+		// 记录标注写请求：加入草稿区域绝不落库（无 annotation_id 可伪造）
+		const annoWrites: string[] = [];
+		page.on("request", (req) => {
+			const p = new URL(req.url()).pathname;
+			if (p.startsWith("/api/annotation") && req.method() !== "GET") {
+				annoWrites.push(`${req.method()} ${p}`);
+			}
+		});
+
+		// 打开 AI 面板并输入文字（发送时必须原样保留）
+		await page.locator("#ai-btn").click();
+		await expect(page.locator("#ai-panel")).toBeVisible();
+		await page.locator("#ai-task").fill("帮我看看这个未保存区域");
+
+		// 矩形工具 + 预设尺寸放置 → 未保存草稿（自由拖画会自动保存，不适用）
+		await page.locator("#roi-rect-btn").click();
+		await expect(page.locator("#roi-settings")).toBeVisible();
+		await page.evaluate(() => {
+			const unit = document.getElementById("roi-unit-select") as HTMLSelectElement;
+			unit.value = "px";
+			unit.dispatchEvent(new Event("change", { bubbles: true }));
+			const wi = document.getElementById("roi-w-input") as HTMLInputElement;
+			const hi = document.getElementById("roi-h-input") as HTMLInputElement;
+			wi.value = "100";
+			hi.value = "80";
+			hi.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+		});
+		await expect(page.locator("#roi-box")).toBeVisible();
+		const roi = await page.evaluate(() => {
+			const r = (window as { HP_PROJECT_UI?: { viewerState?: { roi?: { x: number; y: number; w: number; h: number } } } })
+				.HP_PROJECT_UI?.viewerState?.roi;
+			if (!r) throw new Error("__PT_TEST_HOOKS 未暴露 viewerState.roi");
+			return { x: r.x, y: r.y, w: r.w, h: r.h };
+		});
+		expect(roi.w).toBe(100);
+		expect(roi.h).toBe(80);
+
+		// 草稿浮条：保存为标记 + ✨（次动作）；点击 ✨ → roi 附件卡
+		const toolbar = page.locator("#anno-obj-toolbar");
+		await expect(toolbar).toBeVisible();
+		await expect(toolbar.locator(".aot-save")).toBeVisible();
+		const askai = toolbar.locator(".aot-askai");
+		await expect(askai).toContainText("加入 AI 对话");
+		await askai.click();
+		const card = page.locator("#ai-pending-attaches .pending-attach.roi");
+		await expect(card).toHaveCount(1);
+		await expect(card).toContainText("未保存区域附件");
+		await expect(card).toContainText(new RegExp(`x${roi.x} y${roi.y} · ${roi.w}×${roi.h}`));
+		// composer 文字保留；加入动作零标注写请求（不落库）
+		await expect(page.locator("#ai-task")).toHaveValue("帮我看看这个未保存区域");
+		expect(annoWrites, `加入草稿区域不得写标注：${annoWrites.join(", ")}`).toEqual([]);
+
+		// 发送：请求体 attachments 携带 kind=roi + 点击时冻结的 bbox
+		await page.locator("#ai-start-btn").click();
+		await expect.poll(() => runBodies.length, { timeout: 15_000 }).toBe(1);
+		const body = runBodies[0]!;
+		expect(body.task).toBe("帮我看看这个未保存区域");
+		const atts = body.attachments as Array<Record<string, unknown>>;
+		expect(atts).toHaveLength(1);
+		expect(atts[0]!.kind).toBe("roi");
+		expect(atts[0]!.bbox).toEqual(roi);
+		expect(atts[0]!.annotation_id).toBeUndefined();
+		// 发送动作同样零标注写请求
+		expect(annoWrites).toEqual([]);
 	});
 });

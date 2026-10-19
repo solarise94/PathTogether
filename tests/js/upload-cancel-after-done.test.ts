@@ -67,7 +67,7 @@ describe("完成后点击残留「取消」钮（cancel-after-done.mjs 场景移
 		let click: (() => void) | null = null;
 		const stages: string[] = [];
 		new Function(
-			"row", "tt", "addRowButton", "upload", "lockAbort",
+			"row", "tt", "addRowButton", "upload", "lockAbort", "outcomeSettled",
 			app.slice(begin, end),
 		)(
 			{ setStage: (s: string) => stages.push(s), finish: () => {} },
@@ -75,6 +75,7 @@ describe("完成后点击残留「取消」钮（cancel-after-done.mjs 场景移
 			(_r: unknown, _l: unknown, fn: () => void) => { click = fn; },
 			upload,
 			null,
+			false,
 		);
 		click!();
 		// 原脚本输出（修复前）：{"completed":true,

@@ -29,10 +29,6 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
-// §9.2 第 12 项：对照对象是 ES module，只能顶层 import（设计 §9.2 前言的
-// 「两种加载面」——classic script 用 new Function，ES module 用 import，
-// 同一文件内并存）。生产代码**不** import 它（它是工具页 DOM 依赖）。
-import { createUploadController } from "../../static/tools/tools-slides-upload.js";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -480,7 +476,7 @@ describe("inline-convert 纯函数", () => {
 	it("progressStage：stage / stage-bundle / level 三形态（§3.3）", () => {
 		const I = IC();
 		expect(I.progressStage({ unit: "stage", done: 5, total: 10 }))
-			.toEqual({ key: "tools.phase.probing", frac: 0.5, noteKey: null });
+			.toEqual({ key: "upload.step.prepare", frac: 0.5, noteKey: null });
 		const b = I.progressStage({ unit: "stage-bundle", done: 5, total: 10, member: 2, members: 4 }) as {
 			noteKey: string; noteVars: { member: number } };
 		expect(b.noteKey).toBe("tools.stage.bundle.bytes");
@@ -1001,12 +997,14 @@ describe("bundle（§4.1.1）", () => {
 		const pickAt = appSrc.indexOf("function importPickFolder");
 		const picked = appSrc.slice(pickAt, pickAt + 900);
 		expect(picked).toContain("importBundleRows(rows, first)");
-		expect(picked).not.toContain("handoffBundleFolder(rows, first)");
+		// 2026-10-20：转换器交接移除——bundle 分流只进面板队列，面板不可用
+		// 时行内说明（convertNeededUnavailable），绝不弹 /tools/slides
 		const router = appSrc.slice(
 			appSrc.indexOf("function importBundleRows"),
-			appSrc.indexOf("function importBundleRows") + 900);
+			appSrc.indexOf("function importBundleRows") + 1200);
 		expect(router).toContain("inlineEnabled()");
-		expect(router).toContain("handoffBundleFolder(rows, folderName)");
+		expect(router).toContain("convertNeededUnavailable(null, folderName, retryBundle)");
+		expect(router).not.toContain("handoffBundleFolder");
 	});
 });
 
@@ -1215,18 +1213,24 @@ describe("独立评审复现：账号归属 / 取消边界 / 磁盘门 reject（
 		};
 		// app.js 的真 uploadEntryArtifact 切片（同 repro；t/humanSize 只是
 		// 进度事件的渲染依赖，注入桩避免未定义引用；authInfoReady 是复核
-		// #4 的身份闸——harness 注入立即落定，归属语义由专属用例覆盖）
+		// #4 的身份闸——harness 注入立即落定，归属语义由专属用例覆盖）。
+		// 2026-10-20：产物上传的 status 分支改经 cosStageView（与直传共用
+		// 服务端阶段映射）——它定义在 app.js 别处，切片需一并携带（tt 是它
+		// 的文案自由变量，注入桩）。
+		const stageViewCode = appSrc.slice(
+			appSrc.indexOf("  function cosStageKey("),
+			appSrc.indexOf("  function cosShowStage("));
 		const artifactCode = appSrc.slice(
 			appSrc.indexOf("  function uploadEntryArtifact("),
-			appSrc.indexOf("  /// 完成收口（§3.5）"));
+			appSrc.indexOf("  /// 完成收口（§3.5）")) + stageViewCode;
 		const actualOnArtifact = new Function(
 			"window", "inlineRunner", "currentUserId", "resolveCosConfig",
 			"apiFetch", "apiFetchNoRedirect", "inlineRowSetStage", "t", "humanSize",
-			"authInfoReady", "authInfoEnabled",
+			"authInfoReady", "authInfoEnabled", "tt",
 			artifactCode + ";return uploadEntryArtifact;")(
 			w, runner, current, () => ({ max_size_bytes: 1000000 }), api, api,
 			() => {}, (k: string) => k, (n: number) => String(n),
-			() => Promise.resolve(), false) as
+			() => Promise.resolve(), false, (k: string) => k) as
 			(e: Entry, a: unknown) => Promise<unknown>;
 		const orch = (w.HP_INLINE_CONVERT as {
 			createOrchestrator: (d: Record<string, unknown>) => Orch;
@@ -1425,7 +1429,9 @@ describe("独立复核 #3 复现移植（check-edges.mjs）：取消最后异步
 		// 按值绑参数会把等待期间的旧值带进迟到回调，仿真不出生产行为。
 		const artifactCode = appSrc.slice(
 			appSrc.indexOf("  function uploadEntryArtifact("),
-			appSrc.indexOf("  /// 完成收口（§3.5）"));
+			appSrc.indexOf("  /// 完成收口（§3.5）")) +
+			appSrc.slice(appSrc.indexOf("  function cosStageKey("),
+				appSrc.indexOf("  function cosShowStage("));
 		let resolveIdentity: (() => void) | null = null;
 		const identityP: Promise<void> = opts.holdIdentity
 			? new Promise<void>((r) => { resolveIdentity = () => r(); })
@@ -1434,7 +1440,7 @@ describe("独立复核 #3 复现移植（check-edges.mjs）：取消最后异步
 			"window", "inlineRunner", "initialUserId", "initialAuthEnabled",
 			"resolveCosConfig",
 			"apiFetch", "apiFetchNoRedirect", "inlineRowSetStage", "t", "humanSize",
-			"authInfoReady",
+			"authInfoReady", "tt",
 			"var currentUserId = initialUserId;\n" +
 			"var authInfoEnabled = initialAuthEnabled;\n" +
 			artifactCode +
@@ -1444,7 +1450,7 @@ describe("独立复核 #3 复现移植（check-edges.mjs）：取消最后异步
 			w, runner, current, opts.authEnabled ?? false,
 			() => ({ max_size_bytes: 1000000 }), api, api,
 			() => {}, (k: string) => k, (n: number) => String(n),
-			() => identityP) as {
+			() => identityP, (k: string) => k) as {
 				setUserId: (v: string) => void;
 				setAuthEnabled: (v: boolean) => void;
 				run: (e: Entry, a: unknown) => Promise<unknown>;
@@ -1747,29 +1753,31 @@ describe("i18n（§8 / §9.2 第 14、22 项）", () => {
 		}
 	});
 
-	it("旧文案改写：unsupported 两态都不点名 /tools/slides；convert_in_browser 用 {link} 形参", () => {
+	it("旧文案改写：unsupported 与 convert_in_browser 都不点名 /tools/slides", () => {
 		const t = loadI18n();
 		for (const lang of ["zh", "en"] as const) {
 			t.setLang(lang);
 			expect(t.t("upload.err.unsupported"), lang).not.toContain("/tools/slides");
-			expect(t.t("upload.cos.err.convert_in_browser"), lang).toContain("{link}");
+			// 2026-10-20：转换器交接移除——convert_in_browser 不再带 {link}
+			// 占位与工具页链接，只提示重试/申请支持
+			expect(t.t("upload.cos.err.convert_in_browser"), lang)
+				.not.toContain("/tools/slides");
+			expect(t.t("upload.cos.err.convert_in_browser"), lang)
+				.not.toContain("{link}");
 		}
-		// 源码级：基础文案里不再出现路径（路径只经 inline_convert.url 追加）
 		const i18nLines = i18nSrc.split("\n").filter(
 			(l) => l.includes('"upload.cos.err.convert_in_browser"'));
 		expect(i18nLines.length).toBe(2);
 		for (const l of i18nLines) expect(l).not.toContain("/tools/slides");
 	});
 
-	it("两态显示：enabled=false 时 convert_in_browser 追加工具页链接（§8 / 第 22 项）", () => {
-		// 文案里只有 {link} 占位；由 convertInBrowserMessage 按开关两态填充
+	it("convertInBrowserMessage 不再携带工具页链接（2026-10-20 回退语义）", () => {
 		const fn = appSrc.slice(
 			appSrc.indexOf("function convertInBrowserMessage"),
 			appSrc.indexOf("function cosErrorMessage"));
 		expect(fn).toContain("upload.cos.err.convert_in_browser");
-		expect(fn).toContain("{ link:");
-		expect(fn).toContain("inlineEnabled()");
-		expect(fn).toContain("CONVERT_HANDOFF_URL");
+		expect(fn).not.toContain("CONVERT_HANDOFF_URL");
+		expect(fn).not.toContain("{ link:");
 		// cosErrorMessage 经它取文案（不在函数内重复硬编码路径）
 		const msg = appSrc.slice(
 			appSrc.indexOf("function cosErrorMessage"),
@@ -1779,147 +1787,12 @@ describe("i18n（§8 / §9.2 第 14、22 项）", () => {
 });
 
 // --------------------------------------------------------------------- //
-// 12. 门禁等价性对照（§2.3 承诺 / §9.2 第 12 项）
-//
-// 对照面**不是** runLocked 全序列：它含人工交互分支（chooseAccountAction 的
-// dialog、signOutForOriginal 的登录跳转）与孤儿结算（settleOrphan），无法逐例
-// 自动比对。这里只比对两点可自动化的观察面：
-//   A 判定结论：面板纯函数 artifactGate 与工具页控制器 ctl.isDisabled 对同一
-//     组输入必须同判（工具页既有测试正是用 isDisabled 断言，
-//     tools-upload-limit.test.ts:169 / tools-upload-feedback.test.ts:270）；
-//   B 副作用：refuse 路径双方都**没有** POST /api/ingestions。
-// 明确**不做**：账号 mismatch / 孤儿 / 已发布重放——它们是工具页特有的交互
-// 语义，面板按设计 §7 自己的处置走，两侧在这些分支上允许不同。
+// 12.（2026-10-20 退役）门禁等价性对照曾与工具页上传控制器的 isDisabled
+// 对拍；控制器与其专用端点已随「转换器只做本地转换与保存」一并移除，
+// 面板 artifactGate 的 fail-closed 行为由上方「viewable_formats 字段缺失」
+// 用例直接覆盖。
 // --------------------------------------------------------------------- //
-describe("门禁等价性对照（§9.2 第 12 项）", () => {
-	const VIEWABLE = ["ome-bigtiff-subifd-rgb-jpeg-pyramid", "classic-bigtiff-jpeg-pyramid"];
-	const cosCaps = (maxSize: number) => ({
-		available: true, max_size_bytes: maxSize, part_bytes: 100,
-		url_ttl_seconds: 600, max_concurrent_parts: 2, sign_batch_max_parts: 4,
-		policy_version: "v1-manual", formats: ["tif", "tiff"],
-	});
 
-	/// 驱动工具页上传控制器（真模块 + 假 runner/fetch），返回 isDisabled + 是否
-	/// 建过 ingestion。形态照 tools-upload-limit.test.ts。
-	async function toolsPageVerdict(maxSize: number, job: unknown) {
-		const fetchLog: Array<{ method: string; url: string }> = [];
-		const cap = {
-			cos_upload: cosCaps(maxSize), viewable_formats: VIEWABLE,
-			account: "u1", account_label: "u1@x",
-		};
-		const resp = (body: unknown, status = 200) => ({
-			ok: status >= 200 && status < 300, status,
-			clone() { return this; },
-			json: () => Promise.resolve(body),
-		});
-		const els: Record<string, { hidden: boolean; disabled: boolean; textContent: string }> = {};
-		const doc = {
-			getElementById(id: string) {
-				if (!els[id]) els[id] = { hidden: false, disabled: false, textContent: "" };
-				return els[id];
-			},
-			createElement() { return { style: {}, appendChild() { }, addEventListener() { } }; },
-			addEventListener() { },
-		};
-		const fetchImpl = vi.fn((url: string, opts?: { method?: string }) => {
-			const method = (opts?.method || "GET").toUpperCase();
-			fetchLog.push({ method, url: String(url) });
-			if (String(url) === "/api/tools/slides/upload-capability") {
-				return Promise.resolve(resp(cap));
-			}
-			if (method === "POST" && String(url) === "/api/ingestions") {
-				return Promise.resolve(resp(
-					{ job_id: "inj_t1", state: "preparing", stage: "uploading" }, 202));
-			}
-			return Promise.resolve(resp({}));
-		}) as unknown as typeof fetch;
-		const w: Record<string, unknown> = { HP_COS_UPLOAD: null };
-		new Function("window", "document", "fetch", "location",
-			readFileSync(resolve(root, "static/upload/cos-uploader.js"), "utf8"))(
-			w, doc, fetchImpl, { href: "http://local/tools/slides", origin: "http://local" });
-		vi.stubGlobal("window", w);
-		vi.stubGlobal("document", doc);
-		vi.stubGlobal("fetch", fetchImpl);
-		vi.stubGlobal("localStorage", { getItem: () => null, setItem() { }, removeItem() { } });
-		vi.stubGlobal("navigator", {
-			locks: { request: (_n: string, _o: unknown, fn: (l: unknown) => Promise<unknown>) =>
-				Promise.resolve(fn({ name: "lock" })) },
-		});
-		const runner = {
-			async getJob() { return job; },
-			async setJobUpload() { return undefined; },
-			async setJobIntent() { return undefined; },
-			async artifactView() { return { size: 1, slice: () => null }; },
-		};
-		const ctl = createUploadController({
-			runner: runner as never,
-			t: (k: string) => k,
-			onJobsRefresh: null, onPublished: null,
-		}) as unknown as {
-			startOrContinue(id: string): Promise<unknown>;
-			setResultJob(id: string): Promise<unknown>;
-			isDisabled(id: string): boolean;
-		};
-		await ctl.setResultJob("job-1");
-		await ctl.startOrContinue("job-1");
-		const created = fetchLog.some(
-			(f) => f.method === "POST" && f.url === "/api/ingestions");
-		return { disabled: ctl.isDisabled("job-1"), created };
-	}
-
-	const cases: Array<{ label: string; max: number; job: unknown }> = [
-		{
-			label: "产物超上限",
-			max: 1000,
-			job: { id: "job-1", state: "ready",
-				result: { outputBytes: 5000, format: VIEWABLE[0] } },
-		},
-		{
-			label: "产物格式不可查看",
-			max: 1_000_000,
-			job: { id: "job-1", state: "ready",
-				result: { outputBytes: 100, format: "something-else" } },
-		},
-		{
-			label: "格式可查看且大小合规",
-			max: 1_000_000,
-			job: { id: "job-1", state: "ready",
-				result: { outputBytes: 100, format: VIEWABLE[0] } },
-		},
-	];
-
-	for (const c of cases) {
-		it(`${c.label}：面板 artifactGate 与工具页 isDisabled 同判（观察面 A/B）`, async () => {
-			const tools = await toolsPageVerdict(c.max, c.job);
-			const I = IC();
-			const cfg = { max_size_bytes: c.max, part_bytes: 100 };
-			const panel = I.artifactGate(cfg, c.job, VIEWABLE);
-			// 观察面 A：判定结论等价（工具页 disabled ⇔ 面板 !ok）
-			expect(panel.ok, `${c.label}: tools.disabled=${tools.disabled}`)
-				.toBe(!tools.disabled);
-			// 观察面 B：refuse 路径双方都零创建
-			if (!panel.ok) expect(tools.created, `${c.label} 不应建 ingestion`).toBe(false);
-			vi.unstubAllGlobals();
-		});
-	}
-
-	it("viewable_formats 字段缺失：面板 fail-closed，与工具页 (cap.viewable_formats || []) 同语义", () => {
-		const job = { id: "job-1", state: "ready",
-			result: { outputBytes: 100, format: VIEWABLE[0] } };
-		const I = IC();
-		// 面板：字段缺失显式 fail-closed（缺字段绝不等于通过，§8）
-		const missing = I.artifactGate({ max_size_bytes: 1_000_000 }, job, undefined);
-		expect(missing.ok).toBe(false);
-		expect(missing.code).toBe("viewable_formats_missing");
-		// 有该字段且格式在集内 → 面板放行
-		expect(I.artifactGate({ max_size_bytes: 1_000_000 }, job, VIEWABLE).ok).toBe(true);
-		// 工具页同语义的**源码级**证据：它对该字段取 `(cap.viewable_formats || [])`，
-		// 缺失即空集 → 空集的 indexOf 判定必落空 → 同样拒绝（与面板一致）。
-		const uploadSrc = readFileSync(
-			resolve(root, "static/tools/tools-slides-upload.js"), "utf8");
-		expect(uploadSrc).toContain("!(cap.viewable_formats || []).includes(fmt)");
-	});
-});
 
 // --------------------------------------------------------------------- //
 // 6.3 按钮全集 + §9.2 第 15/22 项：开关两态与回退（真 app.js，DOM 级）
@@ -2141,13 +2014,14 @@ describe("上传行按钮（§6.3 是按钮全集的唯一权威）", () => {
 		expect(up.inlineEnabled()).toBe(false);
 	});
 
-	it("两态文案：开关关闭时 convert_in_browser 带工具页链接，开启时不带", () => {
+	it("convert_in_browser 文案两态一致：都不带工具页链接（2026-10-20 交接移除）", () => {
 		// 关闭态（无 inline_convert 字段 → enabled=false）
 		const off = loadApp({ cos_upload: { available: true, manual_only: true, formats: ["tif"] } });
 		const msgOff = (off.w.HP_UPLOAD as unknown as {
 			cosErrorMessage(s: number, d: unknown): string;
 		}).cosErrorMessage(0, { code: "convert_in_browser" });
-		expect(msgOff).toContain("/tools/slides");
+		// 关闭态也不再指向转换器页（两态同一文案键；不再拼 CONVERT_HANDOFF_URL）
+		expect(msgOff).not.toContain("/tools/slides");
 		// 开启态
 		const on = loadApp(inlineCaps(true));
 		const msgOn = (on.w.HP_UPLOAD as unknown as {
@@ -2995,11 +2869,11 @@ describe("产物锁来源与进度订阅（独立审查）", () => {
 		emit("progress", { unit: "level", done: 2, total: 8 });
 		await flush(4);
 		const keys = h.stages.map((x) => x[1]);
-		expect(keys).toContain("tools.phase.running");
+		expect(keys).toContain("upload.step.converting");
 		// bundle 成员进度
 		emit("progress", { unit: "stage-bundle", done: 5, total: 10, member: 2, members: 4 });
 		await flush(4);
-		expect(h.stages.map((x) => x[1])).toContain("tools.phase.probing");
+		expect(h.stages.map((x) => x[1])).toContain("upload.step.prepare");
 	});
 
 	it("申请支持预填：bundle 条目不取文件夹名的「点后缀」（v2/01/c 之类）", () => {

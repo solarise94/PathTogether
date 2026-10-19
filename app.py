@@ -3637,62 +3637,29 @@ def tools_slides():
     - 无登录（_require_auth 显式放行本路径）；页面级最小 CSP 由
       _apply_slide_tools_security_headers 设置（不改全站头）。
 
-    C4：ready 产物可选上传工作台（复用 COS 分块上传）。上传入口只由
-    /api/tools/slides/upload-capability（登录后、点击时才请求）驱动——
-    本页渲染路径仍零网络请求。
+    2026-10-20 用户决定：本页只做本地转换与本地保存，不提供上传（工作台
+    上传面板统一完成识别/必要转换/校验/上传）。曾经的
+    /api/tools/slides/upload-capability 能力端点已随转换器上传一并退役。
     """
     resp = make_response(render_template(
         "tools_slides.html", canonical=_public_canonical_url("/tools/slides")))
     return _apply_slide_tools_security_headers(resp)
 
 
-#: C4：本地工具页产物可上传的输出格式表（按核心 result.format 字符串键控，
-#: **不是**扩展名）。计划 §1：「工具能导出」与「平台能查看」是不同能力——
-#: 只有 tests/test_slide_tools_upload_capability.py 用**平台读取器**
+#: 转换产物可查看格式表（按核心 result.format 字符串键控，**不是**扩展名）。
+#: 计划 §1：「工具能导出」与「平台能查看」是不同能力——只有
+#: tests/test_slide_tools_upload_capability.py 用**平台读取器**
 #: （slide_io.open_slide，与查看器同一路径）实际打开过原生 CLI 合成产物
 #: （明场读区域、荧光另读通道）的格式才允许列入本表；该 pytest 把本表与
-#: 读取现实绑定——读取不通过时必须从表中移除，页面随之对该产物显示
-#: 「平台暂不支持查看」并禁用上传入口，本地保存不受影响。
+#: 读取现实绑定——读取不通过时必须从表中移除。
+#: 2026-10-20：它是 inline_convert.viewable_formats 的唯一来源（转换产物
+#: 的上传门禁，直传条目不适用）；曾经的专用查询端点
+#: /api/tools/slides/upload-capability 已随转换器上传一并退役。
 SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS = (
     "classic-bigtiff-jpeg-pyramid",                      # 明场经典金字塔 BigTIFF
     "ome-bigtiff-subifd-rgb-jpeg-pyramid",               # 明场 RGB OME-BigTIFF（SubIFD）
     "ome-bigtiff-subifd-multichannel-jpeg-passthrough",  # 荧光多通道 OME-BigTIFF
 )
-
-
-@app.route("/api/tools/slides/upload-capability")
-def api_tools_slides_upload_capability():
-    """本地工具页上传能力（C4）：登录后才可查（/api/* 未登录 → 401）。
-
-    页面在用户点击「上传」之前不发任何请求（C3 隐私承诺）；本端点在点击后
-    拉取，供页面判定：登录态（401 → 登录提示，不自动跳转）、能力是否可用、
-    最终文件大小上限、产物格式平台能否查看。
-
-    - cos_upload：与工作台 bootstrap 同一权威 payload
-      （_cos_upload_capability_payload；available=false 也回 200——页面需要
-      明确原因，不是错误）；
-    - viewable_formats：SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS（见上）；
-    - account：当前登录 user_id（R1 一键转换并上传，drain 计划 §3.1——
-      本地任务记录把上传意图绑定到授权用户；重新登录为另一账号时页面据此
-      要求重新确认，不静默换账号上传。内网免登录态为空串，绑定语义退化为
-      「同一（唯一）账号」，不构成换账号绕过）；
-    - account_label：该账号的登录名（换账号时告诉用户原上传属于谁、该用
-      哪个账号登录回去；查不到时为空串）。
-    """
-    payload = _cos_upload_capability_payload(False)
-    uid = current_identity().get("user_id") or ""
-    label = ""
-    if uid:
-        try:
-            u = user_store.get_user(uid) or {}
-            label = str(u.get("login_id") or u.get("email") or "")
-        except Exception:  # noqa: BLE001 — 标签只作展示，不影响能力判定
-            label = ""
-    return jsonify(
-        cos_upload=payload,
-        viewable_formats=list(SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS),
-        account=uid,
-        account_label=label)
 
 
 def _plugin_ui_dir(plugin_id):

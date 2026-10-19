@@ -1168,23 +1168,20 @@ describe("导入默认目标与冻结（folder-experience §1）", () => {
 		expect(h.calls.some((c) => c.url === "/api/project/p_t/slides")).toBe(true);
 	});
 
-	it("案例：本机转换 handoff 沿用同一默认与冻结规则（convertHandoffTarget）", async () => {
+	it("案例：导入目标表单仍按同一默认与冻结语义工作（2026-10-20 起没有转换器交接）", async () => {
 		const h = bootApp((s) => { seedFx(s); seedAuth(s, AUTH_U1); });
 		await flush(20);
 		h.UI.fb.go("p_t");
 		await openDrawer(h);
-		const w = (globalThis as { window?: { HP_UPLOAD?: { convertHandoffTarget(): unknown } } }).window;
-		expect(w!.HP_UPLOAD!.convertHandoffTarget()).toEqual({ project: "p_t" });
-		// 「新项目」目标把名称 + 一次性幂等键交给工具页
+		// convertHandoffTarget 已随交接移除；同一「当前文件夹 = 默认目标」
+		// 语义由面板入队前的 importTargetSnapshot 承担（uploadFile 在
+		// enqueue 前调用它——源码级断言见本文件「上传前先冻结」用例）。
+		// 这里验证表单仍可切换到「新项目」并输入名称（冻结输入面不变）。
 		h.els["import-target-select"].value = "new";
 		h.els["import-target-select"].dispatch("change", {});
 		h.els["import-target-new-name"].value = "转换目录";
 		h.els["import-target-new-name"].dispatch("input", {});
-		const t2 = w!.HP_UPLOAD!.convertHandoffTarget() as { newProject: { name: string; key: string } };
-		expect(t2.newProject.name).toBe("转换目录");
-		expect(typeof t2.newProject.key).toBe("string");
-		// 再次调用复用同一幂等键（冻结语义）
-		expect((w!.HP_UPLOAD!.convertHandoffTarget() as typeof t2).newProject.key).toBe(t2.newProject.key);
+		expect(h.els["import-target-new-name"].value).toBe("转换目录");
 		h.UI.importDrawer.close();
 	});
 });

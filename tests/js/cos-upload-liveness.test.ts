@@ -368,7 +368,7 @@ describe("createUpload sniffGuard（upload-liveness fail-fast）", () => {
 		0x76, 0xDC, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00];
 
 	it("引擎产出（真实 engine.outputFileName 名）的 BigTIFF 产物走完整上传链路", async () => {
-		// 页面生产路径（tools-slides-upload.js:797-803）：产物名经引擎
+		// 页面生产路径（app.js createEntryUpload / uploadFileName）：产物名经引擎
 		// outputFileName 生成，.tif / .ome.tif / .bif / .ndpi 都属 TIFF 族。
 		for (const name of ["bf-580x300.tif", "bf-580x300.ome.tif",
 			"sample.bif", "sample.ndpi"]) {
@@ -548,10 +548,8 @@ describe("i18n：upload-liveness 新键 zh/en 成对存在", () => {
 		"upload.cos.err.validation",
 		"upload.cos.err.raster_mismatch",
 		"upload.cos.err.magic",
-		"tools.upload.failed.client_gone",
-		"tools.upload.failed.client_idle",
-		"tools.upload.failed.raster_mismatch",
-		"tools.upload.failed.magic",
+		// 2026-10-20：tools.upload.failed.* 随转换器上传控制器退役——
+		// 同一组 fail_code 现统一经 upload.cos.err.* 在工作台行内呈现
 	];
 
 	it("client_gone / client_idle_timeout / fail_detail / magic 在 zh+en 词典都有可读文案", () => {

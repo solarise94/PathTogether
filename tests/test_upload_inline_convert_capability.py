@@ -103,13 +103,11 @@ def test_inline_convert_payload_default_on(_iso, _cos_on, monkeypatch):
         app_mod.SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS)
 
 
-def test_inline_convert_viewable_formats_same_source_as_tools_endpoint(
-        _iso, _cos_on, owner_client, monkeypatch):
-    """与 /api/tools/slides/upload-capability 的 viewable_formats 同源
-    （两处必须相等——单一来源 SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS）。"""
+def test_inline_convert_viewable_formats_single_source(monkeypatch):
+    """viewable_formats 单一来源 SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS
+    （2026-10-20：/api/tools/slides/upload-capability 已退役，端点对照
+    由 tests/test_slide_tools_upload_capability.py 的退役用例钉住）。"""
     bootstrap = _payload(monkeypatch)["inline_convert"]["viewable_formats"]
-    body = owner_client.get("/api/tools/slides/upload-capability").get_json()
-    assert body["viewable_formats"] == bootstrap
     assert set(bootstrap) == set(app_mod.SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS)
 
 

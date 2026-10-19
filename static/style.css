@@ -4346,6 +4346,17 @@ button {
 .imp-task-row.state-failed .imp-task-state,
 .imp-task-row.state-cancelled .imp-task-state { color: var(--danger); }
 
+/* P2 复核 2026-10-20（问题 3）：上传行容器移入导入抽屉时的形态。
+   .upload-item 系列是全局样式（与侧栏共用同一份 DOM），这里只补抽屉
+   环境的宽度/换行细节——侧栏折叠与小屏（抽屉全宽）都直接可用。 */
+.import-upload-host { min-width: 0; }
+.import-upload-host .upload-progress-list { margin-top: 2px; }
+.import-drawer .upload-item-name,
+.import-drawer .upload-item-status,
+.import-drawer .upload-item-bytes { white-space: normal; overflow-wrap: anywhere; }
+.import-drawer .upload-item-actions { flex-wrap: wrap; }
+.imp-task-row.state-local .imp-task-state { color: var(--text); }
+
 /* 百度候选列表 */
 .baidu-candidate-list {
   display: flex;

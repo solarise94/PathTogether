@@ -1,20 +1,21 @@
-// tools-slides.js — /tools/slides 本地切片工具页（C3；U2 页面简化）。
+// tools-slides.js — /tools/slides 本地切片工具页（C3；本地转换 + 本地保存）。
 // 页面唯一职责：UI、文件授权、设置选择与结果展示；全部转换逻辑经
 // C2 运行器（slide-transform/runner.js，页面唯一 API 面）。零第三方依赖。
 //
-// 隐私（计划 §6）：除本页自托管静态代码外不发任何网络请求；文件字节/
-// 文件名/哈希/缩略图不出浏览器；不创建平台任务。离线可用（引擎加载后）。
+// 隐私（2026-10-20 收敛）：本页只做本地转换与本地保存——除自托管静态代码
+// 与引擎外不发任何网络请求；文件字节/文件名/哈希/缩略图不出浏览器；不创建
+// 平台任务。上传统一在工作台上传面板完成，本页不再提供任何上传入口。
 //
-// U2 结构：默认视图 = 标题 + 一行本地处理说明 + 大拖放区/选择文件；识别后
-// 只出现一张配置摘要（文件/类型/输出/画质 + 折叠「更多选项」）与两个动作
-// （转换并上传到工作台 / 仅转换）。file input 与 drop 都进入同一
-// prepareSource 流程；一次只接受一个切片文件（多文件给明确提示）；
-// F3：MRXS 完整包经「选择文件夹（MRXS）」（webkitdirectory）或目录 drop
-// （事件内遍历构造相对路径成员行）进入同一 prepareBundleSource →
-// runner.prepareBundle（缺成员在复制前被类型化拒绝）。扩展名只是提示，
-// 识别靠 engine.js 的文件头魔数表（已知不支持文件在完整复制前被拒绝）。
-// 画质（U3 编码档）与输出格式同样遵循「prepared 可改并落盘、开始即锁定、
-// 重开以任务记录为准」的合同。
+// 结构：默认视图 = 标题 + 一行本地处理说明 + 大拖放区/选择文件；识别后
+// 只出现一张配置摘要（文件/类型/输出/画质 + 折叠「更多选项」）与「开始
+// 转换」。file input 与 drop 都进入同一 prepareSource 流程；一次只接受一个
+// 切片文件（多文件给明确提示）；F3：MRXS 完整包经「选择文件夹（MRXS）」
+// （webkitdirectory）或目录 drop（事件内遍历构造相对路径成员行）进入同一
+// prepareBundleSource → runner.prepareBundle（缺成员在复制前被类型化拒绝）。
+// 扩展名只是提示，识别靠 engine.js 的文件头魔数表（已知不支持文件在完整
+// 复制前被拒绝）。已兼容的文件（OME-TIFF 等）提示「无需转换；上传请前往
+// 工作台」。画质（U3 编码档）与输出格式同样遵循「prepared 可改并落盘、
+// 开始即锁定、重开以任务记录为准」的合同。
 //
 // 可访问性：progress 用 role=progressbar + aria-valuenow；状态文本走
 // aria-live；对话框 <dialog showModal> 原生焦点圈 + 打开者焦点还原；
@@ -25,10 +26,6 @@ import { SlideToolsRunner } from './slide-transform/runner.js';
 import * as E from './slide-transform/engine.js';
 import { bundleRoute, bundleRows, collectEntryFiles, folderNameFromRelPath }
   from './tools-slides-bundle.js';
-import { createUploadController } from './tools-slides-upload.js';
-import { createConvertUploadController } from './tools-slides-convert-upload.js';
-import { createDirectUploadController } from './tools-slides-direct-upload.js';
-import { toolStageText } from './tools-slides-upload.js';
 
 const CHANNEL_JSON_MAX_BYTES = 1 << 20; // 伴随文件读取上限 1 MiB（有界）
 
@@ -77,7 +74,6 @@ const els = {
   formatLocked: $('format-locked'),
   runSection: $('run-section'),
   convertBtn: $('convert-btn'),
-  convertUploadBtn: $('convert-upload-btn'),
   cancelBtn: $('cancel-btn'),
   runStatus: $('run-status'),
   runProgress: $('run-progress'),
@@ -89,18 +85,6 @@ const els = {
   persistBtn: $('persist-btn'),
   saveStatus: $('save-status'),
   saveCapabilityNote: $('save-capability-note'),
-  uploadBtn: $('upload-btn'),
-  uploadCancelBtn: $('upload-cancel-btn'),
-  uploadStatus: $('upload-status'),
-  directSection: $('direct-section'),
-  directUploadBtn: $('direct-upload-btn'),
-  directStatus: $('direct-status'),
-  directAssocRetryBtn: $('direct-assoc-retry-btn'),
-  directOpenLink: $('direct-open-link'),
-  directCancelBtn: $('direct-cancel-btn'),
-  directProgress: $('direct-progress'),
-  directBar: $('direct-bar'),
-  directBytes: $('direct-bytes'),
   jobsDetails: $('jobs-details'),
   jobsList: $('jobs-list'),
   pageError: $('page-error'),
@@ -198,13 +182,7 @@ function dlRow(grid, term, definition, ddId) {
 
 const page = {
   runner: null,
-  uploadCtl: null,         // C4 上传控制器（tools-slides-upload.js）
-  convertUploadCtl: null,  // R1 一键转换并上传控制器（tools-slides-convert-upload.js）
-  directCtl: null,         // 阶段 1 直传类别上传控制器（tools-slides-direct-upload.js）
-  directReceiptId: null,   // 当前显示回执的句柄（receipt_id/job_id；复核 8428f7f0）
-  directSlideId: null,     // 当前显示回执的 slide_id（句柄消歧；复核第二轮）
   file: null,
-  directCls: null,         // 阶段 1：当前直传类别文件的嗅探结果（classifyFile）
   bundleFiles: null,       // F3：MRXS 完整包成员行 [{name, relPath, file}] | null
   bundleFolderName: null,  // F3：选择的文件夹名（任务列表显示用）
   channelJson: null,       // string | null（≤1 MiB 读取结果）
@@ -231,9 +209,6 @@ function rerenderForLang() {
   renderSaveStatus();
   renderResultPanel();
   renderJobs(page.lastJobs || []);
-  if (page.uploadCtl) page.uploadCtl.rerenderForLang();
-  if (page.convertUploadCtl) page.convertUploadCtl.rerenderForLang();
-  if (directMsg.key) els.directStatus.textContent = t(directMsg.key, directMsg.vars);
   if (page.prep) {
     renderSummary();
     renderProbeSummary();
@@ -244,22 +219,6 @@ function rerenderForLang() {
   if (inputMsg.key) els.inputMessage.textContent = t(inputMsg.key, inputMsg.vars);
   if (runBytesMsg.key && !els.runBytes.hidden) els.runBytes.textContent = t(runBytesMsg.key, runBytesMsg.vars);
   updateStrictWarning();
-}
-
-/// R1 一键链流程文案（#page-status；「去登录」链接是文案的一部分——DOM
-/// 构造，不用 innerHTML）。语言切换由 convertUploadCtl.rerenderForLang 重放。
-function renderFlowMsg(key, vars) {
-  els.pageStatus.textContent = '';
-  if (key === 'tools.cu.login.required') {
-    els.pageStatus.appendChild(document.createTextNode(t(key)));
-    els.pageStatus.appendChild(document.createTextNode(' '));
-    const a = document.createElement('a');
-    a.href = '/login?next=/tools/slides';
-    a.textContent = t('tools.upload.login.link');
-    els.pageStatus.appendChild(a);
-    return;
-  }
-  if (key) els.pageStatus.textContent = t(key, vars || {});
 }
 
 // ------------------------------------------------------------- dialogs --
@@ -370,122 +329,21 @@ async function sniffOrNull(file) {
   return null;
 }
 
-/// 「已是可上传格式」面板：直传类别文件不复制、不探测，等用户点击上传。
-/// 点击之前零 /api 请求（C3 合同不变）。
-function showDirectReady(file, cls) {
+/// 已兼容的文件（OME-TIFF / 本工具导出的 BigTIFF）：无需转换，提示可直接
+/// 使用；上传请前往工作台（本页不提供上传）。点击之前零 /api 请求（C3 不变）。
+function showDirectHint(file) {
   resetFlowPanels();
   els.fileInput.value = '';
   els.folderInput.value = '';
   page.file = file;
-  page.directCls = cls || null;
-  els.directSection.hidden = false;
-  // review #3/#4/#6：面板每次准备重置（receipt 入口 / 关联重试 / 进度条）
-  page.directReceiptId = null;
-  page.directSlideId = null;
-  if (els.directOpenLink) els.directOpenLink.hidden = true;
-  if (els.directAssocRetryBtn) els.directAssocRetryBtn.hidden = true;
-  if (els.directCancelBtn) els.directCancelBtn.hidden = true;
-  if (els.directProgress) {
-    els.directProgress.hidden = true;
-    setProgress(els.directProgress, els.directBar, els.directBytes, 0, '');
-    els.directBytes.hidden = true;
-  }
-  setDirectStatus(null);
-}
-
-/// 直传发布后的入口 UI（review #3/#4）：已发布同文件 → 「打开切片」；
-/// 关联待完成 → 「重试加入项目」。绝不引导重复上传。
-/// 复核 8428f7f0（第二轮）：重试句柄必须完整指认被显示的回执——
-/// receipt_id/job_id 与 slide_id 一起记录、一起回传（同句柄多回执时只有
-/// slide_id 能消歧；命中多条控制器按 ambiguous 拒绝）。
-function updateDirectReceiptUi(r) {
-  if (r && r.receiptId) page.directReceiptId = r.receiptId;
-  if (r && r.slideId) page.directSlideId = r.slideId;
-  const slideId = r && r.slideId;
-  if (slideId && els.directOpenLink) {
-    els.directOpenLink.href = '/?slide=' + encodeURIComponent(slideId);
-    els.directOpenLink.hidden = false;
-  }
-  const assocPending = !!(r && (r.assocPending ||
-    r.reason === 'association' || r.reason === 'account'));
-  if (els.directAssocRetryBtn) els.directAssocRetryBtn.hidden = !assocPending;
-}
-
-/// 直传引擎事件 → 进度条/取消按钮（review #6：复用产物上传的同一套交互，
-/// 不另做只显示成功/失败的面板）
-function onDirectEngineEvent(ev) {
-  if (!els.directProgress) return;
-  if (ev && ev.type === 'progress' && ev.phase === 'uploading') {
-    els.directProgress.hidden = false;
-    if (els.directCancelBtn) els.directCancelBtn.hidden = false;
-    // 与工作台上传行同一词汇（U1 字节级进度：绝不虚构完成）
-    let bytesText = '';
-    if (ev.sentAll) {
-      bytesText = t('upload.cos.sent_all');
-    } else if (ev.determinate !== false && ev.totalBytes > 0) {
-      bytesText = t('upload.cos.bytes', {
-        done: fmtBytes(ev.loadedBytes), total: fmtBytes(ev.totalBytes),
-      });
-    }
-    setProgress(els.directProgress, els.directBar, els.directBytes,
-      ev.determinate === false ? null : ev.frac, bytesText);
-    els.directBytes.hidden = false;
-  } else if (ev && ev.type === 'status' && ev.body) {
-    // 服务端阶段（排队/接收/校验/发布/可查看）——状态文本由 stageText 渲染
-    const txt = toolStageText(t, ev.body);
-    if (txt) setDirectStatusText(txt);
-    if (ev.body.stage !== 'uploading' && els.directCancelBtn) {
-      els.directCancelBtn.hidden = true;
-    }
-  } else if (ev && ev.type === 'retry') {
-    if (els.directBytes) els.directBytes.textContent = t('upload.cos.retrying');
-  }
-}
-
-function setDirectStatusText(text) {
-  directMsg.key = null;
-  directMsg.vars = null;
-  els.directStatus.textContent = text;
-}
-
-/// 「重试加入项目」（review #4/#5）：只做关联（同 slideId、同幂等键），
-/// 成功后控制器才回调 onPublished（全量成功）。复核 8428f7f0（第二轮）：
-/// 传入页面当前显示回执的完整句柄（receipt_id/job_id + slide_id）——绝不
-/// 重试另一条回执；句柄缺失/歧义/账号不符由控制器拒绝（不发任何请求）。
-async function onDirectAssocRetry() {
-  if (!page.directCtl) return;
-  if (els.directAssocRetryBtn) els.directAssocRetryBtn.disabled = true;
-  try {
-    const r = await page.directCtl.retryAssociation(
-      page.directReceiptId || null, page.directSlideId || null);
-    updateDirectReceiptUi(r);
-  } finally {
-    if (els.directAssocRetryBtn) els.directAssocRetryBtn.disabled = false;
-  }
-}
-
-const directMsg = { key: null, vars: null };
-function setDirectStatus(key, vars) {
-  directMsg.key = key;
-  directMsg.vars = vars || null;
-  els.directStatus.textContent = key ? t(key, directMsg.vars) : '';
-}
-
-/// 「上传到工作台」点击：直传控制器完成能力判定/登录检查/上限/格式受理，
-/// 数据源就是用户的 File（无 OPFS 中转）。目标沿用工作台交接（如有）。
-async function onDirectUpload() {
-  if (!page.file || !page.directCtl) return;
-  els.directUploadBtn.disabled = true;
-  try {
-    const r = await page.directCtl.uploadFile(page.file, {
-      cls: page.directCls,
-      target: page.convertUploadCtl ? page.convertUploadCtl.handoffTarget() : null,
-    });
-    updateDirectReceiptUi(r);
-  } finally {
-    els.directUploadBtn.disabled = false;
-    if (els.directCancelBtn) els.directCancelBtn.hidden = true;
-  }
+  els.inputMessage.textContent = '';
+  const line = document.createElement('span');
+  line.textContent = t('tools.direct.hint') + ' ';
+  const a = document.createElement('a');
+  a.href = '/app';
+  a.textContent = t('tools.to.workbench');
+  els.inputMessage.appendChild(line);
+  els.inputMessage.appendChild(a);
 }
 
 /// drop 事件取目录项只能在事件处理器内同步做（webkitGetAsEntry 的有效
@@ -609,23 +467,16 @@ function resetFlowPanels() {
   page.bundleFolderName = null;
   page.outputLockedProfile = null;
   page.encodingLockedProfile = null;
-  // 阶段 1：直传面板一并复位（换新文件时离开上一个未完成任务）
-  els.directSection.hidden = true;
-  setDirectStatus(null);
-  page.directCls = null;
   for (const el of [els.probeSection, els.estimateSection, els.profileSection,
     els.policySection, els.formatSection, els.resultSection, els.summarySection,
     els.channelSection]) el.hidden = true;
   els.runSection.hidden = true;
   els.convertBtn.disabled = true;
-  if (els.convertUploadBtn) els.convertUploadBtn.disabled = true;
   els.runStatus.textContent = '';
   els.runProgress.hidden = true;
   els.runBytes.hidden = true;
   els.stageSection.hidden = true;
   els.prepareCancelBtn.hidden = true;
-  els.uploadStatus.textContent = '';
-  els.uploadCancelBtn.hidden = true;
   els.qualityFieldset.hidden = true;
   els.qualityFieldset.disabled = false;
   els.qualityMrsxNote.hidden = true;
@@ -653,13 +504,13 @@ async function onFilePicked(explicitFile) {
     await prepareBundleSource([file]);
     return;
   }
-  // 阶段 1（先转换后上传）：OME-TIFF/转换器 BigTIFF 不进转换——「已是可
-  // 上传格式」面板 +「上传到工作台」（嗅探只读 ≤128KB 头；分类表见
-  // slide-sniff.js）。input 与 drop 的唯一汇合点在此。
+  // 已兼容格式（OME-TIFF / 本工具导出的 BigTIFF）不进转换——提示可直接
+  // 使用、上传前往工作台（嗅探只读 ≤128KB 头；分类表见 slide-sniff.js）。
+  // input 与 drop 的唯一汇合点在此。
   const directCls = await sniffOrNull(file);
   if (directCls && (directCls.cls === 'ome-tiff'
                     || directCls.cls === 'converter-bigtiff')) {
-    showDirectReady(file, directCls);
+    showDirectHint(file);
     return;
   }
   clearInputMessage();
@@ -678,36 +529,6 @@ async function onFolderPicked() {
   const files = list ? Array.from(list) : [];
   if (!files.length) return;
   await prepareBundleSource(files);
-}
-
-/// R1 工作台交接：postMessage 收到的 File 走与手动选择完全相同的流程
-/// （复制与探测、磁盘确认、设置、结果）。不复制第二次——唯一副本仍是
-/// 运行器 staging 进 OPFS 的 source.bin。用户无需重选文件。
-async function takeHandoffFile(file) {
-  if (!file) return;
-  resetFlowPanels();
-  els.fileInput.value = '';
-  els.folderInput.value = '';
-  page.file = file;
-  page.channelJson = null;
-  page.channelJsonName = null;
-  await runProbeFlow();
-}
-
-/// 阶段 1 交接（直传类别）：OME-TIFF/转换器 BigTIFF 不进转换——直接上传
-/// 并关联工作台带来的目标项目（用户已在工作台完成选择动作）。
-async function takeDirectHandoffFile(file, cls, target) {
-  if (!file || !page.directCtl) return;
-  showDirectReady(file, cls);
-  await page.directCtl.uploadFile(file, { cls, target });
-}
-
-/// 阶段 1 交接（MRXS 文件夹）：成员行（[{file, relPath}]）走与「选择文件夹
-/// （MRXS）」完全相同的 prepareBundleSource 流程（转换意图由用户在结果面板
-/// 点击「转换并上传到工作台」时经 convertUploadCtl 的交接目标收口）。
-async function takeHandoffBundle(rows, opts = {}) {
-  if (!rows || !rows.length) return;
-  await prepareBundleSource(rows, opts);
 }
 
 async function readChannelJsonInput() {
@@ -825,7 +646,6 @@ async function runPrepareFlow(doPrepare, totalBytes) {
   renderProbeSummary();
   els.runSection.hidden = false;
   els.convertBtn.disabled = false;
-  if (els.convertUploadBtn) els.convertUploadBtn.disabled = false;
   applyProfileSuggestion();
   updateStrictWarning();
   refreshJobs();
@@ -1233,7 +1053,6 @@ async function driveConversion() {
   if (!page.prep || (!page.file && !page.bundleFiles)) return null;
   clearError();
   els.convertBtn.disabled = true;
-  if (els.convertUploadBtn) els.convertUploadBtn.disabled = true;
   els.prepareCancelBtn.hidden = true;
   els.fileInput.disabled = true;
   els.folderInput.disabled = true;
@@ -1292,13 +1111,11 @@ async function driveConversion() {
       els.runStatus.textContent = phaseText('cancelled');
       setPageMsg('tools.run.cancelled.note');
       els.convertBtn.disabled = false;
-      if (els.convertUploadBtn) els.convertUploadBtn.disabled = false;
     } else {
       const err = (result && result.error) || { code: 'io_recoverable', message: 'unknown' };
       els.runStatus.textContent = phaseText('failed');
       showError(err);
       els.convertBtn.disabled = false;
-      if (els.convertUploadBtn) els.convertUploadBtn.disabled = false;
     }
     refreshJobs();
     return result;
@@ -1312,7 +1129,6 @@ async function driveConversion() {
     els.runStatus.textContent = phaseText('failed');
     showError(e);
     els.convertBtn.disabled = false;
-    if (els.convertUploadBtn) els.convertUploadBtn.disabled = false;
     refreshJobs();
     return { ok: false, error: e };
   }
@@ -1320,18 +1136,6 @@ async function driveConversion() {
 
 async function onConvert() {
   await driveConversion();
-}
-
-/// R1 一键「转换并上传」：授权整条链（预检 → 意图落盘 → 本机转换 → 校验 →
-/// 重新准入 → 上传 → 可查看），转换成功后自动上传、无第二次确认。
-async function onConvertUpload() {
-  if (!page.prep || !page.file) return;
-  await page.convertUploadCtl.start({
-    jobId: page.prep.jobId,
-    target: page.convertUploadCtl.handoffTarget(),
-    runConvert: driveConversion,
-  });
-  refreshJobs();
 }
 
 async function onCancel() {
@@ -1400,8 +1204,6 @@ function renderResultPanel() {
         `result-channel-${i}`);
     });
   }
-  if (page.uploadCtl) page.uploadCtl.setResultJob(page.readyInfo.jobId);
-  updateUploadCancelVisibility();
 }
 
 /// 任务列表里的上传/继续/取消旧上传：反馈都写在结果面板（#upload-status）
@@ -1521,13 +1323,6 @@ const JOB_ACTION_LABEL_KEY = {
   discard: 'tools.jobs.action.discard',
 };
 
-/// R1：挂着待执行上传意图的任务，开始/续跑按钮文案换成「继续转换并上传」
-/// （动作不变——完成后自动进入上传）。
-const JOB_ACTION_INTENT_LABEL_KEY = {
-  start: 'tools.jobs.action.intent.start',
-  resume: 'tools.jobs.action.intent.resume',
-};
-
 function renderJobs(jobs) {
   page.lastJobs = jobs;
   // 任务记录默认折叠；有任务（可续跑/可保存/上传中）时自动展开一次
@@ -1597,17 +1392,14 @@ function renderJobs(jobs) {
     const actions = document.createElement('div');
     actions.className = 'job-actions';
     const primary = job.nextAction;
-    const intentPending = !!(job.intent && job.intent.state === 'pending');
+    // 2026-10-20：历史 pending 上传意图一律不再执行——开始/续跑只是本地
+    // 转换（普通文案），完成后停在结果面板，绝不自动上传。
     if (primary !== 'discard') {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = primary === 'export' ? 'btn btn-primary' : 'btn btn-secondary';
       btn.dataset.action = primary;
-      if (intentPending && JOB_ACTION_INTENT_LABEL_KEY[primary]) {
-        btn.dataset.intent = '1';
-      }
-      btn.textContent = t(intentPending && JOB_ACTION_INTENT_LABEL_KEY[primary]
-        ? JOB_ACTION_INTENT_LABEL_KEY[primary] : JOB_ACTION_LABEL_KEY[primary]);
+      btn.textContent = t(JOB_ACTION_LABEL_KEY[primary] || primary);
       btn.disabled = primary === 'export' && typeof window.showSaveFilePicker !== 'function';
       btn.addEventListener('click', () => onJobAction(primary, job));
       actions.appendChild(btn);
@@ -1621,31 +1413,8 @@ function renderJobs(jobs) {
     del.addEventListener('click', () => onJobAction('discard', job));
     actions.appendChild(del);
     row.appendChild(actions);
-    // C4：行内上传状态/继续/取消旧上传；上传进行中禁用删除（避免丢唯一
-    // 本地产物）。必须在 actions 挂到行之后再渲染（段内 insertBefore 以
-    // actions 为锚点）。
-    if (page.uploadCtl && (job.state === 'ready' || job.state === 'exported')) {
-      page.uploadCtl.renderRowSegment(job, actions, del);
-    }
-
     els.jobsList.appendChild(row);
   }
-  updateUploadCancelVisibility();
-}
-
-/// R1：#upload-cancel-btn 在两种形态下可见——上传进行中（C4 既有语义），
-/// 或当前结果面板指向的任务还挂着待执行的自动上传意图（转换后、上传前的
-/// 停止态；点击 = 撤销自动上传，产物保留、无 ingestion）。
-function updateUploadCancelVisibility() {
-  if (!page.uploadCtl) return;
-  let pending = false;
-  if (page.readyInfo) {
-    const job = (page.lastJobs || []).find((j) => j.id === page.readyInfo.jobId);
-    pending = !!(job && job.intent && job.intent.state === 'pending'
-      && (!job.upload || job.upload.state !== 'published'));
-  }
-  const busyHere = !!page.readyInfo && page.uploadCtl.busyJobId() === page.readyInfo.jobId;
-  els.uploadCancelBtn.hidden = !(busyHere || pending);
 }
 
 async function onJobAction(action, job) {
@@ -1657,10 +1426,12 @@ async function onJobAction(action, job) {
         await page.runner.discardJob(job.id);
       } catch (e) {
         const info = (e && e.error) || {};
-        // 遗留上传记录（没有任何标签在传）：再确认一次放弃上传才删除
+        // 遗留上传记录（没有任何标签在传）：再确认一次放弃上传才删除。
+        // 2026-10-20：本页不再联网取消旧任务——记录就地放弃，服务器对长
+        // 时间无活动的任务有到期清理兜底（其他标签/工作台正在传的不受影响：
+        // lockHeld=true 时这里不会到达）。
         if (errCode(e) !== 'upload_active' || info.lockHeld !== false) throw e;
         if (!window.confirm(t('tools.upload.abandon.confirm'))) return;
-        await page.uploadCtl.abandon(job);
         await page.runner.discardJob(job.id, { abandonUpload: true });
       }
       refreshJobs();
@@ -1731,11 +1502,8 @@ async function onJobAction(action, job) {
         page.saveMsg = null;
         renderResultPanel();
         renderSaveStatus();
-        // R1「继续转换并上传」：任务挂着待执行的上传意图时，转换完成后
-        // 自动进入上传（无第二次确认；大小/格式重新准入在上传控制器内）。
-        if (job.intent && job.intent.state === 'pending') {
-          await page.uploadCtl.startOrContinue(job.id);
-        }
+        // 2026-10-20：历史 pending 上传意图不再执行——转换完成后停在结果
+        // 面板（保存到电脑），绝不自动上传。
       } else if (result && result.type === 'cancelled') {
         els.runStatus.textContent = phaseText('cancelled');
       } else {
@@ -1790,32 +1558,6 @@ async function init() {
   }
   page.runner.on('progress', onProgress);
   page.runner.on('state', onRunnerState);
-  page.uploadCtl = createUploadController({
-    runner: page.runner,
-    t,
-    onJobsRefresh: refreshJobs,
-    onPublished: (jobId, slideId) => (page.convertUploadCtl
-      ? page.convertUploadCtl.handlePublished(jobId, slideId) : undefined),
-    onSelectJob: selectResultJob,
-  });
-  page.convertUploadCtl = createConvertUploadController({
-    runner: page.runner,
-    uploadCtl: page.uploadCtl,
-    t,
-    onJobsRefresh: refreshJobs,
-    onFlowMessage: renderFlowMsg,
-    takeFile: takeHandoffFile,
-    // 阶段 1：直传类别文件 / MRXS 文件夹的交接接收（见 acceptHandoff）
-    takeDirectFile: takeDirectHandoffFile,
-    takeBundle: takeHandoffBundle,
-  });
-  page.convertUploadCtl.installHandoffReceiver();
-  page.directCtl = createDirectUploadController({
-    t,
-    onStatus: (text) => { els.directStatus.textContent = text; },
-    onPublished: () => { refreshJobs(); },
-    onEngineEvent: onDirectEngineEvent,
-  });
   refreshJobs();
 
   // 拖放：全页阻止默认导航（拖到页面任意位置都不会打开/替换文档），
@@ -1844,32 +1586,12 @@ async function init() {
   els.folderInput.addEventListener('change', () => { onFolderPicked(); });
   els.channelInput.addEventListener('change', () => { onChannelPicked(); });
   els.convertBtn.addEventListener('click', () => { onConvert(); });
-  if (els.convertUploadBtn) {
-    els.convertUploadBtn.addEventListener('click', () => { onConvertUpload(); });
-  }
   els.cancelBtn.addEventListener('click', () => { onCancel(); });
   els.prepareCancelBtn.addEventListener('click', () => { onPrepareCancel(); });
   els.saveBtn.addEventListener('click', () => { onSave(); });
   els.persistBtn.addEventListener('click', () => { onPersist(); });
-  // C4：上传是唯一主动外连入口（点击后先查能力，再判定登录/限额/格式）
-  els.uploadBtn.addEventListener('click', () => {
-    if (page.readyInfo) page.uploadCtl.startOrContinue(page.readyInfo.jobId);
-  });
-  // 阶段 1：直传类别文件的「上传到工作台」（点击后才查能力）
-  if (els.directUploadBtn) {
-    els.directUploadBtn.addEventListener('click', () => { onDirectUpload(); });
-  }
-  // review #4/#5：published receipt 的关联重试；review #6：取消上传
-  if (els.directAssocRetryBtn) {
-    els.directAssocRetryBtn.addEventListener('click', () => { onDirectAssocRetry(); });
-  }
-  if (els.directCancelBtn) {
-    els.directCancelBtn.addEventListener('click', () => { page.directCtl.cancel(); });
-  }
-  els.uploadCancelBtn.addEventListener('click', () => { page.uploadCtl.cancel(); });
   // 测试/诊断可观测钩子（不承载任何逻辑）
   window.__stToolsReady = true;
-  window.__stToolsDirect = page.directCtl;
 }
 
 const runBytesMsg = { key: null, vars: null };

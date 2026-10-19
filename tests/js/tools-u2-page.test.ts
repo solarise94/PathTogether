@@ -32,7 +32,6 @@ const read = (rel: string) => readFileSync(resolve(here, "../..", rel), "utf8");
 const shellSrc = read("templates/tools_slides.html");
 const pageSrc = read("static/tools/tools-slides.js");
 const cssSrc = read("static/tools/tools-slides.css");
-const uploadSrc = read("static/tools/tools-slides-upload.js");
 const i18nSrc = read("static/i18n.js");
 const runnerSrc = read("static/tools/slide-transform/runner.js");
 
@@ -106,10 +105,10 @@ describe("U2 default view (template structure)", () => {
 		expect(pageSrc).toMatch(/resetFlowPanels\(\)[\s\S]*?els\.qualityNdpiNote\.hidden = true/);
 	});
 
-	it("one-line local explanation with the full privacy items folded", () => {
+	it("one-line local explanation with details folded (no upload on this page)", () => {
 		expect(shellSrc).toContain('id="privacy-details"');
 		expect(shellSrc).toContain('data-i18n="tools.privacy.brief"');
-		expect(shellSrc).toContain('data-i18n="tools.privacy.note"');
+		expect(shellSrc).toContain('data-i18n="tools.privacy.details"');
 	});
 
 	it("distinct prepare and convert stages, preparation cancellable", () => {
@@ -120,11 +119,12 @@ describe("U2 default view (template structure)", () => {
 		expect(pageSrc).toContain("els.prepareCancelBtn.addEventListener('click'");
 	});
 
-	it("config summary card with output summary, quality and two actions", () => {
+	it("config summary card with output summary, quality and one action", () => {
 		expect(shellSrc).toContain('id="summary-section"');
 		expect(shellSrc).toContain('id="summary-grid"');
 		expect(shellSrc).toContain('id="output-summary-text"');
-		expect(shellSrc).toContain('data-i18n="tools.run.upload"');
+		expect(shellSrc).not.toContain('data-i18n="tools.run.upload"');
+		expect(shellSrc).toContain('id="convert-btn"');
 		expect(shellSrc).toContain('id="more-options"');
 		expect(pageSrc).toContain("renderSummary()");
 	});
@@ -138,8 +138,10 @@ describe("U2 default view (template structure)", () => {
 			expect(inner).toContain(`id="${id}"`);
 		}
 		// the space confirmation is a modal dialog outside any collapsible
-		const dialog = shellSrc.slice(shellSrc.indexOf('id="disk-dialog"'));
-		expect(dialog).toContain("<dialog");
+		// (2026-10-20: account-dialog 随上传控制器退役移除，disk-dialog 是唯一对话框)
+		const dialog = shellSrc.slice(shellSrc.indexOf("<dialog"));
+		expect(dialog).toContain('id="disk-dialog"');
+		expect(dialog).not.toContain("account-dialog");
 		expect(dialog).not.toContain("<details");
 	});
 
@@ -161,8 +163,8 @@ describe("U2 entry flow (page source wiring)", () => {
 		// onFilePicked is the shared next step of the manual and dropped path
 		expect(pageSrc).toMatch(/async function prepareSource\(fileList\)[\s\S]*?await onFilePicked\(route\.file\)/);
 		expect(pageSrc).toMatch(/async function onFilePicked\(explicitFile\)[\s\S]*?await runProbeFlow\(\)/);
-		// handoff uses the same flow too
-		expect(pageSrc).toMatch(/async function takeHandoffFile\(file\)[\s\S]*?await runProbeFlow\(\)/);
+		// 2026-10-20：工作台交接接收器已随上传移除
+		expect(pageSrc).not.toContain("takeHandoffFile");
 	});
 
 	it("drop navigation is prevented anywhere on the page", () => {
@@ -274,27 +276,20 @@ describe("U2 i18n (zh/en pairs for the new concepts)", () => {
 		expect(i18nSrc).toContain('"tools.quality.compact": "Smaller file (lossy)"');
 	});
 
-	it("upload stages follow the plan: 排队 → 上传至腾讯云 → 工作台接收 → 校验/发布 → 可查看", () => {
-		expect(i18nSrc).toContain('"tools.upload.stage.queued": "排队"');
-		expect(i18nSrc).toContain('"tools.upload.stage.cos": "上传至腾讯云"');
-		expect(i18nSrc).toContain('"tools.upload.stage.workbench": "工作台接收"');
-		expect(i18nSrc).toContain('"tools.upload.stage.validate": "校验/发布"');
-		expect(i18nSrc).toContain('"tools.upload.stage.viewable": "可查看"');
-		expect(i18nSrc).toContain('"tools.upload.stage.queued": "Queued"');
-		expect(i18nSrc).toContain('"tools.upload.stage.cos": "Uploading to Tencent Cloud"');
-		expect(i18nSrc).toContain('"tools.upload.stage.workbench": "Receiving in the workbench"');
-		expect(i18nSrc).toContain('"tools.upload.stage.validate": "Validating/publishing"');
-		expect(i18nSrc).toContain('"tools.upload.stage.viewable": "Viewable"');
-	});
-
-	it("the tool-page uploader maps engine stages onto those five labels", () => {
-		expect(uploadSrc).toContain("TOOL_STAGE_KEY");
-		expect(uploadSrc).toContain("waiting_space: 'tools.upload.stage.queued'");
-		expect(uploadSrc).toContain("uploading: 'tools.upload.stage.cos'");
-		expect(uploadSrc).toContain("downloading: 'tools.upload.stage.workbench'");
-		expect(uploadSrc).toContain("validating: 'tools.upload.stage.validate'");
-		expect(uploadSrc).toContain("viewable: 'tools.upload.stage.viewable'");
-		expect(uploadSrc).toContain("setStageTxt(jobId, t('tools.upload.stage.cos'))");
+	it("2026-10-20 local-only: no upload entries remain on the tool page", () => {
+		// 上传已收敛到工作台：页面模板与页面脚本都不再有上传入口/引擎
+		expect(shellSrc).not.toContain("cos-uploader.js");
+		expect(shellSrc).not.toContain("convert-upload-btn");
+		expect(shellSrc).not.toContain("upload-block");
+		expect(shellSrc).not.toContain("direct-upload-btn");
+		expect(shellSrc).toContain('data-i18n="tools.privacy.brief"');
+		expect(shellSrc).toContain('data-i18n="tools.privacy.details"');
+		expect(shellSrc).toContain('href="/app" data-i18n="tools.to.workbench"');
+		expect(pageSrc).not.toContain("createUploadController");
+		expect(pageSrc).not.toContain("createDirectUploadController");
+		expect(pageSrc).toContain("showDirectHint(file)");
+		// 兼容格式提示（不上传，指引工作台）
+		expect(i18nSrc).toContain('"tools.direct.hint": "此文件无需转换，可直接使用；如需上传，请前往工作台。"');
 	});
 
 	it("drop hints explain MRXS bundles (complete package + folder button) in both languages", () => {

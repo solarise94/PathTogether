@@ -5,9 +5,10 @@
  * 锁定 uploadFile 的分类分流合同：
  *   - OME-TIFF（真实 TIFF 头夹具）→ 立即创建 ingestion，创建体带
  *     direct_class="ome-tiff"（engine 的 createBody 合并）；
- *   - KFB → 不建任务、零 /api 请求，行内给「在本机转换并上传」入口；
+ *   - KFB → 不建任务、零 /api 请求，行内给「本机转换暂不可用」说明 +
+ *     重试/申请支持（2026-10-20 起不再交接转换器页）；
  *   - 未登记扩展名 → 明确错误 toast，不建任务；
- *   - MRXS 文件夹（handoffBundleFolder）→ 交接消息携带 bundle 成员数组
+ *   - MRXS 文件夹且面板不可用 → 行内说明 + 重试（2026-10-20 交接移除）
  *     （{file, relPath}）+ folderName，工具页按文件夹接收。
  *
  * 本文件把 inline_convert 显式设为 **enabled=false**（设计 §9.1）：它锁定的
@@ -218,17 +219,22 @@ describe("工作台直传分流（阶段 1）", () => {
 		expect(body.direct_class).toBe("ome-tiff");
 	});
 
-	it("KFB → 不建任务（零 /api 请求），行内给「在本机转换并上传」入口", async () => {
+	it("KFB → 不建任务（零 /api 请求），行内「本机转换暂不可用」+ 重试/支持（不跳转换器页）", async () => {
 		const h = loadApp({ cos_upload: COS_CAPS });
 		h.up.uploadFile({ name: "spec.kfb", size: 30, slice: () => null });
 		await flush(8);
 		expect(fetchCalls(h).filter((c) => c.url === "/api/ingestions")).toHaveLength(0);
 		const row = h.container.children[h.container.children.length - 1] as ReturnType<typeof el>;
+		// 零 window.open（不弹转换器页）
+		expect((h.w.open as { calls?: unknown[] }).calls ?? []).toHaveLength(0);
 		const btns = (row.children as Array<ReturnType<typeof el>>).filter(
 			(c) => (c as { _listeners?: Record<string, unknown[]> })._listeners?.click);
 		expect(btns.length).toBe(2);
 		// app.js 的 tt() 在无 HP_I18N 词条时回落内置 zh 文案
-		expect(String(btns[0].textContent)).toContain("在本机转换并上传");
+		expect(String(btns[0].textContent)).toContain("重试");
+		expect(String(btns[1].textContent)).toContain("申请支持该格式");
+		expect(String((row.children[2] as { textContent: string }).textContent))
+			.toContain("本机转换暂不可用");
 	});
 
 	it("zip（运输容器）→ 创建体不携带 direct_class", async () => {
@@ -253,35 +259,21 @@ describe("工作台直传分流（阶段 1）", () => {
 			.toBe(true);
 	});
 
-	it("MRXS 文件夹（handoffBundleFolder）→ 交接消息携带 bundle 成员数组 + folderName", async () => {
-		const posted: unknown[] = [];
-		const popupStub = { closed: false, postMessage: (...args: unknown[]) => void posted.push(args) };
-		const h = loadApp({ cos_upload: COS_CAPS }, () => popupStub);
-		const mk = (name: string, n: number) => ({
-			name, size: n, slice: () => null,
-		});
-		h.up.handoffBundleFolder([
+	it("MRXS 文件夹且面板不可用 → 行内说明 + 重试（2026-10-20 起不再交接转换器）", async () => {
+		const h = loadApp({ cos_upload: COS_CAPS });
+		const mk = (name: string, n: number) => ({ name, size: n, slice: () => null });
+		h.up.importBundleRows([
 			{ file: mk("CMU-1.mrxs", 10), relPath: "CMU-1/CMU-1.mrxs" },
 			{ file: mk("Slidedat.ini", 5), relPath: "CMU-1/Slidedat.ini" },
 		], "CMU-1");
 		await flush(8);
+		// 零 ingestion、零弹窗；行内是「本机转换暂不可用」说明 + 重试/支持
+		expect(fetchCalls(h).filter((c) => c.url === "/api/ingestions")).toHaveLength(0);
 		const row = h.container.children[h.container.children.length - 1] as ReturnType<typeof el>;
+		const text = String((row.children[2] as { textContent: string }).textContent || "");
+		expect(text).toContain("本机转换暂不可用");
 		const btns = (row.children as Array<ReturnType<typeof el>>).filter(
 			(c) => (c as { _listeners?: Record<string, unknown[]> })._listeners?.click);
-		expect(btns.length).toBe(2);
-		(btns[0]._listeners as Record<string, Array<() => void>>).click[0]();
-		// 交接消息重投至 ack（400ms 首轮）
-		await new Promise((r) => setTimeout(r, 600));
-		expect(posted.length).toBeGreaterThan(0);
-		const msg = posted[0][0] as {
-			type: string; file: unknown;
-			bundle: Array<{ file: unknown; relPath: string }> | null;
-			folderName: string | null;
-		};
-		expect(msg.type).toBe("pt:convert-upload-handoff");
-		expect(msg.file).toBeNull();
-		expect(msg.bundle).toHaveLength(2);
-		expect(msg.bundle![0].relPath).toBe("CMU-1/CMU-1.mrxs");
-		expect(msg.folderName).toBe("CMU-1");
+		expect(btns.length).toBe(2);   // 重试 + 申请支持该格式
 	});
 });

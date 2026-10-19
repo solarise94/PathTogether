@@ -211,8 +211,14 @@ function loadApp(fetchImpl?: typeof fetch, bootstrap?: unknown) {
 	})) as unknown as typeof fetch);
 	const w: Record<string, unknown> = {
 		HP_I18N: {
-			t: (k: string, vars?: Record<string, unknown>) =>
-				(vars && Object.keys(vars).length) ? `${k}:${Object.values(vars).join(",")}` : k,
+			// upload.stage.pct 按真实词条形渲染（zh 全角括号）——行标签组装
+			// 「正在上传（100%）」依赖它；其余键保持 key:vars 形供断言
+			t: (k: string, vars?: Record<string, unknown>) => {
+				if (k === "upload.stage.pct") {
+					return `（${(vars as { pct: number }).pct}%）`;
+				}
+				return (vars && Object.keys(vars).length) ? `${k}:${Object.values(vars).join(",")}` : k;
+			},
 			getLang: () => "zh",
 		},
 		fetch: theFetch,
@@ -417,8 +423,8 @@ describe("选路：capability / eligible 判定（统一 COS）", () => {
 		expect(h.up.cosUploadEligible({ name: "a.svs", size: 1001 })).toBe(false);     // 超产品上限
 		expect(String(h.up.cosIneligibleReason({ name: "a.mrxs", size: 30 }))).toContain("不支持该文件格式");
 		expect(String(h.up.cosIneligibleReason({ name: "a.svs", size: 5000 }))).toContain("超过平台上限");
-		// 不合格 → 零请求 + 可读说明（不提供另一后端）。阶段 1：mrxs 按嗅探
-		// 类别走「本机转换并上传」入口（行提示，不判失败）；超大 .svs 走
+		// 不合格 → 零请求 + 可读说明（不提供另一后端）。mrxs 走面板队列或
+		// 行内「本机转换暂不可用」说明（不判失败）；超大 .svs 走
 		// 「超过平台上限」toast（嗅探读失败按暂时直传降级 → 词表路径）
 		h.up.uploadFile({ name: "a.mrxs", size: 30 });
 		h.up.uploadFile({ name: "huge.svs", size: 5000 });
@@ -426,7 +432,7 @@ describe("选路：capability / eligible 判定（统一 COS）", () => {
 		expect(FakeXHR.instances).toHaveLength(0);
 		expect(h.fetchCalls().length).toBe(0);
 		const rows = h.container.appendChildren;
-		// mrxs 行是「待本机转换」提示（upload.kfb.hint），不判失败；huge 行
+		// mrxs 行是「本机转换暂不可用」行内说明（upload.kfb.unavailable），不判失败；huge 行
 		// 是「超过平台上限」toast（upload.cos.err.too_large）
 		const mrxsRow = String(rows[rows.length - 2].children[2].textContent);
 		expect(mrxsRow).toContain("本机转换");
@@ -589,11 +595,11 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 		const completeCall = calls().find((c) => c.url.endsWith("/upload-complete") && c.method === "POST");
 		expect(completeCall).toBeTruthy();
 		expect((completeCall!.opts.headers as Record<string, string>)["X-CSRF-Token"]).toBe("tok");
-		// 上传阶段 100%（按字节：30/30）；阶段行（aria-live）只装阶段名，
-		// 百分比/字节在非播报的字节行——绝不显示「完成」
-		expect(String(statusEl.textContent)).toContain("正在上传");
-		expect(rowText(row, "upload-item-bytes")).toContain("100%");
-		expect(String(statusEl.textContent)).not.toContain("100%");
+		// 上传阶段 100%（按字节：30/30）——用户五步字面格式：百分比并入
+		// 主阶段标签「正在上传（100%）」；字节行保留字节细节，绝不显示「完成」
+		expect(String(statusEl.textContent)).toContain("正在上传（100%）");
+		expect(rowText(row, "upload-item-bytes")).not.toContain("100%");
+		expect(rowText(row, "upload-item-bytes")).toContain("upload.cos.bytes:30 B,30 B");
 		// 恢复记录：confirmed 全量落 localStorage（非秘密：无签名 URL/凭证）
 		const saved = JSON.parse(h.storage.getItem("pt.cos.jobs") || "[]");
 		expect(saved[0] && saved[0].confirmed).toEqual([1, 2, 3, 4]);
@@ -602,12 +608,11 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 		expect(releaseServerStage).toBeTruthy();
 		releaseServerStage!();
 		await vi.advanceTimersByTimeAsync(0);
-		expect(String(statusEl.textContent)).toContain("等待服务器接收");
+		expect(String(statusEl.textContent)).toContain("服务器正在处理…");
 		await vi.advanceTimersByTimeAsync(2000);   // awaiting_server → downloading
-		expect(String(statusEl.textContent)).toContain("服务器接收中");
-		// 下载阶段百分比同样在字节行（aria-live 只随阶段播报）
-		expect(rowText(row, "upload-item-bytes")).toContain("50%");
-		expect(String(statusEl.textContent)).not.toContain("50%");
+		// 下载阶段（服务器接收 checkpoint 有真实分母）——同样并入主标签
+		expect(String(statusEl.textContent)).toContain("服务器正在处理（50%）");
+		expect(rowText(row, "upload-item-bytes")).not.toContain("50%");
 		await vi.advanceTimersByTimeAsync(2000);   // downloading → viewable
 		await vi.advanceTimersByTimeAsync(0);
 		expect(h.toastMessages.some((m) => m.indexOf("upload.done") >= 0)).toBe(true);
@@ -660,7 +665,7 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 		expect(h.fetchCalls().some((c) => c.url === "/api/ingestions/inj_f/upload-complete")).toBe(true);
 		expect(h.toastMessages.some((m) => m.indexOf("upload.done") >= 0)).toBe(true);
 		// 失败重试不累计字节：进度按唯一 confirmed 分块计（viewable 后行文案
-		// 已切「入库完成」，以恢复记录为准）
+		// 已切「上传成功」（upload.stage.done 新文案），以恢复记录为准）
 		const saved = JSON.parse(h.storage.getItem("pt.cos.jobs") || "[]");
 		expect(saved).toEqual([]);   // 成功后清理
 	});
@@ -738,7 +743,7 @@ describe("waiting_capacity：排队展示与轮询推进", () => {
 		const row = h.container.appendChildren[h.container.appendChildren.length - 1];
 		const statusEl = row.children[2];
 		// 排队位置展示（0 基 → 第 1 位，位置在字节行）；无预计时间（不出现 eta 字样）
-		expect(String(statusEl.textContent)).toContain("等待暂存空间");
+		expect(String(statusEl.textContent)).toContain("服务器正在处理…");
 		expect(rowText(row, "upload-item-bytes")).toContain("upload.cos.queue:1");
 		expect(String(statusEl.textContent)).not.toContain("eta");
 		await vi.advanceTimersByTimeAsync(4999);
@@ -782,10 +787,9 @@ describe("刷新恢复：只读进度行与终态清理", () => {
 		expect(h.container.appendChildren).toHaveLength(1);
 		const row = h.container.appendChildren[0];
 		expect(String(row.children[0].textContent)).toContain("big.svs");
-		expect(String(row.children[2].textContent)).toContain("服务器接收中");
-		// 下载百分比在字节行（阶段行 aria-live 只装阶段名）
-		expect(rowText(row, "upload-item-bytes")).toContain("33%");
-		expect(String(row.children[2].textContent)).not.toContain("33%");
+		// 下载阶段（有真实分母）：百分比并入主标签「服务器正在处理（33%）」
+		expect(String(row.children[2].textContent)).toContain("服务器正在处理（33%）");
+		expect(rowText(row, "upload-item-bytes")).not.toContain("33%");
 		// uploading 未完成 → 提示重选同名文件可续传（位置在字节行）
 		stage = "uploading";
 		await vi.advanceTimersByTimeAsync(3000);

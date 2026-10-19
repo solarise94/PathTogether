@@ -1230,6 +1230,17 @@
   // 登录，不进这两个状态。
   var annoListError = null;   // {status:number}；加载成功或换片即清
   var annoListStale = false;  // true = 面板当前展示的是上次成功加载的数据
+  // 列表请求世代（P2 复核 2026-10-18）：loadCurrentSlideAnnotations 与
+  // refreshCurrentAnnotations 共用同一计数器。每个新的列表请求 +1，换片也
+  // +1 作废在途请求；响应落地前（响应到达时、JSON 解析后、catch 内）比对，
+  // 世代已旧即整体静默丢弃——切片对象身份判不了「同一切片内」两个请求的
+  // 新旧（review 047 #1：初始加载 500 → 重试挂起 → 保存触发刷新已落地 →
+  // 放行旧重试，晚到旧 200 把列表回退、晚到旧 500 把已有数据清成错误页）。
+  var annoListReqGen = 0;
+  // currentAnnotations 归属的切片对象（与数据同写同清）：load 失败时据此
+  // 判定已有成功数据是否属于当前切片——属于才保留数据走 stale 提示；
+  // 跨切片残留的旧数据不冒充当前切片的数据。
+  var currentAnnotationsSlide = null;
   var allSharesCache = null; // 缓存分享列表，供语言切换时重渲
 
   // ---------- AI 读片助手状态（Stage 2：平台侧仅保留叠加层） ----------
@@ -2070,6 +2081,10 @@
     annoPanelOpen = false;
     annoListError = null;
     annoListStale = false;
+    // 换片作废在途列表请求（load/refresh 共用世代，见 annoListReqGen 声明）；
+    // 随后的 loadCurrentSlideAnnotations 会再 +1，此处兜住换片后不发 load 的
+    // 分支（如关闭切片），保证在途响应一律判旧。
+    annoListReqGen++;
     syncAnnoAllBtns();
     state.showAnno = false;
     state.focusAnno = null;
@@ -9444,26 +9459,36 @@
   }
 
   // 拉取当前切片标注（openSlide 打开切片后调用；面板错误态的重试按钮复用）。
-  // 迟到响应防护（P2 复核 2026-10-18）：深链直开与快速换片时，上一个 open
-  // 的标注响应可能在新切片打开后才回来——沿用发起时的切片对象身份判定，
-  // 绝不让旧响应覆盖新切片的 currentAnnotations/失败态。
+  // 迟到响应防护（P2 复核 2026-10-18）：切片对象身份只判「换片」，判不了
+  // 同一切片内两个请求的新旧——load 与 refresh 共用 annoListReqGen 世代：
+  // 新请求发出即 +1，响应到达时、JSON 解析后与 catch 内都复核，世代已旧
+  // （同切片内更新的 load/refresh 已发出，或已换片）整体静默丢弃，成功与
+  // 失败都不例外。
   // 非 401 失败（网络断开/5xx/403/非 JSON 体）进入 annoListError 显式错误
   // 态：面板按钮放开供查看错误与重试，绝不渲染成「暂无标注」冒充空切片。
+  // 例外（review 047 #1）：当前切片已有成功数据（如重试失败时较新的刷新已
+  // 先落地）→ 保留数据与选中，面板顶部插失效提示（stale），绝不把
+  // currentAnnotations 置 null 清空用户正在看的内容。
   // 401(auth_required) 由 apiFetch 统一跳登录：静默退出，不闪错误 UI。
   function loadCurrentSlideAnnotations() {
     if (!state.slide) return Promise.resolve();
     var slideAtReq = state.slide;
+    var genAtReq = ++annoListReqGen;
     annoListError = null;
     els.annoBtn.disabled = true;
     return apiFetch(annotationsQueryFor(state.slide))
       .then(function (r) {
+        if (genAtReq !== annoListReqGen || state.slide !== slideAtReq) {
+          throw { annoStaleReq: true }; // 迟到旧请求：连状态码都不再消费
+        }
         if (r.status === 401) throw { annoSilent: true };
         if (!r.ok) throw { status: r.status };
         return r.json();
       })
       .then(function (data) {
-        if (state.slide !== slideAtReq) return;
+        if (genAtReq !== annoListReqGen || state.slide !== slideAtReq) return;
         currentAnnotations = data;
+        currentAnnotationsSlide = slideAtReq;
         annoListError = null;
         var annos = data.annotations || [];
         if (annos.length > 0) {
@@ -9478,9 +9503,19 @@
         if (annoPanelOpen) renderAnnoPanel(annos);
       })
       .catch(function (e) {
+        if (e && e.annoStaleReq) return;        // 迟到的旧世代响应：静默丢弃
         if (e && e.annoSilent) return;          // 401：页面即将跳 /login
-        if (state.slide !== slideAtReq) return; // 晚到的旧切片响应：丢弃
+        if (genAtReq !== annoListReqGen || state.slide !== slideAtReq) return;
+        if (currentAnnotations && currentAnnotationsSlide === slideAtReq) {
+          // 本切片已有成功数据（较新的刷新/加载先落地）：保留数据走失效
+          // 提示，绝不置 null 清空（review 047 #1）
+          annoListStale = true;
+          els.annoBtn.disabled = false;
+          if (annoPanelOpen) renderAnnoPanelStale();
+          return;
+        }
         currentAnnotations = null;
+        currentAnnotationsSlide = null;
         editItem = null;
         state.focusAnno = null;
         editing = false;
@@ -9543,17 +9578,24 @@
   // 重新拉取当前切片标注并重绘（工单 D：返回 Promise 供「选中新标注」等待）
   function refreshCurrentAnnotations() {
     if (!state.slide) { redrawAnnoCanvas(); return Promise.resolve(); }
-    // 迟到响应防护：请求发出后用户换片（state.slide 已是另一对象）→ 丢弃
-    // 响应，绝不让旧切片的数据覆盖新切片的标注面板/画布。
+    // 迟到响应防护（P2 复核 2026-10-18）：与 loadCurrentSlideAnnotations
+    // 共用 annoListReqGen 世代——请求发出即 +1，响应到达时、JSON 解析后与
+    // catch 内复核，世代已旧（同切片内更新的 load/refresh 已发出，或已换
+    // 片）整体静默丢弃，成功与失败都不例外；响应发出后用户换片（state.slide
+    // 已是另一对象）同样丢弃，绝不让旧数据覆盖当前面板/画布。
     var slideAtReq = state.slide;
+    var genAtReq = ++annoListReqGen;
     return apiFetch(annotationsQueryFor(state.slide))
       .then(function (r) {
+        if (genAtReq !== annoListReqGen || state.slide !== slideAtReq) {
+          throw { annoStaleReq: true }; // 迟到旧请求：连状态码都不再消费
+        }
         if (r.status === 401) throw { annoSilent: true };
         if (!r.ok) throw { status: r.status };
         return r.json();
       })
       .then(function (data) {
-        if (state.slide !== slideAtReq) return;
+        if (genAtReq !== annoListReqGen || state.slide !== slideAtReq) return;
         // 刷新成功即清两个失败态（先于 editDrag/kbEditSession 早退：即便
         // 本轮数据因手势不落地，错误态也不滞留——手势结束后的保存路径会
         // 再刷新）。否则「初始失败 → 手动新建保存成功 → 重开面板」仍会
@@ -9564,6 +9606,7 @@
         // 正在进行的 applyEditDrag 会改到孤儿对象）；结束后的保存路径会再刷新
         if (editDrag || kbEditSession) return;
         currentAnnotations = data;
+        currentAnnotationsSlide = slideAtReq;
         var annos = data.annotations || [];
         els.annoBtn.disabled = annos.length === 0;
         els.annoAllBtn.disabled = annos.length === 0;
@@ -9614,8 +9657,9 @@
         updateAnnoToolbarPos();
       })
       .catch(function (e) {
+        if (e && e.annoStaleReq) return;        // 迟到的旧世代响应：静默丢弃
         if (e && e.annoSilent) return;          // 401：页面即将跳 /login
-        if (state.slide !== slideAtReq) return; // 晚到的旧切片响应：丢弃
+        if (genAtReq !== annoListReqGen || state.slide !== slideAtReq) return;
         if (!currentAnnotations) {
           // 仍在「从未加载成功」的错误态（无旧数据可保留）：维持错误态——
           // 更新失败详情并重渲错误块，不标失效（stale 语义是「展示的是

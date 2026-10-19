@@ -31,6 +31,9 @@ describe("标注面板随刷新重渲（panel-refresh.mjs 场景移植）", () =
 	it("刷新落地后已打开的面板重渲一次", async () => {
 		const harness = new Function("apiFetch", `
 		 var state={slide:{id:'fixture-slide'}},currentAnnotations={annotations:[]};
+		 // annoListReqGen/currentAnnotationsSlide 在生产 app.js 是模块级变量
+		 // （被测切片之外），harness 按同语义补声明（review 047 #1 世代计数）
+		 var annoListReqGen=0,currentAnnotationsSlide=null;
 		 var editDrag=null,kbEditSession=null,editItem=null,editing=false,editBeforeSnapshot=null;
 		 var annoPanelOpen=true,panelRenderCount=0;
 		 var els={annoBtn:{disabled:false},annoAllBtn:{disabled:false}};

@@ -88,9 +88,9 @@ describe("output profile helpers (engine.js)", () => {
 	});
 });
 
-// ---- 2026-10-20：上传控制器（tools-slides-upload.js）已随「转换器只做本地
-// 转换与保存」退役；产物名（<base>.ome.tif / <base>.tif）由 engine.js 的
-// outputFileName 覆盖（tools-result-format 用例）与工作台 e2e 断言。 ----
+// ---- 2026-10-20：转换器上传控制器已随「转换器只做本地转换与保存」退役；
+// 产物名（<base>.ome.tif / <base>.tif）由 engine.js 的 outputFileName 覆盖
+//（tools-result-format 用例）与工作台 e2e 断言。 ----
 
 // ---- page wiring (source-level; tools-slides.js is a live-DOM module) ----
 

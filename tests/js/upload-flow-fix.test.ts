@@ -411,26 +411,54 @@ describe("五步文案：用户可见状态 zh/en", () => {
 	it("五步精确串存在（zh + en）：选择上传/准备/正在上传/服务器正在处理/上传成功", () => {
 		const zh = dict("zh");
 		const en = dict("en");
-		// 步 2（准备；仅在确有转换时带括注——direct 文件永不显示转换状态）
+		// 步 2（准备；仅确在转换时带「（格式转换中）」括注——direct 文件与
+		// 排队态都不显示转换状态；「排队中…」旧文案不复活）
 		expect(zh.get("upload.step.prepare")).toBe("正在准备上传文件");
 		expect(zh.get("upload.step.converting")).toBe("正在准备上传文件（格式转换中）");
 		expect(en.get("upload.step.prepare")).toBe("Preparing upload");
 		expect(en.get("upload.step.converting")).toBe("Preparing upload (converting)");
-		// 步 3（正在上传 xx%——百分比由字节事件驱动，标签本身不带数字）
+		expect(zh.get("upload.inline.stage.queued")).toBe("正在准备上传文件");
+		expect(en.get("upload.inline.stage.queued")).toBe("Preparing upload");
+		// 必要停止态保留自己的显式文案：跨标签槽等待（可取消）与身份确认等待
+		expect(zh.get("upload.cos.other.tab")).toContain("另一个标签页");
+		expect(zh.get("upload.cos.other.tab")).toContain("可取消");
+		expect(zh.get("upload.inline.identity.waiting")).toContain("正在确认登录身份");
+		// 步 3（正在上传（xx%）——百分比由真实字节分母驱动，并入主标签）
 		expect(zh.get("upload.cos.stage.uploading")).toBe("正在上传");
-		// 步 4（服务器正在处理；无分母用 … 活动指示）
+		// 步 4（服务器正在处理（xx%）——仅服务器接收 checkpoint 有真实分母；
+		// 无分母用 … 活动指示；readiness/viewable 检查也属于本步——
+		// 直到 viewable 才切「上传成功」，行内不再显示「准备打开」）
 		expect(zh.get("upload.cos.stage.awaiting_server")).toBe("服务器正在处理…");
 		expect(zh.get("upload.cos.stage.downloading")).toBe("服务器正在处理");
 		expect(zh.get("upload.cos.stage.validating")).toBe("服务器正在处理…");
 		expect(zh.get("upload.cos.stage.processing")).toBe("服务器正在处理…");
+		expect(zh.get("upload.cos.stage.readiness")).toBe("服务器正在处理…");
+		expect(zh.get("upload.cos.stage.viewable")).toBe("服务器正在处理…");
 		expect(en.get("upload.cos.stage.awaiting_server")).toBe("Server processing…");
 		expect(en.get("upload.cos.stage.downloading")).toBe("Server processing");
+		expect(en.get("upload.cos.stage.readiness")).toBe("Server processing…");
+		expect(en.get("upload.cos.stage.viewable")).toBe("Server processing…");
 		// 步 5：只有 viewable 才是成功（upload.stage.done 的判定不变；
 		// 该键的主源是 app.js 的 _EXTRA 兜底表——i18n.js 无此键，两处一致）
 		expect(zh.has("upload.stage.done")).toBe(false);
 		expect(appSrc).toContain('"upload.stage.done": { zh: "上传成功", en: "Upload successful" }');
 		expect(appSrc).toContain(
 			'"upload.cos.stage.awaiting_server": { zh: "服务器正在处理…", en: "Server processing…" }');
+		// 百分比并入主阶段标签（用户字面格式；zh 全角括号 / en 半角）
+		expect(zh.get("upload.stage.pct")).toBe("（{pct}%）");
+		expect(en.get("upload.stage.pct")).toBe(" ({pct}%)");
+		expect(appSrc).toContain('"upload.stage.pct": { zh: "（{pct}%）", en: " ({pct}%)" }');
+		// 仅「正在上传 / 服务器接收 checkpoint」两个真实分母阶段并入标签；
+		// 上传成功（done）与步 2 准备态绝不带百分比
+		expect(appSrc).toContain("var PCT_IN_LABEL_KEYS = {");
+		expect(appSrc).toContain('"upload.cos.stage.uploading": 1,');
+		expect(appSrc).toContain('"upload.cos.stage.downloading": 1,');
+		const pctKeys = appSrc.slice(appSrc.indexOf("var PCT_IN_LABEL_KEYS"),
+			appSrc.indexOf("};", appSrc.indexOf("var PCT_IN_LABEL_KEYS")));
+		expect(pctKeys).not.toContain("upload.stage.done");
+		expect(pctKeys).not.toContain("upload.step.prepare");
+		// 行渲染经 tt("upload.stage.pct") 组装（源码级）
+		expect(appSrc).toContain('tt("upload.stage.pct", { pct: pct })');
 	});
 
 	it("普通进度行不暴露内部术语（COS/工作台接收/发布/收口/词表）", () => {

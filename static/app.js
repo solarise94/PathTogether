@@ -60,8 +60,8 @@
     "upload.cos.stage.downloading": { zh: "服务器正在处理", en: "Server processing" },
     "upload.cos.stage.validating": { zh: "服务器正在处理…", en: "Server processing…" },
     "upload.cos.stage.processing": { zh: "服务器正在处理…", en: "Server processing…" },
-    "upload.cos.stage.readiness": { zh: "准备打开", en: "Preparing to open" },
-    "upload.cos.stage.viewable": { zh: "准备打开", en: "Preparing to open" },
+    "upload.cos.stage.readiness": { zh: "服务器正在处理…", en: "Server processing…" },
+    "upload.cos.stage.viewable": { zh: "服务器正在处理…", en: "Server processing…" },
     "upload.cos.queue": { zh: "第 {n} 位", en: "position {n}" },
     "upload.cos.cancel": { zh: "取消", en: "Cancel" },
     "upload.cos.cancelled": { zh: "已取消", en: "Cancelled" },
@@ -100,7 +100,10 @@
     "upload.kfb.unavailable": { zh: "该文件需要先转换后上传：本机转换暂不可用，可重试或申请支持该格式", en: "This file must be converted before upload: local conversion is unavailable right now — retry or request format support" },
     // 上传面板内转换（docs/upload-inline-convert-design-20261015.md；i18n.js 为主源，
     // 此处兜底：app.js 的 tt() 在无 HP_I18N 词条时回落到本表）
-    "upload.inline.stage.queued": { zh: "排队中…", en: "Queued…" },
+    "upload.stage.pct": { zh: "（{pct}%）", en: " ({pct}%)" },
+    "upload.step.prepare": { zh: "正在准备上传文件", en: "Preparing upload" },
+    "upload.step.converting": { zh: "正在准备上传文件（格式转换中）", en: "Preparing upload (converting)" },
+    "upload.inline.stage.queued": { zh: "正在准备上传文件", en: "Preparing upload" },
     "upload.inline.stage.rejected": { zh: "已拒绝：内容或格式不受支持", en: "Rejected: content or format not supported" },
     "upload.inline.stage.notAccepted": { zh: "上传词表不含该格式", en: "This format is not in the upload vocabulary" },
     "upload.inline.stage.resumable": { zh: "未完成的转换", en: "Unfinished conversion" },
@@ -10451,6 +10454,14 @@
   // 每个上传文件一行（名称 + 独立进度条 + 三段状态文本）；行挂在侧栏
   // #upload-progress-list 容器下，完成后短暂保留再移除。容器缺失（旧模板）
   // 时回退到旧的单进度条元素。
+  // 用户五步口径（2026-10-20 复核）：确有真实分母的两个阶段（正在上传 /
+  // 服务器接收 checkpoint）把百分比并进**主阶段标签**——「正在上传（42%）」
+  // 「服务器正在处理（42%）」（zh 全角括号、en 半角，形由 upload.stage.pct
+  // 按语言给出）；其余阶段百分比留在次行，done/终态绝不带百分比。
+  var PCT_IN_LABEL_KEYS = {
+    "upload.cos.stage.uploading": 1,
+    "upload.cos.stage.downloading": 1,
+  };
   function humanSize(n) {
     if (n >= 1024 * 1024 * 1024) return (n / (1024 * 1024 * 1024)).toFixed(1) + " GB";
     if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MB";
@@ -10503,9 +10514,9 @@
       }, delay);
     }
     return {
-      // 三段状态：正在传输（字节事件为准）→ 服务端校验 → 入库完成
+      // 三段状态：正在传输（字节事件为准）→ 服务端校验 → 上传成功
       // note（可选，COS 直传引入）：字节文本（已传输 X / 总大小 Y、
-      // 「数据已发送，等待确认」）——与百分比一起写进独立的非播报元素；
+      // 「数据已发送，等待确认」）——写进独立的非播报元素（次行细节）；
       // indeterminate（U1）：当前阶段无量化信息 → 不定态活动指示
       // （移除 aria-valuenow、清内联宽度让 CSS 动画接管），
       // 百分比只表示当前阶段，绝不合成为全流程百分比
@@ -10514,8 +10525,12 @@
         var pct = (!indeterminate && frac !== undefined && frac !== null &&
                    isFinite(frac))
           ? Math.max(0, Math.min(100, Math.round(frac * 100))) : null;
-        statusEl.textContent = label;
-        bytesEl.textContent = (pct !== null ? pct + "% · " : "") + (note || "");
+        var inLabel = pct !== null && PCT_IN_LABEL_KEYS[stageKey];
+        var pctText = inLabel ? tt("upload.stage.pct", { pct: pct }) : "";
+        statusEl.textContent = label + pctText;
+        bytesEl.textContent = inLabel
+          ? (note || "")
+          : ((pct !== null ? pct + "% · " : "") + (note || ""));
         if (bar.classList) {
           if (indeterminate) bar.classList.add("upload-item-bar-indeterminate");
           else bar.classList.remove("upload-item-bar-indeterminate");
@@ -10529,7 +10544,7 @@
           if (els.progressWrap && els.progressWrap.style) els.progressWrap.style.display = "block";
           if (els.progressBar && els.progressBar.style) els.progressBar.style.width = (pct === null ? 0 : pct) + "%";
           if (els.progressText) els.progressText.textContent =
-            (pct !== null ? label + " " + pct + "%" : label) + (note ? " · " + note : "");
+            label + pctText + (note ? " · " + note : "");
         } else if (bar.style) {
           // 不定态清内联宽度：否则旧宽度覆盖动画类的 30%（条不动）
           bar.style.width = pct === null ? "" : pct + "%";
@@ -12131,7 +12146,7 @@
     };
   }
 
-  /// 读回记录的续传判定（与工具页 tools-slides-upload.js:786-793 同语义）：
+  /// 读回记录的续传判定（ready/exported 产物、非终态 upload → 复用同一 ingestion）：
   /// 未收口的 ingestionId → resumeJobId 复用；终态/无记录 → null（新建）。
   function resumeIdFromRecord(job) {
     var up = job && job.upload;

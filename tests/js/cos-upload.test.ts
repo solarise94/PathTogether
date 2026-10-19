@@ -211,8 +211,14 @@ function loadApp(fetchImpl?: typeof fetch, bootstrap?: unknown) {
 	})) as unknown as typeof fetch);
 	const w: Record<string, unknown> = {
 		HP_I18N: {
-			t: (k: string, vars?: Record<string, unknown>) =>
-				(vars && Object.keys(vars).length) ? `${k}:${Object.values(vars).join(",")}` : k,
+			// upload.stage.pct 按真实词条形渲染（zh 全角括号）——行标签组装
+			// 「正在上传（100%）」依赖它；其余键保持 key:vars 形供断言
+			t: (k: string, vars?: Record<string, unknown>) => {
+				if (k === "upload.stage.pct") {
+					return `（${(vars as { pct: number }).pct}%）`;
+				}
+				return (vars && Object.keys(vars).length) ? `${k}:${Object.values(vars).join(",")}` : k;
+			},
 			getLang: () => "zh",
 		},
 		fetch: theFetch,
@@ -589,11 +595,11 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 		const completeCall = calls().find((c) => c.url.endsWith("/upload-complete") && c.method === "POST");
 		expect(completeCall).toBeTruthy();
 		expect((completeCall!.opts.headers as Record<string, string>)["X-CSRF-Token"]).toBe("tok");
-		// 上传阶段 100%（按字节：30/30）；阶段行（aria-live）只装阶段名，
-		// 百分比/字节在非播报的字节行——绝不显示「完成」
-		expect(String(statusEl.textContent)).toContain("正在上传");
-		expect(rowText(row, "upload-item-bytes")).toContain("100%");
-		expect(String(statusEl.textContent)).not.toContain("100%");
+		// 上传阶段 100%（按字节：30/30）——用户五步字面格式：百分比并入
+		// 主阶段标签「正在上传（100%）」；字节行保留字节细节，绝不显示「完成」
+		expect(String(statusEl.textContent)).toContain("正在上传（100%）");
+		expect(rowText(row, "upload-item-bytes")).not.toContain("100%");
+		expect(rowText(row, "upload-item-bytes")).toContain("upload.cos.bytes:30 B,30 B");
 		// 恢复记录：confirmed 全量落 localStorage（非秘密：无签名 URL/凭证）
 		const saved = JSON.parse(h.storage.getItem("pt.cos.jobs") || "[]");
 		expect(saved[0] && saved[0].confirmed).toEqual([1, 2, 3, 4]);
@@ -604,10 +610,9 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 		await vi.advanceTimersByTimeAsync(0);
 		expect(String(statusEl.textContent)).toContain("服务器正在处理…");
 		await vi.advanceTimersByTimeAsync(2000);   // awaiting_server → downloading
-		expect(String(statusEl.textContent)).toContain("服务器正在处理");
-		// 下载阶段百分比同样在字节行（aria-live 只随阶段播报）
-		expect(rowText(row, "upload-item-bytes")).toContain("50%");
-		expect(String(statusEl.textContent)).not.toContain("50%");
+		// 下载阶段（服务器接收 checkpoint 有真实分母）——同样并入主标签
+		expect(String(statusEl.textContent)).toContain("服务器正在处理（50%）");
+		expect(rowText(row, "upload-item-bytes")).not.toContain("50%");
 		await vi.advanceTimersByTimeAsync(2000);   // downloading → viewable
 		await vi.advanceTimersByTimeAsync(0);
 		expect(h.toastMessages.some((m) => m.indexOf("upload.done") >= 0)).toBe(true);
@@ -782,10 +787,9 @@ describe("刷新恢复：只读进度行与终态清理", () => {
 		expect(h.container.appendChildren).toHaveLength(1);
 		const row = h.container.appendChildren[0];
 		expect(String(row.children[0].textContent)).toContain("big.svs");
-		expect(String(row.children[2].textContent)).toContain("服务器正在处理");
-		// 下载百分比在字节行（阶段行 aria-live 只装阶段名）
-		expect(rowText(row, "upload-item-bytes")).toContain("33%");
-		expect(String(row.children[2].textContent)).not.toContain("33%");
+		// 下载阶段（有真实分母）：百分比并入主标签「服务器正在处理（33%）」
+		expect(String(row.children[2].textContent)).toContain("服务器正在处理（33%）");
+		expect(rowText(row, "upload-item-bytes")).not.toContain("33%");
 		// uploading 未完成 → 提示重选同名文件可续传（位置在字节行）
 		stage = "uploading";
 		await vi.advanceTimersByTimeAsync(3000);

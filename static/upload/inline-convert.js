@@ -113,8 +113,8 @@
     return null;
   }
 
-  /// 转换产物门禁（设计 §5.1）——纯函数，与工具页
-  /// tools-slides-upload.js:772-789 的判定序列等价：
+  /// 转换产物门禁（设计 §5.1）——纯函数（与历史工具页控制器的判定序列
+  /// 等价；该控制器已随转换器上传退役，本函数是唯一权威实现）：
   ///   ② 最终文件大小（job.result.outputBytes）↔ cfg.max_size_bytes
   ///   ③ 核心 result.format ∈ viewable_formats
   /// 字段缺失 = fail-closed（与工具页 `(cap.viewable_formats || [])` 落空同义）。
@@ -1366,7 +1366,7 @@
     }
 
     /// 显式确认后的改绑（复核 #2；工具页 chooseAccountAction 的 'separate'
-    /// 同语义，tools-slides-upload.js:734-767）：**只有用户点确认才到这里**。
+    /// 同语义）：**只有用户点确认才到这里**。
     /// 进行中的旧 ingestion 原样记入 superseded（归属不变，由原账号取消或
     /// 服务端到期清理），本地上传记录改绑当前账号（ingestionId 清空 → 之后
     /// 的新建是当前账号的新 ingestion）；pending intent 一并重绑。失败时行
@@ -1496,8 +1496,8 @@
     }
 
     /// 转换产物的门禁（设计 §5.1）：只有本机产物走这里（直传条目**不适用**）。
-    /// 实现是下面的纯函数 artifactGate（与工具页 tools-slides-upload.js:772-789
-    /// 的判定序列等价）；这里只负责取出本条目的 cfg 与 viewable_formats。
+    /// 实现是下面的纯函数 artifactGate（唯一权威实现）；这里只负责取出
+    /// 本条目的 cfg 与 viewable_formats。
     function entryArtifactGate(e, job) {
       return artifactGate(caps.cosConfig, job,
         caps.inlineConvert ? caps.inlineConvert.viewableFormats : null);
@@ -1853,7 +1853,7 @@
 
     // ------------------------------------------------- 刷新恢复（§6.2） --
 
-    /// 记录归属（复核 #2；与工具页 tools-slides-upload.js:711-724 同语义）：
+    /// 记录归属（复核 #2；进行中上传/pending 意图绑定授权账号）：
     /// 进行中的上传属于创建它的账号（服务端 ingestion 的归属与容量记账都在
     /// 那个账号上），未收口的自动上传意图同样绑定授权账号。返回归属账号，
     /// 无归属证据（升级窗口旧行）→ null——绝不据空值误判。

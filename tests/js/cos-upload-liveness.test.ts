@@ -368,7 +368,7 @@ describe("createUpload sniffGuard（upload-liveness fail-fast）", () => {
 		0x76, 0xDC, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00];
 
 	it("引擎产出（真实 engine.outputFileName 名）的 BigTIFF 产物走完整上传链路", async () => {
-		// 页面生产路径（tools-slides-upload.js:797-803）：产物名经引擎
+		// 页面生产路径（app.js createEntryUpload / uploadFileName）：产物名经引擎
 		// outputFileName 生成，.tif / .ome.tif / .bif / .ndpi 都属 TIFF 族。
 		for (const name of ["bf-580x300.tif", "bf-580x300.ome.tif",
 			"sample.bif", "sample.ndpi"]) {

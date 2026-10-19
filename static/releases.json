@@ -3,6 +3,33 @@
   "version_scheme": "YYYY.MM.DD product release. Do not use PathTogether package.json 0.1.0 (test package) as the product version.",
   "releases": [
     {
+      "version": "2026.10.20",
+      "date": "2026-10-20",
+      "published": true,
+      "components": {
+        "histopilot": "0.4.8",
+        "pathtogether": "suite-20261020"
+      },
+      "items": {
+        "zh": [
+          "工作台上传一次完成：选择文件后自动准备（需要时在本机转换格式）、校验、上传并等待服务器处理，进度依次显示为「正在准备上传文件（格式转换中）」「正在上传（xx%）」「服务器正在处理」「上传成功」，切片可以打开后才显示成功。",
+          "上传进度、取消和重试直接显示在「导入切片」面板里，不必再展开侧栏查看。",
+          "上传中断后可「继续上传」同一任务，已确认的部分不会重传；状态检查失败可「重新检查状态」；等待另一个标签页时取消上传，不再卡住后面的文件。",
+          "切片转换器只在本机转换和保存，不再提供上传；需要上传时直接在工作台选择原文件，工作台会自动完成转换。",
+          "修复重试加载与保存标记同时进行时，标注列表可能退回旧内容或误显示加载失败的问题。",
+          "修复无法在 AI 对话中继续历史「深读」分支的问题；反馈问题、格式支持申请等说明更简洁。"
+        ],
+        "en": [
+          "Uploading from the workbench now runs end to end: after you pick files it prepares them (converting the format locally when needed), validates, uploads and waits for server processing, showing “Preparing upload (converting)”, “Uploading (xx%)”, “Server processing” and “Upload successful” — success only appears once the slide can be opened.",
+          "Upload progress, cancel and retry now appear right in the “Import slides” panel; no need to open the sidebar.",
+          "An interrupted upload can be continued on the same task without resending confirmed parts; a failed status check can be re-checked; cancelling while waiting for another tab no longer blocks the next files.",
+          "The slide converter now only converts and saves on your computer and no longer uploads; to upload, pick the original file in the workbench and it converts automatically.",
+          "Fixed the annotation list sometimes reverting to older content or showing a load error when a retry and a marker save overlapped.",
+          "Fixed continuing a past “deep read” branch in the AI chat; the feedback and format-support request notes are shorter."
+        ]
+      }
+    },
+    {
       "version": "2026.10.19",
       "date": "2026-10-19",
       "published": true,

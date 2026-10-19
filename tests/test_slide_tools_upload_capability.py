@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
-"""C4 上传接入服务端验收（/api/tools/slides/upload-capability + 可查看格式表）。
+"""转换产物可查看格式表验收（原 C4 上传接入文件，2026-10-20 收敛）。
 
-对应计划 docs/browser-slide-tools-and-baidu-plugin-agent-plan-20260929.md
-§1（「工具能导出」与「平台能查看」是不同能力——不支持查看的输出禁用上传
-入口并说明原因）、§9 C4；浏览器侧证据在 tests/browser/slide_tools_c4/。
+2026-10-20 用户决定：独立转换器只做本地转换与保存，上传统一在工作台完成。
+原专用能力端点 /api/tools/slides/upload-capability 已退役（本文件末组用例
+钉住 404）；SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS 保留——它是 inline_convert
+viewable_formats（转换产物上传门禁）的唯一来源。
 
 本文件的**读取器证明**是 viewable_formats 的唯一准入门禁：用原生 CLI
 （slide-transform-core）转出合成产物，经平台读取器（slide_io.open_slide——
 与查看器同一路径）实际打开、读区域（荧光另读通道）。哪个格式打开失败，
-就必须从 app.SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS 移除——页面随之对该产物
-显示「平台暂不支持查看」并禁用上传，本地保存不受影响。
+就必须从 app.SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS 移除——工作台随之对该
+产物拒绝上传（本地保存不受影响）。
 """
 import json
 import subprocess
@@ -164,157 +165,22 @@ def test_viewable_formats_bound_to_proof(native_fixtures):
 
 
 # --------------------------------------------------------------------------- #
-# 端点：登录 / 载荷字段 / demo 关闭
+# 专用端点退役（2026-10-20）：路由已删；无消费者（前端上传控制器一并移除）
 # --------------------------------------------------------------------------- #
-@pytest.fixture()
-def _iso(monkeypatch):
-    isolate_app(monkeypatch, _bootstrap.SHARE_DATA_DIR, clear_stores=True)
-    app_mod.AUTH_ENABLED = True
-    yield
-
-
-@pytest.fixture()
-def _cos_on(monkeypatch):
-    """capability on + 池配置过门禁（同 tests/test_ingestion_api.py 的夹具）。"""
-    monkeypatch.setattr(cos_config, "COS_POOL_CAPACITY_BYTES", 1_000_000_000)
-    monkeypatch.setattr(cos_config, "COS_POOL_SAFETY_BYTES", 100_000_000)
-    monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)
-    monkeypatch.setattr(app_mod, "UPLOAD_PRODUCT_MAX_BYTES", 800_000_000)
-    monkeypatch.setenv("COS_BUCKET", "bucket-appid")
-    monkeypatch.setenv("COS_REGION", "ap-shanghai")
-    monkeypatch.setenv("COS_SECRET_ID", "AKIDtest")
-    monkeypatch.setenv("COS_SECRET_KEY", "k" * 20)
-    monkeypatch.setattr(cos_config, "COS_BUCKET", "bucket-appid")
-    monkeypatch.setattr(cos_config, "COS_REGION", "ap-shanghai")
-    monkeypatch.setattr(cos_config, "COS_UPLOAD_CAPABILITY", "on")
-    cos_pool_store.ensure_pool_state()
-    yield
-
-
-def _mkuser(user_id, role):
-    import pg_store
-    conn = pg_store.connect()
-    try:
-        with pg_store.transaction(conn) as c:
-            with c.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO users (user_id, login_id, display_name, role, "
-                    "disabled, created_at, auth_version) VALUES (%s, %s, %s, "
-                    "%s, false, now(), 1) ON CONFLICT (user_id) DO NOTHING",
-                    (user_id, user_id + "@x", user_id, role))
-    finally:
-        conn.close()
-
-
-@pytest.fixture()
-def owner_client():
-    app_mod.app.config["TESTING"] = True
-    _mkuser("owner-c4", "owner")
-    client = csrf_client(app_mod.app.test_client())
-    with client.session_transaction() as s:
-        s["auth_user"] = "owner-c4@x"
-        s["user_id"] = "owner-c4"
-        s["role"] = "owner"
-        s["auth_version"] = 1
-    return client
-
-
-def test_capability_endpoint_requires_login(_iso):
-    """/api/* 未登录 → 401 auth_required（不 302）。"""
+def test_upload_capability_endpoint_retired(_iso):
+    """转换器上传承诺已移除：专用能力端点返回 404（未登录同样是 404 而非
+    401——路由不存在，不做 /api/* 的鉴权短路）。"""
     app_mod.app.config["TESTING"] = True
     r = app_mod.app.test_client().get("/api/tools/slides/upload-capability")
-    assert r.status_code == 401
-    assert r.get_json()["code"] == "auth_required"
+    assert r.status_code == 404
 
 
-def test_capability_endpoint_payload_fields(_iso, _cos_on, owner_client):
-    """登录后 200；cos_upload 与工作台 bootstrap 同一权威载荷；格式表成对下发。"""
-    r = owner_client.get("/api/tools/slides/upload-capability")
-    assert r.status_code == 200
-    body = r.get_json()
-    caps = body["cos_upload"]
-    assert caps["available"] is True
-    # 与工作台同形（D3 十进制字节整数；manual_only；注册表派生词表）
-    assert caps["manual_only"] is True
-    assert caps["max_size_bytes"] == 800_000_000
-    for k in ("part_bytes", "url_ttl_seconds", "max_concurrent_parts",
-              "sign_batch_max_parts", "policy_version", "formats"):
-        assert k in caps, f"缺字段 {k}"
-    assert "tif" in caps["formats"]
-    fmts = body["viewable_formats"]
-    assert isinstance(fmts, list) and fmts
-    assert all(isinstance(f, str) and f for f in fmts)
-    assert set(fmts) == set(app_mod.SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS)
-
-
-def test_capability_endpoint_exposes_account(_iso, _cos_on, owner_client):
-    """R1（drain 计划 §3.1）：响应携带当前登录 user_id——本地任务记录把上传
-    意图绑定到授权用户；换账号续传时页面据此要求重新确认。"""
-    r = owner_client.get("/api/tools/slides/upload-capability")
-    assert r.status_code == 200
-    assert r.get_json()["account"] == "owner-c4"
-
-    # 换账号（不同 user_id）：同一端点回显新身份——绑定判定在客户端
-    _mkuser("user-c4b", "user")
-    with owner_client.session_transaction() as s:
-        s["auth_user"] = "user-c4b@x"
-        s["user_id"] = "user-c4b"
-        s["role"] = "user"
-    r2 = owner_client.get("/api/tools/slides/upload-capability")
-    assert r2.status_code == 200
-    assert r2.get_json()["account"] == "user-c4b"
-    # 换账号选择框要告诉用户原上传属于哪个登录名
-    assert r2.get_json()["account_label"] == "user-c4b@x"
-
-
-def test_capability_endpoint_off_still_200_with_reason(_iso, owner_client):
-    """capability off：仍 200（页面要展示明确原因），available=False，
-    viewable_formats 照常下发（格式判定与上传开关是两件事）。"""
-    r = owner_client.get("/api/tools/slides/upload-capability")
-    assert r.status_code == 200
-    body = r.get_json()
-    assert body["cos_upload"]["available"] is False
-    assert set(body["viewable_formats"]) == \
-        set(app_mod.SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS)
-
-
-def test_capability_endpoint_never_demo(_iso, owner_client, monkeypatch):
-    """demo 恒关闭：载荷按 demo=False 计算（工具页用户不吃 demo 形态）。"""
-    seen = {}
-
-    def spy(demo):
-        seen["demo"] = demo
-        return {"available": False, "manual_only": True, "formats": ["tif"]}
-
-    monkeypatch.setattr(app_mod, "_cos_upload_capability_payload", spy)
-    r = owner_client.get("/api/tools/slides/upload-capability")
-    assert r.status_code == 200
-    assert seen["demo"] is False
-
-
-def test_capability_endpoint_release_limit_numbers(
-        _iso, owner_client, monkeypatch):
-    """R7（发布配置精确数值）：COS_POOL_CAPACITY_BYTES=1e10 / SAFETY=5e8 /
-    UPLOAD_MAX_REQUEST_BYTES=9.5e9（→ UPLOAD_PRODUCT_MAX_BYTES=9.5e9）——
-    工具页能力端点报 max_size_bytes=9,500,000,000 且 COS 可用（结构门禁
-    9.5e9 == 产品上限，不因 cos_pool_below_product_limit 关闭）。"""
-    monkeypatch.setattr(cos_config, "COS_POOL_CAPACITY_BYTES", 10_000_000_000)
-    monkeypatch.setattr(cos_config, "COS_POOL_SAFETY_BYTES", 500_000_000)
-    monkeypatch.setattr(upload_guard, "UPLOAD_RESERVED_FREE_BYTES", 0)
-    monkeypatch.setattr(app_mod, "UPLOAD_PRODUCT_MAX_BYTES", 9_500_000_000)
-    monkeypatch.setenv("COS_BUCKET", "bucket-appid")
-    monkeypatch.setenv("COS_REGION", "ap-shanghai")
-    monkeypatch.setenv("COS_SECRET_ID", "AKIDtest")
-    monkeypatch.setenv("COS_SECRET_KEY", "k" * 20)
-    monkeypatch.setattr(cos_config, "COS_BUCKET", "bucket-appid")
-    monkeypatch.setattr(cos_config, "COS_REGION", "ap-shanghai")
-    monkeypatch.setattr(cos_config, "COS_UPLOAD_CAPABILITY", "on")
-    cos_pool_store.ensure_pool_state()
-    r = owner_client.get("/api/tools/slides/upload-capability")
-    assert r.status_code == 200
-    caps = r.get_json()["cos_upload"]
-    assert caps["available"] is True
-    assert caps["max_size_bytes"] == 9_500_000_000
+def test_viewable_formats_still_served_via_inline_convert():
+    """格式表仍经工作台 bootstrap 的 inline_convert.viewable_formats 下发
+    （转换产物上传门禁的唯一权威），与常量一致。"""
+    payload = app_mod._inline_convert_payload()
+    assert set(payload["viewable_formats"]) ==         set(app_mod.SLIDE_TOOLS_VIEWABLE_OUTPUT_FORMATS)
+    assert payload["url"]  # 保留字段形（前端 normalizeConfig 兼容读取）
 
 
 def test_product_limit_derives_from_request_max():

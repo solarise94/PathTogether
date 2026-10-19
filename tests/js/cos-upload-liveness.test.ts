@@ -548,10 +548,8 @@ describe("i18n：upload-liveness 新键 zh/en 成对存在", () => {
 		"upload.cos.err.validation",
 		"upload.cos.err.raster_mismatch",
 		"upload.cos.err.magic",
-		"tools.upload.failed.client_gone",
-		"tools.upload.failed.client_idle",
-		"tools.upload.failed.raster_mismatch",
-		"tools.upload.failed.magic",
+		// 2026-10-20：tools.upload.failed.* 随转换器上传控制器退役——
+		// 同一组 fail_code 现统一经 upload.cos.err.* 在工作台行内呈现
 	];
 
 	it("client_gone / client_idle_timeout / fail_detail / magic 在 zh+en 词典都有可读文案", () => {

@@ -6,7 +6,7 @@
  *    OME 续写；
  *  - 文件名按核心 result.format（其次 outputProfile）决定：两种 OME 都是
  *    `.ome.tif`，经典金字塔是 `.tif`；保存对话框过滤器与之匹配；
- *  - 上传（真实 tools-slides-upload.js + 真实共享引擎 cos-uploader.js）：
+ *  - （2026-10-20）上传控制器已退役；上传行为由工作台 e2e 覆盖：
  *    bf-ome 产物以 `.ome.tif` 名创建 ingestion；新格式在 viewable_formats
  *    里才放行，不在则禁用上传（本地保存不受影响）。
  */
@@ -17,7 +17,6 @@ import { fileURLToPath } from "node:url";
 // eslint-disable-next-line
 import * as E from "../../static/tools/slide-transform/engine.js";
 // eslint-disable-next-line
-import { createUploadController } from "../../static/tools/tools-slides-upload.js";
 
 const FMT_CLASSIC = "classic-bigtiff-jpeg-pyramid";
 const FMT_BF_OME = "ome-bigtiff-subifd-rgb-jpeg-pyramid";
@@ -89,162 +88,13 @@ describe("output profile helpers (engine.js)", () => {
 	});
 });
 
-// ---- upload controller harness (same shape as tools-upload-limit.test.ts) --
-
-const here = dirname(fileURLToPath(import.meta.url));
-const cosEngineSrc = readFileSync(
-	resolve(here, "../../static/upload/cos-uploader.js"), "utf8");
-
-function mkEl(id?: string) {
-	return {
-		id: id || "", disabled: false, hidden: false, textContent: "", title: "",
-		className: "",
-		appendChild(c: unknown) { return c; },
-		insertBefore(c: unknown) { return c; },
-		addEventListener() {}, removeEventListener() {}, click() {},
-	};
-}
-
-function mkDoc() {
-	const els = new Map<string, ReturnType<typeof mkEl>>();
-	return {
-		cookie: "csrf_token=tok",
-		getElementById(id: string) {
-			if (!els.has(id)) els.set(id, mkEl(id));
-			return els.get(id)!;
-		},
-		createElement: () => mkEl(),
-		addEventListener() {},
-		querySelector: () => mkEl(),
-		querySelectorAll: () => [] as unknown[],
-		els,
-	};
-}
-
-function resp(body: unknown, status = 200) {
-	return {
-		ok: status >= 200 && status < 300, status,
-		json: () => Promise.resolve(body),
-		headers: { get: () => null },
-	} as unknown as Response;
-}
-
-type FetchLog = { method: string; url: string; body?: unknown };
-
-async function setup(job: Record<string, unknown>, viewable: string[]) {
-	const doc = mkDoc();
-	const store = new Map<string, string>();
-	const messages: string[] = [];
-	const fetchLog: FetchLog[] = [];
-	const fetchImpl = vi.fn((url: string, opts?: RequestInit) => {
-		const method = String((opts && opts.method) || "GET");
-		let body: unknown = undefined;
-		try { body = opts && opts.body ? JSON.parse(String(opts.body)) : undefined; } catch { /* */ }
-		fetchLog.push({ method, url: String(url), body });
-		if (String(url) === "/api/tools/slides/upload-capability") {
-			return Promise.resolve(resp({
-				cos_upload: {
-					available: true, manual_only: true, max_size_bytes: 900000000,
-					part_bytes: 8, url_ttl_seconds: 600, max_concurrent_parts: 2,
-					sign_batch_max_parts: 4, policy_version: "v1-manual", formats: ["tif", "tiff"],
-				},
-				viewable_formats: viewable, account: "u1", account_label: "u1@x",
-			}));
-		}
-		if (method === "POST" && String(url) === "/api/ingestions") {
-			return Promise.resolve(resp({ job_id: "inj_t1", state: "preparing", stage: "uploading" }, 202));
-		}
-		if (String(url).startsWith("/api/ingestions/")) {
-			return Promise.resolve(resp({ state: "failed", stage: "terminal", fail_code: "demo" }));
-		}
-		return Promise.resolve(resp({}));
-	}) as unknown as typeof fetch;
-	const w: Record<string, unknown> = { HP_COS_UPLOAD: null };
-	new Function("window", "document", "fetch", "location", cosEngineSrc)(
-		w, doc, fetchImpl, { href: "http://local/tools/slides", origin: "http://local" });
-	vi.stubGlobal("window", w);
-	vi.stubGlobal("document", doc);
-	vi.stubGlobal("fetch", fetchImpl);
-	vi.stubGlobal("localStorage", {
-		getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
-		setItem: (k: string, v: string) => { store.set(k, String(v)); },
-		removeItem: (k: string) => { store.delete(k); },
-		clear() { store.clear(); },
-	});
-	vi.stubGlobal("navigator", {
-		locks: { request: (_n: string, _o: unknown, fn: (l: unknown) => Promise<unknown>) =>
-			Promise.resolve(fn({ name: "lock" })) },
-	});
-	const artifact = { size: 5000, slice: (s: number, e: number) => ({ s, e }) };
-	const runner = {
-		async getJob(id: string) { return { id, state: "ready", ...job }; },
-		async setJobUpload() { return undefined; },
-		async setJobIntent() { return undefined; },
-		async artifactView() { return artifact; },
-	};
-	const ctl = createUploadController({
-		runner: runner as never,
-		t: (k: string) => { messages.push(k); return k; },
-		onJobsRefresh: null,
-		onPublished: null,
-	}) as unknown as {
-		startOrContinue: (id: string) => Promise<unknown>;
-		setResultJob: (id: string) => Promise<unknown>;
-		isDisabled: (id: string) => boolean;
-	};
-	return { ctl, doc, fetchLog, messages };
-}
-
-afterEach(() => {
-	vi.unstubAllGlobals();
-});
-
-function createdName(fetchLog: FetchLog[]) {
-	const create = fetchLog.find((c) => c.method === "POST" && c.url === "/api/ingestions");
-	expect(create).toBeTruthy();
-	const body = create!.body as Record<string, unknown>;
-	return String(body.filename || body.name || "");
-}
-
-describe("upload of bf-ome artifacts", () => {
-	it("bf-ome artifact uploads as <base>.ome.tif", async () => {
-		const { ctl, fetchLog } = await setup({
-			modality: "brightfield", outputProfile: "bf-ome",
-			source: { name: "case-x.kfb", size: 1 },
-			result: { outputBytes: 5000, format: FMT_BF_OME },
-		}, [FMT_CLASSIC, FMT_BF_OME, FMT_FL]);
-		await ctl.setResultJob("job-1");
-		await ctl.startOrContinue("job-1");
-		expect(createdName(fetchLog)).toBe("case-x.ome.tif");
-	});
-
-	it("legacy classic artifact keeps <base>.tif", async () => {
-		const { ctl, fetchLog } = await setup({
-			modality: "brightfield",
-			source: { name: "case-y.kfb", size: 1 },
-			result: { outputBytes: 5000, format: FMT_CLASSIC },
-		}, [FMT_CLASSIC, FMT_BF_OME, FMT_FL]);
-		await ctl.setResultJob("job-2");
-		await ctl.startOrContinue("job-2");
-		expect(createdName(fetchLog)).toBe("case-y.tif");
-	});
-
-	it("a server that cannot view bf-ome disables upload (no ingestion), save stays", async () => {
-		const { ctl, doc, fetchLog, messages } = await setup({
-			modality: "brightfield", outputProfile: "bf-ome",
-			source: { name: "case-z.kfb", size: 1 },
-			result: { outputBytes: 5000, format: FMT_BF_OME },
-		}, [FMT_CLASSIC, FMT_FL]);
-		await ctl.setResultJob("job-3");
-		await ctl.startOrContinue("job-3");
-		expect(ctl.isDisabled("job-3")).toBe(true);
-		expect(messages).toContain("tools.upload.format.unsupported");
-		expect(doc.getElementById("save-btn").disabled).toBe(false);
-		expect(fetchLog.filter((c) => c.url.indexOf("/api/ingestions") >= 0)).toHaveLength(0);
-	});
-});
+// ---- 2026-10-20：上传控制器（tools-slides-upload.js）已随「转换器只做本地
+// 转换与保存」退役；产物名（<base>.ome.tif / <base>.tif）由 engine.js 的
+// outputFileName 覆盖（tools-result-format 用例）与工作台 e2e 断言。 ----
 
 // ---- page wiring (source-level; tools-slides.js is a live-DOM module) ----
+
+const here = dirname(fileURLToPath(import.meta.url));
 
 const pageSrc = readFileSync(resolve(here, "../../static/tools/tools-slides.js"), "utf8");
 const runnerSrc = readFileSync(resolve(here, "../../static/tools/slide-transform/runner.js"), "utf8");

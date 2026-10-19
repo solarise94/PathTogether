@@ -73,16 +73,23 @@ const api = async (url: string, opts: Record<string, unknown> = {}) => {
 	return { ok: true, status: 200, json: async () => ({ stage: "viewable", slide_id: "slide-B" }) };
 };
 const cfg = { max_size_bytes: 100000, formats: ["tif"] };
+// 2026-10-20：createEntryUpload 的 status 分支经 cosStageView（app.js 别处
+// 定义）——切片一并携带；tt 是它的文案自由变量，注入桩。
+const stageView = app.slice(
+	app.indexOf("  function cosStageKey("),
+	app.indexOf("  function cosShowStage("),
+);
 const code = app.slice(
 	app.indexOf("  function uploadEntryArtifact("),
 	app.indexOf("  /// 完成收口（§3.5）"),
-);
+) + stageView;
 const harness = new Function(
 	"window", "inlineRunner", "resolveCosConfig", "apiFetch", "apiFetchNoRedirect",
-	"inlineRowSetStage", "authInfoReady",
+	"inlineRowSetStage", "authInfoReady", "tt",
 	'var currentUserId="account-A",authInfoEnabled=true;' + code +
 	';return {upload:uploadEntryArtifact,setAccount:(v)=>currentUserId=v};',
-)(w, runner, () => cfg, api, api, () => {}, () => Promise.resolve()) as {
+)(w, runner, () => cfg, api, api, () => {}, () => Promise.resolve(),
+	(k: string) => k) as {
 	upload: (e: unknown, a: unknown) => Promise<unknown>;
 	setAccount: (v: string) => void;
 };

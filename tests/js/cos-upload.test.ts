@@ -417,8 +417,8 @@ describe("选路：capability / eligible 判定（统一 COS）", () => {
 		expect(h.up.cosUploadEligible({ name: "a.svs", size: 1001 })).toBe(false);     // 超产品上限
 		expect(String(h.up.cosIneligibleReason({ name: "a.mrxs", size: 30 }))).toContain("不支持该文件格式");
 		expect(String(h.up.cosIneligibleReason({ name: "a.svs", size: 5000 }))).toContain("超过平台上限");
-		// 不合格 → 零请求 + 可读说明（不提供另一后端）。阶段 1：mrxs 按嗅探
-		// 类别走「本机转换并上传」入口（行提示，不判失败）；超大 .svs 走
+		// 不合格 → 零请求 + 可读说明（不提供另一后端）。mrxs 走面板队列或
+		// 行内「本机转换暂不可用」说明（不判失败）；超大 .svs 走
 		// 「超过平台上限」toast（嗅探读失败按暂时直传降级 → 词表路径）
 		h.up.uploadFile({ name: "a.mrxs", size: 30 });
 		h.up.uploadFile({ name: "huge.svs", size: 5000 });
@@ -426,7 +426,7 @@ describe("选路：capability / eligible 判定（统一 COS）", () => {
 		expect(FakeXHR.instances).toHaveLength(0);
 		expect(h.fetchCalls().length).toBe(0);
 		const rows = h.container.appendChildren;
-		// mrxs 行是「待本机转换」提示（upload.kfb.hint），不判失败；huge 行
+		// mrxs 行是「本机转换暂不可用」行内说明（upload.kfb.unavailable），不判失败；huge 行
 		// 是「超过平台上限」toast（upload.cos.err.too_large）
 		const mrxsRow = String(rows[rows.length - 2].children[2].textContent);
 		expect(mrxsRow).toContain("本机转换");
@@ -602,9 +602,9 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 		expect(releaseServerStage).toBeTruthy();
 		releaseServerStage!();
 		await vi.advanceTimersByTimeAsync(0);
-		expect(String(statusEl.textContent)).toContain("等待服务器接收");
+		expect(String(statusEl.textContent)).toContain("服务器正在处理…");
 		await vi.advanceTimersByTimeAsync(2000);   // awaiting_server → downloading
-		expect(String(statusEl.textContent)).toContain("服务器接收中");
+		expect(String(statusEl.textContent)).toContain("服务器正在处理");
 		// 下载阶段百分比同样在字节行（aria-live 只随阶段播报）
 		expect(rowText(row, "upload-item-bytes")).toContain("50%");
 		expect(String(statusEl.textContent)).not.toContain("50%");
@@ -660,7 +660,7 @@ describe("COS 上传状态机：独立传输、分批签名、并发、进度、
 		expect(h.fetchCalls().some((c) => c.url === "/api/ingestions/inj_f/upload-complete")).toBe(true);
 		expect(h.toastMessages.some((m) => m.indexOf("upload.done") >= 0)).toBe(true);
 		// 失败重试不累计字节：进度按唯一 confirmed 分块计（viewable 后行文案
-		// 已切「入库完成」，以恢复记录为准）
+		// 已切「上传成功」（upload.stage.done 新文案），以恢复记录为准）
 		const saved = JSON.parse(h.storage.getItem("pt.cos.jobs") || "[]");
 		expect(saved).toEqual([]);   // 成功后清理
 	});
@@ -738,7 +738,7 @@ describe("waiting_capacity：排队展示与轮询推进", () => {
 		const row = h.container.appendChildren[h.container.appendChildren.length - 1];
 		const statusEl = row.children[2];
 		// 排队位置展示（0 基 → 第 1 位，位置在字节行）；无预计时间（不出现 eta 字样）
-		expect(String(statusEl.textContent)).toContain("等待暂存空间");
+		expect(String(statusEl.textContent)).toContain("服务器正在处理…");
 		expect(rowText(row, "upload-item-bytes")).toContain("upload.cos.queue:1");
 		expect(String(statusEl.textContent)).not.toContain("eta");
 		await vi.advanceTimersByTimeAsync(4999);
@@ -782,7 +782,7 @@ describe("刷新恢复：只读进度行与终态清理", () => {
 		expect(h.container.appendChildren).toHaveLength(1);
 		const row = h.container.appendChildren[0];
 		expect(String(row.children[0].textContent)).toContain("big.svs");
-		expect(String(row.children[2].textContent)).toContain("服务器接收中");
+		expect(String(row.children[2].textContent)).toContain("服务器正在处理");
 		// 下载百分比在字节行（阶段行 aria-live 只装阶段名）
 		expect(rowText(row, "upload-item-bytes")).toContain("33%");
 		expect(String(row.children[2].textContent)).not.toContain("33%");

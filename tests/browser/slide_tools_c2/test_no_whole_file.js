@@ -15,12 +15,10 @@ const FILES = [
   'static/tools/slide-transform/worker.js',
   'static/tools/slide-transform/runner.js',
   // C4 upload path: the artifact goes to COS as per-part slice() blobs only
+  // (2026-10-20: the tool page is local-convert + local-save only; its upload
+  // controllers were removed — the shared workbench panel drives cos-uploader)
   'static/upload/cos-uploader.js',
-  'static/tools/tools-slides-upload.js',
   'static/tools/tools-slides.js',
-  // R1 one-click convert-and-upload: no file bytes flow through this module
-  // (conversion via the runner, upload via the C4 controller)
-  'static/tools/tools-slides-convert-upload.js',
 ];
 
 // [pattern, why-forbidden]

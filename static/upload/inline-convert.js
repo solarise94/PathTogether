@@ -279,15 +279,18 @@
 
   // -------------------------------------------------------- 转换阶段文案 --
 
-  /// runner state → 行文案键（与工具页 PHASE_LABEL_KEY 同一套键，设计 §3.3）
+  /// runner state → 行文案键（用户五步口径，2026-10-20）：本机识别/复制/
+  /// 转换/校验统一归「正在准备上传文件」；确在转换时显示「（格式转换中）」；
+  /// 无需转换的文件绝不显示转换状态。工具页的 tools.phase.* 仍是转换器
+  /// 页面自己的词表，工作台行不再借用（P2 复核 2026-10-20 五步文案）。
   var PHASE_KEYS = {
-    probing: "tools.phase.probing",
-    planned: "tools.phase.planned",
-    running: "tools.phase.running",
-    paused: "tools.phase.paused",
-    finalizing: "tools.phase.finalizing",
-    validating: "tools.phase.validating",
-    ready: "tools.phase.ready",
+    probing: "upload.step.prepare",
+    planned: "upload.step.prepare",
+    running: "upload.step.converting",
+    paused: "upload.step.prepare",
+    finalizing: "upload.step.converting",
+    validating: "upload.step.prepare",
+    ready: "upload.step.prepare",
     cancelled: "tools.phase.cancelled",
     failed: "tools.phase.failed",
     cleanup_pending: "tools.phase.cleanup_pending",
@@ -299,17 +302,93 @@
     if (p.unit === "stage" || p.unit === "stage-bundle") {
       var frac = p.total ? p.done / p.total : null;
       if (p.unit === "stage-bundle") {
-        return { key: "tools.phase.probing", frac: frac,
+        return { key: "upload.step.prepare", frac: frac,
                  noteKey: "tools.stage.bundle.bytes",
                  noteVars: { member: p.member, members: p.members } };
       }
-      return { key: "tools.phase.probing", frac: frac, noteKey: null };
+      return { key: "upload.step.prepare", frac: frac, noteKey: null };
     }
     if (p.unit === "level" || p.unit === "tile-row") {
       var f2 = p.total ? p.done / p.total : null;
-      return { key: "tools.phase.running", frac: f2, noteKey: null };
+      return { key: "upload.step.converting", frac: f2, noteKey: null };
     }
     return null;
+  }
+
+  // ------------------------------------------------------ 上传失败恢复 --
+
+  /// 上传失败的**类型判定**（P2 复核 2026-10-20 问题 2 的纯函数 half）。
+  /// 恢复动作按失败类型 + 实际服务器任务记录决定，绝不按「有没有本机转换
+  /// jobId」决定——直传条目本来就没有本机 jobId，旧判定把它们的恢复入口
+  /// 全部漏成「申请支持该格式」（复核脚本 directFailure）。
+  /// 返回 { kind, code, detail }；kind ∈
+  ///   part      分块最终失败（引擎 err.part）→ 同任务续传
+  ///   network   网络层失败（引擎 err.network）→ 同任务续传
+  ///   recheck   状态轮询连续失败（引擎 err.recheck）→ 只重查同一任务
+  ///   terminal  服务器终态（err.terminal 的 fail_code / data.code 终态集）
+  ///             → 显式「重新上传」；不可重试的终态（超限/容量配置）不给动作
+  ///   format    格式问题（魔数不符 / 服务端格式不受理）→ 申请支持该格式
+  ///   generic   其余（未知码）→ 维持既有「申请支持该格式」
+  function classifyUploadError(err) {
+    if (err && err.magicMismatch) {
+      return { kind: "format", code: "content_ext_mismatch",
+               detail: err.magicMismatch.detected || null };
+    }
+    if (err && err.terminal) {
+      return { kind: "terminal",
+               code: (err.data && err.data.fail_code) || "",
+               detail: (err.data && err.data.fail_detail) || null };
+    }
+    var code = (err && err.data && (err.data.code || err.data.error)) || "";
+    if (code === "cos_format_unsupported") {
+      return { kind: "format", code: code, detail: null };
+    }
+    if (code === "upload_too_large" || code === "cos_pool_below_product_limit") {
+      // 重传解决不了的终态（超限/容量配置门禁）：只说明原因，不给无效动作
+      return { kind: "terminal", code: code, detail: null };
+    }
+    if (err && err.network) return { kind: "network", code: "network", detail: null };
+    if (err && typeof err.part === "number") {
+      return { kind: "part", code: "part_failed", detail: null };
+    }
+    if (err && err.recheck) return { kind: "recheck", code: "recheck", detail: null };
+    return { kind: "generic", code: code, detail: null };
+  }
+
+  /// 服务器终态里「重新上传（新建任务）」有意义/无意义 的划分：内容与传输
+  /// 类终态重传有意义；超限/容量配置重传必然再失败 → 只说明。
+  var TERMINAL_RETRYABLE = {
+    client_gone: 1, client_idle_timeout: 1, validation_failed: 1,
+    plan_size_mismatch: 1, hash_mismatch: 1, publish_conflict: 1,
+    commit_recovery_failed: 1, name_unavailable: 1,
+  };
+
+  /// 失败条目 → 行内恢复动作序列（P2 问题 2 的**唯一权威表**；app.js 的
+  /// inlineButtonKinds 消费）。kind:
+  ///   continueUpload  同任务续传（resumeJobId=服务器任务 id；已确认分块跳过）
+  ///   recheckUpload   同任务重查（重入状态机轮询，绝不重建/重传）
+  ///   reupload        显式新建任务（清掉旧任务 id 后由点击触发，绝不自动）
+  ///   support         申请支持该格式（只服务格式失败与未知错误）
+  function uploadRecoveryKinds(entry) {
+    var e = entry || {};
+    var err = e.error || {};
+    var hasTask = !!(e.uploadJobId || err.ingestionId);
+    switch (err.kind) {
+      case "part":
+      case "network":
+        // 有任务 → 同任务续传；任务还没建成（创建请求本身失败）→ 重试上传
+        //（无任务可复用，重试就是首次创建，不存在重复建任务）
+        return ["continueUpload"];
+      case "recheck":
+        return ["recheckUpload"];
+      case "terminal":
+        if (TERMINAL_RETRYABLE[err.code]) return ["reupload"];
+        return [];   // 超限/容量配置：重传无意义，行内文案说明原因即可
+      case "format":
+        return ["support"];
+      default:
+        return hasTask ? ["continueUpload"] : ["support"];
+    }
   }
 
   // ------------------------------------------------------------ 编排器 --
@@ -755,7 +834,7 @@
         if (waits && !e.cancelled && e.state === "identity_wait") {
           // 身份落定：恢复「转换中」的行状态，继续启动
           e.state = "converting";
-          setStage(e, "tools.phase.probing", null, "", true);
+          setStage(e, "upload.step.prepare", null, "", true);
           if (ui.buttons) ui.buttons(e);
         }
         // 等待期间被取消：不写（运行器可能已丢弃该任务）
@@ -781,7 +860,7 @@
       activeConvert = e;
       e.state = "converting";
       if (ui.buttons) ui.buttons(e);
-      setStage(e, "tools.phase.probing", null, "", true);
+      setStage(e, "upload.step.prepare", null, "", true);
       attachRunnerEvents();
       var jobOpts = {
         confirmUncertainDisk: !!e._confirmDisk,
@@ -1535,8 +1614,15 @@
     function failUpload(e, err) {
       releaseUploadSlot(e);
       if (e.cancelled) return;   // 用户已取消：取消回声不当失败处理
-      var code = "";
-      var detail = null;
+      // P2 问题 2：失败**类型**与服务器任务 id 落在条目上——行内恢复按钮
+      //（inlineButtonKinds → uploadRecoveryKinds）据此给出「同任务续传/
+      // 重查/显式重传」，而不是只剩「申请支持该格式」。
+      var cls = classifyUploadError(err);
+      var kind = cls.kind;
+      var code = cls.code;
+      var detail = cls.detail;
+      e.errorKind = kind;
+      if (e.uploadJobId) e.errorIngestionId = e.uploadJobId;
       if (err && err.magicMismatch) {
         markError(e, "content_ext_mismatch", null,
           { detectedType: err.magicMismatch.detected });
@@ -1632,8 +1718,7 @@
           if (ui.buttons) ui.buttons(e);
           schedule();
           return e;
-        }
-        // 恢复行的 mode 由 restore 按运行器的 nextAction 定；用户新入队的
+        }        // 恢复行的 mode 由 restore 按运行器的 nextAction 定；用户新入队的
         // 条目恒为 'probe'（有原始 File）。
         if (e.mode === "reselect") {
           // 运行器对 failed 记录 reusable=false，startJob(null) 只会抛
@@ -1680,6 +1765,30 @@
         if (typeof deps.retryIdentity === "function") {
           try { deps.retryIdentity(); } catch (err) { /* 回调失败不翻行 */ }
         }
+        return e;
+      }
+      if (action === "reupload") {
+        // P2 问题 2：服务器终态后的**显式**重传（唯一权威入口；绝不自动
+        // 重建）。清掉失败任务的任务 id 与「全新上传」标记——直传条目据此
+        // 不带 resumeJobId（不复活旧任务），转换产物经记录终态自然新建。
+        e.uploadJobId = null;
+        e.errorIngestionId = null;
+        e._freshUpload = true;
+        e.parked = false;
+        e.state = "upload_queued";
+        setStage(e, "upload.inline.stage.queued");
+        if (ui.buttons) ui.buttons(e);
+        schedule();
+        return e;
+      }
+      if (action === "recheckUpload") {
+        // P2 问题 2：状态轮询失败 → 只重查**同一任务**（resumeJobId 原样
+        // 保留；绝不重建任务/重传分片）。
+        e.parked = false;
+        e.state = "upload_queued";
+        setStage(e, "upload.inline.stage.queued");
+        if (ui.buttons) ui.buttons(e);
+        schedule();
         return e;
       }
       if (action === "cancel") {
@@ -2056,7 +2165,7 @@
         var e = activeConvert;
         if (!e || !ph || !ph.phase) return;
         if (ph.phase === "stage-bundle") {
-          setStage(e, "tools.phase.probing", null, "", true);
+          setStage(e, "upload.step.prepare", null, "", true);
         }
       });
     }
@@ -2098,6 +2207,9 @@
     directDeclaration: directDeclaration,
     artifactGate: artifactGate,
     failureStageKey: failureStageKey,
+    classifyUploadError: classifyUploadError,
+    uploadRecoveryKinds: uploadRecoveryKinds,
+    TERMINAL_RETRYABLE: TERMINAL_RETRYABLE,
     msgKey: msgKey,
     prefillFormatRequest: prefillFormatRequest,
     shouldWarn: shouldWarn,

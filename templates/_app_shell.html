@@ -514,10 +514,10 @@
             <div class="feedback-meta-row">
               <span id="feedback-count" class="feedback-count">0 / 4000</span>
             </div>
-            <p class="changepw-hint" data-i18n="fbk.privacy.hint">将附带最近的操作摘要（页面路径、点击的控件、接口状态码、报错）；不含输入内容、密码、切片图像、Cookie 或查询串。</p>
-            <p class="changepw-hint" data-i18n="fbk.server.hint">服务端还会附带账号、额度、应用版本、最近 24 小时的审计摘要和任务状态，供管理员排查。</p>
+            <p class="changepw-hint" data-i18n="fbk.privacy.hint">提交时会附带必要的账号与任务诊断信息，用于排查本次问题。详情可展开查看。</p>
             <details class="feedback-preview" id="feedback-preview-details">
               <summary data-i18n="fbk.preview.toggle">查看将附带的信息</summary>
+              <p class="changepw-hint" data-i18n="fbk.privacy.details">客户端附带最近的操作摘要（页面路径、点击的控件、接口状态码、报错），不含输入内容、密码、切片图像、Cookie 或查询串；服务端还会附带账号、额度、应用版本、最近 24 小时的审计摘要和任务状态。实际随反馈提交的内容以下方预览为准。</p>
               <pre id="feedback-preview" class="feedback-preview-json"></pre>
             </details>
             <p class="changepw-error" id="feedback-error" role="alert" hidden></p>
@@ -898,6 +898,14 @@
           <div id="baidu-import-items" class="baidu-import-items"></div>
         </div>
       </section>
+      {# P2 复核 2026-10-20（问题 3）：上传队列与选择文件的同一面板。抽屉打开
+         时 app.js 把侧栏的唯一行容器（#upload-progress-list，含本地面板转换
+         行与直传行）**移动**到这里的宿主里——同一份 DOM、同一份状态，关抽屉
+         时移回侧栏；不存在第二份独立任务列表。块显隐由 JS 按行存在性切换。 #}
+      <div class="imp-block" id="import-uploads-block" hidden>
+        <div class="imp-block-title" data-i18n="imp.uploads.title">上传任务</div>
+        <div id="import-upload-host" class="import-upload-host"></div>
+      </div>
       <div class="imp-block" id="import-tasks-block">
         <div class="imp-block-title" data-i18n="imp.tasks.title">后台任务</div>
         <div id="import-task-list" class="import-task-list"

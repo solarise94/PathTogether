@@ -49,19 +49,19 @@
     "upload.err.size_mismatch": { zh: "文件大小与声明不符，请重新上传", en: "File size mismatch, please re-upload" },
     // U3 三段状态（§3.5：正在传输 → 服务端校验 → 入库完成）
     "upload.stage.converting": { zh: "切片转换中", en: "Converting slide" },
-    "upload.stage.done": { zh: "入库完成", en: "Completed" },
+    "upload.stage.done": { zh: "上传成功", en: "Upload successful" },
     "upload.stage.failed": { zh: "上传失败", en: "Upload failed" },
     "upload.err.conversion": { zh: "切片转换失败", en: "Slide conversion failed" },
     // COS 直传 Phase 4（§5 阶段文案固定六段 + 稳定机器码；i18n.js 为主源，
     // 此处兜底）。上传 100% ≠ 可查看，绝不合成全流程百分比
-    "upload.cos.stage.waiting_space": { zh: "等待暂存空间", en: "Waiting for staging space" },
+    "upload.cos.stage.waiting_space": { zh: "服务器正在处理…", en: "Server processing…" },
     "upload.cos.stage.uploading": { zh: "正在上传", en: "Uploading" },
-    "upload.cos.stage.awaiting_server": { zh: "等待服务器接收", en: "Waiting for server" },
-    "upload.cos.stage.downloading": { zh: "服务器接收中", en: "Server downloading" },
-    "upload.cos.stage.validating": { zh: "正在校验", en: "Validating" },
-    "upload.cos.stage.processing": { zh: "服务器处理中（解包/转换）", en: "Server processing (unpack/conversion)" },
-    "upload.cos.stage.readiness": { zh: "准备可查看", en: "Preparing to view" },
-    "upload.cos.stage.viewable": { zh: "可查看", en: "Viewable" },
+    "upload.cos.stage.awaiting_server": { zh: "服务器正在处理…", en: "Server processing…" },
+    "upload.cos.stage.downloading": { zh: "服务器正在处理", en: "Server processing" },
+    "upload.cos.stage.validating": { zh: "服务器正在处理…", en: "Server processing…" },
+    "upload.cos.stage.processing": { zh: "服务器正在处理…", en: "Server processing…" },
+    "upload.cos.stage.readiness": { zh: "准备打开", en: "Preparing to open" },
+    "upload.cos.stage.viewable": { zh: "准备打开", en: "Preparing to open" },
     "upload.cos.queue": { zh: "第 {n} 位", en: "position {n}" },
     "upload.cos.cancel": { zh: "取消", en: "Cancel" },
     "upload.cos.cancelled": { zh: "已取消", en: "Cancelled" },
@@ -73,7 +73,7 @@
     "upload.cos.err.too_large": { zh: "文件超过平台上限", en: "File exceeds the platform size limit" },
     "upload.cos.err.pool_config": { zh: "服务端存储配置暂不能接纳该大小，请联系运维", en: "Server storage config cannot accept this size yet; contact the operator" },
     "upload.cos.unavailable": { zh: "上传暂不可用（云直传能力未开放）", en: "Upload unavailable (cloud direct-upload capability is off)" },
-    "upload.cos.items": { zh: "已发布 {n}/{m} 项", en: "{n}/{m} items published" },
+    "upload.cos.items": { zh: "已加入工作台 {n}/{m} 项", en: "{n}/{m} items added to the workbench" },
     "upload.cos.conv_state": { zh: "转换中（{s}）", en: "Converting ({s})" },
     "upload.cos.err.waiting_limit": { zh: "已有等待中的云端直传任务", en: "Another cloud upload is already waiting" },
     "upload.cos.err.state": { zh: "任务状态冲突，请刷新页面后重试", en: "Job state conflict; please refresh and retry" },
@@ -95,15 +95,9 @@
     "upload.cos.sent_all": { zh: "数据已发送，等待确认", en: "All data sent, awaiting confirmation" },
     "upload.cos.retrying": { zh: "正在重试", en: "Retrying" },
     "upload.cos.err.plan": { zh: "上传计划与文件大小不一致，已停止；请重新上传", en: "Upload plan does not match the file size; stopped — please re-upload" },
-    // R1 一键转换并上传（工作台入口；i18n.js 为主源，此处兜底）
-    "upload.kfb.hint": { zh: "该格式需在本机转换后上传（平台不再在服务器端转换 KFB/KFBF）", en: "This format must be converted on your machine before uploading (the platform no longer converts KFB/KFBF server-side)" },
-    "upload.kfb.btn": { zh: "在本机转换并上传", en: "Convert on this machine and upload" },
-    "upload.kfb.handoff.sent": { zh: "已交给本机转换工具（新窗口）：在那里继续转换与上传", en: "Handed off to the local conversion tool (new window); conversion and upload continue there" },
-    "upload.kfb.popup.blocked": { zh: "弹窗被浏览器拦截：请允许本站弹出窗口后重试，或打开切片格式转换工具手动选择文件", en: "The popup was blocked: allow popups for this site and retry, or open the slide format converter and select the file manually" },
-    "upload.kfb.tools.link": { zh: "打开切片格式转换工具", en: "Open the slide format converter" },
-    "upload.kfb.dismiss": { zh: "忽略", en: "Dismiss" },
-    "upload.kfb.drawer.title": { zh: "以下文件需在本机转换后上传：", en: "These files must be converted on this machine before uploading:" },
-    "upload.kfb.done": { zh: "本机转换并上传完成：{name} 已按目标位置入库", en: "Local convert-and-upload finished: {name} stored under the chosen target" },
+    // 2026-10-20 用户决定：独立转换器只做本地转换与保存；工作台上传不再
+    // 跳转/弹窗交接——需要转换的文件在面板不可用时行内说明 + 重试/支持。
+    "upload.kfb.unavailable": { zh: "该文件需要先转换后上传：本机转换暂不可用，可重试或申请支持该格式", en: "This file must be converted before upload: local conversion is unavailable right now — retry or request format support" },
     // 上传面板内转换（docs/upload-inline-convert-design-20261015.md；i18n.js 为主源，
     // 此处兜底：app.js 的 tt() 在无 HP_I18N 词条时回落到本表）
     "upload.inline.stage.queued": { zh: "排队中…", en: "Queued…" },
@@ -1513,6 +1507,11 @@
     progressBar: $("progress-bar"),
     progressText: $("progress-text"),
     uploadProgressList: $("upload-progress-list"),
+    // P2 复核 2026-10-20（问题 3）：抽屉内的上传队列宿主（行容器的「第二个
+    // 家」）。抽屉打开时行容器移到这里（与选择文件的同一面板），关闭时移回
+    // 侧栏——同一份 DOM/状态，绝不复制第二份任务列表。
+    importUploadsBlock: $("import-uploads-block"),
+    importUploadHost: $("import-upload-host"),
     // W3/W4/W6（2026-09-14）：统一「导入切片」抽屉 + 新建项目对话框
     importSlidesBtn: $("import-slides-btn"),
     importDrawer: $("import-drawer"),
@@ -10722,9 +10721,11 @@
       row.finish(10000);
       return;
     }
-    // 嗅探判定需要本机转换（KFB/KFBF/JPEG SVS/MRXS 成员）→ 本机转换入口
+    // 需要本机转换（KFB/KFBF/JPEG SVS/MRXS 成员）→ 面板内转换；面板不可用
+    //（开关关闭/引擎初始化失败）时行内说明 + 重试，绝不跳转换器页面
     if (cls && cls.cls === "convert") {
-      offerBrowserConvert(file, row);
+      convertNeededUnavailable(file, file && file.name,
+        function () { uploadFile(file, opts); }, row);
       return;
     }
     if (cls && cls.cls === "unsupported") {
@@ -10741,10 +10742,11 @@
       return;
     }
     if (!cosUploadEligible(file)) {
-      // R1：服务端受理词表外但属 browser_convert 词表 → 本机转换并上传
-      //（嗅探不可用时的旧路径兜底）
+      // 服务端受理清单外但属 browser_convert 清单 → 面板内转换（嗅探不可用
+      // 时的兜底）；面板不可用 → 行内说明 + 重试，绝不跳转换器页面
       if (isBrowserConvertFile(file)) {
-        offerBrowserConvert(file, row);
+        convertNeededUnavailable(file, file && file.name,
+          function () { uploadFile(file, opts); }, row);
         return;
       }
       row.markError();
@@ -10770,18 +10772,20 @@
   }
 
   // =========================================================================
-  // R1 一键转换并上传（drain 计划 §3.1）：工作台入口。
-  // KFB/KFBF 不再经服务器转换（422 conversion_moved_to_browser）——选择这类
-  // 文件时给出「在本机转换并上传」：同源 popup 打开 /tools/slides，File 经
-  // postMessage structured clone 交接（零额外整文件复制——唯一副本是运行器
-  // staging 的 OPFS source.bin），并携带显式项目目标；转换/校验/准入/上传
-  // 都在工具页完成，发布后本页收到通知刷新列表（目标关联由工具页按服务端
-  // 权限检查完成）。弹窗被拦截时明示原因并给出工具页链接，选择不静默丢失
-  //（重试按钮仍在）。
+  // 2026-10-20 用户决定：独立转换器（/tools/slides）只做本地转换与保存；
+  // 工作台上传统一在工作台上传面板完成（inline-convert）。旧的「在本机转换
+  // 并上传」弹窗交接（File/文件夹 postMessage、目标项目、自动上传意图）整体
+  // 移除：需要转换的文件在面板不可用时行内说明 + 重试/支持，绝不打开转换器
+  // 页面继续上传。
   // =========================================================================
 
-  /// bootstrap 能力下发的 browser_convert 词表（cos_upload.browser_convert。
-  /// formats；服务端唯一权威——前端不自维护第二份）。
+  /// 转换器页面（仍保留本地转换与保存）；工作台只保留对它的普通页面链接
+  /// 语义（saveLocal），不携带文件/意图。
+  var TOOLS_PAGE_URL = "/tools/slides";
+
+  /// bootstrap 能力下发的 browser_convert 清单（cos_upload.browser_convert.
+  /// formats；服务端唯一权威——前端不自维护第二份）。嗅探不可用时的兜底
+  /// 分流（uploadFileClassified）用。
   function browserConvertFormats() {
     try {
       var caps = window.HP_APP_BOOTSTRAP && window.HP_APP_BOOTSTRAP.capabilities;
@@ -10798,185 +10802,23 @@
     return browserConvertFormats().indexOf(ext) >= 0;
   }
 
-  var CONVERT_HANDOFF_URL = "/tools/slides";
-  var HANDOFF_MSG = "pt:convert-upload-handoff";
-  var HANDOFF_ACK = "pt:convert-upload-ack";
-  var HANDOFF_DONE = "pt:convert-upload-published";
-  var convertHandoff = { popup: null, listenerOn: false };
-
-  /// 交接目标（显式项目目标沿用；「新项目」把名称与一次性幂等键交给工具页，
-  /// 仅在上传成功后创建——转换失败不留空项目）。
-  function convertHandoffTarget() {
-    var st = importTargetState;
-    if (st.pid) return { project: st.pid };
-    if (st.newProjectName) {
-      if (!st.createKey) st.createKey = uuid();
-      return { newProject: { name: st.newProjectName, key: st.createKey } };
-    }
-    return null;   // 未归类
-  }
-
-  function convertHandoffMessage(ev) {
-    if (ev.origin !== window.location.origin) return;
-    var d = ev.data;
-    if (!d || typeof d !== "object") return;
-    if (d.type === HANDOFF_ACK) {
-      convertHandoff.acked = true;
-      return;
-    }
-    if (d.type === HANDOFF_DONE) {
-      // 工具页发布完成（目标关联已在工具页按服务端权限完成）
-      toast(tt("upload.kfb.done", { name: d.slideId || "" }), "success");
-      loadAll();
-      reloadProjectsAndUnfiled();
-    }
-  }
-
-  function ensureConvertHandoffListener() {
-    if (convertHandoff.listenerOn) return;
-    window.addEventListener("message", convertHandoffMessage);
-    convertHandoff.listenerOn = true;
-  }
-
-  /// 「在本机转换并上传」点击：popup 交接。弹窗被拦截 → 明示 + 工具页链接
-  ///（选择不静默丢失：允许弹窗后重按同一按钮即可重试）。
-  /// 阶段 1 扩展：MRXS 文件夹交接——bundle = [{file, relPath}] 数组 +
-  /// folderName；单文件仍走 file 字段（两者互斥，工具页按序消费）。
-  function openConvertHandoff(file, row, bundle) {
-    ensureConvertHandoffListener();
-    var target = convertHandoffTarget();
-    var popup = null;
-    try {
-      popup = window.open(CONVERT_HANDOFF_URL, "pt-convert-upload");
-    } catch (e) {
-      popup = null;
-    }
-    if (!popup || popup.closed) {
-      row.setStage("upload.kfb.popup.blocked");
-      // 明确的工具页链接（手动入口——需要用户重新选择文件）
-      var link = document.createElement("a");
-      link.href = CONVERT_HANDOFF_URL;
-      link.target = "_blank";
-      link.rel = "noopener";
-      link.textContent = tt("upload.kfb.tools.link");
-      if (row._row && row._row.appendChild && !row._toolsLink) {
-        row._row.appendChild(link);
-        row._toolsLink = link;
-      }
-      // 行保留：允许弹窗后重按同一按钮重试
-      toast(tt("upload.kfb.popup.blocked"), "error");
-      return false;
-    }
-    convertHandoff.popup = popup;
-    convertHandoff.acked = false;
-    row.setStage("upload.kfb.handoff.sent");
-    // popup 加载完成前 postMessage 可能丢失：重投至 ack（File/数组结构化
-    // clone，零字节复制；工具页幂等去重）
-    var attempts = 0;
-    var timer = setInterval(function () {
-      attempts++;
-      var closed = false;
-      try { closed = popup.closed; } catch (e) { closed = true; }
-      if (convertHandoff.acked || closed || attempts > 150) {
-        clearInterval(timer);
-        if (!convertHandoff.acked && !closed) {
-          row.setStage("upload.kfb.popup.blocked");
-        }
-        return;
-      }
-      try {
-        popup.postMessage({
-          type: HANDOFF_MSG,
-          file: bundle ? null : file,
-          bundle: bundle || null,          // [{file, relPath}]（MRXS 文件夹）
-          folderName: bundle ? (convertHandoff._folderName || null) : null,
-          target: target,
-        }, window.location.origin);
-      } catch (e) { /* retry next tick */ }
-    }, 400);
+  /// 需要本机转换的文件在面板内转换不可用时的**唯一**收口：行内说明 +
+  /// 「重试」（重新走 uploadFile → 面板初始化/分类）+「申请支持该格式」。
+  /// retry 闭包带原始输入（单文件 File 或文件夹成员行），重试不丢用户选择。
+  /// 已有行（单文件 uploadFile 分流）就地复用；无行（MRXS 文件夹）新建。
+  function convertNeededUnavailable(file, displayName, retry, existingRow) {
+    var row = existingRow || makeUploadRow({
+      name: displayName || (file && file.name) || "?",
+      size: (file && file.size) || 0,
+    });
+    row.setStage("upload.kfb.unavailable");
+    addRowButton(row, tt("upload.cos.retry"), retry);
+    addRowButton(row, tt("upload.inline.action.requestSupport"), function () {
+      openSupportForEntry({ name: displayName || (file && file.name) || "",
+        error: { code: "needs_conversion" } });
+    });
     row.finish(60000);
-    return true;
   }
-
-  /// 抽屉内的待转换区（抽屉遮罩盖住侧栏上传行，侧栏在窄屏/收起时也不可见）
-  function drawerConvertOfferHost() {
-    var panel = els.importPanelLocal;
-    if (!panel || !panel.insertBefore) return null;
-    var host = document.getElementById("import-convert-offers");
-    if (!host) {
-      host = document.createElement("div");
-      host.id = "import-convert-offers";
-      host.className = "import-convert-offers";
-      host.setAttribute("role", "status");
-      var title = document.createElement("div");
-      title.className = "import-convert-offers-title";
-      title.textContent = tt("upload.kfb.drawer.title");
-      host.appendChild(title);
-      panel.insertBefore(host, panel.firstChild);
-    }
-    return host;
-  }
-
-  /// KFB/KFBF/MRXS 文件夹行：不判失败——给出「在本机转换并上传」入口
-  ///（能力词表内）。bundle 形态（MRXS 文件夹）：file 为 null，bundle 是
-  /// [{file, relPath}]；展示名用文件夹名。待操作入口不是完成通知：保留到
-  /// 用户点击或忽略，不定时移除。
-  function offerBrowserConvert(file, row, bundle) {
-    row.setStage("upload.kfb.hint");
-    var displayName = (file && file.name) ||
-      (bundle && bundle.folderName) || "";
-    var drawerItem = null;
-    var drawerHost = null;
-    var buttons = [];
-    function removeDrawerItem() {
-      if (!drawerItem) return;
-      if (drawerItem.parentNode) drawerItem.parentNode.removeChild(drawerItem);
-      drawerItem = null;
-      if (drawerHost && drawerHost.parentNode &&
-          drawerHost.querySelectorAll(".import-convert-offer").length === 0) {
-        drawerHost.parentNode.removeChild(drawerHost);
-      }
-    }
-    function start() {
-      convertHandoff._folderName = bundle ? bundle.folderName : null;
-      if (openConvertHandoff(file, row, bundle ? bundle.rows : null)) {
-        removeDrawerItem();
-        buttons.forEach(function (b) { if (b && b.parentNode) b.parentNode.removeChild(b); });
-      }
-    }
-    function dismiss() {
-      removeDrawerItem();
-      row.finish(0);
-    }
-    buttons.push(addRowButton(row, tt("upload.kfb.btn"), start));
-    buttons.push(addRowButton(row, tt("upload.kfb.dismiss"), dismiss));
-    if (importDrawerState.open) {
-      var host = drawerHost = drawerConvertOfferHost();
-      if (host) {
-        drawerItem = document.createElement("div");
-        drawerItem.className = "import-convert-offer";
-        var label = document.createElement("div");
-        label.className = "import-convert-offer-name";
-        label.textContent = displayName;
-        drawerItem.appendChild(label);
-        var go = document.createElement("button");
-        go.type = "button";
-        go.className = "btn primary small import-convert-offer-btn";
-        go.textContent = tt("upload.kfb.btn");
-        go.addEventListener("click", function (e) { if (e) e.preventDefault(); start(); });
-        var no = document.createElement("button");
-        no.type = "button";
-        no.className = "btn secondary small import-convert-offer-dismiss";
-        no.textContent = tt("upload.kfb.dismiss");
-        no.addEventListener("click", function (e) { if (e) e.preventDefault(); dismiss(); });
-        drawerItem.appendChild(go);
-        drawerItem.appendChild(no);
-        host.appendChild(drawerItem);
-        try { go.focus(); } catch (e) { /* 聚焦失败不影响操作 */ }
-      }
-    }
-  }
-
 
   var COS_JOBS_KEY = "pt.cos.jobs";
 
@@ -11132,19 +10974,10 @@
   }
 
   // ---------- 稳定机器码 → 可读文案（未知码保留原文的兜底模式） ----------
-  /// `convert_in_browser` 的**条件性入口**（设计 §8 / 第四轮复审 A5）：
-  /// 面板内转换开启时面板会自行回队处理，文案**不给**链接（给链接反而误导）；
-  /// 关闭时用户只能在工具页完成，追加一个可点的工具页链接。
-  /// 文案里的 {link} 是占位（i18n 里不再写死路径）。
+  /// `convert_in_browser`（服务端识别漏判）：面板内转换会自动回队处理；该
+  /// 文案不再携带转换器页面链接（2026-10-20 起工作台绝不跳转换器页上传）。
   function convertInBrowserMessage() {
-    var cfg = inlineEnabled() ? inlineConvertCaps() : null;
-    if (cfg && cfg.enabled) {
-      return tt("upload.cos.err.convert_in_browser", { link: "" }).trim();
-    }
-    var url = (cfg && cfg.url) || CONVERT_HANDOFF_URL;
-    return tt("upload.cos.err.convert_in_browser", {
-      link: " " + tt("upload.kfb.tools.link") + "(" + url + ")",
-    });
+    return tt("upload.cos.err.convert_in_browser");
   }
 
   /// 服务端跨账号核对拒绝（P1 cross-account 2026-10-15）：POST /api/ingestions
@@ -11218,11 +11051,14 @@
     return known[stage] ? "upload.cos.stage." + stage : "upload.stage.failed";
   }
 
-  function cosShowStage(row, b, noteOverride) {
-    // 阶段文案唯一入口：上传阶段百分比由字节事件驱动（uploadFileCos 另设），
-    // 下载进度用服务端持久 checkpoint（downloaded_bytes/declared_size）——
-    // 上传 100% ≠ 可查看，绝不合成全流程百分比（§5）。无量化信息的服务端
-    // 阶段用不定态活动指示（U1 §2.3：所有百分比只表示当前阶段）。
+  /// 服务端阶段 → 行视图（**直传与转换产物共用**的映射，P2 复核 2026-10-20
+  /// 「其他差异 1」：转换产物的 status 回调此前只传阶段名，丢掉下载分母与
+  /// 不定态指示——现在两处都走这一个纯函数）。用户口径固定五步：
+  /// 服务器接收/校验/处理/准备可查看统一显示「服务器正在处理」，仅在
+  /// 当前阶段确有真实分母（服务器接收 checkpoint 的 downloaded_bytes /
+  /// declared_size）时显示百分比；其余阶段一律不定态活动指示，绝不把接收
+  /// 字节百分比冒充完整处理进度，也绝不虚构定时器进度。
+  function cosStageView(b, noteOverride) {
     var frac = null;
     var indeterminate = false;
     if (b && b.stage === "downloading" && typeof b.downloaded_bytes === "number" &&
@@ -11230,7 +11066,7 @@
       frac = Math.min(b.downloaded_bytes / b.declared_size, 1);
     } else if (b) {
       // 上传（恢复行/探测期）与其余服务端阶段：无字节量化 → 不定态活动指示；
-      // 上传中的字节事件由 uploadFileCos 的 progress 分支另行驱动
+      // 上传中的字节事件由引擎的 progress 分支另行驱动
       indeterminate = true;
     }
     var note = noteOverride || "";
@@ -11251,7 +11087,13 @@
         note = tt("upload.cos.conv_state", { s: b.conversion.state });
       }
     }
-    row.setStage(cosStageKey(b && b.stage), frac, note, indeterminate);
+    return { key: cosStageKey(b && b.stage), frac: frac,
+             indeterminate: indeterminate, note: note };
+  }
+
+  function cosShowStage(row, b, noteOverride) {
+    var view = cosStageView(b, noteOverride);
+    row.setStage(view.key, view.frac, view.note, view.indeterminate);
   }
 
   // COS 行操作按钮（取消/重试/改用平台上传）：现有上传行无按钮先例，
@@ -11283,10 +11125,35 @@
     // 持久化经注入适配器落到 localStorage pt.cos.jobs（§5：只存非秘密 job id
     // 与文件提示；签名 URL 短 TTL 且属凭证，绝不落 localStorage）。
     opts = opts || {};
+    // P2 复核 2026-10-20（问题 1）：**唯一结果通道**——本函数所有「引擎尚未
+    // 创建」的出口（引擎缺失、等锁被取消、拿到锁后发现已取消）都必须恰好
+    // 收口一次：行 UI 就地收尾，结果经 opts.onOutcome 交回编排器，让它释放
+    // 上传槽、调度下一条、且绝不新建服务器任务。没有这条通道时（旧代码）
+    // 等锁取消只 abort 等待就返回，外层 Promise 永不收口——上传槽被永久
+    // 占住，后续文件全部停在排队（复核脚本 cancelDuringContentLock）。
+    // 同一通道也保证**迟到回调**（取消后才 resolve 的锁/引擎回执）不能再
+    // 二次收口：outcomeSettled 恒为闸。
+    var outcomeSettled = false;
+    var inflightJobId = null;   // 本行当前服务器任务（收口时从在传表清除）
+    function entryCancelled() {
+      if (opts.isCancelled && opts.isCancelled()) return true;
+      return !!(lockAbort && lockAbort.signal && lockAbort.signal.aborted);
+    }
+    function settleOutcome(body, err) {
+      if (outcomeSettled) return;
+      outcomeSettled = true;
+      if (inflightJobId) delete cosInflightJobs[inflightJobId];
+      dropRowCancelBtn();   // 终态：行上的「取消」一并摘除
+      dropVisPoke();        // 注销可见性触点（别留悬空监听）
+      if (opts.onOutcome) opts.onOutcome(body, err);
+    }
     if (!window.HP_COS_UPLOAD || !COS_UPLOAD_CONFIG) {
       row.markError();
       row.setStage("upload.stage.failed");
       row.finish(10000);
+      // P2 问题 1 的同族出口：引擎缺失也是「建引擎前失败」——面板条目同样
+      // 必须收到结果（否则条目永久停在 uploading 占住上传槽）。
+      settleOutcome(null, { data: { code: "cos_unavailable" } });
       return;
     }
     // 跨账号归属绑定（P1 cross-account 2026-10-15）：本次上传开始时**冻结**
@@ -11349,11 +11216,12 @@
       // 后，行上残留的「取消」必须是空操作——绝不把完成行翻回「已取消」，
       // 也绝不补发 cancel 请求（服务端对已发布资产只会拒绝）。摘除由下面的
       // done 收口挂钩负责（三种终态同一路径）。
+      if (outcomeSettled) return;
       if (upload && typeof upload.settled === "function" && upload.settled()) {
         return;
       }
       if (lockAbort) { try { lockAbort.abort(); } catch (e) {} }
-      if (!upload) return;
+      if (!upload) return;   // 等锁中：abort 由锁等待的 reject 分支收口（下同）
       row.setStage("upload.cos.cancelled");
       row.finish(10000);
       upload.cancel();
@@ -11385,11 +11253,11 @@
       // 取消边界（独立复核 #3 问题 1 的顺查）：内容锁等待期间被面板取消
       // （编排器 cancel → entry.cancelled，此刻引擎尚未创建、无处停传）→
       // 不建引擎、不 POST /api/ingestions，释放刚拿到的锁并以取消回执收口。
-      if (opts.isCancelled && opts.isCancelled()) {
+      // P2 问题 1 修复：取消判定同时看行「取消」的 abort 信号（等锁取消在
+      // 旧代码只走下面的 reject 分支且不收口——那是卡槽 bug 本体）。
+      if (entryCancelled()) {
         if (lk && lk.release) { try { lk.release(); } catch (e) {} }
-        dropRowCancelBtn();   // 终态：行上的「取消」一并摘除（引擎无从挂钩）
-        dropVisPoke();
-        if (opts.onOutcome) opts.onOutcome(null, { cancelled: true, __cancelled: true });
+        settleOutcome(null, { cancelled: true, __cancelled: true });
         return;
       }
       upload = window.HP_COS_UPLOAD.createUpload({
@@ -11443,6 +11311,14 @@
                          cosProgressNote(null), true);
           } else if (ev.type === "created") {
             jobId = ev.jobId;
+            // 后台任务摘要（抽屉）的在传登记：收口时清除（settleOutcome）
+            inflightJobId = ev.jobId;
+            cosInflightJobs[ev.jobId] = file.name || "?";
+            // P2 问题 2：把服务器任务 id 交回条目（面板直传条目据此提供
+            // 「同任务续传」——没有它，失败后只剩「申请支持该格式」）。
+            if (typeof opts.onJobCreated === "function") {
+              try { opts.onJobCreated(ev.jobId); } catch (e) { /* 不影响上传 */ }
+            }
             // folder-experience §1.3×§5：ingestion 建成即把上传开始时冻结的
             // 目标快照按任务 ID 落盘——刷新后恢复行完成仍按原目标关联
             fbUpAssocSave(jobId, opts.assocTarget);
@@ -11465,15 +11341,13 @@
       }
       var settled = upload.done.then(function (r) {
         if (!r || r.cancelled) {
-          if (opts.onOutcome) {
-            opts.onOutcome(null, { cancelled: true, __cancelled: true });
-          }
+          settleOutcome(null, { cancelled: true, __cancelled: true });
           return;
         }
         if (opts.onOutcome) {
           // 面板直传条目：结果交回编排器收口（行 UI/关联/打开由面板负责），
           // 不在这里刷新列表与打开切片（避免与面板回调重复）
-          opts.onOutcome(r.body, null);
+          settleOutcome(r.body, null);
           return;
         }
         cosUploadSucceeded(row, r.body, file, opts.assocTarget);
@@ -11485,7 +11359,7 @@
             // 「归属账号」的证据（服务器拒绝 = 会话已不是它）。
             err.expectedAccount = frozenAccount;
           }
-          opts.onOutcome(null, err);
+          settleOutcome(null, err);
           return;
         }
         var msg;
@@ -11525,9 +11399,14 @@
                    function () { lk.release(); });
       settled.then(dropVisPoke, dropVisPoke);   // 行收口即注销可见性触点
     }, function () {
-      // 等锁被取消（AbortError）：取消按钮已把行切到「已取消」，无需再动
-      // （引擎从未创建；注销可见性触点，别留下悬空监听）
-      dropVisPoke();
+      // P2 问题 1（复核 2026-10-20）：等锁被取消（AbortError）必须经**唯一
+      // 结果通道**收口一次——引擎尚未创建、无处停传；行就地切「已取消」，
+      // 结果交回编排器（槽位释放、下一条调度、不建服务器任务）。旧代码在这
+      // 条出口只清可见性监听就返回，外层 Promise 永不收口——上传槽被永久
+      // 占住，后续文件全部停在排队（复核脚本 cancelDuringContentLock 复现）。
+      row.setStage("upload.cos.cancelled");
+      row.finish(10000);
+      settleOutcome(null, { cancelled: true, __cancelled: true });
     });
   }
 
@@ -11659,9 +11538,8 @@
   // 行渲染与按钮（§6.3 是按钮全集的唯一权威）、运行器动态 import、目标快照、
   // 完成时的关联与打开、申请支持、beforeunload。
   //
-  // 开关关闭（inline_convert.enabled=false）→ 完全退回既有弹窗交接路径
-  // （offerBrowserConvert / openConvertHandoff / handoffBundleFolder），
-  // 控制流不变（§8）。
+  // 开关关闭（inline_convert.enabled=false）或引擎初始化失败 → 需要转换的
+  // 文件行内说明 + 重试/支持（绝不跳转换器页；2026-10-20 回退语义改定）。
   // =========================================================================
 
   //: 运行器动态 import 的 URL（唯一常量；生产/测试共用）
@@ -11718,7 +11596,12 @@
             // 唯一合法形式）：先解析内层键再翻译外层，避免把键原文显示给用户。
             toast(tt(key, inlineResolveVars(vars)), kind || "info");
           },
-          refresh: function () { applyBeforeunload(); },
+          refresh: function () {
+            applyBeforeunload();
+            // P2 问题 3：本机队列变化立即重画抽屉「后台任务」的本机部分
+            //（服务器部分沿用缓存，不添网络请求）
+            refreshImportTasksLocalOnly();
+          },
           remove: inlineRowRemove,
         },
         account: function () { return String(currentUserId || ""); },
@@ -11902,8 +11785,7 @@
       if (kind === "saveLocal") {
         var sv = document.createElement("a");
         sv.className = "upload-item-btn";
-        sv.href = inlineConvertCaps() && inlineConvertCaps().url
-          ? inlineConvertCaps().url : CONVERT_HANDOFF_URL;
+        sv.href = TOOLS_PAGE_URL;
         sv.target = "_blank";
         sv.rel = "noopener";
         sv.textContent = tt("upload.inline.action.saveLocal");
@@ -11964,10 +11846,17 @@
       if (entry.jobId) out.push("discard");
     }
     if (st === "upload_failed") {
-      // §6.4/§7.3：记录在案时给「重新上传」（新建 ingestion 只由显式点击
-      // 触发，绝不自动重建）；网络/分块失败另给重试。
-      if (entry.jobId) out.push("continueUpload");
-      out.push("support");
+      // P2 问题 2（复核 2026-10-20）：恢复动作按**失败类型 + 实际服务器任务**
+      // 决定（uploadRecoveryKinds 是唯一权威表）——分块/网络失败给同任务
+      // 续传，状态轮询失败只重查同一任务，明确服务器终态给显式「重新上传」，
+      // 格式失败才给「申请支持该格式」。不再按「有没有本机转换 jobId」判定
+      //（直传条目本来就没有 jobId，旧判定把它们的恢复入口全部漏成支持申请）。
+      var recKinds = window.HP_INLINE_CONVERT &&
+        window.HP_INLINE_CONVERT.uploadRecoveryKinds ?
+        window.HP_INLINE_CONVERT.uploadRecoveryKinds(entry) : [];
+      recKinds.forEach(function (k) {
+        if (out.indexOf(k) < 0) out.push(k);
+      });
     }
     // 终态（含 `done`——`isTerminal` 已把它计入）：本地产物仍在 OPFS，这是
     // 唯一的清理入口（§6.3）。**不得**再单列 `done` 分支——那会把
@@ -11985,6 +11874,8 @@
   function inlineButtonLabel(kind, entry) {
     if (kind === "continue") return tt("upload.inline.action.continue");
     if (kind === "continueUpload") return tt("upload.inline.action.continueUpload");
+    if (kind === "recheckUpload") return tt("upload.cos.recheck");
+    if (kind === "reupload") return tt("upload.inline.action.reupload");
     if (kind === "confirmDisk") return tt("upload.inline.disk.confirm");
     if (kind === "rebindAccount") return tt("upload.inline.action.rebindAccount");
     if (kind === "retryIdentity") return tt("upload.inline.identity.retry");
@@ -12017,6 +11908,18 @@
     }
     if (kind === "continueUpload") {
       inlineOrch.act(entry.id, "continue");
+      return;
+    }
+    if (kind === "recheckUpload") {
+      // P2 问题 2：状态轮询失败 → 只重查同一任务（同 job 重入状态机，
+      // 绝不重建任务/重传分片）
+      inlineOrch.act(entry.id, "recheckUpload");
+      return;
+    }
+    if (kind === "reupload") {
+      // P2 问题 2：服务器终态 → 显式新建任务（act 内清掉旧任务 id；
+      // 只由点击触发，绝不自动重建）
+      inlineOrch.act(entry.id, "reupload");
       return;
     }
     if (kind === "discard") {
@@ -12112,6 +12015,20 @@
             directClass: entry.directClass,
             assocTarget: entry.target,
             isCancelled: function () { return !!entry.cancelled; },
+            // P2 问题 2（复核 2026-10-20）：恢复语义按**失败类型 + 实际服务
+            // 器任务记录**决定，不按是否存在本机转换 jobId。直传条目在这里
+            // 把服务器任务 id 挂到条目上（entry.uploadJobId），失败行的
+            // 「继续上传/重新检查」据此以 resumeJobId 复用同一任务——绝不
+            // 重复建任务、绝不重传已确认分块；「重新上传」（显式终态恢复）
+            // 才清掉任务 id 新建。
+            onJobCreated: function (id) {
+              entry.uploadJobId = id;
+              entry._freshUpload = false;
+            },
+            // 同任务续传：上一轮失败留下的任务 id（part/network/recheck 恢复）；
+            // 显式「重新上传」已置 _freshUpload → 不带 resumeJobId（新建任务）。
+            resumeJobId: entry._freshUpload ? null : (entry.uploadJobId || null),
+            skipConfirm: !!entry.uploadJobId && !entry._freshUpload,
             onEngine: function (upload) {
               // 取消按钮据此真正停传（设计 §5 / §6.3 的「取消」语义）
               entry._upload = upload;
@@ -12337,7 +12254,12 @@
               ev.determinate === false ? null : ev.frac,
               bytesNote, ev.determinate === false);
           } else if (ev.type === "status" && ev.body) {
-            inlineRowSetStage(entry, "upload.cos.stage." + (ev.body.stage || "uploading"));
+            // P2 复核 2026-10-20（其他差异 1）：转换产物与直传**共用同一个
+            // 服务端阶段映射**（cosStageView）——有真实分母（服务器接收
+            // checkpoint）才显示百分比，否则不定态活动指示；不再丢 frac/
+            // indeterminate，也不把接收字节百分比冒充完整处理进度。
+            var sv = cosStageView(ev.body);
+            inlineRowSetStage(entry, sv.key, sv.frac, sv.note, sv.indeterminate);
           } else if (ev.type === "created") {
             entry.uploadJobId = ev.jobId;
           }
@@ -12401,15 +12323,12 @@
     cosErrorMessage: cosErrorMessage,
     initCosUploadUi: initCosUploadUi,
     restoreCosJobs: restoreCosJobs,
-    // R1 一键转换并上传（工作台入口的驱动面）
+    // R1 一键转换并上传（工作台入口的驱动面）；转换器交接已移除（2026-10-20）
     browserConvertFormats: browserConvertFormats,
     isBrowserConvertFile: isBrowserConvertFile,
-    convertHandoffTarget: convertHandoffTarget,
-    openConvertHandoff: openConvertHandoff,
-    // 阶段 1（先转换后上传）：分类分流与交接扩展（测试驱动面）
+    convertNeededUnavailable: convertNeededUnavailable,
+    // 分类分流（测试驱动面；转换器交接已于 2026-10-20 移除）
     uploadFileClassified: uploadFileClassified,
-    offerBrowserConvert: offerBrowserConvert,
-    handoffBundleFolder: handoffBundleFolder,
     importDroppedDirectory: importDroppedDirectory,
     // 上传面板内转换（docs/upload-inline-convert-design-20261015.md §2.2⑦；
     // 测试驱动面——面板本体在 window.HP_INLINE_CONVERT）
@@ -12568,9 +12487,11 @@
     });
   }
 
-  /// bundle 分流（设计 §2.2⑩b / §4.1.1）：开关开 → 进面板队列（绝不弹
-  /// /tools/slides）；关闭 → 既有弹窗交接（控制流不变）。
+  /// bundle 分流（设计 §2.2⑩b / §4.1.1）：面板可用 → 进面板队列；面板不可用
+  ///（开关关闭/引擎初始化失败）→ 行内说明 + 重试，绝不跳转换器页面
+  ///（2026-10-20：转换器交接已移除）。
   function importBundleRows(rows, folderName) {
+    var retryBundle = function () { importBundleRows(rows, folderName); };
     if (inlineEnabled()) {
       ensureInlineOrch().then(function (orch) {
         if (orch) {
@@ -12578,28 +12499,12 @@
             assocTarget: importTargetSnapshot(),
           });
         } else {
-          handoffBundleFolder(rows, folderName);   // 面板不可用 → 回退交接
+          convertNeededUnavailable(null, folderName, retryBundle);
         }
       });
       return;
     }
-    handoffBundleFolder(rows, folderName);
-  }
-
-  /// bundle 完整包 → 本机转换交接（弹窗 + 抽屉待操作入口，可重试）。
-  /// 仅在开关关闭（或面板初始化失败）时使用；开关开时由 importBundleRows
-  /// 进面板队列（设计 §2.2⑩b）。
-  function handoffBundleFolder(rows, folderName) {
-    var total = rows.reduce(function (a, r) {
-      return a + ((r.file && r.file.size) || 0);
-    }, 0);
-    var row = makeUploadRow({ name: folderName, size: total });
-    offerBrowserConvert(null, row, {
-      rows: rows.map(function (r) {
-        return { file: r.file, relPath: r.relPath };
-      }),
-      folderName: folderName,
-    });
+    convertNeededUnavailable(null, folderName, retryBundle);
   }
 
   /// 「选择文件夹（MRXS）」（webkitdirectory input）→ 与拖入目录同一交接。
@@ -12637,6 +12542,7 @@
     maxSampleBytes: 64 * 1024 * 1024,   // /api/slide-formats 下发后覆盖
     taskTimer: null,
     taskPollStopped: false,  // 401/403 后停止（权限失效，重试无意义）
+    lastServerTasks: null,   // 最近一次 /api/conversions 合并结果（本机队列立即重画用）
     lastFocusEl: null,
     // folder-experience §1：目标选择会话——每次打开抽屉 generation 前进；
     // 用户操作任一目标下拉/新建名后 dirty=true，迟到的项目列表不得覆盖。
@@ -13107,6 +13013,37 @@
     });
   }
 
+  // ---- P2 复核 2026-10-20（问题 3）：上传队列跟随选择入口 ----
+  // 行容器（#upload-progress-list）是**唯一**的任务列表：抽屉打开时整容器
+  // 移动到抽屉宿主（#import-upload-host，与「选择文件」同一面板），关闭时移
+  // 回侧栏。移动 DOM 节点保留其监听器，行不需要任何改造；不存在第二份独立
+  // 任务列表。侧栏折叠/小屏时抽屉自持宿主，进度与取消（重试）始终可达。
+  var uploadListHome = null;   // 行容器的原始父节点（侧栏）
+  function syncUploadRowLocation() {
+    var list = els.uploadProgressList;
+    if (!list || !list.parentNode) return;
+    if (!uploadListHome) uploadListHome = list.parentNode;
+    var host = (importDrawerState.open && els.importUploadHost) || uploadListHome;
+    if (list.parentNode !== host) host.appendChild(list);
+  }
+
+  function initUploadRowHostSync() {
+    var list = els.uploadProgressList;
+    if (!list) return;
+    if (!uploadListHome) uploadListHome = list.parentNode;
+    // 块显隐随行存在性切换（无行时整个「上传任务」块隐藏，不占空）；
+    // MutationObserver 集中处理 makeUploadRow / removeLater / inlineRowRemove
+    // 的所有增删路径，不必在每个调用点接线。
+    var block = els.importUploadsBlock;
+    if (block && typeof MutationObserver === "function") {
+      var syncVisible = function () {
+        block.hidden = list.childElementCount === 0;
+      };
+      new MutationObserver(syncVisible).observe(list, { childList: true });
+      syncVisible();
+    }
+  }
+
   // ---------- 后台任务列表（GET /api/conversions?group=…；轮询） ----------
   function conversionStateLabel(state) {
     switch (state) {
@@ -13119,13 +13056,59 @@
     }
   }
 
+  /// 本机进行中的上传/转换任务摘要（P2 复核 2026-10-20 问题 3）：面板条目
+  ///（inlineOrch）+ 直传/恢复行（pt.cos.jobs）。「后台任务」空态必须包含
+  /// 它们——旧实现只查 /api/conversions，用户刚选完文件、浏览器正在本机
+  /// 转换/上传时却显示「暂无进行中的任务」（复核脚本 picker-progress）。
+  /// 这里只读同一线条目的**当前状态**（与行共用状态，不是第二份任务）。
+  /// 本标签**正在进行**的直传任务（uploadFileCos 建引擎时登记、收口时清除；
+  /// 刷新恢复的只读行不算——它们没有在传字节）。与面板条目共用去重键。
+  var cosInflightJobs = {};
+
+  function localUploadTaskSummaries(skipIngestionIds) {
+    var out = [];
+    var skip = skipIngestionIds || {};
+    if (inlineOrch && typeof inlineOrch.list === "function") {
+      inlineOrch.list().forEach(function (e) {
+        if (!e) return;
+        if (e.uploadJobId) skip[e.uploadJobId] = true;
+        var active = e.state === "converting" || e.state === "convert_queued" ||
+          e.state === "upload_queued" || e.state === "uploading" ||
+          e.state === "requeue_convert" || e.state === "identity_wait" ||
+          e.state === "need_disk_confirm";
+        if (!active) return;
+        var label = (e.stage && e.stage.key) ? tt(e.stage.key) : "";
+        out.push({ name: e.artifactName || e.name, state: label });
+      });
+    }
+    Object.keys(cosInflightJobs).forEach(function (id) {
+      if (skip[id]) return;
+      out.push({ name: cosInflightJobs[id],
+                 state: tt("upload.cos.stage.uploading") });
+    });
+    return out;
+  }
+
+  /// 服务器转换任务缓存 + 本机队列的**立即**重画（不网罗网络请求）：面板条
+  /// 目状态变化（ui.refresh）时只重算 localUploadTaskSummaries——选完文件的
+  /// 一两秒内抽屉就要能看到任务，不等下一个 5s 轮询。
+  function refreshImportTasksLocalOnly() {
+    if (!importDrawerState.open || !els.importTaskList) return;
+    renderImportTasks(importDrawerState.lastServerTasks || [],
+                      localUploadTaskSummaries());
+  }
+
   function refreshImportTasks() {
     if (!els.importTaskList || !importDrawerState.open) return;
     apiFetch("/api/conversions?group=open").then(jsonBody)
       .then(function (openRes) {
         if (openRes.status === 401 || openRes.status === 403) {
           importDrawerState.taskPollStopped = true;
-          els.importTaskList.textContent = t("imp.tasks.auth.stop");
+          // 服务器任务拿不到时，本机队列照常展示（不能因此显示「无任务」）
+          var local = localUploadTaskSummaries();
+          importDrawerState.lastServerTasks = [];
+          if (local.length) renderImportTasks([], local);
+          else els.importTaskList.textContent = t("imp.tasks.auth.stop");
           return null;
         }
         // recent 合并展示（open 优先去重；失败不影响 open 列表）
@@ -13142,22 +13125,46 @@
         ((res.recentRes.body && res.recentRes.body.items) || []).forEach(function (j) {
           if (!seen[j.conversion_job_id]) { seen[j.conversion_job_id] = true; items.push(j); }
         });
-        renderImportTasks(items);
+        importDrawerState.lastServerTasks = items;
+        renderImportTasks(items, localUploadTaskSummaries());
       })
       .catch(function () {
-        // 网络故障：明确「暂时无法获取进度」，下次轮询继续（不判失败）
-        if (els.importTaskList) els.importTaskList.textContent = t("imp.tasks.net.err");
+        // 网络故障：明确「暂时无法获取进度」，下次轮询继续（不判失败）；
+        // 本机队列仍在进行时照常列出（不显示「无任务」）。
+        var local = localUploadTaskSummaries();
+        if (els.importTaskList) {
+          if (local.length) renderImportTasks([], local);
+          else els.importTaskList.textContent = t("imp.tasks.net.err");
+        }
       });
   }
 
-  function renderImportTasks(items) {
+  function renderImportTasks(items, localItems) {
     if (!els.importTaskList) return;
     els.importTaskList.innerHTML = "";
-    if (!items || !items.length) {
+    var locals = localItems || [];
+    if ((!items || !items.length) && !locals.length) {
       els.importTaskList.textContent = t("imp.tasks.empty");
       return;
     }
-    items.slice(0, 20).forEach(function (job) {
+    // 本机队列（面板转换/COS 上传）在前：用户刚选的文件排最前（P2 问题 3）
+    locals.forEach(function (lt) {
+      var row = document.createElement("div");
+      row.className = "imp-task-row state-local";
+      var mid = document.createElement("div");
+      mid.className = "imp-task-mid";
+      var nm = document.createElement("div");
+      nm.className = "imp-task-name";
+      nm.textContent = truncateMiddle(String(lt.name || "?"), 36);
+      var st = document.createElement("div");
+      st.className = "imp-task-state";
+      st.textContent = lt.state || "";
+      mid.appendChild(nm);
+      mid.appendChild(st);
+      row.appendChild(mid);
+      els.importTaskList.appendChild(row);
+    });
+    (items || []).slice(0, 20).forEach(function (job) {
       var row = document.createElement("div");
       row.className = "imp-task-row state-" + (job.state || "");
       var mid = document.createElement("div");
@@ -13754,6 +13761,8 @@
     importDrawerState.targetDirty = false;
     els.importDrawer.hidden = false;
     if (els.importDrawerMask) els.importDrawerMask.hidden = false;
+    // P2 问题 3：行容器移动到抽屉宿主（与选择文件的同一面板；关抽屉移回）
+    syncUploadRowLocation();
     // 目标下拉按当前项目列表重建（会话内选择保留）
     var listFresh = false;
     apiFetch("/api/projects").then(jsonBody).then(function (res) {
@@ -13783,6 +13792,8 @@
     importDrawerState.open = false;
     els.importDrawer.hidden = true;
     if (els.importDrawerMask) els.importDrawerMask.hidden = true;
+    // P2 问题 3：行容器移回侧栏（唯一列表，不复制）
+    syncUploadRowLocation();
     stopImportTaskPolling();
     var back = importDrawerState.lastFocusEl;
     importDrawerState.lastFocusEl = null;
@@ -14532,8 +14543,8 @@
         if (els.fileInput) els.fileInput.click();
       });
     }
-    // 阶段 1：「选择文件夹（MRXS）」（webkitdirectory）→ MRXS 完整包走
-    // 本机转换交接（与拖入目录同一 handoffBundleFolder）
+    // 「选择文件夹（MRXS）」（webkitdirectory）→ MRXS 完整包走面板队列
+    //（与拖入目录同一 importBundleRows 分流）
     if (els.importPickFolder) {
       els.importPickFolder.addEventListener("click", function () {
         if (els.importFolderInput) els.importFolderInput.click();
@@ -15432,6 +15443,8 @@
     // COS 直传 Phase 4：capability 可用时渲染手动开关，并恢复未完任务的
     // 只读进度行（off 时均为无操作，上传管线行为不变）
     initCosUploadUi();
+    // P2 问题 3：上传行容器在抽屉/侧栏之间的跟随（块显隐的 MutationObserver）
+    initUploadRowHostSync();
     // 上传面板内转换（设计 §6.2 第 1/2 步）：启动期**只列出**带
     // `intent.channel === 'workbench-inline'` 的未完成任务 → 行 + 「继续转换」
     // /「继续上传」/「删除本地产物」；绝不自动开始转换或上传。

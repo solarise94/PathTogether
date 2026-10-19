@@ -12,6 +12,11 @@ store 级（默认全跑；内嵌 PostgreSQL）：
     裸 IP 字面量 referrer（IPv4/IPv6/IPv4-mapped/带端口）同样归 direct
     （2026-10-15 口径修正：合法外部来源几乎不会是裸 IP），历史 IP 字面量行
     不改写但被 top_referrers 聚合排除、recent 读取口径映射 direct；
+    自有/内部 referrer hostname（2026-10-18 口径修正：COS_FAST_RELAY_URL
+    推导的中转域名 + SITE_STATS_INTERNAL_REFERRER_HOSTS 可选配置）与同站
+    同口径归 direct，且与入口白名单语义分离（Host=中转域名仍被拒绝采集）、
+    精确 hostname 匹配（根域/未列出子域不误伤）、历史存量行不改写仅在
+    读取层排除/映射 direct；
   - 入口域名（review 2026-09-15）：SITE_STATS_ENTRY_HOSTS 独立白名单
     fail-closed——未配置/含非法项停止采集并告警；Host 缺失（None/空）或
     未命中（同机其它站点/裸 IP）静默拒绝；命中后 request_host 规范化
@@ -121,7 +126,9 @@ def _isolate(tmp_path, monkeypatch):
     """
     isolate_app(monkeypatch, tmp_path, clear_stores=True)
     for name in ("SITE_STATS_HMAC_SECRET_FILE", "PUBLIC_BASE_URL",
-                 "PUBLIC_ORIGINS", "SERVER_NAME", "SITE_STATS_ENTRY_HOSTS"):
+                 "PUBLIC_ORIGINS", "SERVER_NAME", "SITE_STATS_ENTRY_HOSTS",
+                 "COS_FAST_RELAY_URL",
+                 "SITE_STATS_INTERNAL_REFERRER_HOSTS"):
         monkeypatch.delenv(name, raising=False)
     sss._reset_warn_state()
     sss.stop_worker()          # 先停 worker（app import 可能已自起；见 app.py）
@@ -363,6 +370,102 @@ def test_ip_literal_referrer_is_direct(secret):
         "referrer_domain"] == "www.google.com"
     assert _ev(referrer="HTTP://News.Example.COM:8443/x")[
         "referrer_domain"] == "news.example.com"
+
+
+def test_relay_referrer_is_direct_at_collection(secret, monkeypatch):
+    """自有 COS fast 中转域名的 Referer 与同站跳转同口径归 direct（采集）。
+
+    生产事实（review 2026-10-18）：COS_FAST_RELAY_URL=
+    https://goapi.solarise94.fun，近 30 天 13 条 referrer_domain=
+    goapi.solarise94.fun 事件（公开 HTML GET）把「外部来源 Top 10」榜污染。
+    修复口径：中转域名是本服务自己的基础设施，不是外部来源——采集归
+    direct；大小写/端口/尾点规范化后仍命中；真实外部来源（google/baidu）
+    保留；solarise94.fun 根域与未列出子域不受影响（精确 hostname，不做
+    后缀匹配）。"""
+    monkeypatch.setenv("COS_FAST_RELAY_URL", "https://goapi.solarise94.fun")
+    assert sss._internal_referrer_hosts() == {"goapi.solarise94.fun"}
+    for referrer in ("https://goapi.solarise94.fun/",
+                     "HTTPS://GoAPI.Solarise94.FUN/a?b=c#f",
+                     "https://goapi.solarise94.fun.:8443/guide",
+                     "http://GOAPI.solarise94.fun:8080/login"):
+        ev = _ev(referrer=referrer)
+        assert ev is not None, referrer
+        assert ev["referrer_domain"] == "direct", referrer
+    # 真实外部来源照常保留
+    assert _ev(referrer="https://www.google.com/search?q=x")[
+        "referrer_domain"] == "www.google.com"
+    assert _ev(referrer="https://www.baidu.com/s?wd=x")[
+        "referrer_domain"] == "www.baidu.com"
+    # 精确 hostname：根域与未列出子域不是自有来源（不做后缀/父域匹配）
+    assert _ev(referrer="https://solarise94.fun/")[
+        "referrer_domain"] == "solarise94.fun"
+    assert _ev(referrer="https://other.solarise94.fun/x")[
+        "referrer_domain"] == "other.solarise94.fun"
+
+
+def test_relay_host_still_rejected_as_request_host(secret, monkeypatch):
+    """自有 referrer 集合绝不参与采集准入：Host=中转域名仍被入口白名单
+    静默拒绝（review 2026-10-18 红线：目标域名决定「是不是本服务访问」，
+    中转域名不是公开服务入口，绝不为此改 SITE_STATS_ENTRY_HOSTS /
+    PUBLIC_ORIGINS）。"""
+    monkeypatch.setenv("COS_FAST_RELAY_URL", "https://goapi.solarise94.fun")
+    assert _ev(host="goapi.solarise94.fun") is None
+    assert _ev(host="GOAPI.Solarise94.FUN:443") is None
+    # 语义分离：入口白名单与公网入口集合都不含中转域名
+    assert sss._stats_entry_hosts() == {"histopilot.com", "pt.solarise94.fun"}
+    assert "goapi.solarise94.fun" not in sss._public_entry_hostnames()
+    assert "goapi.solarise94.fun" not in sss._self_hostnames()
+
+
+def test_internal_referrer_hosts_env_and_relay_derivation(
+        secret, monkeypatch, caplog):
+    """集合推导与可选专用配置 SITE_STATS_INTERNAL_REFERRER_HOSTS。
+
+    - COS_FAST_RELAY_URL 未配置/畸形 → 空集贡献，不抛异常（采集/面板均
+      不受影响，也没有任何来源被误排除）；
+    - 专用配置每项容忍裸 hostname / 完整 origin / 带端口 / 尾点 / 大小写，
+      统一规范化；与中转域名推导取并集；
+    - 含非法项 → 整份作废（fail-closed，不"跳过坏项继续用"）+ 节流告警，
+      中转域名推导不受影响，作废项也不再参与归类。"""
+    # 未配置：空集，referrer 不受影响
+    monkeypatch.delenv("COS_FAST_RELAY_URL", raising=False)
+    monkeypatch.delenv("SITE_STATS_INTERNAL_REFERRER_HOSTS", raising=False)
+    assert sss._internal_referrer_hosts() == set()
+    assert sss._referrer_domain(
+        "https://goapi.solarise94.fun/") == "goapi.solarise94.fun"
+    # 畸形 URL：不抛异常，不贡献 hostname
+    for bad in ("", "::::", "https://", "https://:8443"):
+        monkeypatch.setenv("COS_FAST_RELAY_URL", bad)
+        assert sss._internal_referrer_hosts() == set(), repr(bad)
+    monkeypatch.setenv("COS_FAST_RELAY_URL", "https://goapi.solarise94.fun")
+    # 专用配置：origin/大小写/端口/尾点规范化；与中转域名推导取并集；
+    # 空项忽略
+    monkeypatch.setenv("SITE_STATS_INTERNAL_REFERRER_HOSTS",
+                       " HTTPS://Relay2.Example.COM:8443., "
+                       "relay3.example.com ,,")
+    assert sss._internal_referrer_hosts() == {
+        "goapi.solarise94.fun", "relay2.example.com", "relay3.example.com"}
+    assert sss._referrer_domain("https://relay2.example.com/x") == "direct"
+    # 配置非法项：整份作废 + 节流告警；中转域名推导不受影响
+    sss._reset_warn_state()
+    monkeypatch.setenv("SITE_STATS_INTERNAL_REFERRER_HOSTS",
+                       "relay2.example.com,bad host!!")
+    with caplog.at_level(logging.WARNING, logger="svs.site_stats"):
+        assert sss._internal_referrer_hosts() == {"goapi.solarise94.fun"}
+    assert "SITE_STATS_INTERNAL_REFERRER_HOSTS" in caplog.text
+    # 作废的配置项不再参与归类（未配置的 relay3 同样不受影响）
+    assert sss._referrer_domain(
+        "https://relay2.example.com/") == "relay2.example.com"
+    assert sss._referrer_domain(
+        "https://relay3.example.com/") == "relay3.example.com"
+    # 采集准入与专用配置无关（语义分离红线）：relay2 作废后也不再被归类，
+    # 但作为 Host 仍不在入口白名单、拒绝采集；正常入口 + relay referrer
+    # 照常落事件（正对照，证明 None 来自准入而非 secret 缺失）
+    assert _ev(host="relay2.example.com",
+               referrer="https://relay2.example.com/") is None
+    ev = _ev(referrer="https://relay3.example.com/")
+    assert ev is not None
+    assert ev["referrer_domain"] == "relay3.example.com"
 
 
 def test_foreign_host_on_same_server_is_not_recorded(secret):
@@ -1112,6 +1215,116 @@ def test_top_referrers_exclude_ip_literal_history_rows(secret, monkeypatch):
         " GROUP BY 1 ORDER BY 1")
     assert {(r["referrer_domain"], r["n"]) for r in counts} == {
         ("43.142.130.199", 1), ("::1", 1), ("::ffff:203.0.113.9", 1)}
+
+
+def test_top_referrers_exclude_internal_referrer_history_rows(
+        secret, monkeypatch):
+    """外部来源榜排除自有中转域名的历史存量行（review 2026-10-18）。
+
+    生产事实：近 30 天 13 行 referrer_domain=goapi.solarise94.fun
+    （request_host=histopilot.cn，公开 HTML GET，均未命中 bot 规则）。采集
+    口径修正不回写历史行（不做数据迁移/删除/改判 bot）：top_referrers 经
+    ``<> ALL(%s)`` 参数化排除当前自有/内部集合，recent 明细保留行本身、
+    referrer_domain 读取口径映射为 direct——与裸 IP 字面量历史行同构。
+    精确 hostname 匹配：未列出的其它子域照常保留，不做后缀过滤。"""
+    monkeypatch.setenv("COS_FAST_RELAY_URL", "https://goapi.solarise94.fun")
+    # 生产实例的入口是 histopilot.cn——纳入白名单，使历史行进入主口径，
+    # 证明排除靠的是 referrer 规则而非 host 隔离
+    monkeypatch.setenv("SITE_STATS_ENTRY_HOSTS",
+                       ENTRY_HOSTS_DEFAULT + ",histopilot.cn")
+    human = _ev(remote_addr="198.51.100.5", path="/register",
+                referrer="https://www.google.com/search?q=histopilot")
+    _flush([human])
+    # 手工落历史形态行（绕开 build_event，模拟口径修正前的存量数据）：
+    # goapi 3 条（生产 13 条的代理）+ 未列出子域 1 条（不得被误伤）
+    conn = _conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO site_visit_events (event_id, occurred_at,"
+                " expires_at, dedup_bucket, page_key, request_host,"
+                " referrer_domain, country_code, daily_visitor_hash,"
+                " visitor_kind) VALUES"
+                " ('sve_relayhist000000000000001', %s, %s, %s, 'home',"
+                "  'histopilot.cn', 'goapi.solarise94.fun', 'unknown', %s,"
+                "  'anonymous_human'),"
+                " ('sve_relayhist000000000000002', %s, %s, %s, 'guide',"
+                "  'histopilot.cn', 'goapi.solarise94.fun', 'unknown', %s,"
+                "  'anonymous_human'),"
+                " ('sve_relayhist000000000000003', %s, %s, %s, 'login',"
+                "  'histopilot.cn', 'goapi.solarise94.fun', 'unknown', %s,"
+                "  'anonymous_human'),"
+                " ('sve_relayhist000000000000004', %s, %s, %s, 'demo',"
+                "  'histopilot.cn', 'other.solarise94.fun', 'unknown', %s,"
+                "  'anonymous_human')",
+                (BASE_TIME, BASE_TIME + timedelta(days=90),
+                 int(BASE_TIME.timestamp() // 600) + 0, "d" * 64,
+                 BASE_TIME, BASE_TIME + timedelta(days=90),
+                 int(BASE_TIME.timestamp() // 600) + 1, "e" * 64,
+                 BASE_TIME, BASE_TIME + timedelta(days=90),
+                 int(BASE_TIME.timestamp() // 600) + 2, "f" * 64,
+                 BASE_TIME, BASE_TIME + timedelta(days=90),
+                 int(BASE_TIME.timestamp() // 600) + 3, "6" * 64))
+        conn.commit()
+    finally:
+        conn.close()
+    assert _site_count() == 5
+
+    stats = sss.dashboard_stats(now=BASE_TIME)
+    # 来源榜：goapi 历史行（3 条）全部消失；未列出子域与真实外部来源照常
+    # 保留（同计数按 value 升序）
+    assert stats["top_referrers"] == [
+        {"domain": "other.solarise94.fun", "visits": 1},
+        {"domain": "www.google.com", "visits": 1}]
+    # 总览是「访问量」口径，与 referrer 无关：历史行照常计入、不删除、
+    # 不改判 bot（仍是 anonymous_human）
+    assert stats["today"]["visits"] == 5
+    assert stats["visitor_kinds"]["anonymous_human"] == 5
+    assert stats["visitor_kinds"]["suspected_bot"] == 0
+    # recent 明细保留全部行；goapi 行读取口径映射 direct，未列出子域原样
+    assert len(stats["recent"]) == 5
+    by_page = {r["page_key"]: r["referrer_domain"] for r in stats["recent"]}
+    assert by_page["home"] == "direct"
+    assert by_page["guide"] == "direct"
+    assert by_page["login"] == "direct"
+    assert by_page["demo"] == "other.solarise94.fun"
+    assert by_page["register"] == "www.google.com"
+    # 历史行不改写：goapi 域名仍原样在库
+    counts = _sql_all(
+        "SELECT referrer_domain, count(*) AS n FROM site_visit_events"
+        " WHERE position('solarise94.fun' in referrer_domain) > 0"
+        " GROUP BY 1 ORDER BY 1")
+    assert {(r["referrer_domain"], r["n"]) for r in counts} == {
+        ("goapi.solarise94.fun", 3), ("other.solarise94.fun", 1)}
+
+
+def test_dashboard_relay_exclusion_follows_live_config(secret, monkeypatch):
+    """排除集合每次调用重读 env：同一批历史行，配置生效前照常上榜（无法
+    认定自有），配置后无需任何数据改写即从榜上消失、recent 同步映射
+    direct——口径切换只取决于当前配置，存量数据零迁移。"""
+    monkeypatch.delenv("COS_FAST_RELAY_URL", raising=False)
+    monkeypatch.delenv("SITE_STATS_INTERNAL_REFERRER_HOSTS", raising=False)
+    _flush([_ev(remote_addr="198.51.100.5", referrer="https://news.example.com"),
+            _ev(remote_addr="198.51.100.6", path="/demo",
+                referrer="https://goapi.solarise94.fun/x")])
+    stats = sss.dashboard_stats(now=BASE_TIME)
+    # 未配置中转域名 → 无法认定自有：goapi 历史行照常上榜（旧口径原样，
+    # 不崩溃也不误伤）
+    assert stats["top_referrers"] == [
+        {"domain": "goapi.solarise94.fun", "visits": 1},
+        {"domain": "news.example.com", "visits": 1}]
+    # 配置生效（含畸形值 → 空集，同样不排除）后同一批行立即消失；
+    # COS_FAST_RELAY_URL 非法/为空 → 不崩溃、恢复旧口径（nothing excluded）
+    monkeypatch.setenv("COS_FAST_RELAY_URL", "https://goapi.solarise94.fun")
+    stats = sss.dashboard_stats(now=BASE_TIME)
+    assert stats["top_referrers"] == [
+        {"domain": "news.example.com", "visits": 1}]
+    assert [r["referrer_domain"] for r in stats["recent"]
+            if r["page_key"] == "demo"] == ["direct"]
+    monkeypatch.setenv("COS_FAST_RELAY_URL", "::::")
+    stats = sss.dashboard_stats(now=BASE_TIME)
+    assert {"domain": "goapi.solarise94.fun", "visits": 1} in \
+        stats["top_referrers"]
 
 
 def test_dashboard_fail_closed_when_allowlist_unconfigured(

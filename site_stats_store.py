@@ -7,6 +7,16 @@ docs review-2026-09-02-upload-user-limits-admin-ui-cleanup.md §3.4 / §4.4 /
 **没有** user/invite/session/AI usage 关联，不构建 first/last touch 或
 转化漏斗，不出现"独立用户数"（日轮换哈希跨日不可识别同一人）。
 
+自有/内部来源口径（review 2026-10-18 外部来源榜混入自有中转域名的修复）：
+``COS_FAST_RELAY_URL`` 的 hostname（生产 goapi.solarise94.fun，本服务自己的
+COS fast 中转域名）与可选配置 ``SITE_STATS_INTERNAL_REFERRER_HOSTS``（逗号
+分隔，精确 hostname）构成**独立的自有/内部 referrer 集合**——referrer 命中
+该集合时与同站跳转同口径归 direct（采集），外部来源榜排除、recent 明细按
+direct 展示（历史存量行不做数据迁移，仅读取层修正，与裸 IP 字面量同构）。
+该集合与公开服务入口白名单（``SITE_STATS_ENTRY_HOSTS``/``PUBLIC_ORIGINS``）
+**语义分离**：不参与采集准入（请求 Host 仍只认入口白名单），不做父域/
+后缀匹配（solarise94.fun 根域与未列出的其它子域不受影响）。
+
 对外契约（app.py 接线按此调用，一字不差）：
 
 - ``SITE_BOT_UA_RULESET_VERSION``：bot 词表版本常量（词表修改必须同步提版）；
@@ -29,9 +39,12 @@ docs review-2026-09-02-upload-user-limits-admin-ui-cleanup.md §3.4 / §4.4 /
   历史行（request_host IS NULL = 目标域名未知）默认排除，仅在 ``legacy``
   键单独计数。**目标域名（Host）决定「是不是本服务访问」，Referer 只表示
   「从哪里跳过来」**——外部来源榜照常保留真实外站 Referer（Google 等搜索
-  引擎是有效外部来源），**排除 direct/空与裸 IP 字面量 referrer**（裸 IP
-  只来自扫描器/本服务边缘节点，2026-10-15 口径；历史存量行不做数据迁移、
-  仅在聚合与读取层排除），**固定排除疑似爬虫**（review 2026-09-19 R4：爬虫
+  引擎是有效外部来源），**排除 direct/空、裸 IP 字面量 referrer 与自有/
+  内部 referrer hostname**（裸 IP 只来自扫描器/本服务边缘节点，2026-10-15
+  口径；自有中转域名（COS_FAST_RELAY_URL）与
+  SITE_STATS_INTERNAL_REFERRER_HOSTS 列出的 hostname 也不是外部来源，
+  2026-10-18 口径；历史存量行不做数据迁移、仅在聚合与读取层排除），
+  **固定排除疑似爬虫**（review 2026-09-19 R4：爬虫
   开关退役，含爬虫的对照口径 ``top_referrers_with_bots`` 一并移除——除该
   已退役的 UI 开关外无其他产品消费者；总览疑似爬虫计数保留）。``daily``
   每日趋势 = 近 7 天共 7 行（UTC+8 日界、缺日补 0、**严格倒序**：第 1 行
@@ -49,6 +62,9 @@ secret 文件未配置/缺失/权限过宽/为空        build_event → None（
                                             止）+ 节流 warning
 SITE_STATS_ENTRY_HOSTS 未配置/含非法项     build_event → None（fail-closed，
                                             停止采集）+ 节流 warning
+SITE_STATS_INTERNAL_REFERRER_HOSTS         仅该可选配置整份忽略（中转域名
+含非法项                                   推导不受影响）+ 节流 warning；
+                                           采集与页面服务均不受影响
 Host 缺失（None/空）/ 未命中白名单          build_event → None（静默，无
                                             日志——外部扫描拒绝是常态）
 remote_addr 缺失/不可解析                   build_event → None（无法算
@@ -179,6 +195,16 @@ _SECRET_MAX_BYTES = 4096
 #: CSP/邮件 canonical 配置，允许范围会随入口演进；统计口径要求显式严格，
 #: 未配置/含非法项一律 fail-closed 停止采集（页面服务不受影响）。
 SITE_STATS_ENTRY_HOSTS_ENV = "SITE_STATS_ENTRY_HOSTS"
+
+#: 自有/内部来源 hostname 专用 env（review 2026-10-18 来源站点治理）：逗号
+#: 分隔，每项裸 hostname 或完整 origin（https://host:port），规范化口径与
+#: ``SITE_STATS_ENTRY_HOSTS`` 相同（小写、去端口、去尾点）。**语义与公开
+#: 入口白名单分离**：本列表只影响 referrer 的「同站」归类与外部来源榜
+#: 排除，绝不参与采集准入（请求 Host 仍只认 ``SITE_STATS_ENTRY_HOSTS``），
+#: 也绝不按父域/后缀匹配——未来新增自有域名时在此**精确**追加（如中转域
+#: 名迁移后的新域名）。含非法项整份作废（fail-closed，绝不"跳过坏项继续
+#: 用"）+ 节流告警；未配置时只靠 ``COS_FAST_RELAY_URL`` 推导。
+SITE_STATS_INTERNAL_REFERRER_HOSTS_ENV = "SITE_STATS_INTERNAL_REFERRER_HOSTS"
 
 #: 白名单项（与 0053 CHECK 同一口径）的 hostname 形态
 _ENTRY_HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$")
@@ -493,6 +519,59 @@ def _public_entry_hostnames():
     return hosts
 
 
+def _internal_referrer_hosts():
+    """自有/内部 referrer hostname 集合（review 2026-10-18 来源站点治理）。
+
+    两个来源，均与公开服务入口白名单（``_stats_entry_hosts`` /
+    ``_public_entry_hostnames``）**语义分离**：
+
+    - ``COS_FAST_RELAY_URL`` 的 hostname：本服务自己的 COS fast 中转域名
+      （生产 goapi.solarise94.fun）。它不是公开服务入口，**绝不**为此把它
+      加进 ``SITE_STATS_ENTRY_HOSTS``/``PUBLIC_ORIGINS``；但公开页 Referer
+      指向它时语义是「来自本服务自己的基础设施」，与同站跳转同口径归
+      direct，不当外部来源。未配置/非法 URL（含裸 hostname 以外的畸形值）
+      → 不贡献任何 hostname，绝不抛异常、绝不误伤其它来源。
+    - ``SITE_STATS_INTERNAL_REFERRER_HOSTS``：可选专用配置（见常量注释），
+      规范化与合法性口径同 ``_stats_entry_hosts``（``_ENTRY_HOST_RE``、
+      ≤253）；含非法项整份作废 + 节流告警（fail-closed，不跳过坏项继续
+      用——半生效的排除集会让排障口径难以预测）。
+
+    只影响 referrer 归类（采集归 direct + 读取层排除/映射 direct），**不
+    参与采集准入**。精确 hostname 匹配：不做后缀/父域匹配，``solarise94.fun``
+    根域与未列出的其它子域不受影响。每次调用重读 env（与 entry hosts 同
+    口径，便于测试注入）。hostname 解析/规范化复用 ``_add_url_host`` 与
+    ``_normalize_hostname``——端口、大小写、尾点均归一；punycode/IDN 沿用
+    同款行为（不做转写，配置与 Referer 按同一规范化口径对齐即可）。
+    """
+    hosts = set()
+    _add_url_host(hosts, os.environ.get("COS_FAST_RELAY_URL"))
+    raw = (os.environ.get(SITE_STATS_INTERNAL_REFERRER_HOSTS_ENV) or "").strip()
+    if raw:
+        configured = set()
+        for part in raw.split(","):
+            item = part.strip()
+            if not item:
+                continue
+            if "//" in item:
+                try:
+                    parsed = urlparse(item).hostname
+                except ValueError:
+                    parsed = None
+                host = _normalize_hostname(parsed) if parsed else ""
+            else:
+                host = _normalize_hostname(item)
+            if not host or len(host) > 253 or not _ENTRY_HOST_RE.match(host):
+                _throttled_warn(
+                    "internal_referrer_hosts_invalid",
+                    "site_stats: %s 含非法项，整份忽略（不影响采集与页面服务）"
+                    % SITE_STATS_INTERNAL_REFERRER_HOSTS_ENV)
+                configured = set()
+                break
+            configured.add(host)
+        hosts.update(configured)
+    return hosts
+
+
 def _self_hostnames():
     """视作"同站"的 hostname 集合：统计入口白名单 + 公网入口 + SERVER_NAME
     + 本机兜底。"""
@@ -534,7 +613,12 @@ def _referrer_domain(referrer):
     「外部来源」。IP 判定在 ``_normalize_hostname`` **之前**做——后者按冒号
     截断，会把 IPv6 字面量截成 ``2001`` 之类的假 hostname 反而落成外部来源。
     历史存量行不改写，聚合/展示层排除见 ``dashboard_stats``（top_referrers）
-    与 ``_recent``。"""
+    与 ``_recent``。
+
+    自有/内部来源（2026-10-18）：referrer hostname 命中
+    ``_internal_referrer_hosts()``（COS fast 中转域名 + 可选专用配置）时与
+    同站跳转同口径归 direct——本服务自己的基础设施不是「外部来源」。精确
+    hostname 匹配，与公开入口白名单语义分离（Host 准入口径不变）。"""
     raw = (referrer or "").strip()
     if not raw:
         return "direct"
@@ -550,6 +634,8 @@ def _referrer_domain(referrer):
     if not host:
         return "direct"
     if host in _self_hostnames():
+        return "direct"
+    if host in _internal_referrer_hosts():
         return "direct"
     return host
 
@@ -969,14 +1055,17 @@ def _daily_series(start_utc, end_utc, days, entry_hosts):
 
 
 def _top_list(start_utc, end_utc, column, output_key, extra_where,
-              entry_hosts, limit=10):
+              entry_hosts, limit=10, extra_where_params=()):
     """Top-N（只计白名单入口；column/extra_where 均为模块内字面常量，不经
     外部输入）。top_referrers 排除 direct/空/裸 IP 字面量——同站跳转不是
     外部来源，裸 IP referrer 也只来自扫描器/本服务边缘节点（口径见
-    ``_referrer_domain``；历史存量行不改写、仅在聚合层排除）；来源是浏览器
-    声明的 Referer（可伪造），**固定排除疑似爬虫**（R4 2026-09-19：爬虫
-    开关退役，含爬虫的对照口径 top_referrers_with_bots 一并移除）；
-    top_countries 排除 unknown——UI 据此隐藏国家块。"""
+    ``_referrer_domain``；历史存量行不改写、仅在聚合层排除）；自有/内部
+    referrer hostname（COS fast 中转域名等，2026-10-18）经
+    ``extra_where_params`` 参数化排除（``<> ALL(%s)``；空数组时 PostgreSQL
+    恒真，SQL 形状固定）；来源是浏览器声明的 Referer（可伪造），**固定
+    排除疑似爬虫**（R4 2026-09-19：爬虫开关退役，含爬虫的对照口径
+    top_referrers_with_bots 一并移除）；top_countries 排除 unknown——UI
+    据此隐藏国家块。"""
     sql = (
         "SELECT %s AS value, count(*) AS visits"
         " FROM site_visit_events"
@@ -988,7 +1077,8 @@ def _top_list(start_utc, end_utc, column, output_key, extra_where,
     conn.row_factory = _dict_row()
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, (start_utc, end_utc, list(entry_hosts), limit))
+            cur.execute(sql, (start_utc, end_utc, list(entry_hosts),
+                              *extra_where_params, limit))
             rows = cur.fetchall()
     finally:
         conn.close()
@@ -1002,7 +1092,11 @@ def _recent(entry_hosts, limit=20):
 
     referrer_domain 读取口径（2026-10-15）：历史 IP 字面量行（采集口径修正
     前落库）不改写、照常出现在明细里，但读取时映射为 'direct'——与来源榜
-    同口径，「来源」列不再展示裸 IP；真实外部域名原样返回。"""
+    同口径，「来源」列不再展示裸 IP；真实外部域名原样返回。2026-10-18 起
+    同口径覆盖自有/内部 referrer hostname（COS fast 中转域名 +
+    SITE_STATS_INTERNAL_REFERRER_HOSTS，历史存量行如生产
+    referrer_domain=goapi.solarise94.fun 的 13 行）：明细行保留，来源列按
+    同站展示为 direct。"""
     conn = pg_store.connect()
     conn.row_factory = _dict_row()
     try:
@@ -1017,12 +1111,14 @@ def _recent(entry_hosts, limit=20):
             rows = cur.fetchall()
     finally:
         conn.close()
+    internal_hosts = _internal_referrer_hosts()
     return [{
         "occurred_at": r["occurred_at"].isoformat(),
         "page_key": r["page_key"],
         "request_host": r["request_host"],
         "referrer_domain": "direct"
-        if _is_ip_literal_host(r["referrer_domain"])
+        if (_is_ip_literal_host(r["referrer_domain"])
+            or r["referrer_domain"] in internal_hosts)
         else r["referrer_domain"],
         "country_code": r["country_code"],
         "visitor_kind": r["visitor_kind"],
@@ -1113,6 +1209,12 @@ def dashboard_stats(*, now=None):
         # SQL 与 _is_ip_literal_host 同构（含冒号 = IPv6 形态，合法 hostname
         # 不含冒号；四段纯数字 = IPv4 形态）。NULL 已被 IS NOT NULL 排除，
         # 正则作用于 NULL 得 NULL 亦不入选，空值安全。
+        # 自有/内部 referrer hostname（2026-10-18）同口径：采集已归 direct
+        # （_referrer_domain），历史存量行（生产 referrer_domain=
+        # goapi.solarise94.fun 的 13 行）不做数据迁移、仅在聚合层参数化
+        # 排除（<> ALL(%s)；空集时 PostgreSQL 恒真）。真实外部来源
+        # （google/baidu 等）不受影响；不做后缀匹配，根域与未列出子域
+        # 照常保留。
         "top_referrers": _top_list(
             d30_start, today_end, "referrer_domain", "domain",
             "AND referrer_domain IS NOT NULL"
@@ -1120,7 +1222,9 @@ def dashboard_stats(*, now=None):
             " AND referrer_domain <> ''"
             " AND referrer_domain !~ ':'"
             " AND referrer_domain !~ '^[0-9]+(\\.[0-9]+){3}$'"
-            " AND visitor_kind <> 'suspected_bot'", hosts),
+            " AND referrer_domain <> ALL(%s)"
+            " AND visitor_kind <> 'suspected_bot'", hosts,
+            extra_where_params=[sorted(_internal_referrer_hosts())]),
         "top_pages": _top_list(
             d30_start, today_end, "page_key", "page_key", "", hosts),
         "top_countries": _top_list(

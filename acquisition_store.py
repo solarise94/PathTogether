@@ -131,6 +131,13 @@ def sanitize_referrer_domain(value) -> str:
     """referrer 只保留 hostname：去 query/路径/端口/fragment，小写，截断。
 
     解析失败（裸字符串等）按无域名处理（不落可能携带 query 的原文）。
+
+    口径说明（review 2026-10-18）：本函数**有意不做**自有/内部 hostname
+    （COS fast 中转域名等，见 site_stats_store._internal_referrer_hosts）
+    → 'direct' 的映射——触点/归因写路径自 Batch B 起冻结（app.py /r/ 不再
+    落 record_visit、redeem_invite 不再写归因），不会有新增行；本函数只剩
+    历史查询/排障复用，改变其返回值语义只会扰动冻结路径的存量数据解释。
+    「外部来源榜」的自有域名排除在同仓库 site_stats_store 读取层完成。
     """
     if not isinstance(value, str) or not value.strip():
         return ""

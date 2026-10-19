@@ -203,6 +203,9 @@ test.describe("AI 入口统一（真实 bundle）", () => {
 		const card = page.locator("#ai-pending-attaches .pending-attach.marker");
 		await expect(card).toHaveCount(1);
 		await expect(card).toContainText("标注附件");
+		// 2026-10-19 P2：卡片突出显示标记名（冻结载荷的 label，用户署名；
+		// 模型上下文里的名字以 PT 网关按 annotation_id 解析的权威值为准）
+		await expect(card.locator(".ai-attach-marker-label")).toHaveText("e2e-ai-attach");
 		// interpret 预填退役：composer 文字原样保留
 		await expect(page.locator("#ai-task")).toHaveValue("帮我对比这个区域和周围");
 		// placeholder 提示切换

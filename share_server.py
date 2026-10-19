@@ -2023,8 +2023,12 @@ def share_roi_add(token):
         return jsonify(error="geometry_locked 需为布尔值"), 400
 
     try:
+        # P3-1：分享端标注是人工写路径——显式 source="human"（本就非
+        # ADMIN_TOKEN、推断即 human，这里显式化以防 token 判定规则漂移；
+        # review_status 保持 none，不出「接受」待审徽标）。
         roi = share_store.add_roi(
             token, safe, label, type=typ, note=note,
+            source="human",
             visitor=_visitor_stored(_visitor_id()),
             slide_id=roi_desc.slide_id,
             geometry_locked=bool(geometry_locked) if geometry_locked else False,

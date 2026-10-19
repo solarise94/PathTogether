@@ -270,6 +270,41 @@ def test_api_annotation_v2_and_bounds():
     assert r5.status_code == 200
 
 
+def test_api_annotation_human_post_is_human_source_no_pending():
+    """P3-1（dogfood 2026-10-19）：人工工位 POST /api/annotation 落
+    source=human、review_status=none——自己的标记不再带「待复核/接受」。
+
+    此前缺省让 add_roi 从 token==ADMIN_TOKEN 推断 source=ai+pending；
+    修复后人工路径显式 source="human"，AI 通道（/internal/ai/annotate、
+    plugin v1 annotate，显式 source="ai"）不受影响（ai/pending 语义由
+    test_ai_drawing_geom 锁定）。"""
+    _touch()
+    _setup_owner()
+    c = _client()
+    r = c.post("/api/annotation", json={
+        "slide": "demo.svs", "type": "rect", "label": "我的标记",
+        "x": 100, "y": 100, "w": 320, "h": 170,
+    })
+    assert r.status_code == 200, r.get_data(as_text=True)
+    aid = r.get_json()["annotation_id"]
+    roi = share_store.get_roi_by_annotation_id(aid)
+    assert roi["source"] == "human"
+    assert roi["review_status"] == "none"
+
+    # 工具条数据（/api/annotations 行）不出现 ai+pending 组合——前端只在
+    # it.source === "ai" && it.review_status === "pending" 时渲染「接受」。
+    r2 = c.get("/api/annotations?slide=demo.svs")
+    assert r2.status_code == 200, r2.get_data(as_text=True)
+    anns = r2.get_json()["annotations"]
+    items = [it for grp in anns for it in (grp.get("items") or [])]
+    mine = [it for it in items
+            if it.get("annotation_id") == aid or it.get("label") == "我的标记"]
+    assert mine, r2.get_data(as_text=True)
+    for it in mine:
+        assert not (it.get("source") == "ai"
+                    and it.get("review_status") == "pending")
+
+
 def test_api_patch_v2_geom_with_cas():
     _touch()
     _setup_owner()

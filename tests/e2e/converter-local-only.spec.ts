@@ -89,6 +89,25 @@ test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => localStorage.setItem("hp_lang", "zh"));
 });
 
+test.afterEach(async ({ page }) => {
+  // 转换器不上传（零任务）；防御性清场：取消本页可能遗留的 ingestion
+  try {
+    await page.evaluate(async () => {
+      const csrf = decodeURIComponent(
+        (document.cookie.split("; ").find((x) => x.startsWith("csrf_token=")) || "")
+          .split("=").slice(1).join("=") || "");
+      for (const j of JSON.parse(localStorage.getItem("pt.cos.jobs") || "[]")) {
+        if (j && j.job_id) {
+          try {
+            await fetch("/api/ingestions/" + encodeURIComponent(j.job_id) + "/cancel",
+              { method: "POST", headers: { "X-CSRF-Token": csrf } });
+          } catch { /* 尽力 */ }
+        }
+      }
+    });
+  } catch { /* 页面已关闭 */ }
+});
+
 test("转换器本地转换全程零 API/零对象存储；不登录可用；无上传入口", async ({ page }) => {
   test.setTimeout(240_000);
   const kfb = ensureKfb(KFB_W, KFB_H);
@@ -149,7 +168,7 @@ test("转换器本地转换全程零 API/零对象存储；不登录可用；无
   expect(cosPuts).toEqual([]);
 });
 
-test("历史 pending 上传意图：打开页面/继续转换不恢复上传，产物保留", async ({ page }) => {
+test("历史 pending 上传意图：继续转换不自动上传；删除经双重确认且零请求", async ({ page }) => {
   test.setTimeout(300_000);
   const kfb = ensureKfb(KFB_W, KFB_H);
   const apiCalls: string[] = [];
@@ -163,35 +182,38 @@ test("历史 pending 上传意图：打开页面/继续转换不恢复上传，�
   });
 
   await page.goto("/tools/slides");
-  // 用页面同源 runner 模块准备一个任务（同一 module 实例；零网络）
-  const jobId = await page.evaluate(async (path: string) => {
-    const bytes = await fetch(path).then((r) => r.arrayBuffer());
-    const f = new File([bytes], "legacy.kfb",
-      { type: "application/octet-stream", lastModified: 123 });
-    const mod = await import("/static/tools/slide-transform/runner.js");
-    const runner = await mod.SlideToolsRunner.create();
-    const prep = await runner.probe(f, {});
-    const started = await runner.startJob(f, { jobId: prep.jobId });
-    const result = await started.done;
-    if (!result || !result.ok) throw new Error("seed conversion failed");
-    return prep.jobId;
-  }, kfb);
+  // 用页面同源 runner 模块准备一个 PREPARED 任务（probe 完成未开始；零网络；
+  // 文件字节经 base64 注入——页面 fetch 不到文件系统路径），再注历史 pending
+  // 上传意图 + 未收口上传记录（旧版形态；「开始」按旧版会在转换后自动上传）
+  const b64 = readFileSync(kfb).toString("base64");
+  const jobId = await page.evaluate(async (b64: string) => {
+    try {
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const f = new File([bytes], "legacy.kfb",
+        { type: "application/octet-stream", lastModified: 123 });
+      const mod = await import("/static/tools/slide-transform/runner.js");
+      const runner = await mod.SlideToolsRunner.create();
+      const prep = await runner.probe(f, {});
+      // 历史 pending 上传意图（旧版「继续转换并上传」的执行依据）。遗留
+      // 上传记录只在 ready/exported 任务上合法（运行器拒绝 prepared 挂
+      // upload）——「开始」后按新语义停在结果面板、意图原样保留，即
+      // 「不自动上传」的完整观察面。
+      await runner.setJobIntent(prep.jobId, {
+        state: "pending", account: "", channel: "tool",
+        target: { pid: "legacy-project" }, createdAt: new Date().toISOString(),
+      });
+      return prep.jobId;
+    } catch (e) {
+      // 运行器的类型化错误是普通对象——转成带内容的 Error 才能进测试报告
+      throw new Error("seed failed: " + JSON.stringify(e));
+    }
+  }, b64);
   expect(jobId).toBeTruthy();
-  // 本地任务（真产物）注历史 pending 上传意图 + 未收口上传记录（旧版形态）
-  await page.evaluate(async (id: string) => {
-    const mod = await import("/static/tools/slide-transform/runner.js");
-    const runner = await mod.SlideToolsRunner.create();
-    await runner.setJobIntent(id, {
-      state: "pending", account: "", channel: "tool",
-      target: { pid: "legacy-project" }, createdAt: new Date().toISOString(),
-    });
-    await runner.setJobUpload(id, {
-      ingestionId: "ing-legacy", filename: "legacy.ome.tif", size: 1234,
-      state: "uploading", confirmedParts: [0], account: "",
-    });
-  }, jobId);
   apiCalls.length = 0;
   ingestionCalls.length = 0;
+  cosPuts.length = 0;
 
   // 刷新：任务列表恢复（不自动开始、零请求），意图不再出现「继续转换并上传」
   await page.reload();
@@ -199,20 +221,23 @@ test("历史 pending 上传意图：打开页面/继续转换不恢复上传，�
   await expect(page.locator("#jobs-details")).toBeVisible({ timeout: 30_000 });
   await expect(page.locator("#jobs-list")).toContainText("legacy.kfb", { timeout: 30_000 });
   await expect(page.locator("#jobs-list")).not.toContainText("继续转换并上传");
+  await expect(page.locator('#jobs-list button[data-action="upload"],' +
+    ' #jobs-list button[data-action="upload-continue"]')).toHaveCount(0);
   await page.waitForTimeout(3_000);
   expect(apiCalls, `刷新后 API: ${apiCalls.join(", ")}`).toEqual([]);
   expect(ingestionCalls).toEqual([]);
   expect(cosPuts).toEqual([]);
 
-  // 继续（本地转换续跑）：完成后停在结果面板——绝不自动上传、产物不丢
-  const cont = page.locator('#jobs-list button[data-action="resume"], #jobs-list button[data-action="start"]').first();
-  await cont.click();
+  // 继续（本地转换）：完成后停在结果面板——绝不自动上传；历史意图与遗留
+  // 上传记录不被静默执行/改写（不丢产物、不取消其他任务）
+  const start = page.locator('#jobs-list button[data-action="start"]').first();
+  await expect(start).toBeVisible({ timeout: 30_000 });
+  await start.click();
   await expect(page.locator("#result-section")).toBeVisible({ timeout: 240_000 });
   expect(ingestionCalls).toEqual([]);
   expect(cosPuts).toEqual([]);
   expect(apiCalls).toEqual([]);
-  // 历史意图未被静默执行/改写为 done：仍是 pending（不因继续转换而上传）
-  const intentState = await page.evaluate(async (id: string) => {
+  const state = await page.evaluate(async (id: string) => {
     const mod = await import("/static/tools/slide-transform/runner.js");
     const runner = await mod.SlideToolsRunner.create();
     const job = await runner.getJob(id);
@@ -220,9 +245,16 @@ test("历史 pending 上传意图：打开页面/继续转换不恢复上传，�
              upload: job.upload && job.upload.state,
              hasResult: !!(job.result && job.result.outputBytes) };
   }, jobId);
-  expect(intentState.hasResult).toBe(true);
-  expect(intentState.intent).toBe("pending");
-  // 不静默取消其他任务：未收口上传记录原样保留（其他标签/工作台自管）
-  expect(intentState.upload).toBe("uploading");
-  writeFileSync(join(FIXTURE_DIR, "converter-intent-seen"), "1");
+  expect(state.hasResult).toBe(true);      // 产物保留
+  expect(state.intent).toBe("pending");    // 意图未被静默执行（也未标记 done）
+  expect(state.upload).toBeFalsy();        // 零上传记录（全程未创建任务）
+
+  // 删除：零网络（不再请求平台取消）
+  page.on("dialog", (d) => d.accept());
+  await page.locator(`[data-job-discard="${jobId}"]`).click();
+  await expect(page.locator(`[data-job-discard="${jobId}"]`)).toHaveCount(0,
+    { timeout: 30_000 });
+  expect(ingestionCalls).toEqual([]);
+  expect(cosPuts).toEqual([]);
+  expect(apiCalls).toEqual([]);
 });

@@ -111,10 +111,12 @@ def test_tools_slides_csp_cos_malformed_fail_closed(_iso, monkeypatch):
         assert "myqcloud" not in csp and "evil.example" not in csp
 
 
-def test_tools_slides_assets_exist_includes_shared_uploader():
-    """C4：工具页以 classic script 加载共享 COS 引擎（CSP 'self' 允许）。"""
+def test_tools_slides_assets_local_only_no_upload_engine():
+    """2026-10-20 转换器收敛为本地转换与保存：页面不再加载 COS 上传引擎
+    （共享引擎文件保留——工作台上传面板仍在用）。"""
     html = (REPO_ROOT / "templates" / "tools_slides.html").read_text(encoding="utf-8")
-    assert 'src="/static/upload/cos-uploader.js' in html
+    assert "cos-uploader.js" not in html
+    assert 'src="/static/upload/slide-sniff.js' in html
     assert (REPO_ROOT / "static" / "upload" / "cos-uploader.js").is_file()
 
 

@@ -167,7 +167,7 @@ def test_viewable_formats_bound_to_proof(native_fixtures):
 # --------------------------------------------------------------------------- #
 # 专用端点退役（2026-10-20）：路由已删；无消费者（前端上传控制器一并移除）
 # --------------------------------------------------------------------------- #
-def test_upload_capability_endpoint_retired(_iso):
+def test_upload_capability_endpoint_retired():
     """转换器上传承诺已移除：专用能力端点返回 404（未登录同样是 404 而非
     401——路由不存在，不做 /api/* 的鉴权短路）。"""
     app_mod.app.config["TESTING"] = True

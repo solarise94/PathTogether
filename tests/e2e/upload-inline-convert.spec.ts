@@ -156,6 +156,31 @@ test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => localStorage.setItem("hp_lang", "zh"));
 });
 
+test.afterEach(async ({ page }) => {
+  // 失败路径清场：取消本页遗留的服务器任务（完成态任务 404/409 无副作用）
+  try {
+    await page.evaluate(async () => {
+      const csrf = decodeURIComponent(
+        (document.cookie.split("; ").find((x) => x.startsWith("csrf_token=")) || "")
+          .split("=").slice(1).join("=") || "");
+      const ids = new Set<string>();
+      try {
+        const o = (window as any).HP_UPLOAD && (window as any).HP_UPLOAD.inlineOrch();
+        for (const e of (o && o.list() || [])) if (e.uploadJobId) ids.add(e.uploadJobId);
+      } catch { /* 无面板 */ }
+      for (const j of JSON.parse(localStorage.getItem("pt.cos.jobs") || "[]")) {
+        if (j && j.job_id) ids.add(String(j.job_id));
+      }
+      for (const id of ids) {
+        try {
+          await fetch("/api/ingestions/" + encodeURIComponent(id) + "/cancel",
+            { method: "POST", headers: { "X-CSRF-Token": csrf } });
+        } catch { /* 尽力 */ }
+      }
+    });
+  } catch { /* 页面已关闭 */ }
+});
+
 // --------------------------------------------------------------------------- //
 // 复核 #5：auth/info 持续失败（503，route 拦截，手动放行前一直失败——
 // 自动退避重试同样被拦）→ 身份闸不落定，条目停在可见的 identity_wait

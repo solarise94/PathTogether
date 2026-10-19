@@ -1902,6 +1902,43 @@ button {
   padding: 6px;
 }
 .anno-panel-empty { color: var(--text-3); font-size: 13px; text-align: center; padding: 20px 8px; }
+/* 列表加载失败显式错误态（P3 2026-10-19）：整块替换列表内容 */
+.anno-panel-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 20px 8px;
+  text-align: center;
+}
+.anno-panel-error-msg { color: var(--danger); font-size: 13px; line-height: 1.5; }
+/* 刷新失败的失效提示条：插在既有行顶部，不清空列表 */
+.anno-panel-stale {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 2px 2px 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--danger);
+  border-radius: var(--r-row);
+  background: var(--danger-tint);
+  font-size: 12px;
+  color: var(--text-2);
+}
+.anno-panel-stale-msg { flex: 1 1 auto; text-align: left; }
+.anno-panel-retry {
+  flex: 0 0 auto;
+  padding: 3px 12px;
+  font-size: 12px;
+  border-radius: 999px;
+  border: 1px solid var(--danger);
+  background: transparent;
+  color: var(--danger);
+  cursor: pointer;
+}
+.anno-panel-retry:hover:not(:disabled) { background: var(--danger-tint); }
+.anno-panel-retry:disabled { opacity: 0.55; cursor: default; }
 .anno-group-head {
   display: flex;
   align-items: center;

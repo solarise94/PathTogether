@@ -1222,6 +1222,14 @@
   var currentAnnotations = null; // 当前切片的标注 {slide, annotations:[{label,count,items}]}
   var annoOverlays = [];   // 兼容旧引用，已不再新增（标注改画到 canvas）
   var annoPanelOpen = false;
+  // 标注列表加载失败态（P3 2026-10-19，生产误报复盘：列表接口瞬时失败曾被
+  // 渲染成「暂无标注」，与真正的空切片不可分辨）。非 401 失败（网络断开/
+  // 5xx/403/非 JSON 体）：annoListError = 当前切片列表从未成功加载（面板显
+  // 示显式错误态 + 重试）；annoListStale = 刷新失败但已有上次成功数据（保留
+  // 旧行，面板顶部插失效提示条）。401(auth_required) 仍由 apiFetch 统一跳
+  // 登录，不进这两个状态。
+  var annoListError = null;   // {status:number}；加载成功或换片即清
+  var annoListStale = false;  // true = 面板当前展示的是上次成功加载的数据
   var allSharesCache = null; // 缓存分享列表，供语言切换时重渲
 
   // ---------- AI 读片助手状态（Stage 2：平台侧仅保留叠加层） ----------
@@ -2060,6 +2068,8 @@
     els.annoAllBtn.disabled = true;
     els.annoPanel.style.display = "none";
     annoPanelOpen = false;
+    annoListError = null;
+    annoListStale = false;
     syncAnnoAllBtns();
     state.showAnno = false;
     state.focusAnno = null;
@@ -2075,29 +2085,9 @@
       // 管理员标注工具在任意打开的切片上可用（箭头/描图不依赖 mpp）
       els.annoArrowBtn.disabled = false;
       els.annoFreeBtn.disabled = false;
-      // 拉取该切片标注（P2 合同 §3.1：?slide_id= 优先，旧后端 ?slide=<名>）
-      var annoQuery = annotationsQueryFor(state.slide);
-      // 迟到响应防护（P2 复核 2026-10-18）：深链直开与快速换片时，上一个
-      // open 的标注响应可能在新切片打开后才回来——按发起时的切片对象判定，
-      // 绝不让旧响应覆盖新切片的 currentAnnotations。
-      var slideAtReq = state.slide;
-      apiFetch(annoQuery)
-        .then(function (r) { return r.json(); })
-        .then(function (data) {
-          if (state.slide !== slideAtReq) return;
-          currentAnnotations = data;
-          var annos = data.annotations || [];
-          if (annos.length > 0) {
-            els.annoBtn.disabled = false;
-            els.annoAllBtn.disabled = false;
-          }
-          editItem = null;
-          state.focusAnno = null;
-          editing = false;
-          rebuildFlatItems();
-          redrawAnnoCanvas();
-        })
-        .catch(function () { if (state.slide !== slideAtReq) return; currentAnnotations = null; editItem = null; state.focusAnno = null; editing = false; rebuildFlatItems(); redrawAnnoCanvas(); });
+      // 拉取该切片标注（P2 合同 §3.1：?slide_id= 优先，旧后端 ?slide=<名>；
+      // 迟到响应防护与非 401 失败的显式错误态见 loadCurrentSlideAnnotations）
+      loadCurrentSlideAnnotations();
     } else {
       els.annoArrowBtn.disabled = true;
       els.annoFreeBtn.disabled = true;
@@ -9401,6 +9391,111 @@
     }
   }
 
+  // ---------- 标注列表加载失败态（P3 2026-10-19） ----------
+  // 失败详情（anno.panel.load.error 的 {e}）：HTTP 状态优先，网络断开/
+  // 响应非 JSON 等无状态失败回落网络异常文案。
+  function annoLoadFailDetail(e) {
+    if (e && e.status) return "HTTP " + e.status;
+    return t("anno.panel.load.net");
+  }
+
+  // 拉取当前切片标注（openSlide 打开切片后调用；面板错误态的重试按钮复用）。
+  // 迟到响应防护（P2 复核 2026-10-18）：深链直开与快速换片时，上一个 open
+  // 的标注响应可能在新切片打开后才回来——沿用发起时的切片对象身份判定，
+  // 绝不让旧响应覆盖新切片的 currentAnnotations/失败态。
+  // 非 401 失败（网络断开/5xx/403/非 JSON 体）进入 annoListError 显式错误
+  // 态：面板按钮放开供查看错误与重试，绝不渲染成「暂无标注」冒充空切片。
+  // 401(auth_required) 由 apiFetch 统一跳登录：静默退出，不闪错误 UI。
+  function loadCurrentSlideAnnotations() {
+    if (!state.slide) return Promise.resolve();
+    var slideAtReq = state.slide;
+    annoListError = null;
+    els.annoBtn.disabled = true;
+    return apiFetch(annotationsQueryFor(state.slide))
+      .then(function (r) {
+        if (r.status === 401) throw { annoSilent: true };
+        if (!r.ok) throw { status: r.status };
+        return r.json();
+      })
+      .then(function (data) {
+        if (state.slide !== slideAtReq) return;
+        currentAnnotations = data;
+        annoListError = null;
+        var annos = data.annotations || [];
+        if (annos.length > 0) {
+          els.annoBtn.disabled = false;
+          els.annoAllBtn.disabled = false;
+        }
+        editItem = null;
+        state.focusAnno = null;
+        editing = false;
+        rebuildFlatItems();
+        redrawAnnoCanvas();
+        if (annoPanelOpen) renderAnnoPanel(annos);
+      })
+      .catch(function (e) {
+        if (e && e.annoSilent) return;          // 401：页面即将跳 /login
+        if (state.slide !== slideAtReq) return; // 晚到的旧切片响应：丢弃
+        currentAnnotations = null;
+        editItem = null;
+        state.focusAnno = null;
+        editing = false;
+        rebuildFlatItems();
+        redrawAnnoCanvas();
+        annoListError = { status: (e && e.status) || 0 };
+        // 「显示全部标记」无数据可叠加保持禁用；面板钮放开，用户可打开面板
+        // 看到显式错误并重试（修复前按钮永禁用 + 面板显示「暂无标注」）
+        els.annoAllBtn.disabled = true;
+        els.annoBtn.disabled = false;
+        if (annoPanelOpen) renderAnnoPanelError();
+      });
+  }
+
+  // 面板内显式错误态（当前切片列表从未加载成功）：文案 + 重试按钮
+  function renderAnnoPanelError() {
+    els.annoPanelList.innerHTML = "";
+    var box = document.createElement("div");
+    box.className = "anno-panel-error";
+    var msg = document.createElement("div");
+    msg.className = "anno-panel-error-msg";
+    msg.textContent = t("anno.panel.load.error",
+      { e: annoLoadFailDetail(annoListError) });
+    var retry = document.createElement("button");
+    retry.className = "anno-panel-retry";
+    retry.type = "button";
+    retry.textContent = t("anno.panel.load.retry");
+    retry.addEventListener("click", function () {
+      retry.disabled = true;
+      loadCurrentSlideAnnotations();
+    });
+    box.appendChild(msg);
+    box.appendChild(retry);
+    els.annoPanelList.appendChild(box);
+  }
+
+  // 刷新失败但面板正展示旧数据：顶部插失效提示条（保留既有行，绝不清空
+  // 重画——瞬时失败不能把用户正在看的列表抹掉）。
+  function renderAnnoPanelStale() {
+    var prev = els.annoPanelList.querySelector(".anno-panel-stale");
+    if (prev) prev.remove();
+    var box = document.createElement("div");
+    box.className = "anno-panel-stale";
+    var msg = document.createElement("span");
+    msg.className = "anno-panel-stale-msg";
+    msg.textContent = t("anno.panel.stale");
+    var retry = document.createElement("button");
+    retry.className = "anno-panel-retry";
+    retry.type = "button";
+    retry.textContent = t("anno.panel.load.retry");
+    retry.addEventListener("click", function () {
+      retry.disabled = true;
+      refreshCurrentAnnotations();
+    });
+    box.appendChild(msg);
+    box.appendChild(retry);
+    els.annoPanelList.insertBefore(box, els.annoPanelList.firstChild);
+  }
+
   // 重新拉取当前切片标注并重绘（工单 D：返回 Promise 供「选中新标注」等待）
   function refreshCurrentAnnotations() {
     if (!state.slide) { redrawAnnoCanvas(); return Promise.resolve(); }
@@ -9408,9 +9503,19 @@
     // 响应，绝不让旧切片的数据覆盖新切片的标注面板/画布。
     var slideAtReq = state.slide;
     return apiFetch(annotationsQueryFor(state.slide))
-      .then(function (r) { return r.json(); })
+      .then(function (r) {
+        if (r.status === 401) throw { annoSilent: true };
+        if (!r.ok) throw { status: r.status };
+        return r.json();
+      })
       .then(function (data) {
         if (state.slide !== slideAtReq) return;
+        // 刷新成功即清两个失败态（先于 editDrag/kbEditSession 早退：即便
+        // 本轮数据因手势不落地，错误态也不滞留——手势结束后的保存路径会
+        // 再刷新）。否则「初始失败 → 手动新建保存成功 → 重开面板」仍会
+        // 渲染错误块（review e64acaf3 #1）。
+        annoListError = null;
+        annoListStale = false;
         // 拖动/键盘编辑进行中：不重建 flatItems（item 引用会被替换，
         // 正在进行的 applyEditDrag 会改到孤儿对象）；结束后的保存路径会再刷新
         if (editDrag || kbEditSession) return;
@@ -9464,7 +9569,24 @@
         redrawAnnoCanvas();
         updateAnnoToolbarPos();
       })
-      .catch(function () {});
+      .catch(function (e) {
+        if (e && e.annoSilent) return;          // 401：页面即将跳 /login
+        if (state.slide !== slideAtReq) return; // 晚到的旧切片响应：丢弃
+        if (!currentAnnotations) {
+          // 仍在「从未加载成功」的错误态（无旧数据可保留）：维持错误态——
+          // 更新失败详情并重渲错误块，不标失效（stale 语义是「展示的是
+          // 上次成功数据」，此处没有上次数据，stale 条叠在错误块上只会
+          // 自相矛盾）（review e64acaf3 #2）。
+          annoListError = { status: (e && e.status) || 0 };
+          if (annoPanelOpen) renderAnnoPanelError();
+          return;
+        }
+        // 非 401 刷新失败（P3 2026-10-19）：currentAnnotations 保持上次
+        // 成功数据不动（失效数据优于伪装成空/清空面板），面板打开时顶部
+        // 插失效提示 + 重试；面板关着时记状态，下次打开随行渲染。
+        annoListStale = true;
+        if (annoPanelOpen) renderAnnoPanelStale();
+      });
   }
 
   // 把几何字段写回 item（rect/arrow/freehand/polygon；撤销/冲突恢复共用）
@@ -9489,7 +9611,12 @@
   // 标注面板 + 全部标记叠加（查看器）
   // =========================================================================
   function openAnnoPanel() {
-    if (!state.slide || !currentAnnotations) { toast(t("anno.none.current"), "info"); return; }
+    if (!state.slide) { toast(t("anno.none.current"), "info"); return; }
+    if (!currentAnnotations && !annoListError) {
+      // 列表尚未成功加载（首拉在途/401 跳转中）：维持旧提示，面板不开
+      toast(t("anno.none.current"), "info");
+      return;
+    }
     // 开标注面板时关闭 AI 面板（协调权交给插件：发 panel.toggle {open:false}）
     hpRequest("panel.toggle", { open: false }).catch(function () { /* 插件未启用：静默 */ });
     annoPanelOpen = true;
@@ -9497,7 +9624,14 @@
     // P2 合同 §5.4：面板标题主显示 display_name（旧 DTO 回落 name）
     els.annoPanelTitle.textContent = t("anno.panel.title.with", {
       name: truncateMiddle(slideDisplayName(state.slide) || state.slide.name, 28) });
-    renderAnnoPanel(currentAnnotations.annotations || []);
+    if (annoListError) {
+      // 当前切片列表从未加载成功：显式错误态 + 重试（绝不冒充「暂无标注」）
+      renderAnnoPanelError();
+    } else {
+      renderAnnoPanel(currentAnnotations.annotations || []);
+      // 之前的刷新失败过：行保留，顶部补失效提示（stale indicator）
+      if (annoListStale) renderAnnoPanelStale();
+    }
     updateResearchBusy();  // P3：面板打开取消稳定观察检测
   }
 

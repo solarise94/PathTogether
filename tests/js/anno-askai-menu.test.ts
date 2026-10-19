@@ -17,7 +17,8 @@
  *     点击（无监听）不 emit；
  *   - 行为：⋯ 菜单含「锁定/解锁位置」（带锁状态提示），定位项文案为
  *     「居中显示此标记」；菜单不再有 AI 解读项；
- *   - 源契约：draft（临时框）目标不出现 AI 加入项——早退分支在其之前；
+ *   - 源契约：draft（临时框）分支自带 ROI 附件入口（次动作，保存仍居首，
+ *     冻结走 freezeDraftAttachPayload）；标记 ✨ 渲染在其分支之后；
  *     标注行不再渲染 fork「快速问答」/ branch「从此处深读」，改为单个
  *     「✨ 加入 AI 对话」chip（buildAnnoAiActions 统一入口）。
  */
@@ -492,7 +493,7 @@ describe("⋯ 菜单：锁定移入 + 定位改名 + 无 AI 解读项", () => {
 });
 
 describe("源契约与文案（AI 入口统一 2026-10-18）", () => {
-  it("draft（临时框）早退分支在 AI 加入之前——未保存草稿不提供加入入口", () => {
+  it("draft（临时框）分支自带 ROI 附件入口（次动作）；标记 ✨ 仍在 draft 分支之后", () => {
     const fnStart = appSrc.indexOf("function renderAnnoToolbar");
     expect(fnStart).toBeGreaterThan(-1);
     const fnText = appSrc.slice(fnStart);
@@ -500,6 +501,13 @@ describe("源契约与文案（AI 入口统一 2026-10-18）", () => {
     const askaiIdx = fnText.indexOf("annoAiAttachToolbarButton");
     expect(draftReturn).toBeGreaterThan(-1);
     expect(askaiIdx).toBeGreaterThan(draftReturn);
+    // ROI 附件（2026-10-18）：draft 分支在其 return 前渲染自己的 ✨（次动作，
+    // 保存为标记仍居首）——冻结走 freezeDraftAttachPayload，不与 marker 共用。
+    const draftBranch = fnText.slice(draftReturn, fnText.indexOf("return;", draftReturn));
+    expect(draftBranch).toContain("annoAiAttachDraftToolbarButton");
+    expect(draftBranch).not.toContain("annoAiAttachToolbarButton(");
+    expect(appSrc).toContain("function freezeDraftAttachPayload");
+    expect(appSrc).toContain("function attachDraftToConversation");
     // 冻结与右键「将此标注加入会话」同一实现；点击时刻冻结（不在菜单打开期）
     expect(appSrc).toContain("function attachMarkerToConversation");
     expect(appSrc).toContain("freezeMarkerAttachPayload(it, null)");

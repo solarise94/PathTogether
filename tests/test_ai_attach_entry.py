@@ -267,3 +267,113 @@ def test_viewport_attachment_has_no_label_and_missing_marker_still_404(monkeypat
     assert r2.get_json()["code"] == "annotation_not_found"
     # 第二次请求未达 sidecar（第一次 1 次 + 0 = 共 1 次 run 调用）
     assert len([x for x in fake.calls if x["path"].endswith("/run")]) == 1
+
+
+# =========================================================================== #
+# ROI 附件（未保存草稿区域，2026-10-18）：kind=roi——与技能 target 的 roi 同名
+# 同义（handoff §5.1「如要提供加入对话，作为 ROI 附件，不伪造 annotation_id，
+# 也不悄悄落库」）。只有点击时刻冻结的 bbox：与 viewport 同口径严格校验，
+# 不做任何标注查询；annotation_id 等额外键一律不透传（白名单重建）。
+# =========================================================================== #
+
+def _roi_attachment(**over):
+    att = {"kind": "roi", "bbox": {"x": 450, "y": 360, "w": 100, "h": 80},
+           "slide": "demo.svs"}
+    att.update(over)
+    return att
+
+
+def test_roi_attachment_passes_without_annotation_lookup(monkeypatch):
+    """roi 附件（未保存区域）通过：白名单重建原样透传 bbox；不查任何标注。"""
+    fake = _setup_run_env(monkeypatch)
+    _touch()
+    _register_run_sse(fake, "sess-roi-1")
+    lookups = []
+    orig = share_store.get_roi_by_annotation_id
+
+    def _spy(aid):
+        lookups.append(aid)
+        return orig(aid)
+
+    monkeypatch.setattr(share_store, "get_roi_by_annotation_id", _spy)
+    c = _browser_client(app_mod.app)
+    r = c.post("/api/ai/run?fresh=1", json={
+        "slide": "demo.svs", "task": "看这个未保存区域",
+        "attachments": [_roi_attachment(
+            render_context={"version": 1, "activeChannels": []})]})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    sent = fake.calls[-1]["body"]["attachments"]
+    assert sent == [{"kind": "roi", "bbox": {"x": 450, "y": 360, "w": 100, "h": 80},
+                     "slide": "demo.svs",
+                     "render_context": {"version": 1, "activeChannels": []}}]
+    assert lookups == []   # roi 不做标注查询（无标注语义，不伪造引用）
+
+
+def test_roi_attachment_extra_keys_not_passthrough(monkeypatch):
+    """客户端在 roi 附件里塞 annotation_id/revision/label：不透传、不查询
+    （白名单重建——伪造标注引用与伪造 label 同样进不了 sidecar）。"""
+    fake = _setup_run_env(monkeypatch)
+    _touch()
+    lookups = []
+    monkeypatch.setattr(share_store, "get_roi_by_annotation_id",
+                        lambda aid: lookups.append(aid) or None)
+    _register_run_sse(fake, "sess-roi-2")
+    c = _browser_client(app_mod.app)
+    r = c.post("/api/ai/run?fresh=1", json={
+        "slide": "demo.svs", "task": "看",
+        "attachments": [_roi_attachment(
+            annotation_id="00000000-0000-0000-0000-000000000000",
+            revision=7, label="伪造名", type="rect", note=" injected")]}
+    )
+    assert r.status_code == 200, r.get_data(as_text=True)
+    sent = fake.calls[-1]["body"]["attachments"]
+    assert sent == [{"kind": "roi", "bbox": {"x": 450, "y": 360, "w": 100, "h": 80},
+                     "slide": "demo.svs"}]
+    assert lookups == []
+
+
+def test_roi_attachment_bbox_validated_like_viewport(monkeypatch):
+    """roi bbox 与 viewport 同口径：w/h≤0、负 x/y、超量级、缺 bbox → 400
+    invalid_argument（先于预算预占，零 sidecar 调用）。"""
+    fake = _setup_run_env(monkeypatch)
+    _touch()
+    c = _browser_client(app_mod.app)
+    bad_bboxes = [
+        {"x": 10, "y": 10, "w": 0, "h": 10},      # w 非正
+        {"x": 10, "y": 10, "w": 10, "h": -3},     # h 非正
+        {"x": -1, "y": 0, "w": 10, "h": 10},      # 负 x
+        {"x": 0, "y": -2, "w": 10, "h": 10},      # 负 y
+        {"x": 0, "y": 0, "w": 2e8, "h": 10},      # 超量级上限（1e8）
+    ]
+    for bb in bad_bboxes:
+        r = c.post("/api/ai/run?fresh=1", json={
+            "slide": "demo.svs", "task": "看",
+            "attachments": [_roi_attachment(bbox=bb)]})
+        assert r.status_code == 400, (bb, r.get_data(as_text=True))
+        assert r.get_json()["code"] == "invalid_argument"
+    # 缺 bbox
+    r = c.post("/api/ai/run?fresh=1", json={
+        "slide": "demo.svs", "task": "看",
+        "attachments": [{"kind": "roi", "slide": "demo.svs"}]})
+    assert r.status_code == 400
+    assert r.get_json()["code"] == "invalid_argument"
+    # 全部零 sidecar 调用
+    assert fake.calls == []
+
+
+def test_unknown_attachment_kind_still_rejected(monkeypatch):
+    """未知 kind → 400 明确拒绝（旧网关对新客户端的可辨识失败边界——
+    绝不静默丢弃附件假装成功）。marker/viewport 语义不受影响。"""
+    fake = _setup_run_env(monkeypatch)
+    _touch()
+    c = _browser_client(app_mod.app)
+    r = c.post("/api/ai/run?fresh=1", json={
+        "slide": "demo.svs", "task": "看",
+        "attachments": [{"kind": "layer",
+                         "bbox": {"x": 1, "y": 2, "w": 3, "h": 4},
+                         "slide": "demo.svs"}]})
+    assert r.status_code == 400, r.get_data(as_text=True)
+    body = r.get_json()
+    assert body["code"] == "invalid_argument"
+    assert "kind 非法" in body["error"]
+    assert fake.calls == []

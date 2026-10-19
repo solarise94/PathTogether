@@ -8462,11 +8462,14 @@
     el.hidden = false;
 
     if (target === "draft") {
-      // 临时框：[保存为标记] [锁定位置] [⋯]
+      // 临时框：[保存为标记] [✨ 加入 AI 对话] [锁定位置] [⋯]
+      // （ROI 附件 2026-10-18：未保存草稿可加入对话——次动作，保存仍为主动作；
+      //   冻结点击时刻的 level-0 bbox，不伪造 annotation_id、不落库。）
       el.appendChild(annoToolbarButton("aot-save", t("anno.toolbar.save"),
         t("anno.toolbar.save.tip"), function () {
           submitCurrentDraft();
         }, drawPhase === "saving"));
+      el.appendChild(annoAiAttachDraftToolbarButton());
       el.appendChild(annoToolbarButton("aot-lock" + (state.roiGeometryLocked ? " on" : ""),
         state.roiGeometryLocked ? "🔒 " + t("anno.lock.locked.short") : "🔒 " + t("anno.lock.lock"),
         state.roiGeometryLocked ? t("anno.lock.unlock") : t("anno.lock.lock.tip"),
@@ -8544,6 +8547,47 @@
     }
     var frozen = null;
     try { frozen = freezeMarkerAttachPayload(it, null); } catch (e) { frozen = null; }
+    if (!frozen) {
+      toast(t("anno.menu.askai.unavailable"), "error");
+      return;
+    }
+    emitConversationAttachIntent(frozen);
+  }
+
+  // 工具条「✨ 加入 AI 对话」按钮——临时框（未保存草稿）版（ROI 附件
+  // 2026-10-18）。禁用语义与标记版一致：插件未加载 / 几何冻结不出来
+  // （草稿宽高非法）→ 禁用 + 明确 tooltip，不假装加入成功。次动作：
+  // 「保存为标记」仍是主动作（renderAnnoToolbar draft 分支首位）。
+  function annoAiAttachDraftToolbarButton() {
+    var disabled = false;
+    var tip = t("anno.menu.askai.draft.tip");
+    if (!hpReady()) {
+      disabled = true;
+      tip = t("ctxmenu.attach.plugin.missing");
+    } else {
+      try {
+        if (!freezeDraftAttachPayload()) {
+          disabled = true;
+          tip = t("anno.menu.askai.unavailable");
+        }
+      } catch (e) {
+        disabled = true;
+        tip = t("anno.menu.askai.unavailable");
+      }
+    }
+    return annoToolbarButton("aot-askai aot-askai-draft", "✨ " + t("anno.menu.askai"), tip,
+      function () { attachDraftToConversation(); }, disabled);
+  }
+
+  // 未保存草稿 → 当前 AI 会话草稿（点击时刻冻结 roi 载荷；此后草稿移动/
+  // 缩放/保存都不影响已加入的附件——冻结的是独立快照）。
+  function attachDraftToConversation() {
+    if (!hpReady()) {
+      toast(t("ctxmenu.attach.plugin.missing"), "error");
+      return;
+    }
+    var frozen = null;
+    try { frozen = freezeDraftAttachPayload(); } catch (e) { frozen = null; }
     if (!frozen) {
       toast(t("anno.menu.askai.unavailable"), "error");
       return;
@@ -15133,7 +15177,11 @@
       return;
     }
     hpEmit("conversation.attachIntent", payload);
-    toast(t(payload.kind === "marker" ? "ctxmenu.attach.anno.added" : "ctxmenu.attach.view.added"), "success");
+    // 加入成功提示按附件类型区分（roi = 未保存草稿区域，无标注语义）
+    var addedKey = payload.kind === "marker" ? "ctxmenu.attach.anno.added"
+      : (payload.kind === "roi" ? "ctxmenu.attach.roi.added"
+        : "ctxmenu.attach.view.added");
+    toast(t(addedKey), "success");
   }
 
   // ---------- 载荷冻结（菜单打开时执行；字段与工单 E 契约一一对应） ----------
@@ -15181,6 +15229,36 @@
       label: (it.label != null ? String(it.label) : null),
       geometry: geom,
       note: (it.note != null ? String(it.note) : null),   // 未受信文本：仅透传展示
+      frozen_at: Math.floor(Date.now() / 1000),
+    };
+  }
+
+  // 未保存候选框 → ROI 附件载荷（ROI 附件 2026-10-18）。点击「✨ 加入 AI
+  // 对话」的时刻冻结：level-0 bbox 取自当前草稿 state.roi（取整、必须为正），
+  // 切片身份（slide_id + name 快照）、倍率与 render context 同一刻取值。
+  // 绝不伪造 annotation_id/revision，也不悄悄落库——发送后由 PT 网关按
+  // kind=roi 白名单重建（只认 bbox/render_context，不查任何标注）。
+  // 此后草稿继续移动/缩放、或保存成标记，都不影响已冻结的附件载荷
+  // （冻结的是独立对象；保存后的标记要加入对话走 marker 入口重新冻结）。
+  // 无有效草稿（非矩形工具 / 宽高 ≤ 0 / 数值非法）→ null，调用方给明确提示。
+  function freezeDraftAttachPayload() {
+    if (!rectToolActive() || !(state.roi.w > 0) || !(state.roi.h > 0)) return null;
+    var x = Math.round(Number(state.roi.x)), y = Math.round(Number(state.roi.y));
+    var w = Math.round(Number(state.roi.w)), h = Math.round(Number(state.roi.h));
+    if (!isFinite(x) || !isFinite(y) || !isFinite(w) || !isFinite(h) ||
+        w <= 0 || h <= 0) return null;
+    var bbox = { x: x, y: y, w: w, h: h };
+    return {
+      kind: "roi",
+      slide_id: (state.slide && state.slide.id) || null,
+      slide: state.slide.name,
+      bbox: bbox,
+      click_point: null,
+      center: { x: Math.round(bbox.x + bbox.w / 2), y: Math.round(bbox.y + bbox.h / 2) },
+      magnification: currentViewerMagnification(),
+      render_context: viewerRenderContextSnapshot(),
+      annotation_id: null, revision: null, type: null,
+      geometry: null, note: null, label: null,
       frozen_at: Math.floor(Date.now() / 1000),
     };
   }

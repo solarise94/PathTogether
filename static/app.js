@@ -15042,6 +15042,9 @@
       annotation_id: (it.annotation_id != null ? String(it.annotation_id) : null),
       revision: (it.revision != null ? Number(it.revision) : null),
       type: it.type || "rect",
+      // 标记名（用户署名）：仅展示用；模型上下文里的 label 以服务端
+      // _validate_ai_attachments 解析授权后写入的权威值为准，此处值不采信。
+      label: (it.label != null ? String(it.label) : null),
       geometry: geom,
       note: (it.note != null ? String(it.note) : null),   // 未受信文本：仅透传展示
       frozen_at: Math.floor(Date.now() / 1000),

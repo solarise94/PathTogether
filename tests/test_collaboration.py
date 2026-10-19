@@ -438,19 +438,21 @@ def test_api_review_accept_reject_and_human_400():
     _setup_users()
     co = _client()
     _login(co, "owner@x.com", "ownerpass123456")
-    # AI 标注（默认 shared=False）
-    ai_idx = _post_anno(co, "demo.svs", shared=False).get_json()["index"]
+    # AI 标注：走 AI 写通道语义造数（store 显式 source="ai" → pending）。
+    # P3-1（dogfood 2026-10-19）起 /api/annotation 人工端点恒落 human——
+    # 不再充当 AI 行的造数入口（旧用例借 ADMIN_TOKEN 推断 ai 的行为已修）。
+    ai_idx = _add(shared=False, source="ai")["index"]
     r = co.post("/api/annotation/admin/%d/review" % ai_idx,
                 json={"action": "accept"})
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.get_json()["review_status"] == "accepted"
     # reject 另一条
-    ai_idx2 = _post_anno(co, "demo.svs", shared=False).get_json()["index"]
+    ai_idx2 = _add(shared=False, source="ai")["index"]
     r = co.post("/api/annotation/admin/%d/review" % ai_idx2,
                 json={"action": "reject"})
     assert r.status_code == 200
     assert r.get_json()["review_status"] == "rejected"
-    # 人工标注 review → 400
+    # 人工标注（人工端点写入）review → 400
     h_idx = _post_anno(co, "demo.svs", shared=True).get_json()["index"]
     r = co.post("/api/annotation/admin/%d/review" % h_idx,
                 json={"action": "accept"})

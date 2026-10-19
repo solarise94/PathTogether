@@ -18139,11 +18139,35 @@ def _validate_ai_viewport(body):
     return out, None
 
 
+# 附件标签（marker 的用户署名）进模型上下文时的规范化上限：字符串纯展示，
+# 非指令——去控制字符/换行防伪排版注入，截断防超长刷屏。
+_AI_ATTACH_LABEL_MAX_LEN = 80
+
+
+def _attachment_label_of(roi):
+    """从已解析的标注行取服务端权威 label（附件上下文用）。
+
+    label 是用户数据：strip 后剥离控制字符/换行（C0/C1——换行会把单条附件
+    行断成多行，让客户端提供的名字伪装成上下文框架文本），截断到
+    _AI_ATTACH_LABEL_MAX_LEN。旧行缺 label → 「未署名」（与读侧
+    share_shared._norm_label 同语义），保证 marker 附件恒有可显示的名字。
+    绝不采信客户端提供的 label——浏览器载荷里的 label 只做展示。
+    """
+    raw = roi.get("label") if isinstance(roi, dict) else None
+    if not isinstance(raw, str):
+        raw = ""
+    cleaned = re.sub(r"[\x00-\x1f\x7f\x80-\x9f]+", " ", raw).strip()
+    return (cleaned or "未署名")[:_AI_ATTACH_LABEL_MAX_LEN]
+
+
 def _validate_ai_attachments(body, slide):
     """校验 run/continue/branch 的 attachments 数组；返回 (cleaned, err)。
 
-    每项须含 kind=viewport|marker 与合法 bbox。marker 须可读且 revision 匹配。
-    非法 → 400/403/409；缺省/空 → (None, None)。
+    每项须含 kind=viewport|marker 与合法 bbox。marker 须可读且 revision 匹配；
+    服务端在解析授权后把权威 label（用户署名，规范化）一并写入重建记录——
+    模型侧「标记名 ↔ annotation_id ↔ 区域」映射由此对齐，杜绝模型按坐标
+    猜错名字（dogfood dg19-A2/B2 调换）。非法 → 400/403/409；缺省/空 →
+    (None, None)。
     """
     if not isinstance(body, dict) or "attachments" not in body:
         return None, None
@@ -18208,6 +18232,9 @@ def _validate_ai_attachments(body, slide):
             rec["annotation_id"] = aid
             rec["revision"] = int(roi.get("revision") or 1)
             rec["type"] = roi.get("type")
+            # 服务端权威 label（用户署名）：只在服务端解析授权后的 roi 上取，
+            # 客户端同名字段一律不采信（旧客户端不带也不受影响）。
+            rec["label"] = _attachment_label_of(roi)
         out.append(rec)
     return out, None
 
@@ -24533,8 +24560,15 @@ def api_annotation_add():
         if reject is not None:
             return jsonify(error=reject[0]), 400
     try:
+        # P3-1（dogfood 2026-10-19）：本端点是人工工位写路径——显式 source="human"
+        # （review_status 随之为 none）。此前缺省让 add_roi 从 token==ADMIN_TOKEN
+        # 推断 source="ai"+pending，导致用户自己在工作台画的标记带着「待复核/
+        # 接受」徽标。AI 写入仍走 /internal/ai/annotate 与 plugin v1 annotate
+        # （显式 source="ai"+provenance），互不影响；显式传参也使语义不随
+        # store 的 token 推断规则漂移。
         roi = share_store.add_roi(
             share_store.ADMIN_TOKEN, safe, label, type=typ, shared=shared, note=note,
+            source="human",
             owner_user_id=ident["user_id"], requester_role=ident["role"],
             client_action_id=body.get("client_action_id"),
             slide_id=desc.slide_id,

@@ -3466,6 +3466,15 @@ button {
   margin-top: 4px;
   line-height: 1.4;
 }
+/* 附件卡上的标记名（用户署名；2026-10-19 P2 label 映射）：突出显示，与
+   「附件 N（marker「…」…）」模型文本对应。类由 HP 插件卡片输出；无该样式
+   的旧宿主回退 .ai-attach-body 基础排版，不影响展示。 */
+.ai-attach .ai-attach-marker-label {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--accent);
+  word-break: break-all;
+}
 .ai-attach-actions {
   display: flex;
   align-items: center;

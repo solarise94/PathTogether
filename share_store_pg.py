@@ -278,6 +278,19 @@ def _update_roi_row(cur, rid: str, roi: dict):
     )
 
 
+def _slide_id_read_compat(roi: dict, col_slide_id) -> dict:
+    """读兼容（hotfix 2026-10-19）：JSON data 缺 ``slide_id`` 键时以离散列
+    权威回填（仅输出副本，不回写存储）。
+
+    生产实测存在「``rois.slide_id`` 列已落 ID、JSON 文档缺键」的分裂态行
+    （写路径收口前的历史行）。读侧一律以列为准回填，保证调用方（分组/
+    过滤/归属比较）拿到的 ``slide_id`` 与权威列一致；JSON 已有键时不覆盖。
+    """
+    if col_slide_id and not roi.get("slide_id"):
+        roi["slide_id"] = col_slide_id
+    return roi
+
+
 def _roi_out(roi: dict, index=None, shared=None) -> dict:
     """ROI 导出副本：统一补 index/shared/note 兼容字段（与 json 一致）。
 
@@ -1285,6 +1298,8 @@ def list_rois(token=None, subject=None, access_context=None):
 
     0056：subject 非 None 时按主体过滤（annotation_access.can_read_annotation）；
     index 保持 pre-filter 位置（token 内非 tombstone 序），不按可见子集重编号。
+    hotfix 2026-10-19：``slide_id`` 以离散列权威回填（JSON 缺键的分裂态行
+    不再在调用方按 JSON slide_id 过滤时被当 unresolved 丢掉）。
     """
     conn = _connect()
     try:
@@ -1292,12 +1307,13 @@ def list_rois(token=None, subject=None, access_context=None):
             with c.cursor() as cur:
                 if token is not None:
                     cur.execute(
-                        "SELECT data FROM rois WHERE token=%s AND NOT deleted "
-                        "ORDER BY insert_seq", (token,))
+                        "SELECT data, slide_id FROM rois WHERE token=%s "
+                        "AND NOT deleted ORDER BY insert_seq", (token,))
                     rows = cur.fetchall()
                 else:
                     cur.execute(
-                        "SELECT data FROM rois WHERE NOT deleted ORDER BY insert_seq")
+                        "SELECT data, slide_id FROM rois WHERE NOT deleted "
+                        "ORDER BY insert_seq")
                     rows = cur.fetchall()
         ctx = (access_context if access_context is not None
                else annotation_access.access_context_for(subject)
@@ -1309,6 +1325,7 @@ def list_rois(token=None, subject=None, access_context=None):
                         subject, row["data"], ctx):
                     continue
                 r = _geometry_lock_read(_rect_read_compat(dict(row["data"])))
+                _slide_id_read_compat(r, row["slide_id"])
                 r["index"] = i
                 r["shared"] = _roi_shared_compat(r)
                 r["note"] = r.get("note", "")
@@ -1326,6 +1343,7 @@ def list_rois(token=None, subject=None, access_context=None):
                     subject, r_raw, ctx):
                 continue
             r = _geometry_lock_read(_rect_read_compat(dict(r_raw)))
+            _slide_id_read_compat(r, row["slide_id"])
             r["index"] = idx
             r["shared"] = _roi_shared_compat(r)
             r["note"] = r.get("note", "")
@@ -1337,18 +1355,23 @@ def list_rois(token=None, subject=None, access_context=None):
 
 
 def get_roi(token, index):
-    """返回该 token 下第 index 条 roi 的 dict 副本（跳过 tombstone）；无则 None。"""
+    """返回该 token 下第 index 条 roi 的 dict 副本（跳过 tombstone）；无则 None。
+
+    hotfix 2026-10-19：``slide_id`` 以离散列权威回填（JSON 缺键的分裂态行
+    在归属比较/ID 反解处不再退化为 None）。
+    """
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "SELECT data FROM rois WHERE token=%s AND NOT deleted "
-                    "ORDER BY insert_seq", (token,))
+                    "SELECT data, slide_id FROM rois WHERE token=%s "
+                    "AND NOT deleted ORDER BY insert_seq", (token,))
                 rows = cur.fetchall()
         if index < 0 or index >= len(rows):
             return None
         r = _geometry_lock_read(_rect_read_compat(dict(rows[index]["data"])))
+        _slide_id_read_compat(r, rows[index]["slide_id"])
         r["index"] = index
         r["shared"] = _roi_shared_compat(r)
         r["visitor"] = r.get("visitor", "") or ""
@@ -1359,16 +1382,25 @@ def get_roi(token, index):
 
 
 def get_roi_by_annotation_id(annotation_id):
-    """按稳定 annotation_id 取 ROI 完整 dict（含 tombstone）；不存在返回 None。"""
+    """按稳定 annotation_id 取 ROI 完整 dict（含 tombstone）；不存在返回 None。
+
+    hotfix 2026-10-19：``slide_id`` 以离散列权威回填（AI 目标注归属比较
+    app._ai_target_clean、评论/审核按 ID 反解切片等读侧不再因 JSON 缺键
+    误判为 unresolved）。
+    """
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                cur.execute("SELECT data FROM rois WHERE annotation_id=%s",
-                            (annotation_id,))
+                cur.execute(
+                    "SELECT data, slide_id FROM rois WHERE annotation_id=%s",
+                    (annotation_id,))
                 row = cur.fetchone()
-        return _geometry_lock_read(
-            _rect_read_compat(dict(row["data"]))) if row else None
+        if not row:
+            return None
+        return _slide_id_read_compat(
+            _geometry_lock_read(_rect_read_compat(dict(row["data"]))),
+            row["slide_id"])
     finally:
         conn.close()
 
@@ -3123,11 +3155,15 @@ def annotations_by_slide(subject=None, access_context=None):
             if subject is not None and not annotation_access.can_read_annotation(
                     subject, r, ctx):
                 continue
-            # P3（合同 §1.2；P2 偏差 #1 收口）：分组键切 **slide_id**（行有
-            # ID 按 ID；NULL-ID 历史行按名称快照）——id_bundle 资产可同
+            # P3（合同 §1.2；P2 偏差 #1 收口）：分组键切 **slide_id**——hotfix
+            # 2026-10-19 起以离散列 ``rois.slide_id`` 为权威（列优先），JSON
+            # data 的 slide_id 次之，NULL-ID 历史行按名称快照兜底。生产存在
+            # 「列有 ID、JSON 缺键」的分裂态行：此前按 JSON 分组会把同片行拆进
+            # ID 组与名组两个桶，/api/annotations 的「ID 组 or 名组」二选一
+            # 取组导致「新增一条标注隐藏全部旧标注」。id_bundle 资产可同
             # original_filename，按名分组会串；ID 维度天然隔离。消费方（app
             # 的 /api/annotations 系）按 ID 取组、展示键在 DTO 层投影。
-            slide = r.get("slide_id") or r.get("slide")
+            slide = row["slide_id"] or r.get("slide_id") or r.get("slide")
             lbl = _norm_label(r.get("label"))
             grp_map = by_slide.setdefault(slide, {})
             grp = grp_map.get(lbl)
@@ -3139,7 +3175,9 @@ def annotations_by_slide(subject=None, access_context=None):
                 "index": idx,
                 "token": tok,
                 "slide": r.get("slide"),
-                "slide_id": r.get("slide_id"),
+                # hotfix 2026-10-19：JSON 缺键时以列回填（_slide_id_read_compat
+                # 同口径），items.slide_id 与分组键一致。
+                "slide_id": r.get("slide_id") or row["slide_id"],
                 "type": r.get("type", "rect"),
                 "x": r.get("x"),
                 "y": r.get("y"),
@@ -3180,8 +3218,9 @@ def annotations_by_project(pid=None, subject=None, access_context=None):
     语义同 annotations_by_slide：非 None 时按主体过滤）。
 
     P2（合同 §3.2）：过滤按 project_slides.slide_id（权威）；P3 起分组键=
-    slide_id（NULL-ID 历史行按名快照分组），与 project_ids/project_slides
-    双集过滤天然对齐——项目内同名不同 ID 并存互不串。
+    slide_id（hotfix 2026-10-19 以 rois.slide_id 列为权威，NULL-ID 历史
+    行按名快照分组），与 project_ids/project_slides 双集过滤天然对齐——
+    项目内同名不同 ID 并存互不串。
     """
     by_slide = annotations_by_slide(subject=subject,
                                     access_context=access_context)

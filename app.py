@@ -23629,9 +23629,16 @@ def api_share_create():
     if body.get("include_annotations", True) is not False:
         subject = annotation_access.subject_from_request()
         by_slide = share_store.annotations_by_slide(subject=subject)
-        # P2：分组键 = 名称快照（资产身份经 items.slide_id 携带）
-        for sname in clean:
-            for grp in by_slide.get(sname, []):
+        # hotfix 2026-10-19：分组键以 rois.slide_id 列为权威（NULL-ID 历史
+        # 行才落名组）——授权收集必须 ID 组 ∪ 名组双取，只按名会在「列有
+        # ID、JSON 缺键」的存量行上漏授（分享创建不再带上既有标注）。
+        # 每行只落一个组，双取不会重复授权。
+        for sname, sid in zip(clean, resolved_ids):
+            groups = []
+            if sid:
+                groups.extend(by_slide.get(sid) or [])
+            groups.extend(by_slide.get(sname) or [])
+            for grp in groups:
                 for it in grp.get("items") or []:
                     aid = it.get("annotation_id")
                     if not aid:

@@ -1626,6 +1626,7 @@
       if (err && err.magicMismatch) {
         markError(e, "content_ext_mismatch", null,
           { detectedType: err.magicMismatch.detected });
+        e.error.kind = "format";
         e.state = "upload_failed";
         setStage(e, "upload.inline.err.magic");
         if (ui.buttons) ui.buttons(e);
@@ -1673,6 +1674,8 @@
         return;
       }
       markError(e, code || "upload_failed", detail, {});
+      // P2 问题 2：失败类型随错误对象落条目（行内恢复按钮的输入）
+      e.error.kind = kind;
       // 门禁分支已自行决定终态文案（convert_failed + 具体原因），不覆盖
       if (err && err.__skipStage) {
         e.state = "convert_failed";

@@ -766,4 +766,99 @@ test.describe("viewer 标注交互（§5.4/§6，真实后端）", () => {
 		expect(items.map((it) => it.annotation_id)).toEqual([aidC]);
 		await page.screenshot({ path: `${EVIDENCE_DIR}/e2e-del-by-id-sequence.png` });
 	});
+
+	// ------------------------------------------------------------------
+	// 标注列表加载失败（P3 2026-10-18，生产误报复盘）：/api/annotations 非
+	// 401 失败（此处模拟 5xx）绝不能渲染成「暂无标注」冒充空切片。
+	//   - 初始加载 500：#anno-btn 放开、面板显式错误态 + 重试；重试走真实
+	//     后端恢复列表；
+	//   - 面板开着刷新失败（删除一条触发 refreshCurrentAnnotations）：
+	//     旧行保留 + 顶部失效提示条，绝不清空面板；提示条重试恢复真实列表。
+	// 401(auth_required) 跳登录契约由 tests/js/api-fetch-401.test.ts 权威
+	// 覆盖，不在真实后端上重复。
+	// ------------------------------------------------------------------
+	test("标注列表加载失败：面板显式错误态+重试；刷新失败保留旧行+失效提示", async ({ page }) => {
+		const SID = CREDS.rasterSlides.workbench.slide_id;
+		await initSession(page);
+		await login(page, CREDS.userLogin, CREDS.userPassword);
+		await wipeAnnotations(page, SID);
+		const r1 = await pageApi(page, "POST", "/api/annotation", {
+			slide_id: SID, type: "rect", x: 60, y: 50, w: 80, h: 60,
+			label: "e2e-list-err-1", shared: true,
+		});
+		const r2 = await pageApi(page, "POST", "/api/annotation", {
+			slide_id: SID, type: "rect", x: 400, y: 420, w: 60, h: 50,
+			label: "e2e-list-err-2", shared: true,
+		});
+		expect(r1.status, JSON.stringify(r1.j)).toBe(200);
+		expect(r2.status, JSON.stringify(r2.j)).toBe(200);
+
+		// --- 初始加载失败：GET /api/annotations 一律 500 ---
+		let failAnnoList = true;
+		await page.route("**/api/annotations*", async (route) => {
+			if (failAnnoList && route.request().method() === "GET") {
+				await route.fulfill({ status: 500, contentType: "application/json",
+					body: JSON.stringify({ error: "simulated outage" }) });
+				return;
+			}
+			await route.continue();
+		});
+		await page.goto(`/app?slide=${SID}`);
+		await expandSidebar(page);
+		const fbRow = page.locator(`.fb-hit[data-slide-id="${SID}"]`);
+		await expect(fbRow).toBeVisible();
+		await fbRow.click();
+		await expect(page.locator("#viewer .openseadragon-canvas"))
+			.toBeVisible({ timeout: 20_000 });
+		// 修复前：失败被当成空列表，#anno-btn 永久禁用，用户无从发现
+		const annoBtn = page.locator("#anno-btn");
+		await expect(annoBtn).toBeEnabled({ timeout: 15_000 });
+		await annoBtn.click();
+		const errorBox = page.locator("#anno-panel-list .anno-panel-error");
+		await expect(errorBox).toBeVisible();
+		await expect(errorBox).toContainText("标注列表加载失败");
+		await expect(page.locator("#anno-panel-list .anno-panel-empty"))
+			.toHaveCount(0);
+		await page.screenshot({ path: `${EVIDENCE_DIR}/e2e-anno-list-error.png` });
+
+		// --- 错误态重试走真实后端：错误块消失、行渲染 ---
+		failAnnoList = false;
+		await errorBox.locator(".anno-panel-retry").click();
+		await expect(page.locator("#anno-panel-list .anno-item").first())
+			.toBeVisible({ timeout: 15_000 });
+		await expect(page.locator("#anno-panel-list .anno-panel-error"))
+			.toHaveCount(0);
+
+		// --- 面板开着刷新失败（删除一条触发刷新，列表 GET 500）：旧行保留 +
+		//     顶部失效提示条，绝不整表清成「暂无标注」 ---
+		failAnnoList = true;
+		const delRow = page.locator(".anno-item").filter({
+			has: page.locator(".ai-label", { hasText: "e2e-list-err-1" }),
+		});
+		await expect(delRow).toBeVisible();
+		const [delResp] = await Promise.all([
+			page.waitForResponse((r) => r.request().method() === "DELETE"
+				&& r.url().includes("/api/annotation/")),
+			delRow.locator(".ai-del").click(),
+		]);
+		expect(delResp.status()).toBe(200);
+		const staleBar = page.locator("#anno-panel-list .anno-panel-stale");
+		await expect(staleBar).toBeVisible();
+		await expect(staleBar).toContainText("刷新失败");
+		// 未删的那条仍在（瞬时刷新失败不清空用户正在看的列表）
+		const keepRow = page.locator(".anno-item").filter({
+			has: page.locator(".ai-label", { hasText: "e2e-list-err-2" }),
+		});
+		await expect(keepRow).toBeVisible();
+		await expect(page.locator("#anno-panel-list .anno-panel-empty"))
+			.toHaveCount(0);
+		await page.screenshot({ path: `${EVIDENCE_DIR}/e2e-anno-list-stale.png` });
+
+		// --- 失效提示条上的重试：恢复真实列表（只剩第二条） ---
+		failAnnoList = false;
+		await staleBar.locator(".anno-panel-retry").click();
+		await expect(staleBar).toHaveCount(0);
+		await expect(keepRow).toBeVisible();
+		await expect(page.locator("#anno-panel-list .anno-item")).toHaveCount(1);
+	});
 });

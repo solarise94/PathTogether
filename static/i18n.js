@@ -400,6 +400,11 @@
       "anno.panel.title": "标注",
       "anno.panel.empty": "暂无标注",
       "anno.panel.toggle.title": "显示/隐藏全部标记",
+      // 列表加载失败（P3 2026-10-18：非 401 失败不再冒充「暂无标注」）
+      "anno.panel.load.error": "标注列表加载失败: {e}",
+      "anno.panel.load.net": "网络异常",
+      "anno.panel.load.retry": "重试",
+      "anno.panel.stale": "刷新失败，以下为上次加载的结果",
 
       // ---- AI 面板 ----
       "ai.panel.title": "✨ AI 导航助手",
@@ -2105,6 +2110,12 @@
       "anno.panel.title": "Annotations",
       "anno.panel.empty": "No annotations yet",
       "anno.panel.toggle.title": "Show/hide all marks",
+      // List load failure (P3 2026-10-18: non-401 failures no longer masquerade
+      // as an empty slide)
+      "anno.panel.load.error": "Failed to load annotations: {e}",
+      "anno.panel.load.net": "Network error",
+      "anno.panel.load.retry": "Retry",
+      "anno.panel.stale": "Refresh failed — showing the last loaded list",
 
       // ---- AI 面板 ----
       "ai.panel.title": "✨ AI navigation assistant",

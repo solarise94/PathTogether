@@ -221,6 +221,46 @@ function rerenderForLang() {
   updateStrictWarning();
 }
 
+// ------------------------------------------- 保存能力缺失（新转换闸） --
+// 2026-10-20：无 File System Access 保存 API 的浏览器没有产出物的出口——
+// 不让用户把时间花在「转换成无法保存的东西」上：禁用**新**转换的全部入口
+// （选择文件/文件夹、拖放），就地显示工作台指引（带普通「打开工作台」
+// 链接，不带文件/意图）。既有任务的查看与删除不受影响。
+function saveUnsupported() {
+  return typeof window.showSaveFilePicker !== 'function';
+}
+
+/// 把保存能力缺失的指引写进 #save-capability-note（文字 + 打开工作台
+/// 链接；DOM 构造，不用 innerHTML）。renderSaveStatus 与入口闸共用。
+function paintSaveUnsupportedNote() {
+  const note = els.saveCapabilityNote;
+  if (!note || !note.appendChild) return;
+  note.textContent = '';
+  note.appendChild(document.createTextNode(t('tools.input.save.unsupported') + ' '));
+  const a = document.createElement('a');
+  a.href = '/app';
+  a.textContent = t('tools.open.workbench');
+  note.appendChild(a);
+}
+
+/// 禁用新转换入口（按钮/拖放区）；既有任务的查看/删除照常。
+function disableNewConversionInputs() {
+  for (const btn of [els.pickFileBtn, els.pickFolderBtn]) {
+    if (btn) { btn.disabled = true; btn.setAttribute('aria-disabled', 'true'); }
+  }
+  if (els.dropZone) {
+    els.dropZone.setAttribute('aria-disabled', 'true');
+    els.dropZone.classList.add('drop-zone-disabled');
+  }
+}
+
+function guardNewConversion() {
+  if (!saveUnsupported()) return false;
+  paintSaveUnsupportedNote();
+  showInputMessage('tools.input.save.unsupported');
+  return true;
+}
+
 // ------------------------------------------------------------- dialogs --
 
 /// uncertain 磁盘确认：返回 true（确认继续）/ false（取消）。焦点进入对话框，
@@ -296,6 +336,7 @@ async function probeWithDiskFlow(file, opts = {}) {
 // 复制之前拒绝已知不支持的文件）。
 
 async function prepareSource(fileList) {
+  if (guardNewConversion()) return;   // 无保存出口：不开始会做无用功的转换
   const route = bundleRoute(fileList);
   if (route.route === 'empty') return;
   if (page.running) {
@@ -370,6 +411,7 @@ function handleDropData(dt) {
 /// 目录 drop 的遍历与接管（webkitGetAsEntry 只能在事件内同步取，取到的
 /// entry 对象此后仍可异步读取）。
 async function onDirectoryDropped(dirEntries) {
+  if (guardNewConversion()) return;
   if (page.running) {
     showInputMessage('tools.drop.busy');
     return;
@@ -490,6 +532,7 @@ function resetFlowPanels() {
 }
 
 async function onFilePicked(explicitFile) {
+  if (guardNewConversion()) return;   // 无保存出口：file input 的 change 直达这里
   const list = els.fileInput.files;
   const file = explicitFile || (list && list[0]);
   if (!file) return;
@@ -525,6 +568,7 @@ async function onFilePicked(explicitFile) {
 /// webkitRelativePath 已带文件夹前缀（engine 据此定位包根），交给
 /// prepareBundleSource（与目录 drop 完全相同的流程）。
 async function onFolderPicked() {
+  if (guardNewConversion()) return;
   const list = els.folderInput.files;
   const files = list ? Array.from(list) : [];
   if (!files.length) return;
@@ -1045,7 +1089,7 @@ function phaseText(state) {
   return key ? t(key) : state;
 }
 
-/// 转换执行驱动（「仅转换」与 R1「转换并上传」共用）：startJob → 进度/结果
+/// 转换执行驱动（手动开始与任务列表开始/续跑共用）：startJob → 进度/结果
 /// UI。返回 worker 的 result（{ok}|{type:'cancelled'}|失败形态）。
 /// F3：完整包任务 page.file 为 null——源已整包复制进 OPFS（bundle 记录），
 /// startJob(null, {jobId}) 直接用暂存成员，无需（也无法）再提供 File。
@@ -1238,7 +1282,8 @@ async function selectResultJob(jobId) {
 function renderSaveStatus() {
   const supported = typeof window.showSaveFilePicker === 'function';
   els.saveCapabilityNote.hidden = supported;
-  els.saveCapabilityNote.textContent = supported ? '' : t('tools.input.save.unsupported');
+  if (!supported) paintSaveUnsupportedNote();   // 文字 + 「打开工作台」链接
+  else if (els.saveCapabilityNote.textContent) els.saveCapabilityNote.textContent = '';
   els.saveBtn.disabled = !supported || !page.readyInfo;
   els.saveBtn.setAttribute('aria-disabled', String(els.saveBtn.disabled));
   if (!supported) {
@@ -1590,6 +1635,9 @@ async function init() {
   els.prepareCancelBtn.addEventListener('click', () => { onPrepareCancel(); });
   els.saveBtn.addEventListener('click', () => { onSave(); });
   els.persistBtn.addEventListener('click', () => { onPersist(); });
+  // 保存能力缺失：禁用新转换入口 + 常驻工作台指引（renderSaveStatus 已把
+  // 指引写进 #save-capability-note；既有任务的查看/删除不受影响）
+  if (saveUnsupported()) disableNewConversionInputs();
   // 测试/诊断可观测钩子（不承载任何逻辑）
   window.__stToolsReady = true;
 }

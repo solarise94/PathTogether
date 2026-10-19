@@ -92,17 +92,38 @@ test('刷新后从任务记录保存：显示本任务结果，取消与失败�
   await expect(page.locator('#save-status')).toContainText('已保存');
 });
 
-test('缺少保存 API：选文件前显示警告，保留转换上传路径，手机不溢出', async ({ page }) => {
+test('缺少保存 API：选文件前显示工作台指引，禁用新转换，手机不溢出', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 900 });
   await picker(page, false); await open(page);
-  await expect(page.locator('#save-capability-note')).toBeVisible();
-  await expect(page.locator('#save-capability-note')).toContainText('无法将转换结果保存到电脑');
-  await expect(page.locator('#save-capability-note')).toContainText('登录上传');
+
+  // 2026-10-20 转换器本地化：无保存 API = 没有产出物出口——选文件前就地
+  // 给出工作台指引（含普通「打开工作台」链接，不带文件/意图），不再承诺
+  // 「转换后登录上传」
+  const note = page.locator('#save-capability-note');
+  await expect(note).toBeVisible();
+  await expect(note).toContainText('无法将转换结果保存到电脑');
+  await expect(note).toContainText('在工作台选择原文件');
+  await expect(note).toContainText('工作台会自动完成转换');
+  await expect(note.locator('a[href="/app"]', { hasText: '打开工作台' })).toBeVisible();
+  await expect(note).not.toContainText('登录上传');
+  // 上传入口已不存在于本页
+  await expect(page.locator('#upload-btn')).toHaveCount(0);
+  await expect(page.locator('#convert-upload-btn')).toHaveCount(0);
+
+  // 新转换入口全部禁用（按钮 + 拖放区），绕过入口塞文件也不会开始转换
+  await expect(page.locator('#pick-file-btn')).toBeDisabled();
+  await expect(page.locator('#pick-folder-btn')).toBeDisabled();
+  await expect(page.locator('#drop-zone')).toHaveAttribute('aria-disabled', 'true');
+  await page.setInputFiles('#file-input', bmp());
+  await expect(page.locator('#summary-section')).toBeHidden();
+  await expect(page.locator('#input-message')).toContainText('无法将转换结果保存到电脑');
+
+  // 既有任务的查看/删除不受影响：任务记录卡照常存在（无任务时空态文案）
+  await expect(page.locator('#jobs-details')).toContainText('任务记录');
+
+  // 手机宽度无横向溢出
   const layout = await page.evaluate(() => ({ width: innerWidth, scroll: document.documentElement.scrollWidth }));
   expect(layout.scroll).toBeLessThanOrEqual(layout.width + 1);
-  await convert(page);
-  await expect(page.locator('#save-btn')).toBeDisabled();
-  await expect(page.locator('#upload-btn')).toBeEnabled();
 });
 
 test('不支持的格式：短说明与可用转换指南入口，不展示过时的格式集合', async ({ page }) => {

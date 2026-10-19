@@ -403,3 +403,8 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
 .job-upload-state.err { color: var(--danger); }
 .job-upload-state.run { color: var(--accent); }
 .job-upload-state a { color: var(--accent); }
+
+/* 2026-10-20：无保存 API 时禁用新转换入口（guard 在 prepareSource/
+   onFilePicked/onFolderPicked/onDirectoryDropped；既有任务查看/删除照常） */
+.drop-zone-disabled { opacity: 0.55; cursor: not-allowed; }
+.drop-zone-disabled.dragover { background: var(--hover); }

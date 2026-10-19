@@ -15,6 +15,8 @@
  *
  *  - by-id 写路径（松手保存、工具条锁定）在 id_bundle 切片上按 slide_id
  *    鉴权，200 后刷新保持几何与锁状态（文件尾用例）。
+ *  - 同切片列表请求反序（review 047 #1）：晚到旧 load 200/500 均整体丢弃，
+ *    不回退保存后的新列表、不进错误页、选中保持（文件尾用例）。
  */
 import { expect, test, type Page } from "@playwright/test";
 import { readFileSync } from "node:fs";
@@ -860,5 +862,133 @@ test.describe("viewer 标注交互（§5.4/§6，真实后端）", () => {
 		await expect(staleBar).toHaveCount(0);
 		await expect(keepRow).toBeVisible();
 		await expect(page.locator("#anno-panel-list .anno-item")).toHaveCount(1);
+	});
+
+	// ------------------------------------------------------------------
+	// 同切片列表请求反序（review 047 #1 回归，P2 2026-10-18）：切片对象
+	// 身份判不了同切片两个请求的新旧——初始加载 500 → 点重试（请求挂起）
+	// → 关面板画框保存（刷新先落地、面板已显示新数据）→ 放行旧重试。
+	// 修复前：晚到旧 200 把列表回退到保存前（新标记从面板消失）；晚到旧
+	// 500 把已有数据清成错误页并清空选中。修复后（load/refresh 共用切片
+	// 世代）：旧响应无论成败整体丢弃——行数不变、错误页不出现、选中保持、
+	// 服务端数据完好。两种反序都覆盖。
+	// ------------------------------------------------------------------
+	test("同切片晚到旧列表响应：不覆盖保存后的新列表（review 047 #1）", async ({ page }) => {
+		test.setTimeout(120_000);
+		const SID = CREDS.rasterSlides.workbench.slide_id;
+		await initSession(page);
+		await login(page, CREDS.userLogin, CREDS.userPassword);
+		await wipeAnnotations(page, SID);
+		// 预置两条（reviewer 场景的列表非空基线；后续每轮保存再各 +1）
+		for (const [i, pos] of [[1, { x: 60, y: 50 }], [2, { x: 400, y: 420 }]] as const) {
+			const r = await pageApi(page, "POST", "/api/annotation", {
+				slide_id: SID, type: "rect", x: pos.x, y: pos.y, w: 80, h: 60,
+				label: `e2e-list-race-seed-${i}`, shared: true,
+			});
+			expect(r.status, JSON.stringify(r.j)).toBe(200);
+		}
+
+		for (const lateStatus of [200, 500]) {
+			let count = 0;
+			let heldSeen = false;
+			let release!: () => void;
+			const gate = new Promise<void>((res) => { release = res; });
+			await page.route("**/api/annotations?**", async (route) => {
+				// 只拦每切片列表（侧栏徽标等无 slide_id 的调用照常放行）
+				if (!new URL(route.request().url()).searchParams.has("slide_id")) {
+					return route.continue();
+				}
+				count++;
+				if (count === 1) {
+					await route.fulfill({ status: 500, contentType: "application/json",
+						body: JSON.stringify({ error: "initial load failure" }) });
+					return;
+				}
+				if (count === 2) {
+					// 重试：先取真实旧列表体，挂住不放（晚到反序的旧响应）
+					const oldResponse = await route.fetch();
+					const oldBody = await oldResponse.json();
+					heldSeen = true;
+					await gate;
+					if (lateStatus === 200) {
+						return route.fulfill({ status: 200, contentType: "application/json",
+							body: JSON.stringify(oldBody) });
+					}
+					return route.fulfill({ status: 500, contentType: "application/json",
+						body: JSON.stringify({ error: "delayed retry failure" }) });
+				}
+				return route.continue();
+			});
+
+			await page.goto(`/app?slide=${SID}`);
+			await expect(page.locator("#viewer .openseadragon-canvas"))
+				.toBeVisible({ timeout: 20_000 });
+			const annoBtn = page.locator("#anno-btn");
+			await expect(annoBtn).toBeEnabled({ timeout: 20_000 });
+			await annoBtn.click();
+			const errorBox = page.locator("#anno-panel-list .anno-panel-error");
+			await expect(errorBox).toBeVisible();
+			await errorBox.locator(".anno-panel-retry").click();
+			await expect.poll(() => heldSeen).toBe(true);
+			await page.locator("#anno-panel-close").click();
+
+			// 关面板画框并保存新标记（110×85 px）
+			await page.locator("#roi-rect-btn").click();
+			await expect(page.locator("#roi-settings")).toBeVisible();
+			await page.evaluate(() => {
+				const unit = document.getElementById("roi-unit-select") as HTMLSelectElement;
+				unit.value = "px";
+				unit.dispatchEvent(new Event("change", { bubbles: true }));
+				document.getElementById("roi-w-input")!.value = "110";
+				const hi = document.getElementById("roi-h-input") as HTMLInputElement;
+				hi.value = "85";
+				hi.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+			});
+			await expect(page.locator("#roi-box")).toBeVisible();
+			const post = page.waitForResponse((r) =>
+				new URL(r.url()).pathname === "/api/annotation" &&
+				r.request().method() === "POST");
+			await page.locator("#anno-obj-toolbar .aot-save").click();
+			expect((await post).status()).toBe(200);
+			const savedToolbar = page.locator(
+				"#anno-obj-toolbar .aot-askai:not(.aot-askai-draft)");
+			await expect(savedToolbar).toBeVisible(); // 保存后非草稿工具条（选中）
+
+			// 重开面板：刷新已落地 → 显示含新标记的列表（不是错误页）
+			await annoBtn.click();
+			const beforeRows = await page
+				.locator("#anno-panel-list .anno-item").count();
+			expect(beforeRows, "保存后的新列表应已渲染").toBeGreaterThan(0);
+			await expect(page.locator("#anno-panel-list"))
+				.not.toContainText("HTTP 500");
+
+			// 放行早先挂起的旧重试：修复前晚到旧 200 回退行数 / 旧 500 清成
+			// 错误页；修复后旧世代响应整体丢弃
+			release();
+			await page.waitForTimeout(350);
+			const afterRows = await page
+				.locator("#anno-panel-list .anno-item").count();
+			expect(afterRows, "晚到旧响应不得改变行数").toBe(beforeRows);
+			await expect(page.locator("#anno-panel-list .anno-panel-error"))
+				.toHaveCount(0);
+			await expect(page.locator("#anno-panel-list"))
+				.not.toContainText("HTTP 500");
+			await expect(savedToolbar).toBeVisible(); // 选中保持（未被清空）
+			await page.screenshot({
+				path: `${EVIDENCE_DIR}/e2e-anno-list-race-late-${lateStatus}.png` });
+			await page.unroute("**/api/annotations?**");
+
+			// 服务端数据完好：行数与面板一致（面板回退纯属前端覆盖）
+			const persisted = await pageApi(page, "GET",
+				`/api/annotations?slide_id=${encodeURIComponent(SID)}`);
+			expect(persisted.status).toBe(200);
+			const persistedRows = ((persisted.j.annotations || []) as unknown[])
+				.reduce((n, g) => n +
+					(((g as { items?: unknown[] }).items) || []).length, 0);
+			expect(persistedRows).toBe(beforeRows);
+		}
+
+		// 收尾清场（给后续 spec 留干净切片）
+		await wipeAnnotations(page, SID);
 	});
 });

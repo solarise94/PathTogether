@@ -10,7 +10,12 @@
  *     （renderAnnoPanel 不被清空调用），顶部插失效提示条；成功后标记清除；
  *     刷新成功同时清错误态（先于 editDrag 早退）；currentAnnotations 为空
  *     （仍在错误态）时刷新失败维持错误态、不标失效（review e64acaf3 #1/#2）。
- *   - 迟到响应防护沿用 slideAtReq 对象身份判定：换片后的旧响应整体丢弃。
+ *   - 迟到响应防护（P2 复核 2026-10-18）：load/refresh 共用 annoListReqGen
+ *     世代——同一切片内的反序响应（晚到旧 load 200/500、晚到旧 refresh
+ *     200/500）在响应到达、JSON 解析后与 catch 内都按世代+切片身份复核，
+ *     旧世代整体静默丢弃；换片后的旧响应同样丢弃（跨切片防护保持）。
+ *   - 当前世代 load 失败但本切片已有成功数据：保留数据走失效提示，绝不
+ *     置 null（review 047 #1）；数据属于旧切片时仍清空进错误态。
  *   - openAnnoPanel：错误态/失效提示的打开入口。
  */
 import { describe, expect, it } from "vitest";
@@ -101,6 +106,7 @@ function makeEl(tag = "div") {
 
 interface HarnessInit {
 	currentAnnotations?: any;
+	currentAnnotationsSlide?: any;
 	annoListError?: any;
 	annoListStale?: boolean;
 	annoPanelOpen?: boolean;
@@ -136,6 +142,13 @@ function makeHarness(
 		"counters",
 		`
 		 // —— 初始值（init 通道；对象引用与外部共享）——
+		 // annoListReqGen/currentAnnotationsSlide 在生产 app.js 是模块级变量
+		 // （被测切片之外），此处按 init 通道补声明：已有数据默认归属当前
+		 // 切片，可用 init.currentAnnotationsSlide 指定为别的切片对象。
+		 var annoListReqGen = 0;
+		 var currentAnnotationsSlide = ("currentAnnotationsSlide" in init)
+			 ? init.currentAnnotationsSlide
+			 : (init.currentAnnotations ? state.slide : null);
 		 var currentAnnotations = ("currentAnnotations" in init) ? init.currentAnnotations : null;
 		 var annoListError = ("annoListError" in init) ? init.annoListError : null;
 		 var annoListStale = !!init.annoListStale;
@@ -172,6 +185,7 @@ function makeHarness(
 			 read: function () {
 				 return {
 					 currentAnnotations: currentAnnotations,
+					 currentAnnotationsSlide: currentAnnotationsSlide,
 					 annoListError: annoListError,
 					 annoListStale: annoListStale,
 					 annoPanelOpen: annoPanelOpen,
@@ -201,6 +215,7 @@ function makeHarness(
 		};
 		read: () => {
 			currentAnnotations: any;
+			currentAnnotationsSlide: any;
 			annoListError: any;
 			annoListStale: boolean;
 			annoPanelOpen: boolean;
@@ -224,6 +239,13 @@ const okResp = (body: unknown) => ({
 });
 /** 宏任务等待：一次冲干净被测切片整条 promise 链的微任务 */
 const settle = () => new Promise((r) => setTimeout(r, 0));
+/** 逐调用挂起的 fetch 桩：calls[i](response) 放行第 i+1 次请求（世代反序用） */
+function deferredFetch() {
+	const calls: Array<(v: unknown) => void> = [];
+	const fetchImpl = () =>
+		new Promise((res) => { calls.push(res); });
+	return { calls, fetchImpl };
+}
 const fresh = {
 	annotations: [
 		{
@@ -311,6 +333,153 @@ describe("标注列表初始加载失败（loadCurrentSlideAnnotations）", () =
 		const r = harness.read();
 		expect(r.currentAnnotations).toBeNull();
 		expect(r.annoListError).toBeNull();
+	});
+});
+
+// —— review 047 #1 回归：同一切片内 load/refresh 反序（共用请求世代）——
+// 切片对象身份判不了同切片两个请求的新旧：初始加载 500 → 重试挂起 → 保存
+// 触发刷新已落地 → 放行旧重试，晚到旧 200 把列表回退、晚到旧 500 把已有
+// 数据清成错误页。共用 annoListReqGen 后两种反序都必须整体丢弃。
+describe("同切片请求世代：反序响应整体丢弃（review 047 #1）", () => {
+	const old3 = { annotations: [
+		{ label: "old", count: 2, items: [{ annotation_id: "a" }, { annotation_id: "b" }] },
+	] };
+	const new4 = { annotations: [
+		{ label: "old", count: 2, items: [{ annotation_id: "a" }, { annotation_id: "b" }] },
+		{ label: "new", count: 1, items: [{ annotation_id: "c" }] },
+	] };
+
+	it("晚到旧 load 200：较新的 refresh 已落地 → 旧响应整体丢弃，列表不回退", async () => {
+		const { calls, fetchImpl } = deferredFetch();
+		const { harness } = makeHarness(fetchImpl, { annoPanelOpen: true });
+		const load1 = harness.load();      // 世代1：初始加载/重试挂起
+		const refresh1 = harness.refresh(); // 世代2：保存后的刷新先落地
+		calls[1](okResp(new4));
+		await refresh1;
+		expect(harness.read().currentAnnotations).toEqual(new4);
+		// 放行旧 load（200 + 旧 3 行体）：整体丢弃——数据不回退、面板不随旧
+		// 数据重渲、也不误标失效；且连旧响应的 json() 都不再消费
+		let jsonRead = false;
+		calls[0]({ ok: true, status: 200, json: () => {
+			jsonRead = true;
+			return Promise.resolve(old3);
+		} });
+		await load1;
+		const r = harness.read();
+		expect(jsonRead).toBe(false);
+		expect(r.currentAnnotations).toEqual(new4);
+		expect(r.annoListError).toBeNull();
+		expect(r.annoListStale).toBe(false);
+		expect(harness.counters.panelRender).toBe(1); // 只有刷新那一次整表重渲
+	});
+
+	it("晚到旧 load 500：不清空已落地数据、不进错误页、不误标失效", async () => {
+		const { calls, fetchImpl } = deferredFetch();
+		const { harness, els } = makeHarness(fetchImpl, { annoPanelOpen: true });
+		const load1 = harness.load();
+		const refresh1 = harness.refresh();
+		calls[1](okResp(new4));
+		await refresh1;
+		calls[0](failResp(500));
+		await load1;
+		const r = harness.read();
+		expect(r.currentAnnotations).toEqual(new4);
+		expect(r.annoListError).toBeNull();
+		expect(r.annoListStale).toBe(false);
+		expect(els.annoPanelList.querySelector(".anno-panel-error")).toBeNull();
+	});
+
+	it("晚到旧 refresh 200：其后较新的 load 已落地 → 丢弃，不覆盖新数据", async () => {
+		const { calls, fetchImpl } = deferredFetch();
+		const { harness } = makeHarness(fetchImpl, { annoPanelOpen: true });
+		const refresh1 = harness.refresh(); // 世代1挂起
+		const load2 = harness.load();       // 世代2（重试/重开同切片的加载）
+		calls[1](okResp(new4));
+		await load2;
+		calls[0](okResp(old3));
+		await refresh1;
+		const r = harness.read();
+		expect(r.currentAnnotations).toEqual(new4);
+		expect(r.annoListError).toBeNull();
+		expect(harness.counters.panelRender).toBe(1);
+	});
+
+	it("晚到旧 refresh 500：不给较新 load 已落地的数据标失效/进错误页", async () => {
+		const { calls, fetchImpl } = deferredFetch();
+		const { harness, els } = makeHarness(fetchImpl, { annoPanelOpen: true });
+		const refresh1 = harness.refresh();
+		const load2 = harness.load();
+		calls[1](okResp(new4));
+		await load2;
+		calls[0](failResp(500));
+		await refresh1;
+		const r = harness.read();
+		expect(r.currentAnnotations).toEqual(new4);
+		expect(r.annoListStale).toBe(false);
+		expect(r.annoListError).toBeNull();
+		expect(els.annoPanelList.querySelector(".anno-panel-error")).toBeNull();
+		expect(els.annoPanelList.querySelector(".anno-panel-stale")).toBeNull();
+	});
+
+	it("catch 分支世代复核：旧 load 200 不能冲掉较新 refresh 的失败态", async () => {
+		const { calls, fetchImpl } = deferredFetch();
+		const { harness } = makeHarness(fetchImpl);
+		const load1 = harness.load(); // 世代1挂起
+		const refresh1 = harness.refresh(); // 世代2
+		calls[1](failResp(500)); // 刷新失败（无已落地数据 → 错误态落地）
+		await refresh1;
+		expect(harness.read().annoListError).toEqual({ status: 500 });
+		calls[0](okResp(old3)); // 旧 load 200 晚到 → 丢弃，错误态保持
+		await load1;
+		const r = harness.read();
+		expect(r.annoListError).toEqual({ status: 500 });
+		expect(r.currentAnnotations).toBeNull();
+	});
+});
+
+// —— review 047 #1 第二项：当前世代 load 失败但已有本切片成功数据 ——
+describe("load 失败而已有本切片成功数据：保留数据走失效提示", () => {
+	it("重试/初始加载失败：数据保留、顶部插失效条，绝不置 null", async () => {
+		const prev = { annotations: [
+			{ label: "old", count: 1, items: [{ annotation_id: "o1" }] },
+		] };
+		const { harness, state, els } = makeHarness(() => Promise.resolve(failResp(500)), {
+			currentAnnotations: prev, // 默认归属当前切片
+			annoPanelOpen: true,
+		});
+		const rowA = makeEl("div"); rowA.className = "anno-item";
+		const rowB = makeEl("div"); rowB.className = "anno-item";
+		els.annoPanelList.appendChild(rowA);
+		els.annoPanelList.appendChild(rowB);
+
+		await harness.load();
+		const r = harness.read();
+		expect(r.currentAnnotations).toBe(prev); // 上次成功数据原封不动
+		expect(r.currentAnnotationsSlide).toBe(state.slide); // 归属不变
+		expect(r.annoListError).toBeNull();
+		expect(r.annoListStale).toBe(true);
+		expect(els.annoBtn.disabled).toBe(false); // 面板钮不滞留禁用
+		// 失效条 + 旧行照旧（绝不整表清空）
+		expect(els.annoPanelList.children).toHaveLength(3);
+		expect(els.annoPanelList.children[0].className).toBe("anno-panel-stale");
+		expect(els.annoPanelList.children[1]).toBe(rowA);
+		expect(els.annoPanelList.children[2]).toBe(rowB);
+		expect(els.annoPanelList.querySelector(".anno-panel-error")).toBeNull();
+	});
+
+	it("数据属于旧切片（跨切片残留）：失败仍清空进错误态，不冒充当前切片", async () => {
+		const prev = { annotations: [
+			{ label: "prev-slide", count: 1, items: [] },
+		] };
+		const { harness } = makeHarness(() => Promise.resolve(failResp(500)), {
+			currentAnnotations: prev,
+			currentAnnotationsSlide: { id: "slide-0", name: "prev.svs" },
+		});
+		await harness.load();
+		const r = harness.read();
+		expect(r.currentAnnotations).toBeNull();
+		expect(r.currentAnnotationsSlide).toBeNull();
+		expect(r.annoListError).toEqual({ status: 500 });
 	});
 });
 

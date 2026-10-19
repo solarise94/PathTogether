@@ -240,7 +240,7 @@ test("A 小合成 KFB 在工作台面板内转换并上传，拼回的分块被 
   // 行出现并进入转换：面板行文案走引擎阶段词表（design §3.3）
   await expect(panelRows(page)).toHaveCount(before + 1, { timeout: 30_000 });
   const row = panelRows(page).last();
-  await expect(row).toContainText(/复制与探测中|转换中|排队中|正在上传|入库完成/);
+  await expect(row).toContainText(/正在准备上传文件|正在上传|上传成功/);
   await waitSettled(page);
 
   const entry = await entryOf(page);
@@ -248,7 +248,7 @@ test("A 小合成 KFB 在工作台面板内转换并上传，拼回的分块被 
   expect(entry!.error, `转换失败：${JSON.stringify(entry!.error)}`).toBeNull();
   expect(entry!.state).toBe("done");
   // 行到「入库完成」（i18n 键 upload.stage.done）
-  await expect(row.locator(".upload-item-status").first()).toHaveText("入库完成");
+  await expect(row.locator(".upload-item-status").first()).toHaveText("上传成功");
   // 终态行：恰好一个「删除本地产物」（§6.3 唯一的 OPFS 清理入口）
   const rowButtons = row.locator(".upload-item-actions button, .upload-item-actions a");
   await expect(rowButtons.filter({ hasText: "删除本地产物" })).toHaveCount(1);
@@ -489,7 +489,7 @@ test("C 转换中刷新页面，点「继续」把转换做完并上传（刷新
   expect(entry!.jobId).toBe(jobsBefore[0].id);   // 同一个任务，不新建 job
   expect(entry!.error, `续跑失败：${JSON.stringify(entry!.error)}`).toBeNull();
   expect(entry!.state).toBe("done");
-  await expect(row.locator(".upload-item-status").first()).toHaveText("入库完成");
+  await expect(row.locator(".upload-item-status").first()).toHaveText("上传成功");
   expect(entry!.slideId).toMatch(/^sld_/);
   // 续跑把分块真的传了出去
   expect(crossOriginPuts.length).toBeGreaterThan(0);
@@ -513,9 +513,10 @@ test("C 转换中刷新页面，点「继续」把转换做完并上传（刷新
 });
 
 // --------------------------------------------------------------------------- //
-// 开关关闭：回到旧的跳转（弹窗交接）行为
+// 开关关闭（2026-10-20 回退语义改定）：需要转换的文件在当前行得到说明 +
+// 重试/申请支持——绝不弹转换器页；转换器只做本地转换与保存
 // --------------------------------------------------------------------------- //
-test("开关 inline_convert 关闭：回到旧弹窗交接行为（面板内转换不介入）", async ({ page }) => {
+test("开关 inline_convert 关闭：需转换文件行内说明 + 重试/支持（零弹窗、零页面跳转）", async ({ page }) => {
   test.setTimeout(120_000);
   const kfb = ensureKfb(KFB_W, KFB_H);
 
@@ -528,8 +529,6 @@ test("开关 inline_convert 关闭：回到旧弹窗交接行为（面板内转�
   });
   const pageErrors: string[] = [];
   page.on("pageerror", (e) => pageErrors.push(e.message));
-  // window.open 记录 + 替身弹窗（真实弹窗会连到 /tools/slides 并跑第二份
-  // 运行器；交接语义只需证明「确实要弹 /tools/slides」）
   await page.addInitScript(() => {
     const w = window as any;
     w.__opened = [];
@@ -540,22 +539,22 @@ test("开关 inline_convert 关闭：回到旧弹窗交接行为（面板内转�
   // 见 e2e_server.py 的 __inline_convert=0 钩子）
   await openWorkbench(page, "?__inline_convert=0");
   expect(await page.evaluate(() => (window as any).HP_UPLOAD.inlineEnabled())).toBe(false);
-  // 关态下不确认面板行结构（无面板行宿主）；行由既有 makeUploadRow 渲染
   await page.setInputFiles("#file-input", kfb);
 
-  // 旧的回退路径：行给「在本机转换并上传」+「忽略」，不判失败、不建任务
-  const offer = page.locator(".upload-item-btn", { hasText: "在本机转换并上传" });
-  await expect(offer).toHaveCount(1, { timeout: 30_000 });
-  await expect(page.locator(".upload-item").last()).toContainText("该格式需在本机转换后上传");
+  // 关态回退：行内「本机转换暂不可用」说明 + 重试 + 申请支持，零任务、零弹窗
+  const row = page.locator(".upload-item").last();
+  await expect(row).toContainText("本机转换暂不可用", { timeout: 30_000 });
+  const retry = page.locator(".upload-item-btn", { hasText: "重试" });
+  await expect(retry).toHaveCount(1);
+  await expect(page.locator(".upload-item-btn", { hasText: "申请支持该格式" })).toHaveCount(1);
   expect(ingestionCalls).toEqual([]);
+  expect(await page.evaluate(() => (window as any).__opened)).toEqual([]);
   expect(await page.evaluate(() => (window as any).HP_UPLOAD.inlineOrch())).toBeNull();
 
-  await offer.click();
-  await expect.poll(() => page.evaluate(() => (window as any).__opened), {
-    timeout: 15_000,
-  }).toEqual(["/tools/slides"]);
-  // 真弹窗被替身挡住 → 页面给出明确的工具页链接（选择不静默丢失）
-  await expect(page.locator('.upload-item a[href="/tools/slides"]')).toHaveCount(1);
+  // 重试仍不可用（开关没变）：同一说明再现，依旧零任务
+  await retry.click();
+  await page.waitForTimeout(2_000);
+  expect(await page.evaluate(() => (window as any).__opened)).toEqual([]);
   expect(ingestionCalls).toEqual([]);
   expect(popups).toEqual([]);
   expect(pageErrors, `pageerror: ${pageErrors.join(" | ")}`).toEqual([]);

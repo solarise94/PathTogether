@@ -407,6 +407,31 @@ def _sha256_file(path):
     return h.hexdigest()
 
 
+def seed_admin_research_failed_job(user_id):
+    """种一条**终态 failed**（重试耗尽）研究副本删除任务（管理台 E2E 用）。
+
+    只置任务状态/尝试次数/错误码——**不执行任何清理**、不触碰研究数据；
+    worker 不会自动领取（failed + attempts 达上限 = 终态）。
+    """
+    import research_consent_store
+    created = research_consent_store.create_deletion_job(
+        user_id, reason="user_request", actor_user_id=user_id)
+    job_id = created["job"]["job_id"]
+    import psycopg
+    conn = psycopg.connect(os.environ["DATABASE_URL"])
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE research_data_deletion_jobs SET status='failed', "
+                "attempts=%s, error_code='deletion_failed_E2ESeed' "
+                "WHERE job_id=%s",
+                (research_consent_store.MAX_DELETION_ATTEMPTS, job_id))
+        conn.commit()
+    finally:
+        conn.close()
+    return job_id
+
+
 def _install_histopilot_stub(plugin_dir):
     """把桩 bundle 写入 plugin_dir（临时目录，随 e2e 进程清理）。"""
     ui_dir = plugin_dir / "ui"
@@ -528,6 +553,19 @@ def main():
 
     from seed_assets import seed_viewer_assets
     raster_slides = seed_viewer_assets(e2e_user["user_id"])
+
+    # 2026-10-20（评审 §三/§四）管理台 E2E 种子：研究删除异常任务 +
+    # 切片状态筛选所需的墓碑/失败行。**只写元数据，不触发任何清理**：
+    #   - 一条**终态 failed**（重试耗尽）研究副本删除任务：概览「待处理研究
+    #     数据任务 1」与用户抽屉「研究数据」的重新执行入口需要真实行；
+    #   - 一条 deleted 墓碑（用户已删除的切片；文件保留在 objects/，读路径
+    #     已不可见——普通 /api/slides 不受影响）；
+    #   - 一条 legacy failed 且入口文件缺失（历史回填推断档：「历史文件缺失
+    #     （推断）」文案的真实来源）。
+    import research_consent_store
+    from seed_assets import seed_admin_inventory_rows
+    research_job_id = seed_admin_research_failed_job(e2e_user["user_id"])
+    seed_admin_inventory_rows(e2e_user["user_id"])
 
     creds_path = os.environ.get("E2E_CREDS_FILE") or os.path.join(
         tempfile.gettempdir(), "pt-e2e-creds-%d.json" % args.port)

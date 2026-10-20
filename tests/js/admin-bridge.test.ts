@@ -443,16 +443,19 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 			// viewer.open 只读宿主方法）——37 → 37
 			// 2026-10-09（round4 §2.3）：删 2（testApplications.list/review，
 			// 「测试申请」页退役）——37 → 35
-			// 2026-10-20（review-for-opus 一.1/一.3/二，费用页重做）：新增
-			// billing.usage.summary（按用户/小时或按任务的服务端聚合只读）
-			// 与 billing.taskBudget.get（单任务预算 step A 只读）——同域
-			// billing:read 不扩域，35 → 37
-			expect(Object.keys(table)).toHaveLength(37);
+			// 2026-10-20：费用页重做新增 billing.usage.summary 与 billing.taskBudget.get
+			//（billing:read 只读）；「研究删除」一级页退役，新增 users.research（抽屉
+			//「研究数据」只读，复用 users:read），researchDeletionJobs.list/retry 保留兼容。
+			// 35 → 38
+			expect(Object.keys(table)).toHaveLength(38);
 			expect(table["admin.formatRequests.list"]).toBe("admin:users:read");
 			expect(table["admin.formatRequests.get"]).toBe("admin:users:read");
 			expect(table["admin.formatRequests.patch"]).toBe("admin:users:write");
 			expect(table["admin.researchDeletionJobs.list"]).toBe("admin:users:read");
 			expect(table["admin.researchDeletionJobs.retry"]).toBe("admin:users:write");
+			// 2026-10-20（评审 §三）：用户研究数据只读视图（users:read；
+			// 管理端唯一写动作仍是 researchDeletionJobs.retry）
+			expect(table["admin.users.research"]).toBe("admin:users:read");
 			expect(table["admin.settings.model"]).toBe("admin:settings:read");
 			expect(table["admin.settings.model.update"]).toBe("admin:settings:write");
 			// 2026-10-08：临时查看（write）与只读宿主「查看」方法
@@ -544,6 +547,8 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 			//「测试申请」页退役删除（方法整体 unknown_method，无 schema 门）
 			// 2026-09-21：研究删除任务（状态枚举过滤 + 页大小，均可空）
 			"admin.researchDeletionJobs.list",
+			// 2026-10-20（评审 §三）：用户研究数据视图（user_id 必填）
+			"admin.users.research",
 		]) {
 			expect(schemas[method], method).toBeTruthy();
 			// 附加属性一律拒绝（iframe 不能借桥传任意字段）
@@ -613,6 +618,128 @@ describe("AdminBridge host — PR3b read backend proxy (§9 Admin API v1)", () =
 		});
 		await ticks();
 		expect(responses(posted, "r1")[0].env.ok).toBe(true);
+	});
+
+	it("2026-10-20: admin.users.list maps research=abnormal and omits it when absent", async () => {
+		const urls: string[] = [];
+		const { handle, posted, contentWindow } = makeReadHost(async (url) => {
+			urls.push(url);
+			return { status: 200, ok: true, body: { items: [], next_cursor: null } };
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.users.list", {
+				limit: 50, kind: "real", sort: "joined_desc", research: "abnormal",
+			}),
+		});
+		await ticks();
+		// 未置位时缺键（UI 在 filters.research 为空时不带该键）
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r2", "admin.users.list", {
+				limit: 50,
+			}),
+		});
+		await ticks();
+		expect(urls[0]).toBe(
+			"/api/admin/v1/users?limit=50&kind=real&sort=joined_desc&research=abnormal");
+		expect(urls[1]).toBe("/api/admin/v1/users?limit=50");
+		// 空串不是合法枚举值：schema 门拒绝（UI 契约 = 缺键而非空串）
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r4", "admin.users.list", {
+				limit: 50, research: "",
+			}),
+		});
+		await ticks();
+		const emptyStr = responses(posted, "r4");
+		expect(emptyStr[0].env.ok).toBe(false);
+		expect((emptyStr[0].env.error as { code?: string }).code)
+			.toBe("invalid_params");
+		// 非枚举取值在 schema 门就被拒（不发后端请求）
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r3", "admin.users.list", {
+				research: "whatever",
+			}),
+		});
+		await ticks();
+		const bad = responses(posted, "r3");
+		expect(bad[0].env.ok).toBe(false);
+		expect((bad[0].env.error as { code?: string }).code).toBe("invalid_params");
+		expect(urls).toHaveLength(2);
+	});
+
+	it("2026-10-20: admin.users.research proxies the per-user research view path", async () => {
+		const { handle, posted, contentWindow } = makeReadHost(async (url) => {
+			expect(url).toBe("/api/admin/v1/users/usr_AbCd1234/research");
+			return {
+				status: 200, ok: true,
+				body: { user_id: "usr_AbCd1234", collection_enabled: false },
+			};
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.users.research", {
+				user_id: "usr_AbCd1234",
+			}),
+		});
+		await ticks();
+		const rs = responses(posted, "r1");
+		expect(rs[0].env.ok).toBe(true);
+		expect((rs[0].env.result as { user_id?: string }).user_id).toBe("usr_AbCd1234");
+		// user_id 缺失 → schema 门拒绝（required）
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r2", "admin.users.research", {}),
+		});
+		await ticks();
+		const bad = responses(posted, "r2");
+		expect(bad[0].env.ok).toBe(false);
+		expect((bad[0].env.error as { code?: string }).code).toBe("invalid_params");
+	});
+
+	it("2026-10-20: admin.slides.inventory maps status and rejects non-enum values", async () => {
+		const urls: string[] = [];
+		// 独立 slides 权限域（不并入 users/billing 的只读集合）
+		const { handle, posted, contentWindow } = makeHost({
+			permissions: ["admin:slides:read"],
+			fetchJson: async (url) => {
+				urls.push(String(url));
+				return { status: 200, ok: true, body: { items: [], next_cursor: null } };
+			},
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.slides.inventory", {
+				limit: 50, status: "not_deleted",
+			}),
+		});
+		await ticks();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r2", "admin.slides.inventory", {
+				limit: 50,
+			}),
+		});
+		await ticks();
+		expect(urls[0]).toBe(
+			"/api/admin/v1/slides/inventory?limit=50&status=not_deleted");
+		expect(urls[1]).toBe("/api/admin/v1/slides/inventory?limit=50");
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r3", "admin.slides.inventory", {
+				status: "bogus",
+			}),
+		});
+		await ticks();
+		const bad = responses(posted, "r3");
+		expect(bad[0].env.ok).toBe(false);
+		expect((bad[0].env.error as { code?: string }).code).toBe("invalid_params");
+		expect(urls).toHaveLength(2);
 	});
 
 	it("admin.billing.usage.list only whitelists cursor/limit/model/user_id/status", async () => {

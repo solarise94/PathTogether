@@ -116,6 +116,10 @@
     // 2026-10-08（§2）：用户分类（正式/Dogfood）写——与 enable/ai-access
     // 同组同权限域（服务端同 owner + CSRF 复核；值未变不写审计）。
     "admin.users.setAccountKind": "admin:users:write",
+    // 2026-10-20（评审 §三）：用户详情抽屉「研究数据」折叠区（只读）。
+    // 复用 users 权限域（与 researchDeletionJobs.list 同域，不扩权限面）；
+    // 写动作仍只有 researchDeletionJobs.retry（admin:users:write）。
+    "admin.users.research": "admin:users:read",
     // 2026-09-19（R6）：admin.users.create / identityConflicts /
     // discardPending 整行删除（手动建号与身份冲突页退役）——已删方法不在
     // 本表 → dispatch 门按既有语义稳定回 unknown_method。
@@ -240,7 +244,19 @@
         kind: { type: "string", enum: ["real", "dogfood", "all"] },
         sort: { type: "string",
                 enum: ["joined_desc", "joined_asc", "last_login_desc"] },
+        // 2026-10-20（评审 §三）：概览「待处理研究数据任务 N」点入即带
+        // research=abnormal——只看有异常（终态 failed）删除任务的用户；
+        // 缺键 = 不筛选（服务端对未知取值 400，不做隐式兜底）。
+        research: { type: "string", enum: ["abnormal"] },
       },
+      additionalProperties: false,
+    },
+    // 2026-10-20（评审 §三）：用户详情抽屉「研究数据」折叠区的只读数据源
+    //（授权状态/版本/时间 + 删除任务进度 + 采集总开关）；管理端唯一写动作
+    // 仍是 researchDeletionJobs.retry（仅终态 failed）。
+    "admin.users.research": {
+      properties: { user_id: _userIdSpec },
+      required: ["user_id"],
       additionalProperties: false,
     },
     "admin.billing.usage.list": {
@@ -366,7 +382,15 @@
     // 2026-10-08（§3.4）：切片清单 + 管理员临时查看。setVisibility 的
     // schema 已随旧授权模型删除（方法整体 unknown_method）。
     "admin.slides.inventory": {
-      properties: { cursor: _cursorSpec, limit: _limitSpec },
+      properties: {
+        cursor: _cursorSpec,
+        limit: _limitSpec,
+        // 2026-10-20（评审 §四）：状态视图（服务端在分页前执行；缺键 =
+        // 服务端默认 not_deleted）。计数与列表同口径同批数据。
+        status: { type: "string",
+                  enum: ["not_deleted", "viewable", "processing",
+                         "failed", "deleted", "all"] },
+      },
       additionalProperties: false,
     },
     "admin.slides.startTemporaryView": {
@@ -868,7 +892,21 @@
         enabled: payload.enabled, ai_access: payload.ai_access,
         // 2026-10-08（§2）：kind/sort 缺键即省略（服务端默认 real/joined_desc）
         kind: payload.kind, sort: payload.sort,
+        // 2026-10-20（§三）：research=abnormal（缺键即省略 = 不筛选）
+        research: payload.research,
       });
+      return ctx.fetchJson(url).then(function (res) {
+        if (!res.ok) throw backendError(url, res);
+        return res.body;
+      });
+    },
+
+    // 2026-10-20（评审 §三）：用户详情抽屉「研究数据」折叠区（只读）——
+    // GET /api/admin/v1/users/<user_id>/research。pathId 防路径拼接（与
+    // 其它 <user_id> 端点同规格）；user_id 形态由 schema 门 + 宿主侧双检。
+    "admin.users.research": function (ctx, payload) {
+      var url = "/api/admin/v1/users/" +
+        pathId(payload.user_id, "user_id") + "/research";
       return ctx.fetchJson(url).then(function (res) {
         if (!res.ok) throw backendError(url, res);
         return res.body;
@@ -878,9 +916,11 @@
     // 2026-10-08（§3.4）：切片清单（created_at 新→旧 + 每项 temporary_view
     // + 顶层 server_now）与临时查看开/关。旧 setVisibility 后端映射已删
     //（授权模型被 1 小时临时查看取代；服务端旧 visibility 端点 410）。
+    // 2026-10-20（§四）：status 缺键即省略（服务端默认 not_deleted）。
     "admin.slides.inventory": function (ctx, payload) {
       var url = "/api/admin/v1/slides/inventory" + buildQuery({
         cursor: payload.cursor, limit: payload.limit,
+        status: payload.status,
       });
       return ctx.fetchJson(url).then(function (res) {
         if (!res.ok) throw backendError(url, res);

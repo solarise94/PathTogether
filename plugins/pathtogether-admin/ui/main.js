@@ -58,6 +58,19 @@
    真实清理；completed 只能由清理成功产生——本页没有（也不允许有）
    「直接置 completed」的操作。terminal_failed 由服务端判定下发，
    前端只按它显示操作按钮。
+   2026-10-20（评审 §三「研究删除入口可以简化，执行链不能直接下线」）：
+   「研究删除」一级页整体退役（导航/页面/筛选/确认条/清单渲染移除），
+   入口并入用户详情抽屉的「研究数据」折叠区（admin.users.research 只读：
+   授权状态/版本/授权与撤回时间 + 删除任务进度 + 平台采集总开关；采集
+   总开关与个人授权分开显示；管理员不能代用户授权）。概览只在有**异常**
+   删除任务（重试耗尽的终态 failed）时显示「待处理研究数据任务 N」，
+   点入即带 research=abnormal 筛选到这些用户。completed 且
+   backups_pending=true 的行显示「在线副本已清理，备份等待轮换」（不宣称
+   备份已删除）。唯一写动作仍是该折叠区的「重新执行删除」（仅终态 failed，
+   复用既有 retry 桥/鉴权/幂等/审计/worker）。旧 #research-deletion 深链
+   过渡到「用户」页；旧桥方法 admin.researchDeletionJobs.* 暂保留兼容。
+   执行链（撤回同事务建删除任务 / 未了结任务阻断采集 / worker 只删
+   research_* 表）与用户侧撤回、仅删除副本语义**不变**。
    2026-10-08（admin-viewer-simplified §2/§3.4/§4，docs/
    admin-viewer-simplified-20261008.md）：
      - 「邀请」页整体退役（admin.invites.* 桥方法已删、服务端 410；
@@ -105,8 +118,12 @@
     // 分页游标（每列表独立；仅内存）
     cursors: { users: null, usage: null, unpriced: null, ledger: null,
                audit: null, slides: null, formatRequests: null },
-    filters: { users: { kind: "real", sort: "joined_desc" }, usage: {},
-               ledger: {}, audit: {}, format: {}, rdel: {} },
+    // 列表筛选（仅内存）：users.research 是 2026-10-20 的研究异常筛选
+    //（"" | "abnormal"，概览「待处理研究数据任务 N」点入置位）；
+    // slides.status 是切片状态视图（服务端分页前执行，默认 not_deleted）。
+    filters: { users: { kind: "real", sort: "joined_desc", research: "" },
+               usage: {}, ledger: {},
+               audit: {}, format: {}, slides: { status: "not_deleted" } },
     // 切片页临时查看倒计时基准（2026-10-08 §3.4）：清单响应的 server_now +
     // 到达时刻的本地时钟——剩余分钟 = ceil((expires_at - (server_now +
     // 本地流逝))/60)，修正宿主与响应之间的时钟偏移；仅内存。
@@ -194,13 +211,20 @@
   // 回概览而不是报错）。
   // 2026-10-09（round4 §2.3）：test-applications 同规则退役——旧
   // /admin#test-applications 深链回概览。
+  // 2026-10-20（评审 §三）：research-deletion 页退役，但旧深链**过渡**到
+  // 新区域（用户页——研究数据折叠区就在用户详情里），不是回概览：
+  // 深链意图仍被尊重，只是落点换了地方。
+  var HASH_PAGE_ALIASES = { "research-deletion": "users" };
+
   function initialPageFromHash() {
     var pages = ["overview", "users", "slides", "format-requests",
-                 "research-deletion",
                  "settings", "billing", "plugins", "audit"];
     var hash = "";
     try { hash = window.location.hash || ""; } catch (e) { hash = ""; }
     var name = hash.replace(/^#/, "");
+    if (Object.prototype.hasOwnProperty.call(HASH_PAGE_ALIASES, name)) {
+      name = HASH_PAGE_ALIASES[name];
+    }
     return pages.indexOf(name) !== -1 ? name : "overview";
   }
   var initialPage = initialPageFromHash();
@@ -209,10 +233,10 @@
 
   // 2026-10-08：顶级页名收敛——「邀请」页退役移除；「切片可见性」→「切片」
   //（临时查看取代旧 workspace 收录模型）。
+  // 2026-10-20（评审 §三）：「研究删除」页退役移除（并入用户详情抽屉）。
   var PAGE_TITLES = {
     overview: "概览", users: "用户", slides: "切片",
-    "format-requests": "格式申请",
-    "research-deletion": "研究删除", settings: "设置",
+    "format-requests": "格式申请", settings: "设置",
     billing: "费用", plugins: "插件", audit: "审计",
   };
 
@@ -230,7 +254,6 @@
       users: $("adm-page-users"),
       slides: $("adm-page-slides"),
       "format-requests": $("adm-page-format-requests"),
-      "research-deletion": $("adm-page-research-deletion"),
       settings: $("adm-page-settings"),
       billing: $("adm-page-billing"),
       plugins: $("adm-page-plugins"),
@@ -801,6 +824,31 @@
     return card;
   }
 
+  // 概览「待处理研究数据任务 N」（2026-10-20 评审 §三）：**只在有异常删除
+  // 任务**（重试耗尽的终态 failed，待人工处置）时出现——无异常整块隐藏
+  //（不显示 0 噪音）；research.available=false（读取失败）同样不显示：
+  // 绝不把读失败渲染成「无异常」。点「查看待处理用户」带 research=abnormal
+  // 落到用户页并筛选这些用户。
+  function researchKpiCard(count) {
+    var card = document.createElement("div");
+    card.className = "adm-kpi adm-kpi--danger";
+    var l = document.createElement("p");
+    l.className = "adm-kpi-label";
+    l.textContent = "待处理研究数据任务";
+    var v = document.createElement("p");
+    v.className = "adm-kpi-value";
+    v.textContent = fmtNum(count);
+    var n = document.createElement("p");
+    n.className = "adm-kpi-note";
+    n.textContent = "重试耗尽的终态失败，需在用户详情「研究数据」重新执行删除";
+    card.appendChild(l);
+    card.appendChild(v);
+    card.appendChild(n);
+    var btn = actionBtn("查看待处理用户", gotoUsersResearchAbnormal, "secondary");
+    card.appendChild(btn);
+    return card;
+  }
+
   function renderOverviewKpis(ov) {
     var wrap = $("adm-ov-kpis");
     if (!wrap) return;
@@ -827,6 +875,12 @@
     } else {
       wrap.appendChild(kpiCard("计费数据", "不可用",
         "要求 PostgreSQL 后端（" + (b.code || "pg_backend_required") + "）"));
+    }
+    // 研究段（§三）：只在有异常删除任务时出现（见 researchKpiCard）
+    var r = ov.research || {};
+    var abnormal = Number(r.abnormal_deletion_jobs);
+    if (r.available !== false && Number.isFinite(abnormal) && abnormal > 0) {
+      wrap.appendChild(researchKpiCard(abnormal));
     }
   }
 
@@ -1137,15 +1191,14 @@
     ["adm-users-tbody", "adm-usage-tbody", "adm-unpriced-tbody",
      "adm-ledger-tbody", "adm-audit-tbody",
      "adm-plugins-tbody", "adm-slides-tbody",
-     "adm-format-tbody", "adm-rdel-tbody"].forEach(
+     "adm-slides-unregistered-tbody",
+     "adm-format-tbody"].forEach(
     function (id) {
       var el = $(id);
       if (el) el.textContent = "";
     });
     var frDetail = $("adm-format-detail");
     if (frDetail) frDetail.textContent = "";
-    var rdelConfirm = $("adm-rdel-confirm");
-    if (rdelConfirm) { rdelConfirm.hidden = true; rdelConfirm.textContent = ""; }
   }
 
   // 用户分类标签（2026-10-08 §2）：服务端权威 account_kind；未知值回显原文。
@@ -1157,10 +1210,29 @@
   }
 
   // 分类筛选/排序切换（§2）：任一变更即重置游标、作废在途响应、重取首页。
+  // 2026-10-20：研究异常筛选（research=abnormal）走同一入口（resetUsersCursorAndReload）。
   function resetUsersCursorAndReload() {
     state.cursors.users = null;
     state.listSeq++;
+    syncUsersResearchFilter();
     loadUsers(false);
+  }
+
+  // 研究异常筛选的可见性（§三）：置位时显示筛选条与「清除筛选」，
+  // 未置位隐藏——避免操作员误以为列表被截断。
+  function syncUsersResearchFilter() {
+    var box = $("adm-users-research-filter");
+    if (!box) return;
+    box.hidden = (state.filters.users || {}).research !== "abnormal";
+  }
+
+  // 概览「待处理研究数据任务 N」→ 用户页 + research=abnormal（点入筛选异常用户）
+  function gotoUsersResearchAbnormal() {
+    state.filters.users.research = "abnormal";
+    state.cursors.users = null;
+    state.listSeq++;
+    syncUsersResearchFilter();
+    showPage("users");
   }
 
   function loadUsers(append) {
@@ -1174,6 +1246,9 @@
       kind: f.kind || "real",
       sort: f.sort || "joined_desc",
     };
+    // 2026-10-20（§三）：研究异常筛选缺省即省略（不筛选）
+    if (f.research) payload.research = f.research;
+    syncUsersResearchFilter();
     var status = $("adm-users-status");
     setPageState("users", "loading");
     request("admin.users.list", payload).then(function (res) {
@@ -1184,15 +1259,18 @@
       renderUsers(items, append);
       if (!append && !items.length) {
         setPageState("users", "empty", {
-          message: f.kind === "dogfood"
-            ? "还没有 Dogfood 测试账号；在「正式用户」或「全部」列表中可把用户标记为 Dogfood。"
-            : f.kind === "all"
-              ? "暂无用户。"
-              : "暂无正式用户；切到「全部」查看所有账号（含 Dogfood）。",
+          message: f.research === "abnormal"
+            ? "当前没有待处理研究数据任务的用户（没有重试耗尽的终态失败删除任务）。清除筛选可查看全部用户。"
+            : f.kind === "dogfood"
+              ? "还没有 Dogfood 测试账号；在「正式用户」或「全部」列表中可把用户标记为 Dogfood。"
+              : f.kind === "all"
+                ? "暂无用户。"
+                : "暂无正式用户；切到「全部」查看所有账号（含 Dogfood）。",
         });
       } else {
       setPageState("users", "ready", {
-        message: "已更新（" + nowText() + "）",
+        message: "已更新（" + nowText() + "）" +
+          (f.research === "abnormal" ? " · 仅待处理研究数据任务用户" : ""),
       });
       }
       state.cursors.users = res.next_cursor || null;
@@ -1819,6 +1897,9 @@
       kvRow(dl, "额度", "不可用（" + info.reason + "）");
     }
     els.drawerBody.appendChild(dl);
+    // 研究数据折叠区（2026-10-20 评审 §三）：「研究删除」页退役后，授权
+    // 状态与删除任务进度都收在这里（只读；写动作仅终态 failed 的重新执行）
+    els.drawerBody.appendChild(renderResearchSection(u));
     // 低频技术细节默认折叠在底部
     els.drawerBody.appendChild(drawerTechDetails(u));
     var actions = document.createElement("div");
@@ -3675,8 +3756,10 @@
   //（绝不假装翻译），code 缺失时按终态给通用文案。
   // ------------------------------------------------------------------
   var SLIDE_FAIL_CODE_LABELS = {
-    // 回填/迁移（scripts/backfill_slide_asset_state 等）
-    missing_file: "源文件缺失",
+    // 回填/迁移（scripts/backfill_slide_asset_state 等）。
+    // 2026-10-20（评审 §四）：legacy 行入口文件缺失只是**现状推断**
+    //（后端 inferred=true），不声称已查明最初消失原因 →「历史文件缺失（推断）」
+    missing_file: "历史文件缺失",
     // COS 摄取（ingestion_jobs.fail_code）
     cancelled_by_user: "用户已取消上传",
     local_quota_infeasible: "本地容量配额不足，任务未受理",
@@ -3744,20 +3827,28 @@
     if (f && f.code) {
       var code = String(f.code);
       if (code.indexOf("conversion_failed") === 0) return "转换失败";
+      // 2026-10-20（评审 §四）：legacy 行入口文件缺失是**现状推断**
+      //（inferred=true），不能声称已查明最初消失原因——文案直接带（推断）
+      if (code === "missing_file" && f.inferred) {
+        return "历史文件缺失（推断）";
+      }
       return SLIDE_FAIL_CODE_LABELS[code] || ("未知原因（" + code + "）");
     }
     if (f && f.source_state === "cancelled") return "已取消（原因未记录）";
     return "原因未记录";
   }
 
-  // failed 行的紧凑明细：原因 · 来源（任务号）· 时间；推断证据显式标注。
+  // failed 行的紧凑明细：原因 · 来源（任务号）· 时间；推断证据显式标注
+  //（missing_file 的推断已写进原因文案，不再重复「依据现状推断」）。
   function slideFailDetailText(item) {
     var f = item && item.failure;
     if (!f) return "";
     var parts = [slideFailCodeText(f)];
     var src = SLIDE_FAIL_SOURCE_LABELS[f.source] || f.source;
     if (src) parts.push(src + (f.source_ref ? "（" + f.source_ref + "）" : ""));
-    if (f.inferred) parts.push("依据现状推断");
+    if (f.inferred && String(f.code || "") !== "missing_file") {
+      parts.push("依据现状推断");
+    }
     if (f.occurred_at) parts.push(fmtTs(f.occurred_at));
     return parts.join(" · ");
   }
@@ -3835,15 +3926,50 @@
     return cell;
   }
 
+  // ---- 切片状态视图（2026-10-20 评审 §四）----
+  // 服务端在**分页前**执行筛选，计数与列表同口径同批数据；前端只传 status
+  // 并把计数画出来。默认 not_deleted（排除已删除墓碑，保留 deleting 到删除
+  // 真正完成）。筛选代际与分页/刷新/自动刷新共用 state.listSeq：切筛选时
+  // ++ 并清游标，旧筛选的迟到响应一律丢弃（绝不回填）。
+  var SLIDES_STATUS_VALUES = ["not_deleted", "viewable", "processing",
+                              "failed", "deleted", "all"];
+  var SLIDES_STATUS_LABELS = {
+    not_deleted: "未删除", viewable: "可查看", processing: "处理中",
+    failed: "失败", deleted: "已删除", all: "全部",
+  };
+
+  function currentSlidesStatus() {
+    var v = (state.filters.slides || {}).status || "not_deleted";
+    return SLIDES_STATUS_VALUES.indexOf(v) !== -1 ? v : "not_deleted";
+  }
+
+  // 切换筛选（select change 或「筛选」按钮）：值未变不重取；变了则重置游标、
+  // 清空旧筛选缓存、作废在途响应（含自动刷新在途的那一发）。
+  function applySlidesFilter() {
+    var sel = $("adm-slides-status-filter");
+    var v = sel ? String(sel.value || "") : "not_deleted";
+    if (SLIDES_STATUS_VALUES.indexOf(v) === -1) v = "not_deleted";
+    if (v === currentSlidesStatus()) return; // 重复操作不重取
+    state.filters.slides.status = v;
+    state.cursors.slides = null;
+    state.slidesCache = null;
+    slidesInlineConfirm = false;
+    state.listSeq++;
+    loadSlides(false);
+  }
+
   function loadSlides(append) {
     var seq = state.listSeq;
-    var status = $("adm-slides-status");
+    var status = currentSlidesStatus();
+    var statusEl = $("adm-slides-status");
     setPageState("slides", "loading");
     request("admin.slides.inventory", {
       limit: 50,
       cursor: append ? state.cursors.slides : null,
+      // 缺省也显式携带：UI 与服务端默认一致，且筛选代际随请求一起走
+      status: status,
     }).then(function (res) {
-      if (seq !== state.listSeq) return; // 页面已切换：晚到响应丢弃
+      if (seq !== state.listSeq) return; // 页面已切换/筛选已变更：晚到响应丢弃
       hideError();
       var items = (res && res.items) || [];
       // server_now 是剩余分钟与到期判定的基准；本地时钟只追流逝时间
@@ -3854,11 +3980,16 @@
         localAtMs: Date.now(),
         items: (append && state.slidesCache && state.slidesCache.items)
           ? state.slidesCache.items.concat(items) : items,
+        status: (res && res.status) || status,
+        statusCounts: (res && res.status_counts) || null,
+        unregistered: (res && res.unregistered_items) || [],
+        unregisteredTotal: (res && res.unregistered_total) || 0,
       };
       renderSlidesFromCache();
       if (!append && !items.length) {
         setPageState("slides", "empty", {
-          message: "还没有登记的切片文件。用户上传切片后会出现在此。",
+          message: "当前筛选（" + (SLIDES_STATUS_LABELS[status] || status) +
+            "）下没有切片文件；切换状态可查看已删除或全部。",
         });
       } else {
         setPageState("slides", "ready", {
@@ -3868,10 +3999,10 @@
       state.cursors.slides = (res && res.next_cursor) || null;
       var more = $("adm-slides-more-btn");
       if (more) more.disabled = !(res && res.next_cursor);
-      setPageHint(status, res && res.next_cursor ? "还有更多" : "已到底");
+      setPageHint(statusEl, res && res.next_cursor ? "还有更多" : "已到底");
     }).catch(function (err) {
       if (seq !== state.listSeq) return;
-      handleErr(err, status);
+      handleErr(err, statusEl);
       setPageState("slides", "error", {
         code: err && err.code, message: err && err.message,
         retry: function () { loadSlides(false); },
@@ -3883,8 +4014,59 @@
     var tbody = $("adm-slides-tbody");
     if (!tbody) return;
     tbody.textContent = "";
-    (state.slidesCache && state.slidesCache.items || []).forEach(
-      function (item) { renderSlideRow(item); });
+    var cache = state.slidesCache || {};
+    (cache.items || []).forEach(function (item) { renderSlideRow(item); });
+    renderSlidesCounts(cache);
+    renderUnregisteredSlides(cache);
+  }
+
+  // 各状态计数（同口径同批数据）：当前筛选加「←」标记，便于跨页对账。
+  function renderSlidesCounts(cache) {
+    var el = $("adm-slides-counts");
+    if (!el) return;
+    var counts = cache && cache.statusCounts;
+    if (!counts) { el.textContent = ""; return; }
+    var cur = (cache && cache.status) || currentSlidesStatus();
+    var parts = SLIDES_STATUS_VALUES.map(function (key) {
+      var n = counts[key];
+      if (n === null || n === undefined) return null;
+      return SLIDES_STATUS_LABELS[key] + " " + fmtNum(n) +
+        (key === cur ? " ←" : "");
+    }).filter(function (x) { return x !== null; });
+    el.textContent = "各状态计数（全部已登记切片，同一批数据）：" +
+      parts.join(" · ") + "。计数不含盘上未登记文件。";
+  }
+
+  // 未登记文件独立一栏（只报告不认领；不参与状态筛选与计数）
+  function renderUnregisteredSlides(cache) {
+    var box = $("adm-slides-unregistered-box");
+    var tbody = $("adm-slides-unregistered-tbody");
+    if (!box || !tbody) return;
+    var items = (cache && cache.unregistered) || [];
+    var total = (cache && cache.unregisteredTotal) || 0;
+    if (!total) {
+      box.hidden = true;
+      tbody.textContent = "";
+      return;
+    }
+    box.hidden = false;
+    var summary = $("adm-slides-unregistered-summary");
+    if (summary) summary.textContent = "盘上未登记文件 " + fmtNum(total);
+    tbody.textContent = "";
+    items.forEach(function (item) {
+      var tr = document.createElement("tr");
+      tr.appendChild(td(item.name));
+      tr.appendChild(td(fmtBytes(item.size_bytes)));
+      labelResponsiveCells(tr, ["文件", "大小"]);
+      tbody.appendChild(tr);
+    });
+    var note = $("adm-slides-unregistered-note");
+    if (note) {
+      note.textContent = items.length < total
+        ? "共 " + fmtNum(total) + " 个未登记文件，此处只列出前 " +
+          fmtNum(items.length) + " 个（完整清单见接口 orphan_files）。"
+        : "共 " + fmtNum(total) + " 个未登记文件。";
+    }
   }
 
   // 每分钟刷新（§3.4）：按缓存重画整表；任一行从 active 跨过到期时刻则
@@ -4291,18 +4473,25 @@
   // 其历史标记）；导航/页面/筛选/确认条/清单渲染/审核函数与监听已全部
   // 移除，深链 #test-applications 归一回概览。
   // ------------------------------------------------------------------
-  // 研究删除任务处置（2026-09-21，管理员最小处置入口）：
-  //   - admin.researchDeletionJobs.list：GET /api/admin/v1/research-deletion-jobs
-  //     （status 过滤可空；单查即全量、上限由服务端 limit 控制，无游标）；
-  //   - admin.researchDeletionJobs.retry：POST .../<job_id>/retry——把**终态
-  //     failed**（重试耗尽、worker 停止自动重试）的任务复活为 pending、
-  //     attempts 重置 0，交 research_deletion_worker 重新领取并真实清理；
-  //   - 红线：completed 只能由 worker 清理成功产生——本页没有（也不允许有）
-  //     「直接置 completed」的操作；terminal_failed 由服务端判定下发，
-  //     前端只按它显示「重新执行删除」按钮；
-  //   - 409 deletion_job_not_terminal → 提示并刷新（他人已处置/状态已变）；
-  //     404 deletion_job_not_found → 提示并刷新；
-  //   - 渲染白名单字段 textContent（同测试申请页纪律），时间统一 fmtTs。
+  // 研究数据（2026-10-20 评审 §三：「研究删除」一级页退役，入口并入用户
+  // 详情抽屉的「研究数据」折叠区；执行链与用户侧语义不变）：
+  //   - admin.users.research（只读）：GET /api/admin/v1/users/<user_id>/research
+  //     ——授权状态/协议版本/授权与撤回时间/epoch + 删除任务进度 +
+  //     平台采集总开关（与个人授权**分开**显示：开关关着时已授权也不采集）；
+  //   - 红线：管理员**不能代用户授权/撤回**（本区无任何授权写入口）；
+  //   - 删除任务 completed 只表示在线/导出清理完成：backups_pending=true
+  //     时显示「在线副本已清理，备份等待轮换」，绝不宣称备份已删除；
+  //   - 唯一写动作 = 「重新执行删除」，只对**终态 failed**（terminal_failed
+  //     由服务端判定下发）出现，复用既有桥 admin.researchDeletionJobs.retry
+  //     （POST .../<job_id>/retry；复活为 pending、attempts 重置 0，交
+  //     research_deletion_worker 真实清理）——鉴权/幂等/审计/worker 全沿用；
+  //     绝无「直接置 completed」入口；
+  //   - 409 deletion_job_not_terminal → 提示并刷新（他人已处置/worker 已
+  //     领取）；404 deletion_job_not_found → 提示并刷新；
+  //   - 旧桥 admin.researchDeletionJobs.list 暂保留兼容（本区不再调用）；
+  //   - 渲染白名单字段 textContent，时间统一 fmtTs（Asia/Shanghai）；
+  //     失败/错误只写本区状态行（#adm-drawer-research-status）——该节点是
+  //     <p> 而不是 <select>，绝无「把 select 的 option 写没了」的路径。
   // ------------------------------------------------------------------
   var RDEL_STATUS_LABELS = {
     pending: "pending（待执行）", running: "running（执行中）",
@@ -4313,106 +4502,204 @@
     return RDEL_STATUS_LABELS[item.status] || String(item.status || "—");
   }
 
-  function loadResearchDeletionJobs() {
-    var seq = state.listSeq;
-    var f = state.filters.rdel || {};
-    var payload = {};
-    if (f.status) payload.status = f.status;
-    setPageState("research-deletion", "loading");
-    request("admin.researchDeletionJobs.list", payload).then(function (res) {
-      if (seq !== state.listSeq) return; // 页面已切换：晚到响应丢弃
-      hideError();
-      var items = (res && res.items) || [];
-      var tbody = $("adm-rdel-tbody");
-      if (tbody) tbody.textContent = "";
-      items.forEach(function (item) { renderRdelRow(item); });
-      if (!items.length) {
-        setPageState("research-deletion", "empty", {
-          message: f.status
-            ? "没有匹配筛选条件的删除任务；切换筛选可查看全部。"
-            : "暂无研究删除任务。用户撤回研究授权或申请删除研究副本后会出现任务。",
-        });
-      } else {
-        setPageState("research-deletion", "ready", {
-          message: "已更新（" + nowText() + "）",
-        });
+  // 删除任务的清理进度文案（唯一依据是服务端字段，不推断）：
+  // completed 只表示在线/导出清理完成；backups_pending 单独说明备份轮换。
+  function rdelProgressText(job) {
+    if (!job) return "—";
+    if (job.status === "completed") {
+      if (job.backups_pending) return "在线副本已清理，备份等待轮换";
+      return "在线副本与导出已清理（无待轮换备份）";
+    }
+    if (job.status === "failed") {
+      if (job.terminal_failed) {
+        return "清理失败（重试耗尽，待人工处置）：" + (job.error_code || "错误码未记录");
       }
-    }).catch(function (err) {
-      if (seq !== state.listSeq) return;
-      handleErr(err, $("adm-rdel-status"));
-      setPageState("research-deletion", "error", {
-        code: err && err.code, message: err && err.message,
-        retry: function () { loadResearchDeletionJobs(); },
-      });
-    });
+      return "清理失败，等待后台自动重试：" + (job.error_code || "错误码未记录");
+    }
+    if (job.status === "running") return "执行中（后台 worker 正在清理）";
+    if (job.status === "pending") return "待执行（等待后台 worker 领取）";
+    return String(job.status || "—");
   }
 
-  function renderRdelRow(item) {
-    var tbody = $("adm-rdel-tbody");
-    if (!tbody) return;
-    var tr = document.createElement("tr");
-    // 身份主列：identity（邮箱用户名）优先，回退 user_id 技术详情
-    tr.appendChild(td(item.identity || item.user_id));
-    var statusCell = document.createElement("td");
-    statusCell.textContent = rdelStatusLabel(item);
-    if (item.terminal_failed) {
-      // 终态 failed：worker 已停止自动重试，待人工按错误码处置
-      statusCell.appendChild(document.createElement("br"));
-      var meta = document.createElement("span");
-      meta.className = "adm-user-meta";
-      meta.textContent = "终态，待人工处置";
-      statusCell.appendChild(meta);
-    }
-    tr.appendChild(statusCell);
-    tr.appendChild(td(item.attempts, "adm-col-secondary"));
-    tr.appendChild(td(item.error_code));
-    tr.appendChild(td(fmtTs(item.next_retry_at), "adm-cell-time adm-col-secondary"));
-    tr.appendChild(td(item.consent_epoch, "adm-col-secondary"));
-    tr.appendChild(td(fmtTs(item.created_at), "adm-cell-time"));
-    tr.appendChild(td(fmtTs(item.updated_at), "adm-cell-time"));
-    var cell = document.createElement("td");
-    cell.className = "adm-actions-cell";
-    if (item.terminal_failed && item.job_id) {
-      // 唯一动作：重新执行删除（复活为 pending 交 worker 真实清理）；
-      // completed 不提供任何人工置位路径
-      cell.appendChild(actionBtn("重新执行删除", function () {
-        askConfirm($("adm-rdel-confirm"),
-          "确认重新执行该删除任务（" + (item.identity || item.user_id) +
-          "，上次错误 " + (item.error_code || "未知") + "）？任务将复活为" +
-          " pending 并重置尝试次数，由后台 worker 重新清理研究副本；" +
-          "completed 只能由实际清理成功产生。",
-          function () { retryResearchDeletionJob(item); });
+  var RDEL_REASON_LABELS = { withdrawal: "撤回授权触发", user_request: "用户申请删除" };
+
+  function rdelJobNode(job) {
+    var box = document.createElement("div");
+    box.className = "adm-rdel-job";
+    var dl = document.createElement("dl");
+    dl.className = "adm-kv";
+    kvRow(dl, "任务", job.job_id);
+    kvRow(dl, "原因", RDEL_REASON_LABELS[job.reason] || job.reason);
+    kvRow(dl, "状态", rdelStatusLabel(job));
+    kvRow(dl, "清理进度", rdelProgressText(job));
+    kvRow(dl, "尝试次数", job.attempts);
+    kvRow(dl, "错误码", job.error_code);
+    kvRow(dl, "创建时间", fmtTs(job.created_at));
+    kvRow(dl, "更新时间", fmtTs(job.updated_at));
+    if (job.completed_at) kvRow(dl, "完成时间", fmtTs(job.completed_at));
+    if (job.next_retry_at) kvRow(dl, "下次自动重试", fmtTs(job.next_retry_at));
+    box.appendChild(dl);
+    if (job.terminal_failed && job.job_id) {
+      // 唯一动作：重新执行删除（复活为 pending 交 worker 真实清理）
+      var actions = document.createElement("div");
+      actions.className = "adm-actions";
+      actions.appendChild(actionBtn("重新执行删除", function () {
+        askConfirm($("adm-drawer-confirm"),
+          "确认重新执行该删除任务（" + (job.job_id) + "，上次错误 " +
+          (job.error_code || "未知") + "）？任务将复活为 pending 并重置尝试" +
+          "次数，由后台 worker 重新清理研究副本；completed 只能由实际清理" +
+          "成功产生，不会也不允许直接标记完成。",
+          function () { retryResearchDeletionJob(job); });
       }, "primary"));
+      box.appendChild(actions);
     }
-    tr.appendChild(cell);
-    tbody.appendChild(tr);
+    return box;
   }
 
-  function retryResearchDeletionJob(item) {
-    setStatus("adm-rdel-status", "提交中…");
-    request("admin.researchDeletionJobs.retry", { job_id: item.job_id })
+  // 「研究数据」折叠区（抽屉内）：默认折叠；打开抽屉即取一次数据（只读）。
+  function renderResearchSection(u) {
+    var details = document.createElement("details");
+    details.className = "adm-win-adjust adm-drawer-research";
+    details.id = "adm-drawer-research";
+    var summary = document.createElement("summary");
+    summary.textContent = "研究数据（授权状态与删除任务）";
+    details.appendChild(summary);
+    var note = document.createElement("p");
+    note.className = "adm-note";
+    note.textContent = "采集总开关是平台级设置，与该用户的个人授权分开显示：开关" +
+      "关闭时即使已授权也不会采集。管理员不能代用户授权或撤回——授权与撤回" +
+      "只能由用户本人完成。删除任务由后台 worker 异步执行，completed 只能由" +
+      "实际清理成功产生。";
+    details.appendChild(note);
+    // 节点按 ID 解析优先（抽屉重开/重取时复用同一节点；也保证任何经
+    // $() 的写入与渲染落在同一元素上——不产生「两个同 ID 节点」）
+    var body = $("adm-drawer-research-body");
+    if (!body) {
+      body = document.createElement("div");
+      body.id = "adm-drawer-research-body";
+    }
+    details.appendChild(body);
+    var statusEl = $("adm-drawer-research-status");
+    if (!statusEl) {
+      statusEl = document.createElement("p");
+      statusEl.className = "adm-status";
+      // 唯一 ID（2026-10-20 §一.2 重复 DOM ID 修复）：本节点是 <p>，只承接
+      // 文案——错误/重试提示绝不再写进任何 <select>（旧页两处同 ID 的教训）。
+      statusEl.id = "adm-drawer-research-status";
+    }
+    details.appendChild(statusEl);
+    loadUserResearch(u, body, statusEl);
+    return details;
+  }
+
+  function loadUserResearch(u, body, statusEl) {
+    if (!u || !u.user_id || !body) return;
+    body.textContent = "加载中…";
+    // 状态行不清空：处置结果文案（如「已重新执行…」）不被紧随的重取吞掉；
+    // 只有渲染成功后的「已更新」会在其为空/同为「已更新」时刷新（见下）
+    request("admin.users.research", { user_id: u.user_id })
+      .then(function (res) {
+        renderUserResearch(res, body, statusEl);
+      })
+      .catch(function (err) {
+        body.textContent = "";
+        var p = document.createElement("p");
+        p.className = "adm-note";
+        p.textContent = "研究数据读取失败：" + errText(err) +
+          "；可关闭抽屉后重开重试。";
+        body.appendChild(p);
+        if (statusEl) statusEl.textContent = errText(err);
+      });
+  }
+
+  var RESEARCH_CONSENT_LABELS = {
+    granted: "已授权", withdrawn: "已撤回", declined: "未授权（曾拒绝）",
+    reconsent_required: "需重新确认（协议版本已更新）",
+  };
+
+  function researchConsentText(consent) {
+    if (!consent) return "未授权";
+    if (consent.state === "granted") return "已授权";
+    if (consent.state === "withdrawn") return "已撤回";
+    return RESEARCH_CONSENT_LABELS[consent.state] || "未授权";
+  }
+
+  function renderUserResearch(res, body, statusEl) {
+    body.textContent = "";
+    var consent = (res && res.consent) || {};
+    var dl = document.createElement("dl");
+    dl.className = "adm-kv";
+    kvRow(dl, "采集总开关（平台）",
+      (res && res.collection_enabled) ? "已开启" : "已关闭（即使已授权也不采集）");
+    kvRow(dl, "个人授权状态", researchConsentText(consent));
+    kvRow(dl, "协议版本", consent.document_version || "—");
+    kvRow(dl, "授权时间", fmtTs(consent.granted_at));
+    kvRow(dl, "撤回时间", fmtTs(consent.withdrawn_at));
+    kvRow(dl, "授权 epoch", consent.epoch);
+    kvRow(dl, "采集是否生效", (res && res.ingest_allowed)
+      ? "是（开关开启且已授权）" : "否");
+    body.appendChild(dl);
+    var jobs = (res && res.deletion_jobs) || [];
+    var head = document.createElement("p");
+    head.className = "adm-note";
+    head.textContent = jobs.length
+      ? "研究副本删除任务（新→旧）："
+      : "该用户没有研究副本删除任务（未撤回、也未申请删除已有副本）。";
+    body.appendChild(head);
+    jobs.forEach(function (job) { body.appendChild(rdelJobNode(job)); });
+    if (res && res.active_deletion_job) {
+      var active = document.createElement("p");
+      active.className = "adm-note";
+      active.textContent = "当前有未了结删除任务：研究采集/使用侧持续阻断" +
+        "（不影响用户正常读片），任务清理到 completed 才解除。";
+      body.appendChild(active);
+    }
+    if (statusEl) {
+      var cur = statusEl.textContent || "";
+      // 只在空或上一次也是「已更新」时写：重试/失败处置文案不被覆盖
+      if (!cur || cur.indexOf("已更新（") === 0) {
+        statusEl.textContent = "已更新（" + nowText() + "）";
+      }
+    }
+  }
+
+  // 重新执行删除（仅终态 failed 由服务端判定）：成功 → 重取本区；
+  // 409/404 说明他人已处置或任务消失 → 重取（不假装成功）。
+  function retryResearchDeletionJob(job) {
+    var statusEl = $("adm-drawer-research-status");
+    setStatus("adm-drawer-research-status", "提交中…");
+    request("admin.researchDeletionJobs.retry", { job_id: job.job_id })
       .then(function (res) {
         hideError();
         var prev = res && typeof res.previous_attempts === "number"
           ? "（此前尝试 " + res.previous_attempts + " 次）" : "";
-        setStatus("adm-rdel-status",
-          "已重新执行：" + (item.identity || item.user_id) +
-          " 的删除任务复活为 pending，等待 worker 清理" + prev);
-        loadResearchDeletionJobs();
+        setStatus("adm-drawer-research-status",
+          "已重新执行：删除任务复活为 pending，等待 worker 清理" + prev);
+        refreshResearchSection();
       }).catch(function (err) {
         if (err && err.code === "deletion_job_not_terminal") {
-          setStatus("adm-rdel-status",
+          setStatus("adm-drawer-research-status",
             "该任务已不在终态 failed（他人可能已处置或 worker 已领取），已刷新");
-          loadResearchDeletionJobs();
+          refreshResearchSection();
           return;
         }
         if (err && err.code === "deletion_job_not_found") {
-          setStatus("adm-rdel-status", "任务不存在，已刷新");
-          loadResearchDeletionJobs();
+          setStatus("adm-drawer-research-status", "任务不存在，已刷新");
+          refreshResearchSection();
           return;
         }
-        handleErr(err, $("adm-rdel-status"));
+        // 失败只写状态行（<p>），不动任何 select；抽屉与本区保持可用
+        handleErr(err, statusEl);
       });
+  }
+
+  // 重取本区数据（抽屉仍开着才取；抽屉已关则跳过）
+  function refreshResearchSection() {
+    if (!els.drawer || els.drawer.hidden) return;
+    var body = $("adm-drawer-research-body");
+    var statusEl = $("adm-drawer-research-status");
+    if (!body || !drawerUser) return;
+    loadUserResearch(drawerUser, body, statusEl);
   }
 
   // ------------------------------------------------------------------
@@ -4555,7 +4842,6 @@
     else if (name === "users") loadUsers(false);
     else if (name === "slides") loadSlides(false);
     else if (name === "format-requests") loadFormatRequests(false);
-    else if (name === "research-deletion") loadResearchDeletionJobs();
     else if (name === "settings") loadSettingsPage();
     else if (name === "billing") loadBillingPage();
     else if (name === "plugins") loadPlugins();
@@ -4770,6 +5056,13 @@
     // 切片页（2026-10-08 §3.4：清单 + 临时查看；行内动作在行操作列）
     onClick("adm-slides-refresh-btn", function () { loadSlides(false); });
     onClick("adm-slides-more-btn", function () { loadSlides(true); });
+    // 2026-10-20（评审 §四）：状态筛选——change 即应用（值未变不重取），
+    // 「筛选」按钮保留为显式动作；两者共用同一代际逻辑（applySlidesFilter）
+    var slidesStatusSel = $("adm-slides-status-filter");
+    if (slidesStatusSel && slidesStatusSel.addEventListener) {
+      slidesStatusSel.addEventListener("change", applySlidesFilter);
+    }
+    onClick("adm-slides-status-apply", applySlidesFilter);
     // 格式申请页（W2，2026-09-14）：状态筛选 + 分页（详情/迁移动作在行内）
     onClick("adm-format-search-btn", function () {
       state.filters.format = {
@@ -4782,15 +5075,14 @@
     onClick("adm-format-more-btn", function () { loadFormatRequests(true); });
     // 2026-10-09（round4 §2.3）：测试申请页监听（adm-test-search-btn /
     // adm-test-refresh-btn）已随页面退役整体移除。
-    // 研究删除任务页（2026-09-21）：状态过滤 + 刷新（重新执行动作在行内）
-    onClick("adm-rdel-search-btn", function () {
-      state.filters.rdel = {
-        status: $("adm-rdel-status") ? $("adm-rdel-status").value : "",
-      };
-      state.listSeq++;
-      loadResearchDeletionJobs();
+    // 2026-10-20（评审 §三）：研究删除页监听（adm-rdel-search-btn /
+    // adm-rdel-refresh-btn）随页面退役移除——研究数据入口在用户详情抽屉
+    // （折叠区内按钮自绑定），筛选/重试不再经页级监听。
+    // 用户页：研究异常筛选的「清除筛选」（概览点入后的复位）
+    onClick("adm-users-research-clear", function () {
+      state.filters.users.research = "";
+      resetUsersCursorAndReload();
     });
-    onClick("adm-rdel-refresh-btn", function () { loadResearchDeletionJobs(); });
     // 插件页（PR5 修订）
     onClick("adm-plugins-refresh-btn", function () { loadPlugins(); });
     onClick("adm-plugin-secret-copy", function () {

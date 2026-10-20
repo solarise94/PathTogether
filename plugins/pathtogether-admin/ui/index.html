@@ -52,15 +52,21 @@
     「格式申请」（2026-09-14 W2）= 格式支持申请工单：清单 + 状态机处置
     （submitted → reviewing → supported|declined，CAS 迁移 + admin_note）；
     样本只呈现元数据，不内嵌文件内容。
-    页面（9 页 IA）：概览 / 用户 / 切片 / 格式申请 /
-    研究删除 / 设置 / 费用 / 插件 / 审计。
+    页面（8 页 IA）：概览 / 用户 / 切片 / 格式申请 /
+    设置 / 费用 / 插件 / 审计。
     「测试申请」页已整体退役（2026-10-09 round4 §2.3）：admin.testApplications.*
     桥方法删除（unknown_method），服务端路由 410；test_applications 表保留
     为历史。
-    「研究删除」（2026-09-21）= 研究副本删除任务的最小人工处置入口：
-    终态 failed（重试耗尽）任务的清单 + 唯一动作「重新执行删除」（复活为
-    pending 交 worker 真实清理；completed 只能由清理成功产生，绝无
-    「直接置 completed」入口）。
+    「研究删除」一级页已整体退役（2026-10-20 评审 §三）：研究授权状态与删除
+    任务进度并入用户详情抽屉的「研究数据」折叠区（consent 状态/版本/时间 +
+    删除进度 + 采集总开关；管理员不能代用户授权）；概览只在有异常删除任务
+    （重试耗尽的终态 failed）时显示「待处理研究数据任务 N」并点入筛选这些
+    用户；唯一写动作仍是该折叠区内的「重新执行删除」（仅终态 failed，复活
+    为 pending 交 research_deletion_worker 真实清理——completed 只能由清理
+    成功产生，绝无「直接置 completed」入口）。执行链不变：撤回同事务创建
+    删除任务、未了结任务持续阻断研究采集、worker 只删 research_* 表。
+    旧 #research-deletion 深链过渡到「用户」页；旧 API/桥
+    （admin.researchDeletionJobs.list/retry）暂保留兼容。
     2026-10-08（admin-viewer-simplified §2/§3.4/§4，docs/
     admin-viewer-simplified-20261008.md）：
       - 「邀请」页整体退役（注册只剩 closed/public；admin.invites.* 桥方法
@@ -104,7 +110,6 @@
         <button type="button" class="adm-nav-btn" data-page="users">用户</button>
         <button type="button" class="adm-nav-btn" data-page="slides">切片</button>
         <button type="button" class="adm-nav-btn" data-page="format-requests">格式申请</button>
-        <button type="button" class="adm-nav-btn" data-page="research-deletion">研究删除</button>
         <button type="button" class="adm-nav-btn" data-page="settings">设置</button>
         <button type="button" class="adm-nav-btn" data-page="billing">费用</button>
         <button type="button" class="adm-nav-btn" data-page="plugins">插件</button>
@@ -207,7 +212,7 @@
           <div class="adm-state" id="adm-state-users" data-page-state="idle" role="status" aria-live="polite"></div>
           <section class="adm-card">
             <h2>用户</h2>
-            <p class="adm-note">分类用于区分正式用户与内部测试（Dogfood）账号：标记不影响账号数据、额度与权限，随时可改回。启停、AI 权限、重置密码、身份预览与额度调整在「详情」抽屉。时间均为北京时间（GMT+8）；从未登录过的账号「最近登录」显示暂无记录。「研究数据」列是该用户研究授权的当前状态：已授权 / 已撤回 / 未授权。</p>
+            <p class="adm-note">分类用于区分正式用户与内部测试（Dogfood）账号：标记不影响账号数据、额度与权限，随时可改回。启停、AI 权限、重置密码、身份预览与额度调整在「详情」抽屉。时间均为北京时间（GMT+8）；从未登录过的账号「最近登录」显示暂无记录。「研究数据」列是该用户研究授权的当前状态：已授权 / 已撤回 / 未授权；授权版本、删除任务进度与平台采集总开关在「详情」抽屉的「研究数据」折叠区（管理员不能代用户授权）。</p>
             <div class="adm-filters" id="adm-users-filters">
               <div class="adm-kind-seg" id="adm-users-kind-seg" role="group" aria-label="分类筛选">
                 <button type="button" class="adm-kind-btn" data-kind="real" aria-pressed="true">正式用户</button>
@@ -221,6 +226,13 @@
                   <option value="joined_asc">加入时间 · 最早优先</option>
                   <option value="last_login_desc">最近登录</option>
                 </select>
+              </div>
+              <!-- 研究异常筛选（2026-10-20 评审 §三）：概览「待处理研究数据
+                   任务 N」点入即置位——只显示有异常（终态 failed）删除任务的
+                   用户；「清除」恢复全量。 -->
+              <div class="adm-field" id="adm-users-research-filter" hidden>
+                <span class="adm-note" id="adm-users-research-filter-text">仅显示有待处理研究数据任务的用户</span>
+                <button type="button" id="adm-users-research-clear" class="adm-btn-secondary">清除筛选</button>
               </div>
             </div>
             <div class="adm-table-wrap">
@@ -256,12 +268,33 @@
              可查看·剩余 N 分钟 / 本人切片 / 不可查看（原因）；「查看」经
              admin.viewer.open 由宿主在新标签打开 /app?slide=<id>；
              提前结束为行内确认（DEF-4：确认控件渲染在操作单元格内，
-             不再挂表格下方的页级确认条）。 -->
+             不再挂表格下方的页级确认条）。
+             2026-10-20（评审 §四）：状态筛选（服务端分页前执行，计数同口径）
+             ——默认「未删除」（排除已删除墓碑，保留 deleting 到删除完成）；
+             切筛选重置游标并作废在途响应（迟到响应不回填）；盘上未登记文件
+             单独一栏展示，不混入正常资产。 -->
         <section class="adm-page" id="adm-page-slides" hidden>
           <div class="adm-state" id="adm-state-slides" data-page-state="idle" role="status" aria-live="polite"></div>
           <section class="adm-card">
             <h2>用户上传的切片</h2>
-            <p class="adm-note">开启临时查看后 1 小时内可在 Viewer 读取该切片；到期自动结束，也可提前结束。不会修改用户原有的分享设置。</p>
+            <p class="adm-note">开启临时查看后 1 小时内可在 Viewer 读取该切片；到期自动结束，也可提前结束。不会修改用户原有的分享设置。默认只显示未删除的切片；已删除墓碑行保留在库中（旧别名不可重绑、删除幂等与审计依赖它们），本页只读、不做任何数据清理。</p>
+            <div class="adm-filters" id="adm-slides-filters">
+              <div class="adm-field">
+                <label class="adm-field-label" for="adm-slides-status-filter">状态</label>
+                <select id="adm-slides-status-filter">
+                  <option value="not_deleted">未删除（默认）</option>
+                  <option value="viewable">可查看</option>
+                  <option value="processing">处理中</option>
+                  <option value="failed">失败</option>
+                  <option value="deleted">已删除</option>
+                  <option value="all">全部</option>
+                </select>
+              </div>
+              <div class="adm-field adm-field--actions">
+                <button type="button" id="adm-slides-status-apply" class="adm-btn-secondary">筛选</button>
+              </div>
+            </div>
+            <p class="adm-note" id="adm-slides-counts" role="status"></p>
             <div class="adm-table-wrap">
               <table class="adm-table" id="adm-slides-table">
                 <thead>
@@ -275,6 +308,21 @@
                 <tbody id="adm-slides-tbody"></tbody>
               </table>
             </div>
+            <!-- 未登记文件（盘上有文件、库中无 slides 行）：独立一栏展示，
+                 只报告不认领；不参与状态筛选与计数 -->
+            <details class="adm-win-adjust" id="adm-slides-unregistered-box" hidden>
+              <summary id="adm-slides-unregistered-summary">盘上未登记文件</summary>
+              <p class="adm-note">盘上存在、但库中没有对应 slides 行的文件：管理台只报告，不做任何隐式认领或建行。它们不参与状态筛选与计数。</p>
+              <div class="adm-table-wrap">
+                <table class="adm-table" id="adm-slides-unregistered-table">
+                  <thead>
+                    <tr><th>文件</th><th>大小</th></tr>
+                  </thead>
+                  <tbody id="adm-slides-unregistered-tbody"></tbody>
+                </table>
+              </div>
+              <p class="adm-note" id="adm-slides-unregistered-note" role="status"></p>
+            </details>
             <div class="adm-pager">
               <button type="button" id="adm-slides-refresh-btn" class="adm-btn-secondary">刷新列表</button>
               <button type="button" id="adm-slides-more-btn" class="adm-btn-secondary">加载更多</button>
@@ -345,59 +393,14 @@
              test_applications 表保留为历史（研究授权视图仍读取其历史标记）。
              旧 /admin#test-applications 深链与 #invites 同规则归一回概览。 -->
 
-        <!-- 研究删除任务处置（管理员最小处置入口）：终态 failed（重试耗尽、
-             worker 停止自动重试）的研究副本删除任务的人工处置。唯一动作 =
-             「重新执行删除」——复活为 pending、attempts 重置 0，由后台
-             research_deletion_worker 重新领取并真实清理；completed 只能由
-             worker 清理成功产生，本页**没有**（也不允许有）「直接置
-             completed」的操作。处置期间研究侧持续阻断（deletion_pending），
-             与用户正常读片无关；本页不触碰研究数据本身。
-             渲染字段白名单 textContent（同格式申请页纪律）。 -->
-        <section class="adm-page" id="adm-page-research-deletion" hidden>
-          <div class="adm-state" id="adm-state-research-deletion" data-page-state="idle" role="status" aria-live="polite"></div>
-          <section class="adm-card">
-            <h2>研究删除任务</h2>
-            <p class="adm-note">研究副本删除任务（撤回/用户申请产生）由后台 worker 异步执行：失败有界重试，重试耗尽后转为终态 failed 待人工处置。此处唯一操作是「重新执行删除」：任务复活为 pending 并重置尝试次数，由 worker 重新清理——completed 状态只能由实际清理成功产生，本页不提供也不存在「直接标记完成」的入口。删除义务了结前研究侧持续阻断，与用户正常读片无关。</p>
-            <div class="adm-filters" id="adm-rdel-filters">
-              <div class="adm-field">
-                <label class="adm-field-label" for="adm-rdel-status">状态</label>
-                <select id="adm-rdel-status">
-                  <option value="">全部</option>
-                  <option value="failed">failed（含终态待处置）</option>
-                  <option value="pending">pending（待执行）</option>
-                  <option value="running">running（执行中）</option>
-                  <option value="completed">completed（已完成）</option>
-                </select>
-              </div>
-              <div class="adm-field adm-field--actions">
-                <button type="button" id="adm-rdel-search-btn" class="adm-btn-secondary">筛选</button>
-                <button type="button" id="adm-rdel-refresh-btn" class="adm-btn-secondary">刷新</button>
-              </div>
-            </div>
-            <div class="adm-table-wrap">
-              <table class="adm-table" id="adm-rdel-table">
-                <thead>
-                  <tr>
-                    <th>用户</th>
-                    <th>状态</th>
-                    <th class="adm-col-secondary">attempts</th>
-                    <th>错误码</th>
-                    <th class="adm-col-secondary">下次重试</th>
-                    <th class="adm-col-secondary">epoch</th>
-                    <th class="adm-cell-time">创建时间</th>
-                    <th class="adm-cell-time">更新时间</th>
-                    <th>操作</th>
-                  </tr>
-                </thead>
-                <tbody id="adm-rdel-tbody"></tbody>
-              </table>
-            </div>
-            <div class="adm-confirm" id="adm-rdel-confirm" hidden></div>
-            <div class="adm-pager">
-              <span id="adm-rdel-status" class="adm-status"></span>
-            </div>
-          </section>
-        </section>
+        <!-- 研究删除任务处置（2026-10-21 评审 §三）：「研究删除」一级页已
+             退役——授权状态与删除进度并入用户详情抽屉的「研究数据」折叠区
+             （consent 状态/版本/时间 + 删除任务进度 + 采集总开关），异常任务
+             只在概览显示「待处理研究数据任务 N」并可点入筛选这些用户。
+             旧 #research-deletion 深链过渡到「用户」页；旧 API/桥
+             （admin.researchDeletionJobs.list/retry）暂保留兼容。唯一写动作
+             仍是行内「重新执行删除」（仅终态 failed；completed 只能由 worker
+             清理成功产生）。 -->
 
         <!-- 邀请页已整体退役（2026-10-08 §4）：注册只剩 closed/public，
              admin.invites.* 桥方法已删（稳定 unknown_method），服务端

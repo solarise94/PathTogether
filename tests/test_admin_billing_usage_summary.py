@@ -1153,3 +1153,161 @@ def test_summary_attaches_authoritative_lifecycle_status_both_views():
                    % (rid_pending, owner["user_id"])).get_json()
     assert detail["status"] == by_rid[rid_pending]["status"]
     assert detail["status_source"] == by_rid[rid_pending]["status_source"]
+
+
+# --------------------------------------------------------------------------- #
+# 10. 2026-10-21b release review（P2：生命周期身份 / Demo 预占）
+#
+# 复核证据：/mnt/ssd2/tests/review-20261021b-Lhvn5Y（repro.py、repro-demo.py）。
+# 两个场景按**正确行为**断言，原复现输出作为对照：
+#   before → matched_lifecycle_identity=[(rid, None, 'unknown')]；
+#            demo request_only 预占 = 0
+#   after  → lifecycle 行投影 owner 邮箱（identity_source='email'）；
+#            demo request-only 预占 = 7000000（demo_runs 权威会话）
+# --------------------------------------------------------------------------- #
+def test_lifecycle_only_known_account_projects_real_identity():
+    """P2：已知账号的无用量任务必须投影真实身份（不是「未知身份」）。
+
+    lifecycle 行此前硬编码 ``user_id=NULL``，身份投影只认 user_id，导致
+    邮箱搜索能命中主体、却把行显示成未知身份。修复后 owner/user 主体按
+    users 表映射（与 usage 事件写入路径同一规则）；demo 恒为 Demo。
+    """
+    import budget_store
+    c, owner = _owner_client()
+    _set_email(owner["user_id"], "owner-known@example.com")
+    since, until = _range()
+    rid = "req_known_no_usage"
+    budget_store.ensure_run_binding_pending(rid, "owner", owner["user_id"])
+    body = _summary(c, **_range_qs(
+        since, until, {"view": "task",
+                       "email": "owner-known@example.com"}))
+    assert [(it["request_id"], it["identity"], it["identity_source"])
+            for it in body["items"]] == [
+        (rid, "owner-known@example.com", "email")]
+    row = body["items"][0]
+    assert row["user_id"] == owner["user_id"]
+    assert row["identity_user_id"] == owner["user_id"]
+    assert row["identity_source"] != "unknown"
+    # 不做身份过滤时同样投影真实身份（不是只在搜索命中的响应里补）
+    body = _summary(c, **_range_qs(since, until, {"view": "task"}))
+    row = [it for it in body["items"] if it["request_id"] == rid][0]
+    assert (row["identity"], row["identity_source"]) == (
+        "owner-known@example.com", "email")
+
+    # 注册用户主体（user）：同一 subject_id → users.user_id 规则
+    import spend_store
+    import user_store_pg
+    spend_store.set_total_default(50_000_000_000, 1, updated_by="pytest")
+    member = user_store_pg.create_user_with_total_allowance(
+        "member-known", "memberpass123456", display_name="Member")[0]
+    _set_email(member["user_id"], "member-known@example.com")
+    budget_store.ensure_run_binding_pending(
+        "req_member_no_usage", "user", member["user_id"])
+    body = _summary(c, **_range_qs(
+        since, until, {"view": "task",
+                       "email": "member-known@example.com"}))
+    assert [(it["request_id"], it["identity"], it["identity_source"])
+            for it in body["items"]] == [
+        ("req_member_no_usage", "member-known@example.com", "email")]
+
+    # demo 主体：user_id 仍为 NULL，身份投影为 Demo（不伪造注册用户）
+    conn = bh.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO demo_sessions (id, token_hash, created_at, "
+                " expires_at) VALUES ('cap_ident_demo', 'tok_ident_demo', "
+                " now(), now() + interval '1 day')")
+            cur.execute(
+                "INSERT INTO demo_runs (demo_run_id, capability_id, request_id,"
+                " state, histopilot_session_id, accepted_at, expires_at, "
+                " updated_at) "
+                "VALUES ('dmr_ident_demo', 'cap_ident_demo', "
+                " 'req_demo_no_usage_ident', 'accepted', "
+                " 'sess_ident_demo', now(), now() + interval '1 hour', now())")
+        conn.commit()
+    finally:
+        conn.close()
+    body = _summary(c, **_range_qs(since, until, {"view": "task"}))
+    demo_row = [it for it in body["items"]
+                if it["request_id"] == "req_demo_no_usage_ident"][0]
+    assert demo_row["user_id"] is None
+    assert demo_row["identity"] == "Demo"
+    assert demo_row["identity_source"] == "demo"
+
+
+def test_task_detail_resolves_demo_session_from_demo_runs():
+    """P2：只传任务 ID 时，Demo 任务的待结算预占也必须算上。
+
+    demo 主体的权威绑定在 demo_runs（request_id + capability_id），不在
+    ai_run_bindings/usage。省略 session_id 时按同一请求 + 同一 capability
+    解析会话，统计该会话的 open holds；with_session 结果必须一致。
+    """
+    c, _owner = _owner_client()
+    conn = bh.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO demo_sessions (id, token_hash, created_at, "
+                " expires_at) VALUES ('cap_review_no_usage', "
+                " 'tok_review_no_usage', now(), now() + interval '1 day')")
+            cur.execute(
+                "INSERT INTO demo_runs (demo_run_id, capability_id, request_id,"
+                " state, histopilot_session_id, accepted_at, expires_at, "
+                " updated_at) "
+                "VALUES ('dmr_review_no_usage', 'cap_review_no_usage', "
+                " 'req_demo_no_usage', 'accepted', 'sess_demo_no_usage', "
+                " now(), now() + interval '1 hour', now())")
+        conn.commit()
+    finally:
+        conn.close()
+    _open_hold("sess_demo_no_usage", "demo", "cap_review_no_usage")
+    args = {"request_id": "req_demo_no_usage", "subject_type": "demo",
+            "subject_id": "cap_review_no_usage"}
+    detail = c.get("/api/admin/v1/billing/task-detail",
+                   query_string=args).get_json()
+    assert detail["session_id"] == "sess_demo_no_usage"
+    assert detail["budget"]["reserved_nano_cny"] == "7000000"
+    assert detail["budget"]["reserved_scope"] == "session"
+    assert detail["budget"]["open_holds_count"] == 1
+    assert detail["status"] == "running"
+    assert detail["status_source"] == "demo_runs"
+    # 显式传 session_id：结果一致（不是两条统计路径）
+    detail_both = c.get(
+        "/api/admin/v1/billing/task-detail",
+        query_string=dict(args, session_id="sess_demo_no_usage")).get_json()
+    assert detail_both["budget"]["reserved_nano_cny"] == "7000000"
+    assert detail_both["budget"]["reserved_scope"] == "session"
+    # 主体一致性：request_id 属于 cap_review_no_usage，换个 demo capability
+    # 不得借用它的会话/预占
+    mismatched = c.get(
+        "/api/admin/v1/billing/task-detail",
+        query_string=dict(args, subject_id="cap_other")).get_json()
+    assert mismatched["budget"]["reserved_nano_cny"] == "0"
+    assert mismatched["budget"]["reserved_scope"] == "none"
+    assert mismatched["budget"]["open_holds_count"] == 0
+
+
+def test_task_detail_resolves_legacy_reservation_session_request_only():
+    """P2：pre-F ai_budget_reservations 会话回退（仍支持的历史来源）。
+
+    历史 consumed 行带 histopilot_session_id；request_id-only 调用必须能
+    定位并按主体隔离（同 request_id 换主体不得借用另一主体的预占）。
+    """
+    c, owner = _owner_client()
+    rid = "req_legacy_session"
+    bh.bind_reservation(rid, "sess_legacy", "owner", owner["user_id"])
+    _open_hold("sess_legacy", "owner", owner["user_id"])
+    args = {"request_id": rid, "subject_type": "owner",
+            "subject_id": owner["user_id"]}
+    detail = c.get("/api/admin/v1/billing/task-detail",
+                   query_string=args).get_json()
+    assert detail["session_id"] == "sess_legacy"
+    assert detail["budget"]["reserved_nano_cny"] == "7000000"
+    assert detail["budget"]["reserved_scope"] == "session"
+    mismatched = c.get("/api/admin/v1/billing/task-detail",
+                       query_string=dict(args,
+                                         subject_id="usr_other_principal")
+                       ).get_json()
+    assert mismatched["budget"]["reserved_nano_cny"] == "0"
+    assert mismatched["budget"]["reserved_scope"] == "none"

@@ -610,21 +610,51 @@
                       aria-selected="false" tabindex="-1" aria-controls="adm-tabpanel-detail">计费异常</button>
             </div>
             <div class="adm-tabpanel" id="adm-tabpanel-detail" role="tabpanel" aria-labelledby="adm-tab-usage">
-              <!-- 模型调用（usage events）：默认列 时间/用户/模型/状态/输入/输出
-                   token/用户费用；provider 成本/cache/event 放行详情 -->
+              <!-- 模型调用（2026-10-20 review 二：默认「按用户 / 小时」聚合，
+                   可切「按任务」；小时行 → 任务行 → 原始调用三层展开）。
+                   聚合与分页全在服务端（浏览器不分组、不跨页累加）：
+                   - 小时桶固定 Asia/Shanghai 自然小时；
+                   - 金额 = ai_usage_events priced 事件合计（void 排除），
+                     unpriced 只计数量、金额未知（绝不显示成 0 元）；
+                     hold 预占单列，不进已用；账本流水与消费统计分开；
+                   - 任务键 = 权威 request_id + 主体；request_id 缺失的历史行
+                     按「主体 + 会话」分组并标「历史未归属调用」。 -->
               <div id="adm-usage-section">
+                <p class="adm-note">聚合口径：金额为已计价（priced）事件合计，void 排除；未计价只计数量、金额未知（不是 0 元）；hold 预占单列展示、不进已用；账务流水与消费统计分开，不重复累计。小时桶固定 Asia/Shanghai 自然小时；跨小时任务在「按任务」视图保留一项。</p>
                 <div class="adm-filters" id="adm-usage-filters">
+                  <div class="adm-field">
+                    <label class="adm-field-label" for="adm-usage-view">视图</label>
+                    <select id="adm-usage-view">
+                      <option value="hour">按用户 / 小时</option>
+                      <option value="task">按任务</option>
+                    </select>
+                  </div>
+                  <div class="adm-field">
+                    <label class="adm-field-label" for="adm-usage-range">时间范围</label>
+                    <select id="adm-usage-range">
+                      <option value="24h">近 24 小时</option>
+                      <option value="7d" selected>近 7 天</option>
+                      <option value="30d">近 30 天</option>
+                    </select>
+                  </div>
+                  <div class="adm-field">
+                    <label class="adm-field-label" for="adm-usage-sort">排序</label>
+                    <select id="adm-usage-sort">
+                      <option value="default">默认（时段 / 最近活动）</option>
+                      <option value="charge_desc">按用户计费（高 → 低）</option>
+                    </select>
+                  </div>
+                  <div class="adm-field">
+                    <label class="adm-field-label" for="adm-usage-email">邮箱搜索（子串）</label>
+                    <input type="text" id="adm-usage-email" placeholder="如 review@example.invalid" maxlength="128" autocomplete="off">
+                  </div>
                   <div class="adm-field">
                     <label class="adm-field-label" for="adm-usage-model">模型（精确）</label>
                     <input type="text" id="adm-usage-model" placeholder="如 deepseek-v4-flash" maxlength="128">
                   </div>
                   <div class="adm-field">
-                    <label class="adm-field-label" for="adm-usage-user">user_id（精确）</label>
-                    <input type="text" id="adm-usage-user" placeholder="如 usr_AbCdEfGh" maxlength="128">
-                  </div>
-                  <div class="adm-field">
-                    <label class="adm-field-label" for="adm-usage-status">状态</label>
-                    <select id="adm-usage-status">
+                    <label class="adm-field-label" for="adm-usage-status-filter">状态</label>
+                    <select id="adm-usage-status-filter">
                       <option value="">全部</option>
                       <option value="priced">priced</option>
                       <option value="unpriced">unpriced</option>
@@ -632,28 +662,37 @@
                   </div>
                   <div class="adm-field adm-field--actions">
                     <button type="button" id="adm-usage-search-btn" class="adm-btn-secondary">筛选</button>
+                    <button type="button" id="adm-usage-reset-btn" class="adm-btn-secondary">重置</button>
                   </div>
                 </div>
+                <!-- 范围说明（服务端权威：金额属于所选范围；含 unpriced 未知口径） -->
+                <p class="adm-note" id="adm-usage-range-note" role="status"></p>
                 <div class="adm-table-wrap">
-                  <table class="adm-table">
-                    <thead>
-                      <tr>
-                        <th>时间</th><th>用户</th><th>模型</th><th>状态</th>
-                        <th>输入 tokens</th><th>输出 tokens</th><th>用户费用</th><th>详情</th>
-                      </tr>
-                    </thead>
+                  <table class="adm-table" id="adm-usage-table">
+                    <thead id="adm-usage-thead"></thead>
                     <tbody id="adm-usage-tbody"></tbody>
                   </table>
                 </div>
                 <div class="adm-pager">
                   <button type="button" id="adm-usage-more-btn" class="adm-btn-secondary">加载更多</button>
-                  <span id="adm-usage-status" class="adm-status"></span>
+                  <span id="adm-usage-status-message" class="adm-status" role="status"></span>
                 </div>
               </div>
               <!-- 账务流水（ledger · 只读不可变）：默认列 时间/用户/类型/
-                   金额 CNY/原因；account_id/entry_id/nano/metadata 放行详情 -->
+                   金额 CNY/原因；account_id/entry_id/nano/metadata 放行详情。
+                   2026-10-20：身份由服务端批投影（邮箱搜索按主体过滤），与
+                   费用统计分开——账本条目绝不并进消费合计。 -->
               <div id="adm-ledger-section" hidden>
-                <p class="adm-note">账本只读；冲正通过新条目追加，不提供编辑/删除。金额列按两位小数 CNY 显示，原始 nano 在行详情。</p>
+                <p class="adm-note">账本只读；冲正通过新条目追加，不提供编辑/删除。金额列按两位小数 CNY 显示，原始 nano 在行详情。流水与上方消费统计是两套账：这里的金额不会并进「用户计费」合计。</p>
+                <div class="adm-filters" id="adm-ledger-filters">
+                  <div class="adm-field">
+                    <label class="adm-field-label" for="adm-ledger-email">邮箱搜索（子串）</label>
+                    <input type="text" id="adm-ledger-email" placeholder="如 review@example.invalid" maxlength="128" autocomplete="off">
+                  </div>
+                  <div class="adm-field adm-field--actions">
+                    <button type="button" id="adm-ledger-search-btn" class="adm-btn-secondary">筛选</button>
+                  </div>
+                </div>
                 <div class="adm-table-wrap">
                   <table class="adm-table">
                     <thead>

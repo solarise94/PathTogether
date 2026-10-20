@@ -140,6 +140,13 @@
     // 服务端负责，桥层不再出现这些名字。
     "admin.billing.usage.list": "admin:billing:read",
     "admin.billing.ledger.list": "admin:billing:read",
+    // 2026-10-20（review-for-opus 一.1/一.3/二，费用页重做）：聚合视图 +
+    // 单任务预算投影（只读，沿用 admin:billing:read 域，不新开权限）。
+    // usage.summary = 按用户/小时（默认）或按任务的服务端聚合分页；
+    // taskBudget.get = 单任务的范围内/完整/范围外金额 + 权威生命周期状态 +
+    // step A 预算投影（本任务已用 / 待结算预占 / 账户剩余额度及其类型）。
+    "admin.billing.usage.summary": "admin:billing:read",
+    "admin.billing.taskBudget.get": "admin:billing:read",
     "admin.billing.providerBalance.get": "admin:billing:read",
     // refresh 是 PR3b 对 §8.4 表的最小扩展：只抓取供应商自身余额写快照，
     // 不触碰任何用户数据，与 get 同级（admin:billing:read）；服务端有独立
@@ -242,12 +249,61 @@
         limit: _limitSpec,
         model: { type: "string", maxLength: 128, nullable: true },
         user_id: { type: "string", maxLength: 128, nullable: true },
+        // 2026-10-20（review 一.1）：身份子串搜索（服务端解析成 user_id 集合）
+        email: { type: "string", maxLength: 128, nullable: true },
+        // 聚合视图展开「原始调用」按任务 / 历史未归属行按会话取明细
+        request_id: { type: "string", minLength: 1, maxLength: 128,
+                      nullable: true },
+        session_id: { type: "string", minLength: 1, maxLength: 128,
+                      nullable: true },
         status: { type: "string", enum: ["priced", "unpriced"] },
       },
       additionalProperties: false,
     },
     "admin.billing.ledger.list": {
-      properties: { cursor: _cursorSpec, limit: _limitSpec },
+      properties: {
+        cursor: _cursorSpec,
+        limit: _limitSpec,
+        user_id: { type: "string", minLength: 1, maxLength: 128,
+                   nullable: true },
+        email: { type: "string", maxLength: 128, nullable: true },
+      },
+      additionalProperties: false,
+    },
+    // 费用聚合（review 二）：view=hour（按用户/小时，默认）|task（按任务）；
+    // since/until 为 epoch 秒或 RFC3339（缺省近 7 个 Asia/Shanghai 自然日，
+    // 由服务端决定）；email 为身份搜索；sort 的合法性由服务端权威校验
+    //（本表按视图枚举收敛，两个视图各允许两种排序）。
+    "admin.billing.usage.summary": {
+      properties: {
+        cursor: _cursorSpec,
+        limit: _limitSpec,
+        view: { type: "string", enum: ["hour", "task"] },
+        sort: { type: "string",
+                enum: ["hour_desc", "activity_desc", "charge_desc"] },
+        since: { type: "string", maxLength: 64, nullable: true },
+        until: { type: "string", maxLength: 64, nullable: true },
+        email: { type: "string", maxLength: 128, nullable: true },
+        model: { type: "string", maxLength: 128, nullable: true },
+        user_id: { type: "string", maxLength: 128, nullable: true },
+        status: { type: "string", enum: ["priced", "unpriced"] },
+      },
+      additionalProperties: false,
+    },
+    // 单任务预算投影（review 一.3 step A）：只读；request_id 与 session_id
+    // 至少一个（历史未归属行按 session 定位）。
+    "admin.billing.taskBudget.get": {
+      properties: {
+        request_id: { type: "string", minLength: 1, maxLength: 128,
+                      nullable: true },
+        subject_type: { type: "string", enum: ["owner", "user", "demo"] },
+        subject_id: { type: "string", minLength: 1, maxLength: 128 },
+        session_id: { type: "string", minLength: 1, maxLength: 128,
+                      nullable: true },
+        since: { type: "string", maxLength: 64, nullable: true },
+        until: { type: "string", maxLength: 64, nullable: true },
+      },
+      required: ["subject_type", "subject_id"],
       additionalProperties: false,
     },
     "admin.billing.providerBalance.get": {
@@ -861,7 +917,8 @@
     "admin.billing.usage.list": function (ctx, payload) {
       var url = "/api/admin/v1/billing/usage-events" + buildQuery({
         cursor: payload.cursor, limit: payload.limit, model: payload.model,
-        user_id: payload.user_id, status: payload.status,
+        user_id: payload.user_id, email: payload.email, status: payload.status,
+        request_id: payload.request_id, session_id: payload.session_id,
       });
       return ctx.fetchJson(url).then(function (res) {
         if (!res.ok) throw backendError(url, res);
@@ -872,6 +929,36 @@
     "admin.billing.ledger.list": function (ctx, payload) {
       var url = "/api/admin/v1/billing/ledger" + buildQuery({
         cursor: payload.cursor, limit: payload.limit,
+        user_id: payload.user_id, email: payload.email,
+      });
+      return ctx.fetchJson(url).then(function (res) {
+        if (!res.ok) throw backendError(url, res);
+        return res.body;
+      });
+    },
+
+    // 2026-10-20（review 二）：费用聚合视图（按用户/小时 / 按任务）。
+    // 聚合与分页全在服务端完成——宿主只透传筛选/排序/游标；since/until 由
+    // 插件页按所选范围传 epoch 秒（缺省由服务端取近 7 个上海自然日）。
+    "admin.billing.usage.summary": function (ctx, payload) {
+      var url = "/api/admin/v1/billing/usage-summary" + buildQuery({
+        cursor: payload.cursor, limit: payload.limit, view: payload.view,
+        sort: payload.sort, since: payload.since, until: payload.until,
+        email: payload.email, model: payload.model, user_id: payload.user_id,
+        status: payload.status,
+      });
+      return ctx.fetchJson(url).then(function (res) {
+        if (!res.ok) throw backendError(url, res);
+        return res.body;
+      });
+    },
+
+    // 单任务预算投影（step A：已用 / 待结算预占 / 账户剩余额度及其类型）。
+    "admin.billing.taskBudget.get": function (ctx, payload) {
+      var url = "/api/admin/v1/billing/task-detail" + buildQuery({
+        request_id: payload.request_id, subject_type: payload.subject_type,
+        subject_id: payload.subject_id, session_id: payload.session_id,
+        since: payload.since, until: payload.until,
       });
       return ctx.fetchJson(url).then(function (res) {
         if (!res.ok) throw backendError(url, res);

@@ -969,7 +969,13 @@ def test_admin_manifest_plugin_version_bumped_with_hashes():
     # 0.4.17（未发布，不 bump）——概览用户口径收敛正式用户、用户表恢复
     # 余额 + 研究数据列、「测试申请」页退役（admin.testApplications.* 删除），
     # hashes/pin 同步。
-    assert data["pluginVersion"] == "0.4.17"  # hashes/pin 同步
+    # 2026-10-20 0.4.18（review-for-opus 一.1/一.2/一.3/二）：费用页重做——
+    # 默认「按用户 / 小时」服务端聚合视图（可切「按任务」、三层展开到原始
+    # 调用）、身份由服务端批投影（不再依赖用户页缓存）、重复 DOM id 修复
+    #（adm-usage-status → adm-usage-status-filter / adm-usage-status-message）、
+    # 新增桥方法 admin.billing.usage.summary / admin.billing.taskBudget.get
+    #（同 billing:read 域不扩域），hashes/pin 同步。
+    assert data["pluginVersion"] == "0.4.18"  # hashes/pin 同步
     assert "admin:settings:read" in data["adminPermissions"]
     assert "admin:settings:write" in data["adminPermissions"]
     assert "admin:slides:read" in data["adminPermissions"]

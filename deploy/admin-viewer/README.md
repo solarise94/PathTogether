@@ -1,7 +1,7 @@
 # Admin / Viewer deployment
 
 Deploy the `admin-viewer` branch from the current production lineage. This release
-requires migrations through `0081_user_feedback.sql` and admin plugin **0.4.17**.
+requires migrations through `0081_user_feedback.sql` and admin plugin **0.4.18**（费用页聚合视图与身份投影；桥新增 `admin.billing.usage.summary` / `admin.billing.taskBudget.get`）。
 Set `APP_REVISION` to the full deployed Git revision for feedback diagnostics. Switch the
 plugin bundle while the platform is stopped, then restart with the matching source
 policy pin. Migration 0080 immediately ends old permanent admin view grants.

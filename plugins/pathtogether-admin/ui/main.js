@@ -106,7 +106,7 @@
     cursors: { users: null, usage: null, unpriced: null, ledger: null,
                audit: null, slides: null, formatRequests: null },
     filters: { users: { kind: "real", sort: "joined_desc" }, usage: {},
-               audit: {}, format: {}, rdel: {} },
+               ledger: {}, audit: {}, format: {}, rdel: {} },
     // 切片页临时查看倒计时基准（2026-10-08 §3.4）：清单响应的 server_now +
     // 到达时刻的本地时钟——剩余分钟 = ceil((expires_at - (server_now +
     // 本地流逝))/60)，修正宿主与响应之间的时钟偏移；仅内存。
@@ -125,11 +125,17 @@
     billProviderBalanceError: null,
     billDemo: null,
     // 展示 J：user_id → 完整邮箱用户名（email 优先，否则 login_id）的
-    // 内存映射——用量/账单/额度等以 user_id 出线的表格统一换算身份主列
+    // 内存映射——仅用户页使用（rememberIdentities 由 loadUsers 填充）。
+    // 2026-10-20（review 一.1）：费用/流水/格式申请**不再**依赖本缓存，
+    // 身份由服务端在各自 API 里批投影（identity/identity_source）。
     identityById: {},
+    // 费用聚合视图状态（2026-10-20 review 二）：视图/范围/排序（内存态）
+    usageView: "hour",
+    usageRange: "7d",
+    usageSort: "default",
   };
 
-  // 身份主列 helper（J）：user 行或 user_id → 完整邮箱用户名。
+  // 身份主列 helper（J，仅用户页）：user 行或 user_id → 完整邮箱用户名。
   // 不再用 display_name 冒充身份；解析不到回退 user_id（次级技术详情）。
   function identityText(u) {
     if (!u) return "";
@@ -143,6 +149,43 @@
           u.identity || u.email || u.login_id || String(u.user_id);
       }
     });
+  }
+
+  // 2026-10-20（review 一.1）：费用/流水/格式申请的身份主列 = 服务端投影。
+  // 规则（与用户列表 identity 同源，服务端唯一实现）：
+  //   - identity 有值（email_normalized → email → login_id）→ 直接显示；
+  //   - Demo 主体 → 「Demo」（不伪装成注册用户）；
+  //   - 未知身份 → 「未知身份」显式降级，**原始 user_id 只在技术详情**
+  //     （identity_user_id / 行详情），主列绝不把原始 ID 当邮箱用；
+  //   - 无投影字段（旧后端）→ 退回既有缓存渲染（兼容），仍不猜邮箱。
+  function identityCell(item) {
+    if (item && item.identity) return td(item.identity);
+    if (item && (item.identity_source === "demo"
+                 || item.subject_type === "demo")) {
+      return td("Demo");
+    }
+    if (item && item.identity_source) {
+      var cell = td("未知身份");
+      cell.className = "adm-cell-unknown";
+      return cell;
+    }
+    return td(item && item.user_id
+      ? identityText(String(item.user_id)) : "—");
+  }
+
+  // 身份技术详情行（原始 ID / 投影来源 / 降级说明 / 禁用标记）
+  function identityDetailRows(item) {
+    var rows = [];
+    if (!item) return rows;
+    rows.push(["user_id（原始）", item.identity_user_id || item.user_id]);
+    if (item.identity_source) {
+      rows.push(["身份来源", item.identity_source]);
+    }
+    if (item.identity_note) rows.push(["身份说明", item.identity_note]);
+    if (item.identity_disabled === true) {
+      rows.push(["账号状态", "已禁用（身份仍按邮箱显示）"]);
+    }
+    return rows;
   }
 
   // 深链起始页（PR5 /admin#users 兼容）：宿主把父页 hash 透传到本 iframe
@@ -2514,6 +2557,10 @@
   // 标签激活代际：每次切换 ++；迟到的旧标签响应按代际丢弃（§4.6：
   // 切换标签时取消/忽略旧请求结果，防止迟到响应覆盖当前视图）
   var billTabSeq = 0;
+  // 2026-10-20（review 二）：聚合视图的筛选代际——筛选改变（视图/范围/
+  // 排序/邮箱/模型/状态/重置）或切页时 ++；旧筛选在途响应与旧游标一律丢弃，
+  // 迟到响应绝不回填到新筛选的表格里。
+  var billUsageSeq = 0;
 
   function loadBillingPage() {
     setPageState("billing", "loading");
@@ -2728,6 +2775,8 @@
     if (BILL_TABS.indexOf(name) === -1) name = "usage";
     billTab = name;
     billTabSeq++;
+    // 切标签同样作废在途聚合响应（聚合视图代际与标签代际同进）
+    billUsageSeq++;
     var seq = billTabSeq;
     BILL_TABS.forEach(function (t) {
       var btn = $("adm-tab-" + t);
@@ -2745,7 +2794,7 @@
       if (sec) sec.hidden = t !== name;
     });
     // 只有当前标签发请求；同一激活代际内的迟到旧响应按代际丢弃
-    if (name === "usage") loadUsage(false, seq);
+    if (name === "usage") loadUsageSummary(false, billUsageSeq);
     else if (name === "ledger") loadLedger(false, seq);
     else loadUnpriced(false, seq);
   }
@@ -2766,29 +2815,537 @@
     }
   }
 
-  // ---- 费用明细：模型调用（usage events）----
-  // 默认列：时间/用户/模型/状态/输入/输出 token/用户费用；
-  // provider 成本、cache hit/miss、event_id 放行详情（行详情折叠区）。
-  function loadUsage(append, seqGuard) {
-    var seq = seqGuard !== undefined ? seqGuard : billTabSeq;
+  // ---- 费用明细：聚合视图（2026-10-20 review 二）----
+  // 默认「按用户 / 小时」（小时行 → 任务行 → 原始调用三层展开），
+  // 可切「按任务」。聚合与分页全在服务端（浏览器不分组、不跨页累加）；
+  // 筛选改变即丢弃旧响应/旧游标（billUsageSeq 代际）。
+  var BILL_USAGE_RANGE_HOURS = { "24h": 24, "7d": 168, "30d": 720 };
+
+  function usageRangeParams() {
+    var hours = BILL_USAGE_RANGE_HOURS[state.usageRange] || 168;
+    var until = Math.floor(Date.now() / 1000) + 60; // 上界留 1 分钟余量
+    return { since: String(until - hours * 3600), until: String(until) };
+  }
+
+  function usageFilterPayload() {
     var f = state.filters.usage || {};
-    var payload = { limit: 50, cursor: append ? state.cursors.usage : null };
+    var range = usageRangeParams();
+    var payload = { limit: 50, view: state.usageView,
+                    since: range.since, until: range.until };
+    if (state.usageSort && state.usageSort !== "default") {
+      payload.sort = state.usageSort;
+    }
+    if (f.email) payload.email = f.email;
     if (f.model) payload.model = f.model;
-    if (f.user_id) payload.user_id = f.user_id;
     if (f.status) payload.status = f.status;
-    var status = $("adm-usage-status");
-    request("admin.billing.usage.list", payload).then(function (res) {
-      if (seq !== billTabSeq) return; // 标签已切换：迟到旧响应一律丢弃
+    if (f.user_id) payload.user_id = f.user_id;
+    return payload;
+  }
+
+  // 读筛选控件 → state.filters.usage（筛选按钮/回车/重置共用同一读取）
+  function readUsageFilters() {
+    var viewSel = $("adm-usage-view");
+    var rangeSel = $("adm-usage-range");
+    var sortSel = $("adm-usage-sort");
+    if (viewSel) state.usageView = viewSel.value === "task" ? "task" : "hour";
+    if (rangeSel && BILL_USAGE_RANGE_HOURS[rangeSel.value]) {
+      state.usageRange = rangeSel.value;
+    }
+    if (sortSel) {
+      state.usageSort = sortSel.value === "charge_desc" ? "charge_desc"
+        : "default";
+    }
+    state.filters.usage = {
+      email: ($("adm-usage-email") && $("adm-usage-email").value || "").trim(),
+      model: ($("adm-usage-model") && $("adm-usage-model").value || "").trim(),
+      status: $("adm-usage-status-filter")
+        ? $("adm-usage-status-filter").value : "",
+    };
+  }
+
+  // 筛选代际 +1、清游标与旧行，然后重新加载第一页——所有筛选控件走本函数，
+  // 保证「筛选改变 → 丢弃旧响应/旧游标」只有一条路径。
+  function applyUsageFilters() {
+    readUsageFilters();
+    billUsageSeq++;
+    state.cursors.usage = null;
+    var tbody = $("adm-usage-tbody");
+    if (tbody) tbody.textContent = "";
+    var msg = $("adm-usage-status-message");
+    if (msg) msg.textContent = "";
+    loadUsageSummary(false, billUsageSeq);
+  }
+
+  function loadUsageSummary(append, seqGuard) {
+    var seq = seqGuard !== undefined ? seqGuard : billUsageSeq;
+    var payload = usageFilterPayload();
+    if (append) payload.cursor = state.cursors.usage;
+    var status = $("adm-usage-status-message");
+    request("admin.billing.usage.summary", payload).then(function (res) {
+      if (seq !== billUsageSeq) return; // 筛选/标签/页面已切换：迟到响应丢弃
       hideError();
-      renderUsage(res.items || [], append);
-      state.cursors.usage = res.next_cursor || null;
+      renderUsageSummary(res || {}, append);
+      state.cursors.usage = (res && res.next_cursor) || null;
       var more = $("adm-usage-more-btn");
-      if (more) more.disabled = !res.next_cursor;
-      setPageHint(status, res.next_cursor ? "还有更多" : "已到底");
+      if (more) more.disabled = !(res && res.next_cursor);
+      setPageHint(status, res && res.next_cursor ? "还有更多" : "已到底");
     }).catch(function (err) {
-      if (seq !== billTabSeq) return; // 旧标签的迟到失败也忽略
+      if (seq !== billUsageSeq) return; // 旧筛选的迟到失败也忽略
+      // 失败只写消息行（adm-usage-status-message），绝不写进筛选控件——
+      // 2026-10-20 复核的重复 DOM id 曾让 textContent 清空 select 的 option
       handleErr(err, status);
     });
+  }
+
+  function usageHeadLabels() {
+    return state.usageView === "task"
+      ? ["用户", "任务（request_id）", "开始（GMT+8）", "最后活动（GMT+8）",
+         "调用数", "供应商成本", "用户计费", "未计价", "状态", "详情"]
+      : ["时段（Asia/Shanghai）", "用户", "任务数", "调用数", "供应商成本",
+         "用户计费", "未计价", "详情"];
+  }
+
+  function renderUsageHead() {
+    var thead = $("adm-usage-thead");
+    if (!thead) return;
+    thead.textContent = "";
+    var tr = document.createElement("tr");
+    usageHeadLabels().forEach(function (label) {
+      var th = document.createElement("th");
+      th.textContent = label;
+      tr.appendChild(th);
+    });
+    thead.appendChild(tr);
+  }
+
+  // 状态标签（权威生命周期）：running/finished/accepted/unknown
+  function taskStatusText(item) {
+    var status = item && item.status;
+    if (status === "running") return "进行中";
+    if (status === "finished") return "已结束";
+    if (status === "accepted") {
+      return item.status_detail === "pending_session"
+        ? "已起跑（等待会话绑定）" : "会话已绑定（无终态来源）";
+    }
+    return "状态未知";
+  }
+
+  // 时段标签：Asia/Shanghai 自然小时（hour_start → hour_end 均为服务端口径）
+  function hourLabel(item) {
+    var start = item && item.hour_start;
+    var end = item && item.hour_end;
+    if (start === null || start === undefined) return "—";
+    var fmt = function (epoch) {
+      var d = new Date(Number(epoch) * 1000);
+      var p = shanghaiParts(d);
+      return p.year + "-" + p.month + "-" + p.day + " " + p.hour + ":00";
+    };
+    return fmt(start) + " – " + (end ? fmt(end).slice(-5) : "—") + "（GMT+8）";
+  }
+
+  function usageAmountCell(nano, cny) {
+    // 金额一律按整数 nano 显示（先整和后统一舍入，前端不 Number 累加）；
+    // 服务端同源两位小数串放技术详情做交叉核对
+    var cell = td(fmtCny(nano), "adm-cell-time");
+    if (cny) cell.title = cny + " CNY（服务端舍入值）";
+    return cell;
+  }
+
+  function unpricedCell(count) {
+    var n = Number(count || 0);
+    if (!n) return td("0");
+    var cell = td(String(n) + "（金额未知）", "adm-cell-warn");
+    return cell;
+  }
+
+  function renderUsageSummary(res, append) {
+    var tbody = $("adm-usage-tbody");
+    if (!tbody) return;
+    if (!append) tbody.textContent = "";
+    renderUsageHead();
+    renderUsageRangeNote(res);
+    var items = res.items || [];
+    if (state.usageView === "task") {
+      items.forEach(function (item) { renderTaskRow(tbody, item); });
+    } else {
+      items.forEach(function (item) { renderHourRow(tbody, item); });
+    }
+    if (!append && !items.length) {
+      var empty = document.createElement("tr");
+      var cell = document.createElement("td");
+      cell.colSpan = usageHeadLabels().length;
+      cell.className = "adm-cell-empty";
+      cell.textContent = (res.identity_search
+        ? "没有匹配「" + res.identity_search + "」的消费记录（邮箱搜索按主体过滤）。"
+        : "所选范围内没有模型调用记录；放宽时间范围或清空筛选。");
+      empty.appendChild(cell);
+      tbody.appendChild(empty);
+    }
+  }
+
+  function renderUsageRangeNote(res) {
+    var note = $("adm-usage-range-note");
+    if (!note) return;
+    var range = res && res.range;
+    if (!range) { note.textContent = ""; return; }
+    var totals = (res && res.totals) || {};
+    var parts = [
+      "范围：" + fmtTs(range.since) + " → " + fmtTs(range.until) +
+        "（Asia/Shanghai 自然小时）",
+      "合计：" + fmtNum(totals.call_count) + " 次调用（已计价 " +
+        fmtNum(totals.priced_call_count) + " / 未计价 " +
+        fmtNum(totals.unpriced_call_count) + "）",
+      "用户计费 " + fmtCny(totals.charge_nano_cny) +
+        (Number(totals.unpriced_call_count || 0) > 0 ? "（未计价金额未知，未计入）" : ""),
+    ];
+    if (Number(totals.void_excluded_count || 0) > 0) {
+      parts.push("已排除 void " + totals.void_excluded_count + " 条");
+    }
+    if (res.identity_search_truncated) {
+      parts.push("邮箱搜索命中过多，只取前 500 个账号，请缩小关键词");
+    }
+    if (totals.ledger_included === false) {
+      parts.push("不含账本流水（两套账分开）");
+    }
+    note.textContent = parts.join(" · ");
+  }
+
+  // 小时行（默认视图）：可展开任务行
+  function renderHourRow(tbody, item) {
+    var tr = document.createElement("tr");
+    tr.className = "adm-usage-group-row";
+    tr.appendChild(td(hourLabel(item), "adm-cell-time"));
+    tr.appendChild(identityCell(item));
+    tr.appendChild(td(fmtNum(item.task_count)));
+    tr.appendChild(td(fmtNum(item.call_count)));
+    tr.appendChild(usageAmountCell(item.provider_cost_nano_cny,
+                                   item.provider_cost_cny));
+    tr.appendChild(usageAmountCell(item.charge_nano_cny, item.charge_cny));
+    tr.appendChild(unpricedCell(item.unpriced_call_count));
+    var cell = document.createElement("td");
+    cell.className = "adm-actions-cell";
+    var btn = actionBtn("展开任务", function () {
+      toggleSubRow(tbody, tr, "adm-hour-tasks", btn, "展开任务", function () {
+        return hourTasksContent(item);
+      });
+    }, "secondary");
+    cell.appendChild(btn);
+    tr.appendChild(cell);
+    tbody.appendChild(tr);
+  }
+
+  // 折叠子行通用实现（全宽子行；再点一次收起）。显式接收 tbody——不依赖
+  // parentNode（宿主与测试替身都不保证父子指针）。
+  function toggleSubRow(tbody, tr, className, btn, idleLabel, buildContent) {
+    if (!tbody) return;
+    var next = tr.nextSibling;
+    if (next && next.className &&
+        String(next.className).indexOf(className) !== -1) {
+      if (tbody.removeChild) tbody.removeChild(next);
+      if (btn) btn.textContent = idleLabel;
+      return;
+    }
+    if (btn) btn.textContent = "收起";
+    var sub = document.createElement("tr");
+    sub.className = className;
+    var cell = document.createElement("td");
+    cell.colSpan = tr.children ? tr.children.length : 1;
+    cell.appendChild(buildContent());
+    sub.appendChild(cell);
+    if (next && tbody.insertBefore) tbody.insertBefore(sub, next);
+    else tbody.appendChild(sub);
+  }
+
+  // 小时行展开内容：内联任务行（服务端聚合已带 tasks；浏览器不再分组）
+  function hourTasksContent(item) {
+    var box = document.createElement("div");
+    box.className = "adm-hour-tasks-box";
+    var tasks = item.tasks || [];
+    if (!tasks.length) {
+      box.textContent = "该时段没有可展开的任务行。";
+      return box;
+    }
+    box.appendChild(taskListTable(tasks));
+    if (item.tasks_truncated) {
+      var note = document.createElement("p");
+      note.className = "adm-note";
+      note.textContent = "本时段任务较多，只显示前 " + tasks.length +
+        " 个（按费用降序）；完整清单请切「按任务」视图（同一筛选可分页取全）。";
+      box.appendChild(note);
+    }
+    return box;
+  }
+
+  function taskListTable(tasks) {
+    var wrap = document.createElement("div");
+    wrap.className = "adm-task-list";
+    var table = document.createElement("table");
+    table.className = "adm-table adm-table--nested";
+    var thead = document.createElement("thead");
+    var htr = document.createElement("tr");
+    ["任务（request_id）", "开始", "最后活动", "调用数", "供应商成本",
+     "用户计费", "未计价", "状态", "会话", "详情"].forEach(function (label) {
+      var th = document.createElement("th");
+      th.textContent = label;
+      htr.appendChild(th);
+    });
+    thead.appendChild(htr);
+    table.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    tasks.forEach(function (task) {
+      var tr = document.createElement("tr");
+      tr.appendChild(td(task.unattributed ? "历史未归属调用"
+                                          : (task.request_id || "—")));
+      tr.appendChild(td(fmtTs(task.started_at), "adm-cell-time"));
+      tr.appendChild(td(fmtTs(task.last_at), "adm-cell-time"));
+      tr.appendChild(td(fmtNum(task.call_count)));
+      tr.appendChild(usageAmountCell(task.provider_cost_nano_cny,
+                                     task.provider_cost_cny));
+      tr.appendChild(usageAmountCell(task.charge_nano_cny, task.charge_cny));
+      tr.appendChild(unpricedCell(task.unpriced_call_count));
+      tr.appendChild(td(taskStatusText(task)));
+      tr.appendChild(td(task.session_id || "—", "adm-col-secondary"));
+      var cell = document.createElement("td");
+      cell.className = "adm-actions-cell";
+      cell.appendChild(actionBtn("预算与原始调用", function () {
+        toggleTaskPanel(tbody, tr, task);
+      }, "secondary"));
+      tr.appendChild(cell);
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    return wrap;
+  }
+
+  // 「按任务」视图行（跨小时保留一项；无 usage 的进行中任务也在此出现）
+  function renderTaskRow(tbody, item) {
+    var tr = document.createElement("tr");
+    tr.className = "adm-usage-task-row";
+    tr.appendChild(identityCell(item));
+    var keyCell = td(item.unattributed
+      ? "历史未归属调用" : (item.request_id || "—"));
+    if (item.unattributed) keyCell.className = "adm-cell-warn";
+    if (item.lifecycle_only) {
+      keyCell.appendChild(document.createTextNode("（尚无用量）"));
+    }
+    tr.appendChild(keyCell);
+    tr.appendChild(td(fmtTs(item.started_at), "adm-cell-time"));
+    tr.appendChild(td(fmtTs(item.last_at), "adm-cell-time"));
+    tr.appendChild(td(fmtNum(item.call_count)));
+    tr.appendChild(usageAmountCell(item.provider_cost_nano_cny,
+                                   item.provider_cost_cny));
+    tr.appendChild(usageAmountCell(item.charge_nano_cny, item.charge_cny));
+    tr.appendChild(unpricedCell(item.unpriced_call_count));
+    tr.appendChild(td(taskStatusText(item)));
+    var cell = document.createElement("td");
+    cell.className = "adm-actions-cell";
+    cell.appendChild(actionBtn("预算与原始调用", function () {
+      toggleTaskPanel(tbody, tr, item);
+    }, "secondary"));
+    tr.appendChild(cell);
+    tbody.appendChild(tr);
+  }
+
+  // 任务行展开：预算投影（step A）+ 原始模型调用（旧明细接口按 request_id
+  // 过滤；历史未归属行按 session_id）
+  function toggleTaskPanel(tbody, tr, task) {
+    toggleSubRow(tbody, tr, "adm-task-panel", null, "", function () {
+      var box = document.createElement("div");
+      box.className = "adm-task-panel-box";
+      box.textContent = "读取任务预算与原始调用…";
+      var token = ++billUsagePanelSeq;
+      loadTaskBudget(box, task, token);
+      loadTaskRawCalls(box, task, token);
+      return box;
+    });
+  }
+
+  var billUsagePanelSeq = 0;
+
+  // 预算投影（step A：本任务已用 / 待结算预占 / 账户剩余额度及其类型；
+  // 无单次上限时明确说明——不伪造任务专属人民币预算）
+  function loadTaskBudget(box, task, token) {
+    var payload = {
+      subject_type: task.subject_type,
+      subject_id: task.subject_id,
+      since: usageRangeParams().since,
+      until: usageRangeParams().until,
+    };
+    if (task.request_id) payload.request_id = task.request_id;
+    else if (task.session_id) payload.session_id = task.session_id;
+    else return;
+    request("admin.billing.taskBudget.get", payload).then(function (res) {
+      if (token !== billUsagePanelSeq) return;
+      if (!res || !res.budget) return;
+      renderTaskBudget(box, task, res);
+    }).catch(function (err) {
+      if (token !== billUsagePanelSeq) return;
+      var p = document.createElement("p");
+      p.className = "adm-note";
+      p.textContent = "预算投影读取失败：" + errText(err);
+      box.appendChild(p);
+    });
+  }
+
+  function renderTaskBudget(box, task, res) {
+    var budget = res.budget || {};
+    var account = res.account || {};
+    var dl = document.createElement("dl");
+    dl.className = "adm-kv adm-detail-kv";
+    kvRow(dl, "本任务已用（全量）", fmtCny(budget.spent_nano_cny));
+    kvRow(dl, "待结算预占" + (budget.reserved_scope === "session"
+      ? "（会话级）" : ""), fmtCny(budget.reserved_nano_cny));
+    kvRow(dl, "未计价调用（金额未知）",
+      fmtNum(budget.unpriced_call_count));
+    kvRow(dl, "任务单次上限",
+      budget.per_task_cap_nano_cny === null ||
+        budget.per_task_cap_nano_cny === undefined
+        ? (budget.note || "未设置单次上限，按账户剩余额度控制")
+        : fmtCny(budget.per_task_cap_nano_cny));
+    kvRow(dl, "账户剩余额度（" +
+      (account.limit_type_label || "额度投影不可用") + "）",
+      account.remaining_nano_cny === null ||
+        account.remaining_nano_cny === undefined
+        ? (account.error ? "不可用（" + account.error + "）" : "—")
+        : fmtCny(account.remaining_nano_cny));
+    kvRow(dl, "任务状态", taskStatusText({
+      status: res.status, status_detail: res.status_detail }));
+    kvRow(dl, "状态来源", res.status_source || "无权威来源（状态未知）");
+    kvRow(dl, "所选范围内金额", fmtCny((res.in_range || {}).charge_nano_cny));
+    kvRow(dl, "范围外金额（同一任务）",
+      fmtCny((res.outside_range || {}).charge_nano_cny));
+    kvRow(dl, "完整任务金额（含范围外）",
+      fmtCny((res.lifetime || {}).charge_nano_cny));
+    var head = document.createElement("p");
+    head.className = "adm-note";
+    head.textContent = "任务预算（step A）：已用与待结算预占分列——hold 预占不加进已用；" +
+      (budget.reserved_scope_note || "") +
+      " 单次任务上限（step B）尚未实现，账户额度仍按" +
+      (account.limit_type_label || "账户剩余额度") + "控制。";
+    var section = document.createElement("div");
+    section.className = "adm-task-budget";
+    section.appendChild(head);
+    section.appendChild(dl);
+    if (res.identity || res.identity_source) {
+      var idl = document.createElement("dl");
+      idl.className = "adm-kv adm-detail-kv";
+      identityDetailRows(res).forEach(function (row) {
+        kvRow(idl, row[0], row[1]);
+      });
+      section.appendChild(idl);
+    }
+    box.appendChild(section);
+  }
+
+  // 原始模型调用（旧明细接口保留兼容）：按 request_id（历史行按 session_id）
+  // 过滤，展开到任务行下方——聚合视图不再刷屏，明细按需加载
+  function loadTaskRawCalls(box, task, token) {
+    var payload = { limit: 50 };
+    if (task.request_id) payload.request_id = task.request_id;
+    else if (task.session_id) payload.session_id = task.session_id;
+    if (state.filters.usage && state.filters.usage.status) {
+      payload.status = state.filters.usage.status;
+    }
+    if (state.filters.usage && state.filters.usage.model) {
+      payload.model = state.filters.usage.model;
+    }
+    if (!payload.request_id && !payload.session_id) return;
+    request("admin.billing.usage.list", payload).then(function (res) {
+      if (token !== billUsagePanelSeq) return;
+      renderRawCalls(box, res || {});
+    }).catch(function (err) {
+      if (token !== billUsagePanelSeq) return;
+      var p = document.createElement("p");
+      p.className = "adm-note";
+      p.textContent = "原始调用读取失败：" + errText(err);
+      box.appendChild(p);
+    });
+  }
+
+  function renderRawCalls(box, res) {
+    var items = res.items || [];
+    var head = document.createElement("p");
+    head.className = "adm-note";
+    head.textContent = items.length
+      ? "原始模型调用（本任务" + (res.next_cursor ? "，仅前 " + items.length +
+          " 条，可继续加载更多" : "，全部 " + items.length + " 条") + "）"
+      : "本任务没有可显示的原始调用。";
+    box.appendChild(head);
+    if (!items.length) return;
+    var table = document.createElement("table");
+    table.className = "adm-table adm-table--nested";
+    var thead = document.createElement("thead");
+    var htr = document.createElement("tr");
+    ["时间", "模型", "状态", "输入 tokens", "输出 tokens", "用户费用",
+     "详情"].forEach(function (label) {
+      var th = document.createElement("th");
+      th.textContent = label;
+      htr.appendChild(th);
+    });
+    thead.appendChild(htr);
+    table.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    items.forEach(function (e) {
+      var tr = document.createElement("tr");
+      tr.appendChild(td(fmtTs(e.occurred_at), "adm-cell-time"));
+      tr.appendChild(td(e.model));
+      // 三态显式：priced / unpriced / void（作废行不混进「未计价」口径）
+      tr.appendChild(td(e.status === "priced" ? "已计价"
+        : (e.status === "void" ? "已作废" : "未计价")));
+      tr.appendChild(td(fmtNum((Number(e.cache_hit_input_tokens) || 0) +
+                               (Number(e.cache_miss_input_tokens) || 0))));
+      tr.appendChild(td(fmtNum(e.output_tokens)));
+      tr.appendChild(td(e.charge_nano_cny === null ||
+        e.charge_nano_cny === undefined ? "—" : fmtCny(e.charge_nano_cny),
+        "adm-cell-time"));
+      var cell = document.createElement("td");
+      cell.className = "adm-actions-cell";
+      cell.appendChild(actionBtn("详情", function () {
+        toggleDetailRow(tr, function () {
+          return detailDl([
+            ["event_id", e.event_id],
+            ["request_id", e.request_id],
+            ["session_id", e.session_id],
+            ["provider 成本", e.provider_cost_nano_cny === null ||
+              e.provider_cost_nano_cny === undefined
+              ? "—" : fmtCny(e.provider_cost_nano_cny)],
+            ["cache 命中/未命中 tokens",
+              fmtNum(e.cache_hit_input_tokens) + " / " + fmtNum(e.cache_miss_input_tokens)],
+            ["未计价原因", e.unpriced_reason],
+            ["原始 nano（charge）", e.charge_nano_cny],
+          ].concat(identityDetailRows(e)));
+        });
+      }, "secondary"));
+      tr.appendChild(cell);
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    box.appendChild(table);
+    if (res.next_cursor) {
+      var more = actionBtn("加载更多原始调用", function () {
+        more.disabled = true;
+        request("admin.billing.usage.list", rawCallsNextPayload(res))
+          .then(function (next) {
+            more.disabled = false;
+            renderRawCalls(box, next || {});
+          }).catch(function (err) {
+            more.disabled = false;
+            more.textContent = "加载失败：" + errText(err);
+          });
+      }, "secondary");
+      box.appendChild(more);
+    }
+  }
+
+  function rawCallsNextPayload(res) {
+    var payload = { limit: 50, cursor: res.next_cursor };
+    if (res.items && res.items.length) {
+      var first = res.items[0];
+      if (first.request_id) payload.request_id = first.request_id;
+      else if (first.session_id) payload.session_id = first.session_id;
+    }
+    return payload;
   }
 
   // 行详情折叠区：单行「详情」按钮切换（colspan 全宽子行）
@@ -2818,53 +3375,15 @@
     return dl;
   }
 
-  function renderUsage(items, append) {
-    var tbody = $("adm-usage-tbody");
-    if (!tbody) return;
-    if (!append) tbody.textContent = "";
-    items.forEach(function (e) {
-      var tr = document.createElement("tr");
-      tr.appendChild(td(fmtTs(e.occurred_at), "adm-cell-time"));
-      tr.appendChild(td(e.user_id ? identityText(String(e.user_id))
-        : (e.subject_type === "demo" ? "Demo" : e.subject_type)));
-      tr.appendChild(td(e.model));
-      tr.appendChild(td(e.status === "priced" ? "已计价" : "未计价"));
-      tr.appendChild(td(fmtNum((Number(e.cache_hit_input_tokens) || 0) +
-                               (Number(e.cache_miss_input_tokens) || 0))));
-      tr.appendChild(td(fmtNum(e.output_tokens)));
-      // §4.7：用户费用两位小数 CNY；unpriced 金额保持 null 呈现「—」，
-      // 绝不显示成 0 元
-      tr.appendChild(td(e.charge_nano_cny === null || e.charge_nano_cny === undefined
-        ? "—" : fmtCny(e.charge_nano_cny), "adm-cell-time"));
-      var cell = document.createElement("td");
-      cell.className = "adm-actions-cell";
-      var btn = actionBtn("详情", function () {
-        toggleDetailRow(tr, function () {
-          return detailDl([
-            ["event_id", e.event_id],
-            ["主体", e.subject_type + (e.user_id ? " · " + identityText(String(e.user_id)) : "")],
-            ["provider 成本", e.provider_cost_nano_cny === null ||
-              e.provider_cost_nano_cny === undefined
-              ? "—" : fmtCny(e.provider_cost_nano_cny)],
-            ["cache 命中/未命中 tokens",
-              fmtNum(e.cache_hit_input_tokens) + " / " + fmtNum(e.cache_miss_input_tokens)],
-            ["未计价原因", e.unpriced_reason],
-            ["原始 nano（charge）", e.charge_nano_cny],
-          ]);
-        });
-      }, "secondary");
-      cell.appendChild(btn);
-      tr.appendChild(cell);
-      tbody.appendChild(tr);
-    });
-  }
-
   // ---- 费用明细：账务流水（ledger，只读不可变）----
   // 默认列：时间/用户/类型/金额（CNY）/原因；account_id/entry_id/nano/
-  // metadata 放行详情。
+  // metadata 放行详情。2026-10-20（review 一.1）：身份由服务端批投影
+  // （identity/identity_source），邮箱搜索按主体过滤——不再依赖用户页缓存。
   function loadLedger(append, seqGuard) {
     var seq = seqGuard !== undefined ? seqGuard : billTabSeq;
+    var f = state.filters.ledger || {};
     var payload = { limit: 50, cursor: append ? state.cursors.ledger : null };
+    if (f.email) payload.email = f.email;
     var status = $("adm-ledger-status");
     request("admin.billing.ledger.list", payload).then(function (res) {
       if (seq !== billTabSeq) return;
@@ -2875,8 +3394,8 @@
       (res.items || []).forEach(function (e) {
         var tr = document.createElement("tr");
         tr.appendChild(td(fmtTs(e.created_at), "adm-cell-time"));
-        tr.appendChild(td(e.user_id ? identityText(String(e.user_id))
-                      : (e.account_id || "—")));
+        tr.appendChild(e.user_id || e.identity_source
+          ? identityCell(e) : td(e.account_id || "—"));
         var kindCell = td(e.kind);
         // PR6 模拟扣费条目：metadata.simulated=true → kind 旁加「模拟」徽标
         if (e.metadata && e.metadata.simulated === true) {
@@ -2898,7 +3417,7 @@
               ["entry_id", e.entry_id],
               ["金额（原始 nano）", e.amount_nano_cny],
               ["metadata", e.metadata ? JSON.stringify(e.metadata) : null],
-            ]);
+            ].concat(identityDetailRows(e)));
           });
         }, "secondary");
         cell.appendChild(btn);
@@ -3590,8 +4109,13 @@
     if (!tbody) return;
     var tr = document.createElement("tr");
     tr.appendChild(td(fmtTs(item.created_at), "adm-cell-time"));
-    tr.appendChild(td(item.owner_user_id
-      ? identityText(String(item.owner_user_id)) : "—"));
+    // 2026-10-20（review 一.1）：格式申请的身份同样由服务端批投影
+    //（identity/identity_source/identity_user_id），不再依赖用户页缓存
+    tr.appendChild(item.owner_user_id || item.identity_source
+      ? identityCell({ identity: item.identity,
+                       identity_source: item.identity_source,
+                       user_id: item.owner_user_id })
+      : td("—"));
     tr.appendChild(td(item.format_ext, "adm-col-secondary"));
     tr.appendChild(td(formatStatusLabel(item.business_status)));
     tr.appendChild(td(item.mail_status, "adm-col-secondary"));
@@ -3995,6 +4519,7 @@
     state.page = name;
     state.listSeq++; // 作废在途列表响应（§8.2：晚到响应不写回新页面）
     billTabSeq++;    // 作废在途费用明细响应（跨页迟到不写回）
+    billUsageSeq++;  // 作废在途费用聚合响应（跨页迟到不写回）
     closeUserDrawer();
     if (els.pageTitle) els.pageTitle.textContent = PAGE_TITLES[name] || name;
     // 手机端：切页后收起导航抽屉
@@ -4187,18 +4712,51 @@
         btn.addEventListener("keydown", billingTabKeydown);
       }
     });
-    onClick("adm-usage-search-btn", function () {
-      state.filters.usage = {
-        model: ($("adm-usage-model") && $("adm-usage-model").value || "").trim(),
-        user_id: ($("adm-usage-user") && $("adm-usage-user").value || "").trim(),
-        status: $("adm-usage-status") ? $("adm-usage-status").value : "",
-      };
-      state.cursors.usage = null;
-      loadUsage(false);
+    // 费用聚合筛选（2026-10-20 review 二）：视图/范围/排序/邮箱/模型/状态
+    // 任一改变 → applyUsageFilters（代际 +1、清游标与旧行、重新取第一页）；
+    // 下拉即时生效，文本框按「筛选」按钮或回车提交
+    ["adm-usage-view", "adm-usage-range", "adm-usage-sort",
+     "adm-usage-status-filter"].forEach(function (id) {
+      var sel = $(id);
+      if (sel && sel.addEventListener) {
+        sel.addEventListener("change", function () { applyUsageFilters(); });
+      }
     });
-    onClick("adm-usage-more-btn", function () { loadUsage(true); });
+    ["adm-usage-email", "adm-usage-model"].forEach(function (id) {
+      var input = $(id);
+      if (input && input.addEventListener) {
+        input.addEventListener("keydown", function (ev) {
+          if (ev && ev.key === "Enter") { ev.preventDefault(); applyUsageFilters(); }
+        });
+      }
+    });
+    onClick("adm-usage-search-btn", function () { applyUsageFilters(); });
+    onClick("adm-usage-reset-btn", function () {
+      var viewSel = $("adm-usage-view");
+      var rangeSel = $("adm-usage-range");
+      var sortSel = $("adm-usage-sort");
+      var emailInput = $("adm-usage-email");
+      var modelInput = $("adm-usage-model");
+      var statusSel = $("adm-usage-status-filter");
+      if (viewSel) viewSel.value = "hour";
+      if (rangeSel) rangeSel.value = "7d";
+      if (sortSel) sortSel.value = "default";
+      if (emailInput) emailInput.value = "";
+      if (modelInput) modelInput.value = "";
+      if (statusSel) statusSel.value = "";
+      applyUsageFilters();
+    });
+    onClick("adm-usage-more-btn", function () { loadUsageSummary(true); });
     onClick("adm-unpriced-more-btn", function () { loadUnpriced(true); });
     onClick("adm-ledger-more-btn", function () { loadLedger(true); });
+    onClick("adm-ledger-search-btn", function () {
+      state.filters.ledger = {
+        email: ($("adm-ledger-email") && $("adm-ledger-email").value || "").trim(),
+      };
+      state.cursors.ledger = null;
+      billTabSeq++; // 作废在途 ledger 响应（旧筛选的迟到结果不写回）
+      loadLedger(false, billTabSeq);
+    });
     // 审计页
     onClick("adm-audit-search-btn", function () {
       state.filters.audit = {

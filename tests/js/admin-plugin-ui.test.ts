@@ -1422,9 +1422,11 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 			"adm-spend-owner-month", "adm-spend-mode",
 			"adm-rt-psteps", "adm-rt-demosteps", "adm-rt-concurrency",
 			"adm-win-demo-limit", "adm-win-owner-limit",
-			// 费用页：Demo 统计窗口 / 用量筛选 / 审计筛选
-			"adm-demo-window", "adm-usage-model", "adm-usage-user",
-			"adm-usage-status", "adm-audit-action",
+			// 费用页：Demo 统计窗口 / 用量聚合筛选（视图/范围/排序/邮箱/
+			// 模型/状态）/ 账本邮箱搜索 / 审计筛选
+			"adm-demo-window", "adm-usage-view", "adm-usage-range",
+			"adm-usage-sort", "adm-usage-email", "adm-usage-model",
+			"adm-usage-status-filter", "adm-ledger-email", "adm-audit-action",
 		];
 		const missing = ids.filter((id) =>
 			!new RegExp(`<label[^>]*for=["']${id}["']`).test(htmlSrc));
@@ -1623,25 +1625,39 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 		expect(billing).toContain("模型调用");
 		expect(billing).toContain("账务流水");
 		expect(billing).toContain("计费异常");
-		// usage 默认列（时间/用户/模型/状态/输入/输出 token/用户费用）
+		// 2026-10-20（review 二）：usage 区 = 聚合视图（服务端聚合后分页，
+		// 表头按视图动态渲染）——默认「按用户 / 小时」，可切「按任务」；
+		// 表体/表头都是 JS 渲染，HTML 里只有容器 + 视图/范围/排序/邮箱筛选
 		const usageStart = billing.indexOf('id="adm-usage-section"');
 		const usageEnd = billing.indexOf('id="adm-ledger-section"');
 		const usage = billing.slice(usageStart, usageEnd);
-		expect(usage).toContain("<th>时间</th>");
-		expect(usage).toContain("<th>用户</th>");
-		expect(usage).toContain("<th>模型</th>");
-		expect(usage).toContain("<th>状态</th>");
-		expect(usage).toContain("<th>输入 tokens</th>");
-		expect(usage).toContain("<th>输出 tokens</th>");
-		expect(usage).toContain("<th>用户费用</th>");
-		expect(usage).not.toContain("provider 成本</th>");
+		expect(usage).toContain('id="adm-usage-view"');
+		expect(usage).toContain("按用户 / 小时");
+		expect(usage).toContain("按任务");
+		expect(usage).toContain('id="adm-usage-range"');
+		expect(usage).toContain('id="adm-usage-sort"');
+		expect(usage).toContain('id="adm-usage-email"');
+		expect(usage).toContain('id="adm-usage-thead"');
+		expect(usage).toContain('id="adm-usage-tbody"');
+		expect(usage).toContain('id="adm-usage-status-filter"');
+		expect(usage).toContain('id="adm-usage-status-message"');
+		// 重复 DOM id 修复（2026-10-20 复核一.2）：旧 adm-usage-status 不再存在
+		expect(htmlSrc).not.toMatch(/id="adm-usage-status"/);
+		// 聚合口径说明必须在页面上（unpriced 未知 ≠ 0；hold 预占不进已用；
+		// 账本与消费统计分开）
+		expect(usage).toContain("未计价只计数量、金额未知（不是 0 元）");
+		expect(usage).toContain("账务流水与消费统计分开，不重复累计");
+		expect(usage).toContain("Asia/Shanghai 自然小时");
+		// 旧明细列（逐条刷屏）不再作为默认表头
+		expect(usage).not.toContain("<th>输入 tokens</th>");
 		expect(usage).not.toContain("<th>event</th>");
-		// ledger 默认列（时间/用户/类型/金额 CNY/原因）
+		// ledger 默认列（时间/用户/类型/金额 CNY/原因）+ 邮箱搜索
 		const ledgerStart = billing.indexOf('id="adm-ledger-section"');
 		const ledgerEnd = billing.indexOf('id="adm-unpriced-section"');
 		const ledger = billing.slice(ledgerStart, ledgerEnd);
 		expect(ledger).toContain("<th>金额（CNY）</th>");
 		expect(ledger).toContain("<th>原因</th>");
+		expect(ledger).toContain('id="adm-ledger-email"');
 		expect(ledger).not.toContain("<th>账户</th>");
 		expect(ledger).not.toContain("金额（nano）");
 		// unpriced 空态中性文案，无红框卡片
@@ -2233,8 +2249,10 @@ describe("wave 2 — 费用页（Demo 统计 + 页内标签 §4.6）", () => {
 		expect(methods()).toContain("admin.overview.get");
 		expect(methods()).toContain("admin.billing.providerBalance.get");
 		expect(methods()).toContain("admin.spend.demoStats.get");
-		// 默认标签 = 模型调用（唯一当前标签发请求）
-		expect(methods().filter((m) => m === "admin.billing.usage.list").length).toBe(1);
+		// 默认标签 = 模型调用（唯一当前标签发请求；2026-10-20 起默认走
+		// 服务端聚合视图，不再逐条拉明细）
+		expect(methods().filter((m) => m === "admin.billing.usage.summary").length).toBe(1);
+		expect(methods()).not.toContain("admin.billing.usage.list");
 		expect(methods()).not.toContain("admin.billing.ledger.list");
 		replyMethod(bus, NONCE, "admin.overview.get", {
 			ok: true, result: { users: { total: 2 }, billing: {
@@ -2247,8 +2265,11 @@ describe("wave 2 — 费用页（Demo 统计 + 页内标签 §4.6）", () => {
 		replyMethod(bus, NONCE, "admin.spend.demoStats.get", {
 			ok: true, result: DEMO_STATS,
 		});
-		replyMethod(bus, NONCE, "admin.billing.usage.list", {
-			ok: true, result: { items: [], next_cursor: null },
+		replyMethod(bus, NONCE, "admin.billing.usage.summary", {
+			ok: true, result: { view: "hour", items: [], next_cursor: null,
+				totals: { call_count: 0, priced_call_count: 0,
+					unpriced_call_count: 0, charge_nano_cny: "0",
+					provider_cost_nano_cny: "0" } },
 		});
 		await ticks(6);
 		expect(bus.els["adm-state-billing"].getAttribute("data-page-state")).toBe("ready");
@@ -2291,20 +2312,22 @@ describe("wave 2 — 费用页（Demo 统计 + 页内标签 §4.6）", () => {
 		await ticks(4);
 		// 捕获 usage 标签的 requestId（默认标签），但不立即回复
 		const usageReq = bus.parentPosted
-			.filter((p) => p.env.kind === "request" && p.env.method === "admin.billing.usage.list")
+			.filter((p) => p.env.kind === "request" && p.env.method === "admin.billing.usage.summary")
 			.at(-1);
 		expect(usageReq).toBeTruthy();
 		// 切到账务流水（usage 请求仍在途）
 		bus.els["adm-tab-ledger"]._fire("click", {});
 		await ticks(2);
-		// 迟到的 usage 响应（含大量行）到达——必须被代际丢弃
+		// 迟到的聚合响应（含大量行）到达——必须被代际丢弃
 		bus.dispatch(bus.parent, {
 			kind: "response", bridge: "admin", nonce: NONCE,
 			requestId: usageReq!.env.requestId, ok: true,
-			result: { items: [{ event_id: "stale-1", occurred_at: 1700000000,
-				model: "m", status: "priced", charge_nano_cny: "1",
-				cache_hit_input_tokens: 0, cache_miss_input_tokens: 0,
-				output_tokens: 0 }], next_cursor: null },
+			result: { view: "hour", items: [{ group_key: "hour:stale-1",
+				hour_start: 1700000000, hour_end: 1700003600,
+				subject_type: "user", subject_id: "usr_stale", identity: "stale-1",
+				task_count: 1, call_count: 1, charge_nano_cny: "1",
+				provider_cost_nano_cny: "0", unpriced_call_count: 0,
+				tasks: [] }], next_cursor: null },
 		});
 		await ticks(4);
 		// usage 表仍为空（迟到响应没有写回）
@@ -2330,8 +2353,10 @@ describe("wave 2 — 费用页（Demo 统计 + 页内标签 §4.6）", () => {
 		replyMethod(bus, NONCE, "admin.spend.demoStats.get", {
 			ok: false, error: { code: "not_implemented", message: "" },
 		});
-		replyMethod(bus, NONCE, "admin.billing.usage.list", {
-			ok: true, result: { items: [], next_cursor: null },
+		replyMethod(bus, NONCE, "admin.billing.usage.summary", {
+			ok: true, result: { view: "hour", items: [], next_cursor: null,
+				totals: { call_count: 0, unpriced_call_count: 0,
+					charge_nano_cny: "0", provider_cost_nano_cny: "0" } },
 		});
 		await ticks(6);
 		expect(bus.els["adm-bill-alert"].hidden).toBe(true);
@@ -2351,8 +2376,10 @@ describe("wave 2 — 费用页（Demo 统计 + 页内标签 §4.6）", () => {
 		replyMethod(bus, NONCE, "admin.spend.demoStats.get", {
 			ok: true, result: { ...DEMO_STATS, unpriced_calls: 4 },
 		});
-		replyMethod(bus, NONCE, "admin.billing.usage.list", {
-			ok: true, result: { items: [], next_cursor: null },
+		replyMethod(bus, NONCE, "admin.billing.usage.summary", {
+			ok: true, result: { view: "hour", items: [], next_cursor: null,
+				totals: { call_count: 0, unpriced_call_count: 4,
+					charge_nano_cny: "0", provider_cost_nano_cny: "0" } },
 		});
 		await ticks(6);
 		expect(bus.els["adm-bill-alert"].hidden).toBe(false);
@@ -3277,4 +3304,366 @@ describe("切片页：unavailable 原因（failed 资产失败原因/来源/时�
 			(e.textContent === "开启 1 小时" || e.textContent === "查看" ||
 			 e.textContent === "结束查看"))).toHaveLength(0);
 	});
+});
+
+// ==========================================================================
+// 2026-10-20（review-for-opus 一.1/一.2/一.3/二）：费用页聚合视图重做
+//   - 默认「按用户 / 小时」+ 可展开任务行，可切「按任务」；
+//   - 身份主列来自服务端投影（Demo / 未知身份显式降级），**不依赖用户页**；
+//   - 筛选改变丢弃旧响应与旧游标（迟到响应不回填）；
+//   - 失败只写消息行（adm-usage-status-message），绝不清空筛选 select
+//     （重复 DOM id 曾让 textContent 写到 select 上）；
+//   - 任务预算面板 = step A（本任务已用 / 待结算预占 / 账户剩余额度及其
+//     类型 / 未设置单次上限），原始调用按需展开（旧明细接口保留兼容）。
+// ==========================================================================
+describe("2026-10-20 费用聚合视图（review 二）", () => {
+	const NONCE = "b7".repeat(32);
+
+	function bootBilling(permissions: string[] = ["admin:overview:read", "admin:billing:read"]) {
+		const bus = loadPluginUiWithBus();
+		bus.dispatch(bus.parent, {
+			kind: "init", bridge: "admin", protocolVersion: "1.0.0", nonce: NONCE,
+			adminPermissions: permissions,
+		});
+		bus.client!.showPage("billing");
+		return bus;
+	}
+
+	function methodsOf(bus: ReturnType<typeof loadPluginUiWithBus>) {
+		return bus.parentPosted.filter((p) => p.env.kind === "request")
+			.map((p) => String(p.env.method));
+	}
+
+	function lastRequest(bus: ReturnType<typeof loadPluginUiWithBus>, method: string) {
+		return bus.parentPosted
+			.filter((p) => p.env.kind === "request" && p.env.method === method)
+			.at(-1);
+	}
+
+	const HOUR_ITEM = {
+		group_key: "hour:1792400000|user|usr_a",
+		hour_start: 1792400000, hour_end: 1792403600,
+		subject_type: "user", subject_id: "usr_a",
+		identity: "review@example.invalid", identity_source: "email",
+		identity_user_id: "usr_a",
+		task_count: 2, call_count: 41, unpriced_call_count: 1,
+		provider_cost_nano_cny: "1950000000", charge_nano_cny: "391205560",
+		charge_cny: "0.39", provider_cost_cny: "1.95",
+		tasks: [
+			{ request_id: "req_41", subject_type: "user", subject_id: "usr_a",
+			  task_key: "req_41", unattributed: false, user_id: "usr_a",
+			  identity: "review@example.invalid", identity_source: "email",
+			  started_at: 1792400100, last_at: 1792400900,
+			  call_count: 41, unpriced_call_count: 1,
+			  provider_cost_nano_cny: "1950000000",
+			  charge_nano_cny: "391205560", session_id: "sess_1",
+			  status: "unknown", status_source: null },
+			{ request_id: null, subject_type: "user", subject_id: "usr_a",
+			  task_key: "~sess_2|user|usr_a", unattributed: true,
+			  task_label: "历史未归属调用", user_id: null,
+			  identity: null, identity_source: "unknown",
+			  started_at: 1792400200, last_at: 1792400200,
+			  call_count: 1, unpriced_call_count: 0,
+			  provider_cost_nano_cny: "0", charge_nano_cny: "100000000",
+			  session_id: "sess_2", status: "unknown", status_source: null },
+		],
+		tasks_truncated: false,
+	};
+
+	const SUMMARY_BODY = {
+		view: "hour", sort: "hour_desc", items: [HOUR_ITEM],
+		totals: { task_count: 2, call_count: 41, priced_call_count: 40,
+			unpriced_call_count: 1, void_excluded_count: 0,
+			provider_cost_nano_cny: "1950000000", charge_nano_cny: "391205560",
+			unpriced_amount: "unknown", ledger_included: false },
+		next_cursor: null, limit: 50,
+		range: { since: 1791800000, until: 1792403600, timezone: "Asia/Shanghai",
+			default_applied: false },
+		identity_search_truncated: false, identity_search: null,
+	};
+
+	it("默认「按用户 / 小时」：服务端身份直出（未访问用户页）；金额按 nano 求和后舍入", async () => {
+		const bus = bootBilling();
+		await ticks(4);
+		const req = lastRequest(bus, "admin.billing.usage.summary");
+		expect(req).toBeTruthy();
+		// 默认视图/范围在请求里（服务端权威解析 since/until）
+		const payload = req!.env.payload as Record<string, unknown>;
+		expect(payload.view).toBe("hour");
+		expect(String(payload.since)).toMatch(/^\d+$/);
+		expect(String(payload.until)).toMatch(/^\d+$/);
+		expect(payload.cursor).toBeUndefined();
+		// 首屏不访问用户页（身份不依赖 users 页缓存）
+		expect(methodsOf(bus)).not.toContain("admin.users.list");
+		replyMethod(bus, NONCE, "admin.billing.usage.summary", {
+			ok: true, result: SUMMARY_BODY,
+		});
+		await ticks(4);
+		const thead = bus.els["adm-usage-thead"].textContent;
+		expect(thead).toContain("时段（Asia/Shanghai）");
+		expect(thead).toContain("任务数");
+		expect(thead).toContain("供应商成本");
+		expect(thead).toContain("用户计费");
+		expect(thead).toContain("未计价");
+		const tbody = bus.els["adm-usage-tbody"].textContent;
+		// 身份主列 = 服务端投影的邮箱（无需先打开用户页）
+		expect(tbody).toContain("review@example.invalid");
+		expect(tbody).not.toContain("usr_a");
+		// 金额两位小数（391205560 nano → 0.39 CNY）+ 未计价计数显式「金额未知」
+		expect(tbody).toContain("0.39 CNY");
+		expect(tbody).toContain("1（金额未知）");
+		// 范围说明含合计与「未计价金额未知」口径
+		const note = bus.els["adm-usage-range-note"].textContent;
+		expect(note).toContain("41 次调用");
+		expect(note).toContain("未计价金额未知");
+		expect(note).toContain("不含账本流水");
+		// 未访问用户页：身份仍正确（回归「先打开用户页才显示邮箱」）
+		expect(methodsOf(bus)).not.toContain("admin.users.list");
+	}, 10000);
+
+	it("小时行可展开任务行；未知状态标「状态未知」，历史空 request_id 标「历史未归属调用」", async () => {
+		const bus = bootBilling();
+		await ticks(4);
+		replyMethod(bus, NONCE, "admin.billing.usage.summary", {
+			ok: true, result: SUMMARY_BODY,
+		});
+		await ticks(4);
+		const expand = bus.created.find((e) => e.tagName === "BUTTON" &&
+			e.textContent === "展开任务");
+		expect(expand).toBeTruthy();
+		expand!._fire("click", {});
+		await ticks(2);
+		const tbody = bus.els["adm-usage-tbody"].textContent;
+		expect(tbody).toContain("req_41");
+		expect(tbody).toContain("历史未归属调用");
+		expect(tbody).toContain("状态未知");
+		// 任务行不给「进行中/已结束」的臆测（无权威生命周期来源时）
+		expect(tbody).not.toContain("进行中");
+		expect(tbody).not.toContain("已结束");
+	}, 10000);
+
+	it("切「按任务」视图：请求带 view=task，进行中任务（无用量）与未归属行都可渲染", async () => {
+		const bus = bootBilling();
+		await ticks(4);
+		replyMethod(bus, NONCE, "admin.billing.usage.summary", {
+			ok: true, result: SUMMARY_BODY,
+		});
+		await ticks(4);
+		const viewSel = bus.els["adm-usage-view"];
+		viewSel.value = "task";
+		viewSel._fire("change", {});
+		await ticks(2);
+		const req = lastRequest(bus, "admin.billing.usage.summary");
+		const payload = req!.env.payload as Record<string, unknown>;
+		expect(payload.view).toBe("task");
+		expect(payload.cursor).toBeUndefined(); // 视图改变 → 游标重置
+		replyMethod(bus, NONCE, "admin.billing.usage.summary", {
+			ok: true, result: {
+				...SUMMARY_BODY, view: "task",
+				items: [
+					{ request_id: "req_new", subject_type: "user",
+					  subject_id: "usr_a", task_key: "req_new", unattributed: false,
+					  lifecycle_only: true, user_id: "usr_a",
+					  identity: "review@example.invalid", identity_source: "email",
+					  started_at: 1792400000, last_at: 1792400000,
+					  call_count: 0, unpriced_call_count: 0,
+					  provider_cost_nano_cny: "0", charge_nano_cny: "0",
+					  session_id: null, status: "accepted",
+					  status_source: "ai_run_bindings",
+					  status_detail: "pending_session" },
+					{ request_id: null, subject_type: "user", subject_id: "usr_a",
+					  task_key: "~sess_2|user|usr_a", unattributed: true,
+					  user_id: null, identity: null, identity_source: "unknown",
+					  started_at: 1792400100, last_at: 1792400100,
+					  call_count: 3, unpriced_call_count: 0,
+					  provider_cost_nano_cny: "0", charge_nano_cny: "1",
+					  session_id: "sess_2", status: "unknown",
+					  status_source: null },
+					{ request_id: "req_demo", subject_type: "demo",
+					  subject_id: "cap_x", task_key: "req_demo", unattributed: false,
+					  user_id: null, identity: "Demo", identity_source: "demo",
+					  started_at: 1792400200, last_at: 1792400200,
+					  call_count: 5, unpriced_call_count: 0,
+					  provider_cost_nano_cny: "0", charge_nano_cny: "2",
+					  session_id: "sess_d", status: "finished",
+					  status_source: "demo_runs" },
+				],
+			},
+		});
+		await ticks(4);
+		const tbody = bus.els["adm-usage-tbody"].textContent;
+		expect(tbody).toContain("req_new");
+		expect(tbody).toContain("（尚无用量）");
+		expect(tbody).toContain("已起跑（等待会话绑定）");
+		expect(tbody).toContain("历史未归属调用");
+		expect(tbody).toContain("Demo");
+		expect(tbody).toContain("已结束");
+		// 未知身份不在主列泄露原始 ID（usr_a 只出现在技术详情里）
+		expect(bus.els["adm-usage-thead"].textContent).toContain("任务（request_id）");
+	}, 10000);
+
+	it("筛选改变：丢弃旧响应与旧游标（迟到响应不回填新筛选）", async () => {
+		const bus = bootBilling();
+		await ticks(4);
+		const staleReq = lastRequest(bus, "admin.billing.usage.summary");
+		expect(staleReq).toBeTruthy();
+		// 改邮箱搜索并提交（旧请求仍在途）
+		bus.els["adm-usage-email"].value = "someone@x.com";
+		bus.els["adm-usage-search-btn"]._fire("click", {});
+		await ticks(2);
+		const freshReq = lastRequest(bus, "admin.billing.usage.summary");
+		expect(freshReq!.env.requestId).not.toBe(staleReq!.env.requestId);
+		expect((freshReq!.env.payload as Record<string, unknown>).email)
+			.toBe("someone@x.com");
+		expect((freshReq!.env.payload as Record<string, unknown>).cursor)
+			.toBeUndefined();
+		// 旧响应迟到到达：绝不写回
+		bus.dispatch(bus.parent, {
+			kind: "response", bridge: "admin", nonce: NONCE,
+			requestId: staleReq!.env.requestId, ok: true,
+			result: { ...SUMMARY_BODY, items: [{ ...HOUR_ITEM,
+				identity: "stale@x.com" }] },
+		});
+		await ticks(4);
+		expect(bus.els["adm-usage-tbody"].textContent).not.toContain("stale@x.com");
+		// 新筛选的响应正常渲染
+		replyMethod(bus, NONCE, "admin.billing.usage.summary", {
+			ok: true, result: SUMMARY_BODY,
+		});
+		await ticks(4);
+		expect(bus.els["adm-usage-tbody"].textContent)
+			.toContain("review@example.invalid");
+		// 重置：回到默认视图/范围并清空搜索
+		bus.els["adm-usage-reset-btn"]._fire("click", {});
+		await ticks(2);
+		const resetReq = lastRequest(bus, "admin.billing.usage.summary");
+		const payload = resetReq!.env.payload as Record<string, unknown>;
+		expect(payload.email).toBeUndefined();
+		expect(payload.view).toBe("hour");
+	}, 10000);
+
+	it("聚合请求失败：错误只写消息行，筛选 select 原样保留（重复 DOM id 回归）", async () => {
+		const bus = bootBilling();
+		await ticks(4);
+		replyMethod(bus, NONCE, "admin.billing.usage.summary", {
+			ok: false, error: { code: "internal", message: "simulated 500" },
+		});
+		await ticks(4);
+		// 失败文案落在消息行（role=status）
+		expect(bus.els["adm-usage-status-message"].textContent)
+			.toContain("internal");
+		// 筛选 select 未被写入错误文案（旧 bug：重复 id 让 textContent 写到
+		// select 上，把 option 全部清空）——取到的是同一个元素对象
+		const filterSel = bus.doc.getElementById("adm-usage-status-filter");
+		expect(filterSel.textContent).toBe("");
+		// HTML 源级：筛选 select 仍是带 3 个 option 的 select（DOM id 唯一）
+		const filterTag = htmlSrc.slice(htmlSrc.indexOf('id="adm-usage-status-filter"'));
+		expect(filterTag.slice(0, filterTag.indexOf("</select>"))).toContain("<option");
+		expect((filterTag.slice(0, filterTag.indexOf("</select>")).match(/<option/g) || []).length)
+			.toBe(3);
+		// 状态筛选仍是合法筛选参数（priced/unpriced 由服务端校验）
+		filterSel.value = "unpriced";
+		bus.els["adm-usage-search-btn"]._fire("click", {});
+		await ticks(2);
+		const req = lastRequest(bus, "admin.billing.usage.summary");
+		expect((req!.env.payload as Record<string, unknown>).status)
+			.toBe("unpriced");
+		// 筛选控件仍可读（没被错误文案清空）
+		expect(filterSel.value).toBe("unpriced");
+	}, 10000);
+
+	it("任务面板：step A 预算（已用/待结算预占/账户剩余及其类型/未设置单次上限）+ 原始调用展开", async () => {
+		const bus = bootBilling();
+		await ticks(4);
+		replyMethod(bus, NONCE, "admin.billing.usage.summary", {
+			ok: true, result: SUMMARY_BODY,
+		});
+		await ticks(4);
+		// 先展开小时行，任务行里才有「预算与原始调用」
+		const expand = bus.created.find((e) => e.tagName === "BUTTON" &&
+			e.textContent === "展开任务");
+		expect(expand).toBeTruthy();
+		expand!._fire("click", {});
+		await ticks(2);
+		const btn = bus.created.find((e) => e.tagName === "BUTTON" &&
+			e.textContent === "预算与原始调用");
+		expect(btn).toBeTruthy();
+		btn!._fire("click", {});
+		await ticks(2);
+		const budgetReq = lastRequest(bus, "admin.billing.taskBudget.get");
+		expect(budgetReq).toBeTruthy();
+		expect((budgetReq!.env.payload as Record<string, unknown>).request_id)
+			.toBe("req_41");
+		const rawReq = lastRequest(bus, "admin.billing.usage.list");
+		expect(rawReq).toBeTruthy();
+		expect((rawReq!.env.payload as Record<string, unknown>).request_id)
+			.toBe("req_41");
+		replyMethod(bus, NONCE, "admin.billing.taskBudget.get", {
+			ok: true, result: {
+				request_id: "req_41", subject_type: "user", subject_id: "usr_a",
+				user_id: "usr_a", identity: "review@example.invalid",
+				identity_source: "email", identity_user_id: "usr_a",
+				session_id: "sess_1",
+				in_range: { call_count: 41, unpriced_call_count: 1,
+					provider_cost_nano_cny: "1950000000",
+					charge_nano_cny: "391205560",
+					started_at: 1792400100, last_at: 1792400900 },
+				lifetime: { call_count: 42, unpriced_call_count: 1,
+					provider_cost_nano_cny: "2000000000",
+					charge_nano_cny: "400000000",
+					started_at: 1792000000, last_at: 1792400900 },
+				outside_range: { call_count: 1, unpriced_call_count: 0,
+					provider_cost_nano_cny: "50000000",
+					charge_nano_cny: "8794440" },
+				status: "unknown", status_source: null, status_detail: null,
+				budget: { spent_nano_cny: "400000000",
+					unpriced_call_count: 1, unpriced_amount: "unknown",
+					reserved_nano_cny: "7000000", open_holds_count: 1,
+					reserved_scope: "session",
+					reserved_scope_note: "预占按会话统计（billing_holds 以 call/会话为粒度，没有 request_id 列）",
+					per_task_cap_nano_cny: null,
+					per_task_cap_configured: false,
+					note: "未设置单次上限，按账户剩余额度控制",
+					ledger_included: false },
+				account: { subject_type: "user", subject_id: "usr_a",
+					limit_type: "user_total_allowance",
+					limit_type_label: "注册用户一次性总额度",
+					remaining_nano_cny: "46000000000",
+					limit_nano_cny: "50000000000",
+					spent_nano_cny: "400000000", reserved_nano_cny: "7000000",
+					error: null },
+			},
+		});
+		replyMethod(bus, NONCE, "admin.billing.usage.list", {
+			ok: true, result: { items: [{ event_id: "use_x",
+				request_id: "req_41", session_id: "sess_1",
+				occurred_at: 1792400100, model: "deepseek-flash",
+				status: "priced", charge_nano_cny: "9500000",
+				provider_cost_nano_cny: "4750000",
+				cache_hit_input_tokens: 1, cache_miss_input_tokens: 2,
+				output_tokens: 3, identity: "review@example.invalid",
+				identity_source: "email", identity_user_id: "usr_a" }],
+				next_cursor: null },
+		});
+		await ticks(4);
+		const text = bus.els["adm-usage-tbody"].textContent;
+		expect(text).toContain("本任务已用（全量）");
+		expect(text).toContain("0.40 CNY");       // 400000000 nano
+		expect(text).toContain("待结算预占");
+		expect(text).toContain("0.01 CNY");       // 7000000 nano（hold 预占）
+		// 预占与已用分列：已用不含预占（0.40 而不是 0.41）
+		expect(text).not.toContain("0.41 CNY");
+		expect(text).toContain("未设置单次上限，按账户剩余额度控制");
+		expect(text).toContain("注册用户一次性总额度");
+		expect(text).toContain("46.00 CNY");      // 46000000000 nano 剩余额度
+		expect(text).toContain("范围外金额（同一任务）");
+		expect(text).toContain("完整任务金额（含范围外）");
+		// 原始调用展开（旧明细接口保留兼容）
+		expect(text).toContain("原始模型调用");
+		expect(text).toContain("deepseek-flash");
+		expect(text).toContain("0.01 CNY");
+		// 预算口径说明：hold 预占不加进已用；step B 未实现
+		expect(text).toContain("hold 预占不加进已用");
+		expect(text).toContain("单次任务上限（step B）尚未实现");
+	}, 10000);
 });

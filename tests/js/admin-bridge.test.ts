@@ -443,7 +443,11 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 			// viewer.open 只读宿主方法）——37 → 37
 			// 2026-10-09（round4 §2.3）：删 2（testApplications.list/review，
 			// 「测试申请」页退役）——37 → 35
-			expect(Object.keys(table)).toHaveLength(35);
+			// 2026-10-20（review-for-opus 一.1/一.3/二，费用页重做）：新增
+			// billing.usage.summary（按用户/小时或按任务的服务端聚合只读）
+			// 与 billing.taskBudget.get（单任务预算 step A 只读）——同域
+			// billing:read 不扩域，35 → 37
+			expect(Object.keys(table)).toHaveLength(37);
 			expect(table["admin.formatRequests.list"]).toBe("admin:users:read");
 			expect(table["admin.formatRequests.get"]).toBe("admin:users:read");
 			expect(table["admin.formatRequests.patch"]).toBe("admin:users:write");
@@ -464,6 +468,8 @@ describe("AdminBridge host — §8.4 method→permission mapping (drift guard)",
 			expect(table["admin.users.resetPassword"]).toBe("admin:users:write");
 			expect(table["admin.users.setAccountKind"]).toBe("admin:users:write");
 			expect(table["admin.billing.usage.list"]).toBe("admin:billing:read");
+			expect(table["admin.billing.usage.summary"]).toBe("admin:billing:read");
+			expect(table["admin.billing.taskBudget.get"]).toBe("admin:billing:read");
 			expect(table["admin.billing.ledger.list"]).toBe("admin:billing:read");
 			expect(table["admin.billing.providerBalance.get"]).toBe("admin:billing:read");
 			expect(table["admin.billing.providerBalance.refresh"]).toBe("admin:billing:read");
@@ -623,6 +629,80 @@ describe("AdminBridge host — PR3b read backend proxy (§9 Admin API v1)", () =
 		});
 		await ticks();
 		expect(responses(posted, "r1")[0].env.ok).toBe(true);
+	});
+
+	it("admin.billing.usage.summary 代理聚合视图（view/sort/since/until/email/status 白名单）", async () => {
+		const { handle, posted, contentWindow } = makeReadHost(async (url) => {
+			// 空值字段被 buildQuery 省略；status 与 email 原样透传
+			expect(url).toBe("/api/admin/v1/billing/usage-summary"
+				+ "?limit=50&view=task&sort=charge_desc"
+				+ "&since=1791800000&until=1792403600"
+				+ "&email=review%40example.invalid&status=unpriced");
+			return { status: 200, ok: true, body: { items: [], next_cursor: null } };
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.billing.usage.summary", {
+				limit: 50, view: "task", sort: "charge_desc",
+				since: "1791800000", until: "1792403600",
+				email: "review@example.invalid", status: "unpriced",
+				model: null, user_id: null, cursor: null,
+			}),
+		});
+		await ticks();
+		expect(responses(posted, "r1")[0].env.ok).toBe(true);
+	});
+
+	it("admin.billing.usage.summary 拒绝视图/排序枚举外的值（桥层 schema 门）", async () => {
+		const { handle, posted, contentWindow } = makeReadHost(async () => {
+			throw new Error("schema 门应先行拦截，不应发出后端请求");
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.billing.usage.summary",
+				{ view: "weird" }),
+		});
+		await ticks();
+		const rs = responses(posted, "r1");
+		expect(rs[0].env.ok).toBe(false);
+		expect((rs[0].env.error as { code: string }).code).toBe("invalid_params");
+	});
+
+	it("admin.billing.taskBudget.get 代理单任务预算投影（request_id/subject/session/范围）", async () => {
+		const { handle, posted, contentWindow } = makeReadHost(async (url) => {
+			expect(url).toBe("/api/admin/v1/billing/task-detail"
+				+ "?request_id=req_1&subject_type=user&subject_id=usr_1"
+				+ "&session_id=sess_1&since=1791800000&until=1792403600");
+			return { status: 200, ok: true, body: { budget: {}, account: {} } };
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.billing.taskBudget.get", {
+				request_id: "req_1", subject_type: "user", subject_id: "usr_1",
+				session_id: "sess_1", since: "1791800000", until: "1792403600",
+			}),
+		});
+		await ticks();
+		expect(responses(posted, "r1")[0].env.ok).toBe(true);
+	});
+
+	it("admin.billing.taskBudget.get 拒绝缺 subject 的载荷（必填门）", async () => {
+		const { handle, posted, contentWindow } = makeReadHost(async () => {
+			throw new Error("必填门应先行拦截，不应发出后端请求");
+		});
+		handle._handleIframeLoad();
+		handle._handleWindowMessage({
+			source: contentWindow,
+			data: requestEnv(nonce0(posted), "r1", "admin.billing.taskBudget.get",
+				{ request_id: "req_1" }),
+		});
+		await ticks();
+		const rs = responses(posted, "r1");
+		expect(rs[0].env.ok).toBe(false);
+		expect((rs[0].env.error as { code: string }).code).toBe("invalid_params");
 	});
 
 	it("admin.siteStats.get proxies GET /api/admin/v1/site-stats verbatim (wave 2)", async () => {

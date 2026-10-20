@@ -913,6 +913,94 @@ def create_bootstrap_owner(login_id, password):
         conn.close()
 
 
+# --------------------------------------------------------------------------- #
+# 身份批投影（admin 费用/流水/格式申请的身份主列；展示 J 规则的单点实现）
+#
+# 规则与用户列表（GET /api/admin/v1/users 的 identity 字段）**同源**：
+# ``email_normalized or email or login_id``；两者皆空 → 身份不可用（unknown，
+# 绝不伪造邮箱，原始 user_id 由调用方放进技术详情）。is_demo 主体（subject_type
+# = demo）在聚合出口单独映射为「Demo」，不走本表。
+# --------------------------------------------------------------------------- #
+_IDENTITY_SEL = (
+    "user_id, login_id, display_name, email, email_normalized, disabled, "
+    "activation_state"
+)
+
+
+def _identity_out(row) -> dict:
+    """用户行 → 身份投影项（email 优先，否则 login_id；无两者 = unknown）。"""
+    uid = str(row.get("user_id") or "")
+    email_norm = str(row.get("email_normalized") or row.get("email") or "")
+    login_id = str(row.get("login_id") or "")
+    if email_norm:
+        identity, source = email_norm, "email"
+    elif login_id:
+        identity, source = login_id, "login_id"
+    else:
+        identity, source = None, "unknown"
+    return {
+        "user_id": uid,
+        "identity": identity,
+        "identity_source": source,
+        "email": str(row.get("email") or "") or None,
+        "login_id": login_id or None,
+        "display_name": row.get("display_name"),
+        "disabled": bool(row.get("disabled")),
+        "activation_state": row.get("activation_state") or "active",
+    }
+
+
+def get_user_identity_map(user_ids):
+    """批量身份投影：``{user_id: 投影项}``（单条 SELECT，无 N+1）。
+
+    未命中的 user_id（账号已不存在/事件主体未就绪）**不出现在返回 dict**，
+    调用方按 unknown 降级渲染（不伪造邮箱、不把原始 ID 当身份主列）。
+    """
+    ids = sorted({str(u) for u in (user_ids or []) if u})
+    if not ids:
+        return {}
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT " + _IDENTITY_SEL + " FROM users "
+                    "WHERE user_id = ANY(%s)", (ids,))
+                rows = cur.fetchall()
+        return {str(r["user_id"]): _identity_out(r) for r in rows}
+    finally:
+        conn.close()
+
+
+def list_user_ids_matching_identity(query, *, limit=500):
+    """身份搜索：email_normalized / email / login_id 子串匹配 → user_id 列表。
+
+    费用/流水的「邮箱搜索」用（服务端先解析成 user_id 集合，再按账务主键
+    user_id 过滤——邮箱只用于展示/搜索，不成为账务键）。大小写不敏感；
+    上限 ``limit``（调用方按截断语义提示，不静默丢用户）。
+    """
+    text = str(query or "").strip()
+    if not text:
+        return []
+    pattern = "%" + text.replace("\\", "\\\\").replace("%", "\\%") \
+        .replace("_", "\\_") + "%"
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT user_id FROM users "
+                    "WHERE COALESCE(email_normalized, '') ILIKE %s ESCAPE '\\' "
+                    "   OR COALESCE(email, '') ILIKE %s ESCAPE '\\' "
+                    "   OR COALESCE(login_id, '') ILIKE %s ESCAPE '\\' "
+                    "ORDER BY user_id LIMIT %s",
+                    (pattern, pattern, pattern, int(limit)))
+                rows = cur.fetchall()
+        return [str(r["user_id"]) for r in rows]
+    finally:
+        conn.close()
+
+
 def resolve_primary_owner():
     """解析唯一的 primary owner（只读，永不写库、永不接受密码参数）。
 

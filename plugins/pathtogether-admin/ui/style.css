@@ -562,6 +562,25 @@ body {
 }
 .adm-detail-kv { grid-template-columns: 180px 1fr; margin: 6px 0; }
 
+/* ---- 2026-10-20（review 二）：费用聚合视图（小时行 → 任务行 → 原始调用）
+   三层展开 + 身份降级列 ---- */
+.adm-usage-group-row > td { background: rgba(0, 0, 0, 0.02); }
+.adm-usage-task-row > td { white-space: normal; }
+.adm-hour-tasks > td,
+.adm-task-panel > td {
+  background: rgba(0, 0, 0, 0.015); white-space: normal;
+  word-break: normal; overflow-wrap: anywhere;
+}
+.adm-task-list { margin: 4px 0; }
+.adm-table--nested { font-size: 13px; }
+.adm-table--nested th, .adm-table--nested td { padding: 4px 8px; }
+.adm-task-panel-box { display: flex; flex-direction: column; gap: 8px; }
+.adm-task-budget .adm-kv { grid-template-columns: 200px 1fr; }
+/* 未知身份：显式降级（原始 ID 只在技术详情），与「未计价」同用告警色 */
+.adm-cell-unknown { color: var(--text-2); font-style: italic; }
+.adm-cell-warn { color: var(--danger); font-weight: 600; }
+.adm-cell-empty { color: var(--text-2); text-align: center; padding: 16px 8px; }
+
 /* ---- wave 2：Demo 消耗卡异常色（仅 unpriced>0 / 统计不完整 / 超额才加） ---- */
 .adm-card--anomaly { border: 1px solid rgba(255, 59, 48, 0.35); }
 .adm-card--anomaly h2 { color: var(--danger); }

@@ -2902,13 +2902,17 @@ ADMIN_USAGE_STATUSES = ("priced", "unpriced")
 
 
 def admin_usage_events_page(*, cursor=None, limit=50, model=None, user_id=None,
-                            subject_type=None, status=None):
+                            user_ids=None, subject_type=None, status=None,
+                            request_id=None, session_id=None):
     """admin usage 明细分页（§10.4：按模型/用户/状态筛选，最新在前）。
 
     keyset 游标：(occurred_at epoch, event_id) 降序。``status`` 限
     priced/unpriced；``user_id`` 按 ai_usage_events.user_id（权威主体解析后
-    的镜像列）精确过滤；未就绪的 user_id 缺行按 NULL 存储时不会命中筛选
-    （subject_type/subject_id 仍保留在行内供归因展示）。
+    的镜像列）精确过滤；``user_ids`` 是按主体集合过滤（邮箱搜索先在 app 层
+    解析成 user_id 集合——邮箱只用于展示/搜索，账务主键仍是 user_id）；
+    ``request_id`` / ``session_id`` 供聚合视图展开「原始模型调用」时按任务
+    （历史未归属行按会话）取明细；未就绪的 user_id 缺行按 NULL 存储时不会
+    命中筛选（subject_type/subject_id 仍保留在行内供归因展示）。
     返回 ``{"items": [...], "next_cursor": str|None}``。
     """
     limit = max(1, min(int(limit or 50), 200))
@@ -2919,6 +2923,18 @@ def admin_usage_events_page(*, cursor=None, limit=50, model=None, user_id=None,
     if user_id is not None:
         where.append("user_id=%s")
         params.append(str(user_id))
+    if request_id is not None:
+        where.append("request_id=%s")
+        params.append(str(request_id))
+    if session_id is not None:
+        where.append("session_id=%s")
+        params.append(str(session_id))
+    if user_ids is not None:
+        ids = list(user_ids)
+        if not ids:
+            return {"items": [], "next_cursor": None}
+        where.append("user_id = ANY(%s)")
+        params.append(ids)
     if subject_type is not None:
         where.append("subject_type=%s")
         params.append(str(subject_type))
@@ -2963,7 +2979,7 @@ def admin_usage_events_page(*, cursor=None, limit=50, model=None, user_id=None,
     return {"items": rows, "next_cursor": next_cursor}
 
 
-def admin_ledger_page(*, cursor=None, limit=50):
+def admin_ledger_page(*, cursor=None, limit=50, user_ids=None):
     """admin ledger 只读分页（不可变账本，最新在前；§10.4 只读表）。
 
     keyset 游标：(created_at epoch, entry_id) 降序。含 ``metadata``（PR6 起
@@ -2971,9 +2987,13 @@ def admin_ledger_page(*, cursor=None, limit=50):
     total_tokens, session_id}``，全部非敏感字段；人工调账行恒 ``{}``）——
     插件 UI 用 ``metadata.simulated`` 渲染「模拟」徽标。metadata 的写入侧
     即红线边界（不落 prompt/key/IP/请求体），出口不再二次脱敏。
+
+    2026-10-20（review 一.1）：``account_id → billing_accounts.user_id`` 左
+    连接带出账务主键 user_id（台账行本身没有邮箱；身份由 app 层批投影），
+    ``user_ids``（邮箱搜索先在 app 层解析成 user_id 集合）按主体过滤。
     """
     limit = max(1, min(int(limit or 50), 200))
-    where, params = "", []
+    where, params = [], []
     if cursor is not None:
         try:
             created, entry_id = cursor
@@ -2981,20 +3001,31 @@ def admin_ledger_page(*, cursor=None, limit=50):
             entry_id = str(entry_id)
         except (TypeError, ValueError) as exc:
             raise ValueError("cursor 非法") from exc
-        where = (" WHERE (extract(epoch from created_at) < %s OR "
-                 "(extract(epoch from created_at) = %s AND entry_id < %s))")
-        params = [created, created, entry_id]
+        where.append("(extract(epoch from l.created_at) < %s OR "
+                     "(extract(epoch from l.created_at) = %s "
+                     " AND l.entry_id < %s))")
+        params.extend([created, created, entry_id])
+    if user_ids is not None:
+        if not list(user_ids):
+            # 邮箱搜索命中 0 个账号：直接空页（不退回全表，避免把「搜索
+            # 无结果」渲染成「全部流水」）
+            return {"items": [], "next_cursor": None}
+        where.append("a.user_id = ANY(%s)")
+        params.append(list(user_ids))
+    sql_where = (" WHERE " + " AND ".join(where)) if where else ""
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
                 cur.execute(
-                    "SELECT entry_id, account_id, event_id, kind, "
-                    "amount_nano_cny, idempotency_key, reason, actor_user_id, "
-                    "metadata, "
-                    "extract(epoch from created_at)::float8 AS created_at "
-                    "FROM billing_ledger_entries" + where +
-                    " ORDER BY created_at DESC, entry_id DESC LIMIT %s",
+                    "SELECT l.entry_id, l.account_id, a.user_id, l.event_id, "
+                    "l.kind, l.amount_nano_cny, l.idempotency_key, l.reason, "
+                    "l.actor_user_id, l.metadata, "
+                    "extract(epoch from l.created_at)::float8 AS created_at "
+                    "FROM billing_ledger_entries l "
+                    "LEFT JOIN billing_accounts a "
+                    " ON a.account_id = l.account_id" + sql_where +
+                    " ORDER BY l.created_at DESC, l.entry_id DESC LIMIT %s",
                     params + [limit + 1])
                 rows = [dict(r) for r in cur.fetchall()]
     finally:
@@ -3016,6 +3047,682 @@ def _as_aware_dt(value):
     if isinstance(value, str):
         return billing_pricing.parse_rfc3339(value)
     return datetime.fromtimestamp(float(value), tz=timezone.utc)
+
+
+# --------------------------------------------------------------------------- #
+# 费用聚合（2026-10-20 review §二：按用户/小时 + 按任务；聚合先于分页）
+#
+# 纪律（与明细出口分开，逐条锁定）：
+#   - 只读 ``ai_usage_events``，**绝不**与 ``billing_ledger_entries`` 相加
+#     （event + ledger 重复累计是本次改动明确禁止的口径）；hold 预占只作为
+#     「待结算预占」单列展示，不加进已消费；
+#   - ``status='void'`` 事件全程排除（不计调用数、不计金额）；
+#   - unpriced 只计数量、金额保持未知（出口 ``unpriced_amount='unknown'``），
+#     绝不按 0 元混入金额合计；
+#   - 金额按原始整数 nano 求和（BIGINT），不逐条舍入；出口 wire 为十进制
+#     字符串（app 层 ``_admin_v1_nano_out``），前端不得 Number 累加；
+#   - 小时桶固定 ``Asia/Shanghai`` 自然小时（``date_trunc('hour',
+#     occurred_at AT TIME ZONE 'Asia/Shanghai')``），跨小时任务在小时视图
+#     只归入各小时实际发生的事件，在任务视图保留一项；
+#   - 任务键 = 权威 ``request_id`` + 主体身份（subject_type/subject_id）。
+#     ``session_id`` 只是会话（一次会话含多次任务），**不作任务键**；
+#     ``request_id`` 缺失的历史行按「主体 + 会话」分组，标
+#     ``unattributed=true``（「历史未归属调用」），不把所有空值并成一次任务；
+#   - 稳定分组键分页（keyset，游标是不透明 base64 的排序键元组）；聚合在
+#     服务端完成，浏览器不分组、不跨页累加。
+# --------------------------------------------------------------------------- #
+
+#: 小时桶时区（固定 Asia/Shanghai 自然小时；PG 侧 AT TIME ZONE 用同一常量）
+ADMIN_AGG_TIMEZONE = "Asia/Shanghai"
+#: 视图名（wire/bridge 参数枚举）
+ADMIN_USAGE_VIEWS = ("hour", "task")
+#: 排序枚举：hour 视图 hour_desc|charge_desc；task 视图 activity_desc|charge_desc
+ADMIN_USAGE_SORTS = ("hour_desc", "activity_desc", "charge_desc")
+#: 每组（小时行）内联任务行上限——超出由 ``tasks_truncated`` 标记提示，
+#: 不静默丢行（完整清单在「按任务」视图按同一筛选可分页取全）
+ADMIN_MAX_TASKS_PER_GROUP = 50
+
+#: 任务键表达式（request_id 缺失 → 主体 + 会话，绝不跨主体/跨会话合并）。
+#: 归因键：一次任务 = 权威 request_id + 主体身份；session_id 只是会话，
+#: 一次会话含多次任务，不作任务键。
+_TASK_KEY_SQL = (
+    "(COALESCE(e.request_id, '~' || e.session_id) || '|' || e.subject_type "
+    "|| '|' || e.subject_id)"
+)
+#: 与 _TASK_KEY_SQL 对齐的任务计数（DISTINCT 记录，NULL request_id 按会话区分）
+_TASK_COUNT_SQL = (
+    "count(DISTINCT (COALESCE(e.request_id, '~' || e.session_id), "
+    "e.subject_type, e.subject_id))"
+)
+
+
+def _agg_filters_where(*, since, until, user_ids=None, model=None, status=None,
+                       alias="e", include_void=False):
+    """usage 聚合 WHERE 片段 + 参数（``void`` 默认排除，时间窗含起不含止）。
+
+    ``user_ids`` 为 app 层解析好的账务主键集合（邮箱搜索先解析成 user_id）；
+    ``model`` 为精确匹配；``status`` 限 priced/unpriced（void 不可筛选，恒
+    排除）。没有任何身份条件时 user_ids=None（不过滤）。
+    ``include_void=True`` 供合计查询把状态判定交给 FILTER（void 数量单列），
+    聚合与分页一律用缺省（void 全程排除）。
+    """
+    where = []
+    if not include_void:
+        where.append("%s.status <> 'void'" % alias)
+    where.append("%s.occurred_at >= %%s" % alias)
+    where.append("%s.occurred_at < %%s" % alias)
+    params = [since, until]
+    if user_ids is not None:
+        where.append("%s.user_id = ANY(%%s)" % alias)
+        params.append(list(user_ids))
+    if model is not None:
+        where.append("%s.model = %%s" % alias)
+        params.append(str(model))
+    if status is not None:
+        if status not in ADMIN_USAGE_STATUSES:
+            raise ValueError("status 需为 %s" % (ADMIN_USAGE_STATUSES,))
+        where.append("%s.status = %%s" % alias)
+        params.append(str(status))
+    return " AND ".join(where), params
+
+
+def _agg_amount_out(row):
+    """聚合行金额键 int 化（psycopg 可能回 Decimal）。"""
+    out = dict(row)
+    for key in ("provider_cost_nano_cny", "charge_nano_cny"):
+        if out.get(key) is not None:
+            out[key] = int(out[key])
+    for key in ("task_count", "call_count", "priced_call_count",
+                "unpriced_call_count", "void_excluded_count"):
+        if out.get(key) is not None:
+            out[key] = int(out[key])
+    return out
+
+
+def _agg_totals(cur, *, since, until, user_ids=None, model=None, status=None):
+    """所选范围合计（与分页同一筛选；void 单列计数，unpriced 只计数量）。
+
+    ``unpriced_amount='unknown'``：合计金额只含 priced 事件，unpriced 绝不按
+    0 元并进金额；``ledger_included=False``：金额只来自 ``ai_usage_events``，
+    与不可变账本分开，不做 event + ledger 双计。void 行不参与任何金额/调用
+    计数，但其数量单列（``void_excluded_count``，说明「哪些行被排除」）。
+    """
+    where, params = _agg_filters_where(since=since, until=until,
+                                       user_ids=user_ids, model=model,
+                                       status=status, include_void=True)
+    cur.execute(
+        "SELECT count(*) FILTER (WHERE e.status = 'priced')::int "
+        "         AS priced_call_count, "
+        "       count(*) FILTER (WHERE e.status = 'unpriced')::int "
+        "         AS unpriced_call_count, "
+        "       count(*) FILTER (WHERE e.status = 'void')::int "
+        "         AS void_excluded_count, "
+        "       COALESCE(sum(e.provider_cost_nano_cny) FILTER "
+        "         (WHERE e.status = 'priced'), 0)::bigint "
+        "         AS provider_cost_nano_cny, "
+        "       COALESCE(sum(e.charge_nano_cny) FILTER "
+        "         (WHERE e.status = 'priced'), 0)::bigint AS charge_nano_cny "
+        "FROM ai_usage_events e WHERE " + where, params)
+    row = _agg_amount_out(cur.fetchone())
+    row["call_count"] = row["priced_call_count"] + row["unpriced_call_count"]
+    row["unpriced_amount"] = "unknown"
+    row["amount_scope"] = "priced_only"
+    # 金额来自数据库现存全部事件：数据库接收时刻 != 供应商调用时刻，
+    # 晚到事件（received_at 晚于 occurred_at）仍按 occurred_at 归入原小时
+    row["source"] = "ai_usage_events"
+    row["ledger_included"] = False
+    return row
+
+
+def _agg_task_count(cur, *, since, until, user_ids=None, model=None,
+                    status=None):
+    """范围内任务数（与分页同一 WHERE；任务键 = request_id + 主体）。"""
+    where, params = _agg_filters_where(since=since, until=until,
+                                       user_ids=user_ids, model=model,
+                                       status=status)
+    cur.execute(
+        "SELECT " + _TASK_COUNT_SQL + "::int AS task_count "
+        "FROM ai_usage_events e WHERE " + where, params)
+    return int(cur.fetchone()["task_count"])
+
+
+#: 任务行出口列（小时视图的行内 tasks 与「按任务」视图共用同一形状）
+_TASK_ROW_SQL = (
+    "e.subject_type, e.subject_id, "
+    "COALESCE(e.request_id, '~' || e.session_id) AS task_key, "
+    "e.request_id AS request_id, "
+    "(e.request_id IS NULL) AS unattributed, "
+    "(array_agg(e.user_id) FILTER (WHERE e.user_id IS NOT NULL))[1] "
+    "  AS user_id, "
+    "extract(epoch FROM min(e.occurred_at))::float8 AS started_at, "
+    "extract(epoch FROM max(e.occurred_at))::float8 AS last_at, "
+    "count(*)::int AS call_count, "
+    "count(*) FILTER (WHERE e.status = 'unpriced')::int "
+    "  AS unpriced_call_count, "
+    "COALESCE(sum(e.provider_cost_nano_cny) FILTER "
+    "  (WHERE e.status = 'priced'), 0)::bigint AS provider_cost_nano_cny, "
+    "COALESCE(sum(e.charge_nano_cny) FILTER "
+    "  (WHERE e.status = 'priced'), 0)::bigint AS charge_nano_cny, "
+    "(array_agg(e.session_id ORDER BY e.occurred_at DESC))[1] AS session_id"
+)
+
+#: 任务行 GROUP BY（与 _TASK_ROW_SQL 的四个非聚合键一一对应）
+_TASK_ROW_GROUP_BY = (
+    "e.subject_type, e.subject_id, "
+    "COALESCE(e.request_id, '~' || e.session_id), e.request_id, "
+    "(e.request_id IS NULL)"
+)
+
+
+def _task_rows_out(rows):
+    out = []
+    for row in rows:
+        item = _agg_amount_out(row)
+        item["unattributed"] = bool(item.get("unattributed"))
+        item["task_label"] = ("历史未归属调用" if item["unattributed"]
+                              else item.get("request_id"))
+        out.append(item)
+    return out
+
+
+def admin_usage_hour_summary(*, since, until, user_ids=None, model=None,
+                             status=None, sort="hour_desc", cursor=None,
+                             limit=50):
+    """按用户 × Asia/Shanghai 自然小时聚合（服务端聚合后 keyset 分页）。
+
+    ``user_ids``/``model`` 由 app 层解析好（邮箱搜索在服务端解析成 user_id
+    集合再按账务主键过滤）；GROUP BY 内不含邮箱，账务主键仍是 user_id。
+    返回 ``{"items", "next_cursor", "totals", "range"}``：
+
+    - ``items``：每个 (小时, 主体) 一行（邮箱由 app 层批投影）+
+      ``tasks``（该小时内的任务行，按费用降序，上限
+      ``ADMIN_MAX_TASKS_PER_GROUP``；超出 ``tasks_truncated=true``）；
+    - 排序 ``hour_desc``（默认，最新时段在前）或 ``charge_desc``（谁在消耗）；
+    - 游标为不透明排序键元组（客户端只回传，不解析）。
+    """
+    limit = max(1, min(int(limit or 50), 200))
+    sort = sort if sort in ("hour_desc", "charge_desc") else "hour_desc"
+    where, params = _agg_filters_where(since=since, until=until,
+                                       user_ids=user_ids, model=model,
+                                       status=status)
+    keyset, cursor_params = "", []
+    if cursor is not None:
+        try:
+            if sort == "charge_desc":
+                charge, hour_start, stype, sid = cursor
+                keyset = (" WHERE (charge_nano_cny, hour_start, subject_type, "
+                          "subject_id) < (%s, %s, %s, %s)")
+                cursor_params = [int(charge), float(hour_start), str(stype),
+                                 str(sid)]
+            else:
+                hour_start, stype, sid = cursor
+                keyset = (" WHERE (hour_start, subject_type, subject_id) "
+                          "< (%s, %s, %s)")
+                cursor_params = [float(hour_start), str(stype), str(sid)]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("cursor 非法") from exc
+    order = ("charge_nano_cny DESC, hour_start DESC, subject_type DESC, "
+             "subject_id DESC") if sort == "charge_desc" else \
+            "hour_start DESC, subject_type DESC, subject_id DESC"
+    sql = (
+        "WITH groups AS ("
+        "  SELECT date_trunc('hour', e.occurred_at AT TIME ZONE %s) "
+        "           AS hour_local, e.subject_type, e.subject_id, "
+        "         (array_agg(e.user_id) FILTER "
+        "           (WHERE e.user_id IS NOT NULL))[1] AS user_id, "
+        "         " + _TASK_COUNT_SQL + "::int AS task_count, "
+        "         count(*)::int AS call_count, "
+        "         count(*) FILTER (WHERE e.status = 'unpriced')::int "
+        "           AS unpriced_call_count, "
+        "         COALESCE(sum(e.provider_cost_nano_cny) FILTER "
+        "           (WHERE e.status = 'priced'), 0)::bigint "
+        "           AS provider_cost_nano_cny, "
+        "         COALESCE(sum(e.charge_nano_cny) FILTER "
+        "           (WHERE e.status = 'priced'), 0)::bigint "
+        "           AS charge_nano_cny "
+        "  FROM ai_usage_events e WHERE " + where + " "
+        "  GROUP BY 1, 2, 3"
+        "), ranked AS ("
+        "  SELECT *, extract(epoch FROM (hour_local AT TIME ZONE %s))::bigint "
+        "           AS hour_start, "
+        "         extract(epoch FROM ((hour_local AT TIME ZONE %s) "
+        "           + interval '1 hour'))::bigint AS hour_end "
+        "  FROM groups"
+        ")"
+        " SELECT * FROM ranked" + keyset + " ORDER BY " + order + " LIMIT %s")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    sql,
+                    [ADMIN_AGG_TIMEZONE] + params + [ADMIN_AGG_TIMEZONE,
+                                                     ADMIN_AGG_TIMEZONE]
+                    + cursor_params + [limit + 1])
+                rows = [dict(r) for r in cur.fetchall()]
+                has_more = len(rows) > limit
+                rows = rows[:limit]
+                keys = [(int(r["hour_start"]), r["subject_type"],
+                         r["subject_id"]) for r in rows]
+                tasks_by_group = {}
+                if keys:
+                    values = ", ".join(
+                        ["(%s::bigint, %s::text, %s::text)"] * len(keys))
+                    flat = [v for key in keys for v in key]
+                    twhere, tparams = _agg_filters_where(
+                        since=since, until=until, user_ids=user_ids,
+                        model=model, status=status)
+                    cur.execute(
+                        "WITH tasks AS ("
+                        "  SELECT date_trunc('hour', e.occurred_at "
+                        "           AT TIME ZONE %s) AS hour_local, "
+                        "         " + _TASK_ROW_SQL + " "
+                        "  FROM ai_usage_events e WHERE " + twhere + " "
+                        "  GROUP BY 1, " + _TASK_ROW_GROUP_BY + ""
+                        "), listed AS ("
+                        "  SELECT *, extract(epoch FROM (hour_local "
+                        "           AT TIME ZONE %s))::bigint AS hour_start "
+                        "  FROM tasks"
+                        ")"
+                        " SELECT * FROM listed WHERE "
+                        " (hour_start, subject_type, subject_id) IN "
+                        " (VALUES " + values + ") "
+                        " ORDER BY hour_start DESC, charge_nano_cny DESC, "
+                        " last_at DESC, task_key",
+                        [ADMIN_AGG_TIMEZONE] + tparams
+                        + [ADMIN_AGG_TIMEZONE] + flat)
+                    for row in _task_rows_out([dict(r) for r in
+                                               cur.fetchall()]):
+                        tasks_by_group.setdefault(
+                            (int(row["hour_start"]), row["subject_type"],
+                             row["subject_id"]), []).append(row)
+                totals = _agg_totals(cur, since=since, until=until,
+                                     user_ids=user_ids, model=model,
+                                     status=status)
+                totals["task_count"] = _agg_task_count(
+                    cur, since=since, until=until, user_ids=user_ids,
+                    model=model, status=status)
+    finally:
+        conn.close()
+    items = []
+    for row in rows:
+        item = _agg_amount_out(row)
+        key = (int(item["hour_start"]), item["subject_type"],
+               item["subject_id"])
+        # 稳定分组键（UI 展开/分页去重与 DOM 身份都用它；同筛选下恒定）
+        item["group_key"] = "hour:%d|%s|%s" % key
+        item["tasks"] = tasks_by_group.get(key, [])
+        item["tasks_truncated"] = len(item["tasks"]) > ADMIN_MAX_TASKS_PER_GROUP
+        if item["tasks_truncated"]:
+            item["tasks"] = item["tasks"][:ADMIN_MAX_TASKS_PER_GROUP]
+        item["task_count"] = max(int(item["task_count"]),
+                                 len(item["tasks"]))
+        items.append(item)
+    next_cursor = None
+    if has_more and rows:
+        last = rows[-1]
+        if sort == "charge_desc":
+            next_cursor = (int(last["charge_nano_cny"]),
+                           int(last["hour_start"]), last["subject_type"],
+                           last["subject_id"])
+        else:
+            next_cursor = (int(last["hour_start"]), last["subject_type"],
+                           last["subject_id"])
+    return {"items": items, "next_cursor": next_cursor, "limit": limit,
+            "sort": sort, "totals": totals}
+
+
+def admin_usage_task_page(*, since, until, user_ids=None, model=None,
+                          status=None, sort="activity_desc", cursor=None,
+                          limit=50):
+    """「按任务」视图：一个任务一行（跨小时保留一项），服务端分页。
+
+    行 = 用量聚合任务 ∪ **只有权威生命周期、尚无用量**的进行中任务
+    （验收 §五.3：全新任务无 usage 也能显示真实运行状态）。后者
+    ``lifecycle_only=true``（0 调用、0 金额）。``request_id`` 缺失的历史行
+    按「主体 + 会话」分组（``unattributed=true`` → 「历史未归属调用」），
+    不把所有空值并成一次任务。
+    """
+    limit = max(1, min(int(limit or 50), 200))
+    sort = sort if sort in ("activity_desc", "charge_desc") else \
+        "activity_desc"
+    where, params = _agg_filters_where(since=since, until=until,
+                                       user_ids=user_ids, model=model,
+                                       status=status)
+    keyset, cursor_params = "", []
+    if cursor is not None:
+        try:
+            if sort == "charge_desc":
+                charge, last_at, group_key = cursor
+                keyset = (" WHERE (charge_nano_cny, last_at, group_key) "
+                          "< (%s, %s, %s)")
+                cursor_params = [int(charge), float(last_at), str(group_key)]
+            else:
+                last_at, group_key = cursor
+                keyset = " WHERE (last_at, group_key) < (%s, %s)"
+                cursor_params = [float(last_at), str(group_key)]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("cursor 非法") from exc
+    order = ("charge_nano_cny DESC, last_at DESC, group_key DESC"
+             if sort == "charge_desc" else
+             "last_at DESC, group_key DESC")
+    usage_cte = (
+        "usage_tasks AS ("
+        "  SELECT " + _TASK_ROW_SQL + ", "
+        "         false AS lifecycle_only, "
+        "         " + _TASK_KEY_SQL + " AS group_key "
+        "  FROM ai_usage_events e WHERE " + where + " "
+        "  GROUP BY " + _TASK_ROW_GROUP_BY + ""
+        ")"
+    )
+    # 权威生命周期：进行中且尚无 usage 的任务（0 调用、0 金额）。
+    not_exists = ("NOT EXISTS (SELECT 1 FROM ai_usage_events u "
+                  "WHERE u.request_id = %s AND u.status <> 'void')")
+    lifecycle_cte = (
+        "lifecycle AS ("
+        "  SELECT b.subject_type, b.subject_id, b.request_id AS task_key, "
+        "         b.request_id AS request_id, false AS unattributed, "
+        "         NULL::text AS user_id, "
+        "         extract(epoch FROM b.created_at)::float8 AS started_at, "
+        "         extract(epoch FROM b.created_at)::float8 AS last_at, "
+        "         0 AS call_count, 0 AS unpriced_call_count, "
+        "         0::bigint AS provider_cost_nano_cny, "
+        "         0::bigint AS charge_nano_cny, "
+        "         b.histopilot_session_id AS session_id, true AS lifecycle_only, "
+        "         (b.request_id || '|' || b.subject_type || '|' || b.subject_id)"
+        "           AS group_key "
+        "  FROM ai_run_bindings b "
+        "  WHERE b.created_at >= %s AND b.created_at < %s "
+        "    AND " + (not_exists % "b.request_id") + " "
+        "  UNION ALL "
+        "  SELECT 'demo', d.capability_id, d.request_id, d.request_id, false, "
+        "         NULL::text, "
+        "         extract(epoch FROM COALESCE(d.accepted_at, d.created_at))"
+        "           ::float8, "
+        "         extract(epoch FROM COALESCE(d.updated_at, d.accepted_at, "
+        "           d.created_at))::float8, "
+        "         0, 0, 0::bigint, 0::bigint, d.histopilot_session_id, true, "
+        "         (d.request_id || '|demo|' || d.capability_id) "
+        "  FROM demo_runs d "
+        "  WHERE d.state IN ('reserved', 'accepted') "
+        "    AND COALESCE(d.accepted_at, d.created_at) >= %s "
+        "    AND COALESCE(d.accepted_at, d.created_at) < %s "
+        "    AND " + (not_exists % "d.request_id") + " "
+        "  UNION ALL "
+        "  SELECT v.subject_type, v.subject_id, v.request_id, v.request_id, "
+        "         false, NULL::text, "
+        "         extract(epoch FROM v.reserved_at)::float8, "
+        "         extract(epoch FROM COALESCE(v.updated_at, v.reserved_at))"
+        "           ::float8, "
+        "         0, 0, 0::bigint, 0::bigint, v.histopilot_session_id, true, "
+        "         (v.request_id || '|' || v.subject_type || '|' || v.subject_id)"
+        "  FROM ai_budget_reservations v "
+        "  WHERE v.state = 'reserved' "
+        "    AND v.reserved_at >= %s AND v.reserved_at < %s "
+        "    AND " + (not_exists % "v.request_id") +
+        ")"
+    )
+    sql = (
+        "WITH " + usage_cte + ", " + lifecycle_cte + ", "
+        "combined AS (SELECT * FROM usage_tasks UNION ALL "
+        "             SELECT * FROM lifecycle) "
+        " SELECT * FROM combined" + keyset + " ORDER BY " + order + " LIMIT %s"
+    )
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(sql, params + [
+                    since, until, since, until, since, until]
+                    + cursor_params + [limit + 1])
+                rows = [dict(r) for r in cur.fetchall()]
+                has_more = len(rows) > limit
+                rows = rows[:limit]
+                totals = _agg_totals(cur, since=since, until=until,
+                                     user_ids=user_ids, model=model,
+                                     status=status)
+                totals["task_count"] = _agg_task_count(
+                    cur, since=since, until=until, user_ids=user_ids,
+                    model=model, status=status)
+    finally:
+        conn.close()
+    items = _task_rows_out(rows)
+    next_cursor = None
+    if has_more and rows:
+        last = rows[-1]
+        if sort == "charge_desc":
+            next_cursor = (int(last["charge_nano_cny"]),
+                           float(last["last_at"]), last["group_key"])
+        else:
+            next_cursor = (float(last["last_at"]), last["group_key"])
+    return {"items": items, "next_cursor": next_cursor, "limit": limit,
+            "sort": sort, "totals": totals}
+
+
+def admin_task_lifecycle_states(request_ids):
+    """权威任务生命周期（只读）：``{request_id: {status, source, detail}}``。
+
+    只认权威来源表，**绝不用最后一条 usage 的时间猜「进行中/已结束」**：
+
+    - ``demo_runs.state``：reserved/accepted → running、finished → finished、
+      released/expired → finished（终态，未成功执行）；
+    - ``ai_budget_reservations.state``（pre-F 回退）：reserved → running、
+      consumed/released → finished；
+    - ``ai_run_bindings``：行存在即「已起跑」——``histopilot_session_id``
+      为 NULL → accepted/``pending_session``（等待会话绑定），已 attach →
+      accepted/``session_bound``；该表没有终态信号，出口状态为
+      ``accepted``（不冒充「进行中」，也不冒充「已结束」）；
+    - 三者都没有 → ``unknown``（UI 显示「状态未知」）。
+    """
+    ids = sorted({str(r) for r in (request_ids or []) if r})
+    if not ids:
+        return {}
+    out = {}
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT request_id, state FROM ai_budget_reservations "
+                    "WHERE request_id = ANY(%s)", (ids,))
+                for row in cur.fetchall():
+                    state = row["state"]
+                    out[str(row["request_id"])] = {
+                        "status": "running" if state == "reserved"
+                        else "finished",
+                        "source": "ai_budget_reservations",
+                        "detail": state,
+                    }
+                cur.execute(
+                    "SELECT request_id, state FROM demo_runs "
+                    "WHERE request_id = ANY(%s) ORDER BY created_at", (ids,))
+                for row in cur.fetchall():
+                    state = row["state"]
+                    out[str(row["request_id"])] = {
+                        "status": "running" if state in ("reserved", "accepted")
+                        else "finished",
+                        "source": "demo_runs",
+                        "detail": state,
+                    }
+                cur.execute(
+                    "SELECT request_id, histopilot_session_id AS session_id "
+                    "FROM ai_run_bindings WHERE request_id = ANY(%s)", (ids,))
+                for row in cur.fetchall():
+                    rid = str(row["request_id"])
+                    if rid in out:
+                        continue
+                    out[rid] = {
+                        "status": "accepted",
+                        "source": "ai_run_bindings",
+                        "detail": ("pending_session"
+                                   if row["session_id"] is None
+                                   else "session_bound"),
+                    }
+    finally:
+        conn.close()
+    return out
+
+
+def admin_task_detail(*, request_id=None, subject_type, subject_id,
+                      session_id=None, since=None, until=None):
+    """单个任务明细：范围内 / 全量 / 范围外金额 + 权威状态 + 预算投影（只读）。
+
+    金额只来自 ``ai_usage_events``（priced 事件；unpriced 只计数量、金额保持
+    未知；void 排除），**不含账本**；``reserved``（待结算预占）是
+    ``billing_holds`` 的 open 行估算合计，与「已用」分列，不加进已消费。
+
+    ``unattributed``（request_id 为空的历史行）按主体 + 会话定位。
+    单次任务上限（step A）：``per_task_cap_nano_cny`` 恒 None、说明
+    「未设置单次上限，按账户剩余额度控制」——账户额度投影由 app 层装配。
+    """
+    where = ["e.status <> 'void'"]
+    params = []
+    if request_id:
+        where.append("e.request_id = %s")
+        params.append(str(request_id))
+    else:
+        where.append("e.request_id IS NULL")
+        if session_id:
+            where.append("e.session_id = %s")
+            params.append(str(session_id))
+    where.append("e.subject_type = %s")
+    params.append(str(subject_type))
+    where.append("e.subject_id = %s")
+    params.append(str(subject_id))
+    sql = (
+        "SELECT "
+        "  count(*)::int AS lifetime_call_count, "
+        "  (array_agg(e.user_id) FILTER (WHERE e.user_id IS NOT NULL))[1] "
+        "    AS user_id, "
+        "  count(*) FILTER (WHERE e.status = 'unpriced')::int "
+        "    AS lifetime_unpriced_call_count, "
+        "  COALESCE(sum(e.charge_nano_cny) FILTER "
+        "    (WHERE e.status = 'priced'), 0)::bigint "
+        "    AS lifetime_charge_nano_cny, "
+        "  COALESCE(sum(e.provider_cost_nano_cny) FILTER "
+        "    (WHERE e.status = 'priced'), 0)::bigint "
+        "    AS lifetime_provider_cost_nano_cny, "
+        "  extract(epoch FROM min(e.occurred_at))::float8 "
+        "    AS lifetime_started_at, "
+        "  extract(epoch FROM max(e.occurred_at))::float8 AS lifetime_last_at, "
+        "  count(*) FILTER (WHERE e.occurred_at >= %s AND e.occurred_at < %s)"
+        "    ::int AS in_range_call_count, "
+        "  count(*) FILTER (WHERE e.occurred_at >= %s AND e.occurred_at < %s "
+        "    AND e.status = 'unpriced')::int AS in_range_unpriced_call_count, "
+        "  COALESCE(sum(e.charge_nano_cny) FILTER "
+        "    (WHERE e.occurred_at >= %s AND e.occurred_at < %s "
+        "     AND e.status = 'priced'), 0)::bigint AS in_range_charge_nano_cny, "
+        "  COALESCE(sum(e.provider_cost_nano_cny) FILTER "
+        "    (WHERE e.occurred_at >= %s AND e.occurred_at < %s "
+        "     AND e.status = 'priced'), 0)::bigint "
+        "    AS in_range_provider_cost_nano_cny, "
+        "  extract(epoch FROM min(e.occurred_at) FILTER "
+        "    (WHERE e.occurred_at >= %s AND e.occurred_at < %s))::float8 "
+        "    AS in_range_started_at, "
+        "  extract(epoch FROM max(e.occurred_at) FILTER "
+        "    (WHERE e.occurred_at >= %s AND e.occurred_at < %s))::float8 "
+        "    AS in_range_last_at "
+        "FROM ai_usage_events e WHERE " + " AND ".join(where))
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(sql, [since, until] * 6 + params)
+                row = dict(cur.fetchone())
+                for key in ("lifetime_call_count",
+                            "lifetime_unpriced_call_count",
+                            "lifetime_charge_nano_cny",
+                            "lifetime_provider_cost_nano_cny",
+                            "in_range_call_count",
+                            "in_range_unpriced_call_count",
+                            "in_range_charge_nano_cny",
+                            "in_range_provider_cost_nano_cny"):
+                    if row.get(key) is not None:
+                        row[key] = int(row[key])
+                holds = {"open_holds_count": 0, "estimated_nano_cny": 0,
+                         "scope": "none"}
+                if session_id:
+                    cur.execute(
+                        "SELECT count(*)::int AS n, "
+                        "COALESCE(sum(estimated_nano_cny), 0)::bigint AS est "
+                        "FROM billing_holds WHERE status = 'open' "
+                        "AND expires_at >= now() AND session_id = %s "
+                        "AND subject_type = %s AND subject_id = %s",
+                        (str(session_id), str(subject_type), str(subject_id)))
+                    hold = cur.fetchone()
+                    holds = {
+                        "open_holds_count": int(hold["n"]),
+                        "estimated_nano_cny": int(hold["est"]),
+                        "scope": "session",
+                    }
+    finally:
+        conn.close()
+    lifecycle = admin_task_lifecycle_states([request_id]) if request_id else {}
+    state = lifecycle.get(str(request_id)) if request_id else None
+    if request_id:
+        status = state["status"] if state else "unknown"
+        source = state["source"] if state else None
+        detail = state["detail"] if state else None
+    else:
+        # 历史未归属行（request_id 缺失）：无任何权威生命周期来源
+        status, source, detail = "unknown", None, None
+    in_range = {
+        "call_count": row["in_range_call_count"],
+        "unpriced_call_count": row["in_range_unpriced_call_count"],
+        "provider_cost_nano_cny": row["in_range_provider_cost_nano_cny"],
+        "charge_nano_cny": row["in_range_charge_nano_cny"],
+        "started_at": row["in_range_started_at"],
+        "last_at": row["in_range_last_at"],
+    }
+    lifetime = {
+        "call_count": row["lifetime_call_count"],
+        "unpriced_call_count": row["lifetime_unpriced_call_count"],
+        "provider_cost_nano_cny": row["lifetime_provider_cost_nano_cny"],
+        "charge_nano_cny": row["lifetime_charge_nano_cny"],
+        "started_at": row["lifetime_started_at"],
+        "last_at": row["lifetime_last_at"],
+    }
+    outside = {
+        "call_count": lifetime["call_count"] - in_range["call_count"],
+        "unpriced_call_count": (lifetime["unpriced_call_count"]
+                                - in_range["unpriced_call_count"]),
+        "provider_cost_nano_cny": (lifetime["provider_cost_nano_cny"]
+                                   - in_range["provider_cost_nano_cny"]),
+        "charge_nano_cny": (lifetime["charge_nano_cny"]
+                            - in_range["charge_nano_cny"]),
+    }
+    return {
+        "request_id": str(request_id) if request_id else None,
+        "unattributed": not bool(request_id),
+        "subject_type": str(subject_type),
+        "subject_id": str(subject_id),
+        "user_id": row.get("user_id"),
+        "session_id": str(session_id) if session_id else None,
+        "in_range": in_range,
+        "lifetime": lifetime,
+        "outside_range": outside,
+        "status": status,
+        "status_source": source,
+        "status_detail": detail,
+        # step A（本轮）：只展示已用与待结算预占，不实现单次上限（step B）
+        "budget": {
+            "spent_nano_cny": lifetime["charge_nano_cny"],
+            "unpriced_call_count": lifetime["unpriced_call_count"],
+            "unpriced_amount": "unknown",
+            "reserved_nano_cny": holds["estimated_nano_cny"],
+            "open_holds_count": holds["open_holds_count"],
+            "reserved_scope": holds["scope"],
+            "reserved_scope_note": (
+                "预占按会话统计（billing_holds 以 call/会话为粒度，"
+                "没有 request_id 列）" if holds["scope"] == "session" else
+                "无会话绑定：没有按任务可归属的待结算预占"),
+            "per_task_cap_nano_cny": None,
+            "per_task_cap_configured": False,
+            "note": "未设置单次上限，按账户剩余额度控制",
+            "amount_source": "ai_usage_events",
+            "ledger_included": False,
+        },
+    }
 
 
 #: §7.2 旧错误价格口径（批次 A，只读标记）：cutover 之前的旧价格书/用量/

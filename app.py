@@ -9013,6 +9013,13 @@ _ADMIN_V1_NANO_OUT_KEYS = frozenset((
     "total_limit_nano_cny", "opening_spent_nano_cny",
     "default_limit_nano_cny", "user_default_total_limit_nano_cny",
     "demo_weekly_limit_nano_cny", "owner_monthly_limit_nano_cny",
+    # 2026-10-20（review 一.3/二）：费用聚合出口的任务/范围金额镜像键——
+    # 本任务已用、所选范围内、范围外（完整任务金额 − 范围内）与待结算预占
+    # 同样是 BIGINT nano，必须十进制字符串出线（浏览器 Number 会静默失真）
+    "lifetime_charge_nano_cny", "lifetime_provider_cost_nano_cny",
+    "in_range_charge_nano_cny", "in_range_provider_cost_nano_cny",
+    "outside_range_charge_nano_cny", "outside_range_provider_cost_nano_cny",
+    "remaining_nano_cny",
 ))
 
 
@@ -9040,6 +9047,274 @@ def _admin_v1_nano_out(value):
     if isinstance(value, list):
         return [_admin_v1_nano_out(v) for v in value]
     return value
+
+
+# --------------------------------------------------------------------------- #
+# 2026-10-20（review 一.1/一.3/二）：费用/账务的身份投影与聚合出口
+#
+# 要点（与 review 逐条对应）：
+#   - 身份由**服务端批量投影**（单条 SELECT），不再依赖用户页缓存；规则与
+#     「用户列表 identity」同源（email_normalized → email → login_id）；
+#     Demo 主体显示 Demo；未知身份显式降级（identity=null +
+#     identity_source='unknown'），原始 user_id 只进技术详情，绝不伪造邮箱；
+#   - 聚合先于分页（store 侧 keyset），金额按原始整数 nano 求和后**统一
+#     舍入一次**（Decimal，half away from zero），wire 同时给 nano 十进制
+#     字符串与两位小数 CNY 字符串；
+#   - 邮箱只用于展示/搜索：搜索先在服务端解析成 user_id 集合，再按账务主键
+#     user_id 过滤（不把邮箱当账务键）。
+# --------------------------------------------------------------------------- #
+#: 默认时间范围：近 7 个 Asia/Shanghai 自然日（含今天）
+_ADMIN_AGG_DEFAULT_DAYS = 7
+#: 单次聚合查询的最大范围（护栏；更长历史请缩小窗口）
+_ADMIN_AGG_MAX_RANGE_DAYS = 90
+#: 邮箱搜索命中的 user_id 上限（超出截断并在响应显式标记，不静默丢）
+_ADMIN_IDENTITY_SEARCH_LIMIT = 500
+#: Asia/Shanghai 固定 UTC+8（无夏令时；与 site_stats_store 同口径，不引
+#: tzdata 依赖）
+_ADMIN_SHANGHAI_TZ = timezone(timedelta(hours=8))
+
+
+def _admin_v1_cny_from_nano(nano):
+    """整数 nano-CNY → 两位小数 CNY 字符串（half away from zero，纯 Decimal）。
+
+    「先按原始整数 nano 求和、最后统一舍入一次」是本函数存在的唯一理由：
+    逐条舍入再相加会与权威合计出现分差；全程不经 float/JS Number。
+    """
+    if nano is None:
+        return None
+    value = int(nano)
+    sign = "-" if value < 0 else ""
+    from decimal import Decimal, ROUND_HALF_UP
+    quant = (Decimal(abs(value)) / Decimal(1000000000)).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return sign + str(quant)
+
+
+def _admin_v1_agg_amounts(value):
+    """递归给聚合出口的每个 ``*_nano_cny`` 追加同义 ``*_cny`` 两位小数串。
+
+    只在聚合出口使用（明细出口的金额渲染由前端既有 fmtCny 负责）；nano 键
+    本身仍按 §5 v0.3 出十进制字符串，前端不得 Number 累加。
+    """
+    if isinstance(value, dict):
+        out = {k: _admin_v1_agg_amounts(v) for k, v in value.items()}
+        for key, raw in list(out.items()):
+            if key.endswith("_nano_cny") and raw is not None:
+                out[key[:-len("_nano_cny")] + "_cny"] = _admin_v1_cny_from_nano(
+                    raw)
+        return out
+    if isinstance(value, list):
+        return [_admin_v1_agg_amounts(v) for v in value]
+    return value
+
+
+def _admin_v1_attach_identity(items, *, id_key="user_id",
+                              subject_key="subject_type"):
+    """身份主列批投影（单条 SELECT，无 N+1）。
+
+    ``items`` 内每个 dict 按 ``id_key``（默认 user_id）取主体、按
+    ``subject_key`` 识别 demo 主体；写入统一键 ``identity`` /
+    ``identity_source`` / ``identity_user_id``（技术详情用原始 ID）/
+    ``identity_note``（降级说明）/ ``identity_disabled``（技术详情，不影响
+    主列展示：禁用账号照常显示邮箱）。投影失败按「未知身份」降级——只影响
+    展示列，不让整页 500。
+    """
+    items = [it for it in (items or []) if isinstance(it, dict)]
+    ids = [it.get(id_key) for it in items if it.get(id_key)]
+    try:
+        ident = user_store.get_user_identity_map(ids)
+    except Exception:
+        app.logger.warning("admin 费用身份批投影失败（按未知身份降级）",
+                           exc_info=True)
+        ident = {}
+    for item in items:
+        uid = item.get(id_key)
+        if item.get(subject_key) == "demo":
+            item["identity"] = "Demo"
+            item["identity_source"] = "demo"
+            item["identity_user_id"] = None
+            item["identity_note"] = "Demo 主体（匿名体验），不伪装成注册用户"
+            continue
+        row = ident.get(str(uid)) if uid else None
+        if row is None:
+            item["identity"] = None
+            item["identity_source"] = "unknown"
+            item["identity_user_id"] = str(uid) if uid else None
+            item["identity_note"] = (
+                "事件行没有 user_id 镜像（主体未就绪的历史行）" if not uid
+                else "账号记录不存在或不可用；不伪造邮箱")
+            item["identity_disabled"] = None
+            continue
+        item["identity"] = row["identity"]
+        item["identity_source"] = row["identity_source"]
+        item["identity_user_id"] = str(uid)
+        item["identity_note"] = None
+        item["identity_disabled"] = row["disabled"]
+        item["identity_display_name"] = row["display_name"]
+    return items
+
+
+def _admin_v1_email_filter_ids():
+    """``email`` 查询参数 → (user_ids|None, truncated)。
+
+    无参数 → (None, False)（不过滤）。命中 0 个 → ([], False)（响应明确
+    空页，不退化成全表）。邮箱子串匹配 email_normalized/email/login_id。
+    """
+    raw = (request.args.get("email") or request.args.get("q") or "").strip()
+    if not raw:
+        return None, False
+    limit = _ADMIN_IDENTITY_SEARCH_LIMIT
+    ids = user_store.list_user_ids_matching_identity(raw, limit=limit + 1)
+    truncated = len(ids) > limit
+    return ids[:limit], truncated
+
+
+def _admin_v1_range_arg(raw):
+    """范围参数 → aware datetime（先按 epoch 秒，再按 RFC3339 解析）。
+
+    查询串里两者都是字符串；epoch 用 float 解析（秒，可带小数），非数字才
+    交给 ``billing_store._as_aware_dt``（RFC3339）。解析失败抛 ValueError
+    （路由映射 400），不做「猜时间」的静默兜底。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        raise ValueError("空的时间参数")
+    try:
+        return datetime.fromtimestamp(float(text), tz=timezone.utc)
+    except (TypeError, ValueError):
+        pass
+    return billing_store._as_aware_dt(text)
+
+
+def _admin_v1_usage_range():
+    """``since``/``until`` → (since, until, 元信息 dict)。
+
+    接受 epoch 秒或 RFC3339；缺省 = 近 7 个 Asia/Shanghai 自然日（含今天）。
+    范围非法/过大 → ValueError（路由映射 400），不静默回退到全量。
+    """
+    raw_since = (request.args.get("since") or "").strip()
+    raw_until = (request.args.get("until") or "").strip()
+    default_applied = not (raw_since or raw_until)
+    try:
+        if default_applied:
+            now = datetime.now(timezone.utc)
+            local = now.astimezone(_ADMIN_SHANGHAI_TZ)
+            start_local = ((local - timedelta(days=_ADMIN_AGG_DEFAULT_DAYS - 1))
+                           .replace(hour=0, minute=0, second=0, microsecond=0))
+            since = start_local.astimezone(timezone.utc)
+            until = now
+        else:
+            since = _admin_v1_range_arg(raw_since) if raw_since else None
+            until = _admin_v1_range_arg(raw_until) if raw_until else None
+            if since is None or until is None:
+                raise ValueError("since 与 until 需同时提供")
+            if since >= until:
+                raise ValueError("since 需早于 until")
+            if (until - since) > timedelta(days=_ADMIN_AGG_MAX_RANGE_DAYS):
+                raise ValueError("时间范围超过 %d 天，请缩小窗口"
+                                 % _ADMIN_AGG_MAX_RANGE_DAYS)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("since/until 需为 epoch 秒或 RFC3339 时间：%s"
+                         % (exc,)) from exc
+    return since, until, {
+        "since": since.timestamp(),
+        "until": until.timestamp(),
+        "timezone": billing_store.ADMIN_AGG_TIMEZONE,
+        "default_applied": default_applied,
+        "default_days": _ADMIN_AGG_DEFAULT_DAYS,
+        "amount_scope": "selected_range",
+    }
+
+
+def _admin_v1_agg_cursor(raw_cursor, size):
+    """不透明游标 → 长度 ``size`` 的元组（None 原样；非法 → None）。"""
+    if not raw_cursor:
+        return None
+    keys = raw_cursor.get("k")
+    if not isinstance(keys, list) or len(keys) != size:
+        return None
+    return tuple(keys)
+
+
+def _admin_v1_account_remaining(subject_type, subject_id, user_id=None):
+    """账户剩余额度及其类型（review 一.3 step A 的账户侧投影，只读）。
+
+    - ``user``（注册用户）→ 一次性总额度（``ai_spend_total_allowances``）；
+    - ``owner`` → 月窗口额度（``ai_spend_windows``）；
+    - ``demo`` → 全站共享 Demo 周窗口；
+    - 投影不可用（缺额度行/策略被禁用）→ ``limit_type='unavailable'`` +
+      稳定 ``error``，不伪造 0 剩余。
+    """
+    out = {
+        "subject_type": subject_type,
+        "subject_id": subject_id,
+        "limit_type": "unavailable",
+        "limit_type_label": "额度投影不可用",
+        "remaining_nano_cny": None,
+        "limit_nano_cny": None,
+        "spent_nano_cny": None,
+        "reserved_nano_cny": None,
+        "window_start": None,
+        "window_end": None,
+        "source": None,
+        "error": None,
+    }
+    try:
+        if subject_type == "demo":
+            stats = spend_store.admin_demo_spend_stats("current")
+            out.update({
+                "limit_type": "demo_week_window",
+                "limit_type_label": "Demo 周窗口额度（全站共享）",
+                "remaining_nano_cny": stats.get("remaining_nano"),
+                "limit_nano_cny": stats.get("limit_nano_cny"),
+                "spent_nano_cny": stats.get("spent_nano_cny"),
+                "reserved_nano_cny": stats.get("reserved_nano_cny"),
+                "window_start": stats.get("window_start"),
+                "window_end": stats.get("window_end"),
+                "source": "spend_store.admin_demo_spend_stats",
+            })
+            return out
+        item = spend_store.admin_users_spend_summaries(
+            [(subject_type, subject_id)]).get(subject_id) or {}
+        if item.get("error"):
+            out["error"] = item["error"]
+            return out
+        total = item.get("total")
+        window = item.get("window")
+        if total is not None:
+            out.update({
+                "limit_type": "user_total_allowance",
+                "limit_type_label": "注册用户一次性总额度",
+                "remaining_nano_cny": total.get("remaining_nano"),
+                "limit_nano_cny": total.get("total_limit_nano_cny"),
+                "spent_nano_cny": total.get("spent_nano_cny"),
+                "reserved_nano_cny": total.get("reserved_nano_cny"),
+                "source": total.get("source"),
+            })
+            return out
+        if window is not None:
+            out.update({
+                "limit_type": "owner_month_window",
+                "limit_type_label": "Owner 月窗口额度",
+                "remaining_nano_cny": (
+                    spend_store.window_remaining_nano(window)),
+                "limit_nano_cny": window.get("limit_nano_snapshot"),
+                "spent_nano_cny": window.get("spent_nano_cny"),
+                "reserved_nano_cny": window.get("reserved_nano_cny"),
+                "window_start": window.get("window_start"),
+                "window_end": window.get("window_end"),
+                "source": window.get("policy_id"),
+            })
+            return out
+        out["error"] = "spend_projection_missing"
+    except spend_store.SpendError as exc:
+        out["error"] = getattr(exc, "code", "spend_error")
+    except Exception:
+        app.logger.warning("admin 账户剩余额度投影失败", exc_info=True)
+        out["error"] = "spend_projection_unavailable"
+    return out
 
 
 def _admin_v1_amount_in(value, field, *, allow_negative=False):
@@ -9471,10 +9746,13 @@ def admin_v1_users():
 
 @app.route("/api/admin/v1/billing/usage-events", methods=["GET"])
 def admin_v1_billing_usage_events():
-    """usage 明细分页（§10.4）：model/user_id/status 筛选；unpriced 单独过滤。
+    """usage 明细分页（§10.4）：model/user_id/email/status 筛选。
 
     status 仅接受 priced/unpriced（unpriced 不混入「0 元调用」——金额列保持
-    null 而非 0）。
+    null 而非 0）。2026-10-20（review 一.1）：每行带服务端批投影的身份主列
+    （identity/identity_source；Demo=Demo；未知身份显式降级、原始 user_id 进
+    identity_user_id 技术详情），不再依赖用户页缓存；``email`` 先解析成
+    user_id 集合再按账务主键过滤。旧明细接口保留（兼容，详情/展开仍用它）。
     """
     auth = _require_owner_admin_v1()
     if auth:
@@ -9490,11 +9768,22 @@ def admin_v1_billing_usage_events():
         return _admin_v1_error(
             400, "invalid_request",
             "status 需为 %s" % (billing_store.ADMIN_USAGE_STATUSES,))
+    user_id = (request.args.get("user_id") or "").strip() or None
+    try:
+        search_ids, search_truncated = _admin_v1_email_filter_ids()
+    except Exception:
+        app.logger.exception("admin v1 usage 邮箱搜索失败")
+        return _admin_v1_error(500, "internal", "邮箱搜索失败")
+    user_ids = [user_id] if user_id is not None else search_ids
+    if user_id is not None:
+        search_truncated = False
     try:
         page = billing_store.admin_usage_events_page(
             cursor=cursor, limit=limit,
             model=(request.args.get("model") or "").strip() or None,
-            user_id=(request.args.get("user_id") or "").strip() or None,
+            user_id=user_id, user_ids=(user_ids if user_id is None else None),
+            request_id=(request.args.get("request_id") or "").strip() or None,
+            session_id=(request.args.get("session_id") or "").strip() or None,
             subject_type=(request.args.get("subject_type") or "").strip() or None,
             status=status)
     except ValueError as exc:
@@ -9505,14 +9794,21 @@ def admin_v1_billing_usage_events():
     next_cursor = None
     if page["next_cursor"] is not None:
         next_cursor = _admin_v1_encode_cursor({"k": list(page["next_cursor"])})
+    items = _admin_v1_attach_identity(page["items"])
     # 计价金额字段十进制字符串化（§5 v0.3；unpriced 保持 null 不混 0 元）
-    return jsonify(items=_admin_v1_nano_out(page["items"]),
-                   next_cursor=next_cursor, limit=limit)
+    return jsonify(items=_admin_v1_nano_out(items),
+                   next_cursor=next_cursor, limit=limit,
+                   identity_search_truncated=search_truncated)
 
 
 @app.route("/api/admin/v1/billing/ledger", methods=["GET"])
 def admin_v1_billing_ledger():
-    """不可变账本只读分页（§10.4：只读表，冲正用新操作，无编辑/删除）。"""
+    """不可变账本只读分页（§10.4：只读表，冲正用新操作，无编辑/删除）。
+
+    2026-10-20（review 一.1）：行带 ``account_id → billing_accounts.user_id``
+    与服务端批投影的身份主列；``email`` 先解析成 user_id 集合再按主体过滤。
+    台账金额与费用统计**分开**展示（不做 event + ledger 双计）。
+    """
     auth = _require_owner_admin_v1()
     if auth:
         return auth
@@ -9522,8 +9818,19 @@ def admin_v1_billing_ledger():
     if raw_cursor and "k" in raw_cursor and isinstance(raw_cursor["k"], list) \
             and len(raw_cursor["k"]) == 2:
         cursor = (raw_cursor["k"][0], raw_cursor["k"][1])
+    user_id = (request.args.get("user_id") or "").strip() or None
     try:
-        page = billing_store.admin_ledger_page(cursor=cursor, limit=limit)
+        search_ids, search_truncated = _admin_v1_email_filter_ids()
+    except Exception:
+        app.logger.exception("admin v1 ledger 邮箱搜索失败")
+        return _admin_v1_error(500, "internal", "邮箱搜索失败")
+    user_ids = [user_id] if user_id is not None else search_ids
+    if user_id is not None:
+        search_truncated = False
+    try:
+        page = billing_store.admin_ledger_page(
+            cursor=cursor, limit=limit,
+            user_ids=(user_ids if user_ids is not None else None))
     except ValueError as exc:
         return _admin_v1_error(400, "invalid_request", str(exc))
     except Exception:
@@ -9532,9 +9839,178 @@ def admin_v1_billing_ledger():
     next_cursor = None
     if page["next_cursor"] is not None:
         next_cursor = _admin_v1_encode_cursor({"k": list(page["next_cursor"])})
+    items = _admin_v1_attach_identity(page["items"])
     # entry.amount_nano_cny 十进制字符串化（§5 v0.3）
-    return jsonify(items=_admin_v1_nano_out(page["items"]),
-                   next_cursor=next_cursor, limit=limit)
+    return jsonify(items=_admin_v1_nano_out(items),
+                   next_cursor=next_cursor, limit=limit,
+                   identity_search_truncated=search_truncated)
+
+
+@app.route("/api/admin/v1/billing/usage-summary", methods=["GET"])
+def admin_v1_billing_usage_summary():
+    """费用聚合（review 二，2026-10-20）：``view=hour``（默认，按用户/小时）
+    或 ``view=task``（按任务），服务端先聚合再分页（keyset 稳定分组键）。
+
+    参数：``since``/``until``（epoch 秒或 RFC3339；缺省近 7 个 Asia/Shanghai
+    自然日）、``email``（身份子串搜索 → 先解析成 user_id 集合）、``user_id``
+    （精确主体）、``model``、``sort``、``cursor``、``limit``。
+
+    - 小时桶固定 Asia/Shanghai 自然小时；``view=hour`` 的行内联该小时的
+      ``tasks``（上限 ``ADMIN_MAX_TASKS_PER_GROUP``，超出 ``tasks_truncated``）；
+    - 任务键 = 权威 request_id + 主体身份；``request_id`` 缺失的历史行按
+      主体 + 会话分组并标 ``unattributed``（「历史未归属调用」）；
+    - void 排除、unpriced 只计数（金额 unknown，绝不按 0 元）；金额按整数
+      nano 求和后统一舍入一次，nano 与两位小数 CNY 字符串同时出线；
+    - ``totals`` 为所选范围的权威合计（含 ``unpriced_amount='unknown'``、
+      ``ledger_included=false``——与账本分开，不做 event + ledger 双计）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    limit = _admin_v1_limit_arg()
+    view = (request.args.get("view") or "hour").strip()
+    if view not in billing_store.ADMIN_USAGE_VIEWS:
+        return _admin_v1_error(400, "invalid_request",
+                               "view 需为 %s"
+                               % (billing_store.ADMIN_USAGE_VIEWS,))
+    sort = (request.args.get("sort") or "").strip() or None
+    default_sort = "hour_desc" if view == "hour" else "activity_desc"
+    if sort is None:
+        sort = default_sort
+    if sort not in billing_store.ADMIN_USAGE_SORTS:
+        return _admin_v1_error(400, "invalid_request",
+                               "sort 需为 %s"
+                               % (billing_store.ADMIN_USAGE_SORTS,))
+    if view == "hour" and sort == "activity_desc":
+        sort = "hour_desc"
+    if view == "task" and sort == "hour_desc":
+        sort = "activity_desc"
+    model = (request.args.get("model") or "").strip() or None
+    user_id = (request.args.get("user_id") or "").strip() or None
+    status = (request.args.get("status") or "").strip() or None
+    if status is not None and status not in billing_store.ADMIN_USAGE_STATUSES:
+        return _admin_v1_error(
+            400, "invalid_request",
+            "status 需为 %s" % (billing_store.ADMIN_USAGE_STATUSES,))
+    try:
+        since, until, range_meta = _admin_v1_usage_range()
+        search_ids, search_truncated = _admin_v1_email_filter_ids()
+    except ValueError as exc:
+        return _admin_v1_error(400, "invalid_request", str(exc))
+    except Exception:
+        app.logger.exception("admin v1 usage summary 参数解析失败")
+        return _admin_v1_error(500, "internal", "邮箱搜索失败")
+    user_ids = [user_id] if user_id is not None else search_ids
+    if user_id is not None:
+        search_truncated = False
+    raw_cursor = _admin_v1_decode_cursor(request.args.get("cursor"))
+    if view == "hour":
+        cursor_size = 4 if sort == "charge_desc" else 3
+    else:
+        cursor_size = 3 if sort == "charge_desc" else 2
+    cursor = _admin_v1_agg_cursor(raw_cursor, cursor_size)
+    try:
+        if view == "hour":
+            page = billing_store.admin_usage_hour_summary(
+                since=since, until=until, user_ids=user_ids, model=model,
+                status=status, sort=sort, cursor=cursor, limit=limit)
+        else:
+            page = billing_store.admin_usage_task_page(
+                since=since, until=until, user_ids=user_ids, model=model,
+                status=status, sort=sort, cursor=cursor, limit=limit)
+    except ValueError as exc:
+        return _admin_v1_error(400, "invalid_request", str(exc))
+    except Exception:
+        app.logger.exception("admin v1 usage summary 读取失败")
+        return _admin_v1_error(500, "internal", "费用聚合读取失败")
+    items = _admin_v1_attach_identity(page["items"])
+    if view == "hour":
+        for item in items:
+            _admin_v1_attach_identity(item.get("tasks") or [])
+    next_cursor = None
+    if page["next_cursor"] is not None:
+        next_cursor = _admin_v1_encode_cursor({"k": list(page["next_cursor"])})
+    payload = _admin_v1_nano_out({
+        "view": view,
+        "sort": sort,
+        "items": items,
+        "totals": page["totals"],
+        "next_cursor": next_cursor,
+        "limit": page["limit"],
+        "range": range_meta,
+        "identity_search_truncated": search_truncated,
+        "identity_search": (request.args.get("email") or "").strip() or None,
+        # 口径说明（页面直接展示，避免把两套金额读成一本账）
+        "amount_scope_note": (
+            "金额为 ai_usage_events 的 priced 事件合计（void 排除、unpriced "
+            "金额未知）；不含账本；hold 预占单列不进已用"),
+        "timezone": billing_store.ADMIN_AGG_TIMEZONE,
+    })
+    return jsonify(_admin_v1_agg_amounts(payload))
+
+
+@app.route("/api/admin/v1/billing/task-detail", methods=["GET"])
+def admin_v1_billing_task_detail():
+    """单任务明细 + 预算投影（review 一.3 step A；只读）。
+
+    定位：``request_id`` + ``subject_type`` + ``subject_id``（历史未归属行
+    传 ``session_id`` 且不带 request_id）。返回：
+
+    - ``in_range`` / ``lifetime`` / ``outside_range``：所选范围内、完整任务、
+      范围外（完整 − 范围内）金额与调用——展开时看完整任务金额，避免把完整
+      任务总额重复叠加到每个小时行；
+    - ``status``（权威生命周期：running/finished/accepted/unknown，来自
+      demo_runs / ai_budget_reservations / ai_run_bindings；没有来源时
+      unknown，UI 显示「状态未知」，绝不用最后一条 usage 时间猜）；
+    - ``budget``：本任务已用（lifetime priced charge）与待结算预占（open
+      holds，按会话；hold 表没有 request_id 列）分列，unpriced 只计数；
+      step A 明确「未设置单次上限，按账户剩余额度控制」（per_task_cap 恒
+      null）——**本轮不实现单次上限（step B）**；
+    - ``account``：主体账户剩余额度及其类型（用户一次性总额度 / Owner 月
+      窗口 / Demo 周窗口）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    request_id = (request.args.get("request_id") or "").strip() or None
+    subject_type = (request.args.get("subject_type") or "").strip() or None
+    subject_id = (request.args.get("subject_id") or "").strip() or None
+    session_id = (request.args.get("session_id") or "").strip() or None
+    if not subject_type or not subject_id:
+        return _admin_v1_error(400, "invalid_request",
+                               "subject_type 与 subject_id 必填")
+    if subject_type not in ("owner", "user", "demo"):
+        return _admin_v1_error(400, "invalid_request",
+                               "subject_type 需为 owner|user|demo")
+    if not request_id and not session_id:
+        return _admin_v1_error(
+            400, "invalid_request",
+            "需要 request_id（权威任务键）；无 request_id 的历史行请带 session_id")
+    try:
+        since, until, range_meta = _admin_v1_usage_range()
+    except ValueError as exc:
+        return _admin_v1_error(400, "invalid_request", str(exc))
+    try:
+        detail = billing_store.admin_task_detail(
+            request_id=request_id, subject_type=subject_type,
+            subject_id=subject_id, session_id=session_id,
+            since=since, until=until)
+    except ValueError as exc:
+        return _admin_v1_error(400, "invalid_request", str(exc))
+    except Exception:
+        app.logger.exception("admin v1 task detail 读取失败")
+        return _admin_v1_error(500, "internal", "任务明细读取失败")
+    detail["range"] = range_meta
+    if request_id:
+        detail = _admin_v1_attach_identity([detail], subject_key="subject_type")[0]
+    else:
+        detail["identity"] = None
+        detail["identity_source"] = "unknown"
+        detail["identity_user_id"] = None
+        detail["identity_note"] = "历史未归属调用（无 request_id，无权威生命周期）"
+    detail["account"] = _admin_v1_account_remaining(
+        subject_type, subject_id, user_id=detail.get("user_id"))
+    return jsonify(_admin_v1_agg_amounts(_admin_v1_nano_out(detail)))
 
 
 def _admin_v1_provider_balance_payload():
@@ -11685,7 +12161,12 @@ def admin_v1_ai_unowned_sessions():
 
 @app.route("/api/admin/v1/format-requests", methods=["GET"])
 def admin_v1_format_requests():
-    """格式申请列表（owner-only）。"""
+    """格式申请列表（owner-only）。
+
+    2026-10-20（review 一.1 扫描 identityText(string) 使用点）：``identity``
+    由服务端按 owner_user_id 批投影（与用户列表同规则），前端不再依赖用户页
+    身份缓存；identity_user_id 保留原始 ID 作技术详情。
+    """
     import format_request_http
     auth = _require_owner_admin_v1()
     if auth:
@@ -11695,12 +12176,17 @@ def admin_v1_format_requests():
         for item in payload.get("items") or []:
             if isinstance(item, dict):
                 item.pop("sample_internal_ref", None)
+        _admin_v1_attach_identity(payload.get("items"),
+                                  id_key="owner_user_id")
     return _admin_v1_from_handler((payload, status))
 
 
 @app.route("/api/admin/v1/format-requests/<request_id>", methods=["GET"])
 def admin_v1_format_request_get(request_id):
-    """格式申请详情（含管理字段；样本路径不进 JSON）。"""
+    """格式申请详情（含管理字段；样本路径不进 JSON）。
+
+    同列表：owner 身份批投影（identity/identity_source/identity_user_id）。
+    """
     import format_request_http
     auth = _require_owner_admin_v1()
     if auth:
@@ -11708,6 +12194,7 @@ def admin_v1_format_request_get(request_id):
     payload, status = format_request_http.handle_admin_get(request_id)
     if isinstance(payload, dict):
         payload.pop("sample_internal_ref", None)
+        _admin_v1_attach_identity([payload], id_key="owner_user_id")
     return _admin_v1_from_handler((payload, status))
 
 

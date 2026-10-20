@@ -46,6 +46,9 @@ _PUBLIC_NAMES = (
     "set_user_ai_config",
     "count_owners",
     "has_enabled_users",
+    # 身份批投影（admin 费用/流水/格式申请主列；与用户列表 identity 同规则）
+    "get_user_identity_map",
+    "list_user_ids_matching_identity",
     # owner 解析与引导原语
     "list_enabled_owners",
     "list_owners",

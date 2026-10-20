@@ -127,6 +127,10 @@ def _endpoints(owner_id):
         "/api/admin/v1/users",
         "/api/admin/v1/billing/usage-events",
         "/api/admin/v1/billing/ledger",
+        # 2026-10-20（review 二）：费用聚合视图与单任务预算投影（只读，
+        # 同 admin:billing:read 域）
+        "/api/admin/v1/billing/usage-summary",
+        "/api/admin/v1/billing/task-detail?subject_type=user&subject_id=usr_x",
         "/api/admin/v1/billing/provider-balance",
         "/api/admin/v1/billing/provider-balance/refresh",
         "/api/admin/v1/audit",

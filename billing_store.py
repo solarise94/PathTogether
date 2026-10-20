@@ -3416,65 +3416,105 @@ def admin_usage_task_page(*, since, until, user_ids=None, model=None,
         ")"
     )
     # 权威生命周期：进行中且尚无 usage 的任务（0 调用、0 金额）。
-    not_exists = ("NOT EXISTS (SELECT 1 FROM ai_usage_events u "
-                  "WHERE u.request_id = %s AND u.status <> 'void')")
-    lifecycle_cte = (
-        "lifecycle AS ("
-        "  SELECT b.subject_type, b.subject_id, b.request_id AS task_key, "
-        "         b.request_id AS request_id, false AS unattributed, "
-        "         NULL::text AS user_id, "
-        "         extract(epoch FROM b.created_at)::float8 AS started_at, "
-        "         extract(epoch FROM b.created_at)::float8 AS last_at, "
-        "         0 AS call_count, 0 AS unpriced_call_count, "
-        "         0::bigint AS provider_cost_nano_cny, "
-        "         0::bigint AS charge_nano_cny, "
-        "         b.histopilot_session_id AS session_id, true AS lifecycle_only, "
-        "         (b.request_id || '|' || b.subject_type || '|' || b.subject_id)"
-        "           AS group_key "
-        "  FROM ai_run_bindings b "
-        "  WHERE b.created_at >= %s AND b.created_at < %s "
-        "    AND " + (not_exists % "b.request_id") + " "
-        "  UNION ALL "
-        "  SELECT 'demo', d.capability_id, d.request_id, d.request_id, false, "
-        "         NULL::text, "
-        "         extract(epoch FROM COALESCE(d.accepted_at, d.created_at))"
-        "           ::float8, "
-        "         extract(epoch FROM COALESCE(d.updated_at, d.accepted_at, "
-        "           d.created_at))::float8, "
-        "         0, 0, 0::bigint, 0::bigint, d.histopilot_session_id, true, "
-        "         (d.request_id || '|demo|' || d.capability_id) "
-        "  FROM demo_runs d "
-        "  WHERE d.state IN ('reserved', 'accepted') "
-        "    AND COALESCE(d.accepted_at, d.created_at) >= %s "
-        "    AND COALESCE(d.accepted_at, d.created_at) < %s "
-        "    AND " + (not_exists % "d.request_id") + " "
-        "  UNION ALL "
-        "  SELECT v.subject_type, v.subject_id, v.request_id, v.request_id, "
-        "         false, NULL::text, "
-        "         extract(epoch FROM v.reserved_at)::float8, "
-        "         extract(epoch FROM COALESCE(v.updated_at, v.reserved_at))"
-        "           ::float8, "
-        "         0, 0, 0::bigint, 0::bigint, v.histopilot_session_id, true, "
-        "         (v.request_id || '|' || v.subject_type || '|' || v.subject_id)"
-        "  FROM ai_budget_reservations v "
-        "  WHERE v.state = 'reserved' "
-        "    AND v.reserved_at >= %s AND v.reserved_at < %s "
-        "    AND " + (not_exists % "v.request_id") +
-        ")"
-    )
+    #
+    # 2026-10-21（review P2-2）：生命周期行与 use 行**同一筛选口径**——
+    #   - 生命周期任务没有模型、没有计价状态：``model`` / ``status`` 一旦设置，
+    #     该类行必须整体排除（不能绕过筛选出现在结果里）；
+    #   - ``user_ids``（邮箱搜索已解析成主体）按主体匹配；demo 主体没有邮箱，
+    #     不上用户过滤时可见、一旦按身份过滤即排除；
+    #   - 时间窗与原实现一致（binding.created_at / demo accepted_at /
+    #     reservation reserved_at）。
+    include_lifecycle = model is None and status is None
+    lifecycle_cte = ""
+    lifecycle_params = []
+    if include_lifecycle:
+        not_exists = ("NOT EXISTS (SELECT 1 FROM ai_usage_events u "
+                      "WHERE u.request_id = %s AND u.status <> 'void')")
+        # 身份过滤片段：owner/user 分支按主体匹配；demo 分支没有邮箱，
+        # 一旦按身份过滤就整体排除（AND FALSE，不占参数位）。
+        user_cond = ""
+        demo_cond = ""
+        if user_ids is not None:
+            user_cond = (" AND {alias}.subject_type <> 'demo'"
+                         " AND {alias}.subject_id = ANY(%s)")
+            demo_cond = " AND FALSE"
+        lifecycle_cte = (
+            "lifecycle AS ("
+            "  SELECT b.subject_type, b.subject_id, b.request_id AS task_key, "
+            "         b.request_id AS request_id, false AS unattributed, "
+            "         NULL::text AS user_id, "
+            "         extract(epoch FROM b.created_at)::float8 AS started_at, "
+            "         extract(epoch FROM b.created_at)::float8 AS last_at, "
+            "         0 AS call_count, 0 AS unpriced_call_count, "
+            "         0::bigint AS provider_cost_nano_cny, "
+            "         0::bigint AS charge_nano_cny, "
+            "         b.histopilot_session_id AS session_id, "
+            "         true AS lifecycle_only, "
+            "         (b.request_id || '|' || b.subject_type || '|' "
+            "           || b.subject_id) AS group_key "
+            "  FROM ai_run_bindings b "
+            "  WHERE b.created_at >= %s AND b.created_at < %s "
+            "    AND " + (not_exists % "b.request_id")
+            + (user_cond.format(alias="b") if user_cond else "") + " "
+            "  UNION ALL "
+            "  SELECT 'demo', d.capability_id, d.request_id, d.request_id, "
+            "         false, NULL::text, "
+            "         extract(epoch FROM COALESCE(d.accepted_at, d.created_at))"
+            "           ::float8, "
+            "         extract(epoch FROM COALESCE(d.updated_at, d.accepted_at, "
+            "           d.created_at))::float8, "
+            "         0, 0, 0::bigint, 0::bigint, d.histopilot_session_id, "
+            "         true, "
+            "         (d.request_id || '|demo|' || d.capability_id) "
+            "  FROM demo_runs d "
+            "  WHERE d.state IN ('reserved', 'accepted') "
+            "    AND COALESCE(d.accepted_at, d.created_at) >= %s "
+            "    AND COALESCE(d.accepted_at, d.created_at) < %s "
+            "    AND " + (not_exists % "d.request_id") + demo_cond + " "
+            "  UNION ALL "
+            "  SELECT v.subject_type, v.subject_id, v.request_id, "
+            "         v.request_id, false, NULL::text, "
+            "         extract(epoch FROM v.reserved_at)::float8, "
+            "         extract(epoch FROM COALESCE(v.updated_at, v.reserved_at))"
+            "           ::float8, "
+            "         0, 0, 0::bigint, 0::bigint, v.histopilot_session_id, "
+            "         true, "
+            "         (v.request_id || '|' || v.subject_type || '|' "
+            "           || v.subject_id) "
+            "  FROM ai_budget_reservations v "
+            "  WHERE v.state = 'reserved' "
+            "    AND v.reserved_at >= %s AND v.reserved_at < %s "
+            "    AND " + (not_exists % "v.request_id")
+            + (user_cond.format(alias="v") if user_cond else "") +
+            ")"
+        )
+        # 参数顺序必须与 CTE 文本内的占位符逐一对应（分支内交错）：
+        # bindings [since, until, ids?] → demo [since, until] →
+        # reservations [since, until, ids?]
+        lifecycle_params = [since, until]
+        if user_ids is not None:
+            lifecycle_params.append(list(user_ids))
+        lifecycle_params += [since, until]
+        lifecycle_params += [since, until]
+        if user_ids is not None:
+            lifecycle_params.append(list(user_ids))
+    lifecycle_count_sql = (
+        "WITH " + lifecycle_cte + " SELECT count(*)::int AS n FROM lifecycle"
+        if include_lifecycle else None)
     sql = (
-        "WITH " + usage_cte + ", " + lifecycle_cte + ", "
-        "combined AS (SELECT * FROM usage_tasks UNION ALL "
-        "             SELECT * FROM lifecycle) "
+        "WITH " + usage_cte + ", "
+        + (lifecycle_cte + ", " if include_lifecycle else "")
+        + "combined AS (SELECT * FROM usage_tasks"
+        + (" UNION ALL SELECT * FROM lifecycle" if include_lifecycle else "")
+        + ") "
         " SELECT * FROM combined" + keyset + " ORDER BY " + order + " LIMIT %s"
     )
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                cur.execute(sql, params + [
-                    since, until, since, until, since, until]
-                    + cursor_params + [limit + 1])
+                cur.execute(sql, params + lifecycle_params
+                            + cursor_params + [limit + 1])
                 rows = [dict(r) for r in cur.fetchall()]
                 has_more = len(rows) > limit
                 rows = rows[:limit]
@@ -3484,6 +3524,11 @@ def admin_usage_task_page(*, since, until, user_ids=None, model=None,
                 totals["task_count"] = _agg_task_count(
                     cur, since=since, until=until, user_ids=user_ids,
                     model=model, status=status)
+                if lifecycle_count_sql is not None:
+                    # 合计与列表同口径：生命周期行也是任务（0 调用 0 金额），
+                    # 必须计入 task_count，否则 totals 与可见行数不一致。
+                    cur.execute(lifecycle_count_sql, lifecycle_params)
+                    totals["task_count"] += int(cur.fetchone()["n"])
     finally:
         conn.close()
     items = _task_rows_out(rows)
@@ -3572,6 +3617,9 @@ def admin_task_detail(*, request_id=None, subject_type, subject_id,
     ``billing_holds`` 的 open 行估算合计，与「已用」分列，不加进已消费。
 
     ``unattributed``（request_id 为空的历史行）按主体 + 会话定位。
+    ``session_id`` 可省略：省略时从 usage 事件 / ai_run_bindings 解析该任务
+    的权威会话，再统计该会话的 open holds（review P2-1：request_id-only
+    调用同样返回真实待结算预占）。
     单次任务上限（step A）：``per_task_cap_nano_cny`` 恒 None、说明
     「未设置单次上限，按账户剩余额度控制」——账户额度投影由 app 层装配。
     """
@@ -3639,16 +3687,45 @@ def admin_task_detail(*, request_id=None, subject_type, subject_id,
                             "in_range_provider_cost_nano_cny"):
                     if row.get(key) is not None:
                         row[key] = int(row[key])
+                # 2026-10-21（review P2-1）：待结算预占按会话统计，但调用方
+                # 只传 request_id 时也必须能定位——先用入参 session_id，否则
+                # 从权威来源解析该任务的会话：usage 事件的 session_id（同一
+                # request_id 的历史事件）与 ai_run_bindings（无 usage 的全新
+                # 任务，绑定行才是会话来源）。绝不按「最后一条 usage 时间」
+                # 猜测，也不依赖前端一定传 session_id。
+                sessions = []
+                if session_id:
+                    sessions = [str(session_id)]
+                elif request_id:
+                    cur.execute(
+                        "SELECT DISTINCT session_id FROM ai_usage_events "
+                        "WHERE request_id = %s AND subject_type = %s "
+                        "  AND subject_id = %s AND session_id IS NOT NULL",
+                        (str(request_id), str(subject_type),
+                         str(subject_id)))
+                    sessions.extend(str(r["session_id"]) for r in
+                                    cur.fetchall() if r["session_id"])
+                    cur.execute(
+                        "SELECT histopilot_session_id AS session_id "
+                        "FROM ai_run_bindings "
+                        "WHERE request_id = %s AND subject_type = %s "
+                        "  AND subject_id = %s "
+                        "  AND histopilot_session_id IS NOT NULL",
+                        (str(request_id), str(subject_type),
+                         str(subject_id)))
+                    sessions.extend(str(r["session_id"]) for r in
+                                    cur.fetchall() if r["session_id"])
+                    sessions = sorted(set(sessions))
                 holds = {"open_holds_count": 0, "estimated_nano_cny": 0,
                          "scope": "none"}
-                if session_id:
+                if sessions:
                     cur.execute(
                         "SELECT count(*)::int AS n, "
                         "COALESCE(sum(estimated_nano_cny), 0)::bigint AS est "
                         "FROM billing_holds WHERE status = 'open' "
-                        "AND expires_at >= now() AND session_id = %s "
+                        "AND expires_at >= now() AND session_id = ANY(%s) "
                         "AND subject_type = %s AND subject_id = %s",
-                        (str(session_id), str(subject_type), str(subject_id)))
+                        (sessions, str(subject_type), str(subject_id)))
                     hold = cur.fetchone()
                     holds = {
                         "open_holds_count": int(hold["n"]),
@@ -3697,7 +3774,9 @@ def admin_task_detail(*, request_id=None, subject_type, subject_id,
         "subject_type": str(subject_type),
         "subject_id": str(subject_id),
         "user_id": row.get("user_id"),
-        "session_id": str(session_id) if session_id else None,
+        # 未传 session_id 时回填解析到的权威会话（供 UI/排障核对）
+        "session_id": (str(session_id) if session_id
+                       else (sessions[0] if sessions else None)),
         "in_range": in_range,
         "lifetime": lifetime,
         "outside_range": outside,

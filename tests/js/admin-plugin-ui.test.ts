@@ -3667,3 +3667,175 @@ describe("2026-10-20 费用聚合视图（review 二）", () => {
 		expect(text).toContain("单次任务上限（step B）尚未实现");
 	}, 10000);
 });
+
+// ==========================================================================
+// 2026-10-21 release review（P2-1/4/5）回归
+//
+// 复核证据：/mnt/ssd2/tests/review-20261021-tdkkpN（repro-ui.cjs）。场景按
+// **正确行为**断言，原复现输出作为对照：
+//   before → 预算请求只带 request_id 或 session_id（二选一）；
+//            同时展开两个面板后 [0, 2]（A 的响应被 B 作废，永远停在读取中）；
+//            raw 第 2 页 payload 只剩 cursor + 任务定位（丢 model/status）
+//   after  → 两个 id 都带；[2, 2] 两个面板都渲染；第 2 页保留完整筛选
+// ==========================================================================
+describe("2026-10-21 费用面板与原始调用分页（release review）", () => {
+	const NONCE = "b8".repeat(32);
+
+	function bootBilling() {
+		const bus = loadPluginUiWithBus();
+		bus.dispatch(bus.parent, {
+			kind: "init", bridge: "admin", protocolVersion: "1.0.0", nonce: NONCE,
+			adminPermissions: ["admin:overview:read", "admin:billing:read"],
+		});
+		bus.client!.showPage("billing");
+		return bus;
+	}
+
+	function requestsOf(bus: ReturnType<typeof loadPluginUiWithBus>, method: string) {
+		return bus.parentPosted.filter(
+			(p) => p.env.kind === "request" && p.env.method === method);
+	}
+
+	function reply(bus: ReturnType<typeof loadPluginUiWithBus>, req: { env: Record<string, unknown> },
+		result: unknown) {
+		bus.dispatch(bus.parent, {
+			kind: "response", bridge: "admin", nonce: NONCE,
+			requestId: req.env.requestId, ok: true, result,
+		});
+	}
+
+	const TASK_VIEW_BODY = {
+		view: "task", sort: "activity_desc",
+		items: [
+			{ request_id: "req_A", subject_type: "user", subject_id: "usr_a",
+			  task_key: "req_A", unattributed: false, user_id: "usr_a",
+			  identity: "a@x.com", identity_source: "email",
+			  started_at: 1792400000, last_at: 1792400000,
+			  call_count: 2, unpriced_call_count: 0,
+			  provider_cost_nano_cny: "0", charge_nano_cny: "1",
+			  session_id: "sess_A", status: "unknown", status_source: null },
+			{ request_id: "req_B", subject_type: "user", subject_id: "usr_b",
+			  task_key: "req_B", unattributed: false, user_id: "usr_b",
+			  identity: "b@x.com", identity_source: "email",
+			  started_at: 1792400100, last_at: 1792400100,
+			  call_count: 1, unpriced_call_count: 0,
+			  provider_cost_nano_cny: "0", charge_nano_cny: "2",
+			  session_id: "sess_B", status: "unknown", status_source: null },
+		],
+		totals: { task_count: 2, call_count: 3, priced_call_count: 3,
+			unpriced_call_count: 0, void_excluded_count: 0,
+			provider_cost_nano_cny: "0", charge_nano_cny: "3",
+			unpriced_amount: "unknown", ledger_included: false },
+		next_cursor: null, limit: 50,
+		range: { since: 1791800000, until: 1792403600,
+			timezone: "Asia/Shanghai", default_applied: false },
+		identity_search_truncated: false, identity_search: null,
+	};
+
+	const BUDGET = {
+		budget: { spent_nano_cny: "1", reserved_nano_cny: "7000000",
+			open_holds_count: 1, reserved_scope: "session",
+			reserved_scope_note: "预占按会话统计",
+			unpriced_call_count: 0, per_task_cap_nano_cny: null,
+			per_task_cap_configured: false,
+			note: "未设置单次上限，按账户剩余额度控制",
+			ledger_included: false },
+		account: { limit_type: "user_total_allowance",
+			limit_type_label: "注册用户一次性总额度",
+			remaining_nano_cny: "46000000000", error: null },
+		status: "unknown", status_source: null, status_detail: null,
+		in_range: { charge_nano_cny: "1" },
+		outside_range: { charge_nano_cny: "0" },
+		lifetime: { charge_nano_cny: "1" },
+	};
+
+	/** 切到「按任务」视图并回复任务列表（默认视图是 hour）。 */
+	async function openTaskView(bus: ReturnType<typeof loadPluginUiWithBus>) {
+		await ticks(4);
+		bus.els["adm-usage-view"].value = "task";
+		bus.els["adm-usage-view"]._fire("change", {});
+		await ticks(2);
+		reply(bus, requestsOf(bus, "admin.billing.usage.summary").at(-1)!,
+			TASK_VIEW_BODY);
+		await ticks(4);
+	}
+
+	it("预算请求同时带 request_id 与 session_id（P2-1 前端侧）", async () => {
+		const bus = bootBilling();
+		await openTaskView(bus);
+		const panelBtn = bus.created.find((e) => e.tagName === "BUTTON" &&
+			e.textContent === "预算与原始调用");
+		expect(panelBtn).toBeTruthy();
+		panelBtn!._fire("click", {});
+		await ticks(2);
+		const budgetReq = requestsOf(bus, "admin.billing.taskBudget.get").at(-1)!;
+		const payload = budgetReq.env.payload as Record<string, unknown>;
+		expect(payload.request_id).toBe("req_A");
+		expect(payload.session_id).toBe("sess_A");
+	}, 10000);
+
+	it("同时展开两个任务面板互不作废（P2-4）：两个都渲染预算，A 不停在读取中", async () => {
+		const bus = bootBilling();
+		await openTaskView(bus);
+		const panelBtns = bus.created.filter((e) => e.tagName === "BUTTON" &&
+			e.textContent === "预算与原始调用");
+		expect(panelBtns.length).toBe(2);
+		panelBtns[0]._fire("click", {});
+		await ticks(2);
+		panelBtns[1]._fire("click", {});
+		await ticks(2);
+		const budgetReqs = requestsOf(bus, "admin.billing.taskBudget.get");
+		expect(budgetReqs.length).toBe(2);
+		// 逆序回复：先回 B，再回 A——A 的在途请求不得被 B 作废
+		reply(bus, budgetReqs[1], BUDGET);
+		await ticks(2);
+		reply(bus, budgetReqs[0], BUDGET);
+		await ticks(3);
+		// 两个面板的原始调用也回复（避免主线程挂起）
+		for (const req of requestsOf(bus, "admin.billing.usage.list")) {
+			reply(bus, req, { items: [], next_cursor: null });
+		}
+		await ticks(3);
+		const text = bus.els["adm-usage-tbody"].textContent;
+		expect(text.match(/本任务已用（全量）/g)?.length).toBe(2);
+		expect(text).not.toContain("读取任务预算与原始调用…");
+	}, 10000);
+
+	it("原始调用第 2 页保留模型/状态筛选（P2-5）", async () => {
+		const bus = bootBilling();
+		await openTaskView(bus);
+		// 设置筛选（模型 + 状态）并提交——第一页原始调用会按同一口径请求
+		bus.els["adm-usage-model"].value = "wanted-model";
+		bus.els["adm-usage-status-filter"].value = "unpriced";
+		bus.els["adm-usage-search-btn"]._fire("click", {});
+		await ticks(2);
+		reply(bus, requestsOf(bus, "admin.billing.usage.summary").at(-1)!, TASK_VIEW_BODY);
+		await ticks(4);
+		const panelBtn = bus.created.find((e) => e.tagName === "BUTTON" &&
+			e.textContent === "预算与原始调用");
+		expect(panelBtn).toBeTruthy();
+		panelBtn!._fire("click", {});
+		await ticks(2);
+		const firstRaw = requestsOf(bus, "admin.billing.usage.list").at(-1)!;
+		expect((firstRaw.env.payload as Record<string, unknown>).model)
+			.toBe("wanted-model");
+		expect((firstRaw.env.payload as Record<string, unknown>).status)
+			.toBe("unpriced");
+		reply(bus, firstRaw, { items: [{ request_id: "req_A",
+			session_id: "sess_A", event_id: "use_x", occurred_at: 1792400000,
+			model: "wanted-model", status: "unpriced",
+			charge_nano_cny: null }], next_cursor: "next-page" });
+		await ticks(3);
+		const moreBtn = bus.created.find((e) => e.tagName === "BUTTON" &&
+			e.textContent === "加载更多原始调用");
+		expect(moreBtn).toBeTruthy();
+		moreBtn!._fire("click", {});
+		await ticks(2);
+		const secondRaw = requestsOf(bus, "admin.billing.usage.list").at(-1)!;
+		const payload = secondRaw.env.payload as Record<string, unknown>;
+		expect(payload.cursor).toBe("next-page");
+		expect(payload.request_id).toBe("req_A");
+		expect(payload.model).toBe("wanted-model");   // 第 2 页不丢模型筛选
+		expect(payload.status).toBe("unpriced");      // 第 2 页不丢状态筛选
+	}, 10000);
+});

@@ -3424,6 +3424,13 @@ def admin_usage_task_page(*, since, until, user_ids=None, model=None,
     #     不上用户过滤时可见、一旦按身份过滤即排除；
     #   - 时间窗与原实现一致（binding.created_at / demo accepted_at /
     #     reservation reserved_at）。
+    #
+    # 2026-10-21（review P2）：生命周期行不再硬编码 user_id=NULL——身份投影
+    # （app._admin_v1_attach_identity）只认 user_id，NULL 会让**已知账号**的
+    # 无用量任务显示成「未知身份」。映射规则与 usage 事件写入路径一致
+    # （§7.5 步骤 3）：owner/user 主体只有在 users 表能查到对应行时才写
+    # user_id，缺行保持 NULL（不伪造）；demo 主体恒 NULL（身份由
+    # subject_type='demo' 投影为 Demo，绝不映射登录用户）。
     include_lifecycle = model is None and status is None
     lifecycle_cte = ""
     lifecycle_params = []
@@ -3442,7 +3449,8 @@ def admin_usage_task_page(*, since, until, user_ids=None, model=None,
             "lifecycle AS ("
             "  SELECT b.subject_type, b.subject_id, b.request_id AS task_key, "
             "         b.request_id AS request_id, false AS unattributed, "
-            "         NULL::text AS user_id, "
+            "         (SELECT u.user_id FROM users u "
+            "           WHERE u.user_id = b.subject_id) AS user_id, "
             "         extract(epoch FROM b.created_at)::float8 AS started_at, "
             "         extract(epoch FROM b.created_at)::float8 AS last_at, "
             "         0 AS call_count, 0 AS unpriced_call_count, "
@@ -3473,7 +3481,10 @@ def admin_usage_task_page(*, since, until, user_ids=None, model=None,
             "    AND " + (not_exists % "d.request_id") + demo_cond + " "
             "  UNION ALL "
             "  SELECT v.subject_type, v.subject_id, v.request_id, "
-            "         v.request_id, false, NULL::text, "
+            "         v.request_id, false, "
+            "         CASE WHEN v.subject_type IN ('owner', 'user') THEN "
+            "           (SELECT u.user_id FROM users u "
+            "             WHERE u.user_id = v.subject_id) END, "
             "         extract(epoch FROM v.reserved_at)::float8, "
             "         extract(epoch FROM COALESCE(v.updated_at, v.reserved_at))"
             "           ::float8, "
@@ -3617,9 +3628,13 @@ def admin_task_detail(*, request_id=None, subject_type, subject_id,
     ``billing_holds`` 的 open 行估算合计，与「已用」分列，不加进已消费。
 
     ``unattributed``（request_id 为空的历史行）按主体 + 会话定位。
-    ``session_id`` 可省略：省略时从 usage 事件 / ai_run_bindings 解析该任务
-    的权威会话，再统计该会话的 open holds（review P2-1：request_id-only
-    调用同样返回真实待结算预占）。
+    ``session_id`` 可省略：省略时按 §7.2 的权威顺序从 usage 事件 /
+    ai_run_bindings / demo_runs（demo 主体，request_id + capability_id 双匹配）
+    / ai_budget_reservations（pre-F 历史回退）解析该任务的权威会话，再统计该
+    会话的 open holds（review P2-1/P2-2：request_id-only 调用同样返回真实
+    待结算预占）。
+    ``user_id``：usage 事件镜像不存在时（无用量生命周期任务），owner/user
+    主体按 users 表解析（与 usage 写入路径同一规则；demo 恒不映射）。
     单次任务上限（step A）：``per_task_cap_nano_cny`` 恒 None、说明
     「未设置单次上限，按账户剩余额度控制」——账户额度投影由 app 层装配。
     """
@@ -3687,22 +3702,40 @@ def admin_task_detail(*, request_id=None, subject_type, subject_id,
                             "in_range_provider_cost_nano_cny"):
                     if row.get(key) is not None:
                         row[key] = int(row[key])
-                # 2026-10-21（review P2-1）：待结算预占按会话统计，但调用方
-                # 只传 request_id 时也必须能定位——先用入参 session_id，否则
-                # 从权威来源解析该任务的会话：usage 事件的 session_id（同一
-                # request_id 的历史事件）与 ai_run_bindings（无 usage 的全新
-                # 任务，绑定行才是会话来源）。绝不按「最后一条 usage 时间」
-                # 猜测，也不依赖前端一定传 session_id。
+                # 2026-10-21（review P2）：无 usage 的生命周期任务（0 调用）
+                # 没有事件镜像 user_id；owner/user 主体按与 usage 写入路径
+                # 相同的规则从 users 表解析（subject_id 即 user_id，查不到
+                # 保持 NULL，不伪造）。demo 永不映射登录用户。
+                if row.get("user_id") is None and str(subject_type) in (
+                        "owner", "user"):
+                    cur.execute(
+                        "SELECT user_id FROM users WHERE user_id=%s",
+                        (str(subject_id),))
+                    urow = cur.fetchone()
+                    if urow is not None:
+                        row["user_id"] = urow["user_id"]
+                # 2026-10-21（review P2-1/P2-2）：待结算预占按会话统计，但
+                # 调用方只传 request_id 时也必须能定位——先用入参 session_id，
+                # 否则按 §7.2 的权威顺序解析该任务的会话：
+                #   ① 该 request_id 的 usage 事件（同一任务的历史会话）；
+                #   ② ai_run_bindings（金额时代 run 绑定，主体必须一致）；
+                #   ③ demo_runs（demo 主体的权威绑定：request_id 与
+                #      capability_id 双匹配，其他主体绝不借用 demo 会话）；
+                #   ④ ai_budget_reservations（pre-F 历史回退，主体必须一致；
+                #      session 只在 consume 后写入，released 行结构上为 NULL）。
+                # 绝不按「最后一条 usage 时间」猜测，也不依赖前端一定传
+                # session_id。
                 sessions = []
                 if session_id:
                     sessions = [str(session_id)]
                 elif request_id:
+                    rid, st, sid = (str(request_id), str(subject_type),
+                                    str(subject_id))
                     cur.execute(
                         "SELECT DISTINCT session_id FROM ai_usage_events "
                         "WHERE request_id = %s AND subject_type = %s "
                         "  AND subject_id = %s AND session_id IS NOT NULL",
-                        (str(request_id), str(subject_type),
-                         str(subject_id)))
+                        (rid, st, sid))
                     sessions.extend(str(r["session_id"]) for r in
                                     cur.fetchall() if r["session_id"])
                     cur.execute(
@@ -3711,8 +3744,27 @@ def admin_task_detail(*, request_id=None, subject_type, subject_id,
                         "WHERE request_id = %s AND subject_type = %s "
                         "  AND subject_id = %s "
                         "  AND histopilot_session_id IS NOT NULL",
-                        (str(request_id), str(subject_type),
-                         str(subject_id)))
+                        (rid, st, sid))
+                    sessions.extend(str(r["session_id"]) for r in
+                                    cur.fetchall() if r["session_id"])
+                    if st == "demo":
+                        # demo 绑定永不入 ai_run_bindings（0027 CHECK），
+                        # 权威来源是 demo_runs：capability_id 即 demo 主体 id。
+                        cur.execute(
+                            "SELECT histopilot_session_id AS session_id "
+                            "FROM demo_runs "
+                            "WHERE request_id = %s AND capability_id = %s "
+                            "  AND histopilot_session_id IS NOT NULL",
+                            (rid, sid))
+                        sessions.extend(str(r["session_id"]) for r in
+                                        cur.fetchall() if r["session_id"])
+                    cur.execute(
+                        "SELECT histopilot_session_id AS session_id "
+                        "FROM ai_budget_reservations "
+                        "WHERE request_id = %s AND subject_type = %s "
+                        "  AND subject_id = %s "
+                        "  AND histopilot_session_id IS NOT NULL",
+                        (rid, st, sid))
                     sessions.extend(str(r["session_id"]) for r in
                                     cur.fetchall() if r["session_id"])
                     sessions = sorted(set(sessions))

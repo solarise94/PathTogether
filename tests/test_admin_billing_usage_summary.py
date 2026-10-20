@@ -911,3 +911,245 @@ def test_range_default_is_last_seven_shanghai_days():
     r = c.get("/api/admin/v1/billing/usage-summary?since=0&until=%r"
               % (datetime.now(timezone.utc).timestamp() + 1))
     assert r.status_code == 400
+
+
+# --------------------------------------------------------------------------- #
+# 9. 2026-10-21 release review（P2-1/2/3）回归
+#
+# 复核证据：/mnt/ssd2/tests/review-20261021-tdkkpN（repro.py）。三个场景按
+# **正确行为**断言，原复现输出作为对照：
+#   before → nonmatching_email_items / nonmatching_model_status_items 仍返回
+#            owner 的 lifecycle-only 任务；summary_status=(None,None)；
+#            request_id-only 的 budget_ui_payload 预占 = 0
+#   after  → 过滤后为空；status=accepted/ai_run_bindings；request_id-only
+#            预占 = 7000000（从 usage 事件 / run bindings 解析会话）
+# --------------------------------------------------------------------------- #
+def _open_hold(session_id, subject_type, subject_id, nano=7_000_000):
+    conn = bh.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO billing_holds (hold_id, call_id, subject_type, "
+                " subject_id, installation_id, session_id, model, "
+                " estimated_nano_cny, status, expires_at, reserved_nano_cny) "
+                "VALUES (%s, %s, %s, %s, 'inst_test', %s, 'deepseek-flash', "
+                " %s, 'open', now() + interval '30 min', %s)",
+                ("hold_" + uuid.uuid4().hex[:12], "call_" + uuid.uuid4().hex,
+                 subject_type, subject_id, session_id, nano, nano))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_lifecycle_only_task_respects_identity_model_status_filters():
+    """P2-2：无使用量的进行中任务同样受 email/user/model/status 筛选约束。
+
+    lifecycle-only 任务没有模型、没有计价状态：``model`` / ``status`` 一旦
+    设置必须整体排除；身份筛选（邮箱→user_id）必须命中主体；demo 主体没有
+    邮箱，按身份过滤时同样排除。totals 与列表同口径（含/不含都一致）。
+    """
+    c, owner = _owner_client()
+    _set_email(owner["user_id"], "owner-review@example.invalid")
+    rid = "req_lifecycle_filter"
+    import budget_store
+    budget_store.ensure_run_binding_pending(rid, "owner", owner["user_id"])
+    since, until = _range()
+    # 无筛选：可见（默认视图，0 调用 0 金额）
+    body = _summary(c, **_range_qs(since, until, {"view": "task"}))
+    assert [it["request_id"] for it in body["items"]] == [rid]
+    assert body["totals"]["task_count"] == 1
+    assert body["items"][0]["call_count"] == 0
+    # 不匹配的邮箱：不可见，totals 同步为 0（原复现 bug：仍返回该任务）
+    body = _summary(c, **_range_qs(
+        since, until, {"view": "task",
+                       "email": "nobody-matches-this@example.invalid"}))
+    assert body["items"] == []
+    assert body["totals"]["task_count"] == 0
+    # 匹配的邮箱：可见（身份过滤同样作用于 lifecycle 行）
+    body = _summary(c, **_range_qs(
+        since, until, {"view": "task",
+                       "email": "owner-review@example.invalid"}))
+    assert [it["request_id"] for it in body["items"]] == [rid]
+    assert body["totals"]["task_count"] == 1
+    # 模型筛选：生命周期行没有模型 → 一律排除
+    body = _summary(c, **_range_qs(
+        since, until, {"view": "task", "model": "nonexistent-model"}))
+    assert body["items"] == []
+    assert body["totals"]["task_count"] == 0
+    # 状态筛选（priced/unpriced 都排除）：生命周期行没有计价状态
+    for status in ("unpriced", "priced"):
+        body = _summary(c, **_range_qs(
+            since, until, {"view": "task", "status": status}))
+        assert body["items"] == [], status
+        assert body["totals"]["task_count"] == 0
+    # demo 主体无邮箱：按身份过滤时排除（不匹配任何人）
+    conn = bh.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO demo_sessions (id, token_hash, created_at, "
+                " expires_at) VALUES ('cap_filter', 'tok_filter', now(), "
+                " now() + interval '1 day') ON CONFLICT (id) DO NOTHING")
+            cur.execute(
+                "INSERT INTO demo_runs (demo_run_id, capability_id, request_id,"
+                " state, histopilot_session_id, accepted_at, expires_at) "
+                "VALUES ('dmr_filter', 'cap_filter', 'req_demo_filter', "
+                " 'accepted', 'sess_demo_filter', now(), "
+                " now() + interval '1 hour')")
+        conn.commit()
+    finally:
+        conn.close()
+    body = _summary(c, **_range_qs(since, until, {"view": "task"}))
+    assert "req_demo_filter" in [it["request_id"] for it in body["items"]]
+    body = _summary(c, **_range_qs(
+        since, until, {"view": "task",
+                       "email": "owner-review@example.invalid"}))
+    assert "req_demo_filter" not in [it["request_id"] for it in body["items"]]
+
+
+def test_lifecycle_only_totals_match_list_with_usage_task():
+    """P2-2：totals.task_count 与列表同口径（usage 任务 + lifecycle-only）。"""
+    c, owner = _owner_client()
+    _seed_price_books()
+    since, until = _range()
+    import budget_store
+    budget_store.ensure_run_binding_pending(
+        "req_inflight_totals", "owner", owner["user_id"])
+    _insert_event(subject_type="owner", subject_id=owner["user_id"],
+                  user_id=owner["user_id"], request_id="req_usage_totals",
+                  session_id=_next_session(),
+                  occurred_at=datetime.now(timezone.utc) - timedelta(hours=1),
+                  charge_nano=1_000_000_000)
+    body = _summary(c, **_range_qs(since, until, {"view": "task"}))
+    rids = sorted(it["request_id"] for it in body["items"])
+    assert rids == ["req_inflight_totals", "req_usage_totals"]
+    assert body["totals"]["task_count"] == len(rids) == 2
+    # 过滤后列表与 totals 仍一致（usage 任务被模型筛选保留）
+    body = _summary(c, **_range_qs(
+        since, until, {"view": "task", "model": "deepseek-flash"}))
+    assert [it["request_id"] for it in body["items"]] == ["req_usage_totals"]
+    assert body["totals"]["task_count"] == 1
+
+
+def test_task_detail_resolves_session_from_request_id_for_reserved():
+    """P2-1（后端侧）：request_id-only 调用也能返回真实待结算预占。
+
+    会话来源：① 该 request_id 的 usage 事件；② ai_run_bindings（无 usage 的
+    全新任务）。前端 UI 现在 request_id + session_id 都传，但后端不得依赖它。
+    """
+    c, owner = _owner_client()
+    _seed_price_books()
+    since, until = _range()
+    # ① 有 usage：事件会话 sess_usage
+    rid = "req_session_usage"
+    _insert_event(subject_type="owner", subject_id=owner["user_id"],
+                  user_id=owner["user_id"], request_id=rid,
+                  session_id="sess_usage",
+                  occurred_at=datetime.now(timezone.utc) - timedelta(hours=1),
+                  charge_nano=1_000_000_000)
+    _open_hold("sess_usage", "owner", owner["user_id"])
+    detail = c.get("/api/admin/v1/billing/task-detail?request_id=%s"
+                   "&subject_type=owner&subject_id=%s&since=%r&until=%r"
+                   % (rid, owner["user_id"], since.timestamp(),
+                      until.timestamp())).get_json()
+    assert detail["budget"]["reserved_nano_cny"] == "7000000"
+    assert detail["budget"]["reserved_scope"] == "session"
+    assert detail["budget"]["open_holds_count"] == 1
+    assert detail["session_id"] == "sess_usage"
+    # ② 无 usage 的全新任务：会话来自 ai_run_bindings
+    import budget_store
+    rid2 = "req_session_binding"
+    budget_store.ensure_run_binding_pending(rid2, "owner", owner["user_id"])
+    budget_store.attach_run_binding_session(
+        rid2, "sess_binding", "owner", owner["user_id"])
+    _open_hold("sess_binding", "owner", owner["user_id"], nano=3_000_000)
+    detail = c.get("/api/admin/v1/billing/task-detail?request_id=%s"
+                   "&subject_type=owner&subject_id=%s"
+                   % (rid2, owner["user_id"])).get_json()
+    assert detail["lifetime"]["call_count"] == 0
+    assert detail["budget"]["reserved_nano_cny"] == "3000000"
+    assert detail["session_id"] == "sess_binding"
+    # UI 形态（request_id + session_id 都传）结果一致
+    detail_both = c.get("/api/admin/v1/billing/task-detail?request_id=%s"
+                        "&subject_type=owner&subject_id=%s&session_id=%s"
+                        % (rid2, owner["user_id"], "sess_binding")).get_json()
+    assert detail_both["budget"]["reserved_nano_cny"] == "3000000"
+    # 其它主体的 open hold 不得混入（主体隔离）
+    _open_hold("sess_binding", "owner", "usr_other_principal", nano=9_000_000)
+    detail = c.get("/api/admin/v1/billing/task-detail?request_id=%s"
+                   "&subject_type=owner&subject_id=%s"
+                   % (rid2, owner["user_id"])).get_json()
+    assert detail["budget"]["reserved_nano_cny"] == "3000000"
+
+
+def test_summary_attaches_authoritative_lifecycle_status_both_views():
+    """P2-3：小时视图内联任务行与「按任务」行都带权威状态（批投影）。
+
+    与 task-detail 的状态一致；无来源 → unknown；demo finished → finished。
+    """
+    c, owner = _owner_client()
+    _seed_price_books()
+    import budget_store
+    since, until = _range()
+    occurred = datetime.now(timezone.utc) - timedelta(hours=1)
+    # accepted（pending_session）：只有 binding + usage
+    rid_pending = "req_status_pending"
+    budget_store.ensure_run_binding_pending(
+        rid_pending, "owner", owner["user_id"])
+    _insert_event(subject_type="owner", subject_id=owner["user_id"],
+                  user_id=owner["user_id"], request_id=rid_pending,
+                  session_id="sess_status_pending", occurred_at=occurred,
+                  charge_nano=1_000_000_000)
+    # unknown：只有 usage，无任何生命周期来源
+    rid_unknown = "req_status_unknown"
+    _insert_event(subject_type="owner", subject_id=owner["user_id"],
+                  user_id=owner["user_id"], request_id=rid_unknown,
+                  session_id=_next_session(), occurred_at=occurred,
+                  charge_nano=1_000_000_000)
+    # finished（demo_runs）
+    conn = bh.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO demo_sessions (id, token_hash, created_at, "
+                " expires_at) VALUES ('cap_status', 'tok_status', now(), "
+                " now() + interval '1 day') ON CONFLICT (id) DO NOTHING")
+            cur.execute(
+                "INSERT INTO demo_runs (demo_run_id, capability_id, request_id,"
+                " state, histopilot_session_id, accepted_at, expires_at, "
+                " finished_at, updated_at) "
+                "VALUES ('dmr_status', 'cap_status', 'req_status_demo', "
+                " 'finished', 'sess_status_demo', now(), now() + interval "
+                " '1 hour', now(), now())")
+        conn.commit()
+    finally:
+        conn.close()
+    _insert_event(subject_type="demo", subject_id="cap_status", user_id=None,
+                  request_id="req_status_demo", session_id="sess_status_demo",
+                  occurred_at=occurred, charge_nano=1_000_000_000)
+    # 任务视图：每行都带 status/status_source/status_detail
+    body = _summary(c, **_range_qs(since, until, {"view": "task"}))
+    by_rid = {it["request_id"]: it for it in body["items"]}
+    assert by_rid[rid_pending]["status"] == "accepted"
+    assert by_rid[rid_pending]["status_source"] == "ai_run_bindings"
+    assert by_rid[rid_pending]["status_detail"] == "pending_session"
+    assert by_rid[rid_unknown]["status"] == "unknown"
+    assert by_rid[rid_unknown]["status_source"] is None
+    assert by_rid["req_status_demo"]["status"] == "finished"
+    assert by_rid["req_status_demo"]["status_source"] == "demo_runs"
+    # 小时视图的内联任务行同样带状态（同一批投影，不是 N+1）
+    hour_body = _summary(c, **_range_qs(since, until, {"view": "hour"}))
+    nested = {}
+    for hour_item in hour_body["items"]:
+        for task in hour_item.get("tasks") or []:
+            nested[task["request_id"]] = task
+    assert nested[rid_pending]["status"] == "accepted"
+    assert nested[rid_pending]["status_detail"] == "pending_session"
+    assert nested[rid_unknown]["status"] == "unknown"
+    assert nested["req_status_demo"]["status"] == "finished"
+    # 与 task-detail 一致（单一权威来源，不出现两套结论）
+    detail = c.get("/api/admin/v1/billing/task-detail?request_id=%s"
+                   "&subject_type=owner&subject_id=%s"
+                   % (rid_pending, owner["user_id"])).get_json()
+    assert detail["status"] == by_rid[rid_pending]["status"]
+    assert detail["status_source"] == by_rid[rid_pending]["status_source"]

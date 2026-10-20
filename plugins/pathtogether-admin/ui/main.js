@@ -2858,6 +2858,7 @@
     billTabSeq++;
     // 切标签同样作废在途聚合响应（聚合视图代际与标签代际同进）
     billUsageSeq++;
+    invalidateUsagePanels();
     var seq = billTabSeq;
     BILL_TABS.forEach(function (t) {
       var btn = $("adm-tab-" + t);
@@ -2949,6 +2950,7 @@
   function applyUsageFilters() {
     readUsageFilters();
     billUsageSeq++;
+    invalidateUsagePanels(); // 列表代际变化：旧面板的在途响应一律作废
     state.cursors.usage = null;
     var tbody = $("adm-usage-tbody");
     if (tbody) tbody.textContent = "";
@@ -3117,13 +3119,15 @@
 
   // 折叠子行通用实现（全宽子行；再点一次收起）。显式接收 tbody——不依赖
   // parentNode（宿主与测试替身都不保证父子指针）。
-  function toggleSubRow(tbody, tr, className, btn, idleLabel, buildContent) {
+  function toggleSubRow(tbody, tr, className, btn, idleLabel, buildContent,
+                        onClose) {
     if (!tbody) return;
     var next = tr.nextSibling;
     if (next && next.className &&
         String(next.className).indexOf(className) !== -1) {
       if (tbody.removeChild) tbody.removeChild(next);
       if (btn) btn.textContent = idleLabel;
+      if (typeof onClose === "function") onClose();
       return;
     }
     if (btn) btn.textContent = "收起";
@@ -3230,23 +3234,56 @@
 
   // 任务行展开：预算投影（step A）+ 原始模型调用（旧明细接口按 request_id
   // 过滤；历史未归属行按 session_id）
+  //
+  // 2026-10-21（review P2-4）：每个面板独立有效性令牌——展开任务 B 不得
+  // 作废任务 A 的在途请求（共用计数器会让 A 永远停在「读取中」）。令牌只在
+  // 本面板收起/重开、或列表代际变化（筛选/切标签/切页）时失效。
+  var billUsagePanels = [];
+
+  function newUsagePanel() {
+    var panel = { alive: true };
+    billUsagePanels.push(panel);
+    return panel;
+  }
+
+  function invalidateUsagePanels() {
+    billUsagePanels.forEach(function (p) { p.alive = false; });
+    billUsagePanels = [];
+  }
+
+  function panelAlive(panel) {
+    return !panel || panel.alive !== false;
+  }
+
   function toggleTaskPanel(tbody, tr, task) {
     toggleSubRow(tbody, tr, "adm-task-panel", null, "", function () {
+      // 令牌随本次「打开」创建并挂在行上：收起时精确作废本面板（而不是
+      // 误伤别的面板，也不会把刚创建的新令牌当成旧面板）。
+      var panel = newUsagePanel();
+      tr.__usagePanel = panel;
       var box = document.createElement("div");
       box.className = "adm-task-panel-box";
       box.textContent = "读取任务预算与原始调用…";
-      var token = ++billUsagePanelSeq;
-      loadTaskBudget(box, task, token);
-      loadTaskRawCalls(box, task, token);
+      // 首个内容到达后清掉加载提示（不把「读取中…」永久挂在面板顶部）
+      box.__loading = true;
+      loadTaskBudget(box, task, panel);
+      loadTaskRawCalls(box, task, panel);
       return box;
+    }, function () {
+      if (tr.__usagePanel) {
+        tr.__usagePanel.alive = false;
+        tr.__usagePanel = null;
+      }
     });
   }
 
-  var billUsagePanelSeq = 0;
-
   // 预算投影（step A：本任务已用 / 待结算预占 / 账户剩余额度及其类型；
   // 无单次上限时明确说明——不伪造任务专属人民币预算）
-  function loadTaskBudget(box, task, token) {
+  //
+  // 2026-10-21（review P2-1）：request_id 与 session_id **都传**（有哪个传
+  // 哪个）。后端对 request_id-only 调用也会自行从 usage 事件 / run bindings
+  // 解析权威会话，因此预占不会因为前端没带 session_id 而显示 0。
+  function loadTaskBudget(box, task, panel) {
     var payload = {
       subject_type: task.subject_type,
       subject_id: task.subject_id,
@@ -3254,14 +3291,14 @@
       until: usageRangeParams().until,
     };
     if (task.request_id) payload.request_id = task.request_id;
-    else if (task.session_id) payload.session_id = task.session_id;
-    else return;
+    if (task.session_id) payload.session_id = task.session_id;
+    if (!payload.request_id && !payload.session_id) return;
     request("admin.billing.taskBudget.get", payload).then(function (res) {
-      if (token !== billUsagePanelSeq) return;
+      if (!panelAlive(panel)) return;
       if (!res || !res.budget) return;
       renderTaskBudget(box, task, res);
     }).catch(function (err) {
-      if (token !== billUsagePanelSeq) return;
+      if (!panelAlive(panel)) return;
       var p = document.createElement("p");
       p.className = "adm-note";
       p.textContent = "预算投影读取失败：" + errText(err);
@@ -3269,7 +3306,15 @@
     });
   }
 
+  function clearPanelLoading(box) {
+    if (box && box.__loading) {
+      box.textContent = "";
+      box.__loading = false;
+    }
+  }
+
   function renderTaskBudget(box, task, res) {
+    clearPanelLoading(box);
     var budget = res.budget || {};
     var account = res.account || {};
     var dl = document.createElement("dl");
@@ -3321,7 +3366,7 @@
 
   // 原始模型调用（旧明细接口保留兼容）：按 request_id（历史行按 session_id）
   // 过滤，展开到任务行下方——聚合视图不再刷屏，明细按需加载
-  function loadTaskRawCalls(box, task, token) {
+  function loadTaskRawCalls(box, task, panel) {
     var payload = { limit: 50 };
     if (task.request_id) payload.request_id = task.request_id;
     else if (task.session_id) payload.session_id = task.session_id;
@@ -3333,10 +3378,11 @@
     }
     if (!payload.request_id && !payload.session_id) return;
     request("admin.billing.usage.list", payload).then(function (res) {
-      if (token !== billUsagePanelSeq) return;
-      renderRawCalls(box, res || {});
+      if (!panelAlive(panel)) return;
+      // 第一页的完整筛选作为后续分页的基底（review P2-5）
+      renderRawCalls(box, res || {}, payload, panel);
     }).catch(function (err) {
-      if (token !== billUsagePanelSeq) return;
+      if (!panelAlive(panel)) return;
       var p = document.createElement("p");
       p.className = "adm-note";
       p.textContent = "原始调用读取失败：" + errText(err);
@@ -3344,7 +3390,8 @@
     });
   }
 
-  function renderRawCalls(box, res) {
+  function renderRawCalls(box, res, basePayload, panel) {
+    clearPanelLoading(box);
     var items = res.items || [];
     var head = document.createElement("p");
     head.className = "adm-note";
@@ -3406,10 +3453,11 @@
     if (res.next_cursor) {
       var more = actionBtn("加载更多原始调用", function () {
         more.disabled = true;
-        request("admin.billing.usage.list", rawCallsNextPayload(res))
+        request("admin.billing.usage.list", rawCallsNextPayload(res, basePayload))
           .then(function (next) {
             more.disabled = false;
-            renderRawCalls(box, next || {});
+            if (!panelAlive(panel)) return;
+            renderRawCalls(box, next || {}, basePayload, panel);
           }).catch(function (err) {
             more.disabled = false;
             more.textContent = "加载失败：" + errText(err);
@@ -3419,9 +3467,26 @@
     }
   }
 
-  function rawCallsNextPayload(res) {
-    var payload = { limit: 50, cursor: res.next_cursor };
-    if (res.items && res.items.length) {
+  // 2026-10-21（review P2-5）：后续页保留第一页的完整筛选（模型/状态等），
+  // 只替换游标——只带 cursor + 任务定位会让第 2 页悄悄丢掉筛选口径。
+  function rawCallsNextPayload(res, basePayload) {
+    var base = basePayload;
+    if (!base) {
+      // 防御性兜底（旧调用点/复现脚本）：没有显式基底时按当前筛选重建，
+      // 仍然保留模型/状态——绝不只带 cursor + 任务定位。
+      base = { limit: 50 };
+      var f = state.filters.usage || {};
+      if (f.model) base.model = f.model;
+      if (f.status) base.status = f.status;
+    }
+    var payload = {};
+    Object.keys(base).forEach(function (k) {
+      payload[k] = base[k];
+    });
+    payload.limit = base.limit || 50;
+    payload.cursor = res.next_cursor;
+    if (!payload.request_id && !payload.session_id &&
+        res.items && res.items.length) {
       var first = res.items[0];
       if (first.request_id) payload.request_id = first.request_id;
       else if (first.session_id) payload.session_id = first.session_id;
@@ -4807,6 +4872,7 @@
     state.listSeq++; // 作废在途列表响应（§8.2：晚到响应不写回新页面）
     billTabSeq++;    // 作废在途费用明细响应（跨页迟到不写回）
     billUsageSeq++;  // 作废在途费用聚合响应（跨页迟到不写回）
+    invalidateUsagePanels(); // 跨页：旧展开面板的响应不再写回
     closeUserDrawer();
     if (els.pageTitle) els.pageTitle.textContent = PAGE_TITLES[name] || name;
     // 手机端：切页后收起导航抽屉

@@ -9154,6 +9154,37 @@ def _admin_v1_attach_identity(items, *, id_key="user_id",
     return items
 
 
+def _admin_v1_attach_task_status(items):
+    """批投影任务行的权威生命周期状态（review P2-3；单条查询，无 N+1）。
+
+    只认权威来源（demo_runs / ai_budget_reservations / ai_run_bindings）；
+    没有任何来源 → ``status='unknown'``（UI「状态未知」），绝不用最后一条
+    usage 的时间猜「进行中/已结束」。小时视图的内联任务行与「按任务」视图
+    行必须走同一入口，保证与 task-detail 的状态一致。
+    """
+    items = [it for it in (items or []) if isinstance(it, dict)]
+    req_ids = sorted({str(it.get("request_id")) for it in items
+                      if it.get("request_id")})
+    try:
+        states = billing_store.admin_task_lifecycle_states(req_ids)
+    except Exception:
+        app.logger.warning("admin 费用任务状态批投影失败（按状态未知降级）",
+                           exc_info=True)
+        states = {}
+    for item in items:
+        rid = item.get("request_id")
+        state = states.get(str(rid)) if rid else None
+        if state:
+            item["status"] = state["status"]
+            item["status_source"] = state["source"]
+            item["status_detail"] = state["detail"]
+        else:
+            item["status"] = "unknown"
+            item["status_source"] = None
+            item["status_detail"] = None
+    return items
+
+
 def _admin_v1_email_filter_ids():
     """``email`` 查询参数 → (user_ids|None, truncated)。
 
@@ -9965,8 +9996,13 @@ def admin_v1_billing_usage_summary():
         return _admin_v1_error(500, "internal", "费用聚合读取失败")
     items = _admin_v1_attach_identity(page["items"])
     if view == "hour":
+        # 小时行内联任务行：身份 + 权威生命周期状态（同一批投影）
         for item in items:
-            _admin_v1_attach_identity(item.get("tasks") or [])
+            tasks = item.get("tasks") or []
+            _admin_v1_attach_identity(tasks)
+            _admin_v1_attach_task_status(tasks)
+    else:
+        _admin_v1_attach_task_status(items)
     next_cursor = None
     if page["next_cursor"] is not None:
         next_cursor = _admin_v1_encode_cursor({"k": list(page["next_cursor"])})

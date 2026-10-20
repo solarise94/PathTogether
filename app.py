@@ -9289,9 +9289,28 @@ def admin_v1_overview():
         app.logger.exception("admin v1 overview billing 段读取失败")
         return _admin_v1_error(500, "internal", "概览读取失败")
 
+    # 研究段（2026-10-20 §三）：异常删除任务计数（终态 failed 待人工处置）
+    try:
+        research_section = {
+            "available": True,
+            "abnormal_deletion_jobs":
+                research_consent_store.count_abnormal_deletion_jobs(),
+        }
+    except Exception:
+        app.logger.warning("概览读取研究删除任务计数失败（按不可用展示，"
+                           "不渲染成「无异常」）", exc_info=True)
+        research_section = {"available": False,
+                            "abnormal_deletion_jobs": None}
+
     return jsonify(
         users=users_section,
         billing=billing_section,
+        # 2026-10-20（评审 §三）：研究删除不再有独立一级页——概览只在
+        # **有异常删除任务**（重试耗尽的终态 failed，待人工处置）时给计数，
+        # 管理台据此显示「待处理研究数据任务 N」并点入筛选这些用户；
+        # 无异常时 abnormal_deletion_jobs=0（UI 整块隐藏，不显示 0 噪音）。
+        # 读取失败 available=False（前端不显示——绝不把读失败渲染成「无异常」）。
+        research=research_section,
         # 批次 D1（§4.2）：turn_budget 段已移出概览（R3 wave1 起旧
         # /api/admin/v1/turn-budgets 只读兼容端点亦已删除，插件不渲染）
         # G7：V1/ZIP 收口状态机的 committing 积压观测（只含计数与年龄）
@@ -9318,6 +9337,9 @@ def admin_v1_users():
       **分页前**对全量完成排序，user_id 作稳定次键；``last_login_desc`` 下
       ``last_login_at IS NULL`` 恒排末尾（同样按 user_id 稳定）。前端切换
       筛选/排序时清空 cursor（offset 分页在全量排序后切片，语义稳定）。
+    - ``research=abnormal``（2026-10-20 §三）：只保留**有异常删除任务**
+      （重试耗尽的终态 failed，待人工处置）的用户——概览「待处理研究数据
+      任务 N」点入即带此参数；其余取值 400（不做隐式兜底）。
 
     spend 字段（Batch B wave 2，§Batch B API/bridge 契约）：按角色 + target
     返回**互斥**形态原样透传——role=user 且 target=total_allowance →
@@ -9346,6 +9368,12 @@ def admin_v1_users():
         return _admin_v1_error(
             400, "invalid_request",
             "sort 需为 joined_desc / joined_asc / last_login_desc")
+    # 2026-10-20 §三：research=abnormal 只看有异常（终态 failed）删除任务的
+    # 用户；空串/缺键 = 不筛选（未知取值显式 400，不静默忽略）
+    research_f = (request.args.get("research") or "").strip() or None
+    if research_f is not None and research_f != "abnormal":
+        return _admin_v1_error(400, "invalid_request",
+                               "research 需为 abnormal（或缺省）")
 
     users = user_store.list_users()
     if kind != "all":
@@ -9381,6 +9409,18 @@ def admin_v1_users():
         users = [u for u in users if bool(u.get("disabled")) != enabled_f]
     if ai_f is not None:
         users = [u for u in users if bool(u.get("ai_access")) == ai_f]
+    if research_f == "abnormal":
+        # 异常研究删除任务的用户集合（去重）；读取失败 = 显式 503——把读失败
+        # 渲染成「没有待处理用户」会让操作员漏掉真实处置
+        try:
+            abnormal_uids = set(
+                research_consent_store.abnormal_deletion_user_ids())
+        except Exception:
+            app.logger.exception("admin v1 users 研究异常筛选读取失败")
+            return _admin_v1_error(503, "storage_unavailable",
+                                   "存储暂不可用，请稍后重试")
+        users = [u for u in users
+                 if str(u.get("user_id") or "") in abnormal_uids]
 
     page = users[offset:offset + limit + 1]
     has_more = len(page) > limit
@@ -10841,6 +10881,46 @@ def _admin_v1_desc_servable(desc):
     return _desc_state_readable(desc) and _admin_v1_entry_stat(desc)[0]
 
 
+# --------------------------------------------------------------------------- #
+# Admin API v1：切片清单状态筛选（2026-10-20 §四）
+#
+# 状态视图与口径（分页前执行；计数与分页同口径、同一批数据）：
+#   not_deleted（默认）asset_state <> 'deleted'——已删除墓碑排除，
+#                     deleting 保留到删除真正完成（删除中不是「已删除」）
+#   viewable          servable（ready + id_bundle + 入口在盘）
+#   processing        asset_state ∈ {staging, deleting}（上传/转换/删除在途）
+#   failed            asset_state = 'failed'
+#   deleted           asset_state = 'deleted'（墓碑保留：旧别名不可重绑/
+#                     删除幂等/审计依赖；本端点只读，不做数据维护）
+#   all               不筛选（含 legacy 等其余行）
+# 未注册文件（盘上无 slides 行）不参与本筛选与计数——它们走
+# unregistered_items / orphan_files 独立出线。
+# --------------------------------------------------------------------------- #
+_ADMIN_INVENTORY_STATUS_DEFAULT = "not_deleted"
+_ADMIN_INVENTORY_STATUSES = ("not_deleted", "viewable", "processing",
+                             "failed", "deleted", "all")
+#: unregistered_items 单次出线上限（独立清单不参与 cursor 分页；总数另给）
+_ADMIN_INVENTORY_UNREGISTERED_MAX = 200
+
+
+def _admin_inventory_status_match(meta, status):
+    """行是否命中状态视图（与 status_counts 共用，保证计数=列表口径）。"""
+    state = meta.get("asset_state")
+    if status == "all":
+        return True
+    if status == "not_deleted":
+        return state != "deleted"
+    if status == "viewable":
+        return bool(meta.get("servable"))
+    if status == "processing":
+        return state in ("staging", "deleting")
+    if status == "failed":
+        return state == "failed"
+    if status == "deleted":
+        return state == "deleted"
+    return False
+
+
 def _admin_v1_resolve_slide(ref):
     """管理面切片寻址：slide_id（新资产无唯一名）或冻结 legacy 名。"""
     desc = None
@@ -11049,13 +11129,37 @@ def admin_v1_slides_inventory():
 
     排序（2026-10-08 §3.1）：已登记切片按 ``slides.created_at`` 新→旧
     （``slide_id`` 稳定次键）cursor/limit 分页（管理列表禁全量返回的既有
-    口径）；未注册文件接在其后（组内按名升序，维持既有独立口径，不并入
-    正常行序）。
+    口径）。
+
+    状态筛选（2026-10-20 §四，``?status=``，**分页前**在服务端执行）：
+
+      ==============  ==========================================  ==================
+      status          口径（asset_state / 可服务）                 页面文案
+      ==============  ==========================================  ==================
+      not_deleted     默认；asset_state <> 'deleted'               未删除
+                      （deleting 保留到删除真正完成）
+      viewable        ready + id_bundle + 入口文件在盘（= servable） 可查看
+      processing      asset_state ∈ {staging, deleting}            处理中
+      failed          asset_state = 'failed'                       失败
+      deleted         asset_state = 'deleted'                      已删除
+      all             不筛选（含 legacy 等其余行）                  全部
+      ==============  ==========================================  ==================
+
+    顶层 ``status_counts`` 与分页同口径、同一批数据（先算计数再切片），
+    键为上面六个取值——切筛选/翻页看到的是同一代数据，不会因分页改变计数。
+    ``deleted`` 墓碑行继续保留（旧别名不可重绑/删除幂等/审计依赖它们）；
+    本端点只读，不做任何数据维护。
+
+    未注册文件（盘上无 slides 行的支持格式文件）**独立出线**：不再混进
+    ``items``（正常资产），只出现在 ``orphan_files``（名称+大小）与
+    ``unregistered_items``（旧 item 形态，供管理台单独一栏展示；上限
+    ``unregistered_total`` 计数，最多返回 200 条）。它们不参与状态筛选、
+    不参与 ``status_counts``、也不参与 cursor 分页。
 
     temporary_view（actor = 当前登录 owner）：
       - ``own``：切片属于 actor 本人（查看不需要授权）；
       - ``unavailable``：不可读（非 ready / 非 id_bundle / 文件缺失——
-        原因见 asset_state/file_exists 等既有字段；未注册行同此档）；
+        原因见 asset_state/file_exists 等既有字段）；
       - ``active``：actor 有未到期授权（附 granted_at/expires_at）；
       - ``ended``：授权行存在但已到期（附历史 expires_at）；
       - ``none``：无任何授权行。
@@ -11066,6 +11170,12 @@ def admin_v1_slides_inventory():
     if auth:
         return auth
     limit = _admin_v1_limit_arg()
+    status_filter = (request.args.get("status") or "").strip() \
+        or _ADMIN_INVENTORY_STATUS_DEFAULT
+    if status_filter not in _ADMIN_INVENTORY_STATUSES:
+        return _admin_v1_error(
+            400, "invalid_request",
+            "status 需为 %s" % " / ".join(_ADMIN_INVENTORY_STATUSES))
     cur = _admin_v1_decode_cursor(request.args.get("cursor"))
     offset = int(cur.get("o") or 0) if cur else 0
     if offset < 0:
@@ -11116,9 +11226,11 @@ def admin_v1_slides_inventory():
             "created_at": created_by_sid.get(desc.slide_id),
         }
 
-    # 2) 目录扫描——仅产出 orphan_files（无 slides 行的文件；只报告不认领），
-    #    兼容过渡期同时并入 items 的「未注册」形态（见 docstring）
+    # 2) 目录扫描——仅产出 orphan_files（无 slides 行的文件；只报告不认领）。
+    #    未注册文件**不并入 items**（2026-10-20 §四：独立展示，不混入正常
+    #    资产），另走 unregistered_items；不参与状态筛选/计数/分页。
     orphan_files = []
+    unregistered_meta = {}
     for child in UPLOAD_DIR.iterdir():
         if not child.is_file():
             continue
@@ -11131,7 +11243,7 @@ def admin_v1_slides_inventory():
         except OSError:
             continue
         orphan_files.append({"name": child.name, "size_bytes": size})
-        by_name[child.name] = {
+        unregistered_meta[child.name] = {
             "slide_id": None,
             "legacy_filename": child.name,
             "original_filename": None,
@@ -11156,13 +11268,20 @@ def admin_v1_slides_inventory():
                    if m.get("asset_state") == "failed" and m.get("slide_id")}
     failures = _admin_v1_slide_failure_provenance(failed_meta)
 
-    # 排序（§3.1）：已登记 created_at 新→旧（slide_id 次键）；未登记接后
-    registered = [n for n, m in by_name.items() if not m.get("unregistered")]
-    unregistered = [n for n, m in by_name.items() if m.get("unregistered")]
+    # 排序（§3.1）：已登记 created_at 新→旧（slide_id 稳定次键）
+    registered = list(by_name)
     registered.sort(key=lambda n: (
         -(by_name[n].get("created_at") or 0.0), by_name[n].get("slide_id") or n))
-    unregistered.sort()
-    names = registered + unregistered
+
+    # 状态计数（2026-10-20 §四）：与分页同一批数据、同一口径，**先计数再切片**。
+    status_counts = {
+        key: sum(1 for n in registered
+                 if _admin_inventory_status_match(by_name[n], key))
+        for key in _ADMIN_INVENTORY_STATUSES
+    }
+    # 筛选在分页前执行（跨页一致：第 2 页与第 1 页同一筛选代际）
+    names = [n for n in registered
+             if _admin_inventory_status_match(by_name[n], status_filter)]
 
     archived = _archived_slide_names()
     owner_uid = _admin_v1_owner_uid()
@@ -11195,9 +11314,9 @@ def admin_v1_slides_inventory():
     page = page[:limit]
 
     now = time.time()
-    items = []
-    for name in page:
-        meta = by_name[name]
+
+    def _build_item(name, meta):
+        """行 → item（registered 与 unregistered 共用同一出线形态）。"""
         slide_owner = meta.get("owner_user_id") or None
         owner_user = users_by_id.get(str(slide_owner)) if slide_owner else None
         owner_email = (str(owner_user.get("email_normalized")
@@ -11260,7 +11379,14 @@ def admin_v1_slides_inventory():
             }
         if meta.get("unregistered"):
             item["unregistered"] = True
-        items.append(item)
+        return item
+
+    items = [_build_item(name, by_name[name]) for name in page]
+    # 未注册文件独立出线（不参与状态筛选/计数/分页）：上限 200 条 + 总数
+    unregistered_names = sorted(unregistered_meta)
+    unregistered_items = [
+        _build_item(n, unregistered_meta[n])
+        for n in unregistered_names[:_ADMIN_INVENTORY_UNREGISTERED_MAX]]
     next_cursor = None
     if has_more:
         next_cursor = _admin_v1_encode_cursor({"o": offset + limit})
@@ -11269,7 +11395,11 @@ def admin_v1_slides_inventory():
                    owner_user_id=owner_uid, orphan_files=orphan_files,
                    orphan_objects=orphan_objects,
                    staging_residue=staging_residue,
-                   server_now=now)
+                   server_now=now,
+                   status=status_filter,
+                   status_counts=status_counts,
+                   unregistered_items=unregistered_items,
+                   unregistered_total=len(unregistered_names))
 
 
 #: .staging/ 任务键的四个键空间（P5 合同 §1.5「任务键可判」）：
@@ -11884,6 +12014,96 @@ def admin_v1_research_deletion_job_retry(job_id):
         job[key] = _test_app_rfc3339(job.get(key))
     return jsonify(ok=True, job=job,
                    previous_attempts=result["previous_attempts"])
+
+
+@app.route("/api/admin/v1/users/<user_id>/research", methods=["GET"])
+def admin_v1_user_research(user_id):
+    """单个用户的研究数据视图（owner-only；2026-10-20 评审 §三）。
+
+    「研究删除」不再是独立一级页——研究授权状态与删除任务进度并入用户
+    详情抽屉的「研究数据」折叠区，本端点是那一区的唯一数据源（只读）：
+
+    - ``consent``：当前授权状态/协议版本/授权与撤回时间/epoch（唯一权威
+      research_consent_store 行；无行 = 未授权，不伪造）；
+    - ``collection_enabled``：**平台采集总开关**（RESEARCH_COLLECTION_ENABLED）
+      ——与个人授权分开呈现：开关关着时即使已授权也不会采集；
+      ``ingest_allowed`` = 开关开 **且** 已授权；
+    - ``deletion_jobs``：该用户全部研究副本删除任务（新→旧，上限 20），
+      每行带 ``terminal_failed``（重试耗尽的终态 failed = 唯一可经既有
+      POST .../retry 重新执行的状态）与 ``backups_pending``（备份待轮换：
+      completed 只表示在线/导出清理完成，**不**宣称备份已删除——前端文案
+      「在线副本已清理，备份等待轮换」以该字段为唯一依据）；
+    - ``active_deletion_job``：当前未了结任务（pending/running/failed；
+      未了结期间研究侧持续阻断）。
+
+    本端点**只读**：不提供任何「代用户授权」「代用户撤回」或「直接置
+    completed」的动作（红线同研究删除任务入口）。管理员唯一写动作仍是
+    POST /api/admin/v1/research-deletion-jobs/<job_id>/retry（仅终态 failed）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    if not user_id or len(user_id) > 128 or "/" in user_id:
+        return _admin_v1_error(400, "invalid_request", "用户 id 无效")
+    try:
+        user = user_store.get_user(user_id)
+    except Exception:
+        app.logger.exception("admin v1 用户研究视图：用户读取失败")
+        return _admin_v1_error(503, "storage_unavailable",
+                               "存储暂不可用，请稍后重试")
+    if user is None:
+        return _admin_v1_error(404, "user_not_found", "用户不存在")
+    try:
+        view = research_consent_store.research_authorization_view(user_id)
+        jobs = research_consent_store.list_deletion_jobs(user_id)[:20]
+    except Exception:
+        app.logger.exception("admin v1 用户研究视图读取失败")
+        return _admin_v1_error(503, "storage_unavailable",
+                               "存储暂不可用，请稍后重试")
+
+    def _job_wire(row):
+        return {
+            "job_id": row.get("job_id"),
+            "reason": row.get("reason"),
+            "status": row.get("status"),
+            "terminal_failed": (
+                row.get("status") == "failed"
+                and int(row.get("attempts") or 0) >=
+                research_consent_store.MAX_DELETION_ATTEMPTS),
+            "error_code": row.get("error_code"),
+            "attempts": int(row.get("attempts") or 0),
+            "consent_epoch": row.get("consent_epoch"),
+            "online_cleared": bool(row.get("online_cleared")),
+            "exports_cleared": bool(row.get("exports_cleared")),
+            "backups_pending": bool(row.get("backups_pending")),
+            "next_retry_at": _test_app_rfc3339(row.get("next_retry_at")),
+            "created_at": _test_app_rfc3339(row.get("created_at")),
+            "updated_at": _test_app_rfc3339(row.get("updated_at")),
+            "completed_at": _test_app_rfc3339(row.get("completed_at")),
+        }
+
+    email_norm = str(user.get("email_normalized")
+                     or user.get("email") or "") or None
+    resp = jsonify(
+        user_id=str(user.get("user_id") or ""),
+        identity=email_norm or user.get("login_id") or user_id,
+        consent={
+            "state": view.get("state"),
+            "granted": bool(view.get("granted")),
+            "epoch": view.get("epoch"),
+            "document_version": view.get("document_version"),
+            "document_sha256": view.get("document_sha256"),
+            "granted_at": _test_app_rfc3339(view.get("granted_at")),
+            "withdrawn_at": _test_app_rfc3339(view.get("withdrawn_at")),
+        },
+        collection_enabled=bool(view.get("collection_enabled")),
+        ingest_allowed=bool(view.get("ingest_allowed")),
+        deletion_jobs=[_job_wire(j) for j in jobs],
+        active_deletion_job=(_job_wire(view["active_deletion_job"])
+                             if view.get("active_deletion_job") else None),
+    )
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/api/slides")

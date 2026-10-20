@@ -533,10 +533,10 @@ describe("2026-10-09 — 测试申请页退役（round4 §2.3）", () => {
 		]) {
 			expect(htmlSrc, gone).not.toContain(gone);
 		}
-		// 导航按钮总数回落到 9 页（round4：概览/用户/切片/格式申请/研究删除/
-		// 设置/费用/插件/审计）
+		// 导航按钮总数回落到 8 页（2026-10-20 评审 §三：「研究删除」一级页退役
+		// ——概览/用户/切片/格式申请/设置/费用/插件/审计）
 		const navCount = (htmlSrc.match(/class="adm-nav-btn"/g) || []).length;
-		expect(navCount).toBe(9);
+		expect(navCount).toBe(8);
 		// 桥方法不再作为请求发出；函数/监听/schema 残留清零（注释除外）
 		expect(src).not.toContain('request("admin.testApplications.');
 		expect(src).not.toContain("loadTestApplications");
@@ -1714,10 +1714,10 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 	it("批次A-13: 移动端导航 ::before 按同特异性逐页复位", () => {
 		const mobileBlock = cssSrc.slice(cssSrc.indexOf("@media (max-width: 767px)"));
 		expect(mobileBlock).toContain("adm-nav-btn { font-size: 14px");
-		// 2026-10-09：9 页逐一复位（invites/test-applications 随页面退役移除；
-		// slides/format-requests/research-deletion 图标规则统一覆盖）
+		// 2026-10-09：9 页逐一复位；2026-10-20（评审 §三）research-deletion
+		// 随页面退役移除 → 8 页（invites/test-applications 亦已退役）
 		for (const p of ["overview", "users", "slides", "format-requests",
-			"research-deletion", "settings",
+			"settings",
 			"billing", "plugins", "audit"]) {
 			expect(mobileBlock,
 				`mobile ::before reset for ${p}`).toMatch(
@@ -1725,6 +1725,9 @@ describe("UI 批次A 锁定（wave 2 重写版）", () => {
 		}
 		// test-applications 图标规则随页面退役移除（平板与手机两端都不再有）
 		expect(cssSrc).not.toContain('data-page="test-applications"');
+		// research-deletion 同规则：两级媒体查询里都不再有该页图标/复位规则
+		expect(cssSrc).not.toContain('data-page="research-deletion"');
+		expect(htmlSrc).not.toContain('data-page="research-deletion"');
 	});
 
 	// §4.9 紧凑握手
@@ -3001,7 +3004,10 @@ describe("切片页：临时查看五态 + 行内动作（§3.4）", () => {
 		expect(tbody).toContain("可查看 · 剩余 42 分钟"); // ceil((+42*60 - 0)/60)
 		expect(tbody).toContain("本人切片");
 		expect(tbody).toContain("不可查看");
-		expect(tbody).toContain("处理失败：源文件缺失 · 回填/迁移盘点 · 依据现状推断");
+		// 2026-10-20（评审 §四）：legacy 入口文件缺失是推断 → 文案带（推断），
+	// 且不再重复「依据现状推断」（不声称已查明最初消失原因）
+	expect(tbody).toContain("处理失败：历史文件缺失（推断） · 回填/迁移盘点 ·");
+	expect(tbody).not.toContain("依据现状推断");
 		expect(tbody).toContain("未登记文件");
 		// 列：切片名 + 上传者 sub、加入时间（上海时间；SERVER_NOW-86400=2027-01-14）
 		expect(tbody).toContain("reader-a@x.com");
@@ -3265,7 +3271,7 @@ describe("切片页：unavailable 原因（failed 资产失败原因/来源/时�
 		const bus = await bootSlides();
 		const tbody = bus.els["adm-slides-tbody"].textContent;
 		expect(tbody).toContain("不可查看");
-		expect(tbody).toContain("处理失败：源文件缺失 · 回填/迁移盘点 · 依据现状推断 · " +
+		expect(tbody).toContain("处理失败：历史文件缺失（推断） · 回填/迁移盘点 · " +
 			"2026-09-21 22:13:20 GMT+8");
 		expect(tbody).toContain("处理失败：用户已取消上传 · COS 上传（inj_abc）");
 		expect(tbody).toContain("未知原因（weird_code）");
@@ -3276,5 +3282,470 @@ describe("切片页：unavailable 原因（failed 资产失败原因/来源/时�
 		expect(bus.created.filter((e) => e.tagName === "BUTTON" &&
 			(e.textContent === "开启 1 小时" || e.textContent === "查看" ||
 			 e.textContent === "结束查看"))).toHaveLength(0);
+	});
+});
+
+
+// --------------------------------------------------------------------------- //
+// 2026-10-20 评审（§三/§四）：研究删除入口并入用户详情抽屉 + 切片状态筛选
+//
+//   - 「研究删除」一级页退役：导航/页面骨架/监听移除；旧 #research-deletion
+//     深链**过渡**到「用户」页（不是回概览）；
+//   - 抽屉「研究数据」折叠区（admin.users.research 只读）：授权状态/版本/
+//     时间 + 采集总开关（与个人授权分开）+ 删除任务进度；completed 且
+//     backups_pending=true →「在线副本已清理，备份等待轮换」；
+//   - 唯一写动作 = 终态 failed 的「重新执行删除」（复用既有 retry 桥）；
+//     重试失败只写本区状态行（<p>，ID 唯一），绝不清空任何 select 的 option；
+//   - 概览「待处理研究数据任务 N」只在有异常任务时出现，点入带
+//     research=abnormal 落到用户页并显示可清除的筛选条；
+//   - 切片状态筛选：默认未删除、计数同口径、切筛选重置游标、迟到响应不回填、
+//     未登记文件独立一栏。
+// --------------------------------------------------------------------------- //
+describe("2026-10-20 — 研究数据入口并入抽屉 + 切片状态筛选", () => {
+	const NONCE = "r4".repeat(32);
+
+	function boot(bus: ReturnType<typeof loadPluginUiWithBus>) {
+		bus.dispatch(bus.parent, {
+			kind: "init", bridge: "admin", protocolVersion: "1.0.0",
+			nonce: NONCE,
+			adminPermissions: ["admin:overview:read", "admin:users:read",
+				"admin:users:write", "admin:slides:read"],
+		});
+	}
+
+	function lastRequest(bus: ReturnType<typeof loadPluginUiWithBus>, method: string) {
+		return bus.parentPosted
+			.filter((p) => p.env.kind === "request" && p.env.method === method)
+			.at(-1);
+	}
+
+	function reply(bus: ReturnType<typeof loadPluginUiWithBus>, req: Posted, result: unknown) {
+		bus.dispatch(bus.parent, {
+			kind: "response", bridge: "admin", nonce: NONCE,
+			requestId: req.env.requestId, ok: true, result,
+		});
+	}
+
+	function replyErr(bus: ReturnType<typeof loadPluginUiWithBus>, req: Posted, error: unknown) {
+		bus.dispatch(bus.parent, {
+			kind: "response", bridge: "admin", nonce: NONCE,
+			requestId: req.env.requestId, ok: false, error,
+		});
+	}
+
+	const USER_ROW = {
+		user_id: "u1", identity: "zhang@x.com", display_name: "张三",
+		role: "user", enabled: true, ai_access: true, account_kind: "real",
+		created_at: 1700000000, last_login_at: 1700000100,
+		research: { state: "granted", granted: true },
+		spend: {
+			total: {
+				allowance_id: "alw_1", total_limit_nano_cny: "20000000000",
+				spent_nano_cny: "0", reserved_nano_cny: "0",
+				remaining_nano: "20000000000", overage_nano: "0",
+				source: "invite", version: 2, cutover_at: 1700000000,
+			},
+		},
+	};
+
+	async function openDrawer(bus: ReturnType<typeof loadPluginUiWithBus>) {
+		boot(bus);
+		bus.client!.showPage("users");
+		await ticks(4);
+		const listReq = lastRequest(bus, "admin.users.list")!;
+		reply(bus, listReq, { items: [USER_ROW], next_cursor: null });
+		await ticks(4);
+		const detailBtn = bus.created.find((el) =>
+			el.textContent === "详情" && el._listeners && el._listeners.click)!;
+		detailBtn._fire("click", {});
+		await ticks(2);
+		return lastRequest(bus, "admin.users.research")!;
+	}
+
+	const RESEARCH_RESULT = {
+		user_id: "u1", identity: "zhang@x.com",
+		consent: {
+			state: "granted", granted: true, epoch: 3,
+			document_version: "2026-09-01", document_sha256: "a".repeat(64),
+			granted_at: "2026-10-01T00:00:00Z", withdrawn_at: null,
+		},
+		collection_enabled: false, ingest_allowed: false,
+		deletion_jobs: [
+			{
+				job_id: "rdj_done", reason: "user_request", status: "completed",
+				terminal_failed: false, error_code: null, attempts: 1,
+				consent_epoch: 2, online_cleared: true, exports_cleared: true,
+				backups_pending: true,
+				next_retry_at: null, created_at: "2026-09-20T00:00:00Z",
+				updated_at: "2026-09-20T00:05:00Z",
+				completed_at: "2026-09-20T00:05:00Z",
+			},
+		],
+		active_deletion_job: null,
+	};
+
+	it("HTML/JS/CSS：研究删除页骨架与导航移除；抽屉折叠区与唯一状态节点就位", () => {
+		expect(htmlSrc).not.toContain('data-page="research-deletion"');
+		expect(htmlSrc).not.toContain('id="adm-page-research-deletion"');
+		expect(htmlSrc).not.toContain('id="adm-rdel-status"');
+		expect(htmlSrc).not.toContain('id="adm-rdel-tbody"');
+		expect(cssSrc).not.toContain('data-page="research-deletion"');
+		// 页面级函数/监听整段移除（注释除外）
+		expect(src).not.toContain("function loadResearchDeletionJobs(");
+		expect(src).not.toContain("function renderRdelRow(");
+		expect(src).not.toContain('onClick("adm-rdel-search-btn"');
+		expect(src).not.toContain('onClick("adm-rdel-refresh-btn"');
+		expect(src).not.toContain('name === "research-deletion"');
+		expect(src).not.toContain('"research-deletion": "研究删除"');
+		// 新入口：抽屉折叠区 + 只读桥 + 唯一状态节点（<p>）
+		expect(src).toContain('request("admin.users.research"');
+		expect(src).toContain('details.id = "adm-drawer-research";');
+		expect(src).toContain('statusEl.id = "adm-drawer-research-status";');
+		// 唯一写动作仍是既有 retry（不新增任何桥方法）
+		expect(src).toContain('request("admin.researchDeletionJobs.retry"');
+		// 旧深链过渡到用户页
+		expect(src).toContain('HASH_PAGE_ALIASES = { "research-deletion": "users" }');
+	});
+
+	it("DOM ID 全局唯一（研究面）：重复 ID 会让 getElementById 取错节点、写坏 select", () => {
+		// 2026-10-20 §一.2 回归守卫：整份 index.html 的 id 必须唯一。
+		// 唯一已知例外是费用页的 adm-usage-status（select 与 span 同 ID）——
+		// 由并行 billing 分支修为 *-status-filter / *-status-message；
+		// 本分支不触碰费用标记，故此处显式豁免并在合并后自然消失。
+		const ids = [...htmlSrc.matchAll(/\sid="([^"]+)"/g)].map((m) => m[1]);
+		const seen = new Map<string, number>();
+		for (const id of ids) seen.set(id, (seen.get(id) || 0) + 1);
+		const dups = [...seen.entries()]
+			.filter(([id, n]) => n > 1 && id !== "adm-usage-status")
+			.map(([id, n]) => `${id}×${n}`);
+		expect(dups).toEqual([]);
+		// 研究面的 select/状态节点命名分离（旧同 ID 对已不存在）
+		expect(htmlSrc).toContain('id="adm-slides-status-filter"');
+		expect(htmlSrc).not.toContain('id="adm-rdel-status"');
+		// main.js 不再有把状态文案写进 select ID 的路径
+		expect(src).not.toContain('handleErr(err, $("adm-rdel-status"))');
+		expect(src).not.toContain('setStatus("adm-rdel-status"');
+	});
+
+	it("旧 #research-deletion 深链落到「用户」页（新区域），不回概览", async () => {
+		const bus = loadPluginUiWithBus("#research-deletion");
+		boot(bus);
+		expect(bus.els["adm-page-users"].hidden).toBe(false);
+		expect(bus.els["adm-page-overview"].hidden).toBe(true);
+		expect(bus.els["adm-page-title"].textContent).toBe("用户");
+		await ticks(4);
+		const requested = bus.parentPosted
+			.filter((p) => p.env.kind === "request")
+			.map((p) => String(p.env.method));
+		expect(requested).toContain("admin.users.list");
+		expect(requested).not.toContain("admin.overview.get");
+	});
+
+	it("抽屉「研究数据」：授权状态/版本/时间 + 采集总开关分开显示 + backups_pending 文案", async () => {
+		const bus = loadPluginUiWithBus();
+		const req = await openDrawer(bus);
+		expect(req.env.payload).toEqual({ user_id: "u1" });
+		reply(bus, req, RESEARCH_RESULT);
+		await ticks(3);
+		const body = bus.els["adm-drawer-research-body"].textContent;
+		expect(body).toContain("个人授权状态");
+		expect(body).toContain("已授权");
+		expect(body).toContain("2026-09-01");
+		expect(body).toContain("2026-10-01 08:00:00 GMT+8"); // granted_at 上海时间
+		// 采集总开关与个人授权分开（关着时已授权也不采集）
+		expect(body).toContain("采集总开关（平台）");
+		expect(body).toContain("已关闭（即使已授权也不采集）");
+		expect(body).toContain("采集是否生效");
+		expect(body).toContain("否");
+		// completed + backups_pending=true：只宣称在线副本已清理
+		expect(body).toContain("在线副本已清理，备份等待轮换");
+		expect(body).not.toContain("备份已删除");
+		// 无终态失败任务 → 不出现重新执行入口
+		expect(body).not.toContain("重新执行删除");
+		// 管理员不能代用户授权：本区没有任何授权写动作
+		expect(src).not.toContain('request("admin.users.research.grant"');
+		expect(src).not.toContain('request("admin.researchConsent.');
+	});
+
+	it("抽屉「研究数据」：终态 failed 才给「重新执行删除」；非终态 failed 不给", async () => {
+		const bus = loadPluginUiWithBus();
+		const req = await openDrawer(bus);
+		reply(bus, req, {
+			...RESEARCH_RESULT,
+			consent: { ...RESEARCH_RESULT.consent, state: "withdrawn", granted: false },
+			deletion_jobs: [
+				{
+					job_id: "rdj_backoff", reason: "withdrawal", status: "failed",
+					terminal_failed: false, error_code: "deletion_failed_OSError",
+					attempts: 2, consent_epoch: 3, online_cleared: false,
+					exports_cleared: false, backups_pending: false,
+					next_retry_at: "2026-10-20T00:00:00Z",
+					created_at: "2026-10-19T00:00:00Z",
+					updated_at: "2026-10-19T00:10:00Z", completed_at: null,
+				},
+				{
+					job_id: "rdj_terminal", reason: "withdrawal", status: "failed",
+					terminal_failed: true, error_code: "deletion_failed_OSError",
+					attempts: 5, consent_epoch: 3, online_cleared: false,
+					exports_cleared: false, backups_pending: false,
+					next_retry_at: null, created_at: "2026-10-18T00:00:00Z",
+					updated_at: "2026-10-19T00:00:00Z", completed_at: null,
+				},
+			],
+			active_deletion_job: {
+				job_id: "rdj_terminal", reason: "withdrawal", status: "failed",
+				terminal_failed: true, error_code: "deletion_failed_OSError",
+				attempts: 5, consent_epoch: 3, online_cleared: false,
+				exports_cleared: false, backups_pending: false,
+				next_retry_at: null, created_at: "2026-10-18T00:00:00Z",
+				updated_at: "2026-10-19T00:00:00Z", completed_at: null,
+			},
+		});
+		await ticks(3);
+		const body = bus.els["adm-drawer-research-body"].textContent;
+		expect(body).toContain("已撤回");
+		expect(body).toContain("清理失败（重试耗尽，待人工处置）");
+		expect(body).toContain("清理失败，等待后台自动重试");
+		expect(body).toContain("当前有未了结删除任务");
+		const retryBtns = bus.created.filter((el) => el.tagName === "BUTTON" &&
+			el.textContent === "重新执行删除");
+		expect(retryBtns).toHaveLength(1); // 只有终态那一条
+	});
+
+	it("重新执行删除：确认 → 既有 retry 桥（job_id）→ 重取本区；失败只写状态行", async () => {
+		const bus = loadPluginUiWithBus();
+		const req = await openDrawer(bus);
+		const terminalJob = {
+			job_id: "rdj_terminal", reason: "withdrawal", status: "failed",
+			terminal_failed: true, error_code: "deletion_failed_OSError",
+			attempts: 5, consent_epoch: 3, online_cleared: false,
+			exports_cleared: false, backups_pending: false,
+			next_retry_at: null, created_at: "2026-10-18T00:00:00Z",
+			updated_at: "2026-10-19T00:00:00Z", completed_at: null,
+		};
+		reply(bus, req, { ...RESEARCH_RESULT, deletion_jobs: [terminalJob],
+			active_deletion_job: terminalJob });
+		await ticks(3);
+		const retryBtn = bus.created.filter((el) => el.tagName === "BUTTON" &&
+			el.textContent === "重新执行删除")[0]!;
+		retryBtn._fire("click", {});
+		// 二次确认条（抽屉内）→ 确认执行
+		const confirmBox = bus.els["adm-drawer-confirm"];
+		expect(confirmBox.hidden).toBe(false);
+		expect(confirmBox.textContent).toContain("completed 只能由实际清理成功产生");
+		const okBtn = bus.created.filter((el) => el.tagName === "BUTTON" &&
+			el.textContent === "确认执行").at(-1)!;
+		okBtn._fire("click", {});
+		await ticks(3);
+		const retryReq = lastRequest(bus, "admin.researchDeletionJobs.retry")!;
+		expect(retryReq.env.payload).toEqual({ job_id: "rdj_terminal" });
+		// 失败（模拟 HTTP 500）：只写本区状态行；重试入口仍在，UI 不残废
+		replyErr(bus, retryReq, { code: "internal", message: "Review simulated HTTP 500" });
+		await ticks(3);
+		const statusEl = bus.els["adm-drawer-research-status"];
+		expect(statusEl.textContent).toContain("internal");
+		expect(bus.els["adm-drawer-research-body"].textContent)
+			.toContain("重新执行删除");
+		expect(bus.els["adm-error-text"].textContent).toContain("Review simulated");
+		// 成功路径：复活为 pending → 本区重取（第二次 admin.users.research）
+		okBtn._fire("click", {});
+		await ticks(2);
+		const retryReq2 = lastRequest(bus, "admin.researchDeletionJobs.retry")!;
+		reply(bus, retryReq2, { ok: true, previous_attempts: 5,
+			job: { ...terminalJob, status: "pending", attempts: 0 } });
+		await ticks(3);
+		expect(statusEl.textContent).toContain("已重新执行");
+		const refreshReq = lastRequest(bus, "admin.users.research")!;
+		expect(refreshReq.env.requestId).not.toBe(retryReq.env.requestId);
+		reply(bus, refreshReq, { ...RESEARCH_RESULT,
+			deletion_jobs: [{ ...terminalJob, status: "pending",
+				terminal_failed: false, attempts: 0 }],
+			active_deletion_job: { ...terminalJob, status: "pending",
+				terminal_failed: false, attempts: 0 } });
+		await ticks(3);
+		expect(bus.els["adm-drawer-research-body"].textContent)
+			.toContain("待执行（等待后台 worker 领取）");
+	});
+
+	it("概览「待处理研究数据任务 N」：仅异常>0 时出现；available=false 不渲染成无异常", async () => {
+		const bus = loadPluginUiWithBus();
+		boot(bus);
+		bus.client!.showPage("overview");
+		await ticks(4);
+		replyMethod(bus, NONCE, "admin.siteStats.get",
+			{ ok: false, error: { code: "unknown_method", message: "x" } });
+		replyMethod(bus, NONCE, "admin.overview.get", {
+			ok: true,
+			result: {
+				users: { total: 1, active: 1, disabled: 0, ai_access: 0 },
+				billing: { available: true, charge_nano_cny: "10000000" },
+				research: { available: true, abnormal_deletion_jobs: 2 },
+			},
+		});
+		await ticks(3);
+		const kpis = bus.els["adm-ov-kpis"].textContent;
+		expect(kpis).toContain("待处理研究数据任务");
+		expect(kpis).toContain("重试耗尽的终态失败");
+		const goto = bus.created.filter((el) => el.tagName === "BUTTON" &&
+			el.textContent === "查看待处理用户");
+		expect(goto.length).toBeGreaterThan(0);
+		// 点入：用户页 + research=abnormal（筛选条可见）
+		goto[0]!._fire("click", {});
+		await ticks(3);
+		const listReq = lastRequest(bus, "admin.users.list")!;
+		expect(listReq.env.payload).toMatchObject({ research: "abnormal" });
+		expect(bus.els["adm-page-users"].hidden).toBe(false);
+		expect(bus.els["adm-users-research-filter"].hidden).toBe(false);
+		// 「清除筛选」（index.html 静态节点，经 onClick 绑定）：回到不带
+		// research 的请求
+		const clearBtn = bus.els["adm-users-research-clear"];
+		clearBtn._fire("click", {});
+		await ticks(3);
+		const listReq2 = lastRequest(bus, "admin.users.list")!;
+		expect(listReq2.env.payload.research).toBeUndefined();
+		expect(bus.els["adm-users-research-filter"].hidden).toBe(true);
+	});
+
+	it("概览研究计数为 0 / 读取失败（available=false）时整块隐藏", async () => {
+		for (const research of [
+			{ available: true, abnormal_deletion_jobs: 0 },
+			{ available: false, abnormal_deletion_jobs: null },
+		]) {
+			const bus = loadPluginUiWithBus();
+			boot(bus);
+			bus.client!.showPage("overview");
+			await ticks(4);
+			replyMethod(bus, NONCE, "admin.siteStats.get",
+				{ ok: false, error: { code: "unknown_method", message: "x" } });
+			replyMethod(bus, NONCE, "admin.overview.get", {
+				ok: true,
+				result: {
+					users: { total: 1, active: 1, disabled: 0, ai_access: 0 },
+					billing: { available: true, charge_nano_cny: "10000000" },
+					research,
+				},
+			});
+			await ticks(3);
+			expect(bus.els["adm-ov-kpis"].textContent)
+				.not.toContain("待处理研究数据任务");
+		}
+	});
+
+	it("切片页：默认未删除 + 计数同口径渲染 + 未登记文件独立一栏", async () => {
+		const bus = loadPluginUiWithBus();
+		boot(bus);
+		bus.client!.showPage("slides");
+		await ticks(4);
+		const req = lastRequest(bus, "admin.slides.inventory")!;
+		expect(req.env.payload).toEqual({
+			limit: 50, cursor: null, status: "not_deleted",
+		});
+		reply(bus, req, {
+			items: [{ name: "ready.svs", slide_id: "sld_a", asset_state: "ready",
+				servable: true, file_exists: true, created_at: 1700000000,
+				owner_identity: "a@x.com",
+				temporary_view: { status: "none" } }],
+			next_cursor: null, server_now: 1790000000,
+			status: "not_deleted",
+			status_counts: { not_deleted: 121, viewable: 119, processing: 1,
+				failed: 29, deleted: 101, all: 251 },
+			unregistered_items: [{ name: "stray.svs", size_bytes: 8,
+				unregistered: true, slide_id: null }],
+			unregistered_total: 3,
+		});
+		await ticks(3);
+		const counts = bus.els["adm-slides-counts"].textContent;
+		expect(counts).toContain("未删除 121 ←");
+		expect(counts).toContain("可查看 119");
+		expect(counts).toContain("处理中 1");
+		expect(counts).toContain("失败 29");
+		expect(counts).toContain("已删除 101");
+		expect(counts).toContain("全部 251");
+		// 未登记文件独立一栏（不混入主表）
+		expect(bus.els["adm-slides-tbody"].textContent).not.toContain("stray.svs");
+		expect(bus.els["adm-slides-unregistered-box"].hidden).toBe(false);
+		expect(bus.els["adm-slides-unregistered-summary"].textContent)
+			.toContain("盘上未登记文件 3");
+		expect(bus.els["adm-slides-unregistered-tbody"].textContent)
+			.toContain("stray.svs");
+		expect(bus.els["adm-slides-unregistered-note"].textContent)
+			.toContain("只列出前 1 个");
+	});
+
+	it("切片页：切筛选重置游标；旧筛选的迟到响应不回填（代际丢弃）", async () => {
+		const bus = loadPluginUiWithBus();
+		boot(bus);
+		bus.client!.showPage("slides");
+		await ticks(4);
+		const first = lastRequest(bus, "admin.slides.inventory")!;
+		reply(bus, first, {
+			items: [{ name: "ready.svs", slide_id: "sld_a", asset_state: "ready",
+				servable: true, created_time: 0, created_at: 1700000000,
+				temporary_view: { status: "none" } }],
+			next_cursor: "c1", server_now: 1790000000, status: "not_deleted",
+			status_counts: { not_deleted: 2, viewable: 1, processing: 0,
+				failed: 1, deleted: 0, all: 2 },
+			unregistered_items: [], unregistered_total: 0,
+		});
+		await ticks(3);
+		expect(bus.els["adm-slides-tbody"].textContent).toContain("ready.svs");
+
+		// 切到「失败」：新请求带 status=failed + cursor=null（重置游标）
+		const sel = bus.els["adm-slides-status-filter"];
+		sel.value = "failed";
+		sel._fire("change", {});
+		await ticks(3);
+		const failedReq = lastRequest(bus, "admin.slides.inventory")!;
+		expect(failedReq.env.requestId).not.toBe(first.env.requestId);
+		expect(failedReq.env.payload).toEqual({
+			limit: 50, cursor: null, status: "failed",
+		});
+		// 迟到：旧「未删除」响应（在 failed 在途时到达）——必须被丢弃
+		reply(bus, first, {
+			items: [{ name: "late.svs", slide_id: "sld_late",
+				asset_state: "ready", servable: true, created_at: 1700000000,
+				temporary_view: { status: "none" } }],
+			next_cursor: null, server_now: 1790000000, status: "not_deleted",
+			status_counts: { not_deleted: 1, viewable: 1, processing: 0,
+				failed: 0, deleted: 0, all: 1 },
+			unregistered_items: [], unregistered_total: 0,
+		});
+		await ticks(3);
+		expect(bus.els["adm-slides-tbody"].textContent).not.toContain("late.svs");
+		// 新筛选响应到达：只显示失败档数据
+		reply(bus, failedReq, {
+			items: [{ name: "bad.svs", slide_id: "sld_bad",
+				asset_state: "failed", servable: false, file_exists: true,
+				created_at: 1700000000, temporary_view: { status: "unavailable" },
+				failure: { code: "validation_failed", inferred: false,
+					source: "ingestion", source_ref: "inj_1", occurred_at: 1700000000 } }],
+			next_cursor: null, server_now: 1790000000, status: "failed",
+			status_counts: { not_deleted: 2, viewable: 1, processing: 0,
+				failed: 1, deleted: 0, all: 2 },
+			unregistered_items: [], unregistered_total: 0,
+		});
+		await ticks(3);
+		const tbody = bus.els["adm-slides-tbody"].textContent;
+		expect(tbody).toContain("bad.svs");
+		expect(tbody).not.toContain("late.svs");
+		expect(tbody).not.toContain("ready.svs");
+		// 空态文案按当前筛选档给出
+		const more = lastRequest(bus, "admin.slides.inventory")!;
+		bus.els["adm-slides-status-filter"].value = "deleted";
+		bus.els["adm-slides-status-filter"]._fire("change", {});
+		await ticks(3);
+		const emptyReq = lastRequest(bus, "admin.slides.inventory")!;
+		expect(emptyReq.env.payload.status).toBe("deleted");
+		reply(bus, emptyReq, {
+			items: [], next_cursor: null, server_now: 1790000000,
+			status: "deleted",
+			status_counts: { not_deleted: 2, viewable: 1, processing: 0,
+				failed: 1, deleted: 0, all: 2 },
+			unregistered_items: [], unregistered_total: 0,
+		});
+		await ticks(3);
+		expect(bus.els["adm-state-slides"].textContent)
+			.toContain("当前筛选（已删除）下没有切片文件");
+		void more;
 	});
 });

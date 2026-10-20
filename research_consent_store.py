@@ -669,6 +669,46 @@ def list_deletion_jobs_admin(status=None, limit=200) -> list:
         conn.close()
 
 
+def abnormal_deletion_jobs_sql():
+    """异常删除任务谓词（终态 failed：重试耗尽、worker 已停止自动重试）。
+
+    与路由层 ``terminal_failed`` 同源（同一常量 MAX_DELETION_ATTEMPTS）——
+    概览「待处理研究数据任务 N」与用户列表「仅待处理」筛选都以它为准：
+    只有人工经 retry 入口重新执行（或错误消除后由新撤回复活）才离开该档。
+    退避重试中的 failed（attempts < 上限）不在此档——worker 仍会自动重试。
+    """
+    return "(status='failed' AND attempts >= %d)" % MAX_DELETION_ATTEMPTS
+
+
+def count_abnormal_deletion_jobs() -> int:
+    """异常（终态 failed 待人工处置）删除任务条数——概览「待处理研究数据
+    任务 N」的唯一口径；无异常时恒 0（UI 据此整卡隐藏，不显示 0 噪音）。"""
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) AS n FROM research_data_deletion_jobs "
+                "WHERE %s" % abnormal_deletion_jobs_sql())
+            row = cur.fetchone()
+            return int(row["n"]) if row is not None else 0
+    finally:
+        conn.close()
+
+
+def abnormal_deletion_user_ids() -> list:
+    """有异常（终态 failed）删除任务的用户 id（去重、稳定序）——管理台
+    用户列表「仅待处理」筛选的用户集合。"""
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT user_id FROM research_data_deletion_jobs "
+                "WHERE %s ORDER BY user_id" % abnormal_deletion_jobs_sql())
+            return [r["user_id"] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
 def admin_retry_deletion_job(job_id, actor_user_id=None, actor_role=None) -> dict:
     """管理员处置：把**终态 failed**（重试耗尽）的删除任务复活为 pending。
 

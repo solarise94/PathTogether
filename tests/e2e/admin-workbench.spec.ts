@@ -197,6 +197,30 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 		await expect(frame.locator("#adm-page-overview")).toBeVisible();
 	});
 
+	test("7b. 「研究删除」页退役并入用户详情抽屉；旧 #research-deletion 深链过渡到「用户」页（2026-10-20 评审 §三）", async ({ page }) => {
+		await login(page, CREDS.ownerLogin, CREDS.ownerPassword);
+		await page.goto("/admin");
+		await expect(hostStatus(page)).toHaveAttribute(
+			"data-admin-host-state", "ready", { timeout: 5000 });
+		const frame = page.frameLocator("#admin-plugin-frame");
+		// 一级导航与页面骨架都不再存在（执行链与旧 API/桥保留兼容）
+		await expect(frame.locator('.adm-nav-btn[data-page="research-deletion"]')).toHaveCount(0);
+		await expect(frame.locator("#adm-page-research-deletion")).toHaveCount(0);
+		await expect(frame.locator("#adm-rdel-table")).toHaveCount(0);
+		await expect(frame.locator("#adm-rdel-status")).toHaveCount(0);
+		// 旧深链：过渡到「用户」页（新区域），不是回概览、不空屏。
+		// 注意：/admin → /admin#hash 是同文档导航（宿主不会重载 iframe），
+		// 必须先离开 /admin 触发一次全量加载，深链才真正透传进插件 iframe。
+		await page.goto("/app");
+		await page.goto("/admin#research-deletion");
+		await expect(hostStatus(page)).toHaveAttribute(
+			"data-admin-host-state", "ready", { timeout: 5000 });
+		await expect(frame.locator("#adm-page-users")).toBeVisible();
+		await expect(frame.locator("#adm-page-overview")).toBeHidden();
+		await expect(frame.locator("#adm-users-tbody")).toContainText(
+			"e2e-user@pt.test", { timeout: 10_000 });
+	});
+
 	const bridgePages: Array<[string, RegExp]> = [
 		["billing", /ready|error/],
 		["plugins", /ready/],
@@ -566,8 +590,13 @@ test.describe("管理工作台 Chromium E2E（§10.2）", () => {
 // 评审目录作为附加证据（after-*.png，测试数据本身已脱敏：掩码账号、临时凭据）。
 // --------------------------------------------------------------------------- //
 
-const REVIEW_DIR = join(dirname(fileURLToPathSafe()), "..", "..",
-  "review-2026-09-01-admin-ui");
+// 截图目录：默认仍是评审目录（既有行为不变）；本机跑测试时可用
+// E2E_REVIEW_DIR 显式指向 /mnt/ssd2/tests 下的运行目录（工作区约定：本机
+// 测试产物必须落在统一测试根目录，不写仓库内外其它位置）。
+const REVIEW_DIR = process.env.E2E_REVIEW_DIR
+  ? process.env.E2E_REVIEW_DIR
+  : join(dirname(fileURLToPathSafe()), "..", "..",
+    "review-2026-09-01-admin-ui");
 
 /** CJS 转译下 __dirname 可用；兜底 process.cwd()（playwright 从仓库根启动）。 */
 function fileURLToPathSafe(): string {
@@ -913,6 +942,172 @@ test.describe("UI 升级 2026-09-01 — 桌面 1440×900（批次 E）", () => {
     await page.keyboard.press("Escape");
     await expect(drawer).toBeHidden();
   });
+  test("24. 研究数据：概览异常计数点入筛选 + 抽屉折叠区 + 重试失败不破坏任何筛选控件（2026-10-20 评审 §三）", async ({ page }) => {
+    await gotoAdminReady(page);
+    const frame = page.frameLocator("#admin-plugin-frame");
+    // 概览：有异常删除任务（e2e_server 种的终态 failed）才出现计数卡
+    await expect(frame.locator("#adm-ov-kpis")).toContainText(
+      "待处理研究数据任务", { timeout: 10_000 });
+    const researchKpi = frame.locator("#adm-ov-kpis .adm-kpi", {
+      hasText: "待处理研究数据任务",
+    });
+    await expect(researchKpi).toContainText("1");
+    await expect(researchKpi).toContainText("重试耗尽的终态失败");
+    // 点入：用户页 + research=abnormal 筛选（筛选条可见、只出该用户）
+    const usersReq: string[] = [];
+    page.on("request", (r) => {
+      const u = r.url();
+      if (u.includes("/api/admin/v1/users")) usersReq.push(u);
+    });
+    await researchKpi.locator("button", { hasText: "查看待处理用户" }).click();
+    await expect(frame.locator("#adm-page-users")).toBeVisible();
+    await expect(frame.locator("#adm-users-research-filter")).toBeVisible();
+    await expect(frame.locator("#adm-users-tbody")).toContainText(
+      "e2e-user@pt.test", { timeout: 10_000 });
+    await expect(frame.locator("#adm-users-tbody")).not.toContainText(
+      "e2e-limited@pt.test");
+    expect(usersReq.some((u) => u.includes("research=abnormal"))).toBe(true);
+    await expect(frame.locator("#adm-state-users")).toContainText(
+      "仅待处理研究数据任务用户");
+    // 抽屉「研究数据」折叠区：授权状态/版本 + 采集总开关 + 删除任务进度
+    const row = frame.locator("#adm-users-tbody tr", { hasText: "e2e-user@pt.test" });
+    await row.locator("button", { hasText: "详情" }).click();
+    await expect(frame.locator("#adm-user-drawer")).toBeVisible();
+    const researchSection = frame.locator("#adm-drawer-research");
+    await expect(researchSection).toContainText("研究数据（授权状态与删除任务）");
+    // 折叠区默认收起：展开后才做动作（可折叠 = 本区不占常驻版面）
+    await expect(researchSection.locator("#adm-drawer-research-body")).toBeHidden();
+    await researchSection.locator("summary").click();
+    await expect(researchSection.locator("#adm-drawer-research-body")).toBeVisible();
+    await expect(researchSection).toContainText("管理员不能代用户授权或撤回");
+    await expect(researchSection).toContainText("采集总开关（平台）");
+    await expect(researchSection).toContainText("个人授权状态");
+    await expect(researchSection).toContainText("未授权");
+    await expect(researchSection).toContainText("清理失败（重试耗尽，待人工处置）");
+    await expect(researchSection).toContainText("deletion_failed_E2ESeed");
+    await expect(researchSection).toContainText("当前有未了结删除任务");
+    const retryBtn = frame.locator("#adm-drawer-research-body button", {
+      hasText: "重新执行删除",
+    });
+    await expect(retryBtn).toBeVisible();
+    // 研究异常筛选的「清除筛选」：回到全量列表（research 参数不再出现）
+    await frame.locator("#adm-drawer-close").click();
+    await frame.locator("#adm-users-research-clear").click();
+    await expect(frame.locator("#adm-users-research-filter")).toBeHidden();
+    await expect(frame.locator("#adm-users-tbody")).toContainText(
+      "e2e-limited@pt.test", { timeout: 10_000 });
+    await frame.locator("#adm-users-research-filter").waitFor({ state: "hidden" });
+
+    // 重试失败（模拟 HTTP 500）：状态行只写本区文案，**任何 select 的
+    // option 都保持完整**（评审 §一.2 的回归场景，断言正确行为）
+    const jobId = (await frame.locator("#adm-drawer-research-body").textContent())
+      ?.match(/rdj_[A-Za-z0-9_-]+/)?.[0];
+    expect(jobId).toBeTruthy();
+    ignoreApi.push(`/api/admin/v1/research-deletion-jobs/${jobId}/retry`);
+    await page.route("**/api/admin/v1/research-deletion-jobs/*/retry",
+      (route) => route.fulfill({
+        status: 500, contentType: "application/json",
+        body: JSON.stringify({ error: { code: "internal", message: "E2E simulated 500" } }),
+      }));
+    try {
+      // 重新打开该用户的抽屉（前面已关闭以验证清除筛选）
+      await frame.locator("#adm-users-tbody tr", { hasText: "e2e-user@pt.test" })
+        .locator("button", { hasText: "详情" }).click();
+      await expect(frame.locator("#adm-user-drawer")).toBeVisible();
+      await frame.locator("#adm-drawer-research summary").click();
+      await frame.locator("#adm-drawer-research-body button", {
+        hasText: "重新执行删除",
+      }).click();
+      await frame.locator("#adm-drawer-confirm button", { hasText: "确认执行" }).click();
+      await expect(frame.locator("#adm-drawer-research-status")).toContainText(
+        "internal", { timeout: 10_000 });
+      // 重试入口仍在（UI 不残废）
+      await expect(frame.locator("#adm-drawer-research-body button", {
+        hasText: "重新执行删除",
+      })).toBeVisible();
+      // 关键回归：失败提示写的是 <p id=adm-drawer-research-status>，不是
+      // 任何 select —— 全页 select 的 option 数不变（旧 bug：option 被清空）
+      const selectOptions = await frame.locator("select").evaluateAll(
+        (els) => els.map((el) => ({
+          id: el.id,
+          count: el.querySelectorAll("option").length,
+        })));
+      for (const sel of selectOptions) {
+        if (sel.id === "adm-slides-status-filter") expect(sel.count).toBe(6);
+        if (sel.id === "adm-users-sort") expect(sel.count).toBe(3);
+      }
+      expect(selectOptions.length).toBeGreaterThan(0);
+      // DOM ID 唯一（除费用页 adm-usage-status——并行 billing 分支修复；
+      // 本分支不动费用标记）
+      const pluginFrame = page.frames().find(
+        (f) => f.url().includes("pathtogether-admin"));
+      expect(pluginFrame).toBeTruthy();
+      const dupIds = await pluginFrame!.evaluate(() => {
+        const counts = new Map<string, number>();
+        document.querySelectorAll("[id]").forEach((el) => {
+          const id = el.id;
+          if (!id) return;
+          counts.set(id, (counts.get(id) || 0) + 1);
+        });
+        return [...counts.entries()]
+          .filter(([id, n]) => n > 1 && id !== "adm-usage-status")
+          .map(([id, n]) => `${id}x${n}`);
+      });
+      expect(dupIds).toEqual([]);
+      await frame.locator("#adm-drawer-close").click();
+    } finally {
+      await page.unroute("**/api/admin/v1/research-deletion-jobs/*/retry");
+    }
+  });
+
+  test("25. 切片状态筛选：默认未删除、切档跨状态、计数一致、未登记独立一栏、选项保持（2026-10-20 评审 §四）", async ({ page }) => {
+    await gotoAdminReady(page);
+    const frame = page.frameLocator("#admin-plugin-frame");
+    await frame.locator('.adm-nav-btn[data-page="slides"]').click();
+    await expect
+      .poll(async () => frame.locator("#adm-state-slides").getAttribute("data-page-state"))
+      .toBe("ready", { timeout: 10_000 });
+    const sel = frame.locator("#adm-slides-status-filter");
+    await expect(sel).toHaveValue("not_deleted");
+    await expect(sel.locator("option")).toHaveCount(6);
+    // 各状态计数（同口径同批数据）渲染出来，当前档带 ←
+    const counts = frame.locator("#adm-slides-counts");
+    await expect(counts).toContainText("未删除");
+    await expect(counts).toContainText("←");
+    await expect(counts).toContainText("已删除");
+    await expect(counts).toContainText("失败");
+    // 默认「未删除」：已删除墓碑不出现在列表
+    await expect(frame.locator("#adm-slides-tbody")).toContainText("e2e-temp-view.tif");
+    await expect(frame.locator("#adm-slides-tbody")).not.toContainText(
+      "e2e-admin-deleted.bmp");
+    // 切「已删除」：墓碑出现、正常切片消失（筛选在服务端分页前执行）
+    await sel.selectOption("deleted");
+    await expect(frame.locator("#adm-slides-tbody")).toContainText(
+      "e2e-admin-deleted.bmp", { timeout: 10_000 });
+    await expect(frame.locator("#adm-slides-tbody")).not.toContainText(
+      "e2e-temp-view.tif");
+    // 切「失败」：legacy 入口文件缺失显示「历史文件缺失（推断）」
+    await sel.selectOption("failed");
+    await expect(frame.locator("#adm-slides-tbody")).toContainText(
+      "e2e-admin-missing.svs", { timeout: 10_000 });
+    await expect(frame.locator("#adm-slides-tbody")).toContainText(
+      "历史文件缺失（推断）");
+    await expect(frame.locator("#adm-slides-tbody")).not.toContainText(
+      "依据现状推断");
+    // 切回「未删除」：墓碑消失、正常切片回来
+    await sel.selectOption("not_deleted");
+    await expect(frame.locator("#adm-slides-tbody")).toContainText(
+      "e2e-temp-view.tif", { timeout: 10_000 });
+    await expect(frame.locator("#adm-slides-tbody")).not.toContainText(
+      "e2e-admin-deleted.bmp");
+    // 反复切档后筛选控件仍完整（6 档；不因任何失败/重绘丢 option）
+    await expect(sel.locator("option")).toHaveCount(6);
+    await expect(counts).toContainText("未删除");
+    // 临时查看操作仍按状态可用（未删除档的 servable 行）
+    const row = frame.locator("#adm-slides-tbody tr", { hasText: "e2e-temp-view.tif" });
+    await expect(row).toContainText(/未开启|已结束|可查看/);
+    await assertNoHorizontalOverflow(page, "slides-filter-1440");
+  });
 });
 
 test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
@@ -934,7 +1129,8 @@ test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
     // R6（2026-09-19）身份冲突退役 + 2026-10-08 邀请退役 + 2026-10-09
     // 测试申请退役（round4 §2.3）——导航 9 页
     //（概览/用户/切片/格式申请/研究删除/设置/费用/插件/审计）。
-    const labels = ["概览", "用户", "切片", "格式申请", "研究删除", "设置", "费用", "插件", "审计"];
+    // 2026-10-20（评审 §三）：「研究删除」一级页退役 → 8 页
+    const labels = ["概览", "用户", "切片", "格式申请", "设置", "费用", "插件", "审计"];
     const navBtns = frame.locator(".adm-nav-btn");
     expect(await navBtns.count()).toBe(labels.length);
     for (let i = 0; i < labels.length; i++) {
@@ -1044,4 +1240,5 @@ test.describe("UI 升级 2026-09-01 — 移动 390×844（批次 E）", () => {
     await expect(detailBtn).toBeFocused();
     await assertNoHorizontalOverflow(page, "drawer-390");
   });
+
 });

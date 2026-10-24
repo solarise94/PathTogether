@@ -3,6 +3,33 @@
   "version_scheme": "YYYY.MM.DD product release. Do not use PathTogether package.json 0.1.0 (test package) as the product version.",
   "releases": [
     {
+      "version": "2026.10.24",
+      "date": "2026-10-24",
+      "published": true,
+      "components": {
+        "histopilot": "0.4.8",
+        "pathtogether": "suite-20261024"
+      },
+      "items": {
+        "zh": [
+          "切片转换器页面改版：把切片文件或文件夹拖到页面中间即可开始，也可以用「选择文件」「选择文件夹」按钮；页面列出主要特点、完整的支持格式和任务记录。",
+          "MRXS 切片可以先选 .mrxs 主文件，再按提示选择同名数据文件夹，不用从头重新选择；转换器和工作台上传都支持这样选。",
+          "转换完成后可以「保存到我的项目」：登录后选择保存位置，结果交给工作台上传并放进所选文件夹；未登录时会先引导登录或注册，注册后会提醒继续保存。",
+          "Mac 上保存大型 TIFF 后，系统缩略图进程可能造成数分钟卡顿；转换器在保存按钮旁增加了说明和可以尝试的缓解办法。",
+          "修复转换器的若干问题：连续转换两个多文件切片时可能读错文件；转换进程意外退出后任务不再卡住，可恢复的失败任务可以继续；浏览器清理了结果文件时给出明确提示；同一标签页一次只运行一个转换。",
+          "新增「支持项目」页面（转换器页面底部有入口）：可以给作者发邮件，也可以陪页面上的小猫玩一会儿。"
+        ],
+        "en": [
+          "The slide converter page is redesigned: drop slide files or a folder in the middle of the page to start, or use the “Choose file” / “Choose folder” buttons; the page lists the key features, the full set of supported formats and your job records.",
+          "For MRXS slides you can pick the .mrxs file first and then the same-named data folder when prompted, without starting over — in both the converter and workbench uploads.",
+          "After converting, “Save to my project” lets you pick a folder once signed in; the result is handed to the workbench upload and filed there. If you are not signed in you are guided to sign in or register, and reminded to finish saving afterwards.",
+          "On a Mac, saving a large TIFF may let the system thumbnail process slow things down for several minutes; the converter now explains this next to the save buttons, with a workaround to try.",
+          "Converter fixes: converting two multi-file slides in a row could read the wrong files; a crashed conversion no longer leaves the job stuck, and recoverable failed jobs can be resumed; a clear message when the browser has cleared the output file; one conversion at a time per tab.",
+          "New “Support the project” page (linked at the bottom of the converter): email the author, or play with the cat on the page for a while."
+        ]
+      }
+    },
+    {
       "version": "2026.10.20",
       "date": "2026-10-20",
       "published": true,

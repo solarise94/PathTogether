@@ -1537,7 +1537,7 @@ def test_return_page_pending_has_polling_attrs(_iso, monkeypatch):
 
 def test_return_page_paid_shows_receipt_with_verified_data(
         _iso, monkeypatch):
-    """已支付回跳页：凭条展示核实金额 + 订单号 + 准确免责声明 + 重播按钮，
+    """已支付回跳页：凭条展示核实金额 + 订单号 + 用途说明 + 重播按钮，
     并带平滑打印动画类。"""
     rt = sp.get_runtime("sandbox")
     order = _make_order(rt)
@@ -1549,7 +1549,7 @@ def test_return_page_paid_shows_receipt_with_verified_data(
     assert "receipt-live" in body
     assert "receipt-replay" in body
     assert "¥6.66" in body and order["out_trade_no"] in body
-    assert "付款记录以支付宝为准" in body
+    assert "你的支持将用于 HistoPilot 的服务器与日常维护。" in body
     assert "不代表付款记录" not in body
 
 

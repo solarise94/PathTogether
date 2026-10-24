@@ -171,7 +171,7 @@
       // 已支付窗格：致谢凭条打印 + 收下礼物去喂小猫（不再跳转回跳页）
       "support.modal.print.title": "谢谢你的支持！",
       "support.modal.print.kind": "致谢凭条",
-      "support.modal.print.thanks": "谢谢你！凭条上的礼物已打包好，可以拿去喂小猫。",
+      "support.receipt.use": "你的支持将用于 HistoPilot 的服务器与日常维护。",
       "support.modal.print.cta.cat_food": "收下猫粮，去喂小猫",
       "support.modal.print.cta.cat_toy": "收下猫玩具，去陪小猫",
       "support.modal.print.cta.mystery": "收下神秘礼物，交给小猫",
@@ -202,9 +202,7 @@
       "supportreturn.receipt.line.amount": "支持金额",
       "supportreturn.receipt.line.order": "订单号",
       "supportreturn.receipt.line.gift": "这份心意",
-      "supportreturn.receipt.thanks": "谢谢你。这份支持会用于本地切片转换工具与 HistoPilot 的开发、维护和服务器开销。",
       "supportreturn.receipt.sign": "—— HistoPilot 开发者",
-      "supportreturn.receipt.disclaimer": "* 本凭条为致谢卡片，付款记录以支付宝为准。",
       "supportreturn.receipt.replay": "再看一次",
       "supportreturn.receipt.replay.aria": "重新播放凭条打印",
       // 喂猫互动：回跳页只发「领取卡」，礼物本体在 /support 小猫身边
@@ -2027,7 +2025,7 @@
       // Paid pane: thank-you slip printing + take the gift to the cat
       "support.modal.print.title": "Thank you for your support!",
       "support.modal.print.kind": "THANK-YOU SLIP",
-      "support.modal.print.thanks": "Thank you! The gift on this slip is packed and ready to be fed to the cat.",
+      "support.receipt.use": "Your support goes toward HistoPilot's servers and day-to-day maintenance.",
       "support.modal.print.cta.cat_food": "Take the cat food, go feed the cat",
       "support.modal.print.cta.cat_toy": "Take the cat toy, go play with the cat",
       "support.modal.print.cta.mystery": "Take the mystery gift, hand it to the cat",
@@ -2058,9 +2056,7 @@
       "supportreturn.receipt.line.amount": "Amount",
       "supportreturn.receipt.line.order": "Order ref",
       "supportreturn.receipt.line.gift": "This gesture",
-      "supportreturn.receipt.thanks": "Thank you. This contribution goes toward development and maintenance of the local slide converter and HistoPilot.",
       "supportreturn.receipt.sign": "— The HistoPilot developer",
-      "supportreturn.receipt.disclaimer": "* This slip is a thank-you card; the payment record on Alipay prevails.",
       "supportreturn.receipt.replay": "Watch again",
       "supportreturn.receipt.replay.aria": "Replay the slip printing",
       // Feeding: the return page hands over a pickup card; the gift waits

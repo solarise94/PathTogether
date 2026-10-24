@@ -84,9 +84,9 @@ describe("致谢凭条打印（R2 视觉）", () => {
 		expect(supportCss).toContain("prefers-reduced-motion: reduce");
 	});
 
-	it("凭条只在回跳页已支付态；展示核实金额/订单号/准确免责声明 + 领取卡", () => {
+	it("凭条只在回跳页已支付态；展示核实金额/订单号/用途说明 + 领取卡", () => {
 		expect(returnHtml).toContain('class="receipt receipt-live"');
-		expect(returnHtml).toContain("付款记录以支付宝为准");
+		expect(returnHtml).toContain("你的支持将用于 HistoPilot 的服务器与日常维护。");
 		expect(returnHtml).toContain("¥{{ amount_yuan }}");
 		expect(returnHtml).toContain("receipt-replay");
 		// R4：礼物动画舞台退役，改为「领取卡」（礼物本体在 /support 猫卡）

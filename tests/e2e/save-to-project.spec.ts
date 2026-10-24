@@ -32,6 +32,9 @@ const CREDS = JSON.parse(readFileSync(
   inlineConvert?: boolean;
 };
 
+test.skip(!CREDS.inlineConvert,
+  "未装配 inline-convert E2E 基建（需 E2E_INLINE_CONVERT=1 启动 e2e_server）");
+
 const RUN_DIR = process.env.TEST_RUN_DIR || tmpdir();
 const SHOTS = join(RUN_DIR, "shots");
 const FIXTURE_DIR = process.env.E2E_INLINE_FIXTURE_DIR

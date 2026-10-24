@@ -11,7 +11,8 @@
  *   - 致谢凭条：平滑打印动画类 receipt-live；「再看一次」只重播凭条
  *     （礼物动画舞台已退役——喂猫互动在 /support 猫卡）；
  *   - 回跳页已支付态：领取卡（去喂小猫）替代礼物动画舞台；
- *   - /support 待机打印机 + 猫卡礼物（服务端渲染、hidden、托盘真按钮）。
+ *   - /support 猫卡礼物（服务端渲染、hidden、托盘真按钮）；待机打印机
+ *     不再渲染。
  */
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
@@ -95,9 +96,12 @@ describe("致谢凭条打印（R2 视觉）", () => {
 		expect(returnHtml).toContain("去喂小猫");
 		// 凭条礼物行含自定义金额的小鱼干
 		expect(returnHtml).toContain("一条小鱼干");
-		// /support 不自动打印：只有待机打印机与提示；猫卡有 id 锚点
-		expect(supportHtml).toContain("receipt-stage-idle");
-		expect(supportHtml).toContain("receipt-idle-paper");
+		// /support 不自动打印：待机打印机与提示不再渲染（弹层已支付窗格的
+		// 打印时刻仍复用 .printer 视觉）；猫卡有 id 锚点
+		expect(supportHtml).not.toContain("receipt-stage-idle");
+		expect(supportHtml).not.toContain("receipt-idle-paper");
+		expect(supportHtml).not.toContain("receipt-hint");
+		expect(supportHtml).not.toContain("收款机会弹出来");
 		expect(supportHtml).not.toContain('id="receipt"');
 		expect(supportHtml).toContain('id="cat-card"');
 	});

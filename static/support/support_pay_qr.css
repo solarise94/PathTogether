@@ -1,6 +1,7 @@
-/* support_pay_qr.css — /support/pay/<ref>/qr 桌面弹层内嵌二维码页（R3）。
+/* support_pay_qr.css — /support/pay/<ref>/qr 桌面弹层内嵌页。
    本页只活在 /support「支付状态」弹层的同源 iframe 里，布局力求裸：白底、
-   内容居中、无站点顶栏/页脚。无内联样式（CSP style-src 'self'）。 */
+   内容居中、无站点顶栏/页脚。未决订单在服务端 303 直达支付宝网关，本页只
+   渲染中性/关闭两个静态状态。无内联样式（CSP style-src 'self'）。 */
 
 html, body {
   margin: 0;
@@ -22,43 +23,6 @@ body {
   text-align: center;
   padding: 16px 14px;
   max-width: 320px;
-}
-
-.qr-title {
-  margin: 0 0 6px;
-  font-size: 15px;
-  font-weight: 600;
-}
-
-.qr-amount {
-  margin: 0 0 10px;
-  font-size: 22px;
-  font-weight: 700;
-  color: #1093d3;
-}
-
-/* SDK 表单宿主：SDK 的提交按钮去掉内联样式后仍较宽，这里收窄到容器内。
-   二维码 canvas 由收银台页在 iframe 内自行渲染（约 200px）。 */
-.pay-form-host {
-  min-height: 40px;
-}
-
-.pay-form-host input[type="submit"] {
-  width: 100%;
-  max-width: 240px;
-  height: 36px;
-  border: 0;
-  border-radius: 6px;
-  background: #1093d3;
-  color: #fff;
-  font-size: 14px;
-  cursor: pointer;
-}
-
-.qr-note {
-  font-size: 12px;
-  color: #66788a;
-  margin: 10px 0 0;
 }
 
 .qr-card p {

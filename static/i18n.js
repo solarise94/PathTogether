@@ -82,8 +82,6 @@
       "support.voluntary.free": "本地转换与保存继续免费使用，不需要登录。",
       "support.voluntary.noquota": "支持项目不会增加 AI 额度、存储空间、转换次数，也不会开通额外功能或优先处理权益。",
       "support.voluntary.amount": "支持金额由你自愿决定；不支付也不影响使用本地转换工具。",
-      // R2 视觉：凭条打印时刻移到回跳页已支付态（键迁移到 supportreturn.receipt.*）
-      "support.receipt.idle.hint": "完成支持后，收款机会弹出来为你打印一张致谢凭条；凭条上的礼物可以拿去喂小猫。",
       "support.notice.pending.title": "你有一笔支持待确认",
       "support.notice.pending.body": "还有一笔 ¥",
       "support.notice.pending.body2": " 的支持待确认。",
@@ -179,10 +177,8 @@
       "support.modal.print.cta.mystery": "收下神秘礼物，交给小猫",
       "support.modal.print.cta.fish_treat": "收下小鱼干，去喂小猫",
       "support.modal.print.fullreceipt": "查看完整凭条",
-      // R3：/support/pay/<ref>/qr 弹层内嵌二维码页
+      // R3：/support/pay/<ref>/qr 弹层内嵌页（中性/关闭态）
       "supportpayqr.doc.title": "支付宝扫码付款 · HistoPilot",
-      "supportpayqr.title": "支付宝扫码付款",
-      "supportpayqr.noscript": "浏览器未启用 JavaScript：请点击「立即支付」继续。",
       "supportpayqr.closed.title": "订单已关闭",
       "supportpayqr.closed.body": "这个支持订单已关闭。请回到支持页重新发起。",
       "supportpayqr.neutral.title": "没有找到对应的订单",
@@ -1940,9 +1936,6 @@
       "support.voluntary.free": "Local conversion and saving remain free and require no sign-in.",
       "support.voluntary.noquota": "Supporting does not add AI quota, storage, conversion runs, extra features or priority processing.",
       "support.voluntary.amount": "The amount is entirely your choice; not paying does not affect your use of the local converter.",
-      // R2 visual: the slip now prints on the paid return page (keys moved
-      // to supportreturn.receipt.*)
-      "support.receipt.idle.hint": "After you complete a support payment, the checkout printer pops up and prints a thank-you slip; the gift on it can be fed to the cat.",
       "support.notice.pending.title": "You have a support payment pending",
       "support.notice.pending.body": "A ¥",
       "support.notice.pending.body2": " support payment is awaiting confirmation.",
@@ -2040,10 +2033,8 @@
       "support.modal.print.cta.mystery": "Take the mystery gift, hand it to the cat",
       "support.modal.print.cta.fish_treat": "Take the fish treat, go feed the cat",
       "support.modal.print.fullreceipt": "View the full slip",
-      // R3: /support/pay/<ref>/qr embedded QR page inside the modal
+      // R3: /support/pay/<ref>/qr embedded page inside the modal (neutral/closed)
       "supportpayqr.doc.title": "Pay with Alipay · HistoPilot",
-      "supportpayqr.title": "Pay with Alipay",
-      "supportpayqr.noscript": "JavaScript is disabled: please click \"Pay now\" to continue.",
       "supportpayqr.closed.title": "Order closed",
       "supportpayqr.closed.body": "This support order was closed. Please start again from the support page.",
       "supportpayqr.neutral.title": "No matching order",

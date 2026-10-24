@@ -154,7 +154,7 @@
         {% endif %}
 
         {# 可以陪玩的小猫（内联 SVG + CSS 动画，JS 只是渐进增强；无图片
-           资源、无网络请求、无内联样式/脚本）。始终渲染在左栏末位。 #}
+           资源、无网络请求、无内联样式/脚本）。渲染在说明卡之后。 #}
       <section class="card cat-card" id="cat-card" aria-labelledby="cat-caption">
         <h2 id="cat-caption" class="cat-caption" data-i18n="support.cat.caption">先陪小猫玩一会儿吧</h2>
         <div class="cat-stage" id="cat-stage" role="button" tabindex="0"
@@ -208,17 +208,6 @@
         <p class="visually-hidden" id="cat-live" aria-live="polite"></p>
       </section>
       </div>
-
-      {# R2 视觉 + 喂猫互动：打印时刻在桌面端「支付状态」弹层的已支付窗格
-         （付款服务端核实后）；移动端仍在 /support/return。这里只放一台待机
-         打印机与静音提示，保持两栏布局平衡；无内联样式/脚本。 #}
-      <aside class="receipt-stage receipt-stage-idle" aria-label="致谢凭条打印机（待机）">
-        <div class="printer" aria-hidden="true"><span class="printer-led"></span></div>
-        <div class="receipt-window receipt-window-idle">
-          <div class="receipt-idle-paper" aria-hidden="true"></div>
-        </div>
-        <p class="receipt-hint" data-i18n="support.receipt.idle.hint">完成支持后，收款机会弹出来为你打印一张致谢凭条；凭条上的礼物可以拿去喂小猫。</p>
-      </aside>
     </div>
 
 
@@ -238,7 +227,7 @@
   {% if pay_enabled %}
   {# 桌面端「支付状态」弹层（R3）：JS + 宽视口时由 support.js 拦截下单提交，
      JSON 建单后在本页 iframe 里加载 /support/pay/<ref>/qr（同源 embed 页，
-     服务端签名表单带 qr_pay_mode=4 自动提交，收银台在 iframe 内渲染二维码）。
+     未决订单被服务端 303 到签名 GET 网关 URL，收银台在 iframe 内渲染二维码）。
      移动端/窄屏/触屏/无 JS 不渲染此层逻辑（hidden），整页跳转收银台不变。
      无内联样式/脚本；焦点圈闭、Esc 关闭、aria-modal 由 support.js 提供。 #}
   <div class="pay-modal" id="pay-modal" role="dialog" aria-modal="true"

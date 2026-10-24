@@ -120,11 +120,10 @@ main {
   display: flex; flex-direction: column; gap: 22px;
 }
 
-.support-hero {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(300px, 380px);
-  gap: 32px;
-  align-items: start;
+.support-hero,
+#contact {
+  /* 单栏：说明区与联系卡同宽，限宽保持舒适阅读宽度。 */
+  max-width: 800px;
 }
 .support-intro { min-width: 0; }
 
@@ -437,27 +436,6 @@ main {
 }
 .receipt-replay:hover { color: var(--text); background: #2c2c2c; }
 
-/* R2 视觉：/support 上的待机打印机——打印时刻已移到回跳页已支付态。 */
-.receipt-window-idle { padding-bottom: 12px; }
-.receipt-idle-paper {
-  height: 30px;
-  margin: 0 14px;
-  background:
-    repeating-linear-gradient(0deg,
-      rgba(120, 100, 70, 0.03) 0 1px, transparent 1px 3px),
-    var(--paper);
-  border-radius: 0 0 3px 3px;
-  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.3);
-}
-.receipt-hint {
-  margin: 10px 0 0;
-  color: var(--muted);
-  font-size: 13px;
-  text-align: center;
-}
-.receipt-stage-idle { align-items: center; }
-.receipt-window-idle { width: min(360px, 100%); }
-
 /* R2 B1：会话内待确认/近期已支付的提醒卡。 */
 .pay-notice { border-color: rgba(0, 122, 255, 0.35); }
 .pay-notice-title { margin: 0 0 8px; font-size: 16px; }
@@ -548,7 +526,6 @@ main {
 
 /* ---------------------------------------------------------- responsive -- */
 @media (max-width: 900px) {
-  .support-hero { grid-template-columns: minmax(0, 1fr); gap: 26px; }
   .support-intro h1 { font-size: 34px; }
   .receipt-stage { align-items: stretch; }
   .printer, .receipt-window { width: 100%; max-width: 420px; margin-left: auto; margin-right: auto; }
@@ -590,8 +567,8 @@ main {
    未配置收款方式时，「暂未开放」卡片换成一只可以陪玩的小猫：
    内联 SVG + CSS 动画（呼吸/眨眼/尾巴），support.js 只是渐进增强
    （视线跟随、摸摸、毛线球、打盹）。无图片资源、无网络请求。 */
-/* 卡片位于左栏（与其他卡片同宽，凭条仍在右栏）；舞台限宽使猫的高度约
-   380px，与改版前观感一致（R1 视觉评审 2026-10-21）。 */
+/* 卡片与其他说明卡同宽；舞台限宽使猫的高度约 380px，与改版前观感一致
+   （R1 视觉评审 2026-10-21）。 */
 .cat-caption { margin: 0 0 10px; font-size: 17px; font-weight: 700; }
 .cat-stage {
   position: relative;

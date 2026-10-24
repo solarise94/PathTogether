@@ -10,8 +10,10 @@
 - SDK（alipay-sdk-python==3.7.1411，从安装源码核实）：
   - ``from alipay.aop.api.AlipayClientConfig import AlipayClientConfig``
     ``from alipay.aop.api.DefaultAlipayClient import DefaultAlipayClient``
-  - 页面跳转类 API **必须** ``client.page_execute(request)``（返回 HTML 表单，
-    需在浏览器渲染并提交；``execute()`` 只用于查询/退款/关闭等服务端 API）；
+  - 页面跳转类 API **必须** ``client.page_execute(request)``（默认 http_method
+    "POST" 返回 HTML 表单，需在浏览器渲染并提交；``http_method="GET"`` 返回
+    已签名的网关跳转 URL，可作 303 Location 直达收银台；``execute()`` 只用于
+    查询/退款/关闭等服务端 API）；
   - Python 使用 **PKCS#1** 私钥（沙箱文件字段 ``appPrivatePkcsKey``），原样
     写入 SDK 配置：不添加 PEM 头尾、不转换格式、不 Base64 重编码；
   - 时间戳由 SDK 自行按 ``yyyy-MM-dd HH:mm:ss`` 生成（DefaultAlipayClient
@@ -685,9 +687,9 @@ def _order_close_deadline(created_at):
         seconds=SWEEP_CLOSE_MARGIN_SECONDS)
 
 
-def build_page_pay_form(runtime, order, return_url, notify_url=None,
-                        qr_embed=False):
-    """构造 ``alipay.trade.page.pay`` 的 POST 表单 HTML（已收敛 CSP）。
+def _build_page_pay_request(runtime, order, return_url, notify_url=None,
+                            qr_embed=False):
+    """构造 ``alipay.trade.page.pay`` 请求（POST 表单与 GET 跳转 URL 共用）。
 
     ``notify_url``：真实生产/公网联调传入；本地沙箱没有公网 HTTPS 地址时**省略**
     （契约：不传 None/空串/占位 URL）。``return_url`` 来自服务端
@@ -718,8 +720,56 @@ def build_page_pay_form(runtime, order, return_url, notify_url=None,
         model.qr_pay_mode = QR_PAY_MODE_EMBED
         model.qrcode_width = QRCODE_WIDTH_EMBED
     request.biz_model = model
+    return request
+
+
+def build_page_pay_form(runtime, order, return_url, notify_url=None,
+                        qr_embed=False):
+    """构造 ``alipay.trade.page.pay`` 的 POST 表单 HTML（已收敛 CSP）。"""
+    request = _build_page_pay_request(runtime, order, return_url,
+                                      notify_url=notify_url, qr_embed=qr_embed)
     form_html = build_client(runtime).page_execute(request)  # POST 表单
     return sanitize_page_form(form_html)
+
+
+def validate_page_pay_url(url, runtime):
+    """校验 SDK 产出的 GET 跳转 URL（iframe 内 303 直达收银台用），形态不符
+    一律 ``TradeOperationError``（fail-closed，绝不把半成品 URL 发给浏览器）：
+
+    - 必须以运行时配置的**精确网关 URL** + ``?`` 开头（防拼到他方主机）；
+    - 不得含任何空白/CR/LF（URL 进 Location 头，注入面一律拒绝）；
+    - 查询串必须含 ``charset=utf-8``——网关按查询串里的 charset 解码请求
+      （缺省回退 GBK，UTF-8 的 subject 会成乱码，同 ``sanitize_page_form``
+      的闸）；
+    - 必须含非空 ``sign``（无签名网关直接拒绝）。
+    """
+    text = url or ""
+    if not text.startswith(runtime.gateway + "?"):
+        raise TradeOperationError("支付跳转 URL 网关前缀与配置不符")
+    if re.search(r"\s", text):
+        raise TradeOperationError("支付跳转 URL 含空白字符")
+    query = dict(parse_qsl(urlsplit(text).query, keep_blank_values=True))
+    if query.get("charset") != "utf-8":
+        raise TradeOperationError("支付跳转 URL 查询缺少 charset=utf-8")
+    if not query.get("sign"):
+        raise TradeOperationError("支付跳转 URL 缺少签名参数")
+    return text
+
+
+def build_page_pay_url(runtime, order, return_url, notify_url=None,
+                       qr_embed=True):
+    """构造 ``alipay.trade.page.pay`` 的**签名 GET 跳转 URL**（非表单）。
+
+    供 /support/pay/<ref>/qr 在订单未决时 303 重定向：iframe 内零 HTML/零 JS
+    直接跟随到收银台的可嵌入二维码页——不依赖浏览器执行跨站表单自动提交。
+    biz 参数与 ``build_page_pay_form`` 完全一致（含 ``qr_embed`` 语义）。
+    SDK（3.7.1411）：``page_execute(request, http_method="GET")`` 返回
+    ``url + "?" + 公共参数 + "&" + biz 参数``（均 url_encode）。
+    """
+    request = _build_page_pay_request(runtime, order, return_url,
+                                      notify_url=notify_url, qr_embed=qr_embed)
+    url = build_client(runtime).page_execute(request, http_method="GET")
+    return validate_page_pay_url(url, runtime)
 
 
 # --------------------------------------------------------------------------- #

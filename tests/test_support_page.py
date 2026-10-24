@@ -162,17 +162,18 @@ def test_support_no_inline_script_or_style(_iso):
 
 
 # --------------------------------------------------------------------------- #
-# 7. 致谢凭条：打印时刻在回跳页已支付态；/support 只有待机打印机
+# 7. 致谢凭条：打印时刻在弹层已支付窗格/回跳页；/support 不渲染待机打印机
 # --------------------------------------------------------------------------- #
-def test_support_receipt_idle_printer_without_payment_claims(_iso):
-    """R2 视觉 + R4 喂猫互动：/support 不自动打印凭条——只有待机打印机与
-    静音提示（打印时刻在桌面弹层的已支付窗格/移动端回跳页）；凭条本体与
-    打印动画不在本页。"""
+def test_support_receipt_idle_printer_removed_without_payment_claims(_iso):
+    """/support 不渲染待机打印机与静音提示（打印时刻只在桌面弹层的已支付
+    窗格/移动端回跳页）；凭条本体与打印动画不在本页。"""
     body = _get("/support").get_data(as_text=True)
-    assert "receipt-stage-idle" in body
-    assert "receipt-idle-paper" in body
-    assert "完成支持后，收款机会弹出来为你打印一张致谢凭条" in body
-    assert "凭条上的礼物可以拿去喂小猫" in body
+    assert "receipt-stage-idle" not in body
+    assert "receipt-window-idle" not in body
+    assert "receipt-idle-paper" not in body
+    assert "receipt-hint" not in body
+    assert "完成支持后，收款机会弹出来为你打印一张致谢凭条" not in body
+    assert "凭条上的礼物可以拿去喂小猫" not in body
     assert 'id="receipt"' not in body       # 凭条本体不在 /support
     assert "receipt-replay" not in body     # 重播按钮也不在
     # 平台无法核实付款：不得出现到账/已支付/成功状态

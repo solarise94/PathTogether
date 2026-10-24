@@ -242,21 +242,23 @@ def test_return_url_changes_host_and_loses_order_session(_iso, rt, monkeypatch):
 
 
 def test_return_url_qr_embed_uses_entry_host(_iso, rt, monkeypatch):
-    """扩展（B2）：QR 内嵌页 /support/pay/<ref>/qr 同样用入口 host 构造
-    return_url（fake 经 **kwargs 接收 qr_embed=True）。"""
+    """扩展（B2）：QR 内嵌路由 /support/pay/<ref>/qr 同样用入口 host 构造
+    return_url（fake 经 **kwargs 接收 qr_embed=True；未决订单以 303 直达
+    签名 GET 网关 URL）。"""
     order = helpers._make_order(rt)
     monkeypatch.setenv('PUBLIC_BASE_URL', 'https://histopilot.cn')
     client = helpers._client()
     with client.session_transaction(base_url='https://histopilot.com') as sess:
         sess['support_order_refs'] = [order['out_trade_no']]
     captured = []
-    def form(runtime, current_order, return_url, **kwargs):
+    def build_url(runtime, current_order, return_url, **kwargs):
         captured.append(return_url)
-        return '<form class="pay-form"></form>'
-    monkeypatch.setattr(sp, 'build_page_pay_form', form)
+        return runtime.gateway + '?charset=utf-8&sign=fake'
+    monkeypatch.setattr(sp, 'build_page_pay_url', build_url)
     page = client.get('/support/pay/%s/qr' % order['out_trade_no'],
                       base_url='https://histopilot.com')
-    assert page.status_code == 200
+    assert page.status_code == 303
+    assert page.headers['Location'].startswith(rt.gateway + '?')
     assert captured == ['https://histopilot.com/support/return']
 
 

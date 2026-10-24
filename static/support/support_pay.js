@@ -19,7 +19,7 @@
     var page = document.body.getAttribute('data-page');
     var key;
     if (page === 'support-pay-qr') {
-      key = 'supportpayqr.doc.title';       // 弹层内嵌二维码页
+      key = 'supportpayqr.doc.title';       // 弹层内嵌页（中性/关闭态）
     } else if (document.body.querySelector('[data-pay-autosubmit]') != null) {
       key = 'supportpay.doc.title';
     } else {

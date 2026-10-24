@@ -3733,10 +3733,11 @@ def _apply_support_page_security_headers(resp, *, form_action,
 
     ``frame_src``（可选）：CSP frame-src 指令值。仅 /support（开启支付）需要：
     桌面端「支付状态」弹层在本页 iframe 里先加载同源 embed 页
-    （/support/pay/<ref>/qr），embed 页内的签名表单再 POST 到当前模式的支付宝
-    跳转链——两个目标都精确列出（'self' + 当前模式三台 origin，沙箱/生产各自
-    独立、无通配符；生产表与 form_action_origins 同源同表，上线前必须按部署
-    文档实测 Location 链复核）。其余页面不下发 frame-src（default-src 'none'
+    （/support/pay/<ref>/qr），未决订单经它 303 直达当前模式的支付宝网关并
+    继续 302 到收银台——同源页与整条跨站跳转链都精确列出（'self' + 当前模式
+    三台 origin，沙箱/生产各自独立、无通配符；生产表与 form_action_origins
+    同源同表，上线前必须按部署文档实测 Location 链复核）。Chrome 对重定向链
+    的每一跳都执行 frame-src。其余页面不下发 frame-src（default-src 'none'
     已禁框架）。
 
     ``frame_ancestors`` / ``X-Frame-Options``：默认 'none'/'DENY'（全站禁嵌）；
@@ -3778,8 +3779,9 @@ def _apply_support_security_headers(resp):
     第三方图片或 data:。no-store 便于部署后及时撤换收款资料。
     开启支付宝下单（SUPPORT_ALIPAY_PAY_ENABLED）时表单 POST /support/orders
     是同源写 → form-action 'self'，同时放开「支付状态」弹层 iframe 所需的
-    frame-src（'self' + 当前模式支付宝跳转链精确 origin——embed 页与它提交
-    的网关链；关闭态维持 'none' 形态且不下发 frame-src）。
+    frame-src（'self' + 当前模式支付宝跳转链精确 origin——iframe 从同源
+    embed 页 303 到网关并继续跳到收银台；关闭态维持 'none' 形态且不下发
+    frame-src）。
     """
     form_action = "self" if SUPPORT_ALIPAY_PAY_ENABLED else "none"
     frame_src = None
@@ -4559,50 +4561,34 @@ def _support_pay_neutral_response():
     return _apply_support_page_security_headers(resp, form_action="none")
 
 
-#: embed 页（弹层内嵌二维码）族的安全头：CSP form-action 放开当前模式跳转链
-#（仅 form 态），frame-ancestors 'self' + X-Frame-Options SAMEORIGIN——本页
-#: 只为 /support 弹层的同源 iframe 存在（2026-10-22 沙箱实测：收银台 QR 页
-#: 无 X-Frame-Options、不 frame-bust，可嵌入）。
-def _support_pay_qr_response(pay_state, order=None, form_html=""):
-    amount_yuan = None
-    if order is not None and pay_state in ("form", "closed"):
-        amount_yuan = support_payments_module().fen_to_yuan(
-            order["amount_fen"])
+#: embed 页（弹层内嵌二维码）族的安全头：frame-ancestors 'self' +
+#: X-Frame-Options SAMEORIGIN——本页只为 /support 弹层的同源 iframe 存在
+#（沙箱实测：收银台 QR 页无 X-Frame-Options、不 frame-bust，可嵌入）；
+#: 未决订单以 303 离站（无 HTML），中性/关闭态无外发表单 → form-action 'none'。
+def _support_pay_qr_response(pay_state):
     resp = make_response(render_template(
         "support_pay_qr.html",
-        order=order,
-        amount_yuan=amount_yuan,
         pay_state=pay_state,
-        form_html=form_html,
     ))
-    runtime = _support_pay_runtime()
-    if pay_state == "form" and runtime is not None:
-        form_action = " ".join(support_payments_module()
-                               .form_action_origins(runtime.mode))
-    else:
-        form_action = "none"
     return _apply_support_page_security_headers(
-        resp, form_action=form_action,
+        resp, form_action="none",
         frame_ancestors="self", x_frame_options="SAMEORIGIN")
 
 
 @app.route("/support/pay/<out_trade_no>/qr", methods=["GET"])
 def support_pay_qr_embed(out_trade_no):
-    """桌面端「支付状态」弹层的同源内嵌页（iframe 专用，自动提交签名表单）。
+    """桌面端「支付状态」弹层的同源内嵌页（iframe 专用）。
 
-    与 /support/pay/<ref> 同一套闸门与会话绑定（ foreign/unknown/形态非法 →
-    中性页、不建表单、不触碰支付宝），差异只有两点：
-
-    - biz 参数额外下发 ``qr_pay_mode=4`` + ``qrcode_width``（见
-      ``build_page_pay_form``；沙箱实测收银台渲染 200×200 裸二维码 canvas、
-      自动换码、付款后在 iframe 内导航到 return_url——回跳页的外链 JS 会
-      break out 到顶层窗口，弹层轮询通常更早触发顶层跳转）；
-    - CSP：form-action 放开当前模式跳转链（同支付页），frame-ancestors
-      'self' + X-Frame-Options SAMEORIGIN（本页存在的唯一目的就是被本站
-      /support 页 iframe 嵌入）。
+    与 /support/pay/<ref> 同一套闸门与会话绑定（foreign/unknown/形态非法 →
+    中性页、不触碰支付宝），差异在于未决订单的走向：303 重定向到
+    ``alipay.trade.page.pay`` 的**签名 GET 网关 URL**（
+    ``build_page_pay_url``，biz 参数带 ``qr_pay_mode=4`` + ``qrcode_width``）
+    ——iframe 零 HTML/零 JS 直接跟随到收银台可嵌入二维码页，不依赖浏览器
+    执行跨站表单自动提交。iframe 的整条导航链（同源 embed 页 → 网关 →
+    中转 → 收银台）由 /support 的 CSP frame-src 覆盖。
 
     已支付 → 303 回跳结果页（iframe 内同站导航，会话 Cookie 随行）；已关闭 →
-    关闭态页（无表单）。订单/配置归属不匹配 → 与未知订单同一中性响应。
+    关闭态页。订单/配置归属不匹配 → 与未知订单同一中性响应。
     """
     _support_pay_gate_404()
     sp = support_payments_module()
@@ -4618,31 +4604,29 @@ def support_pay_qr_embed(out_trade_no):
     if order["status"] == "paid":
         return redirect("/support/return?out_trade_no=%s"
                         % order["out_trade_no"], code=303)
-    pay_state = "form"
-    form_html = ""
     if order["status"] == "closed":
-        pay_state = "closed"
-    else:
-        if runtime is None:
-            return _support_pay_error("unavailable", status=503)
-        try:
-            return_url = _support_return_url()
-            if not return_url:
-                raise RuntimeError("return_url origin unavailable")
-            notify_url = SUPPORT_ALIPAY_PAY_NOTIFY_URL or None  # 空则省略
-            form_html = sp.build_page_pay_form(runtime, order, return_url,
-                                               notify_url=notify_url,
-                                               qr_embed=True)
-        except (sp.TradeOperationError, sp.SupportPayConfigError,
-                RuntimeError, ValueError) as exc:
-            # 日志只带异常类型，不带表单/签名内容
-            app.logger.error("support pay qr form build failed: %s",
-                             type(exc).__name__)
-            return _support_pay_error("unavailable", status=502)
-        sp.mark_paying(order["out_trade_no"])
-        order = sp.get_order(out_trade_no) or order
-    return _support_pay_qr_response(pay_state, order=order,
-                                    form_html=form_html)
+        return _support_pay_qr_response("closed")
+    if runtime is None:
+        return _support_pay_error("unavailable", status=503)
+    try:
+        return_url = _support_return_url()
+        if not return_url:
+            raise RuntimeError("return_url origin unavailable")
+        notify_url = SUPPORT_ALIPAY_PAY_NOTIFY_URL or None  # 空则省略
+        pay_url = sp.build_page_pay_url(runtime, order, return_url,
+                                        notify_url=notify_url, qr_embed=True)
+    except (sp.TradeOperationError, sp.SupportPayConfigError,
+            RuntimeError, ValueError) as exc:
+        # 日志只带异常类型，不带 URL/签名内容
+        app.logger.error("support pay qr url build failed: %s",
+                         type(exc).__name__)
+        return _support_pay_error("unavailable", status=502)
+    sp.mark_paying(order["out_trade_no"])
+    resp = redirect(pay_url, code=303)
+    # 签名 URL 一次性使用：任何缓存都不得存这条跳转
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return resp
 
 
 @app.route("/support/return", methods=["GET"])

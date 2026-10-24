@@ -78,7 +78,7 @@ describe("support.js 桌面端弹层拦截（R3）", () => {
 		expect(supportJs).toContain("form.submit()");
 	});
 
-	it("iframe 指向同源 embed 页 /support/pay/<ref>/qr（服务端签名 + qr 参数）", () => {
+	it("iframe 指向同源 embed 页 /support/pay/<ref>/qr（未决订单服务端 303 直达签名网关 URL）", () => {
 		expect(supportJs).toContain(
 			"frame.src = '/support/pay/' + data.out_trade_no + '/qr'");
 	});
@@ -203,7 +203,7 @@ describe("support_pay.js 回跳页 breakout（R3）", () => {
 });
 
 describe("embed 模板契约（/support/pay/<ref>/qr）", () => {
-	it("无内联脚本/内联样式；表单宿主交给外链 JS 自动提交", () => {
+	it("无内联脚本/内联样式；模板不含任何支付表单（未决订单服务端 303 离站）", () => {
 		// 先剥 Jinja 注释（{# … #} 不进渲染产物；注释里的字面 <script>/<style>
 		// 不是页面内容），与 pytest 的「渲染后无内联」检查同口径。
 		const rendered = qrHtml.replace(/\{#[\s\S]*?#\}/g, "");
@@ -212,13 +212,15 @@ describe("embed 模板契约（/support/pay/<ref>/qr）", () => {
 		}
 		expect(rendered).not.toContain("<style");
 		expect(rendered).not.toMatch(/\bstyle\s*=/);
-		expect(qrHtml).toContain('class="pay-form-host"');
+		expect(qrHtml).not.toContain("pay-form-host");
+		expect(qrHtml).not.toContain("form_html");
+		expect(qrHtml).not.toContain("<form");
 	});
 
-	it("中性态不渲染表单（无 biz_content 占位）", () => {
+	it("中性态分支不渲染订单上下文", () => {
 		const neutralBranch = qrHtml.slice(
 			qrHtml.indexOf("pay_state == 'neutral'"),
-			qrHtml.indexOf("pay_state == 'closed'"));
+			qrHtml.indexOf("{% else %}"));
 		expect(neutralBranch).not.toContain("form_html");
 	});
 });

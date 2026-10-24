@@ -5,13 +5,13 @@
 //  1. 跟随语言切换更新 document.title；
 //  2. 下单提交防双击（UX 层；服务端幂等 key 才是权威）；
 //  3. 桌面端（宽视口 + 非触控）拦截下单提交：JSON 建单后打开「支付状态」
-//     弹层，iframe 加载同源 embed 页（/support/pay/<ref>/qr，服务端签名表单
-//     带 qr_pay_mode=4 自动提交，收银台在 iframe 内渲染二维码），轮询既有
-//     状态端点。paid → 弹层切到第三窗格「致谢凭条打印」（不再跳转回跳页），
-//     「收下礼物」关弹层、滚到小猫并把礼物放进猫卡；closed → 「二维码已
-//     过期」+「重新生成」（服务端先复核旧单：已支付直接出示凭条，未支付
-//     才关旧建新）；neutral → 「暂时无法确认」会话变体（订单号 + 联系入口，
-//     绝不从它宣判过期）。移动端/窄屏/触屏保持原整页跳转。
+//     弹层，iframe 加载同源 embed 页（/support/pay/<ref>/qr，未决订单被
+//     服务端 303 到签名 GET 网关 URL，收银台在 iframe 内渲染二维码），轮询
+//     既有状态端点。paid → 弹层切到第三窗格「致谢凭条打印」（不再跳转
+//     回跳页），「收下礼物」关弹层、滚到小猫并把礼物放进猫卡；closed →
+//     「二维码已过期」+「重新生成」（服务端先复核旧单：已支付直接出示
+//     凭条，未支付才关旧建新）；neutral → 「暂时无法确认」会话变体（订单
+//     号 + 联系入口，绝不从它宣判过期）。移动端/窄屏/触屏保持原整页跳转。
 //     R3（2026-10-21 评审后 add-on），R4（喂猫互动 add-on，同日用户评审），
 //     r4（neutral/重新生成语义修复，2026-10-23），r5（幂等 key 跟随展示
 //     订单：建单/重建成功后把请求实际使用的 key 同步回表单隐藏输入；换额
@@ -628,7 +628,7 @@
         t('support.modal.frame.aria') || '支付宝收款台');
       // 严格 200×200（收银台 qr_pay_mode=4 二维码原尺寸；滚动关闭）
       frame.setAttribute('scrolling', 'no');
-      // 同源 embed 页：服务端签名表单（qr_pay_mode=4）自动提交到支付宝
+      // 同源 embed 页：未决订单被服务端 303 到签名 GET 网关 URL（qr_pay_mode=4）
       frame.src = '/support/pay/' + data.out_trade_no + '/qr';
       frameHost.appendChild(frame);
       if (qrPane) qrPane.hidden = false;

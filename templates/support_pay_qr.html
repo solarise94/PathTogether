@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page="support-pay-qr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>支付宝扫码付款 · HistoPilot</title>
+  <meta name="robots" content="noindex, nofollow" />
+  {# 页面级 CSP（_support_pay_qr_response）：script-src/style-src 'self'；
+     form 态 form-action 只放开当前模式支付宝网关精确跳转链；frame-ancestors
+     'self' + X-Frame-Options SAMEORIGIN——本页只为 /support「支付状态」弹层的
+     同源 iframe 存在。不得出现内联 <style> / style 属性 / 内联 <script>；
+     SDK 表单已在服务端收敛（去内联脚本，外链 JS 自动提交）。 #}
+  <link rel="stylesheet" href="/static/support/support_pay_qr.css?v=20261021f" />
+  <script defer src="/static/i18n.js?v=20261021i"></script>
+  <script defer src="/static/support/support_pay.js?v=20261021g"></script>
+</head>
+<body id="top">
+  <main id="main">
+    {% if pay_state == 'neutral' %}
+    {# 会话绑定中性态：未知/他方订单同一响应，不渲染任何订单上下文、不建表单 #}
+    <section class="qr-card" aria-labelledby="qr-neutral-title">
+      <h1 id="qr-neutral-title" data-i18n="supportpayqr.neutral.title">没有找到对应的订单</h1>
+      <p data-i18n="supportpayqr.neutral.body">这里只处理本会话刚发起的支持订单。</p>
+    </section>
+    {% elif pay_state == 'closed' %}
+    <section class="qr-card" aria-labelledby="qr-closed-title">
+      <h1 id="qr-closed-title" data-i18n="supportpayqr.closed.title">订单已关闭</h1>
+      <p data-i18n="supportpayqr.closed.body">这个支持订单已关闭。请回到支持页重新发起。</p>
+    </section>
+    {% else %}
+    <section class="qr-card" data-pay-autosubmit>
+      <h1 class="qr-title" data-i18n="supportpayqr.title">支付宝扫码付款</h1>
+      <p class="qr-amount">¥{{ amount_yuan }}</p>
+      {# SDK page_execute 返回的支付表单（qr_pay_mode=4）：服务端已去掉内联
+         脚本/内联样式并加 class="pay-form"；自动提交由 support_pay.js 完成，
+         收银台在 iframe 内渲染可嵌入二维码（沙箱实测 200×200 canvas）。 #}
+      <div class="pay-form-host">{{ form_html | safe }}</div>
+      <noscript><p class="qr-note" data-i18n="supportpayqr.noscript">浏览器未启用 JavaScript：请点击「立即支付」继续。</p></noscript>
+    </section>
+    {% endif %}
+  </main>
+</body>
+</html>

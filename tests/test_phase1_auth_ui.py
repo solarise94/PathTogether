@@ -295,6 +295,52 @@ def test_login_next_allows_site_absolute(monkeypatch):
     assert r.status_code == 302
     assert r.headers["Location"] == "/api/slides"
 
+
+@pytest.mark.parametrize("bad_next", [
+    "/\t/evil.com", "/\n/evil.com", "/\r/evil.com", "/ /evil.com",
+    "/\\evil.com", "\\\\evil.com", "/%09/evil.com", "/%2F/evil.com",
+])
+def test_login_next_rejects_control_chars_and_encoded(monkeypatch, bad_next):
+    """复核 2026-10-22（开放跳转修复）：控制字符/空白/反斜杠/已编码前缀的
+    next 一律回落 /app。
+
+    - 已登录：GET /login?next= 立即 302 —— Location 必须同源（/app）；
+    - 匿名：渲染 200 登录页（绝不 500），页内隐藏 next 已回落（body 不含
+      evil.com）。
+    """
+    from urllib.parse import quote
+    app_mod.AUTH_ENABLED = True
+    _setup_owner_and_user()
+    # 已登录会话：GET /login 立即 302 到安全 next
+    client = _client()
+    _login_ok(client)
+    r = client.get("/login?next=" + quote(bad_next, safe=""))
+    assert r.status_code == 302, bad_next
+    assert r.headers["Location"] == "/app", bad_next
+    # 匿名：200 渲染（此前 CR/LF 会让 redirect() 抛 ValueError → 500）
+    anon = _client()
+    r2 = anon.get("/login?next=" + quote(bad_next, safe=""))
+    assert r2.status_code == 200, bad_next
+    assert "evil.com" not in r2.get_data(as_text=True), bad_next
+
+
+def test_login_next_preserves_query_string(monkeypatch):
+    """转换器「保存到我的项目」回跳（2026-10-22）：next 允许站内绝对路径
+    **带查询串**（/tools/slides?save=<jobId>），登录成功后原样回跳；
+    带查询串的协议相对/反斜杠变体依旧拒绝（防线不因查询串放宽）。"""
+    app_mod.AUTH_ENABLED = True
+    _setup_owner_and_user()
+    client = _client()
+    nxt = "/tools/slides?save=job1"
+    r = _login_ok(client, next=nxt)
+    assert r.status_code == 302
+    assert r.headers["Location"] == nxt
+    for bad in ("//evil.com?save=job1", "/\\evil.com?save=job1",
+                "https://evil.com/?save=job1"):
+        r2 = _login_ok(client, next=bad)
+        assert r2.status_code == 302
+        assert r2.headers["Location"] == "/app"
+
 def test_login_default_next_is_app(monkeypatch):
     """R3：无 next 的普通用户/owner 登录成功默认到 /app（不再回介绍主页）。"""
     app_mod.AUTH_ENABLED = True

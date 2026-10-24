@@ -9,64 +9,186 @@
   <link rel="alternate" href="/guide/conversion.md" type="text/markdown" />
   {% if canonical %}<link rel="canonical" href="{{ canonical }}" />{% endif %}
   {% include "_site_icons.html" %}
-  <link rel="stylesheet" href="/static/tools/tools-slides.css?v=20261003" />
-  <script defer src="/static/i18n.js?v=20261016"></script>
+  <link rel="stylesheet" href="/static/tools/tools-slides.css?v=20261021-redesign" />
+  <script defer src="/static/i18n.js?v=20261021i"></script>
   <!-- 2026-10-20：本页只做本地转换与保存——不再加载 COS 上传引擎。
        slide-sniff 仅用于「此文件无需转换」提示（头级嗅探，零网络）。 -->
   <script defer src="/static/upload/slide-sniff.js?v=20261015"></script>
-  <script type="module" src="/static/tools/tools-slides.js?v=20261015"></script>
+  <!-- MRXS「先选 .mrxs，再选同名数据文件夹」的共享协助逻辑（工作台/转换器页
+       同一实现；classic script，页面在用户手势内惰性读 window.HP_MRXS_COMPANION） -->
+  <script defer src="/static/upload/mrxs-companion.js?v=20261021"></script>
+  <script type="module" src="/static/tools/tools-slides.js?v=20261021-redesign"></script>
 </head>
-<body id="top">
+<body id="top" data-inline-convert-enabled="{{ 'true' if inline_convert_enabled else 'false' }}">
   <a class="skip-link" href="#main" data-i18n="tools.skip">跳到主要内容</a>
 
   <header class="topbar">
     <div class="topbar-inner">
-      <div class="brand-block">
-        <p class="brand-tag"><a class="tools-brand-link" href="/">{% include "_brand_logo.html" %}<span data-i18n="tools.brand">HistoPilot · 切片格式转换</span></a></p>
-        <h1 data-i18n="tools.title">切片格式转换工具</h1>
-        <p class="subtitle" data-i18n="tools.subtitle">在本机浏览器内完成 KFB / KFBF / SVS / SCN / NDPI / 通用 TIFF / 普通图片（BMP/JPEG）单文件与 MRXS / VMS 完整包的识别、转换与保存（BigTIFF / OME-TIFF）</p>
-      </div>
-      <div class="topbar-actions">
-        <a class="btn btn-secondary" href="/app" data-i18n="tools.to.workbench">前往工作台</a>
-        <a class="btn btn-secondary" href="/" data-i18n="tools.back.home">返回主页</a>
-        <a class="btn btn-secondary" href="/guide/conversion" data-i18n="tools.guide.link">支持格式与转换指南</a>
+      <a class="brand" href="/">
+        {% include "_brand_logo.html" %}
+        <span class="brand-name">HistoPilot</span>
+        <span class="brand-sep" aria-hidden="true"></span>
+        <span class="brand-page" data-i18n="tools.title">切片格式转换</span>
+      </a>
+      <nav class="topbar-nav">
+        <a class="topbar-link" href="/app">
+          <svg class="topbar-icon" viewBox="0 0 24 24" width="16" height="16" fill="none"
+               stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+               aria-hidden="true" focusable="false">
+            <rect x="3.5" y="3.5" width="7" height="7" rx="1.5"></rect>
+            <rect x="13.5" y="3.5" width="7" height="7" rx="1.5"></rect>
+            <rect x="3.5" y="13.5" width="7" height="7" rx="1.5"></rect>
+            <rect x="13.5" y="13.5" width="7" height="7" rx="1.5"></rect>
+          </svg>
+          <span data-i18n="tools.nav.workbench">工作台</span>
+        </a>
+        <a class="topbar-link" href="/guide/conversion">
+          <svg class="topbar-icon" viewBox="0 0 24 24" width="16" height="16" fill="none"
+               stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+               aria-hidden="true" focusable="false">
+            <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H19v15H6.5A2.5 2.5 0 0 0 4 20.5z"></path>
+            <path d="M4 20.5A2.5 2.5 0 0 1 6.5 18H19"></path>
+            <path d="M8 7.5h7"></path>
+          </svg>
+          <span data-i18n="tools.nav.guide">格式指南</span>
+        </a>
         <button type="button" class="lang-toggle" data-i18n-aria="lang.toggle.aria" aria-label="切换为英文">EN</button>
-      </div>
+      </nav>
     </div>
   </header>
 
   <main id="main">
-    <p id="save-capability-note" class="warn-panel" role="status" hidden></p>
-    <!-- 2026-10-20：一行本地处理说明 + 折叠详情（本页不上传） -->
-    <details class="privacy" id="privacy-details">
-      <summary data-i18n="tools.privacy.brief">转换和保存均在本机完成。需要上传时，请前往工作台。</summary>
-      <h2 id="privacy-title" data-i18n="tools.privacy.title">本地与隐私</h2>
-      <ul class="privacy-list">
-        <li data-i18n="tools.privacy.details">识别、转换与保存都在这台设备的浏览器内完成；除加载本页自身的静态代码与引擎外，本页不连接平台，也不发送文件内容、文件名或哈希。已兼容的文件（OME-TIFF 等）无需转换，可直接使用；如需上传，请前往工作台。</li>
-      </ul>
-    </details>
+    <section class="hero">
+      <h1 data-i18n="tools.title">切片格式转换</h1>
+      <p class="hero-subtitle" data-i18n="tools.subtitle">在本机浏览器内完成病理切片格式转换，无需上传服务器</p>
+    </section>
 
+    <p id="save-capability-note" class="warn-panel" role="status" hidden></p>
     <p id="page-error" class="error-panel" role="alert" hidden></p>
     <p id="page-status" class="status-panel" role="status" aria-live="polite"></p>
 
-    <!-- 1 · 选择文件：大拖放区为主入口；file input 视觉隐藏但保留键盘可达，
-         与 drop 走同一 prepareSource 流程（U2 §3.2）。F3：MRXS 完整包经
-         webkitdirectory 文件夹选择或拖入整个文件夹（同一 prepareBundleSource） -->
-    <section class="card" id="input-section" aria-labelledby="input-title">
-      <h2 id="input-title" data-i18n="tools.input.title">选择切片文件</h2>
-      <div class="drop-zone" id="drop-zone" aria-describedby="input-hint">
-        <p class="drop-title" data-i18n="tools.drop.title">将切片文件拖到这里</p>
-        <p class="drop-alt" data-i18n="tools.drop.or">或</p>
+    <!-- 1 · 选择文件：大拖放区为主入口；file input 视觉隐藏并以 tabindex="-1"
+         移出 Tab 顺序（按钮是唯一入口），与 drop 走同一 prepareSource 流程
+         （U2 §3.2）。F3：MRXS 完整包经 webkitdirectory 文件夹选择或拖入整个
+         文件夹（同一 prepareBundleSource） -->
+    <section id="input-section" aria-labelledby="input-title">
+      <h2 id="input-title" class="visually-hidden" data-i18n="tools.input.title">选择切片文件</h2>
+      <div class="drop-zone" id="drop-zone" aria-describedby="pick-file-hint pick-folder-hint">
+        <span class="drop-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="42" height="42" fill="none"
+               stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
+               focusable="false">
+            <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"></path>
+            <path d="M14 3v5h5"></path>
+            <path d="M12 17v-5"></path>
+            <path d="m9.5 14.5 2.5-2.5 2.5 2.5"></path>
+          </svg>
+        </span>
+        <p class="drop-title" data-i18n="tools.drop.title">拖拽切片文件或文件夹到这里</p>
+        <p class="drop-alt" data-i18n="tools.drop.or">或使用下方按钮选择</p>
         <div class="drop-actions">
-          <button type="button" id="pick-file-btn" class="btn btn-primary" data-i18n="tools.drop.pick">选择文件</button>
-          <button type="button" id="pick-folder-btn" class="btn btn-secondary" data-i18n="tools.drop.pick.folder">选择文件夹（MRXS）</button>
+          <button type="button" id="pick-file-btn" class="btn btn-primary btn-pick" aria-describedby="pick-file-hint">
+            <svg class="btn-icon" viewBox="0 0 24 24" width="20" height="20" fill="none"
+                 stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+                 aria-hidden="true" focusable="false">
+              <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"></path>
+              <path d="M14 3v5h5"></path>
+            </svg>
+            <span data-i18n="tools.drop.pick">选择文件</span>
+          </button>
+          <button type="button" id="pick-folder-btn" class="btn btn-secondary btn-pick" aria-describedby="pick-folder-hint">
+            <svg class="btn-icon" viewBox="0 0 24 24" width="20" height="20" fill="none"
+                 stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+                 aria-hidden="true" focusable="false">
+              <path d="M3 7a2 2 0 0 1 2-2h4l2 3h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path>
+            </svg>
+            <span data-i18n="tools.drop.pick.folder">选择文件夹</span>
+          </button>
         </div>
+        <p id="pick-file-hint" class="drop-support" data-i18n="tools.drop.file.hint">支持 SVS / KFB / KFBF / NDPI / SCN / BIF / MRXS / VMS / TIFF / BMP / JPEG 等格式</p>
+        <p id="pick-folder-hint" class="drop-guidance" data-i18n="tools.drop.folder.hint">MRXS、VMS 等多文件切片请选择文件夹（MRXS 选包含 .mrxs 和同名数据目录的上一级文件夹）</p>
       </div>
-      <input id="file-input" name="file" type="file" accept=".kfb,.kfbf,.svs,.scn,.ndpi,.bif,.ome.tif,.ome.tiff,.tif,.tiff,.vms,.vmu,.mrxs,.dat,.bmp,.jpg,.jpeg" class="visually-hidden-input" data-i18n-aria="tools.input.file.label" aria-label="切片文件（KFB / KFBF / SVS / SCN / NDPI / BIF / 通用 TIFF / OME-TIFF / VMS / MRXS / 普通图片 BMP/JPEG）" />
-      <input id="folder-input" name="folder" type="file" webkitdirectory multiple class="visually-hidden-input" data-i18n-aria="tools.input.folder.label" aria-label="MRXS / VMS 切片文件夹（完整包）" />
+      <input id="file-input" name="file" type="file" accept=".kfb,.kfbf,.svs,.scn,.ndpi,.bif,.ome.tif,.ome.tiff,.tif,.tiff,.vms,.vmu,.mrxs,.dat,.bmp,.jpg,.jpeg" class="visually-hidden-input" tabindex="-1" data-i18n-aria="tools.input.file.label" aria-label="切片文件（KFB / KFBF / SVS / SCN / NDPI / BIF / 通用 TIFF / OME-TIFF / VMS / MRXS / 普通图片 BMP/JPEG）" />
+      <input id="folder-input" name="folder" type="file" webkitdirectory multiple class="visually-hidden-input" tabindex="-1" data-i18n-aria="tools.input.folder.label" aria-label="MRXS / VMS 切片文件夹（完整包）" />
       <p id="input-message" class="status-panel" role="status"></p>
-      <p id="input-hint" class="hint" data-i18n="tools.input.file.hint">支持已验证的 KFB（明场）、KFBF（荧光）、Aperio SVS、Leica SCN（明场，JPEG 编码）、Hamamatsu NDPI（明场，带 restart marker 的整层 JPEG）、通用瓦片 JPEG TIFF/BigTIFF（无厂商描述的明场金字塔）与普通图片（未压缩 24/32 位 BMP、基线 JPEG——逐图有界解码后整图重编码，无物理标尺）单文件，以及 Ventana BIF（BigTIFF + iScan 元数据——重叠瓦片按记录位置拼接后重编码，输出尺寸与 OpenSlide 一致），标准 MRXS 完整包（.mrxs 主文件 + 同名数据目录，含 Slidedat.ini、Index.dat、Data*.dat）与 Hamamatsu VMS 完整包（.vms 入口 + 同目录全部 tile JPEG——用「选择文件夹」或拖入整个文件夹）；JPEG 2000 编码的 Aperio SVS（33003/33005，明场三分量 8-bit——输出为重新编码的 JPEG-in-TIFF）、荧光/非 JPEG 编码的 SCN、无 restart marker 的 NDPI/VMS tile，VMU（未压缩原始数据），渐进/灰度 JPEG，RLE/位域/调色板位深 BMP，条带存储 / LZW / deflate / 非 8 位 / 多通道的通用 TIFF 变体，以及其他 JPEG 2000 变体（HTJ2K、16 位、荧光、非 Aperio JP2K）和 JPEG 2000 编码、LEFT/DOWN 拼接走向、多 z 层或无 EncodeInfo 记录的 BIF 变体暂不支持。扩展名只是提示——页面按文件头识别，不支持的其他格式会在复制前被拒绝。</p>
     </section>
+
+    <!-- MRXS 同名数据文件夹协助（先选 .mrxs → 提示补选同名文件夹）：非错误的
+         中性状态；消息在 aria-live 区（role=status）；按钮聚焦可达；整个流程
+         在用户补选文件夹之前不复制任何内容。不同名文件夹用原生对话框显式
+         确认（复用 #disk-dialog 的 showModal 焦点圈），无内联样式/脚本。 -->
+    <section id="companion-section" class="card companion-section" aria-labelledby="companion-title" hidden>
+      <h2 id="companion-title" class="visually-hidden" data-i18n="tools.companion.title">还需要数据文件夹</h2>
+      <p id="companion-message" class="status-panel" role="status" aria-live="polite"></p>
+      <p id="companion-hint" class="hint" data-i18n="tools.companion.hint">浏览器会请求允许读取该文件夹；文件只在本机处理，不会上传。</p>
+      <div class="companion-actions">
+        <button type="button" id="companion-pick-btn" class="btn btn-primary"></button>
+        <button type="button" id="companion-cancel-btn" class="btn btn-secondary" data-i18n="tools.companion.cancel">取消</button>
+      </div>
+    </section>
+
+    <!-- 2 · 能力速览（参考稿三列特性条）：本地处理 / 格式范围 / 输出格式。
+         完整支持列表折叠在第二列里（#input-hint 原文保留，键盘可达）。 -->
+    <div class="feature-strip">
+      <article class="feature">
+        <span class="feature-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="26" height="26" fill="none"
+               stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
+               focusable="false">
+            <path d="M12 3 5 6v5c0 4.5 3 7.6 7 9 4-1.4 7-4.5 7-9V6z"></path>
+            <path d="m9.5 12 1.8 1.8 3.5-3.6"></path>
+          </svg>
+        </span>
+        <div class="feature-copy">
+          <h2 class="feature-title" data-i18n="tools.features.local.title">完全本地处理</h2>
+          <p class="feature-desc" data-i18n="tools.features.local.desc">识别、转换与保存都在本机浏览器内完成，不上传文件内容。</p>
+          <!-- 2026-10-21：本地处理说明并入本列，作为小号折叠说明 -->
+          <details class="privacy" id="privacy-details">
+            <summary data-i18n="tools.privacy.brief">需要上传？请前往工作台。</summary>
+            <h3 id="privacy-title" data-i18n="tools.privacy.title">本地与隐私</h3>
+            <ul class="privacy-list">
+              <li data-i18n="tools.privacy.details">识别、转换与保存都在这台设备的浏览器内完成；除加载本页自身的静态代码与引擎外，本页不连接平台，也不发送文件内容、文件名或哈希。已兼容的文件（OME-TIFF 等）无需转换，可直接使用；如需上传，请前往工作台。</li>
+              <!-- 2026-10-21 支持入口补充（§本地与隐私）：主动打开支持页/收款链接会访问外部，但支持操作不读取/上传切片文件 -->
+              <li data-i18n="tools.support.privacy">打开支持页会访问网站；继续打开收款链接时会访问相应支付服务。转换与保存仍在本机完成，支持操作不会读取或上传你的切片文件。</li>
+            </ul>
+          </details>
+        </div>
+      </article>
+      <article class="feature">
+        <span class="feature-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="26" height="26" fill="none"
+               stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
+               focusable="false">
+            <path d="m12 3 9 5-9 5-9-5z"></path>
+            <path d="m3 12 9 5 9-5"></path>
+            <path d="m3 16 9 5 9-5"></path>
+          </svg>
+        </span>
+        <div class="feature-copy">
+          <h2 class="feature-title" data-i18n="tools.features.formats.title">支持多种格式</h2>
+          <p class="feature-desc" data-i18n="tools.features.formats.desc">常见病理切片与普通图片格式。</p>
+          <details class="support-list">
+            <summary data-i18n="tools.features.list.toggle">查看完整支持列表 →</summary>
+            <p id="input-hint" class="hint" data-i18n="tools.input.file.hint">支持已验证的 KFB（明场）、KFBF（荧光）、Aperio SVS、Leica SCN（明场，JPEG 编码）、Hamamatsu NDPI（明场，带 restart marker 的整层 JPEG）、通用瓦片 JPEG TIFF/BigTIFF（无厂商描述的明场金字塔）与普通图片（未压缩 24/32 位 BMP、基线 JPEG——逐图有界解码后整图重编码，无物理标尺）单文件，以及 Ventana BIF（BigTIFF + iScan 元数据——重叠瓦片按记录位置拼接后重编码，输出尺寸与 OpenSlide 一致），标准 MRXS 完整包（.mrxs 主文件 + 同名数据目录，含 Slidedat.ini、Index.dat、Data*.dat）与 Hamamatsu VMS 完整包（.vms 入口 + 同目录全部 tile JPEG——用「选择文件夹」或拖入整个文件夹）；JPEG 2000 编码的 Aperio SVS（33003/33005，明场三分量 8-bit——输出为重新编码的 JPEG-in-TIFF）、荧光/非 JPEG 编码的 SCN、无 restart marker 的 NDPI/VMS tile，VMU（未压缩原始数据），渐进/灰度 JPEG，RLE/位域/调色板位深 BMP，条带存储 / LZW / deflate / 非 8 位 / 多通道的通用 TIFF 变体，以及其他 JPEG 2000 变体（HTJ2K、16 位、荧光、非 Aperio JP2K）和 JPEG 2000 编码、LEFT/DOWN 拼接走向、多 z 层或无 EncodeInfo 记录的 BIF 变体暂不支持。扩展名只是提示——页面按文件头识别，不支持的其他格式会在复制前被拒绝。</p>
+          </details>
+        </div>
+      </article>
+      <article class="feature">
+        <span class="feature-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="26" height="26" fill="none"
+               stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
+               focusable="false">
+            <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"></path>
+            <path d="M14 3v5h5"></path>
+            <path d="m9 15 2 2 4-4"></path>
+          </svg>
+        </span>
+        <div class="feature-copy">
+          <h2 class="feature-title" data-i18n="tools.features.output.title">标准输出格式</h2>
+          <p class="feature-desc" data-i18n="tools.features.output.desc">生成 OME-TIFF 或经典金字塔 TIFF，可用 QuPath / OpenSlide 打开。</p>
+        </div>
+      </article>
+    </div>
 
     <!-- 2 · 准备（复制与识别）：与转换阶段分开显示；可取消准备（U2） -->
     <section class="card" id="stage-section" aria-labelledby="stage-title" hidden>
@@ -74,7 +196,7 @@
         <h2 id="stage-title" data-i18n="tools.stage.title">准备：复制与识别</h2>
         <button type="button" id="prepare-cancel-btn" class="btn btn-danger" data-i18n="tools.stage.cancel" hidden>取消准备</button>
       </div>
-      <p id="stage-status" class="stage-status"></p>
+      <p id="stage-status" class="stage-status" role="status" aria-live="polite"></p>
       <div id="stage-progress" class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"
            aria-labelledby="stage-title">
         <div class="progress-bar" id="stage-bar"></div>
@@ -211,6 +333,9 @@
     <!-- 4 · 转换阶段（与准备阶段分开显示） -->
     <section class="card" id="run-section" aria-labelledby="run-title" hidden>
       <h2 id="run-title" data-i18n="tools.run.title">转换</h2>
+      <!-- 正在转换的任务名（folderName||name，与任务行一致）：从任务列表
+           开始/续跑时，摘要卡可能属于另一个文件，这里明确标出目标 -->
+      <p id="run-job" class="run-job" hidden></p>
       <p id="run-status" class="stage-status" aria-live="polite"></p>
       <div id="run-progress" class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"
            aria-labelledby="run-title" hidden>
@@ -225,23 +350,44 @@
       <h2 id="result-title" data-i18n="tools.result.title">结果与保存</h2>
       <p class="warn-panel" data-i18n="tools.result.not.saved.warn">注意：结果保存在浏览器内部存储（OPFS）中，还不是“已保存到电脑”——在导出前它只是临时产物，且可能被浏览器在空间不足时清理（驱逐）。</p>
       <dl class="probe-grid" id="result-grid"></dl>
+      <p class="hint" data-i18n="tools.result.save.mac.hint">Mac 用户提示：保存大型 TIFF 切片后，系统缩略图进程 ImageThumbnailExtension 可能短时占用较多内存和 CPU，造成数分钟卡顿。可尝试保存到默认“下载”（Downloads）文件夹以外的位置，以缓解此现象。</p>
       <div class="run-actions">
         <button type="button" id="save-btn" class="btn btn-primary" data-i18n="tools.result.save">保存到电脑</button>
-        <button type="button" id="persist-btn" class="btn btn-secondary" data-i18n="tools.result.persist">申请持久存储</button>
+        <button type="button" id="save-project-btn" class="btn btn-secondary" data-i18n="tools.result.saveProject">保存到我的项目</button>
       </div>
       <p id="save-status" class="status-panel" role="status"></p>
     </section>
 
     <!-- 任务记录（折叠；有任务时自动展开） -->
     <details class="card" id="jobs-details">
-      <summary id="jobs-title" data-i18n="tools.jobs.title">任务记录（刷新后可续跑）</summary>
+      <summary id="jobs-title" class="jobs-summary">
+        <svg class="jobs-icon" viewBox="0 0 24 24" width="20" height="20" fill="none"
+             stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"
+             aria-hidden="true" focusable="false">
+          <circle cx="12" cy="12" r="8.5"></circle>
+          <path d="M12 7.5V12l3 2"></path>
+        </svg>
+        <span data-i18n="tools.jobs.title">任务记录（刷新后可续跑）</span>
+      </summary>
       <p class="hint" data-i18n="tools.jobs.hint">续跑使用浏览器临时存储中的源副本，无需重新选择文件；续跑保存设置（档位/策略/输出格式/画质）与上次一致。</p>
+      <p class="hint" data-i18n="tools.result.save.mac.hint">Mac 用户提示：保存大型 TIFF 切片后，系统缩略图进程 ImageThumbnailExtension 可能短时占用较多内存和 CPU，造成数分钟卡顿。可尝试保存到默认“下载”（Downloads）文件夹以外的位置，以缓解此现象。</p>
       <div id="jobs-list" class="jobs-list"></div>
     </details>
   </main>
 
   <footer class="footer">
-    <p class="footer-note" data-i18n="tools.footer">本地工具不会替你判断医学结论；输出文件请自行妥善保管。</p>
+    <div class="footer-note">
+      <p data-i18n="tools.footer">本地工具不会替你判断医学结论；输出文件请自行妥善保管。</p>
+      <!-- 支持项目入口（设计 2026-10-21 §转换器入口）：低强调文字链接，
+           新标签页打开 /support；无 prefetch/preload、无 JS 处理器，
+           点击不触碰进行中的转换任务。 -->
+      <p class="footer-support">
+        <span data-i18n="tools.support.prompt">这个工具对你有帮助？欢迎支持项目的持续开发。</span>
+        <a class="footer-support-link" href="/support" target="_blank" rel="noopener noreferrer"
+           data-i18n="tools.support.link" data-i18n-aria="tools.support.link.aria"
+           aria-label="在新标签页打开支持项目页面">支持项目 ↗</a>
+      </p>
+    </div>
   </footer>
 
   <!-- 磁盘不可证明 / 不足确认（C2 §4.7：uncertain 需用户显式确认；
@@ -255,6 +401,59 @@
                 data-i18n="tools.disk.cancel">取消</button>
         <button type="submit" id="disk-confirm-btn" class="btn btn-primary" value="confirm"
                 data-i18n="tools.disk.confirm">仍要继续</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 保存到我的项目需要登录（2026-10-22 复核 r2）：登录/注册/取消三选；
+       无自动跳转计时器。选择登录或注册时把待保存任务记入 localStorage
+       （pt.tools.pendingSave.v1，24h 有效），工作台据此提示继续保存。 -->
+  <dialog id="save-login-dialog" aria-labelledby="save-login-title">
+    <form method="dialog" class="dialog-form" id="save-login-form">
+      <h2 id="save-login-title" data-i18n="tools.saveproj.login.title">保存到我的项目需要登录</h2>
+      <p data-i18n="tools.saveproj.login.body">登录后可以把转换结果保存到你的文件夹。注册新账号也可以，稍后会提醒你继续保存。</p>
+      <div class="dialog-actions">
+        <button type="submit" id="save-login-cancel-btn" class="btn btn-secondary" value="cancel"
+                data-i18n="tools.saveproj.cancel">取消</button>
+        <button type="submit" id="save-login-register-btn" class="btn btn-secondary" value="register"
+                data-i18n="tools.saveproj.login.register">注册</button>
+        <button type="submit" id="save-login-login-btn" class="btn btn-primary" value="login"
+                data-i18n="tools.saveproj.login.go">登录</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 保存到我的项目（2026-10-22）：身份与目标都只在用户点击后获取；
+       本页不建第二套上传引擎——确认后写 runner intent 并移交工作台
+       （?save-job=<jobId>，仅该任务自动续传）。无内联样式/脚本（CSP）。 -->
+  <dialog id="save-project-dialog" aria-labelledby="save-project-title">
+    <form method="dialog" class="dialog-form" id="save-project-form">
+      <h2 id="save-project-title" data-i18n="tools.saveproj.title">保存到我的项目</h2>
+      <p id="save-project-file" class="saveproj-file"></p>
+      <p id="save-project-status" class="saveproj-status" role="status" aria-live="polite"></p>
+      <div id="save-project-fields" hidden>
+        <p class="saveproj-line"><span data-i18n="tools.saveproj.account">保存到账号：</span><strong id="save-project-account"></strong></p>
+        <label class="saveproj-field" for="save-project-dest">
+          <span data-i18n="tools.saveproj.dest">保存位置</span>
+          <select id="save-project-dest" class="select"></select>
+        </label>
+        <label class="saveproj-field" for="save-project-new-name" id="save-project-new-row" hidden>
+          <span data-i18n="tools.saveproj.new.label">新文件夹名称</span>
+          <input id="save-project-new-name" type="text" maxlength="60" class="input"
+                 autocomplete="off" data-i18n-ph="tools.saveproj.new.name.ph"
+                 placeholder="文件夹名称" />
+        </label>
+      </div>
+      {# 错误行在字段容器之外（2026-10-23 评审修复）：任务缺失/产物被清理/
+         /api/projects 失败都在 fields 仍 hidden 时发生——错误行原来嵌在
+         隐藏容器里，用户只会看到空对话框。同 id/class/role/hidden，仅移出
+         层级；tools-slides.js 逻辑不变。 #}
+      <p id="save-project-error" class="saveproj-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button type="submit" id="save-project-cancel-btn" class="btn btn-secondary" value="cancel"
+                data-i18n="tools.saveproj.cancel">取消</button>
+        <button type="submit" id="save-project-confirm-btn" class="btn btn-primary" value="confirm"
+                data-i18n="tools.saveproj.confirm">保存</button>
       </div>
     </form>
   </dialog>

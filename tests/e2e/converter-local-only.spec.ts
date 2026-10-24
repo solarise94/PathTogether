@@ -126,9 +126,11 @@ test("转换器本地转换全程零 API/零对象存储；不登录可用；无
   await expect(page.locator("#drop-zone")).toBeVisible();
 
   // 页面结构：本地处理说明 + 前往工作台；无任何上传入口/上传引擎
+  // 2026-10-21 视觉打磨：隐私说明并入「完全本地处理」列后，摘要简化为
+  // 「需要上传？请前往工作台。」（完整说明仍在展开内容里）。
   await expect(page.locator("#privacy-details summary"))
-    .toContainText("转换和保存均在本机完成。需要上传时，请前往工作台。");
-  await expect(page.locator('a[href="/app"][data-i18n="tools.to.workbench"]')).toHaveCount(1);
+    .toContainText("需要上传？请前往工作台。");
+  await expect(page.locator('a[href="/app"]:has([data-i18n="tools.nav.workbench"])')).toHaveCount(1);
   await expect(page.locator("#convert-upload-btn")).toHaveCount(0);
   await expect(page.locator("#upload-btn")).toHaveCount(0);
   await expect(page.locator("#direct-upload-btn")).toHaveCount(0);
@@ -248,6 +250,40 @@ test("历史 pending 上传意图：继续转换不自动上传；删除经双�
   expect(state.hasResult).toBe(true);      // 产物保留
   expect(state.intent).toBe("pending");    // 意图未被静默执行（也未标记 done）
   expect(state.upload).toBeFalsy();        // 零上传记录（全程未创建任务）
+
+  // 布局断言（状态徽章 + 三个操作按钮）：桌面与 390px 下，徽章与按钮互不
+  // 重叠、都不超出任务行（复核：390px 保存按钮压住「已完成」徽章）
+  const jobRowIssues = (p: Page) => p.evaluate(() => {
+    const out: string[] = [];
+    document.querySelectorAll("#jobs-list .job-row").forEach((row) => {
+      const rr = row.getBoundingClientRect();
+      const cells = Array.from(
+        row.querySelectorAll(".job-status-cell > *, .job-actions > *"));
+      const boxes = cells.map((c) => ({
+        text: (c.textContent || "").slice(0, 18),
+        r: c.getBoundingClientRect(),
+      })).filter((b) => !(b.r.width === 0 && b.r.height === 0));
+      for (let i = 0; i < boxes.length; i++) {
+        if (boxes[i].r.right > rr.right + 1 || boxes[i].r.left < rr.left - 1) {
+          out.push(`超出行: "${boxes[i].text}" right=${boxes[i].r.right} rowRight=${rr.right}`);
+        }
+        for (let j = i + 1; j < boxes.length; j++) {
+          const a = boxes[i].r, b = boxes[j].r;
+          const separated = a.right <= b.left + 1 || b.right <= a.left + 1 ||
+            a.bottom <= b.top + 1 || b.bottom <= a.top + 1;
+          if (!separated) {
+            out.push(`重叠: "${boxes[i].text}" 与 "${boxes[j].text}"`);
+          }
+        }
+      }
+    });
+    return out;
+  });
+  expect(await jobRowIssues(page)).toEqual([]);
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await jobRowIssues(page)).toEqual([]);
+  await page.setViewportSize({ width: 1280, height: 720 });
+  expect(await jobRowIssues(page)).toEqual([]);
 
   // 删除：零网络（不再请求平台取消）
   page.on("dialog", (d) => d.accept());

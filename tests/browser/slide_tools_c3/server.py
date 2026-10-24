@@ -31,6 +31,7 @@ import pg_reap  # noqa: E402
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8943)
+    parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()
 
     tmp = tempfile.mkdtemp(prefix="pt-c3-tools-")
@@ -68,7 +69,7 @@ def main():
     # 认证开启（生产形态）；/tools/slides 由 _require_auth 白名单放行
     app_mod.AUTH_ENABLED = True
 
-    app_mod.app.run(host="127.0.0.1", port=args.port, threaded=True)
+    app_mod.app.run(host=args.host, port=args.port, threaded=True)
 
 
 if __name__ == "__main__":

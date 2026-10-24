@@ -115,8 +115,31 @@
     "upload.inline.note.keepopen": { zh: "请保持页面打开", en: "keep this page open" },
     "upload.inline.note.committed": { zh: "已提交的进度可在刷新后继续", en: "Committed progress can be resumed after a refresh" },
     "upload.inline.rejected.magic": { zh: "内容与扩展名不符（检测到 {type}）", en: "Content does not match the extension (detected {type})" },
-    "upload.inline.needBundle.mrxs": { zh: "MRXS 需要完整包：.mrxs 主文件 + 同名目录（Slidedat.ini 与全部数据文件）。请用「选择文件夹」或拖入整个文件夹", en: "MRXS needs the whole bundle: the .mrxs entry plus the same-named folder (Slidedat.ini and all data files). Use 'Select folder' or drop the whole folder" },
+    "upload.inline.needBundle.mrxs": { zh: "MRXS 需要完整包：.mrxs 主文件 + 同名数据文件夹（内含 Slidedat.ini 与全部数据文件）。可以先选 .mrxs 主文件、再按提示选择同名文件夹；也可以用「选择文件夹」选择包含两者的文件夹，或拖入整个文件夹", en: "MRXS needs the whole bundle: the .mrxs entry plus its same-named data folder (with Slidedat.ini and all data files). Pick the .mrxs file first and follow the prompt to select the same-named folder; or use 'Select folder' on the folder holding both, or drop the whole folder" },
     "upload.inline.needBundle.vms": { zh: "VMS 需要完整包：.vms 入口 + 同目录全部 tile JPEG。请用「选择文件夹」或拖入整个文件夹", en: "VMS needs the whole bundle: the .vms entry plus every sibling tile JPEG. Use 'Select folder' or drop the whole folder" },
+    // MRXS 协助（先选 .mrxs → 提示补选同名数据文件夹；i18n.js 为主源，此处兜底）
+    "upload.inline.stage.needFolder": { zh: "等待选择同名数据文件夹", en: "Waiting for the same-named data folder" },
+    "upload.inline.needFolder.mrxs": { zh: "这张切片还需要同名数据文件夹，请选择「{stem}」文件夹。", en: "This slide also needs its same-named data folder: please select the “{stem}” folder." },
+    "upload.inline.needFolder.notDataFolder": { zh: "所选文件夹「{folder}」不是「{stem}」的数据文件夹（缺少 Slidedat.ini）。请重新选择文件夹。", en: "The selected folder “{folder}” is not the data folder of “{stem}” (Slidedat.ini is missing). Please choose a different folder." },
+    "upload.inline.needFolder.readFailed": { zh: "无法读取所选文件夹的内容，请重新选择。", en: "The selected folder could not be read; please choose again." },
+    "upload.inline.needFolder.tooMany": { zh: "所选文件夹的成员数超过上限 {n}，请确认选的是这张切片的数据文件夹。", en: "The selected folder has more than {n} members; please make sure it is this slide's data folder." },
+    "upload.inline.needFolder.retry": { zh: "所选文件夹缺少需要的文件，请重新选择「{stem}」文件夹。", en: "The selected folder is missing required files; please choose the “{stem}” folder again." },
+    "upload.inline.needFolder.retryMissing": { zh: "所选文件夹缺少 {missing}，请重新选择「{stem}」文件夹。", en: "The selected folder is missing {missing}; please choose the “{stem}” folder again." },
+    "upload.saveproj.notice.text": { zh: "转换页有一个结果等待保存到我的项目", en: "The converter page has a result waiting to be saved to your projects" },
+    "upload.saveproj.notice.continue": { zh: "继续保存", en: "Continue the save" },
+    "upload.saveproj.notice.dismiss": { zh: "忽略", en: "Dismiss" },
+    "upload.saveproj.fail.prefix": { zh: "无法继续保存到项目：", en: "Cannot continue saving to a project: " },
+    "upload.saveproj.reason.capabilityOff": { zh: "面板内上传未开启", en: "in-panel upload is off" },
+    "upload.saveproj.reason.jobMissing": { zh: "本机没有找到该任务（可能已被清理）", en: "the job was not found on this machine (it may have been cleared)" },
+    "upload.saveproj.reason.notReady": { zh: "任务还没有完成转换", en: "the job has not finished converting" },
+    "upload.saveproj.reason.alreadyUploaded": { zh: "该任务已经上传过", en: "that job was already uploaded" },
+    "upload.inline.needFolder.toast": { zh: "所选文件夹缺少文件，请重新选择「{stem}」文件夹", en: "The selected folder is missing files; choose the “{stem}” folder again" },
+    "upload.inline.needFolder.missingMore": { zh: "{names} 等 {n} 个文件", en: "{names}, and {n} more" },
+    "upload.inline.companion.mismatch": { zh: "所选文件夹「{folder}」与切片「{stem}」不同名，仍然使用吗？", en: "The selected folder “{folder}” does not match the slide name “{stem}”. Use it anyway?" },
+    "upload.inline.companion.use": { zh: "使用此文件夹", en: "Use this folder" },
+    "upload.inline.companion.hint": { zh: "浏览器会请求允许读取该文件夹。", en: "The browser will ask for permission to read this folder." },
+    "upload.inline.companion.unsupported": { zh: "当前浏览器无法在这里选择文件夹；请改用「选择文件夹」按钮选择完整包，或直接拖入整个文件夹。", en: "This browser cannot choose folders here; use “Select folder” on the complete bundle, or drag the whole folder here." },
+    "upload.inline.action.chooseFolderNamed": { zh: "选择「{stem}」文件夹", en: "Choose the “{stem}” folder" },
     "upload.inline.err.disk": { zh: "磁盘空间预检未通过", en: "Disk space precheck failed" },
     "upload.inline.err.quota": { zh: "浏览器存储配额不足：请腾出空间，或改在转换器页转换后本地保存", en: "Browser storage quota is insufficient: free some space, or convert on the converter page and save locally" },
     "upload.inline.err.profile": { zh: "当前资源档位内存预算不足", en: "This resource profile's memory budget is too small" },
@@ -134,6 +157,7 @@
     "upload.inline.action.continue": { zh: "继续", en: "Continue" },
     "upload.inline.action.continueUpload": { zh: "继续上传", en: "Continue upload" },
     "upload.inline.action.reselect": { zh: "重新选择文件", en: "Re-select file" },
+    "upload.inline.action.reselectFolder": { zh: "重新选择文件夹", en: "Choose another folder" },
     "upload.inline.action.chooseFolder": { zh: "选择文件夹", en: "Select folder" },
     "upload.inline.action.discard": { zh: "删除本地产物", en: "Delete local artifacts" },
     "upload.inline.action.discard.published": { zh: "删除本地产物（平台已上传的切片不受影响）", en: "Delete local artifacts (uploaded slides are unaffected)" },
@@ -10741,9 +10765,15 @@
     }
     // 面板内转换（设计 §2.2①）：全部交给面板队列（含散文件 bundle 的
     // 「需要完整包」类型化说明，§4.1.1）。运行器懒加载；加载失败 → 回退
-    // 到既有分流（绝不静默丢弃用户的选择）。
+    // 到既有分流（绝不静默丢弃用户的选择）。opts.fileHandle：drop 事件内
+    // 同步捕获的 FileSystemFileHandle Promise（MRXS 协助流程的 startIn 定位）
     ensureInlineOrch().then(function (orch) {
-      if (orch) orch.enqueue(file, { assocTarget: opts.assocTarget });
+      if (orch) {
+        orch.enqueue(file, {
+          assocTarget: opts.assocTarget,
+          fileHandle: opts.fileHandle || null,
+        });
+      }
       else legacyUploadFile(file, opts);
     });
   }
@@ -11691,8 +11721,16 @@
       // 恢复行的归属判定需要真实账号（独立复核 #3 问题 2：与 /api/auth/info
       // 并行启动时，身份未就绪绝不把自己的记录判成 account_mismatch）。
       authInfoReady().then(function () {
-        inlineOrch.restore();
-        applyBeforeunload();
+        inlineOrch.restore().then(function (made) {
+          // 转换器页「保存到我的项目」的移交标记（?save-job=<jobId>）：
+          // 只对这一个显式移交的 jobId 解除停放并自动续传一次（用户在
+          // 转换器页的点击即同意），随后摘掉 URL 标记；其余恢复行照旧
+          // 停放（设计 §6.2 不自动开始的口径不变）。
+          resumeHandoffJob(made);
+          // 待保存标记（登录/注册绕行，复核 r2 #1）：非阻塞提示继续保存
+          checkPendingSave();
+          applyBeforeunload();
+        });
       });
       return inlineOrch;
     }).catch(function (e) {
@@ -11742,6 +11780,9 @@
     if (host && host.appendChild) {
       note = document.createElement("div");
       note.className = "upload-item-status";
+      // MRXS 协助/确认/拒绝的行内说明都在这条附注上原地更新——aria-live
+      // 让读屏器听到状态变化（设计 §3 的「不只是颜色」同类要求）
+      note.setAttribute("aria-live", "polite");
       // 「请保持页面打开」只对**正在进行**的条目显示（设计 §3）；排队/终态
       // 不需要它。文案随状态在 inlineRowButtons / setStage 里刷新。
       note.textContent = inlineRowNoteText(entry);
@@ -11756,6 +11797,39 @@
   /// 行附注：进行中 → 「请保持页面打开」；磁盘待确认 → need/available 数字；
   /// 已提交格式申请 → 编号回执；其余不显示（设计 §3 / §7.1 / §7.3）。
   function inlineRowNoteText(entry) {
+    // MRXS 协助（2026-10）：等待补选同名数据文件夹——非错误的中性说明；
+    // 确认/拒绝都说明白文件夹名与切片名（读屏经 aria-live 听到变化）
+    if (entry.state === "companion_confirm" && entry.companion) {
+      return tt("upload.inline.companion.mismatch", {
+        folder: entry.companion.folder || "",
+        stem: entry.companion.stem || "",
+      });
+    }
+    if (entry.state === "need_folder") {
+      if (!folderPickSupported()) {
+        // 目录选择器与 webkitdirectory 都没有：不留死按钮，如实说明
+        return tt("upload.inline.companion.unsupported");
+      }
+      var err = entry.companionError || null;
+      if (err && err.read) {
+        return tt("upload.inline.needFolder.readFailed");
+      }
+      if (err && err.code === "too_many_members") {
+        return tt("upload.inline.needFolder.tooMany", {
+          n: String(err.cap || 8192),
+        });
+      }
+      if (err && err.folder) {
+        return tt("upload.inline.needFolder.notDataFolder", {
+          folder: err.folder,
+          stem: (entry.companion && entry.companion.stem) || "",
+        });
+      }
+      // 主提示 + 一句权限说明（浏览器会请求允许读取该文件夹）
+      return tt("upload.inline.needFolder.mrxs", {
+        stem: (entry.companion && entry.companion.stem) || "",
+      }) + " " + tt("upload.inline.companion.hint");
+    }
     if (entry.state === "need_disk_confirm" && entry.diskInfo) {
       return tt("upload.inline.needDisk", {
         available: humanSize(entry.diskInfo.available || 0),
@@ -11784,6 +11858,18 @@
     if (entry.supportRequestId) {
       lines.push(tt("fr.ok.registered", { id: entry.supportRequestId }) + " · " +
         frBusinessStatusLabel(entry.supportBusinessStatus));
+    }
+    // MRXS 协助装配后的包不完整（planner 缺成员）：convert_failed 行上同时
+    // 给「重新选择文件夹」的入口与说明——说明里点名缺哪些文件（复核 r3 B；
+    // 清单过长时截断为前 5 个 + 「等 N 个文件」）
+    if (entry.state === "convert_failed" && entry.companionRetry &&
+        entry.companion) {
+      var missingText = missingListText(entry.companionMissing);
+      lines.push(missingText
+        ? tt("upload.inline.needFolder.retryMissing",
+            { missing: missingText, stem: entry.companion.stem || "" })
+        : tt("upload.inline.needFolder.retry",
+            { stem: entry.companion.stem || "" }));
     }
     return lines.join(" · ");
   }
@@ -11853,7 +11939,10 @@
       }
       var b = document.createElement("button");
       b.type = "button";
-      b.className = "upload-item-btn";
+      // 主动作（MRXS 协助的「选择「{stem}」文件夹」与确认态的「使用此文件夹」）
+      // 用 accent 实底，与 .btn.primary 同语义；其余保持白底描边
+      b.className = kind === "chooseFolder" || kind === "companionUse"
+        ? "upload-item-btn is-primary" : "upload-item-btn";
       var label = inlineButtonLabel(kind, entry);
       b.textContent = label;
       b.addEventListener("click", function (e) {
@@ -11868,6 +11957,18 @@
   function inlineButtonKinds(entry) {
     var st = entry.state;
     var out = [];
+    // MRXS 协助（2026-10）：等待补选同名数据文件夹——主按钮带切片名的
+    // 「选择「{stem}」文件夹」，另给重新选择文件与取消（取消 = 移除该行）
+    if (st === "need_folder") {
+      // 目录选择器与 webkitdirectory 都没有 → 不给死按钮（附注已说明）
+      if (folderPickSupported()) out.push("chooseFolder");
+      out.push("reselect", "cancel");
+      return out;
+    }
+    if (st === "companion_confirm") {
+      out.push("companionUse", "companionReselect");
+      return out;
+    }
     if (st === "convert_queued" || st === "requeue_convert") {
       if (entry.viaRestore) out.push("continue");
     }
@@ -11893,6 +11994,12 @@
     if (st === "convert_failed") {
       if (entry.error && entry.error.code === "need_bundle") {
         out.push("chooseFolder");
+      } else if (entry.companion && entry.companionRetry) {
+        // MRXS 协助装配后 planner 报包不完整：主出口是重新选择文件夹
+        //（无需重选 .mrxs；成功后原地重新转整包）。彻底选不了文件夹的
+        // 浏览器不给死按钮 → 申请支持/保存到本机
+        if (folderPickSupported()) out.push("chooseFolder");
+        else out.push("support", "saveLocal");
       } else if (entry.error && (entry.error.code === "resume_refused" ||
                                  entry.error.code === "job_dir_missing" ||
                                  entry.error.code === "io_recoverable")) {
@@ -11931,6 +12038,20 @@
   }
 
   function inlineButtonLabel(kind, entry) {
+    if (kind === "chooseFolder") {
+      // MRXS 协助行：按钮点名切片（「选择「病例A」文件夹」）；旧的
+      // need_bundle 行 / 整包兜底保持通用文案
+      if (entry && entry.companion && entry.companion.stem) {
+        return tt("upload.inline.action.chooseFolderNamed",
+          { stem: entry.companion.stem });
+      }
+      return tt("upload.inline.action.chooseFolder");
+    }
+    if (kind === "companionUse") return tt("upload.inline.companion.use");
+    // 确认态的「重新选择」回的是**文件夹**选择，不是文件（复核 r3 C）
+    if (kind === "companionReselect") {
+      return tt("upload.inline.action.reselectFolder");
+    }
     if (kind === "continue") return tt("upload.inline.action.continue");
     if (kind === "continueUpload") return tt("upload.inline.action.continueUpload");
     if (kind === "recheckUpload") return tt("upload.cos.recheck");
@@ -11939,7 +12060,6 @@
     if (kind === "rebindAccount") return tt("upload.inline.action.rebindAccount");
     if (kind === "retryIdentity") return tt("upload.inline.identity.retry");
     if (kind === "cancel") return tt("upload.cos.cancel");
-    if (kind === "chooseFolder") return tt("upload.inline.action.chooseFolder");
     if (kind === "reselect") return tt("upload.inline.action.reselect");
     if (kind === "discard") {
       var base = (entry.uploadState === "published")
@@ -11958,7 +12078,21 @@
   function inlineAction(entry, kind) {
     if (!inlineOrch) return;
     if (kind === "chooseFolder") {
+      if (entry && entry.companion) {
+        // MRXS 协助行：目录选择器（startIn 定位）/ webkitdirectory 回退，
+        // 选完经 resolveCompanionFolder 判定/装配——不重选 .mrxs
+        void companionPickForEntry(entry);
+        return;
+      }
       if (els.importFolderInput) els.importFolderInput.click();
+      return;
+    }
+    if (kind === "companionUse") {
+      inlineOrch.act(entry.id, "companionUse");
+      return;
+    }
+    if (kind === "companionReselect") {
+      inlineOrch.act(entry.id, "companionReselect");
       return;
     }
     if (kind === "support") {
@@ -12337,6 +12471,153 @@
   }
 
   /// 完成收口（§3.5）：刷新列表 → 按**入队时冻结的**目标快照关联 → 打开。
+  // ---------- 转换器页「保存到我的项目」：待保存标记与提示（复核 r2） ----
+
+  var PENDING_SAVE_KEY = "pt.tools.pendingSave.v1";
+  var PENDING_SAVE_TTL = 24 * 60 * 60 * 1000;
+
+  function pendingSaveRead() {
+    try {
+      var raw = window.localStorage.getItem(PENDING_SAVE_KEY);
+      if (!raw) return null;
+      var v = JSON.parse(raw);
+      if (!v || !v.jobId || !v.at) return null;
+      if (Date.now() - v.at > PENDING_SAVE_TTL) {
+        window.localStorage.removeItem(PENDING_SAVE_KEY);
+        return null;
+      }
+      return v;
+    } catch (e) { return null; }
+  }
+
+  function pendingSaveClear() {
+    try { window.localStorage.removeItem(PENDING_SAVE_KEY); } catch (e) { /* */ }
+  }
+
+  /// 非阻塞提示条（顶栏下方居中）：消息 + 动作按钮；点任一按钮即移除。
+  function showSaveHandoffNotice(message, actions) {
+    var host = document.getElementById("save-handoff-notice");
+    if (!host) {
+      host = document.createElement("div");
+      host.id = "save-handoff-notice";
+      host.setAttribute("role", "status");
+      if (document.body && document.body.appendChild) {
+        document.body.appendChild(host);
+      }
+    }
+    host.replaceChildren();
+    var p = document.createElement("p");
+    p.textContent = message;
+    host.appendChild(p);
+    var bar = document.createElement("div");
+    bar.className = "save-handoff-actions";
+    (actions || []).forEach(function (a) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.className = a.kind === "primary" ? "btn small primary" : "btn small secondary";
+      b.textContent = a.label;
+      b.addEventListener("click", function () {
+        if (host.parentNode) host.parentNode.removeChild(host);
+        if (a.onClick) a.onClick();
+      });
+      bar.appendChild(b);
+    });
+    host.appendChild(bar);
+  }
+
+  /// 待保存标记检查（/app 登录后、restore 之后调用）：标记新鲜且任务仍在
+  /// 本机 OPFS → 非阻塞提示「继续保存 / 忽略」；任务已消失 → 静默清标记
+  ///（复核 r2 #1：注册/登录绕行后不再丢失待保存任务）。
+  function checkPendingSave() {
+    var v = pendingSaveRead();
+    if (!v) return;
+    var finish = function () { pendingSaveClear(); };
+    var go = function () {
+      pendingSaveClear();
+      window.location.href = "/tools/slides?save=" +
+        encodeURIComponent(v.jobId);
+    };
+    var runnerRef = (window.HP_UPLOAD &&
+                     typeof window.HP_UPLOAD.inlineRunner === "function")
+      ? window.HP_UPLOAD.inlineRunner() : inlineRunner;
+    if (!runnerRef || typeof runnerRef.listJobs !== "function") {
+      // 运行器不可用（面板内上传关闭等）：无法核对任务——仍提示（继续保存
+      // 走转换器页对话框，对话框会显式报告任务是否还在）
+      showSaveHandoffNotice(tt("upload.saveproj.notice.text"), [
+        { label: tt("upload.saveproj.notice.continue"), onClick: go, kind: "primary" },
+        { label: tt("upload.saveproj.notice.dismiss"), onClick: finish },
+      ]);
+      return;
+    }
+    runnerRef.listJobs().then(function (jobs) {
+      var stillThere = (jobs || []).some(function (j) { return j.id === v.jobId; });
+      if (!stillThere) { pendingSaveClear(); return; }   // 任务已消失：静默清
+      showSaveHandoffNotice(tt("upload.saveproj.notice.text"), [
+        { label: tt("upload.saveproj.notice.continue"), onClick: go, kind: "primary" },
+        { label: tt("upload.saveproj.notice.dismiss"), onClick: finish },
+      ]);
+    }, function () { /* 列表读取失败：下次再提示 */ });
+  }
+
+  /// 转换器页移交标记（?save-job=<jobId>，2026-10-22）：restore 完成、身份
+  /// 已落定后调用一次。只有「产物就绪、等待上传」的恢复行自动续传；其余
+  /// 状态（account_mismatch / identity_wait / 转换未完成等）保持原状——
+  /// 行上已有对应的处置入口（含既有 expected_account/归属复核 409 保护）。
+  /// 标记用完即摘（history.replaceState），刷新/再次进入绝不重复自动跑。
+  function resumeHandoffJob(made) {
+    var m = null;
+    try { m = window.location.search.match(/[?&]save-job=([^&]+)/); } catch (e) { return; }
+    var strip = function () {
+      try {
+        var u = new URL(window.location.href);
+        if (!u.searchParams.has("save-job")) return;
+        u.searchParams.delete("save-job");
+        window.history.replaceState({}, "", u.pathname + u.search + u.hash);
+      } catch (e) { /* 摘不掉不致命：自动续传只发生这一次 */ }
+    };
+    if (!m) return;
+    var jobId = "";
+    try { jobId = decodeURIComponent(m[1] || ""); } catch (e) { jobId = ""; }
+    strip();
+    if (!jobId) return;
+    // orch 面经 HP_UPLOAD.inlineOrch() 取（测试注入同一入口）；生产里就是
+    // 本模块闭包的 inlineOrch
+    var orch = (window.HP_UPLOAD &&
+                typeof window.HP_UPLOAD.inlineOrch === "function")
+      ? window.HP_UPLOAD.inlineOrch() : inlineOrch;
+    // 复核 r2 #2：标记无法兑现时**必须**显式说明（绝不静默忽略）。归属
+    // 不符/身份确认由行自身解释（此处不再叠加提示）。
+    var fail = function (reasonKey) {
+      showSaveHandoffNotice(
+        tt("upload.saveproj.fail.prefix") + tt(reasonKey),
+        [{ label: tt("upload.saveproj.notice.dismiss"), onClick: null }]);
+    };
+    if (!orch) {
+      fail("upload.saveproj.reason.jobMissing");
+      return;
+    }
+    var entry = (made || []).find(function (e) { return e.jobId === jobId; });
+    if (!entry) {
+      // 该任务没有恢复出行：本机记录可能已被清理，或不是可上传形态
+      fail("upload.saveproj.reason.jobMissing");
+      return;
+    }
+    if (entry.state === "upload_queued") {
+      orch.act(entry.id, "continue");
+      return;
+    }
+    if (entry.state === "convert_queued") {
+      fail("upload.saveproj.reason.notReady");
+      return;
+    }
+    if (entry.state === "done") {
+      fail("upload.saveproj.reason.alreadyUploaded");
+      return;
+    }
+    // 其余（account_mismatch / identity_wait / convert_failed 等）：行上
+    // 已有对应的处置入口与说明，不再叠加提示
+  }
+
   function inlineUploaded(entry, body) {
     var sid = entry.slideId || null;
     var name = entry.artifactName || entry.name;
@@ -12398,6 +12679,14 @@
     inlineRunner: function () { return inlineRunner; },
     inlineButtonKinds: inlineButtonKinds,
     inlineButtonLabel: inlineButtonLabel,
+    // 转换器「保存到我的项目」移交标记（?save-job=）的处理（测试驱动面）
+    resumeHandoffJob: resumeHandoffJob,
+    pendingSaveCheck: checkPendingSave,
+    pendingSaveRead: pendingSaveRead,
+    pendingSaveClear: pendingSaveClear,
+    showSaveHandoffNotice: showSaveHandoffNotice,
+    // 缺成员清单的行内展示（截断规则；复核 r3 B 的单元测试面）
+    missingListText: missingListText,
     inlineRowEls: inlineRowEls,
     inlineWarnNeeded: function () { return inlineUnloadOn; },
     uploadEntryArtifact: uploadEntryArtifact,
@@ -12461,15 +12750,28 @@
 
   /// drop 事件数据分流：目录项（webkitGetAsEntry 只能在事件处理器内同步取）
   /// 优先——目录走遍历；散文件逐个 uploadFile（内部再按嗅探类别分流）。
+  /// 散文件同时同步索取 FileSystemFileHandle（getAsFileSystemHandle 同样
+  /// 只能在事件内调用）：单个 .mrxs 进入 MRXS 协助流程后，用它把目录选择器
+  /// 定位到原文件旁边（仅定位；用户仍需显式确认文件夹）。
   function handleWorkbenchDrop(dt) {
     if (!dt) return;
     var items = dt.items ? Array.from(dt.items) : [];
     var dirEntries = [];
+    var handles = [];
     for (var i = 0; i < items.length; i++) {
       try {
         var entry = items[i].webkitGetAsEntry && items[i].webkitGetAsEntry();
         if (entry && entry.isDirectory) dirEntries.push(entry);
       } catch (e) { /* 非 filesystem 条目：按普通文件处理 */ }
+      if (items[i].kind === "file" &&
+          typeof items[i].getAsFileSystemHandle === "function") {
+        try {
+          var h = items[i].getAsFileSystemHandle();
+          var f = typeof items[i].getAsFile === "function"
+            ? items[i].getAsFile() : null;
+          if (f && h) handles.push([f, h]);
+        } catch (e2) { /* 句柄不可用：只影响 startIn 定位 */ }
+      }
     }
     if (dirEntries.length) {
       for (var d = 0; d < dirEntries.length; d++) {
@@ -12479,7 +12781,13 @@
     }
     var files = dt.files;
     if (files && files.length > 0) {
-      for (var f = 0; f < files.length; f++) uploadFile(files[f]);
+      for (var f2 = 0; f2 < files.length; f2++) {
+        var handle = null;
+        for (var h2 = 0; h2 < handles.length; h2++) {
+          if (handles[h2][0] === files[f2]) { handle = handles[h2][1]; break; }
+        }
+        uploadFile(files[f2], handle ? { fileHandle: handle } : undefined);
+      }
     }
   }
 
@@ -12566,7 +12874,43 @@
     convertNeededUnavailable(null, folderName, retryBundle);
   }
 
+  /// MRXS 协助的 webkitdirectory 回退：目录选择器不可用/被拒时，行上的
+  /// 「选择文件夹」改点这个隐藏 input；一次待处理的协助（entry id + stem）。
+  var pendingCompanion = null;
+
+  /// 这个浏览器里还能不能选文件夹：showDirectoryPicker 或 webkitdirectory
+  /// 任一可用即可；两者都没有时 need_folder 行不给「选择文件夹」死按钮
+  ///（附注改说明不可用）。协助模块缺失 → 不臆测（保持旧行为）。
+  function folderPickSupported() {
+    var C = window.HP_MRXS_COMPANION;
+    if (!C) return true;
+    if (typeof C.supportsDirectoryPicker === "function" &&
+        C.supportsDirectoryPicker()) return true;
+    if (typeof C.supportsFolderPicker === "function") {
+      return !!C.supportsFolderPicker();
+    }
+    return true;
+  }
+
+  /// 缺成员清单的行内展示（复核 r3 B）：全部列出；超过 5 个时只列前 5 个
+  /// 并追加「等 N 个文件」（zh）/ ", and N more"（en）。分隔符随语言。
+  function missingListText(missing) {
+    var list = (Array.isArray(missing) ? missing : [])
+      .filter(function (m) { return !!m; })
+      .map(function (m) { return String(m); });
+    if (!list.length) return "";
+    var sep = (window.HP_I18N && typeof window.HP_I18N.getLang === "function" &&
+               window.HP_I18N.getLang() === "en") ? ", " : "、";
+    var MAX = 5;
+    if (list.length <= MAX) return list.join(sep);
+    var names = list.slice(0, MAX).join(sep);
+    return tt("upload.inline.needFolder.missingMore",
+      { names: names, n: String(list.length) });
+  }
+
   /// 「选择文件夹（MRXS）」（webkitdirectory input）→ 与拖入目录同一交接。
+  /// 协助流程待处理时（pendingCompanion）改道：这次选择是给那个 .mrxs 行
+  /// 补选同名数据文件夹，交给 resolveCompanionFolder 判定/装配。
   function importPickFolder() {
     var list = els.importFolderInput && els.importFolderInput.files;
     var files = list ? Array.from(list) : [];
@@ -12580,8 +12924,52 @@
     });
     var first = rows[0].relPath.split("/")[0] || rows[0].name;
     els.importFolderInput.value = "";   // 允许再次选择同一目录触发 change
+    if (pendingCompanion && inlineOrch) {
+      var pc = pendingCompanion;
+      pendingCompanion = null;
+      inlineOrch.resolveCompanionFolder(pc.id, rows, first);
+      return;
+    }
     // 与拖入目录同一分流（设计 §2.2⑩b）：开关开 → 面板队列；关闭 → 交接
     importBundleRows(rows, first);
+  }
+
+  /// 协助行的「选择「{stem}」文件夹」：目录选择器优先（startIn 定位到原
+  /// .mrxs 旁边）；无 API/SecurityError → 回退 webkitdirectory input（同
+  /// 手势内 click）。判定/装配在 orchestrator.resolveCompanionFolder。
+  async function companionPickForEntry(entry) {
+    var C = window.HP_MRXS_COMPANION;
+    var comp = entry && entry.companion ? entry.companion : {};
+    var stem = comp.stem || "";
+    if (!C || typeof C.pickDirectory !== "function" ||
+        !C.supportsDirectoryPicker()) {
+      pendingCompanion = { id: entry.id, stem: stem };
+      if (els.importFolderInput) els.importFolderInput.click();
+      return;
+    }
+    var startIn = null;
+    if (comp.handle) {
+      try { startIn = await comp.handle; } catch (e) { startIn = null; }
+    }
+    var res = await C.pickDirectory({ id: "mrxs-companion", startIn });
+    if (res.ok) {
+      var rows = null;
+      try {
+        // picked 目录不同名时只遍历同名直接子目录（多切片父文件夹不整树遍历）
+        rows = await C.collectCompanionFolder(res.handle, stem,
+          { maxMembers: 8192 });
+      } catch (e2) {
+        inlineOrch.resolveCompanionFolder(entry.id, [], res.name,
+          { traversalError: true });
+        return;
+      }
+      inlineOrch.resolveCompanionFolder(entry.id, rows,
+        res.name || res.handle.name || "");
+      return;
+    }
+    if (res.reason === "cancelled") return;   // 用户取消：安静保持待选态
+    pendingCompanion = { id: entry.id, stem: stem };   // security/error → 回退
+    if (els.importFolderInput) els.importFolderInput.click();
   }
 
   // =========================================================================
@@ -15512,7 +15900,21 @@
     // 清理入口随之不可达（`_sweepIncompleteStaging` 显式跳过带 upload 记录的
     // ready/published 任务，不兜底 → 源副本 + 产物永久残留）。开关关闭时不
     // 加载运行器（回退路径与「加载期零面板请求」语义均不变）。
-    if (inlineEnabled()) ensureInlineOrch();
+    if (inlineEnabled()) {
+      ensureInlineOrch();
+    } else if (/[?&]save-job=/.test(window.location.search || "")) {
+      // 复核 r2 #2：移交标记无法兑现（面板内上传未开启）→ 显式说明，
+      // 绝不静默忽略；标记参数照常摘除
+      showSaveHandoffNotice(
+        tt("upload.saveproj.fail.prefix") +
+        tt("upload.saveproj.reason.capabilityOff"),
+        [{ label: tt("upload.saveproj.notice.dismiss"), onClick: null }]);
+      try {
+        var u = new URL(window.location.href);
+        u.searchParams.delete("save-job");
+        window.history.replaceState({}, "", u.pathname + u.search + u.hash);
+      } catch (e) { /* 摘不掉不致命 */ }
+    }
     initAuth();
     // P3 研究采集装配（capabilities.research_collection 开启才工作）
     initResearchTelemetry();

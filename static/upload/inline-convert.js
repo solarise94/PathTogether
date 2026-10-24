@@ -458,6 +458,10 @@
     var engine = deps.engine;
     var sniff = deps.sniff;
     var cos = deps.cos;
+    // MRXS 同名数据文件夹协助（static/upload/mrxs-companion.js）：classic
+    // script 全局；测试可经 deps.companion 注入。
+    var companion = deps.companion ||
+      (typeof window !== "undefined" ? window.HP_MRXS_COMPANION : null) || null;
     var ui = deps.ui || {};
     var caps = deps.caps || {};
     var locks = deps.locks ||
@@ -528,6 +532,13 @@
         cls: fields.cls || null,
         directClass: null,
         needsConvert: false,
+        // 拖入散 .mrxs 时在 drop 事件内同步捕获的句柄 Promise（仅用于
+        // showDirectoryPicker 的 startIn 定位；不可用时为 null）
+        _fileHandle: fields.fileHandle || null,
+        companion: null,       // need_folder 状态：{ stem, name, handle, folder? }
+        companionError: null,  // 上一次补选失败的原因（{ folder } = 不是数据文件夹）
+        companionMissing: null, // 装配后 planner 报的缺成员清单（行内重试说明用）
+        companionRetry: false, // 装配后 planner 报包不完整：行内重新提供选文件夹
         jobId: fields.jobId || null,
         slideId: null,
         uploadJobId: null,
@@ -593,6 +604,7 @@
         name: file.name || "?",
         size: typeof file.size === "number" ? file.size : 0,
         target: opts.assocTarget || null,
+        fileHandle: opts.fileHandle || null,
       });
       if (ui.row) ui.row(e);
       // 步 1：路由嗅探（有界读）
@@ -633,6 +645,110 @@
       setStage(e, "upload.inline.stage.queued");
       schedule();
       return e;
+    }
+
+    /// MRXS 协助收口：补选的同名数据文件夹装配完成 → **原地**转为整包转换
+    ///（同一行：rows/名字/大小换成本包，之后与 enqueueBundle 完全同路——
+    /// prepareBundle → startJob(null)。任何复制都发生在 planner 接受之后）。
+    function resolveNeedFolder(e, rows, folderName) {
+      var real = (rows || []).filter(function (r) { return r && r.file; });
+      if (!real.length) return null;
+      var total = 0;
+      for (var i = 0; i < real.length; i++) {
+        total += (typeof real[i].file.size === "number") ? real[i].file.size : 0;
+      }
+      e.bundle = { rows: real, folderName: folderName || "" };
+      e.name = folderName || e.name;
+      e.size = total;
+      e.cls = { cls: "convert", bundle: true, ext: ".mrxs", directClass: null };
+      e.needsConvert = true;
+      e.companion = null;
+      e.companionError = null;
+      e.companionMissing = null;
+      e.companionRetry = false;
+      e._companionPending = null;
+      e.error = null;
+      e.mode = "bundle";
+      e.state = "convert_queued";
+      if (ui.buttons) ui.buttons(e);
+      setStage(e, "upload.inline.stage.queued");
+      schedule();
+      return e;
+    }
+
+    /// 补选文件夹的统一判定漏斗（工作台的目录句柄路径与 webkitdirectory
+    /// 回退都汇到这里；stem 匹配 / (a)-(d) 判定 / 装配全在共享模块
+    /// HP_MRXS_COMPANION——是否「完整包」的终审仍是 runner 的 planner）。
+    ///   opts.confirmed       mismatch 的显式确认（行内「使用此文件夹」）；
+    ///   opts.traversalError  遍历失败：行回 need_folder 并带 read 原因。
+    ///   use/parent（或确认后的 mismatch）→ resolveNeedFolder；
+    ///   mismatch（未确认）→ 行停 companion_confirm（行内确认，不弹窗）；
+    ///   reject → 行回 need_folder + 「不是数据文件夹」原因，保持可重选。
+    function resolveCompanionFolder(id, rows, folderName, opts) {
+      opts = opts || {};
+      var e = find(id);
+      if (!e || !e.companion || !companion ||
+          typeof companion.planCompanionFolder !== "function" ||
+          typeof companion.mergeRows !== "function") {
+        return null;
+      }
+      var stem = e.companion.stem || "";
+      var folder = String(folderName || "");
+      function backToNeedFolder(errInfo) {
+        e.companionError = errInfo || null;
+        e._companionPending = null;
+        e.state = "need_folder";
+        setStage(e, "upload.inline.stage.needFolder");
+        if (ui.buttons) ui.buttons(e);
+        if (ui.refresh) ui.refresh(e);
+        return e;
+      }
+      if (opts.traversalError) {
+        return backToNeedFolder({ folder: folder, read: true });
+      }
+      var plan = companion.planCompanionFolder({
+        stem: stem, folderName: folder, rows: rows || [],
+      });
+      var merging = plan.status === "use" || plan.status === "parent" ||
+        (plan.status === "mismatch" && opts.confirmed);
+      if (merging) {
+        var merged = companion.mergeRows({
+          stem: stem,
+          entryName: e.companion.name,
+          entryFile: e.file,
+          rows: rows || [],
+          prefixSegs: plan.prefixSegs,
+          maxMembers: (engine && typeof engine.MRXS_MAX_MEMBERS === "number")
+            ? engine.MRXS_MAX_MEMBERS : 8192,
+        });
+        if (!merged.ok) {
+          return backToNeedFolder({
+            folder: folder,
+            code: merged.code || "too_many_members",
+            cap: merged.cap || null,
+          });
+        }
+        return resolveNeedFolder(e, merged.rows, stem);
+      }
+      if (plan.status === "mismatch") {
+        // (c)：不同名但根上有 Slidedat.ini——行内显式确认（非弹窗，随语言
+        // 渲染；「重新选择」回到待选态）
+        e.companion = {
+          stem: stem,
+          name: e.companion.name,
+          handle: e.companion.handle,
+          folder: folder,
+        };
+        e._companionPending = { rows: rows, folderName: folderName };
+        e.companionError = null;
+        e.state = "companion_confirm";
+        setStage(e, "upload.inline.stage.needFolder");
+        if (ui.buttons) ui.buttons(e);
+        if (ui.refresh) ui.refresh(e);
+        return e;
+      }
+      // (d)：根上与同名子目录下都没有 Slidedat.ini——明确拒绝并保持可重选
+      return backToNeedFolder({ folder: folder });
     }
 
     /// 步 2（当场拒绝闸，零网络）+ 步 3（引擎可转换终审）+ 动作分派。
@@ -682,7 +798,28 @@
         return Promise.resolve(e);
       }
       if (cls.bundle === true) {
-        // 散文件 bundle（设计 §4.1.1）：手上没有伴随成员 → 静态说明 + 选择文件夹
+        if (cls.ext === ".mrxs" && companion &&
+            typeof companion.stemOf === "function") {
+          // MRXS（2026-10 交互统一）：进入「选择同名数据文件夹」状态——
+          // 非错误的中性行（不 markError、不复制任何内容）；行上主按钮
+          // 「选择「{stem}」文件夹」，另有重新选择文件/取消。补选的文件夹
+          // 经 resolveCompanionFolder 判定/装配后原地转为整包转换。
+          e.needsConvert = true;
+          e.companion = {
+            stem: companion.stemOf(e.name),
+            name: e.name,
+            handle: e._fileHandle || null,
+            folder: null,
+          };
+          e.companionError = null;
+          e.state = "need_folder";
+          setStage(e, "upload.inline.stage.needFolder");
+          if (ui.buttons) ui.buttons(e);
+          settle(e, "need_folder");
+          return Promise.resolve(e);
+        }
+        // 散文件 bundle（VMS，或协助模块不可用时的 MRXS 兜底）：手上没有
+        // 伴随成员 → 静态说明 + 选择文件夹
         e.needsConvert = true;
         markError(e, "need_bundle", null, {});
         e.state = "convert_failed";
@@ -1024,11 +1161,39 @@
         enterNeedDiskConfirm(e, (err && err.error) || {});
         return;
       }
+      // MRXS 协助装配后的包不完整（planner 缺成员等）：行内回到可重选状态
+      // ——不重复入门提示，重新给出带切片名的「选择文件夹」主按钮；用户重选
+      // 文件夹后仍以原 .mrxs File 装配（无需重选 .mrxs）。
+      if (e.bundle && e.bundle.rows && e.bundle.folderName &&
+          code === "unsupported_input" &&
+          ((err && err.error && err.error.kind) === "mrxs-bundle") &&
+          companion && typeof companion.stemOf === "function") {
+        // e.bundle.folderName 就是装配时的入口词干；rows[0] 是入口行
+        //（其 file = 用户最初选择的 .mrxs File，重选文件夹时复用）
+        e.companion = {
+          stem: String(e.bundle.folderName || ""),
+          name: (e.bundle.rows[0] && e.bundle.rows[0].name) || "",
+          handle: null,
+          folder: null,
+        };
+        // 缺成员清单：行内重试说明要点名缺什么（复核 r3 B）
+        e.companionMissing = Array.isArray(err.error.missing)
+          ? err.error.missing.filter(Boolean) : null;
+        e.companionRetry = true;
+      }
       markError(e, code, detail, { engineReason: reason });
       e.state = "convert_failed";
       setStage(e, "upload.inline.stage.convertFailed");
-      toast("upload.fail", { e: failureStageKey(code, detail)
-        ? msgKey(failureStageKey(code, detail)) : code }, "error");
+      // MRXS 协助装配后的缺成员（复核 r4）：专用短提示——泛化的
+      // 「该文件不支持本机转换」与行注矛盾（文件受支持，只是文件夹不完整）；
+      // 其余失败保持既有 toast
+      if (e.companionRetry && e.companion) {
+        toast("upload.inline.needFolder.toast",
+          { stem: e.companion.stem || "" }, "error");
+      } else {
+        toast("upload.fail", { e: failureStageKey(code, detail)
+          ? msgKey(failureStageKey(code, detail)) : code }, "error");
+      }
       if (ui.buttons) ui.buttons(e);
       settle(e, "convert_failed");
     }
@@ -1815,7 +1980,36 @@
         schedule();
         return e;
       }
+      if (action === "companionUse") {
+        // 行内确认（mismatch）→ 用该文件夹继续（按「{stem}/…」装配）
+        if (e.state !== "companion_confirm" || !e._companionPending) return e;
+        var pend = e._companionPending;
+        return resolveCompanionFolder(e.id, pend.rows, pend.folderName,
+          { confirmed: true });
+      }
+      if (action === "companionReselect") {
+        // mismatch 确认态 / 拒绝态的「重新选择」：回到待选态，保留入口信息
+        if (e.state === "companion_confirm" || e.state === "need_folder") {
+          e._companionPending = null;
+          e.companionError = null;
+          if (e.companion) e.companion.folder = null;
+          e.state = "need_folder";
+          setStage(e, "upload.inline.stage.needFolder");
+          if (ui.buttons) ui.buttons(e);
+          if (ui.refresh) ui.refresh(e);
+        }
+        return e;
+      }
       if (action === "cancel") {
+        if (e.state === "need_folder" || e.state === "companion_confirm") {
+          // 协助态没有任何本地产物/任务：取消 = 移除该行（唯一的收口）
+          e.cancelled = true;
+          var at = entries.indexOf(e);
+          if (at >= 0) entries.splice(at, 1);
+          if (ui.remove) ui.remove(e);
+          if (ui.refresh) ui.refresh(e);
+          return e;
+        }
         cancel(e);
         return e;
       }
@@ -2210,6 +2404,7 @@
     return {
       enqueue: enqueue,
       enqueueBundle: enqueueBundle,
+      resolveCompanionFolder: resolveCompanionFolder,
       act: act,
       cancel: cancel,
       discard: discard,

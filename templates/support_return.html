@@ -1,0 +1,135 @@
+{% import "_gift_items.html" as gifts %}
+<!DOCTYPE html>
+<html lang="zh-CN" data-page="support-return">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>支付结果 · HistoPilot</title>
+  <meta name="robots" content="noindex, nofollow" />
+  <link rel="describedby" href="/llms.txt" type="text/markdown" />
+  {# 页面级 CSP：script-src/style-src 'self'，form-action 'none'（刷新是同源
+     GET 链接）。同步回跳参数不被信任：状态只来自本地库/服务端验签查单。 #}
+  <link rel="stylesheet" href="/static/support/support.css?v=20261021i" />
+  <link rel="stylesheet" href="/static/support/support_pay.css?v=20261021e" />
+  <script defer src="/static/i18n.js?v=20261021i"></script>
+  <script defer src="/static/support/support_pay.js?v=20261021g"></script>
+</head>
+<body id="top">
+  <a class="skip-link" href="#main" data-i18n="support.skip">跳到主要内容</a>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="/">
+        {% include "_brand_logo.html" %}
+        <span class="brand-name">HistoPilot</span>
+        <span class="brand-sep" aria-hidden="true"></span>
+        <span class="brand-page" data-i18n="support.nav.page">支持项目</span>
+      </a>
+      <nav class="topbar-nav" aria-label="页面导航" data-i18n-aria="support.nav.aria">
+        <a class="topbar-link" href="/support" data-i18n="supportpay.back">返回支持页</a>
+        <button type="button" class="lang-toggle" data-i18n-aria="lang.toggle.aria" aria-label="切换为英文">EN</button>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    {% if state == 'paid' %}
+    <section class="card pay-card pay-card-paid" aria-labelledby="return-paid-title">
+      <h1 id="return-paid-title" data-i18n="supportreturn.paid.title">谢谢你的支持！</h1>
+      <p class="return-lead">
+        <span data-i18n="supportreturn.paid.prefix">已收到你的支持</span>
+        <strong class="pay-amount">¥{{ amount_yuan }}</strong>
+        <span data-i18n="supportreturn.paid.suffix">，谢谢！</span>
+      </p>
+      {# R2 视觉：付款已核实 → 打印机平滑地打出致谢凭条（金额/订单号/本地
+         日期/致谢）。纯 CSS transform 动画（无 steps）；prefers-reduced-motion
+         下静态呈现；「再打一张」重播同一动画。 #}
+      <div class="receipt-stage receipt-stage-print">
+        <div class="printer" aria-hidden="true"><span class="printer-led"></span></div>
+        <div class="receipt-window">
+          <article class="receipt receipt-live" id="receipt" aria-labelledby="receipt-title">
+            <header class="receipt-head">
+              <p class="receipt-brand">HISTOPILOT</p>
+              <h2 class="receipt-title" id="receipt-title" data-i18n="supportreturn.receipt.kind">致谢凭条 / THANK-YOU SLIP</h2>
+            </header>
+            <p class="receipt-date"><span data-i18n="supportreturn.receipt.date">日期</span>
+              <time datetime="{{ support_date_iso }}">{{ support_date }}</time></p>
+            <div class="receipt-rule" aria-hidden="true"></div>
+            <ul class="receipt-lines">
+              <li><span class="receipt-label" data-i18n="supportreturn.receipt.line.amount">支持金额</span><span class="receipt-dots" aria-hidden="true"></span><span class="receipt-value receipt-value-amount">¥{{ amount_yuan }}</span></li>
+              <li><span class="receipt-label" data-i18n="supportreturn.receipt.line.order">订单号</span><span class="receipt-dots" aria-hidden="true"></span><span class="receipt-value receipt-ref">{{ order.out_trade_no }}</span></li>
+              {# 这份心意：档位礼物 + 自定义金额（小鱼干）。名称只由服务端
+                 本地订单行的 amount_fen 推导（gift_kind），不信任请求参数。 #}
+              {% if gift_kind %}
+              <li><span class="receipt-label" data-i18n="supportreturn.receipt.line.gift">这份心意</span><span class="receipt-dots" aria-hidden="true"></span><span class="receipt-value" data-i18n="support.tier.{{ gift_kind }}">{{ {
+                'cat_food': '一份猫粮', 'cat_toy': '猫玩具',
+                'mystery': '神秘礼物', 'fish_treat': '一条小鱼干' }[gift_kind] }}</span></li>
+              {% endif %}
+            </ul>
+            <div class="receipt-rule" aria-hidden="true"></div>
+            <p class="receipt-thanks" data-i18n="supportreturn.receipt.thanks">谢谢你。这份支持会用于本地切片转换工具与 HistoPilot 的开发、维护和服务器开销。</p>
+            <p class="receipt-sign" data-i18n="supportreturn.receipt.sign">—— HistoPilot 开发者</p>
+            <p class="receipt-disclaimer" data-i18n="supportreturn.receipt.disclaimer">* 本凭条为致谢卡片，付款记录以支付宝为准。</p>
+            <div class="receipt-barcode" aria-hidden="true"></div>
+          </article>
+        </div>
+      </div>
+      {# 喂猫互动（2026-10-21 用户评审）：不再自动播放礼物动画——礼物已在
+         /support 支持页放到小猫身边，由用户自己去喂。这里只发一张「领取卡」
+         （礼物图标 + 去喂小猫）。gift_kind 由服务端按本地订单行推导
+         （600=一份猫粮 / 1800=猫玩具 / 6800=神秘礼物；自定义金额=小鱼干）。 #}
+      <div class="gift-pickup" role="status">
+        <span class="gift-pickup-art" aria-hidden="true">{{ gifts.gift_icon(gift_kind) }}</span>
+        <p class="gift-pickup-body" data-i18n="supportreturn.pickup.{{ gift_kind }}">{{ {
+          'cat_food': '一份猫粮已经放到小猫身边啦',
+          'cat_toy': '一个猫玩具已经放到小猫身边啦',
+          'mystery': '一个神秘礼物已经放到小猫身边啦',
+          'fish_treat': '一条小鱼干已经放到小猫身边啦' }[gift_kind] }}</p>
+        <a class="btn btn-primary" href="/support#cat-card" rel="nofollow"
+           data-i18n="supportreturn.pickup.cta">去喂小猫</a>
+      </div>
+      <p class="receipt-replay-row">
+        <a class="btn btn-secondary receipt-replay" id="receipt-replay"
+           href="/support/return?out_trade_no={{ order.out_trade_no }}" rel="nofollow"
+           data-i18n="supportreturn.receipt.replay">再看一次</a>
+      </p>
+      <dl class="pay-meta">
+        <div><dt data-i18n="supportpay.order.label">订单号</dt><dd class="pay-ref">{{ order.out_trade_no }}</dd></div>
+      </dl>
+      <p class="note" data-i18n="supportreturn.paid.note">支持与平台账号无关，不会增加 AI 额度或开通功能。凭此订单号可在需要时联系作者。</p>
+      <p><a class="btn btn-secondary" href="/" data-i18n="supportreturn.home">返回主页</a></p>
+    </section>
+    {% elif state == 'closed' %}
+    <section class="card pay-card" aria-labelledby="return-closed-title">
+      <h1 id="return-closed-title" data-i18n="supportreturn.closed.title">订单未完成</h1>
+      <p data-i18n="supportreturn.closed.body">这个订单已关闭，没有产生付款。如果还想支持项目，可以回到支持页重新发起。</p>
+      <dl class="pay-meta">
+        <div><dt data-i18n="supportpay.order.label">订单号</dt><dd class="pay-ref">{{ order.out_trade_no }}</dd></div>
+      </dl>
+      <p><a class="btn btn-secondary" href="/support" data-i18n="supportreturn.closed.back">返回支持页</a></p>
+    </section>
+    {% elif state == 'neutral' %}
+    <section class="card pay-card" aria-labelledby="return-neutral-title">
+      <h1 id="return-neutral-title" data-i18n="supportreturn.neutral.title">没有找到对应的订单</h1>
+      <p data-i18n="supportreturn.neutral.body">这里只处理从支付宝付款后跳回的订单。如果你刚完成付款，请稍等片刻后从支付宝再次返回；也可以回到支持页重新发起。</p>
+      <p><a class="btn btn-secondary" href="/support" data-i18n="supportreturn.closed.back">返回支持页</a></p>
+    </section>
+    {% else %}
+    <section class="card pay-card" aria-labelledby="return-pending-title" data-return-pending{% if order %} data-status-url="/support/orders/{{ order.out_trade_no }}/status"{% endif %}>
+      <h1 id="return-pending-title" data-i18n="supportreturn.pending.title">正在确认支付结果…</h1>
+      <p data-i18n="supportreturn.pending.body">我们还没有核实到这笔订单的付款结果。如果你刚刚完成支付，请稍等片刻后手动刷新本页；未支付的订单 15 分钟后自动关闭。</p>
+      {% if order %}
+      <dl class="pay-meta">
+        <div><dt data-i18n="supportpay.order.label">订单号</dt><dd class="pay-ref">{{ order.out_trade_no }}</dd></div>
+      </dl>
+      {% endif %}
+      <p><a class="btn btn-primary" id="return-refresh" href="/support/return?out_trade_no={{ order.out_trade_no if order else '' }}" rel="nofollow" data-i18n="supportreturn.pending.refresh">刷新支付结果</a></p>
+    </section>
+    {% endif %}
+  </main>
+
+  <footer class="footer">
+    <p class="footer-note" data-i18n="support.footer">支持完全自愿；本地转换与保存始终免费。</p>
+  </footer>
+</body>
+</html>

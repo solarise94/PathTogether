@@ -240,6 +240,16 @@ _BUSINESS_TABLES = (
     "producer_import_events",
     "producer_imports",
     "plugin_import_grants",
+    # 0087 起：支付宝赞助订单/通知事件/退款（通知事件与订单无外键的持久化
+    # 幂等行、退款 FK CASCADE 已随订单清空，显式列出防跨用例残留幂等键占用）
+    "support_notify_events",
+    "support_refunds",
+    "support_orders",
+    # 0087 起（R3/R4 评审 add-on）：后绑定幂等键别名（key→原订单/原退款行；
+    # FK CASCADE 已随订单/退款清空，显式列出防跨用例残留键占用——否则下个
+    # 用例的同名 key 会被当成「已绑定」命中上一用例的订单/退款行）
+    "support_order_key_aliases",
+    "support_refund_key_aliases",
 )
 
 @pytest.fixture(scope="session")

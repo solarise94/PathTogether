@@ -74,6 +74,27 @@ REG_INVITE_LOCK_SECONDS = _int_env("REG_INVITE_LOCK_SECONDS", 900)
 REG_OWNER_CREATE_PER_MINUTE = _int_env("REG_OWNER_INVITE_CREATE_PER_MINUTE", 10)
 REG_OWNER_CREATE_PER_DAY = _int_env("REG_OWNER_INVITE_CREATE_PER_DAY", 100)
 
+# 支付宝赞助下单桶（0087；复用 auth_rate_limits 的 (scope, subject_hash) 通用
+# 计数行，无需新表）：每 IP 前缀 15 分钟 10 次**尝试**（成功也计，达限锁 15
+# 分钟）。匿名公开写面，防脚本刷单占号；主闸仍是高熵订单号 + 金额白名单。
+SCOPE_SUPPORT_ORDER_IP = "support_order_ip"
+SUPPORT_ORDER_IP_ATTEMPT_LIMIT = _int_env("SUPPORT_ORDER_IP_ATTEMPT_LIMIT", 10)
+SUPPORT_ORDER_IP_WINDOW_SECONDS = _int_env(
+    "SUPPORT_ORDER_IP_WINDOW_SECONDS", 900)
+SUPPORT_ORDER_IP_LOCK_SECONDS = _int_env(
+    "SUPPORT_ORDER_IP_LOCK_SECONDS", 900)
+
+# 赞助订单状态轮询（GET /support/orders/<ref>/status，R2 视觉轮询）：
+# 页面每 3s 轮询至多 3 分钟（≈60 次），限额放宽到 240/15min 以容纳刷新与
+# 多标签；滥用仍会被锁。
+SCOPE_SUPPORT_STATUS_IP = "support_status_ip"
+SUPPORT_STATUS_IP_ATTEMPT_LIMIT = _int_env(
+    "SUPPORT_STATUS_IP_ATTEMPT_LIMIT", 240)
+SUPPORT_STATUS_IP_WINDOW_SECONDS = _int_env(
+    "SUPPORT_STATUS_IP_WINDOW_SECONDS", 900)
+SUPPORT_STATUS_IP_LOCK_SECONDS = _int_env(
+    "SUPPORT_STATUS_IP_LOCK_SECONDS", 600)
+
 
 def _connect():
     """建连接并设 dict_row（本模块所有查询按列名访问）。"""
@@ -111,8 +132,17 @@ def _record_failure(cur, scope, subject_hash, limit, window_seconds,
         "failed_count, extract(epoch from locked_until)::float8 AS locked_until "
         "FROM auth_rate_limits WHERE scope=%s AND subject_hash=%s FOR UPDATE",
         (scope, subject_hash))
+    cur.execute(
+        "SELECT extract(epoch from window_started_at)::float8 AS ws, "
+        "failed_count, extract(epoch from locked_until)::float8 AS locked_until "
+        "FROM auth_rate_limits WHERE scope=%s AND subject_hash=%s FOR UPDATE",
+        (scope, subject_hash))
     row = cur.fetchone()
     if row is None:
+        # 桶不存在：插入（R2-5：ON CONFLICT 吸收并发同键首击的竞态；
+        # 本请求抢到插入 → 本次即计数 1，直接返回；输了插入竞态 → 与
+        # 「桶已存在」汇合，统一走下方 FOR UPDATE 重读 + 递增逻辑，
+        # 保证并发首击也被计数（而不是都停在 1）。
         failed_count = 1
         window_start = now
         locked_until = now + lock_seconds if failed_count >= limit else None
@@ -120,28 +150,49 @@ def _record_failure(cur, scope, subject_hash, limit, window_seconds,
             "INSERT INTO auth_rate_limits "
             "(scope, subject_hash, window_started_at, failed_count, "
             " locked_until, updated_at) VALUES (%s,%s, to_timestamp(%s), %s, "
-            "CASE WHEN %s THEN to_timestamp(%s) ELSE NULL END, now())",
+            "CASE WHEN %s THEN to_timestamp(%s) ELSE NULL END, now())"
+            " ON CONFLICT (scope, subject_hash) DO NOTHING",
             (scope, subject_hash, window_start, failed_count,
              locked_until is not None, locked_until))
+        if cur.rowcount == 1:
+            # 本请求建桶成功：本次即第 1 次失败
+            retry = _retry_after(locked_until, now)
+            return {
+                "failed_count": failed_count,
+                "locked": retry > 0,
+                "locked_until": locked_until,
+                "retry_after_seconds": retry,
+            }
+    # 统一递增路径：桶已存在 / 插入输了竞态——重读 FOR UPDATE 后**一定**
+    # 走到下面的递增/锁定逻辑（R2-5：并发首击计数必须累加）。
+    cur.execute(
+        "SELECT extract(epoch from window_started_at)::float8 AS ws, "
+        "failed_count, extract(epoch from locked_until)::float8 AS locked_until "
+        "FROM auth_rate_limits WHERE scope=%s AND subject_hash=%s FOR UPDATE",
+        (scope, subject_hash))
+    row = cur.fetchone()
+    if row is None:
+        # 理论不可达（插入已成功或竞态方已提交）；防御性按首击未锁返回
+        return {"failed_count": 1, "locked": False, "locked_until": None,
+                "retry_after_seconds": 0}
+    if row["ws"] is None or row["ws"] + window_seconds <= now:
+        # 窗口过期：重置计数（新一轮从 1 起）
+        failed_count = 1
+        window_start = now
     else:
-        if row["ws"] is None or row["ws"] + window_seconds <= now:
-            # 窗口过期：重置计数（新一轮从 1 起）
-            failed_count = 1
-            window_start = now
-        else:
-            failed_count = int(row["failed_count"]) + 1
-            window_start = row["ws"]
-        locked_until = row["locked_until"]
-        if failed_count >= limit:
-            candidate = now + lock_seconds
-            # 已锁且截止更晚时保留原截止（不因窗口内继续失败而缩短）
-            locked_until = (max(locked_until, candidate)
-                            if locked_until is not None else candidate)
-        cur.execute(
-            "UPDATE auth_rate_limits SET window_started_at=to_timestamp(%s), "
-            "failed_count=%s, locked_until=to_timestamp(%s), updated_at=now() "
-            "WHERE scope=%s AND subject_hash=%s",
-            (window_start, failed_count, locked_until, scope, subject_hash))
+        failed_count = int(row["failed_count"]) + 1
+        window_start = row["ws"]
+    locked_until = row["locked_until"]
+    if failed_count >= limit:
+        candidate = now + lock_seconds
+        # 已锁且截止更晚时保留原截止（不因窗口内继续失败而缩短）
+        locked_until = (max(locked_until, candidate)
+                        if locked_until is not None else candidate)
+    cur.execute(
+        "UPDATE auth_rate_limits SET window_started_at=to_timestamp(%s), "
+        "failed_count=%s, locked_until=to_timestamp(%s), updated_at=now() "
+        "WHERE scope=%s AND subject_hash=%s",
+        (window_start, failed_count, locked_until, scope, subject_hash))
     retry = _retry_after(locked_until, now)
     return {
         "failed_count": failed_count,
@@ -395,5 +446,94 @@ def record_owner_invite_creation(owner_hash):
                         now)
                     retry = max(retry, int(s.get("retry_after_seconds") or 0))
         return retry
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# 赞助下单限流（0087）：每 IP 前缀尝试桶（成功也计）。全部 PostgreSQL 权威，
+# 多 worker 一致；存储不可用时调用方 fail-closed（同注册限流纪律）。
+# --------------------------------------------------------------------------- #
+def check_support_order_ip_locked(ip_prefix_hash):
+    """查询赞助下单限流锁定状态：返回剩余锁定秒数（0=未锁）。"""
+    if not ip_prefix_hash:
+        return 0
+    now = time.time()
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT extract(epoch from locked_until)::float8 "
+                    "AS locked_until FROM auth_rate_limits "
+                    "WHERE scope=%s AND subject_hash=%s",
+                    (SCOPE_SUPPORT_ORDER_IP, ip_prefix_hash))
+                row = cur.fetchone()
+                if row is None:
+                    return 0
+                return _retry_after(row["locked_until"], now)
+    finally:
+        conn.close()
+
+
+def record_support_order_attempt(ip_prefix_hash):
+    """记录一次赞助下单尝试（成功也计）；返回锁定剩余秒数（0=未锁）。"""
+    now = time.time()
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                _purge_expired(cur, now, SUPPORT_ORDER_IP_WINDOW_SECONDS,
+                               SUPPORT_ORDER_IP_LOCK_SECONDS)
+                if not ip_prefix_hash:
+                    return 0
+                state = _record_failure(
+                    cur, SCOPE_SUPPORT_ORDER_IP, ip_prefix_hash,
+                    SUPPORT_ORDER_IP_ATTEMPT_LIMIT,
+                    SUPPORT_ORDER_IP_WINDOW_SECONDS,
+                    SUPPORT_ORDER_IP_LOCK_SECONDS, now)
+        return int(state.get("retry_after_seconds") or 0)
+    finally:
+        conn.close()
+
+def check_support_status_ip_locked(ip_prefix_hash):
+    """查询赞助状态轮询限流锁定状态：返回剩余锁定秒数（0=未锁）。"""
+    if not ip_prefix_hash:
+        return 0
+    now = time.time()
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT extract(epoch from locked_until)::float8 "
+                    "AS locked_until FROM auth_rate_limits "
+                    "WHERE scope=%s AND subject_hash=%s",
+                    (SCOPE_SUPPORT_STATUS_IP, ip_prefix_hash))
+                row = cur.fetchone()
+                if row is None:
+                    return 0
+                return _retry_after(row["locked_until"], now)
+    finally:
+        conn.close()
+
+
+def record_support_status_attempt(ip_prefix_hash):
+    """记录一次赞助状态轮询请求（200 也计）；返回锁定剩余秒数（0=未锁）。"""
+    now = time.time()
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                _purge_expired(cur, now, SUPPORT_STATUS_IP_WINDOW_SECONDS,
+                               SUPPORT_STATUS_IP_LOCK_SECONDS)
+                if not ip_prefix_hash:
+                    return 0
+                state = _record_failure(
+                    cur, SCOPE_SUPPORT_STATUS_IP, ip_prefix_hash,
+                    SUPPORT_STATUS_IP_ATTEMPT_LIMIT,
+                    SUPPORT_STATUS_IP_WINDOW_SECONDS,
+                    SUPPORT_STATUS_IP_LOCK_SECONDS, now)
+        return int(state.get("retry_after_seconds") or 0)
     finally:
         conn.close()

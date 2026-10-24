@@ -144,6 +144,19 @@ def test_tools_slides_no_inline_script_or_style(_iso):
     assert 'src="http' not in body and "src='http" not in body
 
 
+def test_tools_slides_inline_capability_payload_on_body(_iso, monkeypatch):
+    """「保存到我的项目」的移交门禁（复核 r2 #2）：body 属性下发「面板内
+    上传」开关（与工作台 bootstrap 同一载荷字段 _inline_convert_payload），
+    开关关闭时翻转为 false——转换器据此在移交前禁用并说明原因。"""
+    app_mod.INLINE_CONVERT_ENABLED = True
+    body = _get("/tools/slides").get_data(as_text=True)
+    assert 'data-inline-convert-enabled="true"' in body
+    assert 'data-inline-convert-enabled="false"' not in body
+    monkeypatch.setattr(app_mod, "INLINE_CONVERT_ENABLED", False)
+    body = _get("/tools/slides").get_data(as_text=True)
+    assert 'data-inline-convert-enabled="false"' in body
+
+
 def test_tools_slides_assets_exist():
     """页面引用的静态资源存在（模板 → CSS/JS；引擎产物）。"""
     html = (REPO_ROOT / "templates" / "tools_slides.html").read_text(encoding="utf-8")

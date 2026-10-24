@@ -1,0 +1,341 @@
+{% import "_gift_items.html" as gifts %}
+<!DOCTYPE html>
+<html lang="zh-CN" data-page="support">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>支持项目 · HistoPilot</title>
+  <meta name="description" content="自愿支持 HistoPilot 与本地切片转换工具的持续开发、维护和服务器开销。本地转换与保存始终免费，支持不会兑换 AI 额度或额外功能。" />
+  <link rel="describedby" href="/llms.txt" type="text/markdown" />
+  {% if canonical %}<link rel="canonical" href="{{ canonical }}" />{% endif %}
+  {% include "_site_icons.html" %}
+  {# 页面级 CSP（_apply_support_security_headers）: script-src/style-src 'self';
+     本模板不得出现内联 <style> 或 style 属性。 #}
+  <link rel="stylesheet" href="/static/support/support.css?v=20261023a" />
+  <script defer src="/static/i18n.js?v=20261023a"></script>
+  <script defer src="/static/support/support.js?v=20261023b"></script>
+</head>
+<body id="top">
+  <a class="skip-link" href="#main" data-i18n="support.skip">跳到主要内容</a>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="/">
+        {% include "_brand_logo.html" %}
+        <span class="brand-name">HistoPilot</span>
+        <span class="brand-sep" aria-hidden="true"></span>
+        <span class="brand-page" data-i18n="support.nav.page">支持项目</span>
+      </a>
+      <nav class="topbar-nav" aria-label="页面导航" data-i18n-aria="support.nav.aria">
+        <a class="topbar-link" href="/tools/slides">
+          <svg class="topbar-icon" viewBox="0 0 24 24" width="16" height="16" fill="none"
+               stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+               aria-hidden="true" focusable="false">
+            <rect x="3.5" y="3.5" width="7" height="7" rx="1.5"></rect>
+            <rect x="13.5" y="3.5" width="7" height="7" rx="1.5"></rect>
+            <rect x="3.5" y="13.5" width="7" height="7" rx="1.5"></rect>
+            <rect x="13.5" y="13.5" width="7" height="7" rx="1.5"></rect>
+          </svg>
+          <span data-i18n="support.nav.tools">本地切片工具</span>
+        </a>
+        <a class="topbar-link" href="/">
+          <svg class="topbar-icon" viewBox="0 0 24 24" width="16" height="16" fill="none"
+               stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+               aria-hidden="true" focusable="false">
+            <path d="M4 11.5 12 4l8 7.5"></path>
+            <path d="M6 10v9.5h12V10"></path>
+          </svg>
+          <span data-i18n="support.nav.home">返回主页</span>
+        </a>
+        <button type="button" class="lang-toggle" data-i18n-aria="lang.toggle.aria" aria-label="切换为英文">EN</button>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <div class="support-hero">
+      <div class="support-intro">
+        <p class="kicker" data-i18n="support.kicker">支持项目</p>
+        <h1 data-i18n="support.title">支持项目</h1>
+        <p class="lead" data-i18n="support.lead">如果本地切片工具或 HistoPilot 对你有帮助，欢迎自愿支持项目的持续开发与维护。</p>
+
+        {% if notice_kind and notice_order %}
+        {# R2 B1：会话内待确认/近期已支付订单提醒（仅本会话 refs，无泄露） #}
+        <section class="card pay-notice" aria-labelledby="pay-notice-title">
+          {% if notice_kind == 'pending' %}
+          <h2 id="pay-notice-title" class="pay-notice-title" data-i18n="support.notice.pending.title">你有一笔支持待确认</h2>
+          <p class="section-lead"><span data-i18n="support.notice.pending.body">还有一笔 ¥</span><strong class="pay-notice-amount">{{ notice_amount_yuan }}</strong><span data-i18n="support.notice.pending.body2"> 的支持待确认。</span></p>
+          <p><a class="btn btn-primary" href="/support/return?out_trade_no={{ notice_order['out_trade_no'] }}" rel="nofollow" data-i18n="support.notice.pending.cta">我已完成付款，查看结果</a></p>
+          {% else %}
+          <h2 id="pay-notice-title" class="pay-notice-title" data-i18n="support.notice.paid.title">查看致谢凭条</h2>
+          <p class="section-lead"><span data-i18n="support.notice.paid.body">你有一笔 ¥</span><strong class="pay-notice-amount">{{ notice_amount_yuan }}</strong><span data-i18n="support.notice.paid.body2"> 的支持已完成，谢谢！</span></p>
+          <p><a class="btn btn-primary" href="/support/return?out_trade_no={{ notice_order['out_trade_no'] }}" rel="nofollow" data-i18n="support.notice.paid.cta">查看致谢凭条</a></p>
+          {% endif %}
+        </section>
+        {% endif %}
+
+        <section class="card" aria-labelledby="purpose-title">
+          <h2 id="purpose-title" data-i18n="support.purpose.title">这份支持用在哪里</h2>
+          <p data-i18n="support.purpose.body">你的支持会用于本地切片转换工具与 HistoPilot 套件的开发、维护和服务器开销；支持行为与平台账号无关。</p>
+        </section>
+
+        <section class="card" aria-labelledby="voluntary-title">
+          <h2 id="voluntary-title" data-i18n="support.voluntary.title">自愿支持</h2>
+          <ul class="plain-list">
+            <li data-i18n="support.voluntary.free">本地转换与保存继续免费使用，不需要登录。</li>
+            <li data-i18n="support.voluntary.noquota">支持项目不会增加 AI 额度、存储空间、转换次数，也不会开通额外功能或优先处理权益。</li>
+            <li data-i18n="support.voluntary.amount">支持金额由你自愿决定；不支付也不影响使用本地转换工具。</li>
+          </ul>
+        </section>
+
+        {% if pay_enabled %}
+        {# 第二阶段：支付宝「AI 网页应用收款」金额选择（0087，沙箱）。
+           服务端权威金额校验（¥1–¥500、两位小数）；表单 POST /support/orders
+           走全局 CSRF 闸（隐藏域）。下单成功 303 到 /support/pay/<订单号>，
+           由那里渲染支付宝表单并自动提交——本页 CSP form-action 'self'。 #}
+        <section class="card" id="pay-pick" aria-labelledby="pay-pick-title">
+          <h2 id="pay-pick-title" data-i18n="support.paypick.title">用支付宝支持</h2>
+          <p class="section-lead" data-i18n="support.paypick.lead">选择或输入支持金额，会跳转到支付宝完成付款；不需要登录。</p>
+        {% if pay_error == 'invalid_amount' %}
+          <p class="pay-error" id="pay-error" role="alert" data-i18n="support.paypick.error.invalid_amount">金额无效：请输入 ¥1–¥500 之间、最多两位小数的金额。</p>
+          {% elif pay_error == 'rate_limited' %}
+          <p class="pay-error" id="pay-error" role="alert" data-i18n="support.paypick.error.rate_limited">尝试次数过多，请稍后再试。</p>
+          {% elif pay_error == 'unavailable' %}
+          <p class="pay-error" id="pay-error" role="alert" data-i18n="support.paypick.error.unavailable">在线支持暂时不可用，请稍后再试或通过邮箱联系作者。</p>
+          {% elif pay_error == 'csrf' %}
+          <p class="pay-error" id="pay-error" role="alert" data-i18n="support.paypick.error.csrf">页面已过期，请刷新后重试。</p>
+          {% elif pay_error == 'order_conflict' %}
+          <p class="pay-error" id="pay-error" role="alert" data-i18n="support.paypick.error.order_conflict">订单状态与本次请求不一致，请刷新页面后重新选择金额。</p>
+          {% endif %}
+          <form method="post" action="/support/orders" id="pay-pick-form" aria-describedby="pay-pick-lead-note">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+            {# 下单幂等 key（R1 add-on）：每次渲染新随机值；真双击的两次并发
+               POST 带同一 key，服务端按 UNIQUE 索引只建一单。 #}
+            <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}" />
+            <fieldset class="pay-presets">
+              <legend data-i18n="support.paypick.preset.legend">选择支持档位</legend>
+              <div class="pay-tier-row">
+                {% for fen, yuan, tier in pay_tiers %}
+                <label class="pay-tier">
+                  <input type="radio" name="amount" value="{{ yuan }}"
+                         data-tier="{{ tier }}" {% if loop.first %}checked{% endif %} />
+                  <span class="pay-tier-card">
+                    <span class="pay-tier-art" aria-hidden="true">{{ gifts.gift_icon(tier) }}</span>
+                    <span class="pay-tier-name" data-i18n="support.tier.{{ tier }}">{{ {
+                      'cat_food': '一份猫粮', 'cat_toy': '猫玩具',
+                      'mystery': '神秘礼物' }[tier] }}</span>
+                    <span class="pay-tier-price">¥{{ yuan }}</span>
+                  </span>
+                </label>
+                {% endfor %}
+                <label class="pay-tier pay-tier-custom">
+                  <input type="radio" name="amount" value="" id="amount-custom-radio" />
+                  <span class="pay-tier-card">
+                    <span class="pay-tier-art" aria-hidden="true">{{ gifts.custom_icon() }}</span>
+                    <span class="pay-tier-name" data-i18n="support.paypick.custom.label">自定义</span>
+                    <span class="pay-tier-price" data-i18n="support.paypick.custom.range">¥1–¥500</span>
+                  </span>
+                </label>
+              </div>
+            </fieldset>
+            <div class="pay-custom-field">
+              <label for="amount-custom" data-i18n="support.paypick.custom.field">自定义金额（¥1–¥500）</label>
+              <input type="text" id="amount-custom" name="amount_custom"
+                     inputmode="decimal" autocomplete="off" placeholder="18.88"
+                     aria-describedby="amount-custom-hint" />
+              <p class="hint" id="amount-custom-hint" data-i18n="support.paypick.custom.hint">最多两位小数，例如 6.66。</p>
+            </div>
+            <p id="pay-pick-lead-note" class="note" data-i18n="support.paypick.note">支持与平台账号无关，不会增加 AI 额度或开通功能；付款由支付宝处理。</p>
+            <button type="submit" class="btn btn-primary" id="pay-pick-submit">
+              <span data-i18n="support.paypick.cta">用支付宝支持</span>
+            </button>
+          </form>
+        </section>
+        {% endif %}
+
+        {# 可以陪玩的小猫（内联 SVG + CSS 动画，JS 只是渐进增强；无图片
+           资源、无网络请求、无内联样式/脚本）。始终渲染在左栏末位。 #}
+      <section class="card cat-card" id="cat-card" aria-labelledby="cat-caption">
+        <h2 id="cat-caption" class="cat-caption" data-i18n="support.cat.caption">先陪小猫玩一会儿吧</h2>
+        <div class="cat-stage" id="cat-stage" role="button" tabindex="0"
+             data-i18n-aria="support.cat.aria"
+             aria-label="和小猫玩：按 Enter 摸摸它，也可以拖动毛线球">
+          {% include "_cat_svg.html" %}
+          {# R2 add-on：档位预览——选中档位时对应礼物悬停在猫上方（纯展示；
+             掉落/吃/安装动画只在付款核实后的回跳页播放）。 #}
+          <div class="gift-preview" id="gift-preview" aria-hidden="true">
+            <span class="gift-preview-item gift-preview-cat_food">{{ gifts.gift_icon('cat_food') }}</span>
+            <span class="gift-preview-item gift-preview-cat_toy">{{ gifts.gift_icon('cat_toy') }}</span>
+            <span class="gift-preview-item gift-preview-mystery">{{ gifts.gift_icon('mystery') }}</span>
+          </div>
+          <div class="cat-bubble" aria-hidden="true" data-i18n="support.cat.meow">喵~</div>
+          {# 喂食专属气泡（好吃！）：喂食场景中替换默认的「喵~」（is-yum） #}
+          <div class="cat-bubble cat-bubble-feed" aria-hidden="true" data-i18n="support.cat.feed.yum">好吃！</div>
+          <div class="cat-toy" id="cat-toy" aria-hidden="true">
+            <svg viewBox="0 0 44 44" width="44" height="44" focusable="false">
+              <path d="M33 33 q6 4 9 9" fill="none" stroke="#c9566b" stroke-width="2" stroke-linecap="round"></path>
+              <circle cx="22" cy="22" r="15" fill="#e8798c"></circle>
+              <path d="M10 14 q8 -4 16 4 t10 10 M9 22 q10 -6 18 2 t8 10 M14 9 q2 10 10 14 t6 12 M24 8 q-4 8 2 14 t10 6"
+                    fill="none" stroke="#c9566b" stroke-width="1.8" stroke-linecap="round"></path>
+              <path d="M16 13 q4 -3 8 -2" fill="none" stroke="#f6c3cc" stroke-width="1.6" stroke-linecap="round"></path>
+            </svg>
+          </div>
+          {# 喂猫互动（2026-10-21 用户评审）：本会话已支付订单的礼物本体
+             （服务端权威，最新在前、至多 3 份）。默认 hidden——JS 只揭示
+             本地未喂过的（localStorage 指针，纯装饰状态）。aria-hidden：
+             舞台本身是 role=button；可喂的真正控件是下方礼物托盘的按钮。 #}
+          {% for cat_gift in cat_gifts %}
+          <div class="cat-gift cat-gift-{{ cat_gift.gift }}" data-ref="{{ cat_gift.ref }}"
+               data-gift="{{ cat_gift.gift }}" aria-hidden="true" hidden>
+            {{ gifts.gift_icon(cat_gift.gift) }}
+          </div>
+          {% endfor %}
+        </div>
+        {# 礼物托盘：真实按钮（键盘/读屏可达），点击 = 喂（礼物滑到喂食点）。
+           同样默认 hidden，JS 与舞台礼物一起揭示/清理。 #}
+        <div class="cat-gift-tray" id="cat-gift-tray">
+          {% for cat_gift in cat_gifts %}
+          <button type="button" class="btn btn-secondary cat-gift-feed"
+                  data-ref="{{ cat_gift.ref }}" data-gift="{{ cat_gift.gift }}" hidden
+                  data-i18n="support.cat.feed.{{ cat_gift.gift }}">{{ {
+                    'cat_food': '喂小猫吃猫粮', 'cat_toy': '陪小猫玩小老鼠',
+                    'mystery': '把神秘礼物交给小猫',
+                    'fish_treat': '喂小猫吃小鱼干' }[cat_gift.gift] }}</button>
+          {% endfor %}
+        </div>
+        <p class="cat-hint" data-i18n="support.cat.hint">点一点它会开心；拖动毛线球，它会伸手去拍。</p>
+        {# 喂猫/收礼过程读屏播报（polite，不用 role=alert） #}
+        <p class="visually-hidden" id="cat-live" aria-live="polite"></p>
+      </section>
+      </div>
+
+      {# R2 视觉 + 喂猫互动：打印时刻在桌面端「支付状态」弹层的已支付窗格
+         （付款服务端核实后）；移动端仍在 /support/return。这里只放一台待机
+         打印机与静音提示，保持两栏布局平衡；无内联样式/脚本。 #}
+      <aside class="receipt-stage receipt-stage-idle" aria-label="致谢凭条打印机（待机）">
+        <div class="printer" aria-hidden="true"><span class="printer-led"></span></div>
+        <div class="receipt-window receipt-window-idle">
+          <div class="receipt-idle-paper" aria-hidden="true"></div>
+        </div>
+        <p class="receipt-hint" data-i18n="support.receipt.idle.hint">完成支持后，收款机会弹出来为你打印一张致谢凭条；凭条上的礼物可以拿去喂小猫。</p>
+      </aside>
+    </div>
+
+
+    <section class="card" id="contact" aria-labelledby="contact-title">
+      <h2 id="contact-title" data-i18n="support.contact.title">联系与返回</h2>
+      <p data-i18n="support.contact.body">遇到问题或有其他建议，可以给作者发邮件。</p>
+      <div class="contact-actions">
+        <a class="btn btn-secondary" href="mailto:{{ author_email }}"><span data-i18n="support.contact.email.cta">给作者发邮件</span> <span class="contact-email">{{ author_email }}</span></a>
+        <a class="btn btn-secondary" href="/tools/slides" data-i18n="support.contact.tools">打开本地切片工具</a>
+        <a class="btn btn-secondary" href="/" data-i18n="support.contact.home">返回主页</a>
+      </div>
+      <p class="note" data-i18n="support.contact.tabnote">已有转换任务仍保留在原转换器标签页；从这里重新打开工具不会接管、取消或重建那个任务。</p>
+      <p class="note" data-i18n="support.privacy.note">本页只读取自身静态资源，不读取你的切片、文件名、转换任务或浏览器中的本地文件。</p>
+    </section>
+  </main>
+
+  {% if pay_enabled %}
+  {# 桌面端「支付状态」弹层（R3）：JS + 宽视口时由 support.js 拦截下单提交，
+     JSON 建单后在本页 iframe 里加载 /support/pay/<ref>/qr（同源 embed 页，
+     服务端签名表单带 qr_pay_mode=4 自动提交，收银台在 iframe 内渲染二维码）。
+     移动端/窄屏/触屏/无 JS 不渲染此层逻辑（hidden），整页跳转收银台不变。
+     无内联样式/脚本；焦点圈闭、Esc 关闭、aria-modal 由 support.js 提供。 #}
+  <div class="pay-modal" id="pay-modal" role="dialog" aria-modal="true"
+       aria-labelledby="pay-modal-title" hidden>
+    <div class="pay-modal-box">
+      <header class="pay-modal-head">
+        <h2 class="pay-modal-title" id="pay-modal-title" data-i18n="support.modal.title">支付状态</h2>
+        <button type="button" class="pay-modal-close" id="pay-modal-close"
+                data-i18n-aria="support.modal.close" aria-label="关闭">×</button>
+      </header>
+      <div class="pay-modal-order">
+        <span class="pay-modal-gift" id="pay-modal-gift" aria-hidden="true"></span>
+        <span class="pay-modal-name" id="pay-modal-name"></span>
+      </div>
+      {# 两个窗格叠放在同一 grid 单元格：高度取两者较大者——QR ↔ 过期态切换
+         时弹层不跳动。 #}
+      <div class="pay-modal-panes">
+        <div class="pay-modal-qr" id="pay-modal-qr">
+          <div class="pay-modal-qr-tile">
+            <div class="pay-modal-frame-host" id="pay-modal-frame-host"></div>
+          </div>
+          <p class="pay-modal-amount-big">¥<span id="pay-modal-amount"></span></p>
+          <p class="pay-modal-hint" data-i18n="support.modal.qr.hint">请使用支付宝扫码付款</p>
+          <p class="pay-modal-countdown">
+            <span data-i18n="support.modal.expires.prefix">二维码有效期还剩 </span><span id="pay-modal-countdown">15:00</span>
+          </p>
+          <p class="pay-modal-fallback-row">
+            <a class="btn btn-secondary" id="pay-modal-fallback" href="/support"
+               rel="nofollow" data-i18n="support.modal.fallback">改用支付宝网页收银台</a>
+          </p>
+        </div>
+        <div class="pay-modal-expired" id="pay-modal-expired" hidden>
+          <h3 class="pay-modal-expired-title" data-i18n="support.modal.expired.title">二维码已过期</h3>
+          <p class="pay-modal-expired-body" data-i18n="support.modal.expired.body">这个支付二维码已失效，可以重新生成一个。</p>
+          <button type="button" class="btn btn-primary" id="pay-modal-regenerate" data-i18n="support.modal.regenerate">重新生成</button>
+        </div>
+        {# 第四窗格（2026-10-23 评审）：查询失败/状态未知 ≠ 已过期。只提示
+           不要重复支付，无「重新生成」按钮——JS 持续退避重试，服务端给出
+           明确状态后自动切到过期/打印窗格。r4 会话变体：会话失去订单
+           （neutral）时 JS 换会话正文并露出订单号与联系入口；窗格内只用
+           <p>（既有测试切取本窗格到第一个 </div>）。 #}
+        <div class="pay-modal-unconfirmed" id="pay-modal-unconfirmed" hidden>
+          <h3 class="pay-modal-unconfirmed-title" data-i18n="support.modal.unconfirmed.title">暂时无法确认支付结果</h3>
+          <p class="pay-modal-unconfirmed-body" id="pay-modal-unconfirmed-body" data-i18n="support.modal.unconfirmed.body">网络或服务暂时不稳定，正在重试。如果你已经付款，请不要重复支付，稍后刷新本页即可看到结果。</p>
+          <p class="pay-modal-unconfirmed-session-body" id="pay-modal-unconfirmed-session-body" data-i18n="support.modal.unconfirmed.session.body" hidden>这个页面已无法确认这笔订单（会话可能已失效）。如果你已经付款，请不要重复支付；可以联系作者，附上下面的订单号核对。</p>
+          <p class="pay-modal-unconfirmed-ref" id="pay-modal-unconfirmed-ref-row" hidden><span data-i18n="support.modal.unconfirmed.ref">订单号</span> <span id="pay-modal-unconfirmed-ref"></span></p>
+          <p class="pay-modal-unconfirmed-contact" id="pay-modal-unconfirmed-contact" hidden><a class="btn btn-secondary" id="pay-modal-contact" href="mailto:{{ author_email }}" data-email="{{ author_email }}" data-i18n="support.modal.unconfirmed.contact">联系作者核对</a></p>
+        </div>
+        {# 第三窗格：付款核实后（status JSON paid）的致谢凭条打印。复用
+           .printer/.receipt 视觉语言；凭条单段缓出滑出（同回跳页动画）。
+           不再跳转回跳页——「收下礼物」直接在本页喂小猫；完整凭条仍可经
+           「查看完整凭条」链接查看。 #}
+        <div class="pay-modal-print" id="pay-modal-print" hidden>
+          <div class="pay-print-stage">
+            <div class="printer" aria-hidden="true"><span class="printer-led"></span></div>
+            <div class="pay-print-window">
+              <div class="receipt pay-print-receipt" id="pay-print-receipt">
+                <header class="receipt-head">
+                  <p class="receipt-brand">HISTOPILOT</p>
+                  <p class="receipt-title" data-i18n="support.modal.print.kind">致谢凭条</p>
+                </header>
+                <div class="receipt-rule" aria-hidden="true"></div>
+                <p class="pay-print-gift-row">
+                  <span class="pay-print-gift-art" id="pay-print-gift-art" aria-hidden="true"></span>
+                  <span class="pay-print-gift-name" id="pay-print-gift-name"></span>
+                </p>
+                <p class="pay-print-amount">¥<span id="pay-print-amount"></span></p>
+                <p class="pay-print-meta">
+                  <span id="pay-print-date"></span><span class="receipt-dots" aria-hidden="true"></span><span id="pay-print-ref" class="pay-print-ref"></span>
+                </p>
+                <div class="receipt-rule" aria-hidden="true"></div>
+                <p class="receipt-thanks" data-i18n="support.modal.print.thanks">谢谢你！凭条上的礼物已打包好，可以拿去喂小猫。</p>
+                <p class="receipt-disclaimer" data-i18n="supportreturn.receipt.disclaimer">* 本凭条为致谢卡片，付款记录以支付宝为准。</p>
+              </div>
+            </div>
+          </div>
+          <button type="button" class="btn btn-primary pay-modal-deliver" id="pay-modal-deliver"></button>
+          <p class="pay-modal-fallback-row">
+            <a class="pay-print-fullreceipt" id="pay-modal-fullreceipt" href="/support/return"
+               rel="nofollow" data-i18n="support.modal.print.fullreceipt">查看完整凭条</a>
+          </p>
+        </div>
+      </div>
+      {# 弹层凭条/礼物的图标来源（kind 由服务端 status JSON 给出；含自定义
+         金额 → 小鱼干）。本身 hidden，JS 按 kind 克隆到打印凭条与礼物本体。 #}
+      <div class="pay-gift-art-source" id="pay-gift-art-source" hidden aria-hidden="true">
+        <span data-kind="cat_food">{{ gifts.gift_icon('cat_food') }}</span>
+        <span data-kind="cat_toy">{{ gifts.gift_icon('cat_toy') }}</span>
+        <span data-kind="mystery">{{ gifts.gift_icon('mystery') }}</span>
+        <span data-kind="fish_treat">{{ gifts.gift_icon('fish_treat') }}</span>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  <footer class="footer">
+    <p class="footer-note" data-i18n="support.footer">支持完全自愿；本地转换与保存始终免费。</p>
+  </footer>
+</body>
+</html>

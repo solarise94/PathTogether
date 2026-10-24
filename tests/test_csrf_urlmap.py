@@ -84,12 +84,19 @@ def _build_rule_path(rule):
 
 
 def _collect_cases():
-    """[(rule, method, path)]：全部非豁免、非安全方法路由。"""
+    """[(rule, method, path)]：全部非豁免、非安全方法路由。
+
+    0087 起：豁免判定统一走 ``app_mod._csrf_exempt_path``（含前缀豁免与
+    支付宝异步通知的**精确路径**豁免——通知以 SDK 验签为真实性依据，CSRF
+    双提交语义不适用）。
+    """
     cases = []
     for rule in app_mod.app.url_map.iter_rules():
         if rule.rule == "/static/<path:filename>":  # 静态资源（GET-only，防御位）
             continue
         if rule.rule.startswith(app_mod._CSRF_EXEMPT_PREFIXES):
+            continue
+        if app_mod._csrf_exempt_path(rule.rule):
             continue
         for method in _rule_methods_unsafe(rule):
             cases.append((rule, method, rule.rule))
@@ -128,7 +135,13 @@ _CASES = [(rule.rule, method) for rule, method, _ in _collect_cases()]
 @pytest.mark.parametrize("rule_path,method", _CASES,
                          ids=["%s %s" % (m, p) for p, m in _CASES])
 def test_write_route_without_token_gets_400(rule_path, method):
-    """有 session 无 token 的写请求 → 400（csrf_required；/login 为 HTML 表单页）。"""
+    """有 session 无 token 的写请求 → 400（csrf_required；/login 为 HTML 表单页）。
+
+    0087 特例（同一 CSRF 闸，不同应答形态，均为**拒绝**）：
+      - POST /support/orders（浏览器原生表单）：无 token → 303 回
+        /support?pay_error=csrf（可重试 UX，同 /login 的 HTML 特例精神）；
+        功能关闭时路由本身不存在 → 404（功能闸先于 CSRF 分流）。
+    """
     rule = next(r for r in app_mod.app.url_map.iter_rules()
                 if r.rule == rule_path and method in r.methods)
     path = _build_rule_path(rule)
@@ -136,6 +149,15 @@ def test_write_route_without_token_gets_400(rule_path, method):
         pytest.skip("路由参数含不支持的转换器：%s" % rule_path)
     client = _bare_client()
     r = client.open(path, method=method)
+    if rule_path == "/support/orders":
+        if app_mod.SUPPORT_ALIPAY_PAY_ENABLED:
+            assert r.status_code == 303 and "pay_error=csrf" in (
+                r.headers.get("Location") or ""), (
+                "%s %s -> %s（预期 303 csrf 回跳）" % (method, path, r.status_code))
+        else:
+            assert r.status_code == 404, (
+                "%s %s -> %s（功能关闭应 404）" % (method, path, r.status_code))
+        return
     assert r.status_code == 400, "%s %s -> %s（预期 400 csrf_required）" % (
         method, path, r.status_code)
     if rule_path == "/login":

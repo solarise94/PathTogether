@@ -165,6 +165,7 @@ async function stageSource(jobId, file, faults) {
 // resumable prepared job).
 let bundleDir = null; // OPFS dir handle of `bundle/`
 let bundleMembers = []; // [{name, handle(sync), size}]
+let bundleJobId = null; // job whose staged members the cache above belongs to
 const BUNDLE_STAGE_CHUNK = 4 * 2 ** 20;
 
 async function opfsBundleDir(jobId, create) {
@@ -257,11 +258,15 @@ function closeBundle() {
   }
   bundleMembers = [];
   bundleDir = null;
+  bundleJobId = null;
 }
 
 /// Open all members as sync handles (probe/convert/verify read them).
-async function openBundle(jobId) {
-  if (bundleMembers.length && bundleDir) return bundleMembers;
+/// The cache is per job: preparing bundle B after bundle A must never leave
+/// A's members (or A's manifest) visible to B's probe/convert — the job id
+/// is part of the cache key, exactly like openSource's srcJobId.
+export async function openBundle(jobId) {
+  if (bundleMembers.length && bundleDir && bundleJobId === jobId) return bundleMembers;
   closeBundle();
   const dir = await opfsBundleDir(jobId, false);
   const mfh = await dir.getFileHandle('manifest.json');
@@ -276,6 +281,7 @@ async function openBundle(jobId) {
   }
   bundleDir = dir;
   bundleMembers = members;
+  bundleJobId = jobId;
   return members;
 }
 

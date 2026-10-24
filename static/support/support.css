@@ -1,0 +1,1371 @@
+/* support.css — /support 支持项目页（2026-10-21 第一阶段）。
+   视觉沿用 /tools/slides 改版的深色风格与紧凑顶栏；本页无内联样式
+   （CSP style-src 'self'）。致谢凭条使用 CSS 渐变模拟热敏纸纹理与撕口，
+   打印动画为纯 CSS，禁用 JavaScript 时内容仍完整可读。 */
+
+:root {
+  --bg: #161616;
+  --card: #1e1e1e;
+  --card-edge: #2c2c2c;
+  --text: #e8e8e8;
+  --muted: #9a9a9a;
+  --accent: #007aff;
+  --accent-soft: rgba(0, 122, 255, 0.16);
+  --ok: #4cc38a;
+  --focus-ring: 2px solid #7fb8ff;
+  --radius: 10px;
+  --paper: #f4efe2;
+  --paper-ink: #2b2620;
+  --paper-muted: #6d6355;
+  --paper-line: rgba(64, 53, 38, 0.55);
+}
+
+* { box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+}
+
+.visually-hidden {
+  position: absolute !important;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0; border: 0;
+  clip: rect(0 0 0 0); clip-path: inset(50%);
+  overflow: hidden; white-space: nowrap;
+}
+
+.skip-link {
+  position: absolute; left: 8px; top: -48px;
+  z-index: 10; padding: 8px 14px;
+  background: var(--accent); color: #fff;
+  border-radius: 0 0 var(--radius) var(--radius);
+  text-decoration: none;
+  transition: top 120ms ease;
+}
+.skip-link:focus { top: 0; }
+
+/* ------------------------------------------------------------- topbar -- */
+.topbar {
+  border-bottom: 1px solid var(--card-edge);
+  background: linear-gradient(180deg, #1a1a1a, #171717);
+}
+.topbar-inner {
+  max-width: 1200px; margin: 0 auto;
+  padding: 12px 24px;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 16px;
+}
+.brand {
+  display: inline-flex; align-items: center; gap: 10px;
+  min-width: 0;
+  color: var(--text); text-decoration: none;
+}
+.brand .site-logo {
+  width: 30px; height: 30px; flex: none;
+  border-radius: 8px;
+}
+.brand-name {
+  font-size: 17px; font-weight: 700; letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+.brand-sep {
+  width: 1px; height: 20px; flex: none;
+  background: var(--card-edge);
+}
+.brand-page {
+  color: var(--muted); font-size: 14px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.topbar-nav {
+  display: flex; align-items: center; gap: 4px;
+  flex-wrap: wrap; margin-left: auto;
+}
+.topbar-link {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 7px 10px; border-radius: 8px;
+  color: var(--muted); text-decoration: none; font-size: 14px;
+  white-space: nowrap;
+}
+.topbar-link:hover { color: var(--text); background: #242424; }
+.topbar-icon { flex: none; }
+
+/* 语言切换：地球图标用 CSS mask 引用同源 SVG（CSP img-src 'self'，无 data:
+   图片）；i18n 运行时会用 textContent 重写按钮文本，图标不能是子节点。 */
+.lang-toggle {
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  min-width: 44px; min-height: 36px; padding: 6px 9px;
+  background: transparent; color: var(--muted);
+  border: 1px solid transparent; border-radius: 8px;
+  font: inherit; font-weight: 600; cursor: pointer;
+}
+.lang-toggle::before {
+  content: "";
+  width: 16px; height: 16px; flex: none;
+  background-color: currentColor;
+  -webkit-mask: url("/static/support/globe.svg") center / contain no-repeat;
+  mask: url("/static/support/globe.svg") center / contain no-repeat;
+}
+.lang-toggle:hover { color: var(--text); background: #242424; }
+
+/* -------------------------------------------------------------- page -- */
+main {
+  max-width: 1200px; margin: 0 auto;
+  padding: 30px 24px 64px;
+  display: flex; flex-direction: column; gap: 22px;
+}
+
+.support-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 380px);
+  gap: 32px;
+  align-items: start;
+}
+.support-intro { min-width: 0; }
+
+.kicker {
+  margin: 0 0 6px;
+  color: var(--accent);
+  font-size: 13px; font-weight: 700;
+  letter-spacing: 0.08em; text-transform: uppercase;
+}
+.support-intro h1 {
+  margin: 0;
+  font-size: 40px; line-height: 1.2; letter-spacing: -0.01em;
+}
+.lead {
+  max-width: 720px;
+  margin: 12px 0 22px;
+  color: var(--muted); font-size: 16px; line-height: 1.7;
+}
+.support-intro .card + .card { margin-top: 16px; }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--card-edge);
+  border-radius: 12px;
+  padding: 20px 24px;
+  min-width: 0;
+}
+.card > h2 { margin: 0 0 12px; font-size: 18px; }
+.card p { margin: 0; }
+.card p + p, .card p + ul, .card ul + p { margin-top: 10px; }
+.section-lead { color: var(--muted); font-size: 14px; }
+
+.plain-list {
+  margin: 0; padding-left: 20px;
+  color: var(--muted);
+}
+.plain-list li { margin: 0; }
+.plain-list li + li { margin-top: 8px; }
+
+/* ------------------------------------- 在线赞助金额选择（pay-pick 表单） --
+   金额选择是**真实 radio**（键盘方向键/读屏可用），视觉上替换为胶囊分段
+   按钮；选中态用页面蓝色 accent；:focus-visible 有清晰外圈。无 JS 完整
+   可用（服务端校验权威）；「自定义」选中时经 :has 高亮输入框（渐进增强，
+   不支持的浏览器仅无高亮，功能不变）。R1 视觉评审（2026-10-21）。 */
+.pay-error {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 143, 143, 0.45);
+  border-radius: var(--radius);
+  background: rgba(255, 143, 143, 0.12);
+  color: #ffb3b3;
+  font-size: 14px;
+}
+
+.pay-presets {
+  margin: 0 0 16px;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+.pay-presets legend {
+  margin: 0 0 10px;
+  padding: 0;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+}
+.pay-preset-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.pay-preset {
+  position: relative;
+  display: inline-flex;
+}
+/* radio 视觉隐藏但保持可聚焦/可点（覆盖整个胶囊；方向键切换正常） */
+.pay-preset input[type="radio"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+.pay-preset span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 86px;
+  padding: 9px 16px;
+  border: 1px solid #3a3a3a;
+  border-radius: 999px;
+  background: #242424;
+  color: var(--text);
+  font-size: 14.5px;
+  font-weight: 600;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.pay-preset:hover span { border-color: #4a4a4a; background: #2a2a2a; }
+.pay-preset input[type="radio"]:checked + span {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent);
+  color: #9ecbff;
+}
+.pay-preset input[type="radio"]:focus-visible + span {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+}
+.pay-custom-field {
+  max-width: 320px;
+  margin: 2px 0 0;
+}
+.pay-custom-field label {
+  display: block;
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 14px;
+}
+#amount-custom {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid #3a3a3a;
+  border-radius: 8px;
+  background: #1a1a1a;
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+}
+#amount-custom:hover { border-color: #4a4a4a; }
+#amount-custom:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+/* 「自定义」选中 → 高亮输入框（:has 渐进增强） */
+#pay-pick-form:has(#amount-custom-radio:checked) .pay-custom-field label {
+  color: var(--text);
+}
+#pay-pick-form:has(#amount-custom-radio:checked) #amount-custom {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.pay-custom-field .hint { margin-top: 8px; }
+#pay-pick-form .note { margin-top: 16px; }
+#pay-pick-form .btn { margin-top: 14px; }
+
+/* ------------------------------------------------------------ receipt -- */
+.receipt-stage {
+  display: flex; flex-direction: column; align-items: center;
+  min-width: 0;
+  padding-top: 6px;
+}
+.printer {
+  width: min(360px, 100%);
+  height: 46px;
+  position: relative; z-index: 2;
+  border: 1px solid #454545;
+  border-radius: 10px 10px 4px 4px;
+  background:
+    linear-gradient(180deg, #3c3c3c, #232323 55%, #1a1a1a);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.45);
+}
+.printer::before {
+  content: "";
+  position: absolute; left: 9%; right: 9%; bottom: 8px; height: 6px;
+  border-radius: 3px;
+  background: linear-gradient(180deg, #050505, #111111);
+  box-shadow: inset 0 2px 3px rgba(0, 0, 0, 0.9),
+              0 1px 0 rgba(255, 255, 255, 0.08);
+}
+.printer-led {
+  position: absolute; right: 14px; top: 12px;
+  width: 6px; height: 6px; border-radius: 50%;
+  background: #7fb8ff;
+  box-shadow: 0 0 6px rgba(127, 184, 255, 0.85);
+}
+
+.receipt-window {
+  width: min(360px, 100%);
+  margin-top: -2px;
+  overflow: hidden;
+  padding-bottom: 14px;
+}
+
+.receipt {
+  position: relative;
+  margin: 0;
+  padding: 22px 22px 20px;
+  color: var(--paper-ink);
+  font-family: "SFMono-Regular", ui-monospace, "Cascadia Mono", "Courier New",
+    "Liberation Mono", monospace;
+  font-size: 13px;
+  line-height: 1.55;
+  /* 热敏纸质感：极细横向纤维 + 轻微受光不均；全部由 CSS 渐变构成。 */
+  background:
+    repeating-linear-gradient(0deg,
+      rgba(120, 100, 70, 0.035) 0 1px, transparent 1px 3px),
+    repeating-linear-gradient(90deg,
+      rgba(255, 255, 255, 0.05) 0 1px, transparent 1px 7px),
+    radial-gradient(120% 80% at 18% 0%,
+      rgba(255, 255, 255, 0.55), transparent 62%),
+    var(--paper);
+  box-shadow: 0 20px 44px rgba(0, 0, 0, 0.38);
+  transform-origin: top center;
+}
+
+/* R2 视觉：打印时刻只在 /support/return 的已支付态（付款已服务端核实）。
+   平滑打印 = 纸条从打印机出纸槽**整段滑出**（transform + 出纸槽 overflow
+   裁切），单段缓出、末端轻微回弹，约 2.2s——不再逐帧步进卡顿。
+   prefers-reduced-motion: reduce 下凭条静态完整呈现（见文件尾 media）。 */
+.receipt-live {
+  animation: receipt-slide-out 2.2s cubic-bezier(0.22, 0.9, 0.32, 1) both;
+  will-change: transform;
+}
+
+@keyframes receipt-slide-out {
+  from { transform: translateY(-104%); }
+  82%  { transform: translateY(1.5%); }
+  to   { transform: translateY(0); }
+}
+
+/* 撕口：底部的锯齿纸边（与纸面同色的三角，叠在深色页面背景上）。 */
+.receipt::after {
+  content: "";
+  position: absolute; left: 0; right: 0; bottom: -10px;
+  height: 10px;
+  background:
+    linear-gradient(135deg, var(--paper) 5px, transparent 0) 0 0,
+    linear-gradient(-135deg, var(--paper) 5px, transparent 0) 0 0;
+  background-size: 10px 10px;
+  background-repeat: repeat-x;
+}
+
+.receipt-head { text-align: center; }
+.receipt-brand {
+  margin: 0;
+  font-size: 15px; font-weight: 700;
+  letter-spacing: 0.22em;
+}
+.receipt-title {
+  margin: 2px 0 0;
+  font-size: 11px; font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--paper-muted);
+  text-transform: uppercase;
+}
+.receipt-date {
+  margin: 12px 0 0;
+  font-size: 12px;
+  color: var(--paper-muted);
+}
+.receipt-rule {
+  margin: 12px 0;
+  border-top: 1px dashed var(--paper-line);
+}
+.receipt-lines {
+  list-style: none;
+  margin: 0; padding: 0;
+}
+.receipt-lines li {
+  display: flex; align-items: baseline; gap: 6px;
+  margin: 0 0 6px;
+}
+.receipt-lines li:last-child { margin-bottom: 0; }
+.receipt-label { flex: none; }
+.receipt-value { flex: none; text-align: right; }
+.receipt-dots {
+  flex: 1 1 auto;
+  min-width: 12px;
+  border-bottom: 1px dotted rgba(64, 53, 38, 0.5);
+  transform: translateY(-4px);
+}
+.receipt-thanks {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.receipt-sign {
+  margin: 10px 0 0;
+  text-align: right;
+  font-size: 12.5px;
+}
+.receipt-disclaimer {
+  margin: 14px 0 0;
+  color: var(--paper-muted);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+/* 纯装饰条码：不编码任何内容（aria-hidden），避免被误认为交易号。 */
+.receipt-barcode {
+  height: 22px;
+  margin-top: 12px;
+  opacity: 0.55;
+  background: repeating-linear-gradient(90deg,
+    #3a332a 0 2px, transparent 2px 4px,
+    #3a332a 4px 5px, transparent 5px 9px,
+    #3a332a 9px 12px, transparent 12px 14px);
+}
+
+.receipt-replay {
+  margin-top: 14px;
+  padding: 7px 14px;
+  border: 1px solid #3a3a3a; border-radius: 8px;
+  background: #242424; color: var(--muted);
+  font: inherit; font-size: 13px;
+  cursor: pointer;
+}
+.receipt-replay:hover { color: var(--text); background: #2c2c2c; }
+
+/* R2 视觉：/support 上的待机打印机——打印时刻已移到回跳页已支付态。 */
+.receipt-window-idle { padding-bottom: 12px; }
+.receipt-idle-paper {
+  height: 30px;
+  margin: 0 14px;
+  background:
+    repeating-linear-gradient(0deg,
+      rgba(120, 100, 70, 0.03) 0 1px, transparent 1px 3px),
+    var(--paper);
+  border-radius: 0 0 3px 3px;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.3);
+}
+.receipt-hint {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
+}
+.receipt-stage-idle { align-items: center; }
+.receipt-window-idle { width: min(360px, 100%); }
+
+/* R2 B1：会话内待确认/近期已支付的提醒卡。 */
+.pay-notice { border-color: rgba(0, 122, 255, 0.35); }
+.pay-notice-title { margin: 0 0 8px; font-size: 16px; }
+.pay-notice .section-lead { margin: 0 0 12px; }
+.pay-notice-amount {
+  color: var(--text);
+  font-size: 15px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.pay-notice .btn { margin-top: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  .receipt { animation: none; transform: none; clip-path: none; }
+  .receipt-live { animation: none; transform: none; }
+  .pay-print-receipt.is-printing { animation: none; transform: none; }
+  .skip-link { transition: none; }
+}
+
+/* ------------------------------------------------------------ payment -- */
+/* 2026-10-21 评审：静态收款方式（二维码/收款链接）退役，.pay-grid /
+   .pay-method / .qr-figure 样式随之移除；在线赞助样式见 support_pay.css。 */
+.support-unavailable .email-line {
+  margin-top: 10px;
+  font-family: "SFMono-Regular", ui-monospace, "Courier New", monospace;
+  overflow-wrap: anywhere;
+}
+.support-unavailable a,
+.card a:not(.btn) { color: #7fb8ff; }
+
+/* -------------------------------------------------------------- misc -- */
+.btn {
+  display: inline-block;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 9px 18px;
+  font: inherit; font-weight: 600;
+  cursor: pointer; text-decoration: none;
+  color: var(--text);
+  background: #2a2a2a;
+}
+.btn-primary { background: var(--accent); color: #fff; }
+.btn-primary:hover { background: #1a86ff; }
+.btn-secondary { background: #2a2a2a; border-color: #3a3a3a; }
+.btn-secondary:hover { background: #333333; }
+
+.contact-actions {
+  display: flex; flex-wrap: wrap; gap: 10px;
+  margin-top: 14px;
+}
+.contact-email {
+  font-family: "SFMono-Regular", ui-monospace, "Courier New", monospace;
+  font-weight: 400;
+  overflow-wrap: anywhere;
+}
+
+/* R2 B3：支付跳转页的「返回/前进」恢复面板（默认 hidden，JS 切换）。 */
+.pay-resume { margin-top: 14px; }
+.pay-resume p { margin: 0 0 10px; }
+.hint, .note {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.65;
+}
+.note { margin-top: 14px; }
+.hint { margin-top: 10px; }
+
+.footer {
+  border-top: 1px solid var(--card-edge);
+  margin-top: 20px;
+}
+.footer-note {
+  max-width: 1200px; margin: 0 auto;
+  padding: 18px 24px;
+  color: var(--muted); font-size: 13px;
+}
+
+:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+}
+.brand:focus-visible,
+.topbar-link:focus-visible,
+.lang-toggle:focus-visible,
+.btn:focus-visible,
+.receipt-replay:focus-visible,
+.skip-link:focus-visible { outline-offset: 3px; }
+
+/* ---------------------------------------------------------- responsive -- */
+@media (max-width: 900px) {
+  .support-hero { grid-template-columns: minmax(0, 1fr); gap: 26px; }
+  .support-intro h1 { font-size: 34px; }
+  .receipt-stage { align-items: stretch; }
+  .printer, .receipt-window { width: 100%; max-width: 420px; margin-left: auto; margin-right: auto; }
+  .receipt-replay { align-self: center; }
+}
+
+@media (max-width: 560px) {
+  main { padding: 22px 16px 48px; gap: 18px; }
+  /* 顶栏：logo 一行 + 紧凑导航一行（R1 视觉评审——原 wrap 布局在 390px
+     下会把导航挤得七零八落）。/support、/support/pay、/support/return
+     共用此顶栏。 */
+  .topbar-inner {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 2px;
+    padding: 10px 16px 6px;
+  }
+  .topbar-nav {
+    margin-left: 0;
+    flex-wrap: nowrap;
+    justify-content: flex-start;
+    gap: 2px;
+  }
+  .topbar-link { padding: 8px 10px; font-size: 13.5px; }
+  .brand-page { display: none; }
+  .brand-sep { display: none; }
+  .support-intro h1 { font-size: 30px; }
+  .lead { font-size: 15px; }
+  .card { padding: 16px 16px; }
+  .receipt { padding: 18px 16px 16px; font-size: 12.5px; }
+  .receipt-lines li { flex-wrap: wrap; }
+  .receipt-dots { display: none; }
+  .receipt-value { margin-left: auto; }
+  .contact-actions .btn { width: 100%; text-align: center; }
+  .footer-note { padding: 16px; }
+}
+
+/* ------------------------------------------------- cat play (unconfigured) --
+   未配置收款方式时，「暂未开放」卡片换成一只可以陪玩的小猫：
+   内联 SVG + CSS 动画（呼吸/眨眼/尾巴），support.js 只是渐进增强
+   （视线跟随、摸摸、毛线球、打盹）。无图片资源、无网络请求。 */
+/* 卡片位于左栏（与其他卡片同宽，凭条仍在右栏）；舞台限宽使猫的高度约
+   380px，与改版前观感一致（R1 视觉评审 2026-10-21）。 */
+.cat-caption { margin: 0 0 10px; font-size: 17px; font-weight: 700; }
+.cat-stage {
+  position: relative;
+  display: block;
+  max-width: 520px;
+  margin: 0;
+  border: 1px solid var(--card-edge);
+  border-radius: var(--radius);
+  background:
+    radial-gradient(120% 90% at 50% 0%, rgba(244, 239, 226, 0.05), transparent 60%),
+    #1a1a1a;
+  padding: 8px 8px 4px;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+.cat-stage:focus-visible { outline: var(--focus-ring); outline-offset: 3px; }
+.cat-svg { display: block; width: 100%; height: auto; }
+.cat-hint { margin: 8px 2px 2px; color: var(--muted); font-size: 13px; }
+
+/* 毛线球玩具（HTML 层，方便指针拖动；纯装饰 aria-hidden） */
+.cat-toy {
+  position: absolute;
+  right: 9%; bottom: 10%;
+  width: 44px; height: 44px;
+  /* 松手后弹回原位（带一点回弹） */
+  transition: transform 420ms cubic-bezier(0.3, 1.45, 0.5, 1);
+  will-change: transform;
+  filter: drop-shadow(0 3px 4px rgba(0, 0, 0, 0.4));
+  cursor: grab;
+  touch-action: none; /* 只在拖毛线球时不滚动页面；摸猫区域仍可正常滚动 */
+}
+.cat-stage.is-dragging .cat-toy { transition: none; cursor: grabbing; }
+.cat-toy svg { display: block; width: 100%; height: 100%; }
+
+/* 喵气泡 */
+.cat-bubble {
+  position: absolute; left: 60%; top: 9%;
+  background: var(--paper); color: var(--paper-ink);
+  font-size: 13px; font-weight: 600; line-height: 1;
+  padding: 6px 12px; border-radius: 14px;
+  opacity: 0; transform: scale(0.7); transform-origin: bottom left;
+  transition: opacity 160ms ease, transform 160ms ease;
+  pointer-events: none;
+}
+.cat-stage.is-happy .cat-bubble { opacity: 1; transform: scale(1); }
+
+/* 呼吸 / 眨眼 / 尾巴（默认待机动画） */
+.cat-figure {
+  transform-box: view-box;
+  transform-origin: 128px 182px;
+  animation: cat-breathe 3.4s ease-in-out infinite;
+}
+@keyframes cat-breathe {
+  0%, 100% { transform: scaleY(1); }
+  50% { transform: scaleY(1.02); }
+}
+.cat-tail {
+  transform-box: fill-box;
+  transform-origin: 10% 90%;
+  animation: cat-tail-sway 3.6s ease-in-out infinite alternate;
+}
+@keyframes cat-tail-sway {
+  from { transform: rotate(-6deg); }
+  to { transform: rotate(9deg); }
+}
+/* 视线跟随：JS 只写 --eye-dx/--eye-dy 两个变量，变换全程走合成器 */
+.cat-eye-follow {
+  transform: translate(var(--eye-dx, 0px), var(--eye-dy, 0px));
+  transition: transform 90ms linear;
+}
+.cat-head {
+  transform: translate(calc(var(--eye-dx, 0px) * 0.45), calc(var(--eye-dy, 0px) * 0.45));
+  transition: transform 120ms linear;
+}
+.cat-eyes {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: cat-blink 4.8s infinite;
+}
+@keyframes cat-blink {
+  0%, 91%, 100% { transform: scaleY(1); }
+  94%, 97% { transform: scaleY(0.08); }
+}
+/* 耳朵偶尔抖一下（左右错开周期，不同步才像真猫） */
+.cat-ear { transform-box: fill-box; }
+.cat-ear-l { transform-origin: 80% 100%; animation: cat-ear-twitch-l 7.3s ease-in-out infinite; }
+.cat-ear-r { transform-origin: 20% 100%; animation: cat-ear-twitch-r 9.1s ease-in-out 1.7s infinite; }
+@keyframes cat-ear-twitch-l {
+  0%, 90%, 100% { transform: rotate(0); }
+  92% { transform: rotate(-11deg); }
+  95% { transform: rotate(3deg); }
+  97% { transform: rotate(-5deg); }
+}
+@keyframes cat-ear-twitch-r {
+  0%, 90%, 100% { transform: rotate(0); }
+  92% { transform: rotate(11deg); }
+  95% { transform: rotate(-3deg); }
+  97% { transform: rotate(5deg); }
+}
+
+/* 表情：开心 = ^ ^ 眼 + 张嘴；打盹 = ︶ ︶ 眼。默认隐藏，按状态切换 */
+.cat-eyes-happy,
+.cat-eyes-sleep,
+.cat-mouth-open { opacity: 0; transition: opacity 120ms ease; }
+
+/* 摸摸（开心）：^ω^ + 气泡 + 飘心 */
+.cat-stage.is-happy .cat-eyes { animation: none; opacity: 0; }
+.cat-stage.is-happy .cat-eyes-happy,
+.cat-stage.is-happy .cat-mouth-open { opacity: 1; }
+.cat-stage.is-happy .cat-bell { animation: cat-bell-jingle 0.5s ease-in-out 2; }
+.cat-bell { transform-box: fill-box; transform-origin: 50% 0%; }
+@keyframes cat-bell-jingle {
+  0%, 100% { transform: rotate(0); }
+  25% { transform: rotate(16deg); }
+  75% { transform: rotate(-16deg); }
+}
+.cat-paw { transform-box: fill-box; transform-origin: 20% 30%; }
+.cat-stage.is-batting .cat-paw { animation: cat-bat 0.5s ease; }
+/* 伸爪去拍右下方的毛线球：抬起、向右上挥出、落回 */
+@keyframes cat-bat {
+  0% { transform: translate(0, 0) rotate(0); }
+  40% { transform: translate(9px, -14px) rotate(-32deg); }
+  100% { transform: translate(0, 0) rotate(0); }
+}
+.cat-hearts { opacity: 0; }
+.cat-stage.is-happy .cat-hearts { opacity: 1; }
+.cat-heart { transform-box: fill-box; transform-origin: center; }
+.cat-stage.is-happy .cat-heart { animation: cat-heart 1.5s ease-out forwards; }
+.cat-stage.is-happy .cat-heart-2 { animation-delay: 180ms; }
+.cat-stage.is-happy .cat-heart-3 { animation-delay: 360ms; }
+@keyframes cat-heart {
+  0% { opacity: 0; transform: translateY(10px) scale(0.6); }
+  25% { opacity: 1; }
+  100% { opacity: 0; transform: translateY(-26px) scale(1.05); }
+}
+
+/* 打盹：闭眼 + Zzz；交互后立即醒来（JS） */
+.cat-zzz { opacity: 0; }
+.cat-zzz text {
+  font: 700 15px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  fill: var(--muted);
+}
+.cat-stage.is-sleeping .cat-zzz { opacity: 1; }
+.cat-stage.is-sleeping .cat-eyes { animation: none; opacity: 0; }
+.cat-stage.is-sleeping .cat-eyes-sleep { opacity: 1; }
+.cat-stage.is-sleeping .cat-tail { animation-duration: 8s; }
+.cat-stage.is-sleeping .cat-figure { animation-duration: 5.2s; }
+.cat-stage.is-sleeping .cat-zz { animation: cat-zzz 2.6s ease-in-out infinite; }
+.cat-stage.is-sleeping .cat-zz:nth-of-type(2) { animation-delay: 260ms; }
+.cat-stage.is-sleeping .cat-zz:nth-of-type(3) { animation-delay: 520ms; }
+@keyframes cat-zzz {
+  0% { opacity: 0; transform: translateY(4px); }
+  30% { opacity: 1; }
+  100% { opacity: 0; transform: translateY(-10px); }
+}
+
+/* 标签页隐藏时暂停全部动画（省电） */
+.cat-stage.is-paused .cat-svg *,
+.cat-stage.is-paused .cat-toy svg * { animation-play-state: paused; }
+
+/* 减少动态：静态呈现——摸摸只显示爱心/气泡，不做位移动画 */
+@media (prefers-reduced-motion: reduce) {
+  .cat-figure, .cat-tail, .cat-eyes, .cat-ear,
+  .cat-stage.is-happy .cat-bell,
+  .cat-stage.is-happy .cat-heart,
+  .cat-stage.is-batting .cat-paw,
+  .cat-stage.is-sleeping .cat-zz { animation: none; }
+  .cat-eye-follow, .cat-head, .cat-toy, .cat-bubble { transition: none; }
+  .cat-stage.is-happy .cat-hearts { opacity: 1; }
+  .cat-stage.is-happy .cat-heart { opacity: 1; transform: none; }
+  .cat-stage.is-sleeping .cat-zzz { opacity: 1; }
+}
+
+@media (max-width: 560px) {
+  .cat-stage { padding: 6px 6px 2px; }
+  .cat-toy { width: 36px; height: 36px; right: 6%; bottom: 8%; }
+  .cat-bubble { left: 50%; }
+}
+
+
+/* ------------------------------------------------ 猫咪礼物档（R2 add-on） --
+   选择卡：内联 SVG 小图 + 档位名 + 价格（真实 radio，键盘/focus 可达）；
+   「自定义」与三档同语言（✎/¥ 图标 + ¥1–¥500）。
+   回跳页动画：每档**只有一个**礼物元素，静息位（=无动画时的位置）就在
+   地板线上猫的嘴/爪旁；关键帧讲述 3–4 个节拍的故事，终点即静息位——
+   prefers-reduced-motion 下同一元素呈现同一终点。全部 transform/opacity、
+   单段缓出，无逐帧。道具（安全帽/扳手）在猫 SVG 的头/爪组内随其移动。 */
+.pay-tier-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.pay-tier {
+  position: relative;
+  display: inline-flex;
+}
+.pay-tier input[type="radio"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+.pay-tier-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  min-width: 118px;
+  padding: 12px 14px 10px;
+  border: 1px solid #3a3a3a;
+  border-radius: var(--radius);
+  background: #242424;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.pay-tier:hover .pay-tier-card { border-color: #4a4a4a; background: #2a2a2a; }
+.pay-tier input[type="radio"]:checked + .pay-tier-card {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.pay-tier input[type="radio"]:focus-visible + .pay-tier-card {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+}
+.pay-tier-art .gift-svg { width: 56px; height: auto; display: block; }
+.pay-tier-name { color: var(--text); font-size: 13.5px; font-weight: 600; }
+.pay-tier-price { color: var(--muted); font-size: 13px; }
+
+/* /support 猫卡上的档位预览（悬停物品；纯展示，JS 切 preview 类） */
+.gift-preview { position: absolute; left: 50%; top: 4%; pointer-events: none; }
+.gift-preview-item {
+  position: absolute;
+  transform: translateX(-50%);
+  animation: gift-hover-float 2.4s ease-in-out infinite;
+}
+.gift-preview-item .gift-svg { width: 44px; height: auto; display: block; }
+.gift-preview-item { display: none; }
+.cat-stage.gift-preview-cat_food .gift-preview-cat_food,
+.cat-stage.gift-preview-cat_toy .gift-preview-cat_toy,
+.cat-stage.gift-preview-mystery .gift-preview-mystery { display: block; }
+@keyframes gift-hover-float {
+  from { transform: translateX(-50%) translateY(-4%); }
+  to   { transform: translateX(-50%) translateY(10%); }
+}
+
+/* ---------------------------------------- 猫卡礼物与喂猫互动（R4 add-on） --
+   会话内已支付订单的礼物停在猫卡地板上（服务端权威渲染，默认 hidden，JS 只
+   揭示本地未喂过的——localStorage 指针，纯装饰状态）。用户可拖到猫身上、
+   或点礼物本体/托盘按钮 → 喂食场景（stage 加 is-feeding + feed-<kind>，
+   节拍类 is-eating / is-playing / is-working / is-happy / is-yum /
+   is-gear-off 由 JS 按时间轴切换；复用原回跳页礼物动画的节拍关键帧）。
+   全部 transform/opacity、单段缓出，无 steps；prefers-reduced-motion 直接
+   呈现终态。 */
+.cat-gift {
+  position: absolute;
+  left: var(--rest-x, 5%);
+  bottom: 6.5%;
+  width: 15.5%;
+  z-index: 3;
+  cursor: grab;
+  touch-action: none; /* 只在拖礼物时不滚动页面；舞台其余区域照常滚动 */
+  filter: drop-shadow(0 3px 4px rgba(0, 0, 0, 0.4));
+  transition: transform 420ms cubic-bezier(0.3, 1.45, 0.5, 1),
+              opacity 380ms ease;
+  will-change: transform;
+}
+.cat-stage.is-dragging .cat-gift { transition: none; cursor: grabbing; }
+.cat-gift .gift-svg { display: block; width: 100%; height: auto; }
+/* hidden 必须显式压制：.btn/.pay-modal-print 等作者规则会覆盖 UA 的
+   [hidden]{display:none}（礼物本体/托盘按钮未揭示时必须真隐藏） */
+.cat-gift[hidden],
+.cat-gift-feed[hidden] { display: none; }
+/* 神秘礼物（光猫）安装后驻留：LED 慢闪 */
+.cat-gift.is-installed .gift-led {
+  animation: gift-led-blink 1.6s ease-in-out infinite alternate;
+}
+/* 弹层「收下礼物」送达：从上方掉落到地板（带一点回弹） */
+.cat-gift.is-arriving {
+  animation: gift-item-drop 900ms cubic-bezier(0.3, 0.7, 0.4, 1) both;
+}
+@keyframes gift-item-drop {
+  0%   { opacity: 0; transform: translateY(-320%) rotate(-10deg); }
+  8%   { opacity: 1; }
+  20%  { transform: translateY(5%) rotate(2deg); }
+  28%, 100% { opacity: 1; transform: translateY(0) rotate(0); }
+}
+/* 喂食滑行：起点=当前视觉位（拖拽喂食为落点，点按/按钮为静息位）、
+   终点=喂食点，四个量都由 JS 写入的 CSS 变量决定 */
+.cat-gift.is-gliding {
+  animation: feed-glide 700ms cubic-bezier(0.22, 0.9, 0.32, 1) both;
+  z-index: 4;
+}
+@keyframes feed-glide {
+  from { transform: translate(var(--feed-x0, 0px), var(--feed-y0, 0px)); }
+  to   { transform: translate(var(--feed-dx, 0px), var(--feed-dy, 0px)); }
+}
+/* 吃完/用完：淡出移除 */
+.cat-gift.is-spent { opacity: 0; pointer-events: none; }
+
+/* 喂食场景进行中锁礼物层互动（JS 另有 feeding 闸防重入） */
+.cat-stage.is-feeding { cursor: default; }
+.cat-stage.is-feeding .cat-gift { pointer-events: none; }
+
+/* 头/爪的形变参考系：喂食低头/挥爪的旋转轴在脖/肩（fill-box 百分比），
+   不影响待机态的 var 平移跟随 */
+.cat-stage .cat-head { transform-box: fill-box; transform-origin: 50% 88%; }
+.cat-stage.feed-cat_toy .cat-paw,
+.cat-stage.feed-mystery .cat-paw { transform-origin: 30% 60%; }
+.gift-wrench { transform-box: fill-box; transform-origin: 50% 90%; }
+
+/* —— 猫粮 / 小鱼干：滑到前爪前 → 低头吃几口（猫粮粒/鱼身一段段消失）→
+   ^ω^「好吃！」+ 爱心 → 空碗/残骨淡出 —— */
+/* 低头埋进碗里吃（头组整体下移盖住项圈；碗在 HTML 层，正好挡在下巴前），
+   边吃边眯成 ^^ 眼；猫粮粒/鱼身的消失与每一口对齐 */
+.cat-stage.is-eating .cat-head { animation: gift-head-eat 1.6s ease-in-out both; }
+@keyframes gift-head-eat {
+  0% { transform: none; }
+  14% { transform: translateY(27px) rotate(-3deg); }
+  22% { transform: translateY(22px) rotate(2deg); }
+  30% { transform: translateY(28px) rotate(-3deg); }
+  38% { transform: translateY(22px) rotate(2deg); }
+  46% { transform: translateY(28px) rotate(-2deg); }
+  54% { transform: translateY(22px) rotate(2deg); }
+  62% { transform: translateY(28px) rotate(-2deg); }
+  80%, 100% { transform: none; }
+}
+.cat-stage.is-eating .cat-eyes { animation: none; opacity: 0; }
+.cat-stage.is-eating .cat-eyes-happy { opacity: 1; }
+@keyframes gift-kibble-gone {
+  from { opacity: 1; transform: none; }
+  to   { opacity: 0; transform: translateY(3px) scale(0.6); }
+}
+.cat-stage.feed-cat_food.is-eating .gift-kibble circle {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: gift-kibble-gone 220ms ease-in both;
+}
+.cat-stage.feed-cat_food.is-eating .gift-kibble circle:nth-child(1) { animation-delay: 420ms; }
+.cat-stage.feed-cat_food.is-eating .gift-kibble circle:nth-child(2) { animation-delay: 680ms; }
+.cat-stage.feed-cat_food.is-eating .gift-kibble circle:nth-child(3) { animation-delay: 940ms; }
+/* 小鱼干：整条 → 咬掉鱼头 → 只剩鱼骨头 */
+.gift-fish-bitten,
+.gift-fish-bone { opacity: 0; }
+@keyframes gift-fish-full-out { 0%, 30% { opacity: 1; } 32%, 100% { opacity: 0; } }
+@keyframes gift-fish-bitten-in {
+  0%, 30% { opacity: 0; }
+  32%, 60% { opacity: 1; }
+  62%, 100% { opacity: 0; }
+}
+@keyframes gift-fish-bone-in { 0%, 60% { opacity: 0; } 62%, 100% { opacity: 1; } }
+.cat-stage.feed-fish_treat.is-eating .gift-fish-full { animation: gift-fish-full-out 1.6s linear both; }
+.cat-stage.feed-fish_treat.is-eating .gift-fish-bitten { animation: gift-fish-bitten-in 1.6s linear both; }
+.cat-stage.feed-fish_treat.is-eating .gift-fish-bone { animation: gift-fish-bone-in 1.6s linear both; }
+/* 吃完后淡出期间保持「吃光」的样子（场景类已移除，动画不再持有终态） */
+.cat-gift.is-eaten .gift-kibble,
+.cat-gift.is-eaten .gift-fish-full,
+.cat-gift.is-eaten .gift-fish-bitten { opacity: 0; }
+.cat-gift.is-eaten .gift-fish-bone { opacity: 1; }
+/* 地板上有真礼物/正在喂时，不再显示档位悬停预览（避免两份猫粮） */
+.cat-stage.has-gift .gift-preview,
+.cat-stage.is-feeding .gift-preview { display: none; }
+
+/* —— 猫玩具：老鼠就位 → 下蹲蓄力/眼睛盯住 → 挥爪拍打、老鼠被打得来回窜 →
+   ^ω^ + 爱心；之后老鼠留在舞台上当第二件可拖玩具（is-plaything） —— */
+@keyframes gift-crouch-pounce {
+  0%, 24% { transform: none; }
+  34% { transform: translateY(2.5%) scaleY(0.95); }
+  46% { transform: none; }
+  54% { transform: translateX(4%) rotate(-2deg); }
+  66%, 100% { transform: none; }
+}
+@keyframes gift-paw-swipe {
+  0%, 38% { transform: none; }
+  50% { transform: rotate(-38deg) translateY(-8px); }
+  62% { transform: rotate(8deg); }
+  74%, 100% { transform: none; }
+}
+@keyframes gift-mouse-scurry {
+  0%, 100% { transform: translate(0, 0) rotate(0); }
+  25% { transform: translate(-16%, 0) rotate(-10deg); }
+  45% { transform: translate(8%, 0) rotate(9deg); }
+  68% { transform: translate(-10%, 0) rotate(-6deg); }
+}
+.cat-stage.is-playing .cat-figure { animation: gift-crouch-pounce 2s ease-in-out both; }
+.cat-stage.is-playing .cat-paw { animation: gift-paw-swipe 2s ease-in-out both; }
+.cat-stage.is-playing .cat-gift.is-gliding .gift-svg {
+  animation: gift-mouse-scurry 2s ease-in-out both;
+}
+
+/* —— 神秘礼物（光猫）：猫戴上安全帽、扭头看、举扳手敲两下 → 光猫就位
+   LED 闪烁 → ^ω^ + 爱心；帽/扳手随后淡出，光猫驻留（is-installed） —— */
+.gift-hardhat,
+.gift-wrench { opacity: 0; transition: opacity 420ms ease; }
+@keyframes gift-head-turn {
+  0%, 18% { transform: none; }
+  28%, 82% { transform: translate(-3px, 0) rotate(-4deg); }
+  92%, 100% { transform: none; }
+}
+@keyframes gift-look-rack {
+  0%, 18% { transform: none; }
+  28%, 82% { transform: translate(-4.5px, 1.5px); }
+  92%, 100% { transform: none; }
+}
+@keyframes gift-gear-appear {
+  from { opacity: 0; transform: translateY(-10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes gift-wrench-raise {
+  0%, 30% { opacity: 0; transform: none; }
+  38% { opacity: 1; transform: translateY(-6px) rotate(-12deg); }
+  60% { transform: translateY(-6px) rotate(-12deg); }
+  64% { transform: translateY(-2px) rotate(10deg); }
+  68% { transform: translateY(-6px) rotate(-12deg); }
+  72% { transform: translateY(-2px) rotate(10deg); }
+  80%, 100% { opacity: 1; transform: none; }
+}
+@keyframes gift-led-blink {
+  from { opacity: 1; }
+  to   { opacity: 0.15; }
+}
+.cat-stage.is-working .cat-head { animation: gift-head-turn 2s ease-in-out both; }
+.cat-stage.is-working .cat-eye-follow { animation: gift-look-rack 2s ease-in-out both; }
+.cat-stage.is-working .gift-wrench { animation: gift-wrench-raise 2s ease-in-out both; }
+.cat-stage.is-working .gift-hardhat {
+  animation: gift-gear-appear 500ms cubic-bezier(0.3, 1.4, 0.5, 1) 150ms both;
+}
+.cat-stage.is-working .cat-gift .gift-led {
+  animation: gift-led-blink 700ms ease-in-out 1.2s infinite alternate;
+}
+/* 收工：帽/扳手淡出（is-working 移除后动画不再持有 opacity，过渡回 0） */
+.cat-stage.is-gear-off .gift-hardhat,
+.cat-stage.is-gear-off .gift-wrench { opacity: 0; }
+
+/* 喂食专属气泡（好吃！）——场景中替换默认的「喵~」 */
+.cat-stage.is-yum .cat-bubble:not(.cat-bubble-feed) { opacity: 0; transform: scale(0.7); }
+.cat-stage.is-yum .cat-bubble-feed { opacity: 1; transform: scale(1); }
+
+/* 礼物托盘（真实按钮，键盘/读屏可达；全部喂完后 JS 加 is-empty 隐藏） */
+.cat-gift-tray {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 2px 2px;
+}
+.cat-gift-tray.is-empty { display: none; }
+
+/* 减少动态：不走滑行/进食循环——JS 直接呈现开心终态 + 爱心；这里兜底
+   静态化场景动画与送达动画 */
+@media (prefers-reduced-motion: reduce) {
+  .cat-gift.is-gliding,
+  .cat-gift.is-arriving { animation: none; transform: none; }
+  .cat-stage.is-eating .cat-head,
+  .cat-stage.is-playing .cat-figure,
+  .cat-stage.is-playing .cat-paw,
+  .cat-stage.is-playing .cat-gift.is-gliding .gift-svg,
+  .cat-stage.is-working .cat-head,
+  .cat-stage.is-working .cat-eye-follow,
+  .cat-stage.is-working .gift-wrench,
+  .cat-stage.is-working .gift-hardhat,
+  .cat-stage.is-working .cat-gift .gift-led,
+  .cat-gift.is-installed .gift-led { animation: none; }
+  .cat-stage.is-working .gift-hardhat { opacity: 1; }
+  .cat-gift.is-spent { transition: none; }
+  .gift-preview-item { animation: none; }
+}
+/* --------------------------------------- 支付状态弹层（桌面端 R3 add-on）-- */
+/* 仅桌面端（宽视口 + JS）由 support.js 打开；移动端/窄屏/触屏永远 hidden，
+   整页跳转收银台的既有流程不变。无内联样式（CSP style-src 'self'）。 */
+.pay-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(8, 8, 8, 0.66);
+}
+
+.pay-modal[hidden] { display: none; }
+
+.pay-modal-box {
+  width: min(360px, 100%);
+  max-height: min(86vh, 720px);
+  overflow: auto;
+  background: var(--card);
+  border: 1px solid var(--card-edge);
+  border-radius: var(--radius);
+  padding: 18px 20px 20px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55);
+}
+
+.pay-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.pay-modal-title {
+  margin: 0;
+  font-size: 18px;
+}
+
+.pay-modal-close {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--card-edge);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.pay-modal-close:hover,
+.pay-modal-close:focus-visible {
+  color: var(--text);
+  border-color: var(--muted);
+}
+
+/* 档位行：固定 28×28 图标盒（id 选择器特异性高于 .pay-tier-art .gift-svg 的
+   56px 档卡规则，克隆进来的 SVG 不再溢出）；flex-shrink 0、垂直居中。
+   自定义档的 ¥ 图标同样缩进此盒。 */
+#pay-modal-gift {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#pay-modal-gift .gift-svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.pay-modal-order {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.pay-modal-name {
+  color: var(--muted);
+  font-size: 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 两个窗格（QR ↔ 过期态）叠放进同一 grid 单元格：容器高度=较大者。
+   [hidden] 窗格不用 display:none（那会把它移出单元格、弹层高度跳变），
+   改为保持占位 + visibility:hidden（同样移出无障碍树与 Tab 焦点链）。 */
+.pay-modal-panes {
+  display: grid;
+}
+
+.pay-modal-panes > * { grid-area: 1 / 1; }
+
+.pay-modal-panes > [hidden] {
+  display: flex;               /* 覆盖 UA 的 display:none，保持占位 */
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.pay-modal-qr {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+/* 二维码白瓷砖：iframe 严格 200×200（收银台 qr_pay_mode=4 的裸 canvas 尺寸，
+   沙箱实测该页 body 无边距，200×200 视口恰好完整呈现、无滚动），四周 12px
+   均匀内衬，圆角白底便于扫码。 */
+.pay-modal-qr-tile {
+  background: #fff;
+  border-radius: 12px;
+  padding: 12px;
+  line-height: 0;
+}
+
+.pay-modal-frame {
+  width: 200px;
+  height: 200px;
+  border: 0;
+  background: #fff;
+}
+
+.pay-modal-amount-big {
+  margin: 14px 0 0;
+  font-size: 28px;
+  font-weight: 700;
+  line-height: 1.2;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.pay-modal-hint {
+  margin: 6px 0 0;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.pay-modal-countdown {
+  margin: 10px 0 12px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.pay-modal-fallback-row {
+  margin: 0;
+  text-align: center;
+}
+
+.pay-modal-expired {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 8px 0 4px;
+}
+
+.pay-modal-expired-title {
+  margin: 0 0 6px;
+  font-size: 16px;
+}
+
+.pay-modal-expired-body {
+  margin: 0 0 14px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* 「暂时无法确认」窗格（2026-10-23 评审）：查询失败时的状态未知态（≠过期）。
+   布局复用过期窗格的居中列；无操作按钮——JS 持续退避重试，用户只需等待或
+   稍后刷新。hidden 占位由 .pay-modal-panes > [hidden] 统一处理。 */
+.pay-modal-unconfirmed {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 8px 0 4px;
+}
+
+.pay-modal-unconfirmed-title {
+  margin: 0 0 6px;
+  font-size: 16px;
+}
+
+.pay-modal-unconfirmed-body {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* 会话变体（r4 2026-10-23）：会话失去订单（neutral）时露出会话正文、
+   订单号（等宽，凭条同款）与联系入口；与常规正文互斥，hidden 由 JS 切换。 */
+.pay-modal-unconfirmed-session-body {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.pay-modal-unconfirmed-ref {
+  margin: 12px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.pay-modal-unconfirmed-ref #pay-modal-unconfirmed-ref {
+  font-family: "SFMono-Regular", ui-monospace, "Cascadia Mono",
+    "Courier New", "Liberation Mono", monospace;
+}
+
+.pay-modal-unconfirmed-contact {
+  margin: 10px 0 0;
+}
+
+/* 已支付窗格：致谢凭条打印（复用 .printer/.receipt 视觉语言；凭条从出纸槽
+   单段缓出滑出，动画类由 JS 加/重置）。 */
+.pay-modal-print {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.pay-print-stage {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.pay-print-window {
+  width: 100%;
+  max-width: 300px;
+  margin-top: -2px;
+  overflow: hidden;
+  padding-bottom: 12px;
+}
+.pay-print-receipt { padding: 16px 16px 14px; font-size: 12px; }
+.pay-print-receipt.is-printing {
+  animation: receipt-slide-out 2.2s cubic-bezier(0.22, 0.9, 0.32, 1) both;
+  will-change: transform;
+}
+.pay-print-gift-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: 0 0 4px;
+}
+.pay-print-gift-art { width: 44px; flex: none; }
+.pay-print-gift-art .gift-svg { width: 100%; height: auto; display: block; }
+.pay-print-gift-name { font-size: 15px; font-weight: 700; }
+.pay-print-amount {
+  margin: 0 0 8px;
+  text-align: center;
+  font-size: 24px;
+  font-weight: 700;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+}
+.pay-print-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin: 0;
+  font-size: 11px;
+  color: var(--paper-muted);
+  min-width: 0;
+}
+.pay-print-ref {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pay-modal-deliver { margin-top: 12px; }
+.pay-print-fullreceipt { color: #7fb8ff; font-size: 13px; }
+
+/* 弹层凭条/礼物图标来源块（hidden，仅 JS 克隆用） */
+.pay-gift-art-source[hidden] { display: none; }
+
+/* 回跳页「领取卡」（喂猫互动）：礼物已放到 /support 小猫身边，这里只发卡 */
+.gift-pickup {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  max-width: 520px;
+  margin: 18px auto 6px;
+  padding: 18px 20px;
+  border: 1px solid rgba(0, 122, 255, 0.35);
+  border-radius: var(--radius);
+  background: rgba(0, 122, 255, 0.08);
+  text-align: center;
+}
+.gift-pickup-art { width: 64px; }
+.gift-pickup-art .gift-svg { width: 100%; height: auto; display: block; }
+.gift-pickup-body { margin: 0; font-size: 15px; }

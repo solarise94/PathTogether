@@ -1,0 +1,102 @@
+/* support_pay.css — 支付宝赞助订单的收银台跳转页与回跳结果页（0087）。
+   基础布局/顶栏/卡片/金额选择表单样式都在 support.css（R1 视觉评审后金额
+   选择样式移到那边，/support 与本页共用）；本文件只管支付表单宿主与结果页
+   状态卡。无内联样式（CSP style-src 'self'）；390px 宽度可用。 */
+
+/* ------------------------------------------------ 收银台跳转/结果页 -- */
+.pay-card {
+  max-width: 520px;
+  margin: 0 auto;
+  padding: 26px 22px;
+}
+
+.pay-card h1 {
+  margin: 0 0 12px;
+  font-size: 21px;
+}
+
+.pay-card .return-lead { font-size: 16px; }
+
+.pay-amount { color: var(--ok); }
+
+.pay-card-paid { border-color: rgba(76, 195, 138, 0.4); }
+
+.pay-meta {
+  margin: 16px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pay-meta div {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.pay-meta dt {
+  flex: none;
+  min-width: 4.5em;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.pay-meta dd {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  word-break: break-all;
+}
+
+.pay-form-host { margin: 18px 0 6px; }
+
+/* SDK 表单收敛后（class="pay-form"，内联脚本/样式已去除）：表单保持可见，
+   提交按钮即无 JS 环境的手动「立即支付」入口；JS 环境下
+   support_pay.js 会立即自动提交（正常情况用户只会看到一瞬）。 */
+.pay-form-host form {
+  display: block;
+  margin: 0;
+  padding: 14px;
+  border: 1px dashed var(--card-edge);
+  border-radius: var(--radius);
+}
+
+/* SDK 提交按钮（「立即支付」）：页面主按钮同款样式。只动按钮外观，
+   绝不触碰签名表单字段（R1 视觉评审）。 */
+.pay-form-host input[type="submit"],
+.pay-form-host button {
+  display: inline-block;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 9px 18px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  color: #fff;
+  background: var(--accent);
+}
+
+.pay-form-host input[type="submit"]:hover,
+.pay-form-host button:hover { background: #1a86ff; }
+
+.pay-form-host input[type="submit"]:focus-visible,
+.pay-form-host button:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 3px;
+}
+
+.footer {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 24px 40px;
+}
+
+.footer-note {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+@media (max-width: 480px) {
+  .pay-card { padding: 20px 16px; }
+  .pay-meta div { flex-direction: column; gap: 2px; }
+}

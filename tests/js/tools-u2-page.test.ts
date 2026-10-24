@@ -158,10 +158,11 @@ describe("U2 default view (template structure)", () => {
 
 describe("U2 entry flow (page source wiring)", () => {
 	it("file input and drop converge on one prepareSource flow", () => {
-		expect(pageSrc).toContain("async function prepareSource(fileList)");
+		// 2026-10：opts 携带 drop 事件捕获的文件句柄（MRXS 协助的 startIn 定位）
+		expect(pageSrc).toContain("async function prepareSource(fileList, opts = {})");
 		expect(pageSrc).toContain("els.fileInput.addEventListener('change', () => { onFilePicked(); })");
 		// onFilePicked is the shared next step of the manual and dropped path
-		expect(pageSrc).toMatch(/async function prepareSource\(fileList\)[\s\S]*?await onFilePicked\(route\.file\)/);
+		expect(pageSrc).toMatch(/async function prepareSource\(fileList, opts = \{\}\)[\s\S]*?await onFilePicked\(route\.file\)/);
 		expect(pageSrc).toMatch(/async function onFilePicked\(explicitFile\)[\s\S]*?await runProbeFlow\(\)/);
 		// 2026-10-20：工作台交接接收器已随上传移除
 		expect(pageSrc).not.toContain("takeHandoffFile");
@@ -178,16 +179,20 @@ describe("U2 entry flow (page source wiring)", () => {
 	});
 
 	it("a drop while converting is deflected with a message, not a panel reset", () => {
-		// the file input is disabled during a run; the drop path needs the same
-		// guard so resetFlowPanels cannot tear down the live progress UI
-		expect(pageSrc).toMatch(/if \(page\.running\) \{[\s\S]*?tools\.drop\.busy/);
+		// P1-4: the whole page is busy during preparation and conversion; the
+		// drop path must show the busy message instead of resetFlowPanels
+		expect(pageSrc).toMatch(/if \(page\.busy\) \{[\s\S]*?tools\.drop\.busy/);
 		expect(i18nSrc).toContain('"tools.drop.busy"');
 		expect(i18nSrc).toContain('"tools.drop.busy": "A conversion is running');
 	});
 
 	it(".mrxs/.dat inputs (single or loose) go through the planner — typed missing-members, never silent", () => {
 		// drop route: bundleRoute sends any .mrxs/.dat member to prepareBundleSource
-		expect(pageSrc).toMatch(/route\.route === 'bundle'[\s\S]*?await prepareBundleSource\(route\.files\)/);
+		//（2026-10：纯散 .mrxs 在此之前被同名文件夹协助截停——见
+		// mrxs-companion.test.ts；文件夹/目录输入（fromFolder）与装配后的
+		// 整包仍直达 planner）
+		expect(pageSrc).toMatch(/route\.route === 'bundle'[\s\S]*?await prepareBundleSource\(route\.files, \{ fileHandles: opts\.fileHandles \}\)/);
+		expect(pageSrc).toMatch(/if \(!opts\.fromFolder && !page\.companion\) \{[\s\S]*?C\.detectNeedsFolder\(rows\)/);
 		// file-input route (a .mrxs picked manually) has the same planner delegation
 		expect(pageSrc).toMatch(/inputExtensionHint\(file\.name\) === 'bundle'[\s\S]*?await prepareBundleSource\(\[file\]\)/);
 		// the planner (engine.planBundle 按入口类型分派 via runner.prepareBundle) refuses
@@ -203,8 +208,8 @@ describe("U2 entry flow (page source wiring)", () => {
 		// untraversable directory → message pointing at the folder button
 		expect(pageSrc).toMatch(/catch \(e\) \{[\s\S]*?tools\.drop\.dir\.unreadable/);
 		expect(i18nSrc).toContain('"tools.drop.dir.unreadable"');
-		expect(i18nSrc).toMatch(/"tools\.drop\.dir\.unreadable": "[^"]*选择文件夹（MRXS）[^"]*"/);
-		expect(i18nSrc).toMatch(/"tools\.drop\.dir\.unreadable": "[^"]*Choose folder \(MRXS\)[^"]*"/);
+		expect(i18nSrc).toMatch(/"tools\.drop\.dir\.unreadable": "[^"]*「选择文件夹」[^"]*"/);
+		expect(i18nSrc).toMatch(/"tools\.drop\.dir\.unreadable": "[^"]*“Choose folder”[^"]*"/);
 	});
 
 	it("cancelled preparation is a typed state, not an error panel", () => {
@@ -284,7 +289,8 @@ describe("U2 i18n (zh/en pairs for the new concepts)", () => {
 		expect(shellSrc).not.toContain("direct-upload-btn");
 		expect(shellSrc).toContain('data-i18n="tools.privacy.brief"');
 		expect(shellSrc).toContain('data-i18n="tools.privacy.details"');
-		expect(shellSrc).toContain('href="/app" data-i18n="tools.to.workbench"');
+		expect(shellSrc).toContain('href="/app"');
+		expect(shellSrc).toContain('data-i18n="tools.nav.workbench"');
 		expect(pageSrc).not.toContain("createUploadController");
 		expect(pageSrc).not.toContain("createDirectUploadController");
 		expect(pageSrc).toContain("showDirectHint(file)");
@@ -303,8 +309,10 @@ describe("U2 i18n (zh/en pairs for the new concepts)", () => {
 		expect(i18nSrc).toContain('"tools.drop.bundle.multiple"');
 		// Subtitle and detailed input hint include MRXS; rejection messages
 		// point to that maintained list rather than duplicate its formats.
-		expect(i18nSrc).toMatch(/"tools\.subtitle": "[^"]*MRXS \/ VMS 完整包[^"]*"/);
-		expect(i18nSrc).toMatch(/"tools\.subtitle": "[^"]*complete MRXS \/ VMS bundles[^"]*"/);
+		// 2026-10-21 视觉改版：Hero 副标题收敛为一行；完整格式清单仍在
+		// tools.input.file.hint（下一行断言），不丢失。
+		expect(i18nSrc).toContain('"tools.subtitle": "在本机浏览器内完成病理切片格式转换，无需上传服务器"');
+		expect(i18nSrc).toContain('"tools.subtitle": "Convert pathology slides entirely in your local browser, with no upload to a server"');
 		expect(i18nSrc).toMatch(/"tools\.input\.file\.hint": "[^"]*(?:MRXS 完整包|VMS 完整包)[^"]*"/);
 		expect(i18nSrc).toMatch(/"tools\.input\.folder\.label"[\s\S]*"tools\.input\.folder\.label"/);
 		expect(i18nSrc).toMatch(/"tools\.err\.unsupported_input": "[^"]*未做任何复制[^"]*切片转换指南[^"]*"/);

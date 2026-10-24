@@ -51,3 +51,4 @@ artifacts/import-project-upgrade-20260914T161016Z/
 artifacts/**/reference/
 artifacts/**/smoke/
 .gate-tmp/
+/.alipay-sandbox.json

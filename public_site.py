@@ -66,6 +66,7 @@ def public_pages():
         Page("/guide/conversion", "切片转换指南", GUIDES["conversion"]["intro"]),
         Page("/guide/collaboration", "协作指南", GUIDES["collaboration"]["intro"]),
         Page("/tools/slides", "本地切片转换工具", "无需登录的浏览器本地切片识别、转换、校验与保存。"),
+        Page("/support", "支持项目", "自愿支持本地切片转换工具与 HistoPilot 套件的持续开发、维护和服务器开销；不兑换额度或功能。"),
         Page("/demo", "公开 Demo", "无需登录体验发布的示例切片；不提供个人文件上传。"),
         Page("/site-map", "完整公开网页地图", "公开页面与账户入口，以及面向自动客户端的文档。"),
     ]

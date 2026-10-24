@@ -351,6 +351,10 @@ def test_schema_migrations_recorded(conn):
         # fail-safe 不参与失活判定）与 fail_detail（终态失败的安全白名单
         # 细节），幂等 ADD COLUMN IF NOT EXISTS + audit_events 记录。
         "0084_ingestion_client_seen.sql",
+        # 支付宝赞助订单（0085/0086 已被 kfb-index-diagnostics /
+        # password-reset 分支占用）：订单/通知事件/退款 + 下单与退款幂等键
+        # 的后绑定别名表。
+        "0087_support_payments.sql",
     ]
 
 

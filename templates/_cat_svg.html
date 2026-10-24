@@ -1,0 +1,131 @@
+<svg class="cat-svg" viewBox="0 0 260 190" aria-hidden="true" focusable="false">
+  {# 2026-10-22 重绘：奶油色小橘猫（大头团子比例、双高光大眼、ω 嘴、粉肉垫、
+     项圈铃铛）。保留全部动画钩子：cat-tail / cat-figure / cat-paw / cat-head /
+     cat-eye-follow / cat-eyes / gift-hardhat / gift-wrench / cat-hearts / cat-zzz；
+     坐标系不变（260×190），HTML 叠层（毛线球/礼物/气泡）位置沿用。
+     clipPath id 页内唯一：每个页面只 include 一次本文件。 #}
+  <defs>
+    <clipPath id="cat-body-clip">
+      <path d="M72 152 C 70 118 104 104 140 104 C 180 104 202 126 200 154 C 199 172 186 180 164 180 L 98 180 C 82 180 73 170 72 152 Z"></path>
+    </clipPath>
+  </defs>
+  <ellipse class="cat-shadow" cx="136" cy="181" rx="80" ry="6" fill="#000" opacity="0.3"></ellipse>
+  <g class="cat-tail">
+    <path d="M178 154 C 222 152 238 118 226 88 C 220 74 204 74 204 88" fill="none"
+          stroke="#6b5444" stroke-width="19" stroke-linecap="round"></path>
+    <path d="M178 154 C 222 152 238 118 226 88 C 220 74 204 74 204 88" fill="none"
+          stroke="#f5b073" stroke-width="13.8" stroke-linecap="round"></path>
+    <path d="M216 77 C 208 76 204 80 204 88" fill="none"
+          stroke="#fff6e9" stroke-width="13.8" stroke-linecap="round"></path>
+    <path d="M221 128 h8 M226 109 l8 -2" fill="none"
+          stroke="#e8914e" stroke-width="3.4" stroke-linecap="round"></path>
+  </g>
+  <g class="cat-figure">
+    <path d="M72 152 C 70 118 104 104 140 104 C 180 104 202 126 200 154 C 199 172 186 180 164 180 L 98 180 C 82 180 73 170 72 152 Z"
+          fill="#fff6e9"></path>
+    <g clip-path="url(#cat-body-clip)">
+      <path d="M146 100 C 176 98 206 114 206 140 C 190 146 168 140 156 126 C 150 118 146 110 146 100 Z"
+            fill="#f5b073"></path>
+      <path d="M172 108 q 4 8 2 16 M186 116 q 3 7 1 14" fill="none"
+            stroke="#e8914e" stroke-width="3.4" stroke-linecap="round"></path>
+      <ellipse cx="108" cy="160" rx="34" ry="22" fill="#fffdf8"></ellipse>
+    </g>
+    <path d="M72 152 C 70 118 104 104 140 104 C 180 104 202 126 200 154 C 199 172 186 180 164 180 L 98 180 C 82 180 73 170 72 152 Z"
+          fill="none" stroke="#6b5444" stroke-width="2.6" stroke-linejoin="round"></path>
+    <g class="cat-paw-front">
+      <ellipse cx="92" cy="174" rx="14" ry="8.5" fill="#fff6e9" stroke="#6b5444" stroke-width="2.4"></ellipse>
+      <ellipse cx="125" cy="175" rx="14" ry="8.5" fill="#fff6e9" stroke="#6b5444" stroke-width="2.4"></ellipse>
+      <path d="M88 181 v-4 M96 181 v-4 M121 182 v-4 M129 182 v-4" fill="none"
+            stroke="#6b5444" stroke-width="1.6" stroke-linecap="round"></path>
+    </g>
+    <g class="cat-paw">
+      <ellipse cx="176" cy="172" rx="14" ry="8.5" fill="#fff6e9" stroke="#6b5444" stroke-width="2.4"></ellipse>
+      <path d="M172 179 v-4 M180 179 v-4" fill="none"
+            stroke="#6b5444" stroke-width="1.6" stroke-linecap="round"></path>
+      <ellipse cx="176" cy="172.5" rx="4.2" ry="2.8" fill="#ffb7c0"></ellipse>
+    </g>
+    {# 神秘礼物档——猫师傅的扳手（左前爪旁、朝向左侧机架，随身体移动） #}
+    <g class="gift-wrench" aria-hidden="true">
+      <path d="M59.5 134 L59.5 141 Q59.5 147 62.5 148.5 L62.5 170 Q62.5 173.5 65.5 173.5 Q68.5 173.5 68.5 170 L68.5 148.5 Q71.5 147 71.5 141 L71.5 134 L68 137 L68 141.5 L63 141.5 L63 137 Z"
+            fill="#c3ccd5" stroke="#6b5444" stroke-width="1.8" stroke-linejoin="round"></path>
+    </g>
+    <g class="cat-head">
+      <g class="cat-ear cat-ear-l">
+        <path d="M64 78 C 56 60 56 42 63 30 Q 66 26 70 28 C 82 33 94 45 99 57 Z"
+              fill="#f5b073" stroke="#6b5444" stroke-width="2.6" stroke-linejoin="round"></path>
+        <path d="M69 68 C 65 58 65 47 68 39 C 76 43 84 49 89 56 Z" fill="#ffb7c0"></path>
+        <path d="M71 60 l5 -6 M74 64 l6 -4" fill="none" stroke="#fff6e9"
+              stroke-width="1.6" stroke-linecap="round"></path>
+      </g>
+      <g class="cat-ear cat-ear-r">
+        <path d="M152 78 C 160 60 160 42 153 30 Q 150 26 146 28 C 134 33 122 45 117 57 Z"
+              fill="#fff6e9" stroke="#6b5444" stroke-width="2.6" stroke-linejoin="round"></path>
+        <path d="M147 68 C 151 58 151 47 148 39 C 140 43 132 49 127 56 Z" fill="#ffb7c0"></path>
+        <path d="M145 60 l-5 -6 M142 64 l-6 -4" fill="none" stroke="#fff6e9"
+              stroke-width="1.6" stroke-linecap="round"></path>
+      </g>
+      <path d="M108 48 C 142 48 162 68 162 92 C 162 105 158 115 151 121 Q 157 124 156 127 Q 150 127 146 125 C 136 131 123 133 108 133 C 93 133 80 131 70 125 Q 66 127 60 127 Q 59 124 65 121 C 58 115 54 105 54 92 C 54 68 74 48 108 48 Z"
+            fill="#fff6e9" stroke="#6b5444" stroke-width="2.6" stroke-linejoin="round"></path>
+      <path d="M98 53 Q 100 59 99 65 M108 51 L 108 63 M118 53 Q 116 59 117 65" fill="none"
+            stroke="#f5a862" stroke-width="3.6" stroke-linecap="round"></path>
+      <ellipse cx="70" cy="109" rx="9.5" ry="5.5" fill="#ff9fb0" opacity="0.55"></ellipse>
+      <ellipse cx="146" cy="109" rx="9.5" ry="5.5" fill="#ff9fb0" opacity="0.55"></ellipse>
+      <g class="cat-eye-follow">
+        <g class="cat-eyes">
+          <ellipse cx="88" cy="94" rx="9.5" ry="11" fill="#2a211c"></ellipse>
+          <ellipse cx="128" cy="94" rx="9.5" ry="11" fill="#2a211c"></ellipse>
+          <ellipse cx="88" cy="99.5" rx="6" ry="4.2" fill="#5a4436" opacity="0.85"></ellipse>
+          <ellipse cx="128" cy="99.5" rx="6" ry="4.2" fill="#5a4436" opacity="0.85"></ellipse>
+          <circle cx="91.5" cy="89" r="3.9" fill="#ffffff"></circle>
+          <circle cx="131.5" cy="89" r="3.9" fill="#ffffff"></circle>
+          <circle cx="84.5" cy="99" r="1.7" fill="#ffffff" opacity="0.9"></circle>
+          <circle cx="124.5" cy="99" r="1.7" fill="#ffffff" opacity="0.9"></circle>
+        </g>
+      </g>
+      <g class="cat-eyes-happy" fill="none" stroke="#2a211c" stroke-width="3.4" stroke-linecap="round">
+        <path d="M79 97 Q 88 85 97 97"></path>
+        <path d="M119 97 Q 128 85 137 97"></path>
+      </g>
+      <g class="cat-eyes-sleep" fill="none" stroke="#2a211c" stroke-width="3.2" stroke-linecap="round">
+        <path d="M79 93 Q 88 101 97 93"></path>
+        <path d="M119 93 Q 128 101 137 93"></path>
+      </g>
+      <path d="M103 104 Q 108 101.5 113 104 Q 111 108.5 108 109.5 Q 105 108.5 103 104 Z" fill="#ff8fa0"></path>
+      <circle cx="106.4" cy="104.3" r="1" fill="#ffffff" opacity="0.75"></circle>
+      <g class="cat-mouth-open">
+        <path d="M102 113 Q 108 125 114 113 Q 108 116 102 113 Z" fill="#7a3240"></path>
+        <path d="M104.6 117.4 Q 108 123 111.4 117.4 Q 108 116.2 104.6 117.4 Z" fill="#ff8fa0"></path>
+      </g>
+      <path d="M108 109.5 C 107 114.5 101 115.5 99 111.5 M108 109.5 C 109 114.5 115 115.5 117 111.5"
+            fill="none" stroke="#2a211c" stroke-width="2.2" stroke-linecap="round"></path>
+      <g stroke="#e9dcc8" stroke-width="1.7" stroke-linecap="round" opacity="0.9">
+        <path d="M60 103 L 40 99"></path>
+        <path d="M60 109 L 40 111"></path>
+        <path d="M156 103 L 176 99"></path>
+        <path d="M156 109 L 176 111"></path>
+      </g>
+      <path d="M80 128 Q 108 141 136 128" fill="none" stroke="#ff6b81" stroke-width="5" stroke-linecap="round"></path>
+      <g class="cat-bell">
+        <circle cx="108" cy="139" r="5.6" fill="#ffcf4a" stroke="#b8861f" stroke-width="1.6"></circle>
+        <path d="M104 139 h8 M108 140.5 v3" fill="none" stroke="#8a6a1e" stroke-width="1.3" stroke-linecap="round"></path>
+        <circle cx="106" cy="136.6" r="1.3" fill="#ffffff" opacity="0.85"></circle>
+      </g>
+      {# 神秘礼物档——猫师傅的小安全帽（随头组移动） #}
+      <g class="gift-hardhat" aria-hidden="true">
+        <path d="M84 53 a24 17 0 0 1 48 0 Z" fill="#ffb020" stroke="#6b5444" stroke-width="2.2" stroke-linejoin="round"></path>
+        <path d="M105 37.5 v15 M111 37.5 v15" fill="none" stroke="#ffd061" stroke-width="2.4"></path>
+        <rect x="77" y="50" width="62" height="7" rx="3.5" fill="#ffd061" stroke="#6b5444" stroke-width="1.8"></rect>
+      </g>
+    </g>
+  </g>
+  <g class="cat-hearts" fill="#ff8f9e">
+    <path class="cat-heart cat-heart-1" d="M36 34 c-3-6-12-4-12 3 c0 6 8 10 12 13 c4-3 12-7 12-13 c0-7-9-9-12-3 Z"></path>
+    <path class="cat-heart cat-heart-2" d="M210 30 c-2.5-5-10-3.4-10 2.5 c0 5 7 8.5 10 11 c3-2.5 10-6 10-11 c0-5.9-7.5-7.5-10-2.5 Z"></path>
+    <path class="cat-heart cat-heart-3" d="M172 48 c-2-4-8-2.7-8 2 c0 4 6 7 8 9 c2-2 8-5 8-9 c0-4.7-6-6-8-2 Z"></path>
+  </g>
+  <g class="cat-zzz" aria-hidden="true">
+    <text class="cat-zz" x="168" y="58">Z</text>
+    <text class="cat-zz" x="182" y="42">z</text>
+    <text class="cat-zz" x="196" y="28">Z</text>
+  </g>
+</svg>

@@ -29,7 +29,7 @@ from contextlib import ExitStack, contextmanager
 from collections import OrderedDict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse, urlsplit
 
 from flask import (
     Flask,
@@ -1030,7 +1030,8 @@ def _require_auth():
     """启用认证时拦截未登录 / 已禁用 / 已删除 / **未激活**用户的请求。
 
     放行 /login、/register、/demo、/tools/slides（C3 本地工具页，无账号本地
-    转换）、/verify-email、/api/registration/{start,
+    转换）、/support（公开支持项目页，只读、无账号/数据库访问）、
+    /verify-email、/api/registration/{start,
     verify,resend}、/api/demo/*、/static/、/plugins/、/healthz、/internal/、
     /api/plugin/；其余请求检查 session，并按 user_id 回查用户是否仍存在且
     enabled（禁用或删除立即失效，不等 cookie 过期）。
@@ -1056,7 +1057,10 @@ def _require_auth():
     path = request.path
     if request.blueprint == "public_site" and request.method in ("GET", "HEAD"):
         return None
-    if (path in ("/login", "/register", "/demo", "/tools/slides")
+    if (path in ("/login", "/register", "/demo", "/tools/slides", "/support")
+            or path.startswith("/support/")
+            # /support/ 前缀：赞助订单族（收银台跳转页/回跳页/支付宝异步通知）
+            # 与 /support 同为公开路径；订单路由自身再按功能闸 404（关闭态）。
             or path.startswith("/static/")
             or path.startswith("/plugins/")):
         return None
@@ -1304,6 +1308,12 @@ def _csrf_exempt_path(path: str) -> bool:
     if (has_request_context() and request.blueprint == "public_site"
             and request.method in ("GET", "HEAD")):
         return True
+    # 支付宝异步通知（0087）：请求方是支付宝服务器（无本站会话、form-encoded、
+    # 以 SDK 验签为真实性依据），CSRF 双提交语义不适用——**仅此精确路径**豁免；
+    # 通知处理仍受 SDK 验签 + 业务字段校验约束。其余 /support/* 写路由照走
+    # 全局 CSRF 闸。
+    if path == "/support/alipay/notify":
+        return True
     # C5 用户面 grant 端点走 Cookie+CSRF（前缀豁免的显式例外）
     if path == _PLUGIN_USER_FACE_PREFIX or \
             path.startswith(_PLUGIN_USER_FACE_PREFIX + "/"):
@@ -1379,6 +1389,16 @@ def _csrf_protect():
         next_url = _safe_next_path(request.form.get("next") or request.args.get("next"))
         return _login_page(error="登录状态已过期，请重新提交", error_code="csrf",
                            next_url=next_url, status=400)
+    if path == "/support/orders":
+        # 赞助下单是浏览器原生表单（无 JS 也能用）：同 /login 的可重试 UX——
+        # 303 回 /support 带 pay_error=csrf 提示；JSON 客户端拿 400 csrf_required。
+        # 功能关闭/配置不可用（fail-closed）时不做 CSRF 分流——直接 404（路由
+        # 不存在的语义，与视图层功能闸一致）。
+        if _support_pay_runtime() is None:
+            return abort(404)
+        if _support_pay_wants_json():
+            return jsonify(error="csrf_required"), 400
+        return redirect("/support?pay_error=csrf#pay-pick", code=303)
     return jsonify(error="csrf_required"), 400
 
 
@@ -1417,7 +1437,7 @@ def _public_discovery_headers(resp):
     from public_site import PRIVATE_PREFIXES
     if request.path.startswith(PRIVATE_PREFIXES):
         resp.headers["X-Robots-Tag"] = "noindex, nofollow"
-    if request.path in ("/", "/tools/slides", "/demo"):
+    if request.path in ("/", "/tools/slides", "/demo", "/support"):
         resp.headers.add("Link", '</llms.txt>; rel="describedby"; type="text/markdown"')
     if request.path == "/" and AUTH_ENABLED:
         resp.headers.add("Link", '</index.md>; rel="alternate"; type="text/markdown"')
@@ -1500,18 +1520,27 @@ def _collect_site_visit(resp):
 
 
 def _safe_next_path(candidate) -> str:
-    """登录 next 白名单校验：只允许站内绝对路径。
+    """登录 next 白名单校验：只允许站内绝对路径（plain path）。
 
     拒绝协议 URL（https://…）、`//host`（scheme-relative）与 ``\\\\host``（反斜杠
-    变体，部分浏览器把 /\\ 解释为协议分隔）；不合法一律回落 `/app`——普通登录
-    成功的默认目的地是工作台（R3 2026-09-19），不再回介绍主页（docs §6.3）。
+    变体，部分浏览器把 /\\ 解释为协议分隔）。**复核 2026-10-22（开放跳转修
+    复）另拒**：ASCII 控制字符与空白（WHATWG URL 解析会剥离 tab/CR/LF，
+    ``/\\t/evil.com`` 因此被浏览器解析成 ``//evil.com`` → 开放跳转；CR/LF
+    还会让 redirect() 抛 ValueError → 登录页 500）、**任何位置**的反斜杠、
+    以及已编码形式的 ``/%2F`` ``/%5C`` ``/%09`` 开头（浏览器可能在跳转后
+    解码）。不合法一律回落 `/app`——普通登录成功的默认目的地是工作台
+    （R3 2026-09-19），不再回介绍主页（docs §6.3）。
     """
     if not isinstance(candidate, str):
         return "/app"
     p = candidate.strip()
     if not p.startswith("/") or p.startswith("//") or p.startswith("/\\"):
         return "/app"
-    if "\\" in p[:2]:
+    if "\\" in p:
+        return "/app"
+    if any((ord(ch) < 0x20) or ord(ch) == 0x7F or ch.isspace() for ch in p):
+        return "/app"
+    if p.lower().startswith(("/%2f", "/%5c", "/%09")):
         return "/app"
     return p
 
@@ -3642,8 +3671,1477 @@ def tools_slides():
     /api/tools/slides/upload-capability 能力端点已随转换器上传一并退役。
     """
     resp = make_response(render_template(
-        "tools_slides.html", canonical=_public_canonical_url("/tools/slides")))
+        "tools_slides.html", canonical=_public_canonical_url("/tools/slides"),
+        # 「保存到我的项目」的移交门禁（复核 r2 #2）：与工作台 bootstrap
+        # 同一载荷字段（_inline_convert_payload），关闭态随形下发
+        inline_convert_enabled=_inline_convert_payload()["enabled"]))
     return _apply_slide_tools_security_headers(resp)
+
+
+# --------------------------------------------------------------------------- #
+# /support 支持项目页（赞助只走支付宝「AI 网页应用收款」官方接口）
+# --------------------------------------------------------------------------- #
+# 2026-10-21 用户评审决定：移除第一阶段部署配置的静态收款方式（二维码图片 +
+# 收款链接跳转），赞助入口只剩官方下单接口。相关校验器
+# （SUPPORT_ALIPAY_ALLOWED_HOSTS / _support_qr_public_url /
+# _support_alipay_secure_url / SUPPORT_ALIPAY_QR_PATH / SUPPORT_ALIPAY_URL）
+# 一并退役。未开启支付时页面展示可陪玩小猫 + 邮箱联系。
+
+# 支付宝「AI 网页应用收款」赞助订单（0087，沙箱）：默认关闭；开启后 /support
+# 增加金额选择与「用支付宝支持」，新增订单/收银台跳转/回跳/通知路由。
+# 设计边界：自愿赞助、匿名可用、不绑账号、不兑额度；与 billing/spend 永久独立。
+#: 功能开关（缺省关闭；关闭时订单路由一律 404，/support 行为与第一阶段一致）。
+SUPPORT_ALIPAY_PAY_ENABLED = (
+    (os.environ.get("SUPPORT_ALIPAY_PAY_ENABLED") or "").strip().lower()
+    in ("1", "true", "yes", "on"))
+#: 运行模式 sandbox|production。生产需显式生产配置（app id / 应用私钥文件 /
+#: 支付宝公钥文件 / 收款方 PID，全部环境变量），缺任一即 fail-closed（支付
+#: 功能保持关闭）；生产密钥材料绝不经本仓库或 agent 提供。
+SUPPORT_ALIPAY_PAY_MODE = (
+    (os.environ.get("SUPPORT_ALIPAY_PAY_MODE") or "").strip().lower()
+    or "sandbox")
+#: 可选公网 HTTPS notify_url（生产/公网联调才配置；本地沙箱按契约**省略**，
+#: 由补偿查单兜底）。空 = 不向 SDK 传（绝不传空串/占位 URL）。
+SUPPORT_ALIPAY_PAY_NOTIFY_URL = (
+    os.environ.get("SUPPORT_ALIPAY_PAY_NOTIFY_URL") or "").strip()
+
+#: 下单失败回跳 /support 的错误码白名单（其余参数值一律按缺省渲染，不回显）。
+_SUPPORT_PAY_ERROR_CODES = frozenset({
+    "invalid_amount", "rate_limited", "unavailable", "csrf", "order_conflict",
+})
+
+
+def _support_pay_runtime():
+    """当前支付运行时配置；功能关闭或配置不可用（fail-closed）→ None。"""
+    if not SUPPORT_ALIPAY_PAY_ENABLED:
+        return None
+    import support_payments
+    return support_payments.runtime_ready(SUPPORT_ALIPAY_PAY_MODE)
+
+
+def _apply_support_page_security_headers(resp, *, form_action,
+                                         frame_src=None,
+                                         frame_ancestors="none",
+                                         x_frame_options="DENY"):
+    """支持页族安全响应头。``form_action`` 是 CSP form-action 指令值：
+
+    - /support（静态阶段）：'none'；开启支付宝下单后需向本站 POST 订单 → 'self'；
+    - /support/pay/<ref>：放开当前模式下单 POST 302 跳转链的精确 origin 列表
+      （网关 + 中转 + 收银台，见 support_payments.form_action_origins——下单
+      表单 auto-submit 的唯一合法目标链）；
+    - /support/return：'none'（刷新是普通 GET 链接）。
+
+    ``frame_src``（可选）：CSP frame-src 指令值。仅 /support（开启支付）需要：
+    桌面端「支付状态」弹层在本页 iframe 里先加载同源 embed 页
+    （/support/pay/<ref>/qr），embed 页内的签名表单再 POST 到当前模式的支付宝
+    跳转链——两个目标都精确列出（'self' + 当前模式三台 origin，沙箱/生产各自
+    独立、无通配符；生产表与 form_action_origins 同源同表，上线前必须按部署
+    文档实测 Location 链复核）。其余页面不下发 frame-src（default-src 'none'
+    已禁框架）。
+
+    ``frame_ancestors`` / ``X-Frame-Options``：默认 'none'/'DENY'（全站禁嵌）；
+    唯一例外是 embed 页（/support/pay/<ref>/qr）——它本来就只为 /support 弹层的
+    同源 iframe 存在，放宽为 'self'/'SAMEORIGIN'。
+
+    ``self`` / ``none`` 裸关键字在此统一加引号（CSP 源表达式语法）。
+    """
+    if form_action in ("self", "none"):
+        form_action = "'%s'" % form_action
+    if frame_src in ("self", "none"):
+        frame_src = "'%s'" % frame_src
+    if frame_ancestors in ("self", "none"):
+        frame_ancestors = "'%s'" % frame_ancestors
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = x_frame_options
+    resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    # 收银台跳转/回跳/通知是订单私有路径，不进索引
+    if request.path.startswith(("/support/pay/", "/support/return",
+                                "/support/alipay/")):
+        resp.headers["X-Robots-Tag"] = "noindex, nofollow"
+    csp = (
+        "default-src 'none'; script-src 'self'; style-src 'self'; "
+        "img-src 'self'; font-src 'self'; connect-src 'self'; "
+        "base-uri 'none'; object-src 'none'; form-action %s; "
+        "frame-ancestors %s" % (form_action, frame_ancestors))
+    if frame_src:
+        csp += "; frame-src %s" % frame_src
+    resp.headers["Content-Security-Policy"] = csp
+    return resp
+
+
+def _apply_support_security_headers(resp):
+    """公开支持页：无 inline script/style；脚本/样式/图片仅同源。
+
+    ``img-src 'self'``：配置的二维码也必须经本站 static 路径提供；不放开
+    第三方图片或 data:。no-store 便于部署后及时撤换收款资料。
+    开启支付宝下单（SUPPORT_ALIPAY_PAY_ENABLED）时表单 POST /support/orders
+    是同源写 → form-action 'self'，同时放开「支付状态」弹层 iframe 所需的
+    frame-src（'self' + 当前模式支付宝跳转链精确 origin——embed 页与它提交
+    的网关链；关闭态维持 'none' 形态且不下发 frame-src）。
+    """
+    form_action = "self" if SUPPORT_ALIPAY_PAY_ENABLED else "none"
+    frame_src = None
+    if SUPPORT_ALIPAY_PAY_ENABLED:
+        try:
+            frame_src = "'self' " + " ".join(support_payments_module()
+                                             .form_action_origins(
+                                                 SUPPORT_ALIPAY_PAY_MODE))
+        except support_payments_module().SupportPayConfigError:
+            # 未知模式（配置错误）：不下发 frame-src（fail-closed，iframe 被禁）
+            frame_src = None
+    return _apply_support_page_security_headers(
+        resp, form_action=form_action, frame_src=frame_src)
+
+
+@app.route("/support")
+def support_page():
+    """支持项目页：公开、只读、无账号/数据库访问。
+
+    设计边界（docs/converter-support-page-design-20261021.md；2026-10-21 评审
+    后静态收款方式已退役，赞助只走支付宝官方下单接口）：
+    - 平台无法核实付款：不展示「已支付」/到账状态/赞助人数/金额/名单，也
+      没有「我已支付」按钮。
+    - 未开启支付（SUPPORT_ALIPAY_PAY_ENABLED）：可陪玩小猫 + 邮箱联系；
+    - 开启支付：额外渲染金额选择 +「用支付宝支持」表单（POST /support/orders）；
+      下单失败经 ``pay_error`` 白名单码回跳提示（错误原因不来自请求参数之外
+      的东西，未知码一律按缺省渲染）。
+    """
+    today = datetime.now()
+    pay_error = (request.args.get("pay_error") or "").strip()
+    if pay_error not in _SUPPORT_PAY_ERROR_CODES:
+        pay_error = ""
+    # R2 B1：会话内待确认/近期已支付订单提醒卡（只看会话 refs，无泄露）
+    sp_mod = support_payments_module()
+    notice_kind, notice_order = sp_mod.latest_session_notice_order(
+        session.get(_SUPPORT_SESSION_REFS_KEY) or [])
+    # 喂猫互动（2026-10-21 用户评审）：会话内已支付订单 → 小猫身边的礼物
+    # （服务端权威：只认本地库 status='paid' 的会话订单，最新在前、至多 3 份；
+    # 礼物 kind 由 amount_fen 推导，自定义金额 → 小鱼干）。
+    cat_gifts = [
+        {
+            "ref": order["out_trade_no"],
+            "gift": sp_mod.gift_collectible_for_amount(order["amount_fen"]),
+            "tier": sp_mod.gift_tier_for_amount(order["amount_fen"]),
+            "amount_yuan": sp_mod.fen_to_yuan(order["amount_fen"]),
+        }
+        for order in sp_mod.session_paid_gift_orders(
+            session.get(_SUPPORT_SESSION_REFS_KEY) or [])]
+    resp = make_response(render_template(
+        "support.html",
+        canonical=_public_canonical_url("/support"),
+        author_email=REGISTRATION_HELP_AUTHOR_EMAIL,
+        support_date=today.strftime("%Y-%m-%d"),
+        support_date_iso=today.strftime("%Y-%m-%d"),
+        pay_enabled=bool(SUPPORT_ALIPAY_PAY_ENABLED),
+        pay_error=pay_error,
+        pay_tiers=[(fen, sp_mod.fen_to_yuan(fen), tier)
+                   for fen, tier in sp_mod.GIFT_TIERS],
+        csrf_token=ensure_csrf_token(),
+        idempotency_key=secrets.token_hex(16),  # 下单幂等（每次渲染新 key）
+        notice_kind=notice_kind,
+        notice_order=notice_order,
+        notice_amount_yuan=(sp_mod.fen_to_yuan(notice_order["amount_fen"])
+                            if notice_order is not None else None),
+        cat_gifts=cat_gifts,
+    ))
+    return _apply_support_security_headers(resp)
+
+
+def support_payments_module():
+    """延迟取 support_payments 模块（本文件头部只依赖标准库导入顺序无关）。"""
+    import support_payments
+    return support_payments
+
+
+# --------------------------------------------------------------------------- #
+# 支付宝赞助订单路由（0087；SUPPORT_ALIPAY_PAY_ENABLED 关闭时全部 404）
+# --------------------------------------------------------------------------- #
+def _support_pay_gate_404():
+    """功能闸：关闭（或模式配置 fail-closed 缺失）时按 404 处理。
+
+    生产模式配置缺失等价「功能不存在」（refuse to start 的请求期形态）：
+    绝不回退沙箱配置，也绝不为生产模式构造半可用路由。
+    """
+    if _support_pay_runtime() is None:
+        abort(404)
+    return None
+
+
+def _support_pay_wants_json():
+    accept = request.headers.get("Accept") or ""
+    return "application/json" in accept and "text/html" not in accept
+
+
+def _support_pay_error(code, status=400, retry_after=None):
+    """下单错误响应：浏览器表单 303 回 /support?pay_error=<code>（白名单码）；
+    JSON 客户端拿结构化错误 + 原始状态码。"""
+    if _support_pay_wants_json():
+        resp = jsonify(error=code), status
+        if retry_after:
+            resp[0].headers["Retry-After"] = str(retry_after)
+        return resp
+    resp = redirect("/support?pay_error=%s#pay-pick" % code, code=303)
+    if retry_after:
+        resp.headers["Retry-After"] = str(retry_after)
+    return resp
+
+
+def _out_trade_no_from_request():
+    """从请求参数取订单号并做形态校验（只定位订单，绝不信其余参数）。"""
+    raw = (request.values.get("out_trade_no") or "").strip()
+    if not support_payments_module()._OUT_TRADE_NO_RE.fullmatch(raw):
+        return None
+    return raw
+
+
+#: 回跳/支付页的会话绑定：只有**本会话**（签名 Cookie session，HttpOnly +
+#: SameSite=Lax）创建过的订单号才允许查看详情或触发服务端查单。Lax 在跨站
+#: **顶层 GET 导航**（支付宝付款后的 return 跳转）仍会携带 Cookie，正好覆盖
+#: 回跳场景；跨站 POST 不携带（本站无此需求）。有界列表防会话 Cookie 膨胀。
+_SUPPORT_SESSION_REFS_KEY = "support_order_refs"
+_SUPPORT_SESSION_REFS_MAX = 10
+
+
+def _remember_order_ref(out_trade_no):
+    """把本会话创建的订单号记入 session（去重、保留最近 10 个）。"""
+    refs = [r for r in (session.get(_SUPPORT_SESSION_REFS_KEY) or [])
+            if r != out_trade_no]
+    refs.append(out_trade_no)
+    session[_SUPPORT_SESSION_REFS_KEY] = refs[-_SUPPORT_SESSION_REFS_MAX:]
+
+
+def _session_has_order_ref(out_trade_no):
+    """订单号是否属于当前会话（签名 Cookie，客户端不可伪造内容）。"""
+    return out_trade_no in (session.get(_SUPPORT_SESSION_REFS_KEY) or [])
+
+
+def _support_apply_verified_query(sp, runtime, order, via):
+    """服务端查单并应用 verified 状态推进（R2 B2；回跳页与状态端点共用）。
+
+    规则与回跳页一致：PAID 且金额精确匹配 → mark_paid_idempotent（closed→paid
+    恢复同此路径）；CLOSED → 关单；PENDING/NOT_EXIST/UNKNOWN → 无操作。
+    返回 info（dict）或 None（查询失败/配置不可用）。
+    """
+    if runtime is None:
+        return None
+    try:
+        info = sp.query_trade(runtime, order["out_trade_no"])
+    except (sp.TradeOperationError, sp.SupportPayConfigError):
+        return None
+    sp.record_trade_query(order["out_trade_no"], "%s:%s" % (via, info["state"]))
+    if info["state"] == "PAID":
+        query_fen = sp.amount_fen_from_text(info.get("total_amount"))
+        if query_fen == int(order["amount_fen"]):
+            sp.mark_paid_idempotent(order["out_trade_no"],
+                                    info.get("trade_no"))
+        else:
+            app.logger.error("support %s amount mismatch (%s)",
+                             via, order["out_trade_no"])
+    elif info["state"] == "CLOSED":
+        sp.mark_closed_idempotent(order["out_trade_no"],
+                                  "%s:alipay_closed" % via)
+    return info
+
+
+def _support_settle_open_order(sp, runtime, order, via):
+    """核实并结算一张本地未决订单 → ``"paid"`` / ``"closed"`` / ``"open"``。
+
+    regenerate 端点原有的旧单核实表（R4 契约）抽取为共用助手：regenerate
+    与下单 settle（R5 评审规则 A）共用同一张表，两个入口行为完全一致：
+
+    - 本地已 paid → ``"paid"``（零支付宝调用；调用方通常已提前拦截）；
+    - 服务端查单失败/配置缺失（``_support_apply_verified_query`` → None）→
+      ``"open"``（结果未知，绝不基于未知关单或建新单）；
+    - 查单后重读行：PAID 且金额精确已落库 → ``"paid"``；
+    - 支付宝 CLOSED → ``"closed"``（verified 查单助手已本地关单
+      ``<via>:alipay_closed``）；
+    - 支付宝 PENDING → 调 ``sp.close_trade`` 成功后本地关单（
+      ``<via>:closed``）→ ``"closed"``；close 抛 ``TradeOperationError`` →
+      ``"open"``（旧单可能仍可支付）；
+    - 支付宝 NOT_EXIST → **绝不调 close**（买家扫码前交易不存在、关不掉）：
+      越过 created_at + ORDER_TIMEOUT + STATUS_EXPIRED_GRACE_SECONDS 才本地
+      关单（``<via>:not_exist``）→ ``"closed"``；未到线 → ``"open"``；
+    - 其余（UNKNOWN / 金额不符的 PAID）→ ``"open"``。
+    """
+    if order["status"] == "paid":
+        return "paid"
+    info = _support_apply_verified_query(sp, runtime, order, via=via)
+    if info is None:
+        return "open"
+    current = sp.get_order(order["out_trade_no"]) or order
+    if current["status"] == "paid":
+        return "paid"
+    if info["state"] == "CLOSED":
+        # 支付宝侧已关（_support_apply_verified_query 已本地关单）
+        return "closed"
+    if info["state"] == "PENDING":
+        try:
+            sp.close_trade(runtime, order["out_trade_no"])
+        except sp.TradeOperationError:
+            # 关单失败（结果未知/业务拒绝）：订单可能仍可支付
+            return "open"
+        sp.mark_closed_idempotent(order["out_trade_no"], "%s:closed" % via)
+        return "closed"
+    if info["state"] == "NOT_EXIST":
+        # 交易从未提交：只越过 time_expire 截止线 + 宽限才本地清场（不调
+        # close，同 sweep 约定）；未到线买家仍可能提交
+        created = order["created_at"]
+        if not getattr(created, "tzinfo", None):
+            created = created.replace(tzinfo=timezone.utc)
+        deadline = created + sp.ORDER_TIMEOUT + timedelta(
+            seconds=sp.STATUS_EXPIRED_GRACE_SECONDS)
+        if datetime.now(timezone.utc) < deadline:
+            return "open"
+        sp.mark_closed_idempotent(order["out_trade_no"],
+                                  "%s:not_exist" % via)
+        return "closed"
+    # UNKNOWN / 金额不符的 PAID：结果未知，绝不基于未知关单/建新单
+    return "open"
+
+
+def _support_settle_session_same_amount(sp, runtime, amount_fen, exclude_ref,
+                                        via):
+    """处理会话内同金额未决订单（R5 评审规则 A 步骤 1–3；下单与 regenerate
+    「已被替换」防护共用）。返回应返回的订单行，或 None。
+
+    - 步骤 1：任一同金额会话未决单距 time_expire 还剩 ≥
+      ``sp.ORDER_REUSE_MIN_REMAINING_SECONDS``（与既有复用同一条边界：
+      created 在最近 10 分钟内）→ 复用最新一单（零支付宝调用）；
+      ``exclude_ref`` 把调用方正在处理的订单本身排除在外（regenerate）；
+    - 步骤 2：否则对每张**仍在可支付窗口内**（``sp.
+      list_session_payable_open_orders``）的同金额未决单执行
+      ``_support_settle_open_order``（via 标注留痕）；越线订单不返回——
+      不可支付也不阻塞建新单；
+    - 步骤 3：任一单核实为 paid → 返回最新 paid 单；否则任一为 open（关单
+      失败/查询失败/未到 NOT_EXIST 截止线）→ 返回最新 open 单——两种情况
+      调用方都必须返回该单，绝不建新单；
+    - 全部 closed（或没有窗口内同金额未决单）→ None（调用方可安全建新单）。
+    """
+    session_refs = session.get(_SUPPORT_SESSION_REFS_KEY) or []
+    reuse = sp.find_reusable_open_order(session_refs, amount_fen, runtime,
+                                        exclude_ref=exclude_ref)
+    if reuse is not None:
+        return reuse
+    first_paid = first_open = None
+    for row in sp.list_session_payable_open_orders(session_refs, amount_fen,
+                                                   runtime):
+        if exclude_ref is not None \
+                and row["out_trade_no"] == exclude_ref:
+            continue
+        verdict = _support_settle_open_order(sp, runtime, row, via=via)
+        if verdict == "paid" and first_paid is None:
+            first_paid = row  # 最新在前：首个即最新
+        elif verdict == "open" and first_open is None:
+            first_open = row
+    if first_paid is not None:
+        return first_paid
+    return first_open
+
+
+@app.route("/support/orders/<out_trade_no>/status", methods=["GET"])
+def support_order_status(out_trade_no):
+    """订单状态 JSON（R2 B2；回跳页轮询用）。
+
+    - **会话绑定**：ref 不在当前 session（未知/他方/形态非法）→
+      ``{"status": "neutral"}``，与未知响应一致，不泄露存在性；
+    - 服务端 trade.query 每订单**至多 STATUS_QUERY_WINDOW_SECONDS 秒一次**
+      （last_query_at 节流），其余轮询只回读本地状态；查询只经 verified
+      推进改状态（精确金额 + 归属）；
+    - **查询置信度（2026-10-23 评审 P2）**：created/paying 响应恒带
+      ``confirmed``/``expired`` 两键（``sp.status_confirmation``）。
+      ``confirmed=True`` 仅当 stored **最近一次成功查单**（本请求查得，或
+      节流窗口内复用的上一次成功查单）为支付宝侧 PENDING/NOT_EXIST 且落在
+      置信窗口内；本请求查询失败（网关超时/异常被吞）、不可能查询（运行时
+      缺失/归属不匹配）、UNKNOWN、金额不符的 PAID → ``confirmed=False``。
+      **本地 created/paying + 未确认绝不等于「未支付」**——弹层必须呈现
+      「结果未知」，绝不当作查询成功推进到「已过期 + 重新生成」（买家可能
+      已付，重复支付风险）；
+    - ``expired=True`` 仅当 confirmed 且确认查单落在
+      created_at + ORDER_TIMEOUT + STATUS_EXPIRED_GRACE_SECONDS 之后
+      （time_expire 截止线 + 宽限；只看服务端/DB 时钟，绝不信浏览器时钟）；
+    - 每 IP 限流（auth_limit_store support_status_ip 桶）；CSRF 不适用 GET。
+    """
+    _support_pay_gate_404()
+    sp = support_payments_module()
+    if not (out_trade_no and sp._OUT_TRADE_NO_RE.fullmatch(out_trade_no)) \
+            or not _session_has_order_ref(out_trade_no):
+        return jsonify(status="neutral")
+    ip_hash = _ip_prefix_hash(request.remote_addr or "")
+    import auth_limit_store
+    locked = auth_limit_store.check_support_status_ip_locked(ip_hash)
+    if locked > 0:
+        return jsonify(status="slow_down"), 429
+    auth_limit_store.record_support_status_attempt(ip_hash)
+
+    runtime = _support_pay_runtime()
+    order = sp.get_order(out_trade_no)
+    if order is None:
+        return jsonify(status="neutral")
+    runtime_ok = runtime is not None \
+        and sp.order_matches_runtime(order, runtime)
+    if order["status"] in ("created", "paying") \
+            and runtime_ok \
+            and not sp.order_query_throttled(
+                order, seconds=sp.STATUS_QUERY_WINDOW_SECONDS):
+        _support_apply_verified_query(sp, runtime, order, via="status")
+    order = sp.get_order(out_trade_no) or order
+    if order is not None and order["status"] == "paid":
+        # 已支付：附带弹层致谢凭条/喂猫互动所需的服务端权威字段（载荷构造
+        # 与 regenerate 端点共用 _support_paid_status_payload）
+        return _support_paid_status_payload(sp, order)
+    if order is not None and order["status"] in ("created", "paying"):
+        # 查询置信度（评审 P2）：confirmed=False 时本地 created/paying 绝不
+        # 等于「未支付」——弹层必须显示结果未知，不得推进「已过期」。
+        confirmed, expired = (sp.status_confirmation(order)
+                              if runtime_ok else (False, False))
+        return jsonify(status=order["status"], confirmed=confirmed,
+                       expired=expired)
+    return jsonify(status=order["status"] if order else "neutral")
+
+
+def _support_paid_status_payload(sp, order, name_order=False):
+    """已支付状态载荷（状态端点 / regenerate 端点共用；R4 抽取）。
+
+    金额来自本地订单行；档位/可收集礼物只由 amount_fen 推导（服务端权威）：
+    自定义金额 tier=None、gift=fish_treat。
+
+    ``name_order=True``（R6 评审 add-on，仅 regenerate 在付款落在另一张
+    订单上时使用：「后继单已支付」防护，以及 R5 防护命中单在本请求内核实
+    为 PAID）：额外携带 ``out_trade_no``——付款发生在**另一张**订单（非
+    URL 里的旧单）上，客户端必须把收据切换到这张被点名的订单。默认（False）
+    输出与旧契约逐键一致：状态端点与旧单自身的 paid 路径绝不点名。
+    """
+    if name_order:
+        return jsonify(
+            status="paid",
+            out_trade_no=order["out_trade_no"],
+            amount_yuan=sp.fen_to_yuan(order["amount_fen"]),
+            tier=sp.gift_tier_for_amount(order["amount_fen"]),
+            gift=sp.gift_collectible_for_amount(order["amount_fen"]))
+    return jsonify(
+        status="paid",
+        amount_yuan=sp.fen_to_yuan(order["amount_fen"]),
+        tier=sp.gift_tier_for_amount(order["amount_fen"]),
+        gift=sp.gift_collectible_for_amount(order["amount_fen"]))
+
+
+def _support_order_json_payload(sp, order, reused):
+    """下单 JSON 响应体（桌面端「支付状态」弹层 / 移动端复用同一契约）。
+
+    - ``pay_url``：整页收银台跳转页（移动端/无 JS 的现有流程）；
+    - ``expires_at``：支付宝侧绝对超时（ISO 8601 UTC）——弹层倒计时的唯一
+      权威来源（客户端时钟只做差值显示）；
+    - ``next_idempotency_key``：**未绑定任何订单**的新幂等 key。弹层「二维码
+      已过期 → 重新生成」时用它建新单（老 key 已永久绑定原单，同 key 同金额
+      会命中复用路径返回原单，永远建不出新单——R2-1 语义正是如此）。key 在
+      真正用于下单前不落库、不绑定；真双击两次并发同 key 仍只建一单。
+    """
+    created = order["created_at"]
+    if not getattr(created, "tzinfo", None):
+        created = created.replace(tzinfo=timezone.utc)
+    expires_at = (created + support_payments_module().ORDER_TIMEOUT)\
+        .astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return jsonify(
+        out_trade_no=order["out_trade_no"],
+        pay_url="/support/pay/%s" % order["out_trade_no"],
+        reused=reused,
+        amount_yuan=support_payments_module().fen_to_yuan(order["amount_fen"]),
+        tier=support_payments_module().gift_tier_for_amount(
+            order["amount_fen"]),
+        expires_at=expires_at,
+        next_idempotency_key=secrets.token_hex(16))
+
+
+def _support_reuse_existing_order(sp, order, idem_key, amount_fen, runtime):
+    """复用既有订单并构造下单响应（会话复用 / settle 返回共用；R5 抽取）。
+
+    带 key 时**先落别名再返回**（R3 [P2]，同既有会话复用块）：绑定失败
+    （key 已被其他订单持有）→ 按 key 重查并校验金额/运行时快照，命中返回
+    那一单（防串单），否则 409 ``order_conflict``。无 key 不落别名行（语义
+    不变）。响应：JSON 200 ``reused=True`` / 浏览器表单 303 回该单支付页。
+    """
+    if idem_key and not sp.bind_order_idempotency_key(
+            idem_key, order["out_trade_no"]):
+        existing = sp.get_order_by_idempotency_key(idem_key)
+        if existing is None \
+                or int(existing["amount_fen"]) != amount_fen \
+                or not sp.order_matches_runtime(existing, runtime):
+            return _support_pay_error("order_conflict", status=409)
+        order = existing
+        _remember_order_ref(order["out_trade_no"])
+        app.logger.info("support order reused by key (%s)",
+                        order["out_trade_no"])
+    else:
+        _remember_order_ref(order["out_trade_no"])
+        app.logger.info("support order reused (%s)", order["out_trade_no"])
+    if _support_pay_wants_json():
+        return _support_order_json_payload(sp, order, True), 200
+    return redirect("/support/pay/%s" % order["out_trade_no"], code=303)
+
+
+@app.route("/support/orders", methods=["POST"])
+def support_orders_create():
+    """创建赞助订单（匿名；全局 CSRF 闸覆盖本路由，表单隐藏域提交 token）。
+
+    流程：功能闸 → 速率闸（auth_rate_limits support_order_ip 桶，成功也计）→
+    金额白名单（服务端权威：¥1–¥500、两位小数、Decimal 精确分值）→ 建单
+    （out_trade_no 服务端高熵生成）→ 303 到 /support/pay/<ref> 收银台跳转页。
+    网关/回跳/通知 URL 全部服务端构造，**绝不**接受请求参数传入。
+
+    幂等键（R4 收紧）：by-key 查找 → 会话同金额未决单处理（R5 规则 A）→
+    建单/按 key 重查整段在 ``idempotency_key_lock("order", …)`` 内串行；
+    复用命中时把带 key 请求的 key **后绑定**到目标订单（先落库再返回），
+    页面刷新（每次渲染带新 key）复用命中后同 key 重放也永远回到同一单，
+    绝不产生第二个可支付订单。
+
+    会话同金额未决单处理（R5 评审规则 A；``_support_settle_session_same_
+    amount``，金额相同才生效——不同金额零改动、零支付宝调用）：
+
+    - 任一同金额会话未决单剩余 ≥ ``sp.ORDER_REUSE_MIN_REMAINING_SECONDS``
+      → 复用最新一单（零支付宝调用，key 后绑定）；
+    - 否则对每张**仍在可支付窗口内**（created_at + ORDER_TIMEOUT +
+      STATUS_EXPIRED_GRACE_SECONDS 之前；越线单不可支付、不阻塞、留给
+      sweep）的同金额未决单执行 ``_support_settle_open_order``（via=
+      ``"create"``）：核实为 paid → 返回最新 paid 单；核实为 open（查询
+      失败/关单失败/未到 NOT_EXIST 截止线）→ 返回最新 open 单——两种情况
+      都绝不建新单（同 key 后绑定/重查语义同会话复用；无 key 不落别名）；
+    - 仅当全部同金额窗口内未决单核实为 closed（或根本没有）→ 建新单。
+    """
+    _support_pay_gate_404()
+    sp = support_payments_module()
+    runtime = _support_pay_runtime()
+    if runtime is None:  # 双保险（闸已查）；配置轮换瞬间 fail-closed
+        return _support_pay_error("unavailable", status=503)
+
+    ip_hash = _ip_prefix_hash(request.remote_addr or "")
+    import auth_limit_store
+    locked = auth_limit_store.check_support_order_ip_locked(ip_hash)
+    if locked > 0:
+        return _support_pay_error("rate_limited", status=429,
+                                  retry_after=locked)
+    auth_limit_store.record_support_order_attempt(ip_hash)
+
+    # 自定义金额优先（表单语义：选中「自定义」时输入框有值）；其值必须通过
+    # 服务端形态+边界校验，预设单选值同样走同一解析器（不信前端约束）。
+    raw_amount = (request.form.get("amount_custom")
+                  or request.form.get("amount") or "").strip()
+    try:
+        amount_fen = sp.parse_amount_fen(raw_amount)
+    except sp.InvalidAmount:
+        return _support_pay_error("invalid_amount", status=400)
+
+    # 下单幂等（R1 add-on / R2-1 收紧）：表单每次渲染带随机 idempotency_key
+    # （隐藏域）。真双击 = 两次**并发** POST 带同一（旧）会话 Cookie，会话级
+    # 复用挡不住；key + UNIQUE 索引 + ON CONFLICT DO NOTHING 在数据库层保证
+    # 只建一单，且 key 永久绑定原订单（见下）。
+    raw_key = (request.form.get("idempotency_key") or "").strip()
+    idem_key = raw_key if re.fullmatch(r"[0-9a-f]{32}", raw_key) else None
+    # R4：整段键语义在幂等键锁内串行（无 key 时锁为 no-op）——并发同 key 的
+    # 后进者按 key 重查命中列/别名，绝不绕过绑定另建新单。
+    with sp.idempotency_key_lock("order", idem_key):
+        if idem_key:
+            existing = sp.get_order_by_idempotency_key(idem_key)
+            if existing is not None:
+                if int(existing["amount_fen"]) != amount_fen \
+                        or existing["mode"] != runtime.mode \
+                        or existing["app_id"] != runtime.app_id \
+                        or existing["seller_pid"] != runtime.seller_pid:
+                    # 同 key 不同金额/配置：拒绝且绝不建单（防串单）
+                    return _support_pay_error("order_conflict", status=409)
+                # R2-1：key 与原订单**永久绑定**——绝不清除或改配。无论订单状态
+                # （created/paying/paid/closed）或剩余窗口，同 key 同金额一律 303
+                # 回原订单的支付页：paid/closed 的订单由支付页再转发到收据/关闭
+                # 态；剩余窗口规则只作用于无 key 的会话回退路径（下方）。
+                _remember_order_ref(existing["out_trade_no"])
+                app.logger.info("support order reused by key (%s)",
+                                existing["out_trade_no"])
+                if _support_pay_wants_json():
+                    return _support_order_json_payload(sp, existing, True), 200
+                return redirect("/support/pay/%s" % existing["out_trade_no"],
+                                code=303)
+
+        # 下单幂等 + 会话同金额未决单处理（R1 评审 / R5 规则 A）：本会话已有
+        # 同金额、同运行时快照的未决单时——剩余窗口足够 → 复用最新一单（零
+        # 支付宝调用）；否则逐张核实/关单仍可支付的旧单后再决定复用或建新
+        # （规则 A，见 docstring），绝不在旧单仍可支付时直接建第二张可支付
+        # 订单。带 key 的请求命中复用/返回时 key **后绑定**到该单（R3 评审
+        # [P2]：先落别名再返回，否则订单支付后同 key 重放会另建新单）；无
+        # key 请求复用语义不变（不落别名行）。
+        settle_target = _support_settle_session_same_amount(
+            sp, runtime, amount_fen, exclude_ref=None, via="create")
+        if settle_target is not None:
+            return _support_reuse_existing_order(sp, settle_target, idem_key,
+                                                 amount_fen, runtime)
+
+        order = sp.create_order(runtime, amount_fen, idempotency_key=idem_key)
+        if order is None:
+            # 幂等 key 并发撞库（另一请求刚刚用同一 key 建单）：按 key 重查复用
+            existing = sp.get_order_by_idempotency_key(idem_key)
+            if existing is not None and int(existing["amount_fen"]) == amount_fen:
+                _remember_order_ref(existing["out_trade_no"])
+                if _support_pay_wants_json():
+                    return _support_order_json_payload(sp, existing, True), 200
+                return redirect("/support/pay/%s" % existing["out_trade_no"],
+                                code=303)
+            return _support_pay_error("order_conflict", status=409)
+        # 会话绑定（AI 收款回跳状态展示契约）：回跳页/支付页只服务**本会话**创建
+        # 的订单；他方拿到订单号一律中性态且不触发服务端查单。
+        _remember_order_ref(order["out_trade_no"])
+        app.logger.info("support order created (%s, mode=%s)",
+                        order["out_trade_no"], runtime.mode)
+    if _support_pay_wants_json():
+        return _support_order_json_payload(sp, order, False), 201
+    return redirect("/support/pay/%s" % order["out_trade_no"], code=303)
+
+
+@app.route("/support/orders/<out_trade_no>/regenerate", methods=["POST"])
+def support_order_regenerate(out_trade_no):
+    """重新生成支付订单（桌面弹层「二维码已过期 → 重新生成」；跨层契约，
+    前端按本 docstring 对接，响应恒为 JSON）。
+
+    表单 POST（全局 CSRF 闸：缺 token → 400 ``csrf_required``；
+    ``idempotency_key`` = 32 位小写 hex 必填）。金额字段一律忽略——新单复制
+    **旧订单**的 amount_fen（服务端权威，杜绝金额漂移）。
+
+    流程（有序，前一步命中即返回）：功能闸（404/运行时缺失 503）→ ref 畸形
+    或不属本会话 → 200 ``{"status":"neutral"}``（不查单、不建单、不记限流）
+    → 订单 IP 桶限流（429 + Retry-After，成功也计）→ key 校验（400
+    ``invalid_request``）→ ``idempotency_key_lock("order", key)`` 内：
+
+    - key 已绑定（列或别名）→ 与旧单金额不符或运行时不匹配 → 409
+      ``order_conflict``；否则记住 ref 并 200 返回该单（reused=True；零支付宝
+      调用）；
+    - 旧单行缺失 → 200 neutral；
+    - 订单/配置归属不匹配 → 200 ``{"status":"unconfirmed"}``（不触碰支付宝）；
+    - 本地已 paid → 200 paid 载荷（与状态端点同一构造，零支付宝调用）；
+    - **「后继单已支付」防护（R6 评审）**：会话内存在比旧单**更晚**创建的
+      同金额、同运行时快照、已 paid 订单（``sp.find_session_paid_successor``
+      ——只能是旧单停止可支付后「A 过期 → 重建 B」的 B：规则 A 绝不产生第
+      二张同金额可支付订单，更早创建的同金额 paid 订单是更早的独立赞助，
+      绝不算后继）→ 200 点名 paid 载荷（``out_trade_no``=B）。零支付宝
+      调用：不查单、不关单、不绑定请求 key、绝不建新单；
+    - **「已被替换」防护（R5 评审规则 B）**：对旧单金额的本会话**其余**同
+      金额未决单执行规则 A 步骤 1–3（``_support_settle_session_same_amount``，
+      exclude=旧单，via=``"regenerate"``；旧单视图可能已过期——同一弹层在
+      「A 过期 → 重建 B」后重放仍携带 A 的 key）：命中（复用 / 核实
+      open）→ 请求 key 后绑定到该单并 200 返回（reused=True；409
+      ``order_conflict`` 仅当 key 已被其他金额/运行时不符的订单持有）。
+      复用命中（剩余 ≥5min）零支付宝调用；命中单在本请求内被核实为
+      PAID（settle 落库 paid）→ 不绑定 key，200 点名 paid 载荷（契约
+      见下），绝不落入键绑定/建单路径；
+    - 仅当防护未命中，才对旧单本身执行 ``_support_settle_open_order``（via=
+      ``"regenerate"``，表同该助手 docstring；fresh 查单，不吃节流）：paid →
+      200 paid 载荷；open → 200 ``{"status":"unconfirmed"}``（什么都不建）；
+    - 继续到这里旧单必然已不可支付（绝不把可能仍可支付/已支付的单换成
+      新单）：以旧单金额 + 新 key 建单 → 201（reused=False）；key 并发撞库
+      （create 返回 None）→ 按 key 重查（匹配 → 200 reused，否则 409
+      ``order_conflict``）。
+
+    paid 载荷契约（R6）：**仅当请求 key 未绑定任何订单**时才返回 paid 载荷
+    （key 已绑定分支恒回订单载荷并携带新 ``next_idempotency_key``，见上）；
+    且**恰好当 paid 订单不是 URL 里的旧单时**，载荷才额外带 ``out_trade_no``
+    （点名该单）。原因：key 未消耗，客户端保留它用于后续提交（如不同金额的
+    下一单），同时把收据切换到被点名的订单；旧单自身的 paid 路径（本地已
+    paid / 核实 PAID）不带 ``out_trade_no``，与状态端点载荷逐键一致（状态
+    端点永不点名）。
+    """
+    _support_pay_gate_404()
+    sp = support_payments_module()
+    runtime = _support_pay_runtime()
+    if runtime is None:
+        return jsonify(error="unavailable"), 503
+    if not (out_trade_no and sp._OUT_TRADE_NO_RE.fullmatch(out_trade_no)) \
+            or not _session_has_order_ref(out_trade_no):
+        # 未知/他方/畸形 ref 与未知响应一致（不泄露存在性），且零副作用
+        return jsonify(status="neutral")
+    ip_hash = _ip_prefix_hash(request.remote_addr or "")
+    import auth_limit_store
+    locked = auth_limit_store.check_support_order_ip_locked(ip_hash)
+    if locked > 0:
+        resp = jsonify(error="rate_limited")
+        resp.headers["Retry-After"] = str(locked)
+        return resp, 429
+    auth_limit_store.record_support_order_attempt(ip_hash)
+    raw_key = (request.form.get("idempotency_key") or "").strip()
+    key = raw_key if re.fullmatch(r"[0-9a-f]{32}", raw_key) else None
+    if not key:
+        return jsonify(error="invalid_request"), 400
+
+    with sp.idempotency_key_lock("order", key):
+        old = sp.get_order(out_trade_no)
+        bound = sp.get_order_by_idempotency_key(key)
+        if bound is not None:
+            # key 已绑定某单：金额/运行时与旧单一致才返回那一单（同 key 重放
+            # 永远同单），否则拒绝（防串单）；零支付宝调用
+            if old is not None \
+                    and int(bound["amount_fen"]) != int(old["amount_fen"]):
+                return jsonify(error="order_conflict"), 409
+            if not sp.order_matches_runtime(bound, runtime):
+                return jsonify(error="order_conflict"), 409
+            _remember_order_ref(bound["out_trade_no"])
+            return _support_order_json_payload(sp, bound, True), 200
+        if old is None:
+            return jsonify(status="neutral")
+        if not sp.order_matches_runtime(old, runtime):
+            # 他方配置的订单不查单、不关单、不重建（2026-10-21 归属红线）
+            return jsonify(status="unconfirmed")
+        if old["status"] == "paid":
+            return _support_paid_status_payload(sp, old), 200
+        # 「后继单已支付」防护（R6 评审）：会话内比旧单更晚创建的同金额订单
+        # 只能在旧单停止可支付后出现（规则 A），它已 paid = 旧单的支付意图已
+        # 由该后继完成（另一标签页付款并本地落库）——零支付宝调用返回点名
+        # 的 paid 载荷；不绑定请求 key（客户端留作后续提交）、绝不建新单。
+        successor = sp.find_session_paid_successor(
+            session.get(_SUPPORT_SESSION_REFS_KEY) or [], old, runtime)
+        if successor is not None:
+            return _support_paid_status_payload(sp, successor,
+                                                name_order=True), 200
+        # 「已被替换」防护（R5 规则 B）：旧单视图可能已过期（同一弹层在
+        # 「A 过期 → 重建 B」后重放仍携带 A 的 key）——先按规则 A 步骤 1–3
+        # 处理会话内**其余**同金额未决单（exclude=旧单本身），命中即返回
+        # 那一单，绝不基于过期视图再建第三张可支付订单。
+        replacement = _support_settle_session_same_amount(
+            sp, runtime, int(old["amount_fen"]),
+            exclude_ref=old["out_trade_no"], via="regenerate")
+        if replacement is not None:
+            # 命中单可能恰在本请求内被核实为 paid（settle 落库）：重读行，
+            # paid → 零 key 绑定返回点名 paid 载荷（同后继防护契约）。
+            replacement = sp.get_order(replacement["out_trade_no"]) \
+                or replacement
+            if replacement["status"] == "paid":
+                return _support_paid_status_payload(sp, replacement,
+                                                    name_order=True), 200
+            if not sp.bind_order_idempotency_key(
+                    key, replacement["out_trade_no"]):
+                # key 已被其他订单持有：按 key 重查并校验金额/运行时（防串单）
+                existing = sp.get_order_by_idempotency_key(key)
+                if existing is None \
+                        or int(existing["amount_fen"]) \
+                        != int(old["amount_fen"]) \
+                        or not sp.order_matches_runtime(existing, runtime):
+                    return jsonify(error="order_conflict"), 409
+                replacement = existing
+            _remember_order_ref(replacement["out_trade_no"])
+            return _support_order_json_payload(sp, replacement, True), 200
+        # 服务端核实旧单（fresh，不吃 3s 节流；核实表见
+        # _support_settle_open_order——与下单 settle 共用同一张表）
+        verdict = _support_settle_open_order(sp, runtime, old,
+                                             via="regenerate")
+        if verdict == "paid":
+            return _support_paid_status_payload(
+                sp, sp.get_order(out_trade_no) or old), 200
+        if verdict == "open":
+            # 查询失败/关单失败/UNKNOWN/金额不符/未到 NOT_EXIST 截止线：
+            # 旧单可能仍可支付，绝不重建
+            return jsonify(status="unconfirmed")
+        new = sp.create_order(runtime, old["amount_fen"], idempotency_key=key)
+        if new is None:
+            # key 并发撞库（另一请求刚刚用同一 key 建单）：按 key 重查
+            existing = sp.get_order_by_idempotency_key(key)
+            if existing is not None \
+                    and int(existing["amount_fen"]) == int(old["amount_fen"]) \
+                    and sp.order_matches_runtime(existing, runtime):
+                _remember_order_ref(existing["out_trade_no"])
+                return _support_order_json_payload(sp, existing, True), 200
+            return jsonify(error="order_conflict"), 409
+        _remember_order_ref(new["out_trade_no"])
+        app.logger.info("support order regenerated (%s -> %s)",
+                        old["out_trade_no"], new["out_trade_no"])
+        return _support_order_json_payload(sp, new, False), 201
+
+
+def _support_return_url():
+    """支付宝同步回跳 return_url：发起支付的入口 host 优先（白名单映射）。
+
+    会话 Cookie 是 **host-only**：订单归属（``support_order_refs``）记在
+    Flask session 里，从哪个入口 host 发起支付，回跳就必须落在**同一
+    host**——否则（生产同时服务 histopilot.cn / histopilot.com，见
+    PUBLIC_ORIGINS）session 不随行，用户只会看到中性的「没有找到对应的
+    订单」页。origin 只取**固定入口白名单**
+    ``registration_antibot.entry_site_for_host(request.host)`` 的映射结果
+    （ENTRY_SITES：.cn→.cn、.com→.com、旧 pt.solarise94.fun→.cn，与验证
+    邮件链接同一张表）；未知 Host（本地开发、测试 localhost、恶意伪造）
+    回退 canonical（PUBLIC_BASE_URL）——绝不反映 request.host_url /
+    X-Forwarded-Host / Origin / Referer，也绝不回显未映射的 Host。
+    canonical 不可用（PUBLIC_BASE_URL 缺失/非法）时返回 None：调用方维持
+    fail-closed（RuntimeError → 502），与请求 Host 无关。
+    """
+    canonical = _public_canonical_url("/support/return")
+    if canonical is None:
+        return None
+    site = registration_antibot.entry_site_for_host(request.host)
+    if site:
+        return site["origin"] + "/support/return"
+    return canonical
+
+
+@app.route("/support/pay/<out_trade_no>", methods=["GET"])
+def support_pay_page(out_trade_no):
+    """收银台跳转页：渲染 SDK 支付表单并由同源外链 JS 自动提交。
+
+    - **会话绑定**：订单号不在当前 session（未知/他方订单/形态非法）→ 中性
+      「没有找到对应的订单」页（200，互相无差别，不泄露存在性；不查单、
+      不建表单）。
+    - 已支付 → 303 回跳结果页；已关闭 → 关闭态页。
+    - created/paying：构造 ``alipay.trade.page.pay`` 表单（page_execute；签名
+      服务端完成），置 paying，渲染页面。CSP form-action 放开当前模式下单
+      POST 302 跳转链的精确 origin 列表——该表单是页面里唯一的跨站提交目标。
+    - SDK 调用/表单收敛失败 → 502（fail-closed，不给半渲染页面）。
+    """
+    _support_pay_gate_404()
+    sp = support_payments_module()
+    if not (out_trade_no and sp._OUT_TRADE_NO_RE.fullmatch(out_trade_no)) \
+            or not _session_has_order_ref(out_trade_no):
+        return _support_pay_neutral_response()
+    runtime = _support_pay_runtime()
+    order = sp.get_order(out_trade_no)
+    if order is None:  # 形态合法且在本会话，但订单不存在：同样中性（不泄露）
+        return _support_pay_neutral_response()
+    if runtime is not None and not sp.order_matches_runtime(order, runtime):
+        # 订单/配置归属（2026-10-21 评审）：他方配置的订单不建表单、不渲染
+        # 网关地址——与未知订单同一中性响应（不泄露状态）。
+        return _support_pay_neutral_response()
+    if order["status"] == "paid":
+        return redirect("/support/return?out_trade_no=%s" % order["out_trade_no"],
+                        code=303)
+    pay_state = "form"
+    form_html = ""
+    if order["status"] == "closed":
+        pay_state = "closed"
+    else:
+        if runtime is None:
+            return _support_pay_error("unavailable", status=503)
+        try:
+            return_url = _support_return_url()
+            if not return_url:
+                raise RuntimeError("return_url origin unavailable")
+            notify_url = SUPPORT_ALIPAY_PAY_NOTIFY_URL or None  # 空则省略
+            form_html = sp.build_page_pay_form(runtime, order, return_url,
+                                               notify_url=notify_url)
+        except (sp.TradeOperationError, sp.SupportPayConfigError,
+                RuntimeError, ValueError) as exc:
+            # 日志只带异常类型，不带表单/签名内容
+            app.logger.error("support pay form build failed: %s",
+                             type(exc).__name__)
+            return _support_pay_error("unavailable", status=502)
+        sp.mark_paying(order["out_trade_no"])
+        order = sp.get_order(out_trade_no) or order
+    resp = make_response(render_template(
+        "support_pay.html",
+        order=order,
+        amount_yuan=sp.fen_to_yuan(order["amount_fen"]),
+        pay_state=pay_state,
+        form_html=form_html,
+    ))
+    if pay_state == "form":
+        # form-action 必须覆盖下单 POST 的完整 302 跳转链——Chrome 对重定向链
+        # 的每一跳都执行 form-action：网关 → unitradeprod 中转(appAssign.htm)
+        # → 收银台（按模式精确列表，无通配；2026-10-21 沙箱实测 Location 头）。
+        # 注意：host-source **不带** CSP 关键字引号——'https://…'（带引号）会被
+        # 解析成非法 source 丢弃，空 source list 等价 'none'，提交被浏览器拦截。
+        return _apply_support_page_security_headers(
+            resp,
+            form_action=" ".join(sp.form_action_origins(runtime.mode)))
+    return _apply_support_page_security_headers(resp, form_action="none")
+
+
+def _support_pay_neutral_response():
+    """支付页中性态（未知/他方订单同一响应，不泄露存在性；200）。"""
+    resp = make_response(render_template(
+        "support_pay.html",
+        order=None,
+        amount_yuan=None,
+        pay_state="neutral",
+        form_html="",
+    ))
+    return _apply_support_page_security_headers(resp, form_action="none")
+
+
+#: embed 页（弹层内嵌二维码）族的安全头：CSP form-action 放开当前模式跳转链
+#（仅 form 态），frame-ancestors 'self' + X-Frame-Options SAMEORIGIN——本页
+#: 只为 /support 弹层的同源 iframe 存在（2026-10-22 沙箱实测：收银台 QR 页
+#: 无 X-Frame-Options、不 frame-bust，可嵌入）。
+def _support_pay_qr_response(pay_state, order=None, form_html=""):
+    amount_yuan = None
+    if order is not None and pay_state in ("form", "closed"):
+        amount_yuan = support_payments_module().fen_to_yuan(
+            order["amount_fen"])
+    resp = make_response(render_template(
+        "support_pay_qr.html",
+        order=order,
+        amount_yuan=amount_yuan,
+        pay_state=pay_state,
+        form_html=form_html,
+    ))
+    runtime = _support_pay_runtime()
+    if pay_state == "form" and runtime is not None:
+        form_action = " ".join(support_payments_module()
+                               .form_action_origins(runtime.mode))
+    else:
+        form_action = "none"
+    return _apply_support_page_security_headers(
+        resp, form_action=form_action,
+        frame_ancestors="self", x_frame_options="SAMEORIGIN")
+
+
+@app.route("/support/pay/<out_trade_no>/qr", methods=["GET"])
+def support_pay_qr_embed(out_trade_no):
+    """桌面端「支付状态」弹层的同源内嵌页（iframe 专用，自动提交签名表单）。
+
+    与 /support/pay/<ref> 同一套闸门与会话绑定（ foreign/unknown/形态非法 →
+    中性页、不建表单、不触碰支付宝），差异只有两点：
+
+    - biz 参数额外下发 ``qr_pay_mode=4`` + ``qrcode_width``（见
+      ``build_page_pay_form``；沙箱实测收银台渲染 200×200 裸二维码 canvas、
+      自动换码、付款后在 iframe 内导航到 return_url——回跳页的外链 JS 会
+      break out 到顶层窗口，弹层轮询通常更早触发顶层跳转）；
+    - CSP：form-action 放开当前模式跳转链（同支付页），frame-ancestors
+      'self' + X-Frame-Options SAMEORIGIN（本页存在的唯一目的就是被本站
+      /support 页 iframe 嵌入）。
+
+    已支付 → 303 回跳结果页（iframe 内同站导航，会话 Cookie 随行）；已关闭 →
+    关闭态页（无表单）。订单/配置归属不匹配 → 与未知订单同一中性响应。
+    """
+    _support_pay_gate_404()
+    sp = support_payments_module()
+    if not (out_trade_no and sp._OUT_TRADE_NO_RE.fullmatch(out_trade_no)) \
+            or not _session_has_order_ref(out_trade_no):
+        return _support_pay_qr_response("neutral")
+    runtime = _support_pay_runtime()
+    order = sp.get_order(out_trade_no)
+    if order is None:
+        return _support_pay_qr_response("neutral")
+    if runtime is not None and not sp.order_matches_runtime(order, runtime):
+        return _support_pay_qr_response("neutral")
+    if order["status"] == "paid":
+        return redirect("/support/return?out_trade_no=%s"
+                        % order["out_trade_no"], code=303)
+    pay_state = "form"
+    form_html = ""
+    if order["status"] == "closed":
+        pay_state = "closed"
+    else:
+        if runtime is None:
+            return _support_pay_error("unavailable", status=503)
+        try:
+            return_url = _support_return_url()
+            if not return_url:
+                raise RuntimeError("return_url origin unavailable")
+            notify_url = SUPPORT_ALIPAY_PAY_NOTIFY_URL or None  # 空则省略
+            form_html = sp.build_page_pay_form(runtime, order, return_url,
+                                               notify_url=notify_url,
+                                               qr_embed=True)
+        except (sp.TradeOperationError, sp.SupportPayConfigError,
+                RuntimeError, ValueError) as exc:
+            # 日志只带异常类型，不带表单/签名内容
+            app.logger.error("support pay qr form build failed: %s",
+                             type(exc).__name__)
+            return _support_pay_error("unavailable", status=502)
+        sp.mark_paying(order["out_trade_no"])
+        order = sp.get_order(out_trade_no) or order
+    return _support_pay_qr_response(pay_state, order=order,
+                                    form_html=form_html)
+
+
+@app.route("/support/return", methods=["GET"])
+def support_return_page():
+    """同步回跳结果页：**不信任同步参数**，只以本地库/服务端查单为准。
+
+    从回跳 query 中只取 ``out_trade_no`` 定位本地订单；其余参数（包括
+    ``trade_status``）一律忽略、绝不回显。**会话绑定**（AI 收款回跳状态展示
+    契约）：订单号不在当前 session（未知/他方订单/形态非法）→ 安全的中性页
+    （200），**不触发服务端查单**、不泄露订单存在性（未知与他方同一响应）。
+    同会话订单的状态判定：
+    - 本地 paid → 收据（金额来自本地订单行——服务端已验真才展示）；
+    - 本地 created/paying/closed → 服务端 ``alipay.trade.query``（SDK 验签）：
+      PAID（金额精确匹配）落库——含 **closed → paid 恢复**（本地超时清场后
+      实付的订单照样给收据，mark_paid_idempotent 内记错误级告警）；CLOSED
+      关单；PENDING/NOT_EXIST/UNKNOWN/查询失败 → 维持本地状态；
+    - 然后**重读订单行**再渲染：上面的状态推进（含 closed→paid）必须反映到
+      本次视图，凭条金额永远来自本地订单行。
+    无订单上下文（缺参/未知订单号/非本会话订单）→ 安全的中性状态页（200，
+    不 404/500）。
+    """
+    _support_pay_gate_404()
+    sp = support_payments_module()
+    runtime = _support_pay_runtime()
+    out_trade_no = _out_trade_no_from_request()
+    order = None
+    if out_trade_no and _session_has_order_ref(out_trade_no):
+        order = sp.get_order(out_trade_no)
+    if order is not None and runtime is not None \
+            and not sp.order_matches_runtime(order, runtime):
+        # 订单/配置归属（2026-10-21 评审）：他方配置的订单与未知一致——
+        # 中性、不触发服务端查单、不做任何状态推进。
+        order = None
+    if order is None:
+        state = "neutral"
+    else:
+        if order["status"] in ("created", "paying", "closed") \
+                and runtime is not None:
+            # verified 推进（共用助手）：PAID 金额精确匹配 → paid（含
+            # closed→paid 恢复）；CLOSED → 关单；其余无操作
+            _support_apply_verified_query(sp, runtime, order, via="return")
+            # 重读订单行：状态推进（含 closed→paid 恢复）必须反映到本次渲染
+            order = sp.get_order(out_trade_no) or order
+        state = {"paid": "paid", "closed": "closed"}.get(order["status"],
+                                                          "pending")
+    today = datetime.now()
+    paid = order is not None and state == "paid"
+    gift_tier = (sp.gift_tier_for_amount(order["amount_fen"])
+                 if paid else None)
+    resp = make_response(render_template(
+        "support_return.html",
+        state=state,
+        order=order,
+        amount_yuan=(sp.fen_to_yuan(order["amount_fen"]) if paid else None),
+        gift_tier=gift_tier,
+        # 喂猫互动：回跳页只发「领取卡」，礼物本体已放到 /support 小猫身边
+        #（kind 由 amount_fen 推导，自定义金额 → fish_treat）。
+        gift_kind=(sp.gift_collectible_for_amount(order["amount_fen"])
+                   if paid else None),
+        support_date=today.strftime("%Y-%m-%d"),
+        support_date_iso=today.strftime("%Y-%m-%d"),
+    ))
+    return _apply_support_page_security_headers(resp, form_action="none")
+
+
+@app.route("/support/alipay/notify", methods=["POST"])
+def support_alipay_notify():
+    """支付宝异步通知：**唯一**为它放开 CSRF/登录的路径（见 _csrf_exempt_path
+    与 _require_auth 的 /support/ 前缀放行），不放松其他任何校验面。
+
+    POST 表单（非 JSON）；SDK 验签 + 业务字段校验 + 持久化幂等；应答纯文本
+    ``success``/``failure``（支付宝按非 success 重试）。本地沙箱通常没有公网
+    HTTPS 通知地址，本路径可能收不到任何请求——补偿查单（sweep）是兜底验收
+    路径；生产上线必须配置公网 HTTPS notify_url。
+    """
+    _support_pay_gate_404()  # 功能关闭/配置不可用：404（功能不存在）
+    sp = support_payments_module()
+    runtime = _support_pay_runtime()
+    params = request.form.to_dict(flat=True)
+    body = sp.process_notify(params, runtime, logger=app.logger)
+    return Response(body, mimetype="text/plain")
+
+
+# --------------------------------------------------------------------------- #
+# 赞助订单管理（owner-only Admin API v1；退款 + 退款查询 + 订单查看）。
+# 与既有 /api/admin/v1/* 同口径：_require_owner_admin_v1（预览态拒绝）+ 全局
+# CSRF（before_request）+ _audit 审计。退款幂等键 out_request_no：新退款新号；
+# 同一次退款失败重试必须复用原号与原参数（契约：防重复退款）。
+# --------------------------------------------------------------------------- #
+def _support_admin_order_or_error(out_trade_no):
+    sp = support_payments_module()
+    if not out_trade_no or not sp._OUT_TRADE_NO_RE.fullmatch(out_trade_no):
+        return None, _admin_v1_error(400, "invalid_request", "订单号形态非法")
+    order = sp.get_order(out_trade_no)
+    if order is None:
+        return None, _admin_v1_error(404, "order_not_found", "订单不存在")
+    return order, None
+
+
+@app.route("/api/admin/v1/support-payments/<out_trade_no>", methods=["GET"])
+def admin_v1_support_payment_get(out_trade_no):
+    """订单查看（本地状态 + 退款进度；不含任何密钥材料）。"""
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    order, err = _support_admin_order_or_error(out_trade_no)
+    if err:
+        return err
+    sp = support_payments_module()
+    return jsonify(order={
+        "out_trade_no": order["out_trade_no"],
+        "status": order["status"],
+        "amount_yuan": sp.fen_to_yuan(order["amount_fen"]),
+        "mode": order["mode"],
+        "subject": order["subject"],
+        "trade_no": order["trade_no"],
+        "created_at": order["created_at"].isoformat() if order["created_at"] else None,
+        "paid_at": order["paid_at"].isoformat() if order["paid_at"] else None,
+        "closed_at": order["closed_at"].isoformat() if order["closed_at"] else None,
+        "closed_reason": order["closed_reason"],
+    })
+
+
+def _resolve_pending_refunds(sp, runtime, order, idempotency_key=None):
+    """解决该订单的全部未决退款（requested/unknown 同权——R2-3）。
+
+    返回 ``(state, row, key_bound)``：``state ∈ {"clear", "resolved", "blocked"}``：
+
+    - ``"resolved"``：某未决行在本次请求中被确认/重试成功退款——调用方必须
+      返回**该原始行**的结果（200）并停止，绝不在同一请求里再发新退款；
+      ``key_bound`` = 请求幂等键是否已随解析**同事务**绑定到该行（R3 评审
+      [P1]：``sp.mark_refunded_and_bind_key`` 先落库再返回——绑定失败时调用方
+      409 refund_key_conflict，但已发生的退款事实照常提交）；
+    - ``"blocked"``：某行仍未决——调用方以 409 refund_unresolved 阻断新退款；
+      阻断路径**绝不绑定**幂等键（解析没有发生，键保持未用）；``key_bound``
+      恒 False；
+    - ``"clear"``：无未决行，或未决行全部被明确业务拒绝（failed，额度释放）。
+
+    每行语义（R2-3 收紧）：
+    - 同号退款查询：``REFUND_SUCCESS`` → refunded（+键绑定）→ resolved；
+    - 查询**抛任何异常** → 直接 blocked，**绝不调用 refund_trade**——查询
+      失败时无法确知先前受理状态；同号重试只保留给「查询返回干净、可解析
+      的非成功应答」或「操作员显式传 out_request_no」两种场景；
+    - 干净的非成功应答 → 同号同额重试受理（支付宝按 out_request_no 幂等），
+      按 fail-safe 分类：白名单明确拒绝 → failed（额度释放，继续下一行）；
+      其余一切（无 sub_code/SYSTEM_ERROR/isp.*/未知码/DISCORDANT/Uncertain/
+      任何异常/非 dict/fund_change=N/缺失）→ unknown → blocked；
+      重试 fund_change=Y → refunded（+键绑定）→ resolved。
+    决不在存在未决行时生成新的退款请求号。
+    """
+    for row in sp.list_pending_refunds(order["out_trade_no"]):
+        result = None
+        try:
+            result = sp.query_refund(runtime, order, row["out_request_no"])
+        except Exception:
+            # 查询失败：状态无法确知 → 阻断（绝不盲目同号重试受理）
+            return "blocked", row, False
+        if isinstance(result, dict) \
+                and result.get("refund_status") == "REFUND_SUCCESS":
+            # R3 评审 [P1]：refunded 置位与新键的别名落库**同一事务**——返回
+            # 原行前先提交，之后任何环节（审计/响应构造）中断，同 key 重放
+            # 都按 key 命中本行，绝不产生第二个 out_request_no
+            key_bound = sp.mark_refunded_and_bind_key(
+                row["out_request_no"], idempotency_key,
+                trade_no=result.get("trade_no"))
+            _audit("support_payment.refund_confirmed",
+                   target_type="support_order",
+                   target_id=order["out_trade_no"],
+                   detail={"out_request_no": row["out_request_no"],
+                           "via": "resolve_before_new_refund"})
+            return "resolved", row, key_bound
+        retry = None
+        definite_exc = None
+        try:
+            retry = sp.refund_trade(runtime, order,
+                                    int(row["refund_amount_fen"]),
+                                    row["out_request_no"],
+                                    row["refund_reason"])
+        except Exception as exc:  # noqa: BLE001 — 先分类再处置
+            if sp.is_definite_refund_rejection(exc):
+                definite_exc = exc
+            elif sp.is_discordant_repeat_rejection(exc):
+                sp._alert_refund_discordant_repeat(order["out_trade_no"])
+        if definite_exc is not None:
+            # 同号重试被明确拒绝 → 原受理同样失败（同号幂等）→ failed 释放
+            sp.update_refund_status(row["out_request_no"], "failed",
+                                    fund_change=None,
+                                    trade_no=(getattr(definite_exc,
+                                                      "sub_code", "")
+                                              or None))
+            _audit("support_payment.refund_failed",
+                   target_type="support_order",
+                   target_id=order["out_trade_no"],
+                   detail={"out_request_no": row["out_request_no"],
+                           "sub_code": getattr(definite_exc, "sub_code", "")})
+            continue
+        if not isinstance(retry, dict) or retry.get("fund_change") != "Y":
+            # 结果未知（异常未达明确拒绝 / fund_change=N/缺失 / 非 dict 返回）
+            sp.update_refund_status(row["out_request_no"], "unknown",
+                                    fund_change=(retry.get("fund_change")
+                                                 if isinstance(retry, dict)
+                                                 else None),
+                                    trade_no=(retry.get("trade_no")
+                                              if isinstance(retry, dict)
+                                              else None))
+            return "blocked", row, False
+        # 重试受理成功：refunded 置位与键绑定同事务（同上方 REFUND_SUCCESS）
+        key_bound = sp.mark_refunded_and_bind_key(
+            row["out_request_no"], idempotency_key,
+            fund_change="Y", trade_no=retry.get("trade_no"))
+        _audit("support_payment.refund",
+               target_type="support_order", target_id=order["out_trade_no"],
+               detail={"out_request_no": row["out_request_no"],
+                       "amount_fen": int(row["refund_amount_fen"]),
+                       "fund_change": "Y", "via": "pending_resolution"})
+        return "resolved", row, key_bound
+    return "clear", None, True
+
+
+@app.route("/api/admin/v1/support-payments/<out_trade_no>/refund",
+           methods=["POST"])
+def admin_v1_support_payment_refund(out_trade_no):
+    """发起退款（body {amount_yuan: "0.66", refund_reason?, out_request_no?}）。
+
+    - 仅已支付（paid）订单可退；金额解析用 ``parse_refund_amount_fen``
+      （字符串、两位小数、**最小 ¥0.01**——部分退款允许低于 ¥1）；
+      累计退款（requested/refunded/unknown）不得超过订单实付金额；
+    - **订单/配置归属**：订单的 mode/app_id/seller_pid 与当前运行时不匹配 →
+      409（不发起任何支付宝调用）；
+    - **未决退款优先（R2-3）**：requested/unknown 同权——无显式号的新退款
+      必须先解决未决行（同号退款查询：成功 → 返回该原始行并停止；查询抛
+      任何异常 → 409 阻断且绝不调 refund_trade；干净非成功应答 → 同号同额
+      重试），决不生成新请求号；未决未解决 → 409 refund_unresolved；
+    - ``out_request_no`` 缺省新号；传入已有号 = 同一次退款重试（复用原号、
+      原金额——金额与原行不一致时 409 拒绝；操作员显式重试不做查询前置
+      门槛，直接同号受理）。**不变量（2026-10-23 评审）**：重试绝不会在
+      行处于不预留额度状态（failed）时发往支付宝——failed 行的预算检查
+      通过后、调用支付宝**之前**，行先经
+      ``sp.reserve_failed_refund_for_retry`` 推回 requested 并提交（额度
+      预留）；此后任何时点崩溃/中断，行都是未决退款（同号解决），不存在
+      「账本已释放 + 资金已付出 → 新号重复退款」窗口；状态已被并发改变
+      （CAS 不中）→ 409 ``refund_state_changed`` 且不发起任何支付宝调用；
+    - ``idempotency_key``（R2-2，可选）：退款操作幂等键（8–128 位
+      字母/数字/._:-），UNIQUE 落库；同 key 直接返回原退款行（任何状态）
+      且不做任何支付宝调用；同 key 不同订单 → 409。R3 评审 [P1]：无显式号
+      的请求经未决解析返回原行前，新 key 与该行**同事务**绑定（先落库再
+      返回，``sp.mark_refunded_and_bind_key``）——之后任何环节中断，同 key
+      重放都命中原行，绝不产生第二个 out_request_no；绑定不上（键被其他
+      退款行持有）→ 409 refund_key_conflict（退款事实照常提交）；blocked
+      解析绝不绑定；整段键语义在 ``idempotency_key_lock("refund", …)`` 内
+      串行（嵌于订单锁内，锁序恒为 订单锁 → 键锁）；
+    - ``fund_change=Y`` → refunded；受理成功但 ``N``/缺失 → unknown（契约
+      「待确认」：额度占用，HTTP 200 交还发起方走退款查询）；**无已解析应答**
+      （超时/传输中断/无 ``sub_code`` 异常/``ACQ.SYSTEM_ERROR``/``isp.*``/
+      未知码/任何异常/非 dict 返回）→ unknown + 502 ``refund_uncertain``；
+      只有 ``sub_code`` 在白名单（``sp.REFUND_DEFINITE_REJECT_SUB_CODES``）
+      内的**明确业务拒绝** → failed（释放额度）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    sp = support_payments_module()
+    runtime = _support_pay_runtime()
+    order, err = _support_admin_order_or_error(out_trade_no)
+    if err:
+        return err
+    if order["status"] != "paid":
+        return _admin_v1_error(409, "order_not_paid", "仅已支付订单可退款")
+    if runtime is None or not sp.order_matches_runtime(order, runtime):
+        return _admin_v1_error(409, "order_runtime_mismatch",
+                               "支付配置与订单不匹配（fail-closed，不发起退款）")
+    body = request.get_json(silent=True) or {}
+    refund_reason = (str(body.get("refund_reason") or "").strip()[:200]) or None
+    amount_raw = body.get("amount_yuan")
+    if not isinstance(amount_raw, str):
+        # 金额通道不允许 JSON number（浮点不可作金额来源；admin v1 同红线）
+        return _admin_v1_error(400, "invalid_request",
+                               "amount_yuan 需为字符串（两位小数，¥0.01 起）")
+    try:
+        amount_fen = sp.parse_refund_amount_fen(amount_raw)
+    except sp.InvalidAmount:
+        return _admin_v1_error(400, "invalid_request",
+                               "amount_yuan 需为 ¥0.01 起、最多两位小数的字符串")
+    actor = actor_identity()
+    requested_by = actor.get("user_id") or ""
+
+    # R2-2 退款操作幂等键（可选）：同 key 直接返回原退款行，不做任何支付宝
+    # 调用；key 全局唯一（support_refunds.idempotency_key UNIQUE）。
+    refund_key = (str(body.get("idempotency_key") or "").strip()) or None
+    if refund_key and not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", refund_key):
+        return _admin_v1_error(400, "invalid_request",
+                               "idempotency_key 需为 8–128 位字母/数字/._:-")
+
+    # R1 评审 (b) / R2-3：未决退款解析、累计额度校验与退款行创建（额度预留）
+    # 都在每订单串行锁内——并发退款 POST 不能同时通过额度检查。
+    # R3 评审 [P1]：幂等键锁嵌在订单锁内（锁序恒为 订单锁 → 键锁，无反向
+    # 路径）——同 key 并发请求串行，未决解析「返回原行」与键绑定原子完成。
+    with sp.order_refund_lock(order["out_trade_no"]), \
+            sp.idempotency_key_lock("refund", refund_key):
+        if refund_key:
+            by_key = sp.get_refund_by_idempotency_key(refund_key)
+            if by_key is not None:
+                if by_key["out_trade_no"] != order["out_trade_no"]:
+                    return _admin_v1_error(409, "refund_key_conflict",
+                                           "幂等键已用于其他订单的退款")
+                # 同 key：返回原退款行（任何状态），绝不重复受理
+                return jsonify(refund=_support_refund_out(sp, by_key))
+
+        existing_no = (str(body.get("out_request_no") or "").strip())
+        if existing_no:
+            refund = sp.get_refund(existing_no)
+            if refund is None or refund["out_trade_no"] \
+                    != order["out_trade_no"]:
+                return _admin_v1_error(404, "refund_not_found",
+                                       "退款请求号不存在或不属于该订单")
+            if int(refund["refund_amount_fen"]) != amount_fen:
+                return _admin_v1_error(
+                    409, "refund_retry_amount_mismatch",
+                    "重试必须复用原退款金额（防重复退款）")
+            if refund["status"] == "refunded":
+                return jsonify(refund=_support_refund_out(sp, refund))
+            if refund["status"] == "failed":
+                # R2 复核：failed 行的额度**早已释放**——此后其他退款可能已经
+                # 用掉预算。显式重试必须重跑累计校验（排除本行）：本行金额 +
+                # 其他占用 ≤ 实付，否则 409 且不发起任何支付宝调用。
+                # （requested/unknown 行的金额本就计入占用，无需此检查。）
+                already_excl = sp.sum_refunded_fen(
+                    order["out_trade_no"],
+                    exclude_out_request_no=refund["out_request_no"])
+                if already_excl + amount_fen > int(order["amount_fen"]):
+                    return _admin_v1_error(409, "refund_exceeds_paid",
+                                           "累计退款超过订单实付金额")
+                # 2026-10-23 评审 [P1]：预算通过后、触碰支付宝**之前**，把行
+                # 从 failed 推回 requested 并提交（额度预留）。不变量：重试
+                # 绝不在行处于不预留额度状态（failed）时发往支付宝——受理后
+                # 进程死掉，行也必须是未决（占用额度、同号解决），而不是
+                # 「已释放 + 新号可再退」的重复退款窗口。CAS 只匹配 failed：
+                # 状态已被并发路径改变 → 409，绝不基于过期状态受理。
+                if not sp.reserve_failed_refund_for_retry(
+                        refund["out_request_no"]):
+                    return _admin_v1_error(
+                        409, "refund_state_changed",
+                        "退款行状态已变化（不再处于 failed）；请刷新后重试")
+                _audit("support_payment.refund_retry_reserved",
+                       target_type="support_order",
+                       target_id=order["out_trade_no"],
+                       detail={"out_request_no": refund["out_request_no"],
+                               "amount_fen": amount_fen})
+            # requested/unknown/failed + 操作员显式传号 = 同号重试受理
+            # （操作员显式重试不做查询前置门槛——R2-3 的例外路径）。
+        else:
+            # 无显式号的新退款：必须先解决未决行（requested/unknown 同权）。
+            # 解析出「已退款」→ 返回该原始行结果并停止（R2-2：绝不在同一
+            # 请求里再建新退款）；阻塞 → 409。refund_key 随解析传入：两条
+            # resolved 路径（查询确认 / 同号重试成功）都以
+            # ``mark_refunded_and_bind_key`` 在**同一事务**内置 refunded +
+            # 绑定新键（R3 评审 [P1]：先落库再返回）。
+            state, pending_row, key_bound = _resolve_pending_refunds(
+                sp, runtime, order, refund_key)
+            if state == "resolved":
+                if refund_key and not key_bound:
+                    # 键被其他退款行持有：退款事实已提交（来自支付宝），
+                    # 但本请求的键语义不成立 → 拒绝
+                    return _admin_v1_error(409, "refund_key_conflict",
+                                           "幂等键已用于其他订单的退款")
+                refund = sp.get_refund(pending_row["out_request_no"])
+                return jsonify(refund=_support_refund_out(sp, refund))
+            if state == "blocked":
+                # 阻断路径绝不绑定键（解析未发生，键保持未用）
+                return _admin_v1_error(
+                    409, "refund_unresolved",
+                    "存在未决退款（%s，受理结果未知）；请先用退款查询确认，"
+                    "确认前该金额继续占用、不能发起新退款"
+                    % pending_row["out_request_no"])
+            # 累计校验：clear 后才走到这里
+            already = sp.sum_refunded_fen(order["out_trade_no"])
+            if already + amount_fen > int(order["amount_fen"]):
+                return _admin_v1_error(409, "refund_exceeds_paid",
+                                       "累计退款超过订单实付金额")
+            refund = sp.create_refund_row(order["out_trade_no"], amount_fen,
+                                          requested_by, refund_reason,
+                                          idempotency_key=refund_key)
+            if refund is None:
+                # 幂等键并发撞库：按 key 重查返回原行（绝不新建）
+                by_key = sp.get_refund_by_idempotency_key(refund_key)
+                if by_key is not None \
+                        and by_key["out_trade_no"] == order["out_trade_no"]:
+                    return jsonify(refund=_support_refund_out(sp, by_key))
+                return _admin_v1_error(409, "refund_key_conflict",
+                                       "幂等键已用于其他订单的退款")
+        result = None
+        definite_exc = None
+        try:
+            result = sp.refund_trade(runtime, order,
+                                     int(refund["refund_amount_fen"]),
+                                     refund["out_request_no"], refund_reason)
+        except Exception as exc:  # noqa: BLE001 — 任何异常先分类再处置
+            if sp.is_definite_refund_rejection(exc):
+                definite_exc = exc
+            elif sp.is_discordant_repeat_rejection(exc):
+                sp._alert_refund_discordant_repeat(order["out_trade_no"])
+            result = None
+        if definite_exc is not None:
+            # 明确业务拒绝（白名单 sub_code）→ failed，释放额度
+            sp.update_refund_status(refund["out_request_no"], "failed",
+                                    fund_change=None,
+                                    trade_no=(getattr(definite_exc,
+                                                      "sub_code", "")
+                                              or None))
+            _audit("support_payment.refund_failed",
+                   target_type="support_order", target_id=order["out_trade_no"],
+                   detail={"out_request_no": refund["out_request_no"],
+                           "sub_code": getattr(definite_exc, "sub_code", "")})
+            return _admin_v1_error(502, "refund_failed",
+                                   "支付宝退款受理失败（可复用 out_request_no 重试）")
+        if not isinstance(result, dict):
+            # 无已解析的支付宝应答（超时/传输中断/任何其他异常）→ 结果未知：
+            # unknown，额度继续占用，同号解决（502）
+            sp.update_refund_status(refund["out_request_no"], "unknown",
+                                    fund_change=None, trade_no=None)
+            _audit("support_payment.refund_uncertain",
+                   target_type="support_order", target_id=order["out_trade_no"],
+                   detail={"out_request_no": refund["out_request_no"]})
+            return _admin_v1_error(
+                502, "refund_uncertain",
+                "退款受理结果未知（超时/传输中断）；请先用同一 out_request_no "
+                "走退款查询确认，确认前该金额继续占用")
+        if result.get("fund_change") == "Y":
+            sp.update_refund_status(refund["out_request_no"], "refunded",
+                                    fund_change="Y",
+                                    trade_no=result.get("trade_no"))
+        else:
+            # 受理成功（code=10000）但 fund_change=N/缺失：契约上的「待确认」——
+            # 行置 unknown（额度继续占用），HTTP 200 交还发起方走退款查询确认
+            sp.update_refund_status(refund["out_request_no"], "unknown",
+                                    fund_change=result.get("fund_change"),
+                                    trade_no=result.get("trade_no"))
+        _audit("support_payment.refund", target_type="support_order",
+               target_id=order["out_trade_no"],
+               detail={"out_request_no": refund["out_request_no"],
+                       "amount_fen": int(refund["refund_amount_fen"]),
+                       "fund_change": result.get("fund_change")})
+        refund = sp.get_refund(refund["out_request_no"])
+        return jsonify(refund=_support_refund_out(sp, refund))
+
+
+@app.route(
+    "/api/admin/v1/support-payments/<out_trade_no>/refund-query",
+    methods=["POST"])
+def admin_v1_support_payment_refund_query(out_trade_no):
+    """退款查询（body {out_request_no}）：REFUND_SUCCESS → 落库 refunded。
+
+    契约：只有 refund_status=REFUND_SUCCESS 表示退款成功；两次查询间建议
+    ≥10s（本端点不做节流，调用方自行控制频率）。
+    """
+    auth = _require_owner_admin_v1()
+    if auth:
+        return auth
+    sp = support_payments_module()
+    runtime = _support_pay_runtime()
+    order, err = _support_admin_order_or_error(out_trade_no)
+    if err:
+        return err
+    if runtime is None or not sp.order_matches_runtime(order, runtime):
+        return _admin_v1_error(409, "order_runtime_mismatch",
+                               "支付配置与订单不匹配（fail-closed，不发起查询）")
+    body = request.get_json(silent=True) or {}
+    out_request_no = str(body.get("out_request_no") or "").strip()
+    refund = sp.get_refund(out_request_no)
+    if refund is None or refund["out_trade_no"] != order["out_trade_no"]:
+        return _admin_v1_error(404, "refund_not_found",
+                               "退款请求号不存在或不属于该订单")
+    try:
+        result = sp.query_refund(runtime, order, refund["out_request_no"])
+    except sp.TradeOperationError as exc:
+        return _admin_v1_error(502, "refund_query_failed",
+                               "退款查询失败（%s）" % (
+                                   getattr(exc, "sub_code", "") or "error"))
+    if result.get("refund_status") == "REFUND_SUCCESS":
+        sp.update_refund_status(refund["out_request_no"], "refunded",
+                                trade_no=result.get("trade_no"))
+        _audit("support_payment.refund_confirmed",
+               target_type="support_order", target_id=order["out_trade_no"],
+               detail={"out_request_no": refund["out_request_no"]})
+    refund = sp.get_refund(refund["out_request_no"])
+    return jsonify(refund=_support_refund_out(sp, refund),
+                   alipay_refund_status=result.get("refund_status"))
+
+
+def _support_refund_out(sp, refund):
+    return {
+        "out_request_no": refund["out_request_no"],
+        "out_trade_no": refund["out_trade_no"],
+        "refund_amount_yuan": sp.fen_to_yuan(refund["refund_amount_fen"]),
+        "status": refund["status"],
+        "fund_change": refund["fund_change"],
+        "requested_by": refund["requested_by"],
+        "created_at": refund["created_at"].isoformat() if refund["created_at"] else None,
+    }
 
 
 #: 转换产物可查看格式表（按核心 result.format 字符串键控，**不是**扩展名）。

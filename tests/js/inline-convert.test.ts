@@ -39,6 +39,8 @@ const inlineSrc = readFileSync(
 	resolve(root, "static/upload/inline-convert.js"), "utf8");
 const sniffSrc = readFileSync(
 	resolve(root, "static/upload/slide-sniff.js"), "utf8");
+const companionSrc = readFileSync(
+	resolve(root, "static/upload/mrxs-companion.js"), "utf8");
 const i18nSrc = readFileSync(resolve(root, "static/i18n.js"), "utf8");
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -52,8 +54,11 @@ async function flush(n = 12) {
 type W = Record<string, unknown>;
 function loadInline() {
 	const w: W = {};
-	new Function("window", inlineSrc)(w);
+	// 模板加载顺序（templates/index.html）：slide-sniff → mrxs-companion →
+	// inline-convert。协助模块读 window.HP_MRXS_COMPANION，同窗口装载。
 	new Function("window", sniffSrc)(w);
+	new Function("window", companionSrc)(w);
+	new Function("window", inlineSrc)(w);
 	return w;
 }
 
@@ -266,6 +271,7 @@ function mkOrch(over: {
 	account?: () => string;
 	identityReady?: () => Promise<void>;
 	authEnabled?: () => boolean;
+	companion?: unknown;   // 注入 HP_MRXS_COMPANION 替身（缺省用真模块）
 } = {}) {
 	const w = loadInline();
 	const I = w.HP_INLINE_CONVERT as ReturnType<typeof IC>;
@@ -286,6 +292,8 @@ function mkOrch(over: {
 		engine: engineStub(over.engine),
 		sniff: w.HP_SLIDE_SNIFF,
 		cos,
+		companion: over.companion !== undefined
+			? over.companion : w.HP_MRXS_COMPANION,
 		caps: { ...CAPS, ...(over.caps || {}) },
 		ui: {
 			row: (e: Entry) => { rows.push(e); order.push("row:" + e.id); },
@@ -944,23 +952,34 @@ describe("刷新恢复（§6.2，不自动开始）", () => {
 // 16/21. bundle（散文件与整包、两个入口）
 // --------------------------------------------------------------------- //
 describe("bundle（§4.1.1）", () => {
-	it("散文件 .mrxs → 类型化说明 + 选择文件夹，零网络", async () => {
+	it("散文件 .mrxs → 协助状态（need_folder，非错误），零网络、零复制", async () => {
 		const h = mkOrch();
+		const e = h.orch.enqueue(fakeFile("CMU-1.mrxs", new Uint8Array(4)))!;
+		await flush();
+		// 2026-10 交互统一：MRXS 不再是红色失败——进入「选择同名数据文件夹」
+		expect(e.state).toBe("need_folder");
+		expect(e.error).toBeNull();
+		expect(e.companion?.stem).toBe("CMU-1");
+		expect(h.runner.calls.filter((c) => c[0] === "prepareBundle")).toHaveLength(0);
+		expect(h.cos.uploads).toHaveLength(0);
+		expect(h.stages.some((s) => s[1] === "upload.inline.stage.needFolder")).toBe(true);
+	});
+
+	it("协助模块不可用（deps.companion 无 stemOf）→ 退回静态 need_bundle 说明", async () => {
+		const h = mkOrch({ companion: {} as Record<string, unknown> });
 		const e = h.orch.enqueue(fakeFile("CMU-1.mrxs", new Uint8Array(4)))!;
 		await flush();
 		expect(e.state).toBe("convert_failed");
 		expect(e.error?.code).toBe("need_bundle");
-		expect(h.runner.calls.filter((c) => c[0] === "prepareBundle")).toHaveLength(0);
-		expect(h.cos.uploads).toHaveLength(0);
-		// 说明文案是静态的（不依赖读目录）：行内文案键正确
 		expect(h.stages.some((s) => s[1] === "upload.inline.needBundle.mrxs")).toBe(true);
 	});
 
-	it("散文件 .vms → VMS 版本的静态说明", async () => {
+	it("散文件 .vms → VMS 版本的静态说明（不进入 MRXS 协助）", async () => {
 		const h = mkOrch();
 		const e = h.orch.enqueue(fakeFile("slide.vms", new Uint8Array(4)))!;
 		await flush();
 		expect(e.error?.code).toBe("need_bundle");
+		expect(e.state).toBe("convert_failed");
 		expect(h.stages.some((s) => s[1] === "upload.inline.needBundle.vms")).toBe(true);
 	});
 
@@ -989,14 +1008,16 @@ describe("bundle（§4.1.1）", () => {
 
 	it("bundle 两个入口都走 importBundleRows（开关两态，A3）", () => {
 		// 源码级：importDroppedDirectory 与 importPickFolder 都调 importBundleRows，
-		// 且不再无条件 handoffBundleFolder
+		// 且不再无条件 handoffBundleFolder（协助流程待处理时 importPickFolder
+		// 先改道 resolveCompanionFolder——见本文件 companion 分组）
 		const dropped = appSrc.slice(
 			appSrc.indexOf("function importDroppedDirectory"),
 			appSrc.indexOf("function importBundleRows"));
 		expect(dropped).toContain("importBundleRows(rows, dirEntry.name)");
 		const pickAt = appSrc.indexOf("function importPickFolder");
-		const picked = appSrc.slice(pickAt, pickAt + 900);
+		const picked = appSrc.slice(pickAt, pickAt + 2200);
 		expect(picked).toContain("importBundleRows(rows, first)");
+		expect(picked).toContain("resolveCompanionFolder(pc.id, rows, first)");
 		// 2026-10-20：转换器交接移除——bundle 分流只进面板队列，面板不可用
 		// 时行内说明（convertNeededUnavailable），绝不弹 /tools/slides
 		const router = appSrc.slice(
@@ -1005,6 +1026,265 @@ describe("bundle（§4.1.1）", () => {
 		expect(router).toContain("inlineEnabled()");
 		expect(router).toContain("convertNeededUnavailable(null, folderName, retryBundle)");
 		expect(router).not.toContain("handoffBundleFolder");
+	});
+});
+
+// --------------------------------------------------------------------- //
+// 16b. MRXS 协助（先选 .mrxs → 补选同名数据文件夹 → 原地转整包）
+// --------------------------------------------------------------------- //
+describe("MRXS 同名数据文件夹协助（2026-10）", () => {
+	/// 合成数据文件夹行（webkitRelativePath 形状；首段 = 所选文件夹名）
+	function folderRows(folder: string, opts: { slidedat?: boolean } = {}) {
+		const mk = (name: string, bytes = new Uint8Array(4)) =>
+			({ name, relPath: `${folder}/${name}`, file: fakeFile(name, bytes) });
+		const rows = [mk("Index.dat")];
+		if (opts.slidedat !== false) {
+			rows.unshift({ name: "Slidedat.ini",
+				relPath: `${folder}/Slidedat.ini`, file: fakeFile("Slidedat.ini",
+				new TextEncoder().encode(
+					"[HIERARCHICAL]\r\nINDEXFILE = Index.dat\r\n\r\n[DATAFILE]\r\nFILE_COUNT = 1\r\nFILE_0 = Data0000.dat\r\n")) });
+		}
+		rows.push(mk("Data0000.dat"));
+		return rows;
+	}
+
+	function needEntry(h: ReturnType<typeof mkOrch>, name = "病例A.mrxs") {
+		const e = h.orch.enqueue(fakeFile(name, new Uint8Array(4)))!;
+		return e;
+	}
+
+	it("(a) 同名文件夹：resolveCompanionFolder → 原地转整包，prepareBundle 收到装配行", async () => {
+		const captured: Array<unknown[]> = [];
+		const h = mkOrch({ runner: {
+			prepareBundle: (rows: unknown[], opts: unknown) => {
+				captured.push([rows, opts]);
+				return Promise.resolve({ jobId: "jobB",
+					probe: { document: { modality: "brightfield" } },
+					identity: { size: 10 } });
+			},
+		} });
+		const e = needEntry(h);
+		await flush();
+		expect(e.state).toBe("need_folder");
+		const resolved = h.orch.resolveCompanionFolder(e.id, folderRows("病例A"), "病例A");
+		expect(resolved && resolved.state).toBe("convert_queued");
+		expect(resolved && resolved.companion).toBeNull();
+		expect(resolved && resolved.name).toBe("病例A");
+		await flush(30);
+		expect(captured).toHaveLength(1);
+		const rows = captured[0][0] as Array<{ relPath: string }>;
+		expect(rows.map((r) => r.relPath)).toEqual([
+			"病例A.mrxs", "病例A/Slidedat.ini", "病例A/Index.dat", "病例A/Data0000.dat",
+		]);
+		expect((captured[0][1] as { folderName?: string }).folderName).toBeUndefined();
+		// 入口 File 就是用户先前选的那一个（不重选 .mrxs）
+		expect((rows[0] as unknown as { file: { name: string } }).file.name).toBe("病例A.mrxs");
+		// 转换完成后照常走产物上传
+		await flush(30);
+		expect(h.cos.uploads).toHaveLength(1);
+	});
+
+	it("(b) 父文件夹：用 <stem>/ 子树装配；兄弟目录与散文件被排除", async () => {
+		const captured: Array<unknown[]> = [];
+		const h = mkOrch({ runner: {
+			prepareBundle: (rows: unknown[]) => {
+				captured.push([rows]);
+				return Promise.resolve({ jobId: "jobB",
+					probe: { document: { modality: "brightfield" } },
+					identity: { size: 10 } });
+			},
+		} });
+		const e = needEntry(h, "CMU-1.mrxs");
+		await flush();
+		const rows = [
+			...folderRows("CMU-1"),
+			{ name: "other.txt", relPath: "CMU-1.sibling/junk.txt", file: fakeFile("junk.txt", new Uint8Array(1)) },
+			{ name: "CMU-1.mrxs", relPath: "CMU-1.mrxs", file: fakeFile("CMU-1.mrxs", new Uint8Array(2)) },
+		];
+		h.orch.resolveCompanionFolder(e.id, rows, "Slides");
+		await flush(30);
+		const merged = captured[0][0] as Array<{ relPath: string; file: { size: number } }>;
+		expect(merged.map((r) => r.relPath)).toEqual([
+			"CMU-1.mrxs", "CMU-1/Slidedat.ini", "CMU-1/Index.dat", "CMU-1/Data0000.dat",
+		]);
+		// 入口保留原 File（4 字节），文件夹里的同名 .mrxs（2 字节）被排除
+		expect(merged[0].file.size).toBe(4);
+	});
+
+	it("(c) 不同名：先停 companion_confirm；「使用此文件夹」确认后装配", async () => {
+		const captured: Array<unknown[]> = [];
+		const h = mkOrch({ runner: {
+			prepareBundle: (rows: unknown[]) => {
+				captured.push(rows);
+				return Promise.resolve({ jobId: "jobB",
+					probe: { document: { modality: "brightfield" } },
+					identity: { size: 10 } });
+			},
+		} });
+		const e = needEntry(h);
+		await flush();
+		h.orch.resolveCompanionFolder(e.id, folderRows("wrong_name"), "wrong_name");
+		expect(e.state).toBe("companion_confirm");
+		expect(e.companion?.folder).toBe("wrong_name");
+		// 确认前的「重新选择」→ 回 need_folder，行可重选
+		h.orch.act(e.id, "companionReselect");
+		expect(e.state).toBe("need_folder");
+		expect(e.companionError).toBeNull();
+		// 再次选错名文件夹，这次显式确认
+		h.orch.resolveCompanionFolder(e.id, folderRows("wrong_name"), "wrong_name");
+		expect(e.state).toBe("companion_confirm");
+		h.orch.act(e.id, "companionUse");
+		expect(e.state).toBe("convert_queued");
+		await flush(30);
+		expect(captured).toHaveLength(1);
+	});
+
+	it("(d) 没有 Slidedat.ini → 行回 need_folder 并带原因；重新选择可用", async () => {
+		const h = mkOrch();
+		const e = needEntry(h);
+		await flush();
+		h.orch.resolveCompanionFolder(e.id, folderRows("empty_dir", { slidedat: false }), "empty_dir");
+		expect(e.state).toBe("need_folder");
+		expect(e.companionError?.folder).toBe("empty_dir");
+		// 重新选择（成功的同名文件夹）照常收口
+		const done = h.orch.resolveCompanionFolder(e.id, folderRows("病例A"), "病例A");
+		expect(done && done.state).toBe("convert_queued");
+	});
+
+	it("遍历失败 / 成员超上限：行回 need_folder 并保持可重选（零复制）", async () => {
+		const h = mkOrch({ engine: { MRXS_MAX_MEMBERS: 3 } });
+		const e = needEntry(h);
+		await flush();
+		h.orch.resolveCompanionFolder(e.id, [], "x", { traversalError: true });
+		expect(e.state).toBe("need_folder");
+		expect(e.companionError?.read).toBe(true);
+		const tooMany = [
+			{ name: "Slidedat.ini", relPath: "病例A/Slidedat.ini", file: fakeFile("s", new Uint8Array(2)) },
+		];
+		for (let i = 0; i < 5; i++) {
+			tooMany.push({ name: `Data${i}.dat`, relPath: `病例A/Data${i}.dat`,
+				file: fakeFile(`d${i}`, new Uint8Array(1)) });
+		}
+		h.orch.resolveCompanionFolder(e.id, tooMany, "病例A");
+		expect(e.state).toBe("need_folder");
+		expect(e.companionError?.code).toBe("too_many_members");
+		expect(h.runner.calls.filter((c) => c[0] === "prepareBundle")).toHaveLength(0);
+	});
+
+	it("协助态的「取消」移除该行（没有任何本地产物）；按钮全集与点名文案", async () => {
+		const h = mkOrch();
+		const e = needEntry(h);
+		await flush();
+		h.orch.act(e.id, "cancel");
+		await flush();
+		expect(h.removed()).toBe(1);
+		expect(e.cancelled).toBe(true);
+	});
+
+	// 复核 r2 #1：父文件夹里其他切片的 Slidedat.ini 排在前面——绝不能拿
+	// 遍历顺序的第一个，把目标切片误判成 reject
+	it("其他切片的 Slidedat.ini 排在前面：仍装配目标子树（其他切片的成员一概不进）", async () => {
+		const captured: Array<unknown[]> = [];
+		const h = mkOrch({ runner: {
+			prepareBundle: (rows: unknown[]) => {
+				captured.push(rows);
+				return Promise.resolve({ jobId: "jobB",
+					probe: { document: { modality: "brightfield" } },
+					identity: { size: 10 } });
+			},
+		} });
+		const e = needEntry(h, "病例A.mrxs");
+		await flush();
+		const rows = [
+			{ name: "Slidedat.ini", relPath: "Slides/病例B/Slidedat.ini",
+			  file: fakeFile("sb", new Uint8Array(3)) },
+			...folderRows("病例A"),
+		];
+		h.orch.resolveCompanionFolder(e.id, rows, "Slides");
+		expect(e.state).toBe("convert_queued");
+		await flush(30);
+		const merged = captured[0] as unknown as Array<{ relPath: string }>;
+		expect(merged.map((r) => r.relPath)).toEqual([
+			"病例A.mrxs", "病例A/Slidedat.ini", "病例A/Index.dat", "病例A/Data0000.dat",
+		]);
+	});
+
+	// 复核 r2 #2：成员上限只数**合并子树**——webkitdirectory 回退会把整个
+	// picked 文件夹的行都传进来，其他切片的文件在装配前就被排除、不占上限
+	it("成员上限只数合并子树：其他切片的大量文件不占上限", async () => {
+		const captured: Array<unknown[]> = [];
+		const h = mkOrch({
+			engine: { MRXS_MAX_MEMBERS: 3 },
+			runner: {
+				prepareBundle: (rows: unknown[]) => {
+					captured.push(rows);
+					return Promise.resolve({ jobId: "jobB",
+						probe: { document: { modality: "brightfield" } },
+						identity: { size: 10 } });
+				},
+			},
+		});
+		const e = needEntry(h, "病例A.mrxs");
+		await flush();
+		const rows: Array<{ name: string; relPath: string; file: unknown }> = [];
+		for (let i = 0; i < 20; i++) {
+			rows.push({ name: `big${i}.dat`, relPath: `Slides/病例B/big${i}.dat`,
+				file: fakeFile(`b${i}`, new Uint8Array(1)) });
+		}
+		rows.push({ name: "Slidedat.ini", relPath: "Slides/病例A/Slidedat.ini",
+			file: fakeFile("s", new Uint8Array(2)) });
+		rows.push({ name: "Index.dat", relPath: "Slides/病例A/Index.dat",
+			file: fakeFile("i", new Uint8Array(1)) });
+		h.orch.resolveCompanionFolder(e.id, rows, "Slides");
+		// 入口 + 2 个子树成员 = 3（恰在上限内）；病例B 的 20 个文件被排除
+		expect(e.state).toBe("convert_queued");
+		await flush(30);
+		expect(captured).toHaveLength(1);
+	});
+
+	// 复核 r2 #4：装配后 planner 仍报缺成员 → 行内回到可重选状态（主按钮
+	// = 带切片名的「选择文件夹」），重选后无需重选 .mrxs 即恢复
+	it("装配后缺成员：行内重试状态 + 重选文件夹后原地恢复", async () => {
+		const captured: Array<unknown[]> = [];
+		let rejectFirst = true;
+		const h = mkOrch({ runner: {
+			prepareBundle: (rows: unknown[]) => {
+				if (rejectFirst) {
+					rejectFirst = false;
+					return Promise.reject({ error: {
+						code: "unsupported_input",
+						kind: "mrxs-bundle",
+						missing: ["病例A/Index.dat"],
+					} });
+				}
+				captured.push(rows);
+				return Promise.resolve({ jobId: "jobB",
+					probe: { document: { modality: "brightfield" } },
+					identity: { size: 10 } });
+			},
+		} });
+		const e = needEntry(h, "病例A.mrxs");
+		await flush();
+		h.orch.resolveCompanionFolder(e.id, folderRows("病例A"), "病例A");
+		await flush(20);
+		// planner 失败：行保持 convert_failed，但协助上下文在——行内重试可用
+		expect(e.state).toBe("convert_failed");
+		expect(e.companionRetry).toBe(true);
+		expect(e.companion?.stem).toBe("病例A");
+		expect(e.error?.code).toBe("unsupported_input");
+		// 复核 r3 B：缺成员清单随身携带（行内说明点名缺什么）
+		expect(e.companionMissing).toEqual(["病例A/Index.dat"]);
+		// 复核 r4：toast 用专用短提示（泛化的「不支持本机转换」与行注矛盾）
+		expect(h.toasts.some((t) =>
+			t.startsWith("upload.inline.needFolder.toast|stem=病例A"))).toBe(true);
+		expect(h.toasts.some((t) => t.startsWith("upload.fail|"))).toBe(false);
+		// 重选（同一文件夹或补全后的文件夹）→ 原地恢复整包转换
+		const done = h.orch.resolveCompanionFolder(e.id, folderRows("病例A"), "病例A");
+		expect(done && done.state).toBe("convert_queued");
+		expect(e.companionRetry).toBe(false);
+		expect(e.companionMissing).toBeNull();
+		await flush(30);
+		expect(captured).toHaveLength(1);
 	});
 });
 
@@ -1930,6 +2210,18 @@ describe("上传行按钮（§6.3 是按钮全集的唯一权威）", () => {
 			error: { code: "need_bundle" } })).toEqual(["chooseFolder"]);
 		expect(kinds("convert_failed", { error: { code: "need_bundle" } }))
 			.toEqual(["chooseFolder", "discard"]);
+		// MRXS 协助行：带切片名的「选择文件夹」+ 重新选择文件 + 取消；
+		// 确认态只有「使用此文件夹 / 重新选择」
+		expect(up.inlineButtonKinds({ state: "need_folder", jobId: null,
+			companion: { stem: "病例A" } })).toEqual(["chooseFolder", "reselect", "cancel"]);
+		expect(up.inlineButtonKinds({ state: "companion_confirm", jobId: null,
+			companion: { stem: "病例A", folder: "wrong" } }))
+			.toEqual(["companionUse", "companionReselect"]);
+		expect(up.inlineButtonLabel("chooseFolder",
+			{ companion: { stem: "病例A" } })).toContain("病例A");
+		expect(up.inlineButtonLabel("companionUse", {})).toBeTruthy();
+		// 旧 need_bundle 行（无 companion）保持通用「选择文件夹」文案
+		expect(up.inlineButtonLabel("chooseFolder", {})).toBeTruthy();
 		// 拒绝：申请支持
 		expect(kinds("rejected")).toEqual(expect.arrayContaining(["support"]));
 		// 进行中：取消
@@ -1942,12 +2234,41 @@ describe("上传行按钮（§6.3 是按钮全集的唯一权威）", () => {
 			.toEqual(["continue"]);
 		expect(up.inlineButtonKinds({ state: "upload_queued", viaRestore: true, jobId: "j" }))
 			.toEqual(["continueUpload"]);
+
 		// 已发布的删除按钮文案要说明「平台上的不受影响」（本 harness 未加载
 		// i18n.js → tt 回落 app.js _EXTRA_I18N 的真实中文文案）
 		expect(String(up.inlineButtonLabel("discard", { uploadState: "published" })))
 			.toContain("不受影响");
 		expect(String(up.inlineButtonLabel("discard", { uploadState: "uploading" })))
 			.not.toContain("不受影响");
+	});
+
+	it("缺成员清单的行内展示：≤5 全列、>5 截断为前 5 + 「等 N 个」（复核 r3 B）", () => {
+		const h = loadApp(inlineCaps(true));
+		const up = h.w.HP_UPLOAD as unknown as {
+			missingListText(missing: unknown): string;
+			inlineButtonLabel(kind: string, e: unknown): string;
+		};
+		// ≤5：全部列出（loadApp 的 i18n 替身 getLang=zh → 「、」分隔）
+		expect(up.missingListText(["a/Index.dat", "b/Index.dat", "c/Index.dat"]))
+			.toBe("a/Index.dat、b/Index.dat、c/Index.dat");
+		// >5：只列前 5 个，其余进「等 N 个」占位（替身 tt 渲染为 key:vars）
+		const many = ["1", "2", "3", "4", "5", "6", "7", "8"].map(
+			(n) => `synthetic/${n}.dat`);
+		const long = up.missingListText(many);
+		expect(long).toContain("synthetic/1.dat");
+		expect(long).toContain("synthetic/5.dat");
+		expect(long).toContain("upload.inline.needFolder.missingMore");
+		expect(long).toContain(",8");
+		expect(long).not.toContain("synthetic/6.dat");
+		// 空清单 / 非数组 → 空串（回落到无清单版说明）
+		expect(up.missingListText([])).toBe("");
+		expect(up.missingListText(null)).toBe("");
+		expect(up.missingListText(["", false, undefined, "only.dat"])).toBe("only.dat");
+		// 复核 r3 C：确认态的「重新选择」回的是文件夹（专用文案键；harness 的
+		// tt 无形参时回落 app.js 兜底表的真实中文文案）
+		expect(up.inlineButtonLabel("companionReselect", {})).toBe("重新选择文件夹");
+		expect(up.inlineButtonLabel("reselect", {})).toBe("重新选择文件");
 	});
 
 	it("done 只给一个「删除本地产物」（终态集已含 done，不得再单列）", () => {
@@ -1984,7 +2305,11 @@ describe("上传行按钮（§6.3 是按钮全集的唯一权威）", () => {
 		expect(initStart).toBeGreaterThan(0);
 		const initBody = appSrc.slice(
 			initStart, appSrc.indexOf("function openSlideFromLocation"));
-		expect(initBody).toContain("if (inlineEnabled()) ensureInlineOrch();");
+		// 复核 r2 #2：移交标记无法兑现（面板内上传关闭）→ 显式失败提示，
+		// 绝不静默忽略
+		expect(initBody).toContain("if (inlineEnabled()) {");
+		expect(initBody).toContain('tt("upload.saveproj.reason.capabilityOff")');
+		expect(initBody).toContain('u.searchParams.delete("save-job")');
 		// restore() 仍只由 ensureInlineOrch() 触发（不在别处偷偷启动转换）
 		expect(appSrc.split("inlineOrch.restore()").length - 1).toBe(1);
 	});

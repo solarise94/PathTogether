@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page="support-pay">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>正在跳转到支付宝 · HistoPilot</title>
+  <meta name="robots" content="noindex, nofollow" />
+  <link rel="describedby" href="/llms.txt" type="text/markdown" />
+  {# 页面级 CSP（_apply_support_page_security_headers）：script-src/style-src
+     'self'；form-action 只放开当前模式支付宝网关精确 origin——本页唯一的
+     跨站表单提交目标。本模板不得出现内联 <style> / style 属性 / 内联
+     <script>；SDK 表单已在服务端收敛（去内联脚本，外链 JS 自动提交）。 #}
+  <link rel="stylesheet" href="/static/support/support.css?v=20261021i" />
+  <link rel="stylesheet" href="/static/support/support_pay.css?v=20261021e" />
+  <script defer src="/static/i18n.js?v=20261021i"></script>
+  <script defer src="/static/support/support_pay.js?v=20261021g"></script>
+</head>
+<body id="top">
+  <a class="skip-link" href="#main" data-i18n="support.skip">跳到主要内容</a>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="/">
+        {% include "_brand_logo.html" %}
+        <span class="brand-name">HistoPilot</span>
+        <span class="brand-sep" aria-hidden="true"></span>
+        <span class="brand-page" data-i18n="support.nav.page">支持项目</span>
+      </a>
+      <nav class="topbar-nav" aria-label="页面导航" data-i18n-aria="support.nav.aria">
+        <a class="topbar-link" href="/support" data-i18n="supportpay.back">返回支持页</a>
+        <button type="button" class="lang-toggle" data-i18n-aria="lang.toggle.aria" aria-label="切换为英文">EN</button>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    {% if pay_state == 'neutral' %}
+    {# 会话绑定中性态：未知/他方订单同一响应，不渲染任何订单上下文 #}
+    <section class="card pay-card" aria-labelledby="pay-neutral-title">
+      <h1 id="pay-neutral-title" data-i18n="supportpay.neutral.title">没有找到对应的订单</h1>
+      <p data-i18n="supportpay.neutral.body">这里只处理本会话刚发起的支持订单。请从支持页重新发起，或回到付款前的支付宝页面继续。</p>
+      <p><a class="btn btn-secondary" href="/support" data-i18n="supportpay.back">返回支持页</a></p>
+    </section>
+    {% elif pay_state == 'closed' %}
+    <section class="card pay-card" aria-labelledby="pay-closed-title">
+      <h1 id="pay-closed-title" data-i18n="supportpay.closed.title">订单已关闭</h1>
+      <p data-i18n="supportpay.closed.body">这个支持订单已关闭，没有产生付款。如果还想支持项目，可以回到支持页重新发起。</p>
+      <dl class="pay-meta">
+        <div><dt data-i18n="supportpay.order.label">订单号</dt><dd>{{ order.out_trade_no }}</dd></div>
+      </dl>
+      <p><a class="btn btn-secondary" href="/support" data-i18n="supportpay.back">返回支持页</a></p>
+    </section>
+    {% else %}
+    <section class="card pay-card" aria-labelledby="pay-title" data-pay-autosubmit>
+      <h1 id="pay-title" data-i18n="supportpay.title">正在跳转到支付宝…</h1>
+      <p data-i18n="supportpay.lead">如果没有自动跳转，请点击下面的按钮继续；付款由支付宝处理，本站不接触你的支付密码。</p>
+      <dl class="pay-meta">
+        <div><dt data-i18n="supportpay.amount.label">支持金额</dt><dd class="pay-amount">¥{{ amount_yuan }}</dd></div>
+        <div><dt data-i18n="supportpay.subject.label">项目</dt><dd>{{ order.subject }}</dd></div>
+        <div><dt data-i18n="supportpay.order.label">订单号</dt><dd class="pay-ref">{{ order.out_trade_no }}</dd></div>
+      </dl>
+      {# SDK page_execute 返回的支付表单：服务端已去掉内联脚本/内联样式并加
+         class="pay-form"；自动提交由 /static/support/support_pay.js 完成。
+         无 JS 时按钮可见可点（手动提交同一表单）。表单 action 只会是
+         CSP form-action 白名单内的支付宝网关。 #}
+      <div class="pay-form-host">{{ form_html | safe }}</div>
+      {# R2 B3：从支付宝返回（bfcache/back_forward）时不再自动重提交——
+         显示「查看结果 / 继续付款」。默认 hidden（无 JS 不出现）。 #}
+      <div class="pay-resume" id="pay-resume" hidden>
+        <p><a class="btn btn-primary" href="/support/return?out_trade_no={{ order.out_trade_no }}" rel="nofollow" data-i18n="supportpay.resume.check">我已完成付款，查看结果</a></p>
+        <p><button type="button" class="btn btn-secondary" id="pay-resume-continue" data-i18n="supportpay.resume.continue">继续去支付宝付款</button></p>
+      </div>
+      <noscript><p class="note" data-i18n="supportpay.noscript">浏览器未启用 JavaScript：请点击「立即支付」继续。</p></noscript>
+      <p class="note" data-i18n="supportpay.note">15 分钟内未完成支付，订单会自动关闭；付款结果以支付宝记录与本站核实为准。</p>
+    </section>
+    {% endif %}
+  </main>
+
+  <footer class="footer">
+    <p class="footer-note" data-i18n="support.footer">支持完全自愿；本地转换与保存始终免费。</p>
+  </footer>
+</body>
+</html>

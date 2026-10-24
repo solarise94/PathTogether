@@ -147,6 +147,7 @@ PAGE_ALLOWLIST = {
     "/register": "register",
     "/login": "login",
     "/tools/slides": "slide_converter",
+    "/support": "support",
     "/guide": "guide",
     "/guide/conversion": "conversion_guide",
     "/guide/collaboration": "collaboration_guide",

@@ -42,9 +42,15 @@ const PG_MARKER =
  *     需要带着基建跑别的 spec 时，显式点名本 spec 或临时清掉该变量。
  */
 const INLINE_SPEC = "upload-inline-convert";
+/** MRXS 同名文件夹协助（mrxs-companion）与「保存到我的项目」（save-to-project）
+ *  的主站用例转换后也走真上传，同样需要假 COS 基建；按同一「显式点名才装配」
+ *  规则加入选择集。 */
+const INLINE_SPEC_EXTRA = ["mrxs-companion", "save-to-project"];
 /** 只看测试选择参数（argv[2..]），跳过 node 与 playwright CLI 自身的路径。 */
 function selectsInlineSpec(argv: string[]): boolean {
-	return argv.slice(2).some((a) => a.includes(INLINE_SPEC));
+	return argv.slice(2).some(
+		(a) => a.includes(INLINE_SPEC) ||
+			INLINE_SPEC_EXTRA.some((s) => a.includes(s)));
 }
 const RUNS_INLINE_SPEC = selectsInlineSpec(process.argv);
 const INLINE_OFF = ["0", "false", "no"];

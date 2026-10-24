@@ -75,6 +75,36 @@ import * as E from './engine.js';
 
 const LOCK_HEAVY = 'slide-transform:heavy';
 
+// This runner drives ONE compute worker with ONE synchronous wasm call at a
+// time. A second start/resume in the same tab while the first is in flight
+// would overwrite this.jobId/_doneResolve and interleave two jobs in one
+// worker (audit testN) — it is refused with a typed code instead.
+// (job_locked_other_tab would claim another tab is busy; it is not.)
+export const JOB_BUSY_THIS_TAB = 'job_busy_this_tab';
+// The job record says ready/exported but the OPFS output is gone (browser
+// eviction / manual deletion): the page can tell the user to discard and
+// re-convert instead of surfacing a raw DOMException.
+export const ARTIFACT_MISSING = 'artifact_missing';
+
+/// Failure codes whose typed message promises that the job can continue
+/// (`quota_exceeded_recoverable`: free space and resume; `io_recoverable`:
+/// retry/resume). A failed record with one of these, a staged source and a
+/// journaled generation is offered `nextAction: 'resume'` — resumeJob still
+/// re-verifies the record, source hash and journal before continuing.
+const RESUMABLE_FAILURE_CODES = new Set([
+  E.ERROR_CODES.QUOTA_EXCEEDED,
+  E.ERROR_CODES.IO_RECOVERABLE,
+]);
+
+function cancelledDone(jobId = null) {
+  return { jobId, ok: false, phase: 'cancelled', cancelled: true, type: 'cancelled' };
+}
+
+function artifactMissing(jobId, e) {
+  return E.stError(ARTIFACT_MISSING,
+    `浏览器已清理该结果，请删除任务并重新转换（${E.errText(e)}）`, { jobId });
+}
+
 /// Settings a resumed run must match (see _startOrResume refusals).
 function savedSettings(rec) {
   return {
@@ -136,6 +166,16 @@ export class SlideToolsRunner {
     this._cbs = { state: [], progress: [], fault: [], phase: [], done: [], workerExit: [] };
     this._lock = null;
     this._cancelled = false;
+    // {jobId} of the start/resume this runner is currently driving (set for
+    // the whole async setup too, so a second start is refused early). null
+    // when idle. Kept separate from this.jobId, which probes also set.
+    this._activeStart = null;
+    // set by cancelJob; read by the start/resume failure path to turn a
+    // setup error caused by cancel's directory removal into `cancelled`
+    this._cancelRequested = false;
+    // workers whose loss was already settled ('error' can be followed by
+    // 'messageerror'; the second event must not emit a second workerExit)
+    this._deadWorkers = new WeakSet();
     this.testMode = !!opts.testMode;
   }
 
@@ -169,12 +209,11 @@ export class SlideToolsRunner {
         }
       });
       w.addEventListener('error', (e) => {
-        this._rejectPending(`worker error: ${e.message}`);
-        this._emit('workerExit', { reason: 'error', message: e.message });
-        this.worker = null;
-        this.workerReady = null;
+        this._onWorkerFailure(w, 'error', e && e.message).catch(() => { /* settled */ });
       });
-      w.addEventListener('messageerror', () => this._emit('workerExit', { reason: 'messageerror' }));
+      w.addEventListener('messageerror', () => {
+        this._onWorkerFailure(w, 'messageerror', 'messageerror').catch(() => { /* settled */ });
+      });
     });
     w.addEventListener('message', (ev) => this._onWorkerMessage(ev.data));
     w.postMessage({ type: 'init', testMode: this.testMode });
@@ -238,6 +277,68 @@ export class SlideToolsRunner {
       return;
     }
     if (m.type === 'log') { /* verbose; harness may observe */ }
+  }
+
+  // -------------------------------------------------------- worker loss --
+
+  /// A late event from a worker we already replaced (or already settled)
+  /// must not tear down the worker that replaced it.
+  _onWorkerFailure(w, kind, message) {
+    if (w && this._deadWorkers.has(w)) return Promise.resolve();
+    if (this.worker && this.worker !== w) return Promise.resolve();
+    if (w) this._deadWorkers.add(w);
+    return this._settleWorkerLoss(kind, message, w);
+  }
+
+  /// One endpoint for every way the compute worker can be lost while a job
+  /// exists: an 'error' event (wasm abort / OOM / browser kill),
+  /// 'messageerror', or the test hook's terminate. A dead worker never
+  /// answers a request and never posts `done`; before this path existed the
+  /// active-job guard stayed set and refused every later start until reload.
+  /// The job's `done` resolves with the crashed shape consumers already know
+  /// (`{ok:false, phase:'worker-exit', crashed:true}`) plus a typed
+  /// `io_recoverable` error so the page can say what happened. The record is
+  /// marked failed ONLY when the worker had journalled a generation (the
+  /// crash is then resumable and the job list offers 继续转换); before the gen
+  /// the record is left planned so it can start again from the staged copy.
+  async _settleWorkerLoss(kind, message, w) {
+    const wasRunning = !!this._doneResolve;
+    const jobId = this._activeJobId() || (wasRunning ? this.jobId : null);
+    const text = String(message || kind).slice(0, 300);
+    this._rejectPending(`worker ${kind}: ${text}`, E.ERROR_CODES.IO_RECOVERABLE);
+    if (w) { try { w.terminate(); } catch { /* already dead */ } }
+    if (!w || this.worker === w) {
+      this.worker = null;
+      this.workerReady = null;
+    }
+    const resolve = this._doneResolve;
+    this._doneResolve = null;
+    this._clearActiveStart();
+    const err = E.stError(E.ERROR_CODES.IO_RECOVERABLE,
+      `转换进程意外退出（${text}）：可重新开始，或从任务列表「继续转换」`,
+      { kind: 'worker-exit', reason: kind });
+    const crashed = { jobId, ok: false, phase: 'worker-exit', crashed: true, error: err.error };
+    if (wasRunning && jobId) await this._markCrashedJob(jobId, err.error);
+    this._releaseHeavyLock();
+    this._emit('workerExit', { reason: kind, message: message || null });
+    if (wasRunning) {
+      this._emit('done', crashed);
+      if (resolve) resolve(crashed);
+    }
+  }
+
+  /// Best-effort failed record for a crash that happened after the worker
+  /// journalled a generation: `resumeJob` re-verifies source/journal and
+  /// continues from the last commit, and `_summary` then offers 'resume'.
+  /// No gen (crash during setup) or no readable journal: leave the record as
+  /// it was — a `planned` record keeps 'start' from the staged copy.
+  async _markCrashedJob(jobId, error) {
+    try {
+      const j = await this._readJournal(jobId);
+      if (!j.state.gen) return;
+    } catch { return; }
+    await this._updateJobRecord(jobId, { state: 'failed', error })
+      .catch(() => { /* best effort */ });
   }
 
   // ---------------------------------------------------------- OPFS I/O --
@@ -398,6 +499,31 @@ export class SlideToolsRunner {
     this._lock = null;
   }
 
+  // -------------------------------------------------- active-job guard --
+
+  /// The id of the job this runner is converting (null when idle). During a
+  /// fresh probe start the id is generated and recorded on the token before
+  /// staging, so a discard of this job can still recognise it as active.
+  _activeJobId() {
+    return this._activeStart ? this._activeStart.jobId || null : null;
+  }
+
+  _busyError() {
+    const id = this._activeJobId();
+    return E.stError(JOB_BUSY_THIS_TAB,
+      `本标签页已有转换任务${id ? `（${id}）` : ''}正在运行；请等待完成或先取消，` +
+      '同一标签页不能同时开始第二个转换',
+      { activeJobId: id });
+  }
+
+  _assertNotBusy() {
+    if (this._activeStart) throw this._busyError();
+  }
+
+  _clearActiveStart() {
+    this._activeStart = null;
+  }
+
   // ------------------------------------------------------------- states --
 
   _setState(to, extra = {}) {
@@ -416,6 +542,10 @@ export class SlideToolsRunner {
   /// Stage + probe (the plan's 选择输入 → 探测 step). Leaves a `prepared` job
   /// that startJob({jobId}) converts, or discardJob() removes.
   async probe(file, opts = {}) {
+    // A probe of a NEW input while this tab converts would overwrite
+    // this.jobId (the running job's record/done would land on the new job)
+    // and interleave worker state — same invariant as start/resume.
+    this._assertNotBusy();
     if (!(await this._acquireHeavyLock())) {
       throw E.stError(E.ERROR_CODES.JOB_LOCKED, '另一个标签页正在执行重转换任务（Web Lock）');
     }
@@ -442,6 +572,9 @@ export class SlideToolsRunner {
   /// probe()'s {name, size, sha256} (the entry name, bundle bytes and the
   /// manifest root digest) so the page's summary uses one shape.
   async prepareBundle(files, opts = {}) {
+    // same one-job-per-runner invariant as probe/start: preparing a bundle
+    // during a conversion would overwrite this.jobId and the bundle cache
+    this._assertNotBusy();
     if (!(await this._acquireHeavyLock())) {
       throw E.stError(E.ERROR_CODES.JOB_LOCKED, '另一个标签页正在执行重转换任务（Web Lock）');
     }
@@ -490,7 +623,7 @@ export class SlideToolsRunner {
           encodingProfile = checkedEncoding(
             opts.encodingProfile || E.defaultEncodingProfile(), doc.modality);
         } catch (e) {
-          await this._discardNow(jobId).catch(() => { /* */ });
+          await this._discardNow(jobId, { cleanupOnly: true }).catch(() => { /* */ });
           throw e;
         }
         this._diskGate(E.checkDiskBudget(estimate,
@@ -501,7 +634,7 @@ export class SlideToolsRunner {
           outputProfile = checkedOutputProfile(
             opts.outputProfile || E.defaultOutputProfile(doc.modality), doc.modality);
         } catch (e) {
-          await this._discardNow(jobId).catch(() => { /* */ });
+          await this._discardNow(jobId, { cleanupOnly: true }).catch(() => { /* */ });
           throw e;
         }
         await this._writeJobRecord(jobId, {
@@ -531,7 +664,7 @@ export class SlideToolsRunner {
           updatedAt: E.nowIso(),
         });
       } catch (e) {
-        await this._discardNow(jobId).catch(() => { /* pending-cleanup recorded */ });
+        await this._discardNow(jobId, { cleanupOnly: true }).catch(() => { /* pending-cleanup recorded */ });
         throw e;
       }
       this._setState('planned', { probe: probeResult });
@@ -671,7 +804,19 @@ export class SlideToolsRunner {
       });
   }
 
-  async _discardNow(jobId) {
+  async _discardNow(jobId, opts = {}) {
+    // Discarding the job this tab is converting: the wasm core runs
+    // synchronously, so a queued release-source request would only be served
+    // after the conversion yields (minutes). Terminate the worker first —
+    // cancelJob does exactly that (and removes the job dir itself), releasing
+    // every sync handle with the worker.
+    // opts.cleanupOnly is used by the prepare failure paths: there the worker
+    // is idle (or the same start's setup is failing) — cancelling would turn
+    // the real typed error into `cancelled`.
+    if (!opts.cleanupOnly && this._activeStart && this._activeJobId() === jobId) {
+      await this.cancelJob();
+      return;
+    }
     await this._request('release-source', {});
     // bundle jobs: close the staged members' sync handles too — OPFS refuses
     // to remove entries whose access handles are still open (probe-bundle
@@ -749,14 +894,14 @@ export class SlideToolsRunner {
         encodingProfile = checkedEncoding(
           opts.encodingProfile || E.defaultEncodingProfile(), doc0.modality);
       } catch (e) {
-        await this._discardNow(jobId).catch(() => { /* pending-cleanup recorded */ });
+        await this._discardNow(jobId, { cleanupOnly: true }).catch(() => { /* pending-cleanup recorded */ });
         throw e;
       }
       this._diskGate(E.checkDiskBudget(estimate,
         await navigator.storage.estimate(), { encoding: encodingProfile }), opts, 'post-probe');
       preparedEncoding = encodingProfile;
     } catch (e) {
-      await this._discardNow(jobId).catch(() => { /* pending-cleanup recorded */ });
+      await this._discardNow(jobId, { cleanupOnly: true }).catch(() => { /* pending-cleanup recorded */ });
       throw e;
     }
     const doc = probeResult.document;
@@ -765,7 +910,7 @@ export class SlideToolsRunner {
       outputProfile = checkedOutputProfile(
         opts.outputProfile || E.defaultOutputProfile(doc.modality), doc.modality);
     } catch (e) {
-      await this._discardNow(jobId).catch(() => { /* pending-cleanup recorded */ });
+      await this._discardNow(jobId, { cleanupOnly: true }).catch(() => { /* pending-cleanup recorded */ });
       throw e;
     }
     await this._writeJobRecord(jobId, {
@@ -792,6 +937,10 @@ export class SlideToolsRunner {
   // ----------------------------------------------------------- job start --
 
   async startJob(file, opts = {}) {
+    // Refuse before touching the lock: the running job owns the heavy lock
+    // and this call must not release it.
+    this._assertNotBusy();
+    this._cancelRequested = false;
     if (!(await this._acquireHeavyLock())) {
       throw E.stError(E.ERROR_CODES.JOB_LOCKED,
         '另一个标签页正在执行重转换任务（Web Lock）');
@@ -799,12 +948,13 @@ export class SlideToolsRunner {
     try {
       return await this._startOrResume(file, opts, null);
     } catch (e) {
-      this._releaseHeavyLock();
-      throw e;
+      return this._rethrowOrCancelled(e, opts.jobId || this.jobId || null);
     }
   }
 
   async resumeJob(jobId, _file = null, opts = {}) {
+    this._assertNotBusy();
+    this._cancelRequested = false;
     if (!(await this._acquireHeavyLock())) {
       throw E.stError(E.ERROR_CODES.JOB_LOCKED,
         '另一个标签页正在执行重转换任务（Web Lock）');
@@ -819,12 +969,39 @@ export class SlideToolsRunner {
         Object.entries(opts).filter(([, v]) => v !== undefined));
       return await this._startOrResume(null, { ...saved, ...explicit }, jobId);
     } catch (e) {
-      this._releaseHeavyLock();
+      return this._rethrowOrCancelled(e, jobId);
+    }
+  }
+
+  /// Failure path shared by startJob/resumeJob. A `job_busy_this_tab`
+  /// rejection never acquired anything — the running job keeps the lock and
+  /// the cancellation flags. Otherwise release the lock; if the user
+  /// cancelled while the setup was awaiting OPFS, report a cancelled done
+  /// (cancelJob removed the job dir under us — job_dir_missing would be a
+  /// failure for what the user explicitly asked for).
+  _rethrowOrCancelled(e, jobId) {
+    if (E.errCode(e) === JOB_BUSY_THIS_TAB) throw e;
+    this._releaseHeavyLock();
+    if (this._cancelRequested) {
+      this._cancelRequested = false;
+      return { jobId, done: Promise.resolve(cancelledDone(jobId)) };
+    }
+    throw e;
+  }
+
+  async _startOrResume(file, opts, resumeJobId) {
+    this._assertNotBusy();
+    const token = { jobId: resumeJobId || opts.jobId || null };
+    this._activeStart = token;
+    try {
+      return await this._startOrResumeInner(file, opts, resumeJobId, token);
+    } catch (e) {
+      if (this._activeStart === token) this._clearActiveStart();
       throw e;
     }
   }
 
-  async _startOrResume(file, opts, resumeJobId) {
+  async _startOrResumeInner(file, opts, resumeJobId, token) {
     this._state = 'selected'; // a new job lifecycle begins
     this._cancelled = false;
     const profile = E.getProfile(opts.profileId ||
@@ -865,12 +1042,17 @@ export class SlideToolsRunner {
         reusable = true;
       } else {
         if (!file) throw E.stError(E.ERROR_CODES.IO_RECOVERABLE, '缺少输入文件');
-        await this._prepare(file, { ...opts, jobId: jobId || undefined });
+        // choose the id before staging so the active job is named for the
+        // whole preparation (a discard/cancel during it can find the dir)
+        jobId = jobId || E.newJobId();
+        token.jobId = jobId;
+        await this._prepare(file, { ...opts, jobId });
         jobId = this.jobId;
         record = await this._readJobRecord(jobId);
       }
     }
     this.jobId = jobId;
+    token.jobId = jobId; // the active-job guard now names the real job
     if (!resumeJobId) {
       opts = {
         ...opts,
@@ -1116,6 +1298,7 @@ export class SlideToolsRunner {
     const resolve = this._doneResolve;
     this._doneResolve = null;
     const finish = () => {
+      this._clearActiveStart();
       this._emit('done', m);
       this._releaseHeavyLock();
       if (resolve) resolve(m);
@@ -1144,6 +1327,7 @@ export class SlideToolsRunner {
   }
 
   _onCancelled(m) {
+    this._clearActiveStart();
     if (this._doneResolve) {
       const r = this._doneResolve;
       this._doneResolve = null;
@@ -1178,9 +1362,15 @@ export class SlideToolsRunner {
   /// deletes this job's OPFS dir (pending-cleanup record if that fails).
   async cancelJob(feedbackTs = Date.now()) {
     this._cancelled = true;
+    this._cancelRequested = true;
     this._setState('cancelled', { requestedAt: feedbackTs, immediate: true });
-    // resolve/abort any in-flight job promise and release the lock
-    const crashed = { ok: false, phase: 'cancelled', cancelled: true };
+    // resolve/abort any in-flight job promise and release the lock; the
+    // resolved shape carries BOTH the legacy `cancelled: true` and the
+    // `type: 'cancelled'` marker the converter page checks (without it a
+    // user cancel was rendered as a failure — audit testG)
+    const jobId = this._activeJobId() || this.jobId;
+    this._clearActiveStart();
+    const crashed = cancelledDone(jobId);
     if (this._doneResolve) {
       const r = this._doneResolve;
       this._doneResolve = null;
@@ -1196,7 +1386,6 @@ export class SlideToolsRunner {
       this._rejectPending('cancelled', E.ERROR_CODES.CANCELLED);
       this._emit('workerExit', { reason: 'cancelled' });
     }
-    const jobId = this.jobId;
     if (!jobId) return { cancelled: true, cleanup: 'no-job' };
     try {
       if (this.testMode && this._faults && this._faults.failCleanup) {
@@ -1217,22 +1406,7 @@ export class SlideToolsRunner {
   /// pending job promise and releases the heavy lock. The persisted job
   /// record keeps its last durable state (resume decides from the journal).
   async terminateWorkerForTest() {
-    const crashed = { ok: false, phase: 'worker-exit', crashed: true };
-    if (this._doneResolve) {
-      const r = this._doneResolve;
-      this._doneResolve = null;
-      r(crashed);
-    }
-    this._emit('done', crashed);
-    this._releaseHeavyLock();
-    if (this.worker) {
-      const w = this.worker;
-      this.worker = null;
-      this.workerReady = null;
-      w.terminate();
-      this._rejectPending('worker terminated');
-      this._emit('workerExit', { reason: 'terminated' });
-    }
+    await this._onWorkerFailure(this.worker, 'terminated', 'worker terminated (test)');
   }
 
   // -------------------------------------------------------------- export --
@@ -1241,14 +1415,28 @@ export class SlideToolsRunner {
   /// showSaveFilePicker in the product, or an OPFS test target). One reused
   /// bounded buffer; a failed export NEVER deletes the OPFS artifact.
   async exportJob(jobId, getWritable) {
-    const record = await this._readJobRecord(jobId);
+    let record;
+    try {
+      record = await this._readJobRecord(jobId);
+    } catch (e) {
+      // the whole job dir is gone (evicted/removed): same typed answer as a
+      // missing artifact, never a raw DOMException
+      throw artifactMissing(jobId, e);
+    }
     if (!record || (record.state !== 'ready' && record.state !== 'exported')) {
       throw E.stError(E.ERROR_CODES.NOT_READY,
         `任务状态 ${record ? record.state : 'missing'} 不可导出（仅 ready）`);
     }
-    const dir = await this._jobDir(jobId);
-    const fh = await dir.getFileHandle(E.OUTPUT_NAME);
-    const file = await fh.getFile();
+    // opening the artifact is inside the typed boundary too: audit testK
+    // evicted output.tif and the page got a raw NotFoundError
+    let file;
+    try {
+      const dir = await this._jobDir(jobId);
+      const fh = await dir.getFileHandle(E.OUTPUT_NAME);
+      file = await fh.getFile();
+    } catch (e) {
+      throw artifactMissing(jobId, e);
+    }
     const writable = await getWritable();
     // BYOB reader refilling ONE buffer; each chunk is fully written before
     // the buffer is handed back (per-chunk arrayBuffer() allocations were
@@ -1290,13 +1478,15 @@ export class SlideToolsRunner {
   ///   intent: {state, account, target, channel, updatedAt} | null
   ///            (R1 一键转换并上传；page-managed shape),
   ///   error}
-  /// nextAction: 'start' (prepared) | 'resume' (interrupted run) |
+  /// nextAction: 'start' (prepared) | 'resume' (interrupted run, or a
+  ///   recoverable failure with staged source + journaled generation) |
   ///   'export' (ready/exported) | 'wait' (running in this tab) | 'discard'.
   async _summary(id, dirHandle, rec) {
     const active = this.jobId === id && !!this._lockRelease &&
       ['probing', 'planned', 'running', 'paused', 'finalizing', 'validating'].includes(this._state);
     let committedBytes = 0;
     let hasJournal = false;
+    let hasGen = false;
     try {
       const fh = await dirHandle.getFileHandle(E.JOURNAL_FILE);
       const f = await fh.getFile();
@@ -1305,15 +1495,21 @@ export class SlideToolsRunner {
         const { records } = E.decodeJournal(new TextDecoder().decode(
           await f.slice(0, f.size).arrayBuffer()));
         const st = E.journalState(records);
+        // a journal without a valid generation cannot be resumed (resumeJob
+        // refuses with job_dir_missing); it must not offer 'resume'
+        hasGen = !!st.gen;
         committedBytes = st.lastCommit ? st.lastCommit.st.out : 0;
       }
     } catch { /* no journal yet */ }
     const state = rec ? rec.state : 'staging';
+    const errCode = rec && rec.error && rec.error.code;
     let nextAction = 'discard';
     if (active) nextAction = 'wait';
     else if (state === 'prepared') nextAction = 'start';
     else if ((state === 'planned' || state === 'paused') && hasJournal) nextAction = 'resume';
     else if (state === 'planned' || state === 'paused') nextAction = 'start';
+    else if (state === 'failed' && hasGen && rec.identity &&
+        RESUMABLE_FAILURE_CODES.has(errCode)) nextAction = 'resume';
     else if (state === 'ready' || state === 'exported') nextAction = 'export';
     const id0 = rec && rec.identity;
     return {
@@ -1384,13 +1580,24 @@ export class SlideToolsRunner {
   /// (ready/exported only). The caller reads it strictly via slice() per
   /// part — never whole-file materialization (plan §3/§5).
   async artifactView(jobId) {
-    const record = await this._readJobRecord(jobId);
+    let record;
+    try {
+      record = await this._readJobRecord(jobId);
+    } catch (e) {
+      throw artifactMissing(jobId, e);
+    }
     if (!record || (record.state !== 'ready' && record.state !== 'exported')) {
       throw E.stError(E.ERROR_CODES.NOT_READY,
         `任务状态 ${record ? record.state : 'missing'} 无产物可读（仅 ready）`);
     }
-    const dir = await this._jobDir(jobId);
-    const fh = await dir.getFileHandle(E.OUTPUT_NAME);
-    return fh.getFile();
+    try {
+      const dir = await this._jobDir(jobId);
+      const fh = await dir.getFileHandle(E.OUTPUT_NAME);
+      return await fh.getFile();
+    } catch (e) {
+      // the workbench upload reads through this view; an evicted artifact
+      // must be typed (the upload row can then point at discard/re-convert)
+      throw artifactMissing(jobId, e);
+    }
   }
 }

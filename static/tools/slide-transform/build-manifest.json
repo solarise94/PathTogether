@@ -9,9 +9,9 @@
   "artifacts": {
     "slide_transform_bg.wasm": "314cb6b76507ab4465c2849a387dc89bda5ae4b63ad5549dbbf0e4c592876688",
     "slide_transform.js": "402643d9f9bd0407078a950ab6890986e24141f26e8f19e7d80c810554808d2f",
-    "runner.js": "638ecb423444f0fccab67e24ca10215d377cfd1c7fa94507d1145f28d998f0ca",
+    "runner.js": "13e6f26fc5753709715a619dcf0c50260dcebe1560fcbb5002bfb2b237324ab6",
     "engine.js": "ce58769f3d6b3ecebd0ccb3105d85c7b3563f802eba6838c5cf927170cc4926c",
-    "worker.js": "8e43097d6e2e23301e7c729439e777d43610d6e3532d82aebbcdfe953c6af146",
+    "worker.js": "7d5ad971d4719baa8b64d62e7a7333c05ec20cb9b58f23a8a45862dd6e1c03ed",
     "slide-transform": "7f3c6f75db55d3508083a25d37f81c6d09221e764dfd34543858b134b73a0238"
   },
   "dependencies": [

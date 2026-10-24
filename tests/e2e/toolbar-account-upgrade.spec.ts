@@ -981,6 +981,7 @@ test("连续选片：穿过浮卡覆盖区仍逐张命中，相邻卡联动且�
   const hits = page.locator('.fb-hit');
   await expect(page.locator('#sidebar')).toHaveCSS('width', '224px');
   await expect.poll(() => hits.count()).toBeGreaterThanOrEqual(5);
+  await expect(hits.nth(4)).toBeVisible();
   const boxes = await hits.evaluateAll(nodes => nodes.map(node => {
     const r = node.getBoundingClientRect();
     return { x: r.left, y: r.top, width: r.width, height: r.height, id: (node as HTMLElement).dataset.slideId! };
@@ -1081,6 +1082,9 @@ test("鼠标快速连续点选不会被待弹出的预览吞掉", async ({ page 
   await page.goto(FIXTURE_HOST + '/fixture');
   await expandSidebar(page);
   await expect(page.locator('#sidebar')).toHaveCSS('width', '224px');
+  // The sidebar can reach its final width a frame before its rows are laid
+  // out; measuring then yields zero rects and the pointer lands at (0, 22).
+  await expect(page.locator('.fb-hit').nth(3)).toBeVisible();
   const rows = await page.locator('.fb-hit').evaluateAll(ns => ns.map(n => {
     const r = n.getBoundingClientRect(); return { x: r.left + r.width * .65, y: r.top + 22 };
   }));

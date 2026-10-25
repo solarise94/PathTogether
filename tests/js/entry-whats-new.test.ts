@@ -1,6 +1,6 @@
 /**
  * 工单 G：首页「更新内容」。
- * 锁定：只渲染 published 条目、按日期新→旧、最新展开/历史折叠、中英条目、
+ * 锁定：只渲染最新 published 条目、按日期新→旧、中英条目、
  * 产品版本不是 PathTogether package 0.1.0。
  */
 import { readFileSync } from "node:fs";
@@ -52,7 +52,6 @@ describe("首页更新内容契约", () => {
     }
     expect(js).toContain("published === true");
     expect(js).toContain("localeCompare");
-    expect(js).toContain("details");
     expect(js).toContain("is-latest");
   });
 

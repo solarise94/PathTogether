@@ -1,4 +1,4 @@
-/* 首页「更新内容」：从受版本控制的 releases.json 渲染已发布条目。 */
+/* 首页「更新内容」：从受版本控制的 releases.json 渲染最新已发布条目。 */
 (function () {
   "use strict";
 
@@ -39,11 +39,10 @@
     return node;
   }
 
-  function renderRelease(release, expanded) {
+  function renderRelease(release) {
     var lng = lang();
-    var wrap = expanded ? el("article", "whats-new-release is-latest") : document.createElement("details");
-    if (!expanded) wrap.className = "whats-new-release";
-    var heading = expanded ? el("div", "whats-new-head") : el("summary", "whats-new-head");
+    var wrap = el("article", "whats-new-release is-latest");
+    var heading = el("div", "whats-new-head");
     var ver = el("span", "whats-new-version", String(release.version || ""));
     var date = el("time", "whats-new-date", String(release.date || ""));
     if (release.date) date.setAttribute("datetime", release.date);
@@ -65,9 +64,7 @@
       mount.appendChild(el("p", "whats-new-empty", t("entry.whatsnew.empty", "暂无已发布的更新。")));
       return;
     }
-    list.forEach(function (release, i) {
-      mount.appendChild(renderRelease(release, i === 0));
-    });
+    mount.appendChild(renderRelease(list[0]));
   }
 
   function boot() {

@@ -95,6 +95,13 @@ body {
   white-space: nowrap;
 }
 .topbar-link:hover { color: var(--text); background: #242424; }
+.topbar-support {
+  color: #f3c68c;
+  background: rgba(243, 198, 140, 0.08);
+  border: 1px solid rgba(243, 198, 140, 0.28);
+  margin-left: 6px;
+}
+.topbar-support:hover { color: #ffe0b7; background: rgba(243, 198, 140, 0.16); }
 .topbar-icon { flex: none; }
 
 /* 语言切换：地球图标用 CSS mask（i18n 运行时会用 textContent 重写按钮
@@ -654,17 +661,38 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
   color: var(--muted); font-size: 13px;
 }
 .footer-note p { margin: 0; }
-/* 支持项目入口（2026-10-21 §转换器入口）：低强调、与页脚同色调；键盘焦点
-   有可见环；窄屏时链接整体换到下一行，不在词中断开 */
-.footer-support { margin: 6px 0 0; }
+/* 页脚支持入口：独立的暖色提示区与按钮。 */
+.footer-support {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px 24px;
+  margin: 0 0 18px;
+  padding: 20px 24px;
+  border: 1px solid rgba(243, 198, 140, 0.3);
+  border-radius: 12px;
+  background: linear-gradient(110deg, rgba(243, 198, 140, 0.09), rgba(243, 198, 140, 0.03));
+  color: var(--text);
+  font-size: 15px;
+}
 .footer-support-link {
-  margin-left: 10px;
-  color: var(--muted);
-  text-decoration: underline;
-  text-underline-offset: 3px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  flex-shrink: 0;
+  min-height: 44px;
+  padding: 9px 18px;
+  border: 1px solid #f3c68c;
+  border-radius: 8px;
+  background: #f3c68c;
+  color: #271d11;
+  font-weight: 600;
+  text-decoration: none;
   white-space: nowrap;
 }
-.footer-support-link:hover { color: var(--text); }
+.footer-support-link:hover { background: #ffdaaa; border-color: #ffdaaa; }
+.footer-support-link svg { flex: none; }
 .footer-support-link:focus-visible {
   outline: var(--focus-ring);
   outline-offset: 3px;
@@ -708,6 +736,11 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
 }
 
 @media (max-width: 480px) {
+  .topbar-nav { width: 100%; justify-content: space-between; }
+  .topbar-link { padding: 7px 6px; gap: 4px; font-size: 13px; }
+  .topbar-support { margin-left: 0; }
+  .lang-toggle { padding: 6px 4px; gap: 4px; }
+  .footer-support { flex-direction: column; align-items: stretch; padding: 18px; }
   .drop-zone { padding: 34px 16px 22px; }
   .drop-zone .drop-title { font-size: 20px; }
   .drop-zone .drop-alt { font-size: 14px; }

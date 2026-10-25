@@ -370,21 +370,17 @@ describe("P3-18 folder wording covers MRXS and VMS", () => {
 	});
 });
 
-describe("converter footer support entry (design 2026-10-21 §转换器入口)", () => {
-	it("is a plain new-tab link to /support with noopener noreferrer and an aria label", () => {
-		const linkAt = shellSrc.indexOf('href="/support"');
-		expect(linkAt).toBeGreaterThan(-1);
-		const open = shellSrc.lastIndexOf("<a", linkAt);
-		const close = shellSrc.indexOf("</a>", linkAt);
-		const tag = shellSrc.slice(open, close);
-		expect(tag).toContain('target="_blank"');
-		expect(tag).toMatch(/rel="[^"]*noopener[^"]*"/);
-		expect(tag).toMatch(/rel="[^"]*noreferrer[^"]*"/);
-		expect(tag).toContain('data-i18n="tools.support.link"');
-		expect(tag).toContain('data-i18n-aria="tools.support.link.aria"');
-		// 展示文案用 tools.support.link；页脚内、不在任何卡片/动作流里
-		const footer = shellSrc.slice(shellSrc.indexOf("<footer"));
-		expect(footer).toContain('href="/support"');
+describe("converter support entries preserve the current conversion tab", () => {
+	it("header and footer use plain new-tab links with noopener noreferrer and an aria label", () => {
+		for (const region of [shellSrc.slice(shellSrc.indexOf("<header"), shellSrc.indexOf("</header>")), shellSrc.slice(shellSrc.indexOf("<footer"))]) {
+			const linkAt = region.indexOf('href="/support"');
+			expect(linkAt).toBeGreaterThan(-1);
+			const tag = region.slice(region.lastIndexOf("<a", linkAt), region.indexOf("</a>", linkAt));
+			expect(tag).toContain('target="_blank"');
+			expect(tag).toMatch(/rel="[^"]*noopener[^"]*"/);
+			expect(tag).toMatch(/rel="[^"]*noreferrer[^"]*"/);
+			expect(tag).toContain('data-i18n-aria="tools.support.link.aria"');
+		}
 	});
 
 	it("adds no prefetch/preload/dns-prefetch for /support anywhere in <head>", () => {
@@ -396,9 +392,7 @@ describe("converter footer support entry (design 2026-10-21 §转换器入口)",
 		expect(pageSrc).not.toContain("'/support'");
 	});
 
-	it("footer styling matches the muted footer with a visible focus ring", () => {
-		expect(cssSrc).toMatch(/\.footer-support \{ margin: 6px 0 0; \}/);
-		expect(cssSrc).toMatch(/\.footer-support-link \{[\s\S]*?color: var\(--muted\);[\s\S]*?white-space: nowrap;/);
+	it("the footer support button retains a visible keyboard focus ring", () => {
 		expect(cssSrc).toMatch(/\.footer-support-link:focus-visible \{[\s\S]*?outline: var\(--focus-ring\);/);
 	});
 

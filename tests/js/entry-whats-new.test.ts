@@ -69,9 +69,9 @@ describe("首页顶栏精简（2026-10-14）", () => {
   const nav = html.slice(html.indexOf('<ul class="nav-links">'), html.indexOf("</ul>", html.indexOf('<ul class="nav-links">')));
   const panel = html.slice(html.indexOf('id="account-panel"'), html.indexOf("</nav>"));
 
-  it("顶栏只保留 如何开始 / 切片格式转换工具 / GitHub / 关于我 + 语言切换", () => {
+  it("顶栏提供 如何开始 / 支持项目 / 切片格式转换工具 / GitHub / 关于我 + 语言切换", () => {
     const keys = [...nav.matchAll(/data-i18n="(entry\.nav\.[a-z]+)"/g)].map((m) => m[1]);
-    expect(keys).toEqual(["entry.nav.start", "entry.nav.slides", "entry.nav.github", "entry.nav.home"]);
+    expect(keys).toEqual(["entry.nav.start", "entry.nav.support", "entry.nav.slides", "entry.nav.github", "entry.nav.home"]);
     expect(nav).toMatch(/class="nav-lang"[\s\S]*class="lang-toggle"/);
   });
 

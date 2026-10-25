@@ -112,6 +112,19 @@ button:focus-visible {
   transition: color 0.15s ease;
 }
 .nav-links a:hover { color: var(--text); }
+.nav-links .nav-support {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 4px 10px;
+  color: #f3c68c;
+  border: 1px solid rgba(243, 198, 140, 0.28);
+  border-radius: 8px;
+  background: rgba(243, 198, 140, 0.08);
+}
+.nav-links .nav-support:hover { color: #ffe0b7; background: rgba(243, 198, 140, 0.16); }
+.nav-support svg { flex: none; }
 .nav-links .ext {
   font-size: 11px;
   color: var(--text-3);

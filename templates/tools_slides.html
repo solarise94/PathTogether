@@ -9,8 +9,8 @@
   <link rel="alternate" href="/guide/conversion.md" type="text/markdown" />
   {% if canonical %}<link rel="canonical" href="{{ canonical }}" />{% endif %}
   {% include "_site_icons.html" %}
-  <link rel="stylesheet" href="/static/tools/tools-slides.css?v=20261021-redesign" />
-  <script defer src="/static/i18n.js?v=20261021i"></script>
+  <link rel="stylesheet" href="/static/tools/tools-slides.css?v=20261026b" />
+  <script defer src="/static/i18n.js?v=20261026b"></script>
   <!-- 2026-10-20：本页只做本地转换与保存——不再加载 COS 上传引擎。
        slide-sniff 仅用于「此文件无需转换」提示（头级嗅探，零网络）。 -->
   <script defer src="/static/upload/slide-sniff.js?v=20261015"></script>
@@ -51,6 +51,15 @@
             <path d="M8 7.5h7"></path>
           </svg>
           <span data-i18n="tools.nav.guide">格式指南</span>
+        </a>
+        <a class="topbar-link topbar-support" href="/support" target="_blank" rel="noopener noreferrer"
+           data-i18n-aria="tools.support.link.aria" aria-label="在新标签页打开支持项目页面">
+          <svg class="topbar-icon" viewBox="0 0 24 24" width="16" height="16" fill="none"
+               stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+               aria-hidden="true" focusable="false">
+            <path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8L12 21l8.8-8.6a5.5 5.5 0 0 0 0-7.8Z"></path>
+          </svg>
+          <span data-i18n="tools.nav.support">支持项目</span>
         </a>
         <button type="button" class="lang-toggle" data-i18n-aria="lang.toggle.aria" aria-label="切换为英文">EN</button>
       </nav>
@@ -377,16 +386,20 @@
 
   <footer class="footer">
     <div class="footer-note">
-      <p data-i18n="tools.footer">本地工具不会替你判断医学结论；输出文件请自行妥善保管。</p>
-      <!-- 支持项目入口（设计 2026-10-21 §转换器入口）：低强调文字链接，
-           新标签页打开 /support；无 prefetch/preload、无 JS 处理器，
-           点击不触碰进行中的转换任务。 -->
-      <p class="footer-support">
+      <!-- 支持入口独立呈现；新标签页打开，保留原转换标签页与任务。 -->
+      <div class="footer-support">
         <span data-i18n="tools.support.prompt">这个工具对你有帮助？欢迎支持项目的持续开发。</span>
         <a class="footer-support-link" href="/support" target="_blank" rel="noopener noreferrer"
-           data-i18n="tools.support.link" data-i18n-aria="tools.support.link.aria"
-           aria-label="在新标签页打开支持项目页面">支持项目 ↗</a>
-      </p>
+           data-i18n-aria="tools.support.link.aria" aria-label="在新标签页打开支持项目页面">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none"
+               stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+               aria-hidden="true" focusable="false">
+            <path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8L12 21l8.8-8.6a5.5 5.5 0 0 0 0-7.8Z"></path>
+          </svg>
+          <span data-i18n="tools.support.link">支持项目 ↗</span>
+        </a>
+      </div>
+      <p data-i18n="tools.footer">本地工具不会替你判断医学结论；输出文件请自行妥善保管。</p>
     </div>
   </footer>
 

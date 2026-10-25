@@ -4188,7 +4188,7 @@ def support_orders_create():
     """创建赞助订单（匿名；全局 CSRF 闸覆盖本路由，表单隐藏域提交 token）。
 
     流程：功能闸 → 速率闸（auth_rate_limits support_order_ip 桶，成功也计）→
-    金额白名单（服务端权威：¥1–¥500、两位小数、Decimal 精确分值）→ 建单
+    金额白名单（服务端权威：¥1–¥50、两位小数、Decimal 精确分值）→ 建单
     （out_trade_no 服务端高熵生成）→ 303 到 /support/pay/<ref> 收银台跳转页。
     网关/回跳/通知 URL 全部服务端构造，**绝不**接受请求参数传入。
 

@@ -318,10 +318,10 @@ describe("支付弹层 r5：非订单结论与作废响应不碰隐藏 key（202
 describe("支付弹层 r5：资产版本与既有口径（2026-10-23）", () => {
   const html = readFileSync(resolve(root, "templates/support.html"), "utf8");
 
-  it("support.js 资产版本随本轮修复升到 20261023b；css/i18n 不动", () => {
-    expect(html).toContain("/static/support/support.js?v=20261023b");
+  it("支付脚本与文案缓存随金额档位更新；css 保持既有版本", () => {
+    expect(html).toContain("/static/support/support.js?v=20261026a");
     expect(html).not.toContain("/static/support/support.js?v=20261023a");
     expect(html).toContain("/static/support/support.css?v=20261023a");
-    expect(html).toContain("/static/i18n.js?v=20261023a");
+    expect(html).toContain("/static/i18n.js?v=20261026a");
   });
 });

@@ -803,7 +803,7 @@
     var form = document.getElementById('pay-pick-form');
     var stage = document.getElementById('cat-stage');
     if (!form || !stage) return;
-    var TIERS = { '6.00': 'cat_food', '18.00': 'cat_toy', '68.00': 'mystery' };
+    var TIERS = { '1.00': 'cat_food', '6.00': 'cat_toy', '18.00': 'mystery' };
     function sync() {
       var picked = form.querySelector('input[name="amount"]:checked');
       var tier = picked ? (TIERS[picked.value] || '') : '';

@@ -11,7 +11,7 @@
      GET 链接）。同步回跳参数不被信任：状态只来自本地库/服务端验签查单。 #}
   <link rel="stylesheet" href="/static/support/support.css?v=20261021i" />
   <link rel="stylesheet" href="/static/support/support_pay.css?v=20261021e" />
-  <script defer src="/static/i18n.js?v=20261021i"></script>
+  <script defer src="/static/i18n.js?v=20261026a"></script>
   <script defer src="/static/support/support_pay.js?v=20261021g"></script>
 </head>
 <body id="top">
@@ -76,7 +76,7 @@
       {# 喂猫互动（2026-10-21 用户评审）：不再自动播放礼物动画——礼物已在
          /support 支持页放到小猫身边，由用户自己去喂。这里只发一张「领取卡」
          （礼物图标 + 去喂小猫）。gift_kind 由服务端按本地订单行推导
-         （600=一份猫粮 / 1800=猫玩具 / 6800=神秘礼物；自定义金额=小鱼干）。 #}
+         （100=一份猫粮 / 600=猫玩具 / 1800=神秘礼物；自定义金额=小鱼干）。 #}
       <div class="gift-pickup" role="status">
         <span class="gift-pickup-art" aria-hidden="true">{{ gifts.gift_icon(gift_kind) }}</span>
         <p class="gift-pickup-body" data-i18n="supportreturn.pickup.{{ gift_kind }}">{{ {

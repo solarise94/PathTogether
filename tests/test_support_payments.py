@@ -219,15 +219,15 @@ def _sign_params(params, key):
 # 1. 金额校验（单元 + 路由）
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("raw,fen", [
-    ("6.66", 666), ("18.88", 1888), ("66.66", 6666), ("1", 100),
-    ("1.5", 150), ("500", 50000), ("500.00", 50000), ("1.00", 100),
+    ("6.66", 666), ("18.88", 1888), ("18.00", 1800), ("1", 100),
+    ("1.5", 150), ("50", 5000), ("50.00", 5000), ("1.00", 100),
 ])
 def test_parse_amount_accepts_presets_and_bounds(raw, fen):
     assert sp.parse_amount_fen(raw) == fen
 
 
 @pytest.mark.parametrize("raw", [
-    "", None, "0", "0.99", "500.01", "1000", "-6.66", "+6.66", "6.666",
+    "", None, "0", "0.99", "50.01", "68", "500", "1000", "-6.66", "+6.66", "6.666",
     "6.66.6", "abc", " 6.66", "6.66 ", "1e2", "01.00", "6.", ".5", "6,66",
     "500.000", "１２", "999999999999", "0x10", "6.6600000000001",
     "18.885",
@@ -256,7 +256,7 @@ def test_amount_float_precision_is_exact_decimal():
     assert sp.fen_to_yuan(5) == "0.05"
 
 
-@pytest.mark.parametrize("amount", ["0", "0.99", "501", "-1", "6.666", "abc"])
+@pytest.mark.parametrize("amount", ["0", "0.99", "50.01", "68", "501", "-1", "6.666", "abc"])
 def test_route_rejects_invalid_amounts(_iso, amount):
     c = _client()
     r = _post_order(c, {"amount_custom": amount})
@@ -299,9 +299,9 @@ def test_route_creates_order_and_redirects_to_pay_page(_iso):
 
 def test_route_custom_amount_wins_over_preset(_iso):
     c = _client()
-    r = _post_order(c, {"amount": "6.66", "amount_custom": "123.45"})
+    r = _post_order(c, {"amount": "6.66", "amount_custom": "23.45"})
     out_trade_no = r.headers["Location"].rsplit("/", 1)[-1]
-    assert sp.get_order(out_trade_no)["amount_fen"] == 12345
+    assert sp.get_order(out_trade_no)["amount_fen"] == 2345
 
 
 def test_out_trade_no_uniqueness_and_shape(_iso, rt):
@@ -372,8 +372,8 @@ def test_support_page_with_pay_enabled(_iso):
     body2 = c.get("/support").get_data(as_text=True)
     key2 = re.search(r'name="idempotency_key" value="([0-9a-f]{32})"', body2)
     assert key2 is not None and key2.group(1) != key_match.group(1)
-    # R2 add-on：猫咪礼物档卡（¥6.00/¥18.00/¥68.00 + 名称 + 内联 SVG 小图）
-    for yuan in ("6.00", "18.00", "68.00"):
+    # R2 add-on：猫咪礼物档卡（¥1.00/¥6.00/¥18.00 + 名称 + 内联 SVG 小图）
+    for yuan in ("1.00", "6.00", "18.00"):
         assert 'value="%s"' % yuan in body
     for tier_name in ("一份猫粮", "猫玩具", "神秘礼物"):
         assert tier_name in body
@@ -1443,9 +1443,9 @@ def test_status_endpoint_paid_payload_per_tier(_iso):
     """paid 载荷的 tier/gift 只由本地订单行 amount_fen 推导：三档礼物 + 自定义
     → fish_treat；非 paid 响应绝无额外字段。"""
     rt = sp.get_runtime("sandbox")
-    for fen, tier, gift in ((600, "cat_food", "cat_food"),
-                            (1800, "cat_toy", "cat_toy"),
-                            (6800, "mystery", "mystery"),
+    for fen, tier, gift in ((100, "cat_food", "cat_food"),
+                            (600, "cat_toy", "cat_toy"),
+                            (1800, "mystery", "mystery"),
                             (1888, None, "fish_treat")):
         order = _make_order(rt, amount_fen=fen)
         sp.mark_paid_idempotent(order["out_trade_no"], "trd-payload-%s" % fen)
@@ -1475,10 +1475,10 @@ def test_status_endpoint_non_paid_payload_has_no_gift_fields(_iso):
 
 def test_collectible_mapping_helper():
     """档位礼物与档位同名；非档位金额（含自定义）→ fish_treat（服务端权威）。"""
-    assert sp.gift_collectible_for_amount(600) == "cat_food"
-    assert sp.gift_collectible_for_amount(1800) == "cat_toy"
-    assert sp.gift_collectible_for_amount(6800) == "mystery"
-    for other in (666, 1888, 6666, 100, 50000, 599, 601, 0):
+    assert sp.gift_collectible_for_amount(100) == "cat_food"
+    assert sp.gift_collectible_for_amount(600) == "cat_toy"
+    assert sp.gift_collectible_for_amount(1800) == "mystery"
+    for other in (666, 1888, 6666, 101, 5000, 599, 601, 0):
         assert sp.gift_collectible_for_amount(other) == "fish_treat", other
 
 
@@ -1557,18 +1557,18 @@ def test_return_page_paid_shows_receipt_with_verified_data(
 # 12c. 猫咪礼物档（R2 add-on）：服务端按精确金额推导档位
 # --------------------------------------------------------------------------- #
 def test_gift_tier_mapping_exact_amounts_only():
-    assert sp.gift_tier_for_amount(600) == "cat_food"
-    assert sp.gift_tier_for_amount(1800) == "cat_toy"
-    assert sp.gift_tier_for_amount(6800) == "mystery"
-    for other in (666, 1888, 6666, 100, 50000, 599, 601, 1799, 6799, 0):
+    assert sp.gift_tier_for_amount(100) == "cat_food"
+    assert sp.gift_tier_for_amount(600) == "cat_toy"
+    assert sp.gift_tier_for_amount(1800) == "mystery"
+    for other in (666, 1888, 6666, 101, 5000, 599, 601, 1799, 6799, 0):
         assert sp.gift_tier_for_amount(other) is None, other
 
 
 def test_support_page_renders_tier_cards_with_names_and_prices(_iso):
     body = _client().get("/support").get_data(as_text=True)
     assert "pay-tier" in body
-    for yuan, name in (("6.00", "一份猫粮"), ("18.00", "猫玩具"),
-                       ("68.00", "神秘礼物")):
+    for yuan, name in (("1.00", "一份猫粮"), ("6.00", "猫玩具"),
+                       ("18.00", "神秘礼物")):
         assert 'value="%s"' % yuan in body
         assert name in body
 
@@ -1588,11 +1588,11 @@ def test_support_page_cat_gifts_only_for_session_paid_orders(_iso):
     assert 'class="cat-gift ' not in body
     assert "data-gift=" not in body
 
-    o_pending = sp.create_order(rt, 600)
+    o_pending = sp.create_order(rt, 100)
     sp.mark_paying(o_pending["out_trade_no"])              # 未决：不算
-    o_toy = sp.create_order(rt, 1800)
+    o_toy = sp.create_order(rt, 600)
     sp.mark_paid_idempotent(o_toy["out_trade_no"], "trd-gift1")
-    o_closed = sp.create_order(rt, 6800)
+    o_closed = sp.create_order(rt, 1800)
     sp.mark_closed_idempotent(o_closed["out_trade_no"], "sweep:expired")
     o_fish = sp.create_order(rt, 1888)                     # 自定义 → 小鱼干
     sp.mark_paid_idempotent(o_fish["out_trade_no"], "trd-gift2")
@@ -1632,14 +1632,14 @@ def test_support_page_cat_gifts_max_three_newest_first(_iso):
     rt = sp.get_runtime("sandbox")
     c = _client()
     refs = []
-    for i, fen in enumerate((600, 1800, 6800, 1888)):
+    for i, fen in enumerate((100, 600, 1800, 1888)):
         o = sp.create_order(rt, fen)
         sp.mark_paid_idempotent(o["out_trade_no"], "trd-max-%s" % i)
         refs.append(o["out_trade_no"])
     _own_session(c, *refs)
     body = c.get("/support").get_data(as_text=True)
     rendered = set(re.findall(r'data-ref="(sp[0-9a-z]{24})"', body))
-    assert rendered == set(refs[1:])          # 最旧的 600 被裁掉
+    assert rendered == set(refs[1:])          # 最旧的 100 被裁掉
     assert refs[0] not in rendered
 
 
@@ -1654,15 +1654,15 @@ def test_client_tier_field_is_never_trusted(_iso):
 
 
 def test_return_page_pickup_card_by_server_derived_gift(_iso, monkeypatch):
-    """回跳页已支付：600 → cat_food 领取卡（去喂小猫）+ 凭条礼物行；
+    """回跳页已支付：100 → cat_food 领取卡（去喂小猫）+ 凭条礼物行；
     非档位金额（666）→ fish_treat（一条小鱼干）同样有领取卡与礼物行。
     礼物动画舞台已退役（喂猫互动移到 /support 猫卡）。"""
     rt = sp.get_runtime("sandbox")
     c = _client()
 
-    o1 = _make_order(rt, amount_fen=600)
+    o1 = _make_order(rt, amount_fen=100)
     _own_session(c, o1["out_trade_no"])
-    _mock_query(monkeypatch, state="PAID", amount="6.00",
+    _mock_query(monkeypatch, state="PAID", amount="1.00",
                 trade_no="trd-tier1")
     body1 = c.get("/support/return?out_trade_no=%s" % o1["out_trade_no"]) \
         .get_data(as_text=True)
@@ -1689,9 +1689,9 @@ def test_return_page_pickup_card_by_server_derived_gift(_iso, monkeypatch):
 
 def test_return_page_mystery_tier_pickup_card(_iso, monkeypatch):
     rt = sp.get_runtime("sandbox")
-    o = _make_order(rt, amount_fen=6800)
+    o = _make_order(rt, amount_fen=1800)
     c = _own_session(_client(), o["out_trade_no"])
-    _mock_query(monkeypatch, state="PAID", amount="68.00",
+    _mock_query(monkeypatch, state="PAID", amount="18.00",
                 trade_no="trd-tier3")
     body = c.get("/support/return?out_trade_no=%s" % o["out_trade_no"]) \
         .get_data(as_text=True)

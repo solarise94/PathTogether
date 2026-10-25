@@ -323,7 +323,7 @@ def test_json_create_payload_contract(_iso):
     assert data["pay_url"] == "/support/pay/%s" % data["out_trade_no"]
     assert data["reused"] is False
     assert data["amount_yuan"] == "6.00"
-    assert data["tier"] == "cat_food"
+    assert data["tier"] == "cat_toy"
     # expires_at：ISO 8601 UTC，等于 created_at + 15m（沙箱表单同一截止线）
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
                         data["expires_at"])

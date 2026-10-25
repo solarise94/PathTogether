@@ -147,18 +147,18 @@ _TZ_SHANGHAI = ZoneInfo("Asia/Shanghai")
 #: 订单标题（固定文案，不收集用户自由输入——赞助期跳过留言审核面）。
 ORDER_SUBJECT = "HistoPilot 项目赞助"
 
-#: 金额边界（分）：¥1.00 – ¥500.00；猫咪礼物档：¥6 / ¥18 / ¥68（R2 add-on）。
+#: 当前商户单笔限额 ¥50；猫咪礼物档：¥1 / ¥6 / ¥18。
 AMOUNT_MIN_FEN = 100
-AMOUNT_MAX_FEN = 50000
-AMOUNT_PRESETS_FEN = (600, 1800, 6800)
+AMOUNT_MAX_FEN = 5000
+AMOUNT_PRESETS_FEN = (100, 600, 1800)
 
 #: 猫咪礼物档（R2 add-on）：精确金额（分）→ 档位 key。**服务端权威**——档位
 #: 只由订单的 amount_fen 推导（回跳页/收据展示用），绝不信任任何客户端
 #: 「档位」字段；其他金额（含自定义）→ None（回跳页播放通用开心/爱心反应）。
 GIFT_TIERS = (
-    (600, "cat_food"),   # 一份猫粮
-    (1800, "cat_toy"),   # 猫玩具
-    (6800, "mystery"),   # 神秘礼物（光猫）
+    (100, "cat_food"),   # 一份猫粮
+    (600, "cat_toy"),   # 猫玩具
+    (1800, "mystery"),   # 神秘礼物（光猫）
 )
 
 
@@ -506,8 +506,8 @@ def parse_amount_fen(raw):
 
     只接受**字符串**输入（HTML 表单字段语义）：非字符串（int/float/None）
     一律拒绝——金额通道不允许 JSON number（JS Number 二进制浮点不可作金额
-    来源）。接受 ``6.66`` / ``6.6`` / ``6`` / ``500``；拒绝负数、空白、科学
-    计数、三位小数、前导零、``>500``、``<1`` 等。服务端校验权威，前端约束
+    来源）。接受 ``6.66`` / ``6.6`` / ``6`` / ``50``；拒绝负数、空白、科学
+    计数、三位小数、前导零、``>50``、``<1`` 等。服务端校验权威，前端约束
     只是体验层。
     """
     if not isinstance(raw, str):
@@ -521,7 +521,7 @@ def parse_amount_fen(raw):
     except (InvalidOperation, ValueError) as exc:
         raise InvalidAmount("金额换算失败") from exc
     if fen < AMOUNT_MIN_FEN or fen > AMOUNT_MAX_FEN:
-        raise InvalidAmount("金额超出可支持范围（¥1–¥500）")
+        raise InvalidAmount("金额超出可支持范围（¥1–¥50）")
     return fen
 
 

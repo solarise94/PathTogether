@@ -980,7 +980,11 @@ def test_admin_manifest_plugin_version_bumped_with_hashes():
     # 任务行遵守统一筛选与 totals 口径、列表行批投影权威生命周期状态、
     # 展开面板独立有效性令牌、原始调用分页保留完整筛选；0.4.18 的 bundle
     # 已在 homePC 以不可变版本目录暂存，修复必须换新版本号。hashes/pin 同步。
-    assert data["pluginVersion"] == "0.4.19"  # hashes/pin 同步
+    # 2026-10-29 0.4.20（0089 最近活跃）：用户列表「最近登录」列改「最近活跃」
+    #（last_active_at，排序 last_active_desc；台账 value 旧值仅服务端兼容），
+    # 详情抽屉仍显示「最近登录」；0.4.19 bundle 已在 homePC 以不可变版本目录
+    # 暂存，必须换新版本号。hashes/pin 同步。
+    assert data["pluginVersion"] == "0.4.20"  # hashes/pin 同步
     assert "admin:settings:read" in data["adminPermissions"]
     assert "admin:settings:write" in data["adminPermissions"]
     assert "admin:slides:read" in data["adminPermissions"]

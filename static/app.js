@@ -1645,6 +1645,7 @@
     aiPanelResize: $("ai-panel-resize"),
     aiResetPosition: $("ai-reset-position"),
     annoAllToggle: $("anno-all-toggle"),
+    annoExportBtn: $("anno-export-btn"),
     // 手机端侧栏抽屉
     menuBtn: $("menu-btn"),
     sidebar: $("sidebar"),
@@ -2685,6 +2686,7 @@
         // 临时查看：按到期时间设定清屏计时器（服务端门禁是唯一权限依据）
         armTempViewTimer(state.slide);
         updateCanvasSlideLabel();
+        syncAnnoExportBtn();
         // 反馈记录器（§3）：打开切片记入 nav 事件并更新快照的当前切片
         fbRecSetSlide(info.slide_id || info.name || null);
         fbRecLog("nav", { slide_id: info.slide_id || info.name || null, phase: "slide_open" });
@@ -3061,6 +3063,7 @@
     countHighlight = null;
     state.mppX = null;
     state.roiMode = null;
+    syncAnnoExportBtn();
     clearTempViewTimer();
     // 复位换片标记：随后的 viewer.close 是显式清屏，close 处理器会连桥接
     // 层一起清理（临时查看到期必须同时清掉保留的背景/预览，§4.2.8）
@@ -3887,6 +3890,83 @@
     }
     var wx = w * mx, hy = h * my; // µm
     return (wx / 1000).toFixed(2) + "×" + (hy / 1000).toFixed(2) + "mm";
+  }
+
+  // ---------- 导出标注（QuPath GeoJSON） ----------
+  // 导出当前用户在当前切片上可见的标注：服务端与 /api/annotations 列表
+  // 端点共用同一读门禁与标注级过滤，导出不会放大可见范围。
+  var annoExportBusy = false;
+
+  function annoExportStem() {
+    var s = state.slide || {};
+    var src = String(s.original_filename || s.display_name || s.name || "");
+    var base = src.replace(/\\/g, "/").split("/").pop()
+      .replace(/\.[^.]+$/, "")
+      .replace(/[\u0000-\u001f\u007f]/g, "")
+      .trim();
+    return base || (s.id ? "slide_" + String(s.id) : "slide");
+  }
+
+  function annoExportFilename(disposition) {
+    if (disposition) {
+      // RFC 5987 filename*（中文名走该形态）；解码失败回落默认名
+      var m = /filename\*\s*=\s*utf-8''([^;]+)/i.exec(disposition);
+      if (m) {
+        try {
+          return decodeURIComponent(m[1].trim().replace(/^"|"$/g, ""));
+        } catch (e) { /* fall through */ }
+      }
+      m = /filename\s*=\s*"([^"]*)"/i.exec(disposition) ||
+        /filename\s*=\s*([^;]+)/i.exec(disposition);
+      if (m && m[1].trim()) return m[1].trim();
+    }
+    return annoExportStem() + "_annotations.geojson";
+  }
+
+  function syncAnnoExportBtn() {
+    if (!els.annoExportBtn) return;
+    var ready = !!(slideIdApiOn() && state.slide && state.slide.id);
+    els.annoExportBtn.disabled = !ready || annoExportBusy;
+  }
+
+  function exportAnnotations() {
+    if (annoExportBusy) return;
+    var sid = (slideIdApiOn() && state.slide && state.slide.id) || "";
+    if (!sid) { syncAnnoExportBtn(); return; }
+    annoExportBusy = true;
+    syncAnnoExportBtn();
+    return apiFetch("/api/slides/" + encodeURIComponent(sid) + "/annotations/export")
+      .then(function (res) {
+        if (!res.ok) {
+          return res.json().catch(function () { return {}; }).then(function (j) {
+            throw new Error((j && j.error) || ("HTTP " + res.status));
+          });
+        }
+        var n = parseInt(res.headers.get("X-Annotation-Count") || "0", 10);
+        if (!(n > 0)) {
+          toast(t("anno.export.empty"), "info");
+          return null;
+        }
+        var fname = annoExportFilename(res.headers.get("Content-Disposition"));
+        return res.blob().then(function (blob) {
+          var a = document.createElement("a");
+          var objUrl = URL.createObjectURL(blob);
+          a.href = objUrl;
+          a.download = fname;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setTimeout(function () { URL.revokeObjectURL(objUrl); }, 1000);
+          toast(t("anno.export.done", { n: n }), "success");
+        });
+      })
+      .catch(function (e) {
+        toast(t("anno.export.fail", { s: (e && e.message) || "?" }), "error");
+      })
+      .finally(function () {
+        annoExportBusy = false;
+        syncAnnoExportBtn();
+      });
   }
 
   // ---------- 保存图片（裁剪） ----------
@@ -14806,6 +14886,8 @@
     els.annoAllBtn.addEventListener("click", toggleAnnoAll);
     // 面板头部「显示全部标记」切换钮（与 toggleAnnoAll 同一逻辑）
     if (els.annoAllToggle) els.annoAllToggle.addEventListener("click", toggleAnnoAll);
+    if (els.annoExportBtn) els.annoExportBtn.addEventListener("click", exportAnnotations);
+    syncAnnoExportBtn();
     els.annoArrowBtn.addEventListener("click", function () { toggleDrawMode("arrow"); });
     els.annoFreeBtn.addEventListener("click", function () { toggleDrawMode("freehand"); });
     // 升级 C：单一矩形入口 + 紧凑设置区（旧 6/6.5 分段/滑块已移除）

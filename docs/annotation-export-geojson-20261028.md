@@ -46,7 +46,7 @@ Feature `id` = 平台 `annotation_id`（UUID，QuPath 用作对象 ID）。`prop
 2. 把 `.geojson` 拖进查看器选择 *Import objects*，或用 *File ▸ Import objects from file...*。QuPath 询问是否更新对象 ID 时，建议选择更新，避免与已有对象重复。
 3. 导入后按 classification 分组、着色；AI 结果为橙色，`metadata` 中可见 `source`、`review_status`、`ai_skill` 等。
 
-已用 QuPath 0.7.0 的无头 `QuPath script` 导入平台实际导出的文件验证：矩形、多边形、线段 ROI 的位置与面积，名称、分类与颜色、锁定状态和 metadata 均正确。
+已用 QuPath 0.7.0 的无头 `QuPath script` 导入验证：平台接口导出与浏览器实际下载的文件（人工矩形、人工多边形、AI 描绘多边形）位置与面积、名称、分类与颜色、AI 橙色和 metadata 均正确；箭头（导入为线段）、锁定状态与 AI 矩形用同一导出模块生成的文件验证，同样正确。
 
 ## 6. Python 分析示例
 

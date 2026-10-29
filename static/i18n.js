@@ -551,6 +551,10 @@
       "anno.panel.toggle.title": "显示/隐藏全部标记",
       // 标注导出（QuPath GeoJSON）
       "anno.export.title": "导出标注（QuPath GeoJSON）",
+      "anno.export.all": "导出全部",
+      "anno.export.one": "导出",
+      "anno.export.one.title": "导出这条标注（QuPath GeoJSON）",
+      "anno.export.one.done": "已导出「{name}」",
       "anno.export.empty": "当前切片没有可导出的标注",
       "anno.export.done": "已导出 {n} 个标注",
       "anno.export.fail": "导出失败：{s}",
@@ -2412,6 +2416,10 @@
       "anno.panel.toggle.title": "Show/hide all marks",
       // Annotation export (QuPath GeoJSON)
       "anno.export.title": "Export annotations (QuPath GeoJSON)",
+      "anno.export.all": "Export all",
+      "anno.export.one": "Export",
+      "anno.export.one.title": "Export this annotation (QuPath GeoJSON)",
+      "anno.export.one.done": "Exported “{name}”",
       "anno.export.empty": "No annotations to export on this slide",
       "anno.export.done": "Exported {n} annotations",
       "anno.export.fail": "Export failed: {s}",

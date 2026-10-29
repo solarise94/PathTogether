@@ -1918,15 +1918,17 @@ button {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   padding: 10px 12px;
   border-bottom: 0.5px solid var(--separator);
   font-size: 13px;
   font-weight: 600;
 }
-/* 面板头部右侧操作容器（眼睛切换 + 关闭） */
+/* 面板头部右侧操作容器（导出/眼睛切换 + 关闭）：不参与标题收缩 */
 .anno-panel-header-actions {
   display: inline-flex;
   align-items: center;
+  flex: 0 0 auto;
   gap: 2px;
 }
 /* 「显示/隐藏全部标记」眼睛钮（面板头部）：active = 显示全部 */
@@ -1973,7 +1975,31 @@ button {
   color: var(--text-3);
   opacity: 0.35;
 }
+/* 面板头部「图标 + 文字」按钮（导出全部）：自适应宽度，可用时 accent 高亮 */
+.panel-text-btn {
+  width: auto;
+  padding: 0 10px;
+  gap: 4px;
+  font-size: 12px;
+}
+.panel-text-btn:not(:disabled) {
+  color: var(--accent);
+  background: var(--accent-fill);
+  opacity: 1;
+}
+.panel-text-btn:not(:disabled):hover {
+  color: var(--accent);
+  background: var(--accent-fill);
+  opacity: 1;
+}
+.panel-text-btn .panel-btn-tx {
+  white-space: nowrap;
+  font-weight: 600;
+}
 .anno-panel-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  line-height: 1.4;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2030,20 +2056,34 @@ button {
 }
 .anno-group-head .agh-label { font-size: 11px; font-weight: 600; color: var(--text-2); text-transform: uppercase; letter-spacing: 0.3px; }
 .anno-group-head .agh-count { font-size: 11px; color: var(--text-3); }
+/* 每条标注是独立卡片：信息独占第一行，操作钮在下方自然换行。
+   长名称/箭头的长坐标串在信息区内断行，不再挤压或遮挡操作钮。 */
 .anno-item {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px;
-  padding: 7px 8px;
+  gap: 6px 4px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  background: rgba(255, 255, 255, 0.78);
+  border: 0.5px solid var(--separator-strong);
   border-radius: var(--r-row);
   cursor: pointer;
-  transition: background 0.12s ease;
+  transition: background 0.12s ease, border-color 0.12s ease;
 }
 .anno-item:hover { background: var(--hover); }
-.anno-item .ai-info { flex: 1 1 150px; min-width: 0; }
-.anno-item .ai-title { font-size: 12px; font-weight: 500; color: var(--text); }
-.anno-item .ai-title .ai-label { color: var(--accent); font-weight: 600; }
+.anno-item .ai-info { flex: 1 1 100%; min-width: 0; }
+.anno-item .ai-title {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.anno-item .ai-title .ai-label {
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 13px;
+}
 .anno-item .ai-title .ai-type-icon {
   display: inline-flex;
   align-items: center;
@@ -2058,8 +2098,8 @@ button {
 .anno-item .ai-sub { font-size: 10px; color: var(--text-2); margin-top: 2px; word-break: break-all; }
 
 /* 未公开标注（P1-7）：不再整行降透明度（会让操作按钮看起来像 disabled）。
-   只把名称文字调暗，并配「私有」小徽章表达私有状态；操作按钮保持正常不透明度。 */
-.anno-item.anno-private .ai-title .ai-label { color: var(--text-3); }
+   私有状态由「私有」小徽章表达，名称保持正常深色（浅灰会让用户误以为不可用）。 */
+.anno-item.anno-private .ai-title .ai-label { color: var(--text); }
 .anno-private-badge {
   display: inline-flex;
   align-items: center;
@@ -2152,6 +2192,48 @@ button {
 .anno-item .ai-op:hover { background: var(--hover); opacity: 1; }
 .anno-item .ai-edit:hover { color: var(--accent); background: var(--accent-fill); }
 .anno-item .ai-del:hover { color: var(--danger); background: var(--danger-tint); }
+
+/* 带文字的操作钮（加入 AI 对话 / 导出 / 接受 / 驳回）：26px 图标基类只留给
+   ✎ 🗑 👁；文字钮自适应宽度，不再以居中内容向两侧溢出遮挡相邻按钮。 */
+.anno-item .ai-op.ai-attach-anno,
+.anno-item .ai-op.ai-export,
+.anno-item .ai-op.ai-review-accept,
+.anno-item .ai-op.ai-review-reject,
+.anno-item .ai-op.ai-fork,
+.anno-item .ai-op.ai-branch {
+  width: auto;
+  min-width: 26px;
+  padding: 0 8px;
+  gap: 3px;
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  opacity: 1;
+}
+/* 文字钮做成清晰可见的小胶囊（AI 加入 / 单条导出） */
+.anno-item .ai-op.ai-attach-anno,
+.anno-item .ai-op.ai-export {
+  color: var(--text-2);
+  border: 0.5px solid var(--separator-strong);
+  background: rgba(255, 255, 255, 0.9);
+}
+.anno-item .ai-op.ai-attach-anno:hover,
+.anno-item .ai-op.ai-export:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-fill);
+}
+.anno-item .ai-op .ai-act-svg {
+  width: 12px;
+  height: 12px;
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.anno-item .ai-op .ai-act-tx { white-space: nowrap; }
 
 /* 编辑卡（标注面板顶部） */
 .anno-edit-wrap {
@@ -3659,16 +3741,7 @@ button {
    AI 批注式对话（fork）
    ========================================================================= */
 /* 标注面板行的 fork/branch 动作按钮（P1-6：图标+短文字小按钮，hover 高亮）
-   基类复用 .ai-op（26×26 圆角），文字模式放宽为自适应宽度。 */
-.anno-item .ai-op.ai-fork,
-.anno-item .ai-op.ai-branch {
-  width: auto;
-  min-width: 0;
-  padding: 0 8px;
-  gap: 3px;
-  font-size: 11px;
-  font-weight: 500;
-}
+   文字钮的自适应宽度已并入 `.anno-item .ai-op.ai-*` 共享规则，这里只留配色。 */
 .ai-op .ai-act-ic { font-size: 12px; line-height: 1; }
 .ai-op .ai-act-tx { white-space: nowrap; }
 .anno-item .ai-op.ai-fork:hover { color: #7b5cff; background: rgba(123, 92, 255, 0.12); }

@@ -9816,8 +9816,11 @@
     annoPanelOpen = true;
     els.annoPanel.style.display = "flex";
     // P2 合同 §5.4：面板标题主显示 display_name（旧 DTO 回落 name）
+    var panelName = slideDisplayName(state.slide) || state.slide.name || "";
     els.annoPanelTitle.textContent = t("anno.panel.title.with", {
-      name: truncateMiddle(slideDisplayName(state.slide) || state.slide.name, 28) });
+      name: truncateMiddle(panelName, 28) });
+    // 标题单行省略；悬停看完整切片名
+    els.annoPanelTitle.title = panelName;
     if (annoListError) {
       // 当前切片列表从未加载成功：显式错误态 + 重试（绝不冒充「暂无标注」）
       renderAnnoPanelError();

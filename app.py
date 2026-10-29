@@ -26738,6 +26738,17 @@ def _annotation_export_raw_rois(items):
     return out
 
 
+def _annotation_export_id_error(raw_aid):
+    """单条导出的 annotation_id 参数校验；合法返回 None（错误响应或 None）。"""
+    if raw_aid is None:
+        return None  # 未带参数 = 整片导出（旧行为）
+    if not raw_aid.strip() or len(raw_aid) > 128 or any(
+            ord(ch) < 32 or ord(ch) == 127 for ch in raw_aid):
+        return jsonify(error="annotation_id 无效",
+                       code="invalid_annotation_id"), 400
+    return None
+
+
 @app.route("/api/slides/<slide_id>/annotations/export")
 def api_slide_annotations_export(slide_id):
     """导出当前用户可见的切片标注（QuPath 风格 GeoJSON，附件下载）。
@@ -26746,6 +26757,9 @@ def api_slide_annotations_export(slide_id):
     → subject 推导 → annotations_by_slide(subject) 的标注级可见性 → 同一
     作者/能力投影。因此导出内容恒等于该用户列表端点可见的标注集合，绝不
     因导出通道放大可见性。
+
+    可选 ``annotation_id``：只导出该条（仍在同一可见集合里精确匹配，不区分
+    「不存在」与「不可见」）；该条几何无法生成 Feature 时 422。
 
     QuPath 映射见 annotation_export 模块：rect/polygon/freehand → Polygon，
     arrow → LineString；properties 只含白名单（objectType/name/
@@ -26758,13 +26772,42 @@ def api_slide_annotations_export(slide_id):
     if fmt != "geojson":
         return jsonify(error="format 仅支持 geojson",
                        code="unsupported_format"), 400
+    raw_aid = request.args.get("annotation_id")
+    aid_err = _annotation_export_id_error(raw_aid)
+    if aid_err is not None:
+        return aid_err
     subject = annotation_access.subject_from_request()
     groups = _decorated_slide_annotations(desc, subject)
     items = [item for group in groups for item in group.get("items", [])]
     slide_info = _annotation_export_slide_info(desc)
+    single = None
+    feature = None
+    if raw_aid is not None:
+        for item in items:
+            if item.get("annotation_id") == raw_aid:
+                single = item
+                break
+        if single is None:
+            return jsonify(error="标注不存在或无权查看",
+                           code="annotation_not_found"), 404
+        raw_by_id = _annotation_export_raw_rois([single])
+        raw = raw_by_id.get(raw_aid)
+        feature = annotation_export.build_feature(single, raw)
+        if feature is None:
+            return jsonify(error="该标注的几何数据不完整，无法导出",
+                           code="annotation_not_exportable"), 422
+        items = [single]
+    else:
+        raw_by_id = _annotation_export_raw_rois(items)
     collection = annotation_export.build_feature_collection(
-        items, _annotation_export_raw_rois(items), slide_info,
-        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        items, raw_by_id, slide_info,
+        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        annotation_id=raw_aid if raw_aid is not None else None)
+    filename_item = None
+    if single is not None:
+        # 文件名里的标注名与 Feature name 完全一致（raw label 优先）
+        filename_item = dict(single, label=(feature.get("properties") or {})
+                             .get("name", ""))
     buf = io.BytesIO(
         json.dumps(collection, ensure_ascii=False).encode("utf-8"))
     buf.seek(0)
@@ -26772,7 +26815,8 @@ def api_slide_annotations_export(slide_id):
         buf,
         mimetype="application/geo+json",
         as_attachment=True,
-        download_name=annotation_export.export_filename(slide_info),
+        download_name=annotation_export.export_filename(slide_info,
+                                                        filename_item),
     )
     resp.headers["Cache-Control"] = "no-store"
     resp.headers["X-Annotation-Count"] = str(

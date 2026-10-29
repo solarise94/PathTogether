@@ -456,7 +456,10 @@ def _annotation_stem(item):
     字符；id 只保留字母数字（annotation_id 是 uuid4，取前 8 位）。
     """
     item = item if isinstance(item, dict) else {}
-    name = _WINDOWS_INVALID.sub("_", _sanitize_stem(_label_of(item, None)))
+    # 先替换 / 与 \（以及其它 Windows 非法字符），再清洗控制字符/首尾点；
+    # 反过来做会按路径只保留最后一段，丢失「肿瘤/坏死」的前半段。
+    name = _sanitize_stem(
+        _WINDOWS_INVALID.sub("_", _label_of(item, None)))
     name = name[:40].strip()
     aid = item.get("annotation_id")
     aid8 = re.sub(r"[^A-Za-z0-9]", "", aid if isinstance(aid, str) else "")[:8]

@@ -811,3 +811,12 @@ def test_export_filename_single():
     assert export.export_filename(
         info, {"annotation_id": "ABC-def-123456", "label": "x"}) == \
         "病理切片 01_x_ABCdef12.geojson"
+
+
+def test_export_filename_single_keeps_slash_separated_label():
+    # 斜杠/反斜杠是 Windows 非法字符，必须换成 _ 而不是当路径截断
+    info = {"original_filename": "病理切片 01.svs"}
+    aid = "3f2a9c1e-8b7d-4c6a-9e5f-0123456789ab"
+    item = {"annotation_id": aid, "label": "肿瘤/坏死\\边缘"}
+    assert export.export_filename(info, item) == \
+        "病理切片 01_肿瘤_坏死_边缘_3f2a9c1e.geojson"

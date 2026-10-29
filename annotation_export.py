@@ -1,0 +1,435 @@
+# -*- coding: utf-8 -*-
+"""标注导出（QuPath 风格 GeoJSON）——纯函数模块，不依赖 Flask。
+
+输入契约：
+  - ``item``：/api/annotations 列表端点里的单条标注（已过
+    ``_decorate_annotation_items`` 的作者/能力投影与 ``public_roi_view``
+    白名单）；
+  - ``raw``：同一 annotation_id 的完整存储 dict（``share_store.get_roi_by_
+    annotation_id``；可为 None）。``raw`` 只用于读取列表投影不含的字段
+    （label/note/时间戳/provenance）——本模块**绝不**把 raw 整段输出。
+
+输出契约：QuPath 的 GeoJSON reader 读 ``FeatureCollection.features``，
+Feature ``id`` 按 UUID 解析为对象 ID，properties 认 objectType/name/color/
+classification/isLocked/measurements/metadata。因此：
+
+  - rect → Polygon（左上角起、顺时针闭合环）；
+  - polygon/freehand → Polygon（点列闭合）；arrow → LineString；
+  - 其余（tombstone/几何畸形/未知类型）→ None，由调用方计入 skipped；
+  - properties 只输出白名单字段：provider host、用户/会话/运行 id、
+    idempotency_key、snapshot/渲染指纹、revision/change_seq、visitor/token
+    等内部溯源字段永不导出。
+
+坐标一律为 PathTogether 所服务图像的 level-0 整数像素（x 向右、y 向下、
+原点左上）——与 QuPath/OpenSlide 打开同一文件时的 level-0 网格一致。
+"""
+from __future__ import annotations
+
+import math
+import os
+from datetime import datetime, timezone
+
+import annotation_access
+
+SCHEMA = "pathtogether.annotations.geojson/1"
+
+#: AI 标注的绘制色（与查看器一致：AI 恒橙色描边）
+AI_COLOR = (214, 108, 10)
+
+COORDINATE_SYSTEM = (
+    "level-0 pixel coordinates (x right, y down, origin top-left) of the "
+    "image as served by PathTogether; this is the QuPath / OpenSlide "
+    "level-0 grid"
+)
+
+_GEOMETRY_TYPES = ("rect", "arrow", "freehand", "polygon")
+
+
+# --------------------------------------------------------------------------- #
+# 基础工具
+# --------------------------------------------------------------------------- #
+def _is_number(value):
+    """有限数值（bool 不算数值：JSON true 不能当坐标）。"""
+    return (not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(value))
+
+
+def _point(value):
+    """[x, y] / (x, y) → 新 list；任一分量非法返回 None。"""
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    x, y = value
+    if not _is_number(x) or not _is_number(y):
+        return None
+    return [x, y]
+
+
+def _iso_utc(value):
+    """epoch 秒 → ISO-8601 UTC（...Z）；非法/缺失返回 None。"""
+    if not _is_number(value):
+        return None
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc) \
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _as_text(value):
+    """GeJSON properties/metadata 只放字符串或数字；本模块 metadata 全字符串。"""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def label_rgb(label):
+    """标注标签颜色 → [r, g, b]。
+
+    与 static/app.js ``labelColor`` 的哈希逐位一致：按 UTF-16 code unit
+    迭代（Python 用 utf-16-le 编码取 16 位小端单元），h = (h*31 + unit) >>> 0，
+    hue = h % 360，HSL(hue, 70%, 45%)。
+    """
+    units = str(label or "").encode("utf-16-le", "surrogatepass")
+    h = 0
+    for i in range(0, len(units), 2):
+        unit = units[i] | (units[i + 1] << 8)
+        h = (h * 31 + unit) & 0xFFFFFFFF
+    hue = (h % 360) / 360.0
+    return _hsl_to_rgb(hue, 0.70, 0.45)
+
+
+def _hsl_to_rgb(hue_frac, saturation, lightness):
+    c = (1.0 - abs(2.0 * lightness - 1.0)) * saturation
+    hp = (hue_frac % 1.0) * 6.0
+    x = c * (1.0 - abs(hp % 2.0 - 1.0))
+    if hp < 1:
+        r, g, b = c, x, 0.0
+    elif hp < 2:
+        r, g, b = x, c, 0.0
+    elif hp < 3:
+        r, g, b = 0.0, c, x
+    elif hp < 4:
+        r, g, b = 0.0, x, c
+    elif hp < 5:
+        r, g, b = x, 0.0, c
+    else:
+        r, g, b = c, 0.0, x
+    m = lightness - c / 2.0
+
+    def _byte(v):
+        return max(0, min(255, int(math.floor(v * 255.0 + 0.5))))
+
+    return [_byte(r + m), _byte(g + m), _byte(b + m)]
+
+
+# --------------------------------------------------------------------------- #
+# 几何
+# --------------------------------------------------------------------------- #
+def _closed_ring(points):
+    """点列 → 闭合环（首尾相同则原样，否则补首点）；非法返回 None。"""
+    out = []
+    for p in points:
+        pt = _point(p)
+        if pt is None:
+            return None
+        out.append(pt)
+    if len(out) < 3:
+        return None
+    if out[0] != out[-1]:
+        out.append(list(out[0]))
+    return out
+
+
+def _geometry_for(shape, item):
+    """标注 item → GeoJSON geometry；畸形容器返回 None。"""
+    if shape == "rect":
+        x, y = item.get("x"), item.get("y")
+        w = item.get("w")
+        h = item.get("h")
+        if w is None or h is None:
+            # 旧 v1 rect 只有 side_px（读兼容通常已补 w/h，这里再兜一层）
+            side = item.get("side_px")
+            if w is None:
+                w = side
+            if h is None:
+                h = side
+        if not all(_is_number(v) for v in (x, y, w, h)):
+            return None
+        if w <= 0 or h <= 0:
+            return None
+        return {
+            "type": "Polygon",
+            "coordinates": [[
+                [x, y],
+                [x + w, y],
+                [x + w, y + h],
+                [x, y + h],
+                [x, y],
+            ]],
+        }
+    if shape == "arrow":
+        vals = [item.get(k) for k in ("x1", "y1", "x2", "y2")]
+        if not all(_is_number(v) for v in vals):
+            return None
+        return {"type": "LineString", "coordinates": [[vals[0], vals[1]],
+                                                       [vals[2], vals[3]]]}
+    if shape in ("freehand", "polygon"):
+        points = item.get("points")
+        if not isinstance(points, (list, tuple)):
+            return None
+        ring = _closed_ring(points)
+        if ring is None:
+            return None
+        return {"type": "Polygon", "coordinates": [ring]}
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Feature 构建
+# --------------------------------------------------------------------------- #
+def _label_of(item, raw):
+    for source in (raw, item):
+        if isinstance(source, dict):
+            label = source.get("label")
+            if isinstance(label, str) and label:
+                return label
+    return ""
+
+
+def _provenance(raw):
+    if not isinstance(raw, dict):
+        return {}
+    prov = raw.get("provenance")
+    return prov if isinstance(prov, dict) else {}
+
+
+def _ai_skill(prov):
+    skill = prov.get("skill")
+    if isinstance(skill, str):
+        return skill
+    # 兼容旧口径：部分 AI 行把技能意图当技能名持久化
+    intent = prov.get("skill_intent")
+    return intent if isinstance(intent, str) else ""
+
+
+def _ai_model(prov):
+    model = prov.get("model")
+    return model if isinstance(model, str) else ""
+
+
+def _ai_contour_refined(prov):
+    refine = prov.get("contour_refine")
+    if isinstance(refine, dict):
+        return bool(refine.get("refined"))
+    return False
+
+
+def build_feature(item, raw=None):
+    """单条标注 → GeoJSON Feature；tombstone/几何畸形 → None。"""
+    if not isinstance(item, dict) or item.get("deleted"):
+        return None
+    shape = item.get("type")
+    if shape not in _GEOMETRY_TYPES:
+        return None
+    geometry = _geometry_for(shape, item)
+    if geometry is None:
+        return None
+
+    aid = item.get("annotation_id")
+    aid = aid if isinstance(aid, str) and aid else ""
+    slide_id = item.get("slide_id")
+    if not isinstance(slide_id, str):  # raw 回填可能来自列
+        slide_id = (raw or {}).get("slide_id") if isinstance(raw, dict) else ""
+    slide_id = slide_id if isinstance(slide_id, str) else ""
+
+    label = _label_of(item, raw)
+    source = ""
+    for holder in (item, raw):
+        if isinstance(holder, dict) and isinstance(holder.get("source"), str):
+            source = holder.get("source")
+            break
+    if not source:
+        source = "human"
+    review_status = ""
+    for holder in (item, raw):
+        if isinstance(holder, dict) and isinstance(holder.get("review_status"),
+                                                   str):
+            review_status = holder.get("review_status")
+            break
+    if not review_status:
+        review_status = "none"
+    note = ""
+    for holder in (item, raw):
+        if isinstance(holder, dict) and isinstance(holder.get("note"), str):
+            note = holder.get("note")
+            break
+    created_ts = raw.get("ts") if isinstance(raw, dict) else None
+    if not _is_number(created_ts):
+        created_ts = item.get("ts")
+    updated_ts = raw.get("updated_at") if isinstance(raw, dict) else None
+    if not _is_number(updated_ts):
+        updated_ts = created_ts
+    created_at = _iso_utc(created_ts)
+    updated_at = _iso_utc(updated_ts)
+
+    ai_generated = (annotation_access.is_ai_generated(raw)
+                    if isinstance(raw, dict) else source == "ai")
+    if source == "ai" and not isinstance(raw, dict):
+        ai_generated = True
+
+    geometry_locked = bool(item.get("geometry_locked"))
+    if not geometry_locked and isinstance(raw, dict):
+        geometry_locked = bool(raw.get("geometry_locked"))
+
+    author_kind = item.get("author_kind")
+    author_kind = author_kind if isinstance(author_kind, str) else "unknown"
+    author_label = item.get("author_label_safe")
+    author_label = author_label if isinstance(author_label, str) else ""
+
+    lrgb = label_rgb(label)
+    prov = _provenance(raw)
+    skill = _ai_skill(prov)
+    model = _ai_model(prov)
+    refined = _ai_contour_refined(prov)
+
+    props = {
+        "objectType": "annotation",
+        "name": label,
+    }
+    if label:
+        # QuPath 用 ASCII ":" 构造派生类；改用全角冒号保留原标签语义
+        props["classification"] = {
+            "name": label.replace(":", "："),
+            "color": list(lrgb),
+        }
+    props["color"] = list(AI_COLOR) if ai_generated else list(lrgb)
+    props["isLocked"] = bool(geometry_locked)
+
+    metadata = {}
+
+    def _meta(key, value):
+        if value is None:
+            return
+        metadata[key] = _as_text(value)
+
+    _meta("annotation_id", aid or None)
+    _meta("slide_id", slide_id or None)
+    _meta("source", source)
+    _meta("review_status", review_status)
+    _meta("label", label)
+    if note:
+        _meta("note", note)
+    _meta("shape", shape)
+    _meta("created_at", created_at)
+    _meta("updated_at", updated_at)
+    _meta("author_kind", author_kind)
+    if ai_generated:
+        _meta("ai_skill", skill)
+        _meta("ai_model", model)
+        _meta("ai_contour_refined", refined)
+    props["metadata"] = metadata
+
+    # 扁平字段：pandas / GIS 用户无需展开 metadata 即可取用
+    props["annotation_id"] = aid
+    props["shape"] = shape
+    props["source"] = source
+    props["ai_generated"] = bool(ai_generated)
+    props["review_status"] = review_status
+    props["label"] = label
+    props["note"] = note
+    if created_at is not None:
+        props["created_at"] = created_at
+    if updated_at is not None:
+        props["updated_at"] = updated_at
+    props["author_kind"] = author_kind
+    props["author_label"] = author_label
+    if ai_generated:
+        props["ai"] = {
+            "skill": skill,
+            "model": model,
+            "contour_refined": refined,
+        }
+
+    feature = {
+        "type": "Feature",
+        "geometry": geometry,
+        "properties": props,
+    }
+    if aid:
+        feature["id"] = aid
+    return feature
+
+
+def build_feature_collection(items, raw_by_id, slide_info, exported_at):
+    """列表 items（保持顺序）+ 原始 dict 映射 → QuPath 可导入的 FeatureCollection。"""
+    raw_by_id = raw_by_id or {}
+    slide_info = slide_info or {}
+    features = []
+    ai_count = 0
+    skipped = 0
+    for item in items or []:
+        if not isinstance(item, dict):
+            skipped += 1
+            continue
+        aid = item.get("annotation_id")
+        raw = raw_by_id.get(aid) if isinstance(aid, str) and aid else None
+        feature = build_feature(item, raw)
+        if feature is None:
+            skipped += 1
+            continue
+        features.append(feature)
+        if feature["properties"].get("ai_generated"):
+            ai_count += 1
+    slide = {
+        "slide_id": slide_info.get("slide_id"),
+        "name": (slide_info.get("display_name")
+                 or slide_info.get("original_filename")
+                 or slide_info.get("name") or ""),
+        "width": slide_info.get("width"),
+        "height": slide_info.get("height"),
+        "mpp_x": slide_info.get("mpp_x"),
+        "mpp_y": slide_info.get("mpp_y"),
+        "mpp_source": slide_info.get("mpp_source"),
+    }
+    return {
+        "type": "FeatureCollection",
+        "features": features,
+        "pathtogether": {
+            "schema": SCHEMA,
+            "exported_at": exported_at,
+            "slide": slide,
+            "coordinate_system": COORDINATE_SYSTEM,
+            "feature_count": len(features),
+            "ai_feature_count": ai_count,
+            "skipped": skipped,
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 文件名
+# --------------------------------------------------------------------------- #
+def _sanitize_stem(value):
+    """文件名 stem 清洗：去路径分隔符/控制字符，保留中文与可见标点。"""
+    text = str(value or "")
+    # 只取路径最后一段（同时处理 / 与 \）
+    text = text.replace("\\", "/").split("/")[-1]
+    text = "".join(ch for ch in text
+                   if ord(ch) >= 32 and ord(ch) != 127)
+    return text.strip().strip(".").strip()
+
+
+def export_filename(slide_info):
+    """``<stem>_annotations.geojson``；无可用名称时回退 ``slide_<slide_id>``。"""
+    info = slide_info or {}
+    raw = info.get("original_filename") or info.get("display_name") or ""
+    stem = os.path.splitext(_sanitize_stem(raw))[0].strip().strip(".").strip()
+    if not stem:
+        sid = _sanitize_stem(info.get("slide_id") or "")
+        stem = "slide_%s" % sid if sid else "slide"
+    return stem + "_annotations.geojson"

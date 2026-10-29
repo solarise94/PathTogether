@@ -54,6 +54,7 @@ from PIL import Image
 import requests
 
 import annotation_access
+import annotation_export
 import pg_store
 import share_store
 import share_shared
@@ -26376,6 +26377,18 @@ def api_project_unarchive(pid):
     return jsonify(proj)
 
 
+def _decorated_slide_annotations(desc, subject):
+    """按 slide_id 取本资产标注组并做作者/能力投影（列表与导出的共用口径）。
+
+    P3（合同 §1.2）：annotations_by_slide 分组键已切 slide_id——按 ID 取组，
+    同名 id_bundle 资产互不串（NULL-ID 历史行回落名组）。
+    """
+    by_slide = share_store.annotations_by_slide(subject=subject)
+    key = desc.legacy_filename or desc.original_filename or ""
+    groups = by_slide.get(desc.slide_id) or by_slide.get(key) or []
+    return _decorate_annotation_items({key: groups}, subject)[key]
+
+
 def _decorate_annotation_items(by_slide, subject):
     """标注分组 items 附加 author/capability 字段（工单 A：people 口径 +
     前端能力位）。就地修改并返回 by_slide。
@@ -26541,13 +26554,100 @@ def api_slide_annotations_by_id(slide_id):
     if err is not None:
         return err
     subject = annotation_access.subject_from_request()
-    by_slide = share_store.annotations_by_slide(subject=subject)
-    key = desc.legacy_filename or desc.original_filename or ""
-    groups = by_slide.get(desc.slide_id) or by_slide.get(key) or []
     return jsonify({"slide_id": desc.slide_id,
                     "slide": desc.legacy_filename or "",
-                    "annotations": _decorate_annotation_items(
-                        {key: groups}, subject)[key]})
+                    "annotations": _decorated_slide_annotations(desc, subject)})
+
+
+def _annotation_export_slide_info(desc):
+    """导出头部 slide 元数据；文件元数据读取失败时仍按资产行导出。"""
+    try:
+        info = _slide_info_dict_desc(desc)
+    except Exception:  # noqa: BLE001 - 元数据不是导出前提（几何在 DB）
+        app.logger.warning("标注导出：切片元数据读取失败：%s", desc.slide_id,
+                           exc_info=True)
+        info = {}
+    name = (info.get("display_name") or desc.display_name
+            or desc.original_filename or desc.legacy_filename or "")
+    return {
+        "slide_id": desc.slide_id,
+        "name": name,
+        "display_name": name,
+        "original_filename": (desc.original_filename or desc.legacy_filename
+                              or ""),
+        "width": info.get("width"),
+        "height": info.get("height"),
+        "mpp_x": info.get("mpp_x"),
+        "mpp_y": info.get("mpp_y"),
+        "mpp_source": info.get("mpp_source"),
+    }
+
+
+def _annotation_export_raw_rois(items):
+    """只为**已按主体过滤**的 items 读取原始 dict（含 provenance）。
+
+    导出输出经 annotation_export 白名单投影；原始 dict 仅用于补列表端点
+    不返回的 label/note/时间戳/AI 溯源。并发删除的行（tombstone）按缺失
+    处理（不把已删行带进导出）。
+    """
+    out = {}
+    for item in items:
+        aid = item.get("annotation_id") if isinstance(item, dict) else None
+        if not isinstance(aid, str) or not aid:
+            continue
+        try:
+            raw = share_store.get_roi_by_annotation_id(aid)
+        except Exception:  # noqa: BLE001 - 单行读取失败降级为公共字段
+            app.logger.warning("标注导出：原始标注读取失败：%s", aid,
+                               exc_info=True)
+            raw = None
+        if (not isinstance(raw, dict) or raw.get("deleted")
+                or raw.get("annotation_id") != aid):
+            raw = None
+        out[aid] = raw
+    return out
+
+
+@app.route("/api/slides/<slide_id>/annotations/export")
+def api_slide_annotations_export(slide_id):
+    """导出当前用户可见的切片标注（QuPath 风格 GeoJSON，附件下载）。
+
+    门禁/过滤与 ``api_slide_annotations_by_id`` 完全同源：ID 解析 + 读授权
+    → subject 推导 → annotations_by_slide(subject) 的标注级可见性 → 同一
+    作者/能力投影。因此导出内容恒等于该用户列表端点可见的标注集合，绝不
+    因导出通道放大可见性。
+
+    QuPath 映射见 annotation_export 模块：rect/polygon/freehand → Polygon，
+    arrow → LineString；properties 只含白名单（objectType/name/
+    classification/color/isLocked/metadata + 扁平字段）。
+    """
+    desc, err = _authorize_id_read(slide_id)
+    if err is not None:
+        return err
+    fmt = (request.args.get("format") or "geojson").strip().lower()
+    if fmt != "geojson":
+        return jsonify(error="format 仅支持 geojson",
+                       code="unsupported_format"), 400
+    subject = annotation_access.subject_from_request()
+    groups = _decorated_slide_annotations(desc, subject)
+    items = [item for group in groups for item in group.get("items", [])]
+    slide_info = _annotation_export_slide_info(desc)
+    collection = annotation_export.build_feature_collection(
+        items, _annotation_export_raw_rois(items), slide_info,
+        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    buf = io.BytesIO(
+        json.dumps(collection, ensure_ascii=False).encode("utf-8"))
+    buf.seek(0)
+    resp = send_file(
+        buf,
+        mimetype="application/geo+json",
+        as_attachment=True,
+        download_name=annotation_export.export_filename(slide_info),
+    )
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["X-Annotation-Count"] = str(
+        collection["pathtogether"]["feature_count"])
+    return resp
 
 
 # --------------------------------------------------------------------------- #

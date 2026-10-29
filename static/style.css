@@ -1952,6 +1952,27 @@ button {
   background: var(--accent-fill);
   opacity: 1;
 }
+/* 面板头部内联 SVG（导出按钮）：与工具条图标同一描边风格 */
+.panel-eye-btn .panel-btn-svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+/* 禁用态（无当前 slide_id）：肉眼可见且不响应悬停底色 */
+.panel-eye-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.panel-eye-btn:disabled:hover {
+  background: transparent;
+  color: var(--text-3);
+  opacity: 0.35;
+}
 .anno-panel-title {
   white-space: nowrap;
   overflow: hidden;

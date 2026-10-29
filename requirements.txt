@@ -3,7 +3,7 @@ pillow
 openslide-python
 openslide-bin
 # TIFF reader 与 Zarr store 协议成对升级；避免新旧 store API 混搭。
-tifffile==2026.9.20
+tifffile==2026.10.15
 zarr>=3.4.1,<4
 # 与 tifffile 2026.9.20 的 codecs extra 最低要求一致，保护增量安装。
 imagecodecs>=2026.8.16

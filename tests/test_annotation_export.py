@@ -348,6 +348,39 @@ def test_ai_feature_colour_and_ai_block():
     assert props2["color"] == [214, 108, 10]
 
 
+def test_historical_ai_labelled_human_rows_export_as_human():
+    # 2026-10-19 前工作台存量：人工标注落库 source=ai，无 AI 会话/溯源
+    item = {"annotation_id": "h-1", "slide_id": "sld_1", "type": "freehand",
+            "points": [[0, 0], [10, 0], [5, 10]], "source": "ai",
+            "review_status": "accepted", "author_kind": "user"}
+    raw = dict(item, label="肿瘤", created_by_session_id="", ts=1756857600)
+    props = _feature_props(export.build_feature(item, raw))
+    assert props["source"] == "human"
+    assert props["metadata"]["source"] == "human"
+    assert props["ai_generated"] is False
+    assert "ai" not in props
+    assert not any(k.startswith("ai_") for k in props["metadata"])
+    assert props["color"] == export.label_rgb("肿瘤")
+    assert props["review_status"] == "accepted"
+
+    # 同一行带 AI 会话（无 provenance）即为真 AI 产出
+    props_ai = _feature_props(export.build_feature(
+        item, dict(raw, created_by_session_id="sess_abc")))
+    assert props_ai["source"] == "ai"
+    assert props_ai["ai_generated"] is True
+    assert props_ai["color"] == [214, 108, 10]
+    assert "ai" in props_ai
+
+    # 混合导出：AI 计数只算真 AI 行
+    collection = export.build_feature_collection(
+        [item, dict(item, annotation_id="h-2")],
+        {"h-1": raw,
+         "h-2": dict(raw, annotation_id="h-2",
+                     created_by_session_id="sess_abc")},
+        {"slide_id": "sld_1"}, "2026-10-29T00:00:00Z")
+    assert collection["pathtogether"]["ai_feature_count"] == 1
+
+
 def test_ai_provenance_never_exported():
     forbidden = {
         "provider": "FORBIDDEN_PROVIDER_HOST",

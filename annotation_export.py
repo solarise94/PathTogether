@@ -279,8 +279,9 @@ def build_feature(item, raw=None):
 
     ai_generated = (annotation_access.is_ai_generated(raw)
                     if isinstance(raw, dict) else source == "ai")
-    if source == "ai" and not isinstance(raw, dict):
-        ai_generated = True
+    # source 跟随平台 AI 判定：2026-10-19 前工作台把人工标注存为 source=ai
+    # 且无 AI 会话/溯源，这类行按人工导出
+    source = "ai" if ai_generated else "human"
 
     geometry_locked = bool(item.get("geometry_locked"))
     if not geometry_locked and isinstance(raw, dict):

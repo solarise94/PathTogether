@@ -35,7 +35,7 @@
 Feature `id` = 平台 `annotation_id`（UUID，QuPath 用作对象 ID）。`properties`：
 
 - QuPath 读取的字段：`objectType: "annotation"`；`name` = 标签；`classification: {name, color}`，name 为标签（ASCII `:` 换成全角 `：`，避免 QuPath 生成派生类），color 与查看器的标签哈希色一致；`color` 为对象颜色，AI 结果恒为橙色 `[214,108,10]`，其余同标签色；`isLocked` = 平台位置锁；`metadata` 为全字符串键值，导入 QuPath 后保留在对象上，可随 QuPath 再导出。
-- 扁平字段（便于 pandas/GeoPandas）：`annotation_id`、`shape`、`source`（`ai`/`human`）、`ai_generated`、`review_status`（`none`/`pending`/`accepted`/`rejected`）、`label`、`note`、`created_at`/`updated_at`（ISO-8601 UTC）、`author_kind`、`author_label`。
+- 扁平字段（便于 pandas/GeoPandas）：`annotation_id`、`shape`、`source`（`ai`/`human`）、`ai_generated`、`review_status`（`none`/`pending`/`accepted`/`rejected`）、`label`、`note`、`created_at`/`updated_at`（ISO-8601 UTC）、`author_kind`、`author_label`。`source` 跟随平台的 AI 判定：只有带 AI 会话或溯源记录的标注才是 `ai`；2026-10-19 前工作台保存的人工标注在库中存为 AI 来源（查看器仍按 AI 样式显示），导出时一律输出为 `human` 且 `ai_generated: false`。
 - AI 结果另有 `ai: {skill, model, contour_refined}`（如 `skill: "delineate"` 表示描绘可疑区域，`contour_refined` 表示经过轮廓精修），并同步写入 metadata 的 `ai_skill`/`ai_model`/`ai_contour_refined`。
 
 导出走白名单。provider 主机、用户/会话/运行 ID、幂等键、快照 ID 与框、渲染指纹、revision/change_seq、历史、访客哈希、分享 token 等内部溯源字段一律不导出。

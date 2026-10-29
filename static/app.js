@@ -3896,6 +3896,8 @@
   // 导出当前用户在当前切片上可见的标注：服务端与 /api/annotations 列表
   // 端点共用同一读门禁与标注级过滤，导出不会放大可见范围。
   var annoExportBusy = false;
+  // 单条导出：按 annotation_id 记忙碌，重复点击（含重渲染前的旧按钮）忽略
+  var annoExportOneBusy = {};
 
   function annoExportStem() {
     var s = state.slide || {};
@@ -3907,7 +3909,8 @@
     return base || (s.id ? "slide_" + String(s.id) : "slide");
   }
 
-  function annoExportFilename(disposition) {
+  // 解析 Content-Disposition；没有可用文件名时返回 null（调用方决定回退名）
+  function _annoExportFilename(disposition) {
     if (disposition) {
       // RFC 5987 filename*（中文名走该形态）；解码失败回落默认名
       var m = /filename\*\s*=\s*utf-8''([^;]+)/i.exec(disposition);
@@ -3920,7 +3923,32 @@
         /filename\s*=\s*([^;]+)/i.exec(disposition);
       if (m && m[1].trim()) return m[1].trim();
     }
-    return annoExportStem() + "_annotations.geojson";
+    return null;
+  }
+
+  function annoExportFilename(disposition) {
+    return _annoExportFilename(disposition) ||
+      (annoExportStem() + "_annotations.geojson");
+  }
+
+  function annoExportError(res) {
+    return res.json().catch(function () { return {}; }).then(function (j) {
+      throw new Error((j && j.error) || ("HTTP " + res.status));
+    });
+  }
+
+  // 头部整片导出与行内单条导出共用的下载步骤（blob → 临时 <a download>）
+  function downloadAnnoExport(res, fname) {
+    return res.blob().then(function (blob) {
+      var a = document.createElement("a");
+      var objUrl = URL.createObjectURL(blob);
+      a.href = objUrl;
+      a.download = fname;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function () { URL.revokeObjectURL(objUrl); }, 1000);
+    });
   }
 
   function syncAnnoExportBtn() {
@@ -3937,26 +3965,14 @@
     syncAnnoExportBtn();
     return apiFetch("/api/slides/" + encodeURIComponent(sid) + "/annotations/export")
       .then(function (res) {
-        if (!res.ok) {
-          return res.json().catch(function () { return {}; }).then(function (j) {
-            throw new Error((j && j.error) || ("HTTP " + res.status));
-          });
-        }
+        if (!res.ok) return annoExportError(res);
         var n = parseInt(res.headers.get("X-Annotation-Count") || "0", 10);
         if (!(n > 0)) {
           toast(t("anno.export.empty"), "info");
           return null;
         }
         var fname = annoExportFilename(res.headers.get("Content-Disposition"));
-        return res.blob().then(function (blob) {
-          var a = document.createElement("a");
-          var objUrl = URL.createObjectURL(blob);
-          a.href = objUrl;
-          a.download = fname;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-          setTimeout(function () { URL.revokeObjectURL(objUrl); }, 1000);
+        return downloadAnnoExport(res, fname).then(function () {
           toast(t("anno.export.done", { n: n }), "success");
         });
       })
@@ -3966,6 +3982,36 @@
       .finally(function () {
         annoExportBusy = false;
         syncAnnoExportBtn();
+      });
+  }
+
+  // 导出单条标注（annotation_id 参数）；文件名优先取响应头，回退
+  // <切片 stem>_<标注名>.geojson。
+  function annoExportOne(it, label, btn) {
+    var aid = it && it.annotation_id;
+    if (!aid || annoExportOneBusy[aid]) return;
+    var sid = (slideIdApiOn() && state.slide && state.slide.id) || "";
+    if (!sid) return;
+    annoExportOneBusy[aid] = true;
+    if (btn) btn.disabled = true;
+    var fallback = annoExportStem() + (label ? "_" + label : "") + ".geojson";
+    return apiFetch("/api/slides/" + encodeURIComponent(sid) +
+        "/annotations/export?annotation_id=" + encodeURIComponent(aid))
+      .then(function (res) {
+        if (!res.ok) return annoExportError(res);
+        var fname = _annoExportFilename(
+          res.headers.get("Content-Disposition")) || fallback;
+        return downloadAnnoExport(res, fname).then(function () {
+          toast(t("anno.export.one.done",
+            { name: truncateMiddle(label, 24) }), "success");
+        });
+      })
+      .catch(function (e) {
+        toast(t("anno.export.fail", { s: (e && e.message) || "?" }), "error");
+      })
+      .finally(function () {
+        delete annoExportOneBusy[aid];
+        if (btn) btn.disabled = false;
       });
   }
 
@@ -9816,8 +9862,11 @@
     annoPanelOpen = true;
     els.annoPanel.style.display = "flex";
     // P2 合同 §5.4：面板标题主显示 display_name（旧 DTO 回落 name）
+    var panelName = slideDisplayName(state.slide) || state.slide.name || "";
     els.annoPanelTitle.textContent = t("anno.panel.title.with", {
-      name: truncateMiddle(slideDisplayName(state.slide) || state.slide.name, 28) });
+      name: truncateMiddle(panelName, 28) });
+    // 标题单行省略；悬停看完整切片名
+    els.annoPanelTitle.title = panelName;
     if (annoListError) {
       // 当前切片列表从未加载成功：显式错误态 + 重试（绝不冒充「暂无标注」）
       renderAnnoPanelError();
@@ -9932,6 +9981,24 @@
         if (it.annotation_id) {
           var annoAid = it.annotation_id;
           buildAnnoAiActions(row, annoAid, "op");
+
+          // 单条导出（ID 通道就绪时）：紧跟「加入 AI 对话」，与头部导出同图标
+          if (slideIdApiOn() && state.slide && state.slide.id) {
+            var exportBtn = document.createElement("button");
+            exportBtn.type = "button";
+            exportBtn.className = "ai-op ai-export";
+            exportBtn.title = t("anno.export.one.title");
+            exportBtn.setAttribute("aria-label", t("anno.export.one.title"));
+            exportBtn.innerHTML =
+              '<svg class="ai-act-svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false">' +
+              '<path d="M12 4v11"/><path d="m7.5 10.5 4.5 4.5 4.5-4.5"/><path d="M5 19h14"/></svg>' +
+              '<span class="ai-act-tx">' + esc(t("anno.export.one")) + "</span>";
+            exportBtn.addEventListener("click", function (ev) {
+              ev.stopPropagation();
+              annoExportOne(it, grp.label, exportBtn);
+            });
+            row.appendChild(exportBtn);
+          }
         }
 
         // 编辑钮：跳转到该标注并进入选中编辑态

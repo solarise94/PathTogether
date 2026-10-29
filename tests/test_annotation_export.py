@@ -18,6 +18,7 @@
 import json
 import os
 import sys
+import urllib.parse
 from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
@@ -630,3 +631,192 @@ def test_unsupported_format_400():
     ok = client.get(
         "/api/slides/%s/annotations/export?format=geojson" % sid)
     assert ok.status_code == 200
+
+
+# =========================================================================== #
+# 4. 单条导出
+# =========================================================================== #
+def _post_polygon(client, sid, points=None, label="人工多边形"):
+    points = points or [[100, 100], [900, 120], [500, 800]]
+    return client.post("/api/annotation", json={
+        "slide_id": sid, "type": "polygon", "points": points,
+        "label": label, "note": "poly note",
+    })
+
+
+def _owner_slide(name="single.svs"):
+    owner = _setup_owner()
+    sid = _touch(name)
+    share_store.set_slide_meta(name, owner_user_id=owner["user_id"])
+    client = _client()
+    _login(client)
+    return owner, sid, client
+
+
+def test_single_export_one_feature_and_filename():
+    _owner, sid, client = _owner_slide()
+    rect = _post_human_rect(client, sid, label="单条矩形")
+    assert rect.status_code == 200, rect.get_data(as_text=True)
+    poly = _post_polygon(client, sid, label="AI: 病灶")
+    assert poly.status_code == 200, poly.get_data(as_text=True)
+    aid = poly.get_json()["annotation_id"]
+    assert aid
+    rect_id = rect.get_json()["annotation_id"]
+    assert aid != rect_id
+
+    r = client.get("/api/slides/%s/annotations/export?annotation_id=%s"
+                   % (sid, aid))
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert r.headers["Content-Type"].startswith("application/geo+json")
+    assert r.headers.get("Cache-Control") == "no-store"
+    assert r.headers.get("X-Annotation-Count") == "1"
+    cd = r.headers.get("Content-Disposition", "")
+    assert "attachment" in cd
+    assert "filename*=UTF-8''" in cd
+    # 文件名 = <切片 stem>_<标注名>_<id 前 8 位>.geojson
+    encoded = cd.split("filename*=UTF-8''", 1)[1].strip().strip('"')
+    assert urllib.parse.unquote(encoded) == \
+        "single_AI_ 病灶_%s.geojson" % aid[:8]
+
+    body = json.loads(r.get_data(as_text=True))
+    assert body["type"] == "FeatureCollection"
+    assert body["pathtogether"]["feature_count"] == 1
+    assert body["pathtogether"]["skipped"] == 0
+    assert body["pathtogether"]["annotation_id"] == aid
+    assert len(body["features"]) == 1
+    feature = body["features"][0]
+    assert feature["id"] == aid
+    assert feature["geometry"] == {
+        "type": "Polygon",
+        "coordinates": [[[100, 100], [900, 120], [500, 800], [100, 100]]],
+    }
+    assert _feature_props(feature)["name"] == "AI: 病灶"
+    assert sid not in (rect_id,)
+
+    # 整片导出仍是两条，且不新增 pathtogether.annotation_id
+    whole = client.get("/api/slides/%s/annotations/export" % sid)
+    assert whole.status_code == 200
+    assert whole.headers.get("X-Annotation-Count") == "2"
+    whole_body = json.loads(whole.get_data(as_text=True))
+    assert "annotation_id" not in whole_body["pathtogether"]
+
+
+def test_single_export_unknown_id_404():
+    _owner, sid, client = _owner_slide()
+    r = client.get("/api/slides/%s/annotations/export?annotation_id=%s"
+                   % (sid, "does-not-exist"))
+    assert r.status_code == 404
+    assert r.get_json() == {
+        "error": "标注不存在或无权查看", "code": "annotation_not_found"}
+
+
+def test_single_export_peer_private_annotation_404():
+    owner = _setup_owner()
+    sid = _touch("public-single.svs")
+    share_store.set_slide_meta("public-single.svs",
+                               owner_user_id=owner["user_id"], public=True)
+    owner_client = _client()
+    _login(owner_client)
+    created = _post_human_rect(owner_client, sid, label="owner private")
+    assert created.status_code == 200, created.get_data(as_text=True)
+    aid = created.get_json()["annotation_id"]
+
+    _setup_peer()
+    peer_client = _client()
+    _login(peer_client, "peer@x.com", "peerpass1234567")
+    # 切片可读，但该条私有标注不在 peer 的可见集合里
+    assert peer_client.get(
+        "/api/annotations?slide_id=%s" % sid).status_code == 200
+    r = peer_client.get("/api/slides/%s/annotations/export?annotation_id=%s"
+                        % (sid, aid))
+    assert r.status_code == 404
+    assert r.get_json().get("code") == "annotation_not_found"
+
+
+def test_single_export_invisible_slide_same_as_list():
+    owner = _setup_owner()
+    sid = _touch("private-single.svs")
+    share_store.set_slide_meta("private-single.svs",
+                               owner_user_id=owner["user_id"])
+    _setup_peer()
+    peer_client = _client()
+    _login(peer_client, "peer@x.com", "peerpass1234567")
+    listed = peer_client.get("/api/annotations?slide_id=%s" % sid)
+    exported = peer_client.get(
+        "/api/slides/%s/annotations/export?annotation_id=%s"
+        % (sid, "whatever"))
+    assert listed.status_code == 403
+    assert exported.status_code == listed.status_code
+    assert exported.get_json() == listed.get_json()
+
+
+def test_single_export_invalid_annotation_id_400():
+    _owner, sid, client = _owner_slide()
+    cases = ["", "   ", "x" * 129, "bad\x01id"]
+    for value in cases:
+        r = client.get("/api/slides/%s/annotations/export" % sid,
+                       query_string={"annotation_id": value})
+        assert r.status_code == 400, value
+        assert r.get_json() == {
+            "error": "annotation_id 无效", "code": "invalid_annotation_id"}
+
+    # format 校验仍在 annotation_id 之前
+    r = client.get("/api/slides/%s/annotations/export" % sid,
+                   query_string={"format": "xml",
+                                 "annotation_id": "bad\x01id"})
+    assert r.status_code == 400
+    assert r.get_json().get("code") == "unsupported_format"
+
+
+def test_single_export_bad_geometry_422(monkeypatch):
+    _owner, sid, client = _owner_slide()
+    created = _post_human_rect(client, sid, label="坏几何")
+    assert created.status_code == 200, created.get_data(as_text=True)
+    aid = created.get_json()["annotation_id"]
+
+    monkeypatch.setattr(export, "build_feature", lambda *a, **k: None)
+    r = client.get("/api/slides/%s/annotations/export?annotation_id=%s"
+                   % (sid, aid))
+    assert r.status_code == 422
+    assert r.get_json() == {
+        "error": "该标注的几何数据不完整，无法导出",
+        "code": "annotation_not_exportable"}
+
+
+def test_export_filename_single():
+    info = {"original_filename": "病理切片 01.svs"}
+    aid = "3f2a9c1e-8b7d-4c6a-9e5f-0123456789ab"
+    item = {"annotation_id": aid, "label": "肿瘤: 高级别"}
+    assert export.export_filename(info) == "病理切片 01_annotations.geojson"
+    assert export.export_filename(info, None) == \
+        "病理切片 01_annotations.geojson"
+    assert export.export_filename(info, item) == \
+        "病理切片 01_肿瘤_ 高级别_3f2a9c1e.geojson"
+
+    # Windows 非法字符逐个换成 _
+    bad = {"annotation_id": aid, "label": 'bad<>:"|?*name'}
+    assert export.export_filename(info, bad) == \
+        "病理切片 01_bad_______name_3f2a9c1e.geojson"
+
+    # 标注名为空 → <stem>_annotation_<id8>.geojson
+    assert export.export_filename({}, {"annotation_id": aid, "label": ""}) == \
+        "slide_annotation_3f2a9c1e.geojson"
+
+    # 超长名截到 40 字符
+    long_item = {"annotation_id": aid, "label": "名" * 50}
+    assert export.export_filename(info, long_item) == \
+        "病理切片 01_" + "名" * 40 + "_3f2a9c1e.geojson"
+
+    # id 只保留字母数字再取前 8 位
+    assert export.export_filename(
+        info, {"annotation_id": "ABC-def-123456", "label": "x"}) == \
+        "病理切片 01_x_ABCdef12.geojson"
+
+
+def test_export_filename_single_keeps_slash_separated_label():
+    # 斜杠/反斜杠是 Windows 非法字符，必须换成 _ 而不是当路径截断
+    info = {"original_filename": "病理切片 01.svs"}
+    aid = "3f2a9c1e-8b7d-4c6a-9e5f-0123456789ab"
+    item = {"annotation_id": aid, "label": "肿瘤/坏死\\边缘"}
+    assert export.export_filename(info, item) == \
+        "病理切片 01_肿瘤_坏死_边缘_3f2a9c1e.geojson"

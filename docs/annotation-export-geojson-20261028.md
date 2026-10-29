@@ -9,6 +9,16 @@
 - 权限与 `GET /api/slides/<slide_id>/annotations` 完全同源：同一读授权、同一标注级可见性过滤、同一作者投影。导出内容恒等于该用户在标注列表里看得到的集合，导出通道不放大可见范围；原始行只为已可见的 `annotation_id` 读取。
 - 响应：UTF-8 `application/geo+json` 附件，文件名 `<原始文件名去扩展名>_annotations.geojson`（中文名按 RFC 5987 `filename*`），`Cache-Control: no-store`，`X-Annotation-Count: <条数>`。与裁剪等其他下载一致，不写审计事件。
 
+## 1.1 单条导出
+
+标注面板每条标注右侧另有「导出」按钮，只下载这一条：
+
+- 参数：`GET /api/slides/<slide_id>/annotations/export?annotation_id=<id>`。不带 `annotation_id` 时仍是整片导出（输出不变）。
+- 权限与可见集合和整片导出完全相同：先过切片读门禁，再从该用户可见的标注 items 里按 `annotation_id` 精确匹配。查不到时统一返回 404（不区分「不存在」与「无权查看」）；切片本身不可读时返回与标注列表端点相同的错误。
+- 错误码：`annotation_id` 为空/全空白、超过 128 字符或含控制字符 → 400 `invalid_annotation_id`；不在可见集合 → 404 `annotation_not_found`；该条几何无法生成 Feature → 422 `annotation_not_exportable`。`format` 校验（400 `unsupported_format`）仍在最前。
+- 成功时响应结构同整片导出，但只含这一条 Feature，`X-Annotation-Count: 1`，`pathtogether` 额外带 `annotation_id`（整片导出没有该键）。
+- 文件名：`<原始文件名去扩展名>_<标注名>_<annotation_id 前 8 位>.geojson`；标注名先做与整片导出相同的文件名清洗，再把 Windows 不允许的 `<>:"/\|?*` 换成 `_` 并截到 40 字符；标注名为空时 `<stem>_annotation_<id8>.geojson`。
+
 ## 2. 坐标系
 
 坐标是 PathTogether 所服务图像的 **level-0 整数像素**：x 向右、y 向下、原点在左上角。这就是 QuPath 和 OpenSlide 打开同一文件时的 level-0 网格，导入时不需要换算。

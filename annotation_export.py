@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from datetime import datetime, timezone
 
 import annotation_access
@@ -366,8 +367,13 @@ def build_feature(item, raw=None):
     return feature
 
 
-def build_feature_collection(items, raw_by_id, slide_info, exported_at):
-    """列表 items（保持顺序）+ 原始 dict 映射 → QuPath 可导入的 FeatureCollection。"""
+def build_feature_collection(items, raw_by_id, slide_info, exported_at, *,
+                             annotation_id=None):
+    """列表 items（保持顺序）+ 原始 dict 映射 → QuPath 可导入的 FeatureCollection。
+
+    ``annotation_id`` 仅供单条导出：非空时在 ``pathtogether`` 成员里记录该
+    标注 id；整片导出不传，输出与旧版逐字节一致。
+    """
     raw_by_id = raw_by_id or {}
     slide_info = slide_info or {}
     features = []
@@ -397,18 +403,21 @@ def build_feature_collection(items, raw_by_id, slide_info, exported_at):
         "mpp_y": slide_info.get("mpp_y"),
         "mpp_source": slide_info.get("mpp_source"),
     }
+    export_meta = {
+        "schema": SCHEMA,
+        "exported_at": exported_at,
+        "slide": slide,
+        "coordinate_system": COORDINATE_SYSTEM,
+        "feature_count": len(features),
+        "ai_feature_count": ai_count,
+        "skipped": skipped,
+    }
+    if annotation_id:
+        export_meta["annotation_id"] = annotation_id
     return {
         "type": "FeatureCollection",
         "features": features,
-        "pathtogether": {
-            "schema": SCHEMA,
-            "exported_at": exported_at,
-            "slide": slide,
-            "coordinate_system": COORDINATE_SYSTEM,
-            "feature_count": len(features),
-            "ai_feature_count": ai_count,
-            "skipped": skipped,
-        },
+        "pathtogether": export_meta,
     }
 
 
@@ -425,12 +434,49 @@ def _sanitize_stem(value):
     return text.strip().strip(".").strip()
 
 
-def export_filename(slide_info):
-    """``<stem>_annotations.geojson``；无可用名称时回退 ``slide_<slide_id>``。"""
+#: Windows 文件名不允许的字符（标注名来自用户输入，需再兜一层）
+_WINDOWS_INVALID = re.compile(r'[<>:"/\\|?*]')
+
+
+def _slide_stem(slide_info):
+    """切片名 stem；无可用名称时回退 ``slide_<slide_id>``。"""
     info = slide_info or {}
     raw = info.get("original_filename") or info.get("display_name") or ""
     stem = os.path.splitext(_sanitize_stem(raw))[0].strip().strip(".").strip()
     if not stem:
         sid = _sanitize_stem(info.get("slide_id") or "")
         stem = "slide_%s" % sid if sid else "slide"
-    return stem + "_annotations.geojson"
+    return stem
+
+
+def _annotation_stem(item):
+    """标注名（与 Feature name 同源：``_label_of``）+ id 前 8 位。
+
+    名称先走 ``_sanitize_stem``，再把 Windows 非法字符换成 ``_``，截到 40
+    字符；id 只保留字母数字（annotation_id 是 uuid4，取前 8 位）。
+    """
+    item = item if isinstance(item, dict) else {}
+    # 先替换 / 与 \（以及其它 Windows 非法字符），再清洗控制字符/首尾点；
+    # 反过来做会按路径只保留最后一段，丢失「肿瘤/坏死」的前半段。
+    name = _sanitize_stem(
+        _WINDOWS_INVALID.sub("_", _label_of(item, None)))
+    name = name[:40].strip()
+    aid = item.get("annotation_id")
+    aid8 = re.sub(r"[^A-Za-z0-9]", "", aid if isinstance(aid, str) else "")[:8]
+    return name, aid8
+
+
+def export_filename(slide_info, item=None):
+    """整片导出：``<stem>_annotations.geojson``（旧行为）。
+
+    单条导出（``item`` 非 None）：``<stem>_<标注名>_<id 前 8 位>.geojson``；
+    标注名为空时 ``<stem>_annotation_<id8>.geojson``。
+    """
+    stem = _slide_stem(slide_info)
+    if item is None:
+        return stem + "_annotations.geojson"
+    name, aid8 = _annotation_stem(item)
+    parts = [stem, name or "annotation"]
+    if aid8:
+        parts.append(aid8)
+    return "_".join(parts) + ".geojson"

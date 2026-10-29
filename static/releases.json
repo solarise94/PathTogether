@@ -8,18 +8,20 @@
       "published": true,
       "components": {
         "histopilot": "0.4.8",
-        "pathtogether": "suite-20261029"
+        "pathtogether": "suite-20261029b"
       },
       "items": {
         "zh": [
-          "标注面板新增「导出标注」按钮：把当前切片上你能看到的全部标注下载为一个 GeoJSON 文件，可在 QuPath 中用「File ▸ Import objects from file」或直接拖入导入。",
+          "标注面板新增导出：右上角「导出全部」把当前切片上你能看到的全部标注下载为一个 GeoJSON 文件，每条标注下方的「导出」只下载这一条；在 QuPath 中用「File ▸ Import objects from file」或直接拖入导入。",
           "AI 描绘和落标的结果会一起导出，并标明来源、审核状态、所用技能与模型以及是否经过轮廓精修，方便筛选后做数据分析。",
-          "导出坐标是切片原始分辨率（level-0）的像素坐标，与 QuPath、OpenSlide 打开同一文件时一致；文件中还记录了切片尺寸和像素尺寸（mpp，如有）。"
+          "导出坐标是切片原始分辨率（level-0）的像素坐标，与 QuPath、OpenSlide 打开同一文件时一致；文件中还记录了切片尺寸和像素尺寸（mpp，如有）。",
+          "标注面板整理：「加入 AI 对话」等按钮不再互相遮挡，长坐标和长文件名不再溢出；每条标注单独成卡片，名称更醒目。"
         ],
         "en": [
-          "New “Export annotations” button in the annotation panel: download every annotation you can see on the current slide as one GeoJSON file, which QuPath imports via File ▸ Import objects from file… or drag and drop.",
+          "Annotation export in the annotation panel: “Export all” at the top downloads every annotation you can see on the current slide as one GeoJSON file, and “Export” under each annotation downloads just that one; QuPath imports them via File ▸ Import objects from file… or drag and drop.",
           "AI delineations and placed markers are exported too, labelled with their source, review status, skill, model and whether the contour was refined, so you can filter them for analysis.",
-          "Coordinates are level-0 (full-resolution) pixels, matching QuPath and OpenSlide on the same file; the file also records the slide size and pixel size (mpp, when available)."
+          "Coordinates are level-0 (full-resolution) pixels, matching QuPath and OpenSlide on the same file; the file also records the slide size and pixel size (mpp, when available).",
+          "Annotation panel cleanup: buttons such as “Add to AI chat” no longer overlap, long coordinates and file names no longer overflow, and each annotation now sits on its own card with a clearer name."
         ]
       }
     },

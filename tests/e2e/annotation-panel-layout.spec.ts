@@ -149,6 +149,12 @@ async function shapeAnnotationsLikeProduction(page: Page) {
 				if (grp.label === LONG_LABEL || it.type === "arrow") {
 					it.source = "ai";
 					it.review_status = "pending";
+					// 2026-10-19 起查看器按服务端 author_kind 判定 AI（source=ai
+					// 但无 AI 会话/溯源的存量人工行 author_kind=user，不再渲染
+					// 接受/驳回按钮）。这里模拟真 AI 待审行，布局用例继续覆盖
+					// 带审核按钮的拥挤行；下面的新增断言守住这一覆盖面。
+					it.author_kind = "ai";
+					it.author_key = "ai";
 				}
 				if (it.type === "arrow") {
 					it.x1 = 37454; it.y1 = 23909;
@@ -319,6 +325,16 @@ for (const cfg of LAYOUT_CASES) {
 			await openAnnoPanel(page, cfg.mobile);
 
 			await expect(page.locator("#anno-panel .anno-item")).toHaveCount(3);
+			// 显示规则改为 author_kind 口径后，拦截数据必须显式 author_kind=ai
+			// 才会渲染接受/驳回按钮；守住「两条真 AI 待审行」的布局覆盖面。
+			const reviewRows = page.locator("#anno-panel .anno-item").filter({
+				has: page.locator(".ai-review-accept"),
+			});
+			await expect(reviewRows).toHaveCount(2);
+			for (let i = 0; i < 2; i++) {
+				await expect(reviewRows.nth(i).locator(".ai-review-accept")).toHaveCount(1);
+				await expect(reviewRows.nth(i).locator(".ai-review-reject")).toHaveCount(1);
+			}
 			await expect(page.locator("#anno-export-btn")).toBeEnabled();
 			await expect(page.locator("#anno-export-btn .panel-btn-tx"))
 				.toHaveText(cfg.exportAllText);

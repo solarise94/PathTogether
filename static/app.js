@@ -1816,9 +1816,9 @@
   //   - 优先条目上的 author_key/author_kind（标注 ACL 批次注入）；
   //     author_kind === "unknown" / 缺 key 不计（不虚构人）；
   //   - 旧数据回落 owner_user_id，再回落 visitor；
-  //   - source === "ai" 的条目计标记不计人。
+  //   - AI 条目（itemIsAi）计标记不计人。
   function annoAuthorKey(item) {
-    if (!item || item.source === "ai") return null;
+    if (!item || itemIsAi(item)) return null;
     if (item.author_key != null && item.author_key !== "") {
       if (!item.author_kind || item.author_kind === "unknown") return null;
       return item.author_kind + ":" + item.author_key;
@@ -7183,7 +7183,7 @@
   function drawRectQuad(it, color, selected) {
     var sq = rectScreenQuad(it);
     if (!sq.quad || sq.quad.length < 3) return;
-    var isAi = (it.source === "ai");
+    var isAi = itemIsAi(it);
     annoCtx.save();
     annoCtx.beginPath();
     annoCtx.moveTo(sq.quad[0][0], sq.quad[0][1]);
@@ -7204,8 +7204,9 @@
     var typ = it.type || "rect";
     var hlStroke = selected ? ANNO_SELECTED_STROKE : null;
     var lbl = showText ? it.label : null;
-    // AI 落标（进标注库 source=ai）给半透明青色填充，区别于人工标注（#3）
-    var isAi = (it.source === "ai");
+    // AI 落标（itemIsAi：带 AI 会话/溯源的标注）给半透明橙色填充，
+    // 区别于人工标注（#3）
+    var isAi = itemIsAi(it);
     if (typ === "rect") {
       var bbox = drawRectQuad(it, color, selected);
       if (lbl && bbox) {
@@ -7602,8 +7603,17 @@
   function itemIsReadOnly(it) {
     return !itemCanEdit(it);
   }
+  // AI 判定以服务端 author_kind 为准（与导出 ai_generated 同口径，只有带
+  // AI 会话或溯源的标注才是 AI）；2026-10-19 前工作台人工标注在库里存为
+  // source=ai，无会话/溯源，其 author_kind 为 user。缺 author_kind
+  // （旧接口形态/本地构造的条目）回落 source。
+  function itemIsAi(it) {
+    if (!it) return false;
+    if (it.author_kind) return it.author_kind === "ai";
+    return it.source === "ai";
+  }
   function itemIsAiPending(it) {
-    return !!(it && it.source === "ai" && it.review_status === "pending");
+    return !!(itemIsAi(it) && it.review_status === "pending");
   }
 
   function selectEditItem(it) {
@@ -9944,9 +9954,10 @@
         });
         row.appendChild(sharedBtn);
 
-        // Stage 3c-1：AI 标注审核状态（接受/驳回）。仅 source=ai 且 pending 显示按钮；
-        // 已 accepted/rejected 显示状态徽章。
-        if (it.source === "ai") {
+        // Stage 3c-1：AI 标注审核状态（接受/驳回）。仅 AI 标注（itemIsAi，
+        // 与服务端 author_kind 同口径）且 pending 显示按钮；已
+        // accepted/rejected 显示状态徽章。
+        if (itemIsAi(it)) {
           if (it.review_status === "pending") {
             var acceptBtn = document.createElement("button");
             acceptBtn.className = "ai-op ai-review-accept";

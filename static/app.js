@@ -7204,7 +7204,7 @@
     var typ = it.type || "rect";
     var hlStroke = selected ? ANNO_SELECTED_STROKE : null;
     var lbl = showText ? it.label : null;
-    // AI 落标（itemIsAi：带 AI 会话/溯源的标注）给半透明青色填充，
+    // AI 落标（itemIsAi：带 AI 会话/溯源的标注）给半透明橙色填充，
     // 区别于人工标注（#3）
     var isAi = itemIsAi(it);
     if (typ === "rect") {

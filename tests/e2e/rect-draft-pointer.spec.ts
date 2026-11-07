@@ -26,6 +26,7 @@ const CREDS = JSON.parse(readFileSync(
 };
 
 interface Roi { x: number; y: number; w: number; h: number }
+interface ScreenBox { x: number; y: number; width: number; height: number }
 
 async function roiState(page: Page): Promise<Roi> {
 	return page.evaluate(() => {
@@ -135,6 +136,11 @@ async function savedAnnotation(page: Page, slideId: string, annotationId: string
 /** 松开后悬停穿越框体、手柄与浮条按钮：几何必须一动不动。 */
 async function hoverAcrossDraft(page: Page) {
 	const bb = (await page.locator("#roi-box").boundingBox())!;
+	await hoverAcrossBox(page, bb);
+}
+
+/** 使用冻结的屏幕范围，保存成功移除草稿 DOM 后也能检查同一区域的悬停。 */
+async function hoverAcrossBox(page: Page, bb: ScreenBox) {
 	const midX = bb.x + bb.width / 2;
 	const midY = bb.y + bb.height / 2;
 	await page.mouse.move(midX, midY);
@@ -399,17 +405,47 @@ for (const fmt of [
 			});
 
 			test("正常自由画框：松开恰好自动保存一次（计数 POST）", async ({ page }) => {
-				const cb = await canvasBox(page);
-				await page.mouse.move(cb.x + cb.width * 0.2, cb.y + cb.height * 0.2);
-				await page.mouse.down();
-				await page.mouse.move(cb.x + cb.width * 0.45, cb.y + cb.height * 0.5, { steps: 8 });
-				await page.mouse.up();
-				const drawn = await roiState(page);
-				expect(drawn.w).toBeGreaterThan(0);
-				await expect.poll(() => posts.length, { timeout: 5000 }).toBe(1);
-				expect(bodies[0]).toMatchObject({ type: "rect" });
-				await hoverAcrossDraft(page);
-				expect(posts.length).toBe(1);
+				// POST 一旦成功，应用会移除 #roi-box 并选中新标注。先把真实请求
+				// 暂停在网络边界，分别验证保存中的草稿与保存后的标注，避免测试
+				// 是否读到已移除 DOM 取决于服务器响应速度（CI run 41427796620）。
+				let releaseSave!: () => void;
+				const saveGate = new Promise<void>((resolve) => { releaseSave = resolve; });
+				await page.route((url) => url.pathname === "/api/annotation", async (route) => {
+					if (route.request().method() === "POST") await saveGate;
+					await route.continue();
+				});
+				const response = page.waitForResponse((r) =>
+					new URL(r.url()).pathname === "/api/annotation" && r.request().method() === "POST");
+				try {
+					const cb = await canvasBox(page);
+					await page.mouse.move(cb.x + cb.width * 0.2, cb.y + cb.height * 0.2);
+					await page.mouse.down();
+					await page.mouse.move(cb.x + cb.width * 0.45, cb.y + cb.height * 0.5, { steps: 8 });
+					await page.mouse.up();
+					const drawn = await roiState(page);
+					expect(drawn.w).toBeGreaterThan(0);
+					expect(drawn.h).toBeGreaterThan(0);
+					await expect.poll(() => posts.length, { timeout: 5000 }).toBe(1);
+					expect(bodies[0]).toMatchObject({ type: "rect" });
+					const draftBox = (await page.locator("#roi-box").boundingBox())!;
+					await hoverAcrossDraft(page);
+					expect(await roiState(page)).toEqual(drawn);
+					expect(posts.length).toBe(1);
+
+					releaseSave();
+					const saved = await response;
+					expect(saved.status()).toBe(200);
+					const { annotation_id } = await saved.json();
+					expect(annotation_id).toBeTruthy();
+					await expect(page.locator("#roi-box")).toHaveCount(0);
+					await expect(page.locator("#anno-obj-toolbar")).toBeVisible();
+					await hoverAcrossBox(page, draftBox);
+					expect(posts.length).toBe(1);
+					expect(await savedAnnotation(page, CREDS.rasterSlides[fmt.key].slide_id, annotation_id))
+						.toMatchObject(drawn);
+				} finally {
+					releaseSave();
+				}
 			});
 
 			test("已保存标记编辑、平移/缩放/旋转、浮条点击互不抢事件", async ({ page }) => {

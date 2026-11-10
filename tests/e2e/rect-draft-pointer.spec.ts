@@ -132,9 +132,15 @@ async function savedAnnotation(page: Page, slideId: string, annotationId: string
 		.find((a) => a.annotation_id === annotationId);
 }
 
-/** 松开后悬停穿越框体、手柄与浮条按钮：几何必须一动不动。 */
-async function hoverAcrossDraft(page: Page) {
-	const bb = (await page.locator("#roi-box").boundingBox())!;
+/** 松开后悬停穿越框体、手柄与浮条按钮：几何必须一动不动。
+ * 自动保存成功后草稿框会被收走（#roi-box 消失），此时可传绘制时的页面
+ * 坐标矩形，不依赖 locator 当前是否仍存在。 */
+async function hoverAcrossDraft(
+	page: Page,
+	rect?: { x: number; y: number; width: number; height: number },
+) {
+	const bb = rect ?? (await page.locator("#roi-box").boundingBox());
+	if (!bb) throw new Error("hoverAcrossDraft: #roi-box 不存在且未提供显式矩形");
 	const midX = bb.x + bb.width / 2;
 	const midY = bb.y + bb.height / 2;
 	await page.mouse.move(midX, midY);
@@ -142,8 +148,8 @@ async function hoverAcrossDraft(page: Page) {
 	await page.mouse.move(midX, bb.y - 30, { steps: 4 }); // 标签/浮条方向
 	const toolbar = page.locator("#anno-obj-toolbar");
 	if (await toolbar.isVisible()) {
-		const tb = (await toolbar.boundingBox())!;
-		await page.mouse.move(tb.x + tb.width / 2, tb.y + tb.height / 2, { steps: 3 });
+		const tb = await toolbar.boundingBox();
+		if (tb) await page.mouse.move(tb.x + tb.width / 2, tb.y + tb.height / 2, { steps: 3 });
 	}
 	await page.mouse.move(midX, midY, { steps: 3 });
 }
@@ -400,15 +406,29 @@ for (const fmt of [
 
 			test("正常自由画框：松开恰好自动保存一次（计数 POST）", async ({ page }) => {
 				const cb = await canvasBox(page);
-				await page.mouse.move(cb.x + cb.width * 0.2, cb.y + cb.height * 0.2);
+				const from = { x: cb.x + cb.width * 0.2, y: cb.y + cb.height * 0.2 };
+				const to = { x: cb.x + cb.width * 0.45, y: cb.y + cb.height * 0.5 };
+				// 先挂响应监听再松手：自动保存回包成功后会移除草稿框，
+				// 仅凭请求计数等待会在框已消失时继续悬停（时序抖动）。
+				const saved = page.waitForResponse((r) =>
+					new URL(r.url()).pathname === "/api/annotation" && r.request().method() === "POST");
+				await page.mouse.move(from.x, from.y);
 				await page.mouse.down();
-				await page.mouse.move(cb.x + cb.width * 0.45, cb.y + cb.height * 0.5, { steps: 8 });
+				await page.mouse.move(to.x, to.y, { steps: 8 });
 				await page.mouse.up();
 				const drawn = await roiState(page);
 				expect(drawn.w).toBeGreaterThan(0);
-				await expect.poll(() => posts.length, { timeout: 5000 }).toBe(1);
+				const resp = await saved;
+				expect(resp.status()).toBe(200);
+				expect(posts.length).toBe(1);
 				expect(bodies[0]).toMatchObject({ type: "rect" });
-				await hoverAcrossDraft(page);
+				await hoverAcrossDraft(page, {
+					x: Math.min(from.x, to.x),
+					y: Math.min(from.y, to.y),
+					width: Math.abs(to.x - from.x),
+					height: Math.abs(to.y - from.y),
+				});
+				await page.waitForTimeout(300); // 短暂静置：迟到的 POST 也必须被计数
 				expect(posts.length).toBe(1);
 			});
 

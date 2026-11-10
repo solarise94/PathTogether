@@ -34,10 +34,12 @@
     ``os.replace`` → 同一事务更新 ``slides.accounted_bytes`` + 用户
     ``used_bytes`` + 写新内容 revision（viewer render token / AI snapshot
     attestation / 切片缓存 generation 都以它失效）；DB 失败自动回滚原文件；
-  - ``--repair`` 只处理「tifffile 写出的多级 OME-TIFF + 新缩减层校验失败」
-    的旧构建器产物：先把当前文件 level 0 无损写成同目录临时单层 TIFF，
-    再用同一构建/校验/记账原语重建；健康的金字塔一律 ``not_broken`` 拒绝，
-    不带 ``--slide-id`` 时只读列出候选、绝不改写；
+  - ``--repair`` 只处理「tifffile 写出的多级 OME-TIFF + 缩减层**内容**
+    校验失败（常量/全零或与上一级下采样差异超限）」的旧构建器产物：先把
+    当前文件 level 0 无损写成同目录临时单层 TIFF，再用同一构建/校验/记账
+    原语重建；层数/尺寸序列等结构差异不算损坏，健康金字塔（含第三方工具
+    写出的非构建器层序列）一律 ``not_broken`` 拒绝，不带 ``--slide-id``
+    时只读列出候选、绝不改写；
   - 任何失败保留/恢复原文件，不删除资产、不改授权；临时文件在所有路径
     清理；
   - 绝不访问 COS，不处理 legacy 布局（不可读）资产。
@@ -153,9 +155,10 @@ def _pyramid_state(path, *, info=None):
     """判定修复候选：(candidate, broken, info, detail)。全程只读。
 
     候选形态 = 多级 OME-TIFF 且 OME ``Creator`` 由 tifffile 写出
-    （``Creator="tifffile.py <version>"``）。只有在候选文件**未通过**新的
-    缩减层校验时才认定 ``broken``——健康金字塔（或其它工具写出的、能通过
-    校验的金字塔）绝不改写。
+    （``Creator="tifffile.py <version>"``）。``broken`` **只**由缩减层
+    **内容**校验决定（``validate_sublevel_content``：按文件自身层尺寸推
+    下采样倍率）。层数/尺寸序列/mpp 等结构差异不算损坏——第三方工具写出
+    的合法金字塔不能因为层序列与本地构建器不同而被重写。
     """
     if info is None:
         try:
@@ -168,7 +171,7 @@ def _pyramid_state(path, *, info=None):
     if not creator or not creator.lower().startswith("tifffile"):
         return False, False, info, None
     try:
-        slide_pyramid.validate_pyramid(path, path)
+        slide_pyramid.validate_sublevel_content(path)
     except slide_pyramid.PyramidValidationError as exc:
         return True, True, info, str(exc)
     except Exception as exc:  # noqa: BLE001  校验本身故障不等于可安全修复
@@ -425,8 +428,8 @@ def repair_one(slide_id):
     desc, path, info, bytes_before = ctx
     candidate, broken, info, detail = _pyramid_state(path, info=info)
     if not candidate or not broken:
-        # 健康金字塔/单层资产/非 tifffile 产物都不改；只有新校验失败的
-        # 旧构建器金字塔才进入重建。
+        # 健康金字塔/单层资产/非 tifffile 产物都不改；只有缩减层**内容**
+        # 校验失败的旧构建器金字塔才进入重建（结构差异不算损坏）。
         return EXIT_REFUSED, {"slide_id": slide_id, "ok": False,
                               "refused": "not_broken",
                               "detail": detail}

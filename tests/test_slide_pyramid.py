@@ -178,6 +178,58 @@ def _write_healthy_pyramid_file(path, h=1200, w=1600):
             src.unlink()
 
 
+def _box_reduce_rgb(rgb, out_h, out_w):
+    """2× 盒式平均缩到 out_h×out_w；ceil 尺寸多出的边按 edge 复制。"""
+    h, w = rgb.shape[:2]
+    pad_h, pad_w = int(out_h) * 2 - h, int(out_w) * 2 - w
+    arr = rgb
+    if pad_h > 0 or pad_w > 0:
+        arr = np.pad(arr, ((0, max(0, pad_h)), (0, max(0, pad_w)), (0, 0)),
+                     mode="edge")
+    blocks = arr[:int(out_h) * 2, :int(out_w) * 2].reshape(
+        int(out_h), 2, int(out_w), 2, 3)
+    return ((blocks.sum(axis=(1, 3), dtype=np.uint32) + 2) // 4).astype(
+        np.uint8)
+
+
+def _write_own_dims_pyramid(path, level_dims, *, zero_sublevels=False,
+                            resample=None, shift_sublevels=0):
+    """写「第三方工具形态」金字塔：层尺寸完全由调用方给出。
+
+    缩减层内容由上一级做 2× 下采样得到（可写 floor 或 ceil 序列）：
+    默认用与构建器同口径的对齐盒式平均；``resample="pil"`` 用 Pillow
+    的 BOX 重采样（比例映射，模拟其它转换器的滤波器/取整差异）。
+    ``zero_sublevels`` 时只写全零缩减层，模拟旧构建器写坏的文件；
+    ``shift_sublevels`` 让缩减层内容来自水平错位的源（非全零但明显不符）。
+    """
+    import tifffile
+
+    base_w, base_h = (int(v) for v in level_dims[0])
+    levels = [_gradient_rgb(base_h, base_w)]
+    prev = levels[0]
+    if shift_sublevels:
+        prev = np.roll(prev, int(shift_sublevels), axis=1)
+    for (lw, lh) in level_dims[1:]:
+        if zero_sublevels:
+            prev = np.zeros((int(lh), int(lw), 3), np.uint8)
+        elif resample == "pil":
+            from PIL import Image
+
+            prev = np.asarray(Image.fromarray(
+                prev, "RGB").resize((int(lw), int(lh)), Image.BOX))
+        else:
+            prev = _box_reduce_rgb(prev, int(lh), int(lw))
+        levels.append(prev)
+    with tifffile.TiffWriter(str(path), ome=True) as tw:
+        tw.write(levels[0], photometric="rgb", tile=(512, 512),
+                 compression="deflate", subifds=len(levels) - 1,
+                 metadata={"axes": "YXS"})
+        for level in levels[1:]:
+            tw.write(level, photometric="rgb", tile=(512, 512),
+                     compression="deflate", subfiletype=1)
+    return levels
+
+
 def _platform_mpp(path):
     """经平台读取路径（slide_io）取 (mpp_x, mpp_y)；未报告为 None。"""
     slide = slide_io.open_slide(str(path))
@@ -757,3 +809,117 @@ def test_repair_rebuilds_broken_pyramid_and_accounts(tmp_path, monkeypatch):
     parent = path.parent
     assert not list(parent.glob(".pyramid-*"))
     assert not list(parent.glob(".pyramid-scratch-*"))
+
+
+#: 第三方工具形态的健康金字塔：层序列与本地构建器不同（少一层 / floor /
+#: ceil 取整），但每层内容都是上一级的正确 2× 下采样。
+_NON_BUILDER_HEALTHY_DIMS = {
+    # 构建器会写 3 层 (2400,1200)→(1200,600)→(600,300)；这里少最后一层。
+    "fewer_levels": (((2400, 1200), (1200, 600)), {}),
+    # 构建器用 ceil：(2301,1151)→(1151,576)→(576,288)；这里 floor 到
+    # (1150,575)，层数也少一层。
+    "floor_rounding": (((2301, 1151), (1150, 575)), {}),
+    # 构建器序列的第二层相同，但只写到 ceil 的 (1151,576) 就停止。
+    "ceil_rounding": (((2301, 1151), (1151, 576)), {}),
+    # 其它转换器的滤波器/比例映射（PIL BOX）与对齐盒式参考有差异，
+    # 仍必须判为健康（修复容差要覆盖跨实现重采样）。
+    "pil_resample": (((2301, 1151), (1150, 575), (575, 287)),
+                     {"resample": "pil"}),
+}
+
+
+def _mk_own_dims_slide(slide_id, tmp_path, dims, *, zero=False, **writer_kw):
+    return _mk_ready_slide(
+        slide_id, tmp_path, _write_own_dims_pyramid,
+        level_dims=tuple(dims), zero_sublevels=zero, **writer_kw)
+
+
+def test_non_builder_dimension_sequence_is_healthy_for_repair(tmp_path):
+    """层数/取整与构建器不同、内容健康的金字塔不算损坏（不列出/不改写）。"""
+    mod = _load_backfill()
+    paths = {}
+    for name, (dims, writer_kw) in _NON_BUILDER_HEALTHY_DIMS.items():
+        desc, path = _mk_own_dims_slide("sld_pyr_nb_" + name, tmp_path, dims,
+                                        **writer_kw)
+        paths[name] = (desc, path)
+        # 内容校验（按文件自身尺寸）通过。
+        meta = sp.validate_sublevel_content(path)
+        assert meta["compared_levels"] == len(dims) - 1
+        assert meta["sublevel_max_mean_diff"] <= \
+            sp.PYRAMID_REPAIR_SUBLEVEL_TOLERANCE
+        # 旧的严格校验确实会因结构差异拒绝它——这正是误报来源。
+        with pytest.raises(sp.PyramidValidationError):
+            sp.validate_pyramid(path, path)
+        # 修复列表不含它；--repair --slide-id 以 not_broken 拒绝且不改文件。
+        sig = (path.stat().st_mtime_ns, path.stat().st_size)
+        code, payload = mod.repair_one(desc.slide_id)
+        assert code == 1, payload
+        assert payload["refused"] == "not_broken"
+        assert (path.stat().st_mtime_ns, path.stat().st_size) == sig
+
+    listed = {it["slide_id"] for it in mod._repair_candidates()}
+    assert listed.isdisjoint({desc.slide_id for desc, _ in paths.values()})
+
+
+def test_zeroed_sublevels_with_non_builder_dims_are_repairable(tmp_path):
+    """层序列不同但缩减层全零的文件仍应被列出，并可修复。"""
+    mod = _load_backfill()
+    dims = _NON_BUILDER_HEALTHY_DIMS["floor_rounding"][0]
+    desc, path = _mk_own_dims_slide("sld_pyr_nb_zero", tmp_path, dims,
+                                    zero=True)
+    with pytest.raises(sp.PyramidValidationError):
+        sp.validate_sublevel_content(path)
+    listed = {it["slide_id"]: it for it in mod._repair_candidates()}
+    assert desc.slide_id in listed
+    assert "常量/全零" in listed[desc.slide_id]["validation_error"]
+
+    broken_slide = slide_io.open_slide(str(path))
+    try:
+        old_level0 = np.asarray(
+            broken_slide.read_region((0, 0), 0, (512, 512)).convert("RGB"))
+    finally:
+        broken_slide.close()
+
+    code, payload = mod.repair_one(desc.slide_id)
+    assert code == 0, payload
+    meta = sp.validate_pyramid(path, path, lossless=True)
+    assert meta["sublevel_max_mean_diff"] <= sp.PYRAMID_SUBLEVEL_TOLERANCE
+    slide = slide_io.open_slide(str(path))
+    try:
+        assert slide.level_count > 1
+        new_level0 = np.asarray(
+            slide.read_region((0, 0), 0, (512, 512)).convert("RGB"))
+        # level 0 无损提取：修复不改变原有像素。
+        assert np.array_equal(new_level0, old_level0)
+        for level in range(1, slide.level_count):
+            lw, lh = slide.level_dimensions[level]
+            img = np.asarray(slide.read_region(
+                (0, 0), level, (min(64, lw), min(64, lh))).convert("RGB"))
+            assert float(img.std()) > 1.0
+    finally:
+        slide.close()
+
+
+def test_zeroed_ceil_pyramid_with_fewer_levels_is_repairable(tmp_path):
+    """ceil 取整且少一层、缩减层全零：内容失败仍能识别并修复。"""
+    mod = _load_backfill()
+    dims = _NON_BUILDER_HEALTHY_DIMS["ceil_rounding"][0]
+    desc, path = _mk_own_dims_slide("sld_pyr_nb_zero_ceil", tmp_path, dims,
+                                    zero=True)
+    listed = {it["slide_id"] for it in mod._repair_candidates()}
+    assert desc.slide_id in listed
+    code, payload = mod.repair_one(desc.slide_id)
+    assert code == 0, payload
+    sp.validate_pyramid(path, path, lossless=True)
+
+
+def test_repair_detects_nonzero_but_mismatched_sublevel(tmp_path):
+    """缩减层非全零但与上一级内容明显不符：仍是内容失败（可修复）。"""
+    mod = _load_backfill()
+    dims = ((2301, 1151), (1150, 575))
+    desc, _path = _mk_own_dims_slide("sld_pyr_nb_wrong", tmp_path, dims,
+                                     shift_sublevels=767)
+    with pytest.raises(sp.PyramidValidationError):
+        sp.validate_sublevel_content(_path)
+    listed = {it["slide_id"] for it in mod._repair_candidates()}
+    assert desc.slide_id in listed

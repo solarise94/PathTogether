@@ -89,6 +89,15 @@ PYRAMID_SUBLEVEL_SAMPLE = 256
 #: 缩减层 JPEG q90 的误差量级约 3-6；12 留有解码器/整数取整余量，同时
 #: 远小于全零层造成的 100+ 差异。
 PYRAMID_SUBLEVEL_TOLERANCE = 12.0
+#: 第三方金字塔的内容校验容差（修复分类用，按 block 均值比较）。跨实现
+#: 的重采样滤波器（area/triangle/cubic）与 ceil/floor 比例映射会让逐像素
+#: 比较产生远大于本地 JPEG q90 的差异（高频内容可达 ~36）；先按
+#: :data:`PYRAMID_REPAIR_SUBLEVEL_BLOCK` 做块均值可消除相位/滤波器差异，
+#: 同时保留对「内容来自别处」的敏感性。全零/常量缩减层由独立显式判定
+#: 捕获，不依赖该容差。
+PYRAMID_REPAIR_SUBLEVEL_TOLERANCE = 32.0
+#: 修复分类比较的块边长（期望与实际都先做该尺寸盒式均值）。
+PYRAMID_REPAIR_SUBLEVEL_BLOCK = 8
 
 #: 认定为无损的 TIFF compression 枚举（tifffile Compression 值）。
 _LOSSLESS_COMPRESSIONS = frozenset({
@@ -1251,6 +1260,182 @@ def _validate_sublevels(dst, dims, *, tolerance, comparable):
     return checked, (max(metrics) if metrics else None)
 
 
+def _level_box_factors(prev_dims, dims):
+    """由相邻两层的**实际**尺寸推每轴整数盒式下采样倍率。
+
+    第三方工具写出的金字塔与本地构建器的层尺寸序列可能不同（层数更少、
+    用 floor 而非 ceil 取整）。内容比较只能以文件自身尺寸为准，不能套用
+    构建器的 2× 期望序列。``round(prev/own)`` 得到整数倍率，并允许取整
+    造成的 <1 输出像素偏差（``|prev - own*f| < f``，ceil/floor 都满足）。
+    倍率无法用整数盒式滤波表达时返回 ``None``——该层按「结构差异、内容
+    不可判定」跳过，不据此判定损坏。
+    """
+    pw, ph = int(prev_dims[0]), int(prev_dims[1])
+    lw, lh = int(dims[0]), int(dims[1])
+    if min(pw, ph, lw, lh) <= 0 or lw >= pw or lh >= ph:
+        return None
+    fx = int(round(float(pw) / float(lw)))
+    fy = int(round(float(ph) / float(lh)))
+    if fx < 2 or fy < 2:
+        return None
+    if abs(pw - lw * fx) >= fx or abs(ph - lh * fy) >= fy:
+        return None
+    return fx, fy
+
+
+def _read_own_level_window(slide, level, x, y, w, h):
+    """按**该层自身坐标**读窗口。
+
+    ``slide_io`` 的 ``read_region`` location 语义是 level-0 坐标，内部按
+    该层 downsample 换算。直接传 ``x * ds`` 时浮点除法可能略小于 x
+    （如精确 2.0 算成 1.999…），截断后窗口左移 1 像素；加半个输出像素
+    可稳定落回 x。
+    """
+    ds = float(slide.level_downsamples[int(level)])
+    location = (int((float(x) + 0.5) * ds),
+                int((float(y) + 0.5) * ds))
+    return _rgba_array(slide.read_region(
+        location, int(level), (int(w), int(h))))
+
+
+def _downsample_rgba_by(arr, fx, fy):
+    """把 (h*fy, w*fx, 4) RGBA 块按 (fx, fy) 盒式平均（与构建器同口径）。"""
+    a = np.asarray(arr)
+    h, w = int(a.shape[0]) // int(fy), int(a.shape[1]) // int(fx)
+    if h <= 0 or w <= 0:
+        raise PyramidValidationError("缩减层下采样窗口过小")
+    blocks = a[:h * fy, :w * fx].reshape(h, fy, w, fx, a.shape[-1])
+    count = int(fx) * int(fy)
+    total = blocks.sum(axis=(1, 3), dtype=np.uint64)
+    return ((total + count // 2) // count).astype(np.uint8)
+
+
+def _repair_content_diff(expected, actual):
+    """修复分类的平均绝对差：先做 block 盒式均值，消除重采样相位差异。"""
+    block = max(1, min(PYRAMID_REPAIR_SUBLEVEL_BLOCK,
+                       int(expected.shape[0]), int(expected.shape[1])))
+    exp = _downsample_rgba_by(expected, block, block).astype(np.int16)
+    act = _downsample_rgba_by(actual, block, block).astype(np.int16)
+    return float(np.abs(exp[..., :3] - act[..., :3]).mean(axis=(0, 1)).max())
+
+
+def _own_sublevel_expected(slide, level, ox, oy, win_w, win_h, dims, factors):
+    """按文件自身层尺寸取上一级对应区域做盒式下采样。
+
+    ceil 尺寸多出的最后一列/行按 edge 复制补齐（与 ``_downsample2`` 对
+    奇数边的处理一致），保证期望窗口尺寸与输出窗口严格相等。
+    """
+    fx, fy = factors
+    prev_w, prev_h = int(dims[level - 1][0]), int(dims[level - 1][1])
+    sx, sy = int(ox) * fx, int(oy) * fy
+    src_w, src_h = int(win_w) * fx, int(win_h) * fy
+    cw = max(1, min(src_w, prev_w - sx))
+    ch = max(1, min(src_h, prev_h - sy))
+    arr = _read_own_level_window(slide, level - 1, sx, sy, cw, ch)
+    if cw != src_w or ch != src_h:
+        arr = np.pad(arr, ((0, src_h - ch), (0, src_w - cw), (0, 0)),
+                     mode="edge")
+    return _downsample_rgba_by(arr, fx, fy)
+
+
+def _validate_own_sublevels(slide, dims, *, tolerance, comparable):
+    """按文件自身层尺寸逐级校验缩减层内容；返回统计。
+
+    与 ``_validate_sublevels`` 的区别：不假设构建器的 2× 期望序列——层数
+    与每层尺寸都来自文件本身，倍率由相邻层实际尺寸推导。因此「少一层」
+    或 floor/ceil 取整差异不会造成内容误判；倍率不可判定的层跳过。
+    内容差异用 :func:`_repair_content_diff`（块均值）比较，
+    ``comparable`` 语义同 ``_validate_sublevels``。
+    """
+    checked = 0
+    compared_levels = 0
+    metrics = []
+    last = len(dims) - 1
+    for level in range(1, len(dims)):
+        factors = _level_box_factors(dims[level - 1], dims[level])
+        if factors is None:
+            continue
+        compared_levels += 1
+        lw, lh = int(dims[level][0]), int(dims[level][1])
+        win = max(1, min(PYRAMID_SUBLEVEL_SAMPLE, lw, lh))
+        windows = [(ox, oy, win, win)
+                   for (ox, oy) in _sample_boxes(
+                       lw, lh, PYRAMID_SUBLEVEL_SAMPLE)]
+        if level == last and \
+                lw <= PYRAMID_TARGET_LONG_EDGE and \
+                lh <= PYRAMID_TARGET_LONG_EDGE:
+            windows.append((0, 0, lw, lh))
+        for (ox, oy, win_w, win_h) in windows:
+            expected = _own_sublevel_expected(
+                slide, level, ox, oy, win_w, win_h, dims, factors)
+            actual = _read_own_level_window(
+                slide, level, ox, oy, win_w, win_h)
+            checked += 1
+            if comparable:
+                # 常量/全零判定沿用同一实现（与 strict 校验一致），但差异
+                # 阈值用块均值口径：第三方滤波/取整的相位差不应触发重修。
+                _check_level_content(
+                    level, (ox, oy), expected, actual,
+                    tolerance=float("inf"))
+                metric = _repair_content_diff(expected, actual)
+                if metric > float(tolerance):
+                    raise PyramidValidationError(
+                        "level %d 窗口 %r 内容与上一级下采样不一致"
+                        "（block mean_diff=%.2f > %.2f）"
+                        % (level, (ox, oy), metric, tolerance))
+                metrics.append(metric)
+            else:
+                _check_level_content(level, (ox, oy), expected, actual,
+                                     tolerance=float("inf"))
+    return {"checked": checked, "levels": compared_levels,
+            "max_mean_diff": (max(metrics) if metrics else None)}
+
+
+def validate_sublevel_content(path, *,
+                              tolerance=PYRAMID_REPAIR_SUBLEVEL_TOLERANCE):
+    """只校验多级 TIFF 的缩减层**内容**（按文件自身层尺寸推倍率）。
+
+    供运维修复工具区分「旧构建器写坏」与「第三方工具写出的健康金字塔」：
+    ``validate_pyramid`` 还要求层序列与本地构建器一致、mpp/level-0 像素
+    正确，第三方金字塔会因层数/取整不同被它拒绝。这里只比较内容：
+
+    - 每个 level ≥1 与上一级对应区域盒式下采样比较（倍率由该文件自身
+      相邻层尺寸推导），上一级有内容而该层为常量/全零、或
+      :data:`PYRAMID_REPAIR_SUBLEVEL_BLOCK` 块均值后的平均绝对差超过
+      ``tolerance`` → :class:`PyramidValidationError`；
+    - ``tolerance`` 默认用 :data:`PYRAMID_REPAIR_SUBLEVEL_TOLERANCE`
+      （块均值口径；第三方重采样滤波器/取整映射的相位差不会触发重修）；
+    - 层数、尺寸序列/mpp/level-0 等结构差异**不**算损坏；倍率不可推定的
+      层跳过；单层文件不报错。
+
+    返回 ``{"levels", "level_dimensions", "compared_levels",
+    "sublevel_windows", "sublevel_max_mean_diff"}``。
+    """
+    import slide_io
+
+    dst = None
+    try:
+        dst = slide_io.open_slide(os.fspath(path))
+        dims = tuple((int(w), int(h)) for w, h in dst.level_dimensions)
+        dtype = str(getattr(dst, "_dtype", "") or "")
+        stats = _validate_own_sublevels(
+            dst, dims, tolerance=tolerance,
+            comparable=dtype in ("uint8", "uint16"))
+        return {
+            "levels": int(getattr(dst, "level_count", len(dims)) or 0),
+            "level_dimensions": dims,
+            "compared_levels": stats["levels"],
+            "sublevel_windows": stats["checked"],
+            "sublevel_max_mean_diff": stats["max_mean_diff"],
+        }
+    finally:
+        if dst is not None:
+            try:
+                dst.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def validate_pyramid(src_path, dst_path, *, expected_dims=None,
                      lossless=None, max_mean_diff=8.0,
                      sublevel_tolerance=PYRAMID_SUBLEVEL_TOLERANCE):
@@ -1379,9 +1564,11 @@ __all__ = [
     "PYRAMID_JPEG_QUALITY_LEVEL0", "PYRAMID_JPEG_QUALITY_SUBLEVEL",
     "PYRAMID_MAX_PIXELS", "PYRAMID_MAX_GROWTH_RATIO",
     "PYRAMID_SUBLEVEL_SAMPLE", "PYRAMID_SUBLEVEL_TOLERANCE",
+    "PYRAMID_REPAIR_SUBLEVEL_TOLERANCE", "PYRAMID_REPAIR_SUBLEVEL_BLOCK",
     "PyramidSkip", "PyramidError", "PyramidValidationError", "PyramidResult",
     "pyramid_enabled", "min_long_edge", "needs_pyramid",
     "is_buildable_source",
     "level_dimensions_for", "estimate_output_bytes", "build_pyramid",
-    "extract_level0_tiff", "validate_pyramid", "file_sha256",
+    "extract_level0_tiff", "validate_pyramid", "validate_sublevel_content",
+    "file_sha256",
 ]

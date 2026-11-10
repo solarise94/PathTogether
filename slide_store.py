@@ -702,6 +702,65 @@ class LayoutBindConflict(RuntimeError):
     调用方（迁移工具）按冲突中止该迁移项，绝不自动修正。"""
 
 
+class PyramidAccountingConflict(RuntimeError):
+    """金字塔重建的记账 CAS 未命中（状态/字节数已漂移）。
+
+    调用方（摄取 worker / 回填脚本）必须视为可放弃的构建失败：文件已
+    原样保留或由调用方回滚，绝不在证据不一致时改写账本。"""
+
+
+def record_pyramid_rebuild(slide_id, *, expected_bytes, new_bytes, revision,
+                           conn=None):
+    """金字塔替换后的记账 + 内容 revision（调用方事务内；PG 权威）。
+
+    - ``slides.accounted_bytes`` 以 ``expected_bytes`` 为 CAS 谓词改为
+      ``new_bytes``（资产必须是 ready）；
+    - 写一行 ``slide_assets`` 内容 revision（viewer render token / AI
+      snapshot attestation / 缓存 generation 的失效依据）；
+    - 用户配额按增长/缩减对称调整：``new > expected`` → ``used_bytes``
+      增加；``new < expected`` → 退还差额（``upload_guard`` 唯一记账原语）。
+      空 owner/无配额行静默（与删除退款同口径）。
+
+    锁序（全仓一致）：调用方已持 advisory ``slide:<id>``，本函数取 slides
+    行锁 → upload_user_quotas → slide_assets 插入。返回字节差额（可负）。
+    """
+    sid = str(slide_id or "").strip()
+    if not sid:
+        raise ValueError("record_pyramid_rebuild 需要 slide_id")
+    expected = int(expected_bytes)
+    new = int(new_bytes)
+    if expected < 0 or new < 0:
+        raise ValueError("accounted_bytes 不能为负")
+    rev = str(revision or "").strip()
+    if not rev:
+        raise ValueError("record_pyramid_rebuild 需要内容 revision")
+    with _session(conn) as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "UPDATE slides SET accounted_bytes=%s, updated_at=now() "
+                "WHERE slide_id=%s AND asset_state=%s AND accounted_bytes=%s "
+                "RETURNING owner_user_id",
+                (new, sid, SlideState.READY, expected))
+            row = cur.fetchone()
+            if row is None:
+                raise PyramidAccountingConflict(
+                    "记账 CAS 未命中（slide_id=%s expected=%d state=%s）"
+                    % (sid, expected, SlideState.READY))
+            owner = (row.get("owner_user_id") if isinstance(row, dict)
+                     else row[0]) or ""
+            record_revision(sid, rev, conn=c)
+            delta = new - expected
+            if delta > 0:
+                import upload_guard
+
+                upload_guard.add_used_bytes_locked(cur, owner, delta)
+            elif delta < 0:
+                import upload_guard
+
+                upload_guard.refund_used_bytes_locked(cur, owner, -delta)
+            return delta
+
+
 def bind_id_bundle_layout(slide_id, storage_relpath, *, accounted_bytes=None,
                           expected_state=SlideState.READY,
                           expected_layout=StorageLayout.LEGACY,

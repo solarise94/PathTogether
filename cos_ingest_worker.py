@@ -61,6 +61,7 @@ import re
 import secrets
 import shutil
 import sys
+import tempfile
 import time
 
 import psycopg.rows
@@ -77,6 +78,7 @@ import ingestion_store as ist  # noqa: E402
 import pg_store  # noqa: E402
 import slide_format_registry  # noqa: E402
 import slide_io  # noqa: E402
+import slide_pyramid  # noqa: E402
 import slide_publish  # noqa: E402
 import slide_storage  # noqa: E402
 import slide_store  # noqa: E402
@@ -1666,6 +1668,224 @@ def _ready_probe_path(job, *, root=None):
     return None
 
 
+def _pyramid_event(job_id, generation, kind, detail=None):
+    """记录金字塔事件；StaleLease 返回 False（调用方停止），其余失败只记日志。"""
+    try:
+        ist.worker_note_pyramid_event(job_id, generation, kind, detail)
+        return True
+    except ist.StaleLease:
+        return False
+    except Exception:  # noqa: BLE001  诊断事件绝不阻断摄取
+        _log.warning("pyramid 事件写入失败（job=%s kind=%s）",
+                     job_id, kind, exc_info=True)
+        return True
+
+
+def _pyramid_quota_headroom(job, growth):
+    """返回 (可放行, 原因)。growth<=0 恒放行；无配额行/豁免身份不设限。"""
+    if int(growth) <= 0:
+        return True, ""
+    ident = {"user_id": (job.get("owner_user_id") or "").strip(),
+             "role": job.get("owner_role")}
+    if not upload_guard.quota_applies(ident):
+        return True, ""
+    try:
+        row = upload_guard.peek_quota_row(ident["user_id"])
+    except Exception:  # noqa: BLE001  记账读取失败不阻断（L0 保留原文件更安全）
+        _log.warning("pyramid 配额读取失败，跳过构建（job=%s）",
+                     job.get("job_id"), exc_info=True)
+        return False, "quota_exceeded"
+    if row is None:
+        return True, ""
+    headroom = (int(row["quota_bytes"]) - int(row["used_bytes"])
+                - int(row["reserved_bytes"]))
+    if int(growth) > headroom:
+        return False, "quota_exceeded"
+    return True, ""
+
+
+def _maybe_build_pyramid(job, path, slide_id):
+    """ready 阶段：单层大切片 → 服务端金字塔（任何失败都回退原文件）。
+
+    返回 True=已原子替换并完成记账/revision；False=未构建（跳过/失败/
+    租约易主）。**本函数绝不抛异常给摄取主流程**（调用方另有一层兜底）。
+    """
+    if not slide_pyramid.pyramid_enabled():
+        return False
+    job_id = job["job_id"]
+    gen = job["worker_generation"]
+    token = job.get("worker_lease_token")
+    sid = (slide_id or "").strip()
+    if not sid or not os.path.isfile(path):
+        return False
+    try:
+        slide = slide_io.open_slide(path)
+        try:
+            info = {"level_count": int(getattr(slide, "level_count", 0) or 0),
+                    "dimensions": tuple(slide.dimensions)}
+        finally:
+            try:
+                slide.close()
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001  打不开留给 readiness probe 处置
+        return False
+    if not slide_pyramid.needs_pyramid(info):
+        return False
+
+    bytes_before = int(os.path.getsize(path))
+    if not slide_pyramid.is_buildable_source(path):
+        # .svs/.ndpi 等厂商后缀替换后会被 OpenSlide 优先打开、读不到 SubIFD：
+        # 跳过并保留原文件（只记录证据，不改动资产）。
+        _pyramid_event(job_id, gen, "pyramid_skipped", {
+            "slide_id": sid, "reason": "unsupported_format_ext"})
+        return False
+    if not _pyramid_event(job_id, gen, "pyramid_started", {
+            "slide_id": sid, "bytes_before": bytes_before}):
+        return False
+
+    parent = os.path.dirname(os.path.abspath(path))
+    fd, tmp_path = tempfile.mkstemp(prefix=".pyramid-", suffix=".tiff",
+                                    dir=parent)
+    os.close(fd)
+    try:
+        os.unlink(tmp_path)  # build_pyramid 要求目标不存在
+    except OSError:
+        pass
+
+    last_renew = [0.0]
+
+    def _progress(stage, done, total):
+        now = time.monotonic()
+        if stage not in ("done",) and now - last_renew[0] < 30.0:
+            return
+        last_renew[0] = now
+        if token and not ist.renew_worker_lease(job_id, token):
+            raise slide_pyramid.PyramidSkip("lease_lost")
+
+    try:
+        result = slide_pyramid.build_pyramid(
+            path, tmp_path, scratch_dir=parent, progress=_progress,
+            deadline=job.get("job_deadline_at"))
+    except slide_pyramid.PyramidSkip as exc:
+        _remove_quiet(tmp_path)
+        _pyramid_event(job_id, gen, "pyramid_skipped", {
+            "slide_id": sid, "reason": exc.reason})
+        _log.info("pyramid 跳过（job=%s reason=%s）", job_id, exc.reason)
+        return False
+    except Exception as exc:  # noqa: BLE001  构建失败不得让摄取失败
+        _remove_quiet(tmp_path)
+        _pyramid_event(job_id, gen, "pyramid_failed", {
+            "slide_id": sid, "error_type": type(exc).__name__})
+        _log.warning("pyramid 构建失败，保留原文件（job=%s）：%s",
+                     job_id, type(exc).__name__, exc_info=True)
+        return False
+
+    try:
+        slide_pyramid.validate_pyramid(
+            path, tmp_path, lossless=result.source_lossless,
+            expected_dims=result.level_dimensions)
+    except Exception as exc:  # noqa: BLE001
+        _remove_quiet(tmp_path)
+        _pyramid_event(job_id, gen, "pyramid_failed", {
+            "slide_id": sid, "error_type": type(exc).__name__})
+        _log.warning("pyramid 输出校验失败，保留原文件（job=%s）：%s",
+                     job_id, exc, exc_info=True)
+        return False
+
+    bytes_after = int(os.path.getsize(tmp_path))
+    ok, reason = _pyramid_quota_headroom(job, bytes_after - bytes_before)
+    if not ok:
+        _remove_quiet(tmp_path)
+        _pyramid_event(job_id, gen, "pyramid_skipped", {
+            "slide_id": sid, "reason": reason,
+            "bytes_before": bytes_before, "bytes_after": bytes_after})
+        _log.info("pyramid 跳过（job=%s reason=%s growth=%d）",
+                  job_id, reason, bytes_after - bytes_before)
+        return False
+
+    # 内容 revision：替换后 viewer/AI 缓存必须以新值失效。
+    try:
+        digest = slide_pyramid.file_sha256(tmp_path)
+    except Exception as exc:  # noqa: BLE001
+        _remove_quiet(tmp_path)
+        _pyramid_event(job_id, gen, "pyramid_failed", {
+            "slide_id": sid, "error_type": type(exc).__name__})
+        return False
+    revision = "sha256:%s" % digest[:16]
+
+    if token and not ist.renew_worker_lease(job_id, token):
+        _remove_quiet(tmp_path)
+        return False
+
+    backup = os.path.join(
+        parent, ".pyramid-backup-%s-%s" % (job_id, secrets.token_hex(4)))
+    try:
+        os.link(path, backup)  # 同卷硬链接：DB 失败可原样回滚
+    except OSError as exc:
+        _remove_quiet(tmp_path)
+        _pyramid_event(job_id, gen, "pyramid_failed", {
+            "slide_id": sid, "error_type": type(exc).__name__})
+        _log.warning("pyramid 备份硬链接失败，保留原文件（job=%s）", job_id)
+        return False
+
+    replaced = False
+    try:
+        os.replace(tmp_path, path)   # 原子换入
+        replaced = True
+        ist.worker_record_pyramid_built(
+            job_id, gen, sid, bytes_before=bytes_before,
+            bytes_after=bytes_after, levels=result.levels,
+            seconds=result.seconds, revision=revision,
+            level0_compression=result.level0_compression,
+            sublevel_compression=result.sublevel_compression)
+    except ist.StaleLease:
+        if replaced:
+            try:
+                os.replace(backup, path)
+                replaced = False
+            except OSError:
+                _log.error("pyramid 回滚失败（job=%s slide=%s）",
+                           job_id, sid, exc_info=True)
+        _remove_quiet(tmp_path)
+        _log.warning("pyramid 记账租约已失效，保留/回滚原文件（job=%s）",
+                     job_id)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        if replaced:
+            try:
+                os.replace(backup, path)
+                replaced = False
+            except OSError:
+                _log.error("pyramid 回滚失败（job=%s slide=%s）",
+                           job_id, sid, exc_info=True)
+        _remove_quiet(tmp_path)
+        _pyramid_event(job_id, gen, "pyramid_failed", {
+            "slide_id": sid, "error_type": type(exc).__name__})
+        _log.warning("pyramid 记账失败，保留/回滚原文件（job=%s）", job_id,
+                     exc_info=True)
+        return False
+    finally:
+        try:
+            if os.path.exists(backup):
+                os.unlink(backup)
+        except OSError:
+            pass
+        _remove_quiet(tmp_path)
+
+    _log.info("pyramid 构建完成（job=%s slide=%s levels=%d %d->%d bytes "
+              "%.1fs）", job_id, sid, result.levels, bytes_before,
+              bytes_after, result.seconds)
+    return True
+
+
+def _remove_quiet(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def process_ready(cos=None, state=None):
     """领取 READY：readiness probe（descriptor 路径）→ completed；失败记
     retry 事件并释放租约（§4：不降级、不重下载、不删副本）。
@@ -1701,7 +1921,7 @@ def process_ready(cos=None, state=None):
                 _release_lease(job_id, token, state)  # 在途：下轮再探
                 return None
         else:
-            probe_paths = []
+            probe_items = []  # [(slide_id, path)]：ready 探针 + 金字塔构建
             if kind == ist.KIND_ZIP:
                 for item in ist.list_ingestion_job_items(job_id):
                     if item.get("state") != ist.ITEM_PUBLISHED:
@@ -1713,15 +1933,24 @@ def process_ready(cos=None, state=None):
                         raise ValueError(
                             "probe_path_missing（item %s 未解析到资产）"
                             % item["item_key"])
-                    probe_paths.append(path)
-                if not probe_paths:
+                    probe_items.append((item["slide_id"], path))
+                if not probe_items:
                     raise ValueError("zip_no_published_items")
             else:
                 probe_path = _ready_probe_path(job, root=_ensure_upload_dir())
                 if probe_path is None:
                     raise ValueError("probe_path_missing（slide_id 未解析到资产）")
-                probe_paths.append(probe_path)
-            for path in probe_paths:
+                probe_items.append(((job.get("slide_id") or "").strip(),
+                                    probe_path))
+            # 摄取期金字塔：单层大切片重写为 SubIFD 金字塔后再做 readiness
+            # 探针。构建/记账失败一律回退原文件，绝不让上传失败。
+            for sid, path in probe_items:
+                try:
+                    _maybe_build_pyramid(job, path, sid)
+                except Exception:  # noqa: BLE001  防御：任何异常不阻断摄取
+                    _log.warning("pyramid 前置处理异常，保留原文件（job=%s）",
+                                 job_id, exc_info=True)
+            for _sid, path in probe_items:
                 _probe_viewer_ready(path)
     except Exception as exc:  # noqa: BLE001  确定性失败也只重试（§4）
         try:

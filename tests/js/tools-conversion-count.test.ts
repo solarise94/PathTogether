@@ -87,7 +87,7 @@ describe("converter page summary line", () => {
 	it("static assets are cache-busted for this change", () => {
 		expect(shellSrc).toContain("/static/tools/tools-slides.js?v=20261110a");
 		expect(shellSrc).toContain("/static/tools/tools-slides.css?v=20261110a");
-		expect(shellSrc).toContain("/static/i18n.js?v=20261110a");
+		expect(shellSrc).toContain("/static/i18n.js?v=20261110b");
 	});
 });
 

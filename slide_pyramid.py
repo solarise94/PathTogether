@@ -32,8 +32,9 @@ OME-TIFF，使 viewer/AI 能用真正的低分辨率层看「当前小区域 + �
   tile/块有关（512² × 通道 × dtype），与全图尺寸无关（临时 zarr 文件页
   不计入进程 RSS，不持整级数组）。
 - **校验**：``validate_pyramid`` 除 level-0 像素外，还逐级比较 SubIFD
-  内容（3 个采样窗口 + 最小层整层，与上一级 2× 盒式下采样对比）；全零/
-  常量的缩减层即使层数/尺寸正确也会被拒绝。
+  内容（3 个采样窗口 + 最小层整层，与上一级 2× 盒式下采样对比）；常量/
+  全零缩减层只有在均值也与期望明显不符时才会被拒绝（白玻璃/黑背景的
+  正常平场不算损坏）。
 - **硬上限**（任一命中 → 跳过并保留原文件，``PyramidSkip.reason``）：
   * ``width × height > 2^32``；
   * 预估输出 > 3× 源文件（写出后再按实际大小复核）；
@@ -93,8 +94,8 @@ PYRAMID_SUBLEVEL_TOLERANCE = 12.0
 #: 的重采样滤波器（area/triangle/cubic）与 ceil/floor 比例映射会让逐像素
 #: 比较产生远大于本地 JPEG q90 的差异（高频内容可达 ~36）；先按
 #: :data:`PYRAMID_REPAIR_SUBLEVEL_BLOCK` 做块均值可消除相位/滤波器差异，
-#: 同时保留对「内容来自别处」的敏感性。全零/常量缩减层由独立显式判定
-#: 捕获，不依赖该容差。
+#: 同时保留对「内容来自别处」的敏感性。全零（期望明显非零）由独立显式
+#: 判定捕获；平场的均值差异由块均值容差判定。
 PYRAMID_REPAIR_SUBLEVEL_TOLERANCE = 32.0
 #: 修复分类比较的块边长（期望与实际都先做该尺寸盒式均值）。
 PYRAMID_REPAIR_SUBLEVEL_BLOCK = 8
@@ -1160,12 +1161,27 @@ def _mean_abs_channel_diff(expected, actual):
     return float(np.abs(exp - act).mean(axis=(0, 1)).max())
 
 
-def _check_level_content(level, box, expected, actual, *, tolerance):
-    """比较一个缩减层窗口与上一级 2× 下采样；拒绝常量/全零层。
+#: 常量/全零窗口的全零判据：期望均值高于该值才视为异常。
+#: 近白玻璃/纯黑背景在低分辨率层本来就是平场，不能因「上一级有微小
+#: 纹理」就判为坏层；只有全零且期望明显非零（旧构建器的全零 SubIFD
+#: 期望均值约 239）才单独报错。
+_FLAT_ZERO_MIN_EXPECTED_MEAN = 16.0
 
-    返回该窗口每通道平均绝对差的最大值。全零/常量判定是显式的：旧构建
-    器把空 level 1 降采样成全零 SubIFD 时，平均差已经很大；这里再加一条
-    明确信号，避免「源本身很暗」让大窗口的平均差落回容差内。
+
+def _check_level_content(level, box, expected, actual, *, tolerance):
+    """比较一个缩减层窗口与上一级 2× 下采样；拒绝明显错误的内容。
+
+    返回该窗口每通道平均绝对差的最大值。
+
+    常量/全零窗口只有「均值也对不上」才算损坏：
+
+    - 平场（``actual std <= 0.5``）且均值与期望均值相差超过
+      ``tolerance``；
+    - 或全零且期望均值明显非零（> :data:`_FLAT_ZERO_MIN_EXPECTED_MEAN`）。
+
+    这样白玻璃（期望 ~254.5，实际 255）和黑色背景（期望 ~0，实际 0）
+    都是健康的；旧构建器的全零 SubIFD（期望 ~239、实际 0）仍被捕获。
+    非平场窗口继续按逐像素平均绝对差与 ``tolerance`` 比较。
     """
     if expected.shape != actual.shape:
         raise PyramidValidationError(
@@ -1175,10 +1191,12 @@ def _check_level_content(level, box, expected, actual, *, tolerance):
     act_rgb = actual[..., :3]
     exp_mean, exp_std = float(exp_rgb.mean()), float(exp_rgb.std())
     act_mean, act_std = float(act_rgb.mean()), float(act_rgb.std())
-    if (exp_std > 1.0 and act_std <= 0.5) or \
-            (exp_mean > 1.0 and int(act_rgb.max()) == 0):
+    if act_std <= 0.5 and (
+            abs(act_mean - exp_mean) > float(tolerance)
+            or (int(act_rgb.max()) == 0
+                and exp_mean > _FLAT_ZERO_MIN_EXPECTED_MEAN)):
         raise PyramidValidationError(
-            "level %d 窗口 %r 为常量/全零，但 level 0 对应区域有内容"
+            "level %d 窗口 %r 为常量/全零，且均值与上一级下采样不符"
             "（expected mean=%.1f std=%.1f，actual mean=%.1f std=%.1f）"
             % (level, box, exp_mean, exp_std, act_mean, act_std))
     metric = _mean_abs_channel_diff(expected, actual)
@@ -1372,8 +1390,9 @@ def _validate_own_sublevels(slide, dims, *, tolerance, comparable):
                 slide, level, ox, oy, win_w, win_h)
             checked += 1
             if comparable:
-                # 常量/全零判定沿用同一实现（与 strict 校验一致），但差异
-                # 阈值用块均值口径：第三方滤波/取整的相位差不应触发重修。
+                # 常量/全零判定沿用同一实现（与 strict 校验一致）：这里传
+                # inf 只取「全零且期望明显非零」信号；平场均值/内容差异
+                # 由下面的块均值口径按修复容差判定。
                 _check_level_content(
                     level, (ox, oy), expected, actual,
                     tolerance=float("inf"))
@@ -1400,9 +1419,10 @@ def validate_sublevel_content(path, *,
     正确，第三方金字塔会因层数/取整不同被它拒绝。这里只比较内容：
 
     - 每个 level ≥1 与上一级对应区域盒式下采样比较（倍率由该文件自身
-      相邻层尺寸推导），上一级有内容而该层为常量/全零、或
-      :data:`PYRAMID_REPAIR_SUBLEVEL_BLOCK` 块均值后的平均绝对差超过
-      ``tolerance`` → :class:`PyramidValidationError`；
+      相邻层尺寸推导），:data:`PYRAMID_REPAIR_SUBLEVEL_BLOCK` 块均值的
+      平均绝对差超过 ``tolerance`` → :class:`PyramidValidationError`；
+    - 常量/全零层额外按均值判定：平场均值与期望相差超过同一容差、或
+      全零而期望均值明显非零时算损坏；白玻璃/黑背景的正常平场是健康的；
     - ``tolerance`` 默认用 :data:`PYRAMID_REPAIR_SUBLEVEL_TOLERANCE`
       （块均值口径；第三方重采样滤波器/取整映射的相位差不会触发重修）；
     - 层数、尺寸序列/mpp/level-0 等结构差异**不**算损坏；倍率不可推定的
@@ -1447,7 +1467,8 @@ def validate_pyramid(src_path, dst_path, *, expected_dims=None,
       平均差 ≤ ``max_mean_diff``（同一 JPEG 解码器误差量级）；
     - **每个 level ≥1** 采样 ≤3 个窗口（最小层整层）与上一级 2× 盒式
       下采样比较（链条回到 level 0），平均绝对差 ≤ ``sublevel_tolerance``；
-      全零/常量缩减层即使层数/尺寸正确也抛 :class:`PyramidValidationError`。
+      常量/全零缩减层只在均值与期望明显不符（或全零而期望明显非零）时抛
+      :class:`PyramidValidationError`（白玻璃/黑背景的正常平场是健康的）。
 
     返回 ``{"levels", "level_dimensions", "mpp_x", "mean_diff",
     "sublevel_windows", "sublevel_max_mean_diff"}``。

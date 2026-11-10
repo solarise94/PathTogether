@@ -192,26 +192,43 @@ def _box_reduce_rgb(rgb, out_h, out_w):
         np.uint8)
 
 
+def _near_white_rgb(h, w, *, seed=7, dark_fraction=0.004, dark=127):
+    """近白玻璃：255 底 + 稀疏暗点（mean≈254.5，std≈8）。"""
+    rng = np.random.default_rng(int(seed))
+    data = np.full((int(h), int(w), 3), 255, np.uint8)
+    mask = rng.random((int(h), int(w), 3)) < float(dark_fraction)
+    data[mask] = int(dark)
+    return data
+
+
 def _write_own_dims_pyramid(path, level_dims, *, zero_sublevels=False,
-                            resample=None, shift_sublevels=0):
+                            resample=None, shift_sublevels=0, level0=None,
+                            flat_sublevels=None):
     """写「第三方工具形态」金字塔：层尺寸完全由调用方给出。
 
     缩减层内容由上一级做 2× 下采样得到（可写 floor 或 ceil 序列）：
     默认用与构建器同口径的对齐盒式平均；``resample="pil"`` 用 Pillow
     的 BOX 重采样（比例映射，模拟其它转换器的滤波器/取整差异）。
     ``zero_sublevels`` 时只写全零缩减层，模拟旧构建器写坏的文件；
-    ``shift_sublevels`` 让缩减层内容来自水平错位的源（非全零但明显不符）。
+    ``shift_sublevels`` 让缩减层内容来自水平错位的源（非全零但明显不符）；
+    ``level0`` 覆盖 level-0 像素（默认渐变噪声）。
+    ``flat_sublevels`` 把缩减层写成该灰度值的平场（模拟白玻璃）。
     """
     import tifffile
 
     base_w, base_h = (int(v) for v in level_dims[0])
-    levels = [_gradient_rgb(base_h, base_w)]
+    if level0 is None:
+        level0 = _gradient_rgb(base_h, base_w)
+    levels = [level0]
     prev = levels[0]
     if shift_sublevels:
         prev = np.roll(prev, int(shift_sublevels), axis=1)
     for (lw, lh) in level_dims[1:]:
         if zero_sublevels:
             prev = np.zeros((int(lh), int(lw), 3), np.uint8)
+        elif flat_sublevels is not None:
+            prev = np.full((int(lh), int(lw), 3), int(flat_sublevels),
+                           np.uint8)
         elif resample == "pil":
             from PIL import Image
 
@@ -923,3 +940,79 @@ def test_repair_detects_nonzero_but_mismatched_sublevel(tmp_path):
         sp.validate_sublevel_content(_path)
     listed = {it["slide_id"] for it in mod._repair_candidates()}
     assert desc.slide_id in listed
+
+
+# --------------------------------------------------------------------------- #
+# 平场窗口（白玻璃/黑背景）不得被误判为「常量/全零」坏层
+# --------------------------------------------------------------------------- #
+def test_near_white_flat_sublevels_are_healthy(tmp_path):
+    """近白玻璃 + 缩减层平场 255：严格校验与修复分类都判健康。"""
+    w, h = 5000, 3000
+    dims = sp.level_dimensions_for(w, h)
+    assert len(dims) >= 4
+    level0 = _near_white_rgb(h, w)
+    assert 250.0 <= float(level0.mean()) <= 255.0
+    assert 5.0 <= float(level0.std()) <= 11.0
+    desc, path = _mk_own_dims_slide(
+        "sld_pyr_white_flat", tmp_path, dims, level0=level0,
+        flat_sublevels=255)
+
+    # 层序列/尺寸/mpp/level-0 都与构建器期望一致，只有缩减层是 255 平场：
+    # 严格校验不得把它当作「常量层但上一级有内容」拒绝。
+    meta = sp.validate_pyramid(path, path, lossless=True)
+    assert meta["sublevel_windows"] >= 3
+    meta = sp.validate_sublevel_content(path)
+    assert meta["sublevel_windows"] >= 3
+    assert meta["sublevel_max_mean_diff"] <= 1.0
+
+    mod = _load_backfill()
+    code, payload = mod.repair_one(desc.slide_id)
+    assert code == 1, payload
+    assert payload["refused"] == "not_broken"
+    assert desc.slide_id not in {
+        it["slide_id"] for it in mod._repair_candidates()}
+
+
+def test_zeroed_sublevels_with_expected_238_fail_both(tmp_path):
+    """期望均值 ~238 时全零缩减层仍是损坏（严格与修复都拒绝）。"""
+    w, h = 1600, 1200
+    dims = sp.level_dimensions_for(w, h)
+    rng = np.random.default_rng(5)
+    level0 = np.clip(
+        238 + rng.integers(-3, 4, (h, w, 3), dtype=np.int16),
+        0, 255).astype(np.uint8)
+    assert abs(float(level0.mean()) - 238.0) < 2.0
+    desc, path = _mk_own_dims_slide(
+        "sld_pyr_gray_zero", tmp_path, dims, level0=level0, zero=True)
+
+    with pytest.raises(sp.PyramidValidationError, match="常量/全零"):
+        sp.validate_pyramid(path, path, lossless=True)
+    with pytest.raises(sp.PyramidValidationError, match="常量/全零"):
+        sp.validate_sublevel_content(path)
+
+    mod = _load_backfill()
+    assert desc.slide_id in {it["slide_id"] for it in mod._repair_candidates()}
+
+
+def test_build_pyramid_mostly_white_slide_validates(tmp_path):
+    """真实构建路径：白底 + 小块组织（≥4 层）构建后通过严格校验。"""
+    import tifffile
+
+    w, h = 5000, 3000
+    data = np.full((h, w, 3), 255, np.uint8)
+    data[200:700, 300:800] = 45       # 左上采样窗口内的小组织块
+    data[1400:1900, 2300:2800] = 35   # 中部采样窗口内的小组织块
+    src = tmp_path / "white_slide.ome.tiff"
+    # 未压缩源：近白图像 LZW 后只有 ~0.2MB，会触发「输出 > 3× 源」的
+    # 确定性跳过；本测试要覆盖真实构建+校验，故用未压缩源（仍是同一构建路径）。
+    tifffile.imwrite(
+        str(src), data, photometric="rgb", compression=None, ome=True,
+        metadata={"axes": "YXS", "PhysicalSizeX": 0.25,
+                  "PhysicalSizeXUnit": "µm", "PhysicalSizeY": 0.25,
+                  "PhysicalSizeYUnit": "µm"})
+    out = tmp_path / "white_slide.pyramid.ome.tiff"
+    result = sp.build_pyramid(src, out)
+    assert len(result.level_dimensions) >= 4
+    meta = sp.validate_pyramid(src, out, lossless=True,
+                               expected_dims=result.level_dimensions)
+    assert meta["sublevel_windows"] >= 3

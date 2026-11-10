@@ -2,16 +2,20 @@
 """重上传提示与断点续传清单（upload-resilience 2026-11-10）。
 
 覆盖：
-  - GET /api/ingestions/duplicates：登录/上传权限、owner 隔离、90 天窗口、
-    completed 需 ready 且未删除、unfinished 状态集合与块数（COS ListParts
-    权威；不可得时 uploaded_parts=null）；
+  - POST /api/ingestions/duplicates：登录/上传权限、owner 隔离、90 天窗口、
+    completed 需 ready 且未删除、unfinished 仅限可续传状态（waiting/
+    preparing/uploading）与块数（COS ListParts 权威；不可得时
+    uploaded_parts=null）、processing（已传完、服务端处理中）单列且绝不
+    混入 unfinished、JSON body 契约（非 JSON/超大 → 400）；
   - GET /api/ingestions/<id>/parts：owner 隔离、状态闸、冻结计划 + ListParts
-    清单（编号/长度/ETag）、ListParts 失败降级 502 且不泄露对象键。
+    清单（编号/长度/ETag）、ListParts 失败降级 502 且不泄露对象键；
+  - Web 进程 ListParts 一律传受限 timeout/retry（不钉住 gunicorn 线程）。
 
 COS 一律 monkeypatch ``cos_client.list_parts``（与既有 ingestion 测试同一
 方式：worker 之外不连真实 COS）。
 """
 
+import json
 import time
 
 import pytest
@@ -104,8 +108,8 @@ def _mk_job(job_id, owner, filename, size, *, state, slide_id=None,
 
 
 def _query(client, filename="scan.tif", size=1000):
-    return client.get("/api/ingestions/duplicates",
-                      query_string={"filename": filename, "size": size})
+    return client.post("/api/ingestions/duplicates",
+                       json={"filename": filename, "size": size})
 
 
 # --------------------------------------------------------------------------- #
@@ -121,22 +125,57 @@ def test_duplicates_requires_upload_permission(monkeypatch):
     assert r.status_code in (401, 403)
 
 
-def test_duplicates_validates_filename_and_size(user_client):
-    assert user_client.get("/api/ingestions/duplicates").status_code == 400
+def test_duplicates_is_post_only(user_client):
+    """文件名不得走查询串（访问日志/代理）：GET 不再提供该端点。"""
     r = user_client.get("/api/ingestions/duplicates",
-                        query_string={"filename": "a.tif", "size": 0})
+                        query_string={"filename": "scan.tif", "size": 1000})
+    assert r.status_code == 405
+
+
+def test_duplicates_validates_filename_and_size(user_client):
+    r = user_client.post("/api/ingestions/duplicates")
+    assert r.status_code == 400
+    assert r.get_json()["code"] == "invalid_body"
+    r = user_client.post("/api/ingestions/duplicates",
+                         json={"filename": "a.tif", "size": 0})
     assert r.status_code == 400
     assert r.get_json()["code"] == "invalid_size"
-    r = user_client.get("/api/ingestions/duplicates",
-                        query_string={"filename": "  ", "size": 10})
+    r = user_client.post("/api/ingestions/duplicates",
+                         json={"filename": "  ", "size": 10})
     assert r.status_code == 400
     assert r.get_json()["code"] == "invalid_filename"
+    r = user_client.post("/api/ingestions/duplicates",
+                         json={"filename": 123, "size": 10})
+    assert r.status_code == 400
+    assert r.get_json()["code"] == "invalid_filename"
+    r = user_client.post("/api/ingestions/duplicates",
+                         json={"filename": "a.tif", "size": True})
+    assert r.status_code == 400
+    assert r.get_json()["code"] == "invalid_size"
+    # 非 JSON / 坏 JSON / 超大 body 一律 400（不进入业务查询）
+    r = user_client.post("/api/ingestions/duplicates",
+                         data="filename=scan.tif&size=1000",
+                         content_type="text/plain")
+    assert r.status_code == 400
+    assert r.get_json()["code"] == "invalid_body"
+    r = user_client.post("/api/ingestions/duplicates", data="{bad json",
+                         content_type="application/json")
+    assert r.status_code == 400
+    assert r.get_json()["code"] == "invalid_body"
+    big = json.dumps({"filename": "a.tif", "size": 10,
+                      "pad": "x" * 5000})
+    r = user_client.post("/api/ingestions/duplicates", data=big,
+                         content_type="application/json")
+    assert r.status_code == 400
+    assert r.get_json()["code"] == "body_too_large"
 
 
 def test_duplicates_empty_when_no_match(user_client):
     r = _query(user_client)
     assert r.status_code == 200
-    assert r.get_json() == {"completed": None, "unfinished": None}
+    assert r.get_json() == {"completed": None, "unfinished": None,
+                            "processing": None}
+    assert r.headers["Cache-Control"] == "no-store"
 
 
 # --------------------------------------------------------------------------- #
@@ -210,20 +249,36 @@ def test_completed_size_uses_source_size_when_pinned(user_client):
 # --------------------------------------------------------------------------- #
 # unfinished：状态集合 + 权威块数
 # --------------------------------------------------------------------------- #
+def _list_parts_recorder(result):
+    """替换 cos_client.list_parts：记录调用（含受限 timeout/retry）。"""
+    calls = []
+
+    def fake(key, upload_id, *, timeout=None, retry=None):
+        calls.append({"key": key, "upload_id": upload_id,
+                      "timeout": timeout, "retry": retry})
+        return result
+
+    return fake, calls
+
+
 def test_unfinished_reports_state_and_authoritative_parts(
         user_client, monkeypatch):
     plan = [{"part_number": n, "offset": (n - 1) * 500, "length": 500}
             for n in (1, 2)]
     _mk_job("inj_live", "dup-user-1", "scan.tif", 1000, state=ist.UPLOADING,
             upload_id="up-1", object_key="incoming/u/inj_live/x", plan=plan)
-    monkeypatch.setattr(cos_client, "list_parts", lambda key, upload_id: [
+    fake, calls = _list_parts_recorder([
         {"part_number": 1, "etag": '"abc"', "size": 500,
          "last_modified": time.time()}])
+    monkeypatch.setattr(cos_client, "list_parts", fake)
     body = _query(user_client).get_json()
     assert body["unfinished"] == {
         "job_id": "inj_live", "state": "uploading",
         "uploaded_parts": 1, "total_parts": 2,
     }
+    # web 线程受限调用：浏览器 3 秒放弃，SDK 默认重试（4 次尝试）不可接受
+    assert calls == [{"key": "incoming/u/inj_live/x", "upload_id": "up-1",
+                      "timeout": 3, "retry": 0}]
 
 
 def test_unfinished_parts_unknown_when_list_parts_fails(
@@ -232,7 +287,7 @@ def test_unfinished_parts_unknown_when_list_parts_fails(
     _mk_job("inj_live", "dup-user-1", "scan.tif", 1000, state=ist.UPLOADING,
             upload_id="up-1", object_key="incoming/u/inj_live/x", plan=plan)
 
-    def boom(key, upload_id):
+    def boom(key, upload_id, *, timeout=None, retry=None):
         raise cos_client.CosClientError("HTTP 500 InternalError")
 
     monkeypatch.setattr(cos_client, "list_parts", boom)
@@ -241,13 +296,61 @@ def test_unfinished_parts_unknown_when_list_parts_fails(
     assert body["unfinished"]["total_parts"] == 1
 
 
-def test_unfinished_waiting_has_no_parts(user_client):
-    _mk_job("inj_wait", "dup-user-1", "scan.tif", 1000, state=ist.WAITING)
+@pytest.mark.parametrize("state", [ist.WAITING, ist.PREPARING])
+def test_unfinished_waiting_or_preparing_has_no_parts(user_client, state):
+    _mk_job("inj_pending", "dup-user-1", "scan.tif", 1000, state=state)
     body = _query(user_client).get_json()
     assert body["unfinished"] == {
-        "job_id": "inj_wait", "state": "waiting_capacity",
+        "job_id": "inj_pending", "state": state,
         "uploaded_parts": 0, "total_parts": 0,
     }
+    assert body["processing"] is None
+
+
+@pytest.mark.parametrize("state", ist.DUPLICATE_PROCESSING_STATES)
+def test_processing_states_are_not_unfinished(user_client, state):
+    """分块已全部上传：只报 processing，绝不报「未完成 0/N 块」。"""
+    plan = [{"part_number": n, "offset": (n - 1) * 500, "length": 500}
+            for n in (1, 2)]
+    _mk_job("inj_proc", "dup-user-1", "scan.tif", 1000, state=state,
+            upload_id="up-1", object_key="incoming/u/inj_proc/x", plan=plan)
+    body = _query(user_client).get_json()
+    assert body["unfinished"] is None
+    assert body["processing"] == {"job_id": "inj_proc", "state": state}
+
+
+def test_processing_is_owner_scoped_and_most_recent(user_client,
+                                                    other_client):
+    # 同一 owner 的活动任务唯一索引不允许两条 ACTIVE_UPLOAD_STATES 并存：
+    # 旧任务用 ready（不属于活动集，但仍算「服务端处理中」）。
+    _mk_job("inj_proc_old", "dup-user-1", "scan.tif", 1000,
+            state=ist.READY, created_sql="now() - interval '5 minutes'")
+    _mk_job("inj_proc_new", "dup-user-1", "scan.tif", 1000,
+            state=ist.QUEUED)
+    _mk_job("inj_proc_other", "dup-user-2", "scan.tif", 1000,
+            state=ist.DOWNLOADING)
+    assert _query(user_client).get_json()["processing"] == {
+        "job_id": "inj_proc_new", "state": ist.QUEUED}
+    assert _query(other_client).get_json()["processing"] == {
+        "job_id": "inj_proc_other", "state": ist.DOWNLOADING}
+
+
+def test_unfinished_and_processing_are_reported_independently(
+        user_client, monkeypatch):
+    """旧任务可续传、新任务处理中：两个键都在；客户端按 unfinished 优先，
+    且只取消 unfinished（processing 绝不取消）。"""
+    plan = [{"part_number": 1, "offset": 0, "length": 1000}]
+    _mk_job("inj_old", "dup-user-1", "scan.tif", 1000, state=ist.UPLOADING,
+            upload_id="up-old", object_key="incoming/u/inj_old/x", plan=plan,
+            created_sql="now() - interval '5 minutes'")
+    # ready 不在活动任务唯一索引内（同 owner 可与 uploading 并存）
+    _mk_job("inj_new", "dup-user-1", "scan.tif", 1000, state=ist.READY)
+    fake, _calls = _list_parts_recorder([])
+    monkeypatch.setattr(cos_client, "list_parts", fake)
+    body = _query(user_client).get_json()
+    assert body["unfinished"]["job_id"] == "inj_old"
+    assert body["processing"] == {"job_id": "inj_new",
+                                  "state": ist.READY}
 
 
 def test_terminal_job_is_not_unfinished(user_client):
@@ -257,6 +360,7 @@ def test_terminal_job_is_not_unfinished(user_client):
             terminal_sql="now()")
     body = _query(user_client).get_json()
     assert body["unfinished"] is None
+    assert body["processing"] is None
     assert body["completed"] is None
 
 
@@ -269,12 +373,13 @@ def test_parts_endpoint_returns_plan_and_listed_parts(
             for n in (1, 2, 3)]
     _mk_job("inj_live", "dup-user-1", "scan.tif", 1200, state=ist.UPLOADING,
             upload_id="up-1", object_key="incoming/u/inj_live/x", plan=plan)
-    monkeypatch.setattr(cos_client, "list_parts", lambda key, upload_id: [
+    fake, calls = _list_parts_recorder([
         {"part_number": 1, "etag": '"aa"', "size": 400,
          "last_modified": None},
         {"part_number": 3, "etag": '"cc"', "size": 400,
          "last_modified": None},
     ])
+    monkeypatch.setattr(cos_client, "list_parts", fake)
     r = user_client.get("/api/ingestions/inj_live/parts")
     assert r.status_code == 200
     body = r.get_json()
@@ -289,6 +394,9 @@ def test_parts_endpoint_returns_plan_and_listed_parts(
         {"part_number": 3, "size": 400, "etag": '"cc"'},
     ]
     assert r.headers["Cache-Control"] == "no-store"
+    # 浏览器 8 秒左右放弃：受限 timeout/retry，避免钉住 web 线程
+    assert calls[0]["timeout"] == 8
+    assert calls[0]["retry"] == 1
     # 对象键绝不返回浏览器
     assert "object_key" not in body
     assert "up-1" not in r.get_data(as_text=True)
@@ -299,7 +407,8 @@ def test_parts_endpoint_owner_scoping(user_client, other_client, monkeypatch):
     _mk_job("inj_other", "dup-user-2", "scan.tif", 1000,
             state=ist.UPLOADING, upload_id="up-1",
             object_key="incoming/u/inj_other/x", plan=plan)
-    monkeypatch.setattr(cos_client, "list_parts", lambda key, upload_id: [])
+    monkeypatch.setattr(cos_client, "list_parts",
+                        lambda key, upload_id, **kw: [])
     assert other_client.get("/api/ingestions/inj_other/parts").status_code == 200
     assert user_client.get("/api/ingestions/inj_other/parts").status_code == 403
 
@@ -324,7 +433,7 @@ def test_parts_endpoint_list_parts_failure_is_502(user_client, monkeypatch):
     _mk_job("inj_live", "dup-user-1", "scan.tif", 1000, state=ist.UPLOADING,
             upload_id="up-1", object_key="incoming/u/inj_live/x", plan=plan)
 
-    def boom(key, upload_id):
+    def boom(key, upload_id, **kw):
         raise cos_client.CosClientError("HTTP 404 NoSuchUpload")
 
     monkeypatch.setattr(cos_client, "list_parts", boom)

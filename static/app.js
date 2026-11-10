@@ -62,6 +62,7 @@
     "upload.dup.title": { zh: "重复文件", en: "Duplicate file" },
     "upload.dup.queue": { zh: "「{name}」已在上传列表中，仍要再添加一份吗？", en: "“{name}” is already in the upload list. Add another copy anyway?" },
     "upload.dup.completed": { zh: "你的切片库里已有同名同大小的「{name}」（{time} 上传），仍要再上传一份吗？", en: "You already have “{name}” with the same size in your slide library (uploaded {time}). Upload another copy anyway?" },
+    "upload.dup.processing": { zh: "「{name}」刚上传完成，服务器正在处理，处理完会出现在切片库里。仍要再上传一份吗？", en: "“{name}” just finished uploading and is being processed; it will appear in your slide library shortly. Upload another copy anyway?" },
     "upload.dup.upload": { zh: "再传一份", en: "Upload anyway" },
     "upload.dup.skip": { zh: "不传了", en: "Don't upload" },
     "upload.dup.skipAll": { zh: "全部跳过", en: "Skip all" },
@@ -71,6 +72,7 @@
     "upload.dup.batch.hint": { zh: "选择「全部仍上传」会为未完成的上传新建任务（旧任务会先被取消）。", en: "“Upload all anyway” creates new jobs for unfinished uploads (the old jobs are cancelled first)." },
     "upload.dup.row.queue": { zh: "{name} — 已在上传列表", en: "{name} — already in the upload list" },
     "upload.dup.row.completed": { zh: "{name} — 切片库已有（{time}）", en: "{name} — already in your slide library ({time})" },
+    "upload.dup.row.processing": { zh: "{name} — 刚上传完，正在处理", en: "{name} — just uploaded, processing" },
     "upload.dup.row.unfinished": { zh: "{name} — 有未完成的上传", en: "{name} — unfinished upload" },
     "upload.dup.resume": { zh: "检测到「{name}」有未完成的上传（已传 {uploaded}/{total} 块），要继续上次的上传吗？", en: "An unfinished upload of “{name}” was found ({uploaded}/{total} parts uploaded). Continue that upload?" },
     "upload.dup.resume.generic": { zh: "检测到「{name}」有未完成的上传，要继续上次的上传吗？", en: "An unfinished upload of “{name}” was found. Continue that upload?" },
@@ -10638,8 +10640,8 @@
   // 生产证据：30 天内 5 个用户把同名同大小文件在完成后 2 秒–6 分钟又传了
   // 一遍（其中 3.5 GB 一次在完成后 2 秒开始、5 分钟后取消），两个用户最终
   // 出现重复切片。加文件时先做一次**不阻塞**的去重检查（本地面板队列同步
-  // 判定 + GET /api/ingestions/duplicates，3 秒超时 fail-open），批量添加
-  // 合并为一个对话框。
+  // 判定 + POST /api/ingestions/duplicates，3 秒超时 fail-open），批量添加
+  // 合并为一个对话框。文件名只走 JSON body（不进 URL/访问日志）。
   // =========================================================================
 
   //: 测试注入口（HP_UPLOAD._setUploadConfirm）：opts -> value/Promise。
@@ -11027,8 +11029,9 @@
           return enqueueUploadEntries(entries, assoc, opts, per);
         });
       }
-      // 仍上传：同名未完成任务先取消（否则服务端单活跃任务闸 409），
-      // 再按全新任务入队。
+      // 仍上传：同名**未完成**任务先取消（否则服务端单活跃任务闸 409），
+      // 再按全新任务入队。processing（分块已传完、服务端正在处理）绝不
+      // 取消——用户只是再添一份，不应杀掉一个即将完成的任务。
       var stale = plan.duplicates.filter(function (d) {
         return d.kind === "unfinished" && d.unfinished;
       }).map(function (d) { return d.unfinished.job_id; });
@@ -11048,6 +11051,9 @@
     var title = tt("upload.dup.title");
     if (dup.kind === "queue") {
       message = tt("upload.dup.queue", { name: dup.name });
+    } else if (dup.kind === "processing") {
+      // 分块已全部传完：没有续传选项，也绝不取消既有任务。
+      message = tt("upload.dup.processing", { name: dup.name });
     } else if (dup.kind === "completed") {
       message = tt("upload.dup.completed", {
         name: dup.name,
@@ -11101,6 +11107,9 @@
           name: d.name,
           time: dupTimeText(d.completed && d.completed.completed_at),
         });
+      }
+      if (d.kind === "processing") {
+        return tt("upload.dup.row.processing", { name: d.name });
       }
       return tt("upload.dup.row.unfinished", { name: d.name });
     });

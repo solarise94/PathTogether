@@ -7,7 +7,8 @@
 
      1. 这个文件是否已经在**面板队列**里（非终态或刚完成的同一行）？
      2. 服务端是否已有同一 owner 的（a）已完成切片（90 天内）或
-        （b）未完成上传？——GET /api/ingestions/duplicates。
+        （b）未完成/正在处理的上传？——POST /api/ingestions/duplicates
+        （文件名只走 JSON body，绝不进 URL/访问日志）。
 
    网络失败/超时（默认 3 秒）一律 **fail open**：返回「无重复」继续上传，
    绝不阻塞用户；批量添加（多选/文件夹）按同一份服务端结果给出**一个**
@@ -63,7 +64,8 @@
 
   /// 服务端响应规范化：只接受契约字段；任何异常 → null（fail open）。
   /// {completed:{slide_id,display_name,completed_at}|null,
-  ///  unfinished:{job_id,state,uploaded_parts,total_parts}|null}
+  ///  unfinished:{job_id,state,uploaded_parts,total_parts}|null,
+  ///  processing:{job_id,state}|null}
   function normalizeServerBody(body) {
     if (!body || typeof body !== "object") return null;
     var completed = null;
@@ -90,15 +92,28 @@
         total_parts: (typeof u.total_parts === "number") ? u.total_parts : null,
       };
     }
-    return (completed || unfinished)
-      ? { completed: completed, unfinished: unfinished }
+    var processing = null;
+    var p = body.processing;
+    if (p && typeof p === "object" &&
+        typeof p.job_id === "string" && p.job_id) {
+      processing = {
+        job_id: p.job_id,
+        state: (typeof p.state === "string") ? p.state : "",
+      };
+    }
+    return (completed || unfinished || processing)
+      ? { completed: completed, unfinished: unfinished,
+          processing: processing }
       : null;
   }
 
-  function duplicatesUrl(file) {
-    return "/api/ingestions/duplicates?filename=" +
-      encodeURIComponent(nameOf(file)) + "&size=" + encodeURIComponent(
-        String(sizeOf(file)));
+  /// 只读查询请求（POST + JSON body：文件名不得进入 URL/访问日志）。
+  function duplicatesRequest(file) {
+    return {
+      url: "/api/ingestions/duplicates",
+      method: "POST",
+      body: JSON.stringify({ filename: nameOf(file), size: sizeOf(file) }),
+    };
   }
 
   /// 单文件查询。永不 reject；超时/网络/非 2xx/坏 JSON → null（放行）。
@@ -127,7 +142,14 @@
       }, timeout);
       var p;
       try {
-        p = apiFetch(duplicatesUrl(file), ctl ? { signal: ctl.signal } : undefined);
+        var req = duplicatesRequest(file);
+        var init = {
+          method: req.method,
+          headers: { "Content-Type": "application/json" },
+          body: req.body,
+        };
+        if (ctl) init.signal = ctl.signal;
+        p = apiFetch(req.url, init);
       } catch (e) {
         p = Promise.reject(e);
       }
@@ -192,10 +214,11 @@
   /// items: [{file, handle?}] | File[]
   /// opts: {queueEntries, serverResults}
   /// 返回 {total, duplicates:[{index,file,name,size,kind,queueMatch,
-  ///        server,completed,unfinished}]}
-  ///   kind: "queue"（面板已有）| "completed"（切片库已有）|
-  ///         "unfinished"（上次未完成，可续传）
-  /// 队列命中优先：它比服务端更「近」，文案也不同。
+  ///        server,completed,unfinished,processing}]}
+  ///   kind: "queue"（面板已有）| "unfinished"（上次未完成，可续传）|
+  ///         "processing"（刚传完，服务器正在处理）| "completed"（切片库已有）
+  /// 优先级 queue > unfinished > processing > completed：续传比「正在处理」
+  /// 更可执行，而「正在处理」比已完成更接近（且绝不能取消）。
   function buildPlan(items, opts) {
     opts = opts || {};
     var queueEntries = opts.queueEntries || [];
@@ -209,8 +232,10 @@
       if (!q.length && !s) return;
       var completed = s ? s.completed : null;
       var unfinished = s ? s.unfinished : null;
+      var processing = s ? s.processing : null;
       var kind = q.length ? "queue"
-        : completed ? "completed" : "unfinished";
+        : unfinished ? "unfinished"
+        : processing ? "processing" : "completed";
       duplicates.push({
         index: index,
         file: f,
@@ -222,6 +247,7 @@
         server: s,
         completed: completed,
         unfinished: unfinished,
+        processing: processing,
       });
     });
     return { total: (items || []).length, duplicates: duplicates };
@@ -237,7 +263,7 @@
     fileOf: fileOf,
     queueMatches: queueMatches,
     normalizeServerBody: normalizeServerBody,
-    duplicatesUrl: duplicatesUrl,
+    duplicatesRequest: duplicatesRequest,
     requestOne: requestOne,
     requestDuplicates: requestDuplicates,
     buildPlan: buildPlan,

@@ -65,6 +65,34 @@ def _client() -> CosS3Client:
         return cli
 
 
+def _bounded_client(timeout, retry) -> CosS3Client:
+    """带超时/重试上限的独立缓存客户端（web 进程只读 ListParts 专用）。
+
+    SDK 默认 30s × (retry=3 → 4 次尝试) 会把 gunicorn 线程钉住约 2 分钟，
+    而浏览器 3 秒就放弃——Web 调用必须显式收窄。缓存键包含 timeout/retry，
+    与默认客户端（worker 路径）完全隔离，互不覆盖。
+    """
+    sid, skey, ok = cos_config.cos_credentials()
+    if not ok:
+        raise CosConfigMissing(
+            "COS 配置缺失（COS_BUCKET/COS_REGION/COS_SECRET_ID/COS_SECRET_KEY）"
+            "——调用方应空转告警，capability 保持 off")
+    cache_key = "%s|%s|%s|timeout=%s|retry=%s" % (
+        cos_config.COS_BUCKET, cos_config.COS_REGION, sid, timeout, retry)
+    with _client_lock:
+        cli = _client_cache.get(cache_key)
+        if cli is None:
+            conf = CosConfig(
+                Region=cos_config.COS_REGION, SecretId=sid, SecretKey=skey,
+                Scheme="https", Timeout=timeout)
+            # retry=None 表示沿用 SDK 默认（仅给定 timeout 的调用方）；
+            # 显式给 0 时也必须生效，所以不能用 `retry or 3`。
+            kwargs = {} if retry is None else {"retry": int(retry)}
+            cli = CosS3Client(conf, **kwargs)
+            _client_cache[cache_key] = cli
+        return cli
+
+
 def _bucket() -> str:
     if not cos_config.COS_BUCKET:
         raise CosConfigMissing("COS_BUCKET 未配置")
@@ -157,15 +185,22 @@ def _last_modified_epoch(raw) -> Optional[float]:
     return dt.timestamp()
 
 
-def list_parts(key: str, upload_id: str) -> List[Dict[str, object]]:
+def list_parts(key: str, upload_id: str, *, timeout: Optional[int] = None,
+               retry: Optional[int] = None) -> List[Dict[str, object]]:
     """分页列举已上传分块 → [{part_number, etag, size, last_modified}]
     （编号升序）。``last_modified`` 为分块最近修改时刻（epoch 秒），
-    liveness 活性判定（0084）用；SDK 未返回/解析失败时为 None。"""
+    liveness 活性判定（0084）用；SDK 未返回/解析失败时为 None。
+
+    ``timeout``/``retry`` 仅服务 web 进程的只读调用（给定任一即使用独立
+    缓存的受限客户端）；不传时与 worker 既有路径完全一致（默认客户端）。
+    """
+    client = (_bounded_client(timeout, retry)
+              if timeout is not None or retry is not None else _client())
     try:
         parts: List[Dict[str, object]] = []
         marker = 0
         while True:
-            resp = _client().list_parts(
+            resp = client.list_parts(
                 Bucket=_bucket(), Key=key, UploadId=upload_id,
                 PartNumberMarker=marker)
             for p in (resp.get("Part") or []):

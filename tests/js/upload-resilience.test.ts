@@ -46,22 +46,26 @@ async function until(cond: () => boolean, label = "condition") {
 function loadDedupe() {
 	const w: Record<string, unknown> = {};
 	new Function("window", dedupeSrc)(w);
-	return w.HP_UPLOAD_DEDUPE as {
-		DUP_TIMEOUT_MS: number;
-		key(name: string, size: number): string;
-		queueMatches(entries: unknown[], file: unknown): Array<{ name: string }>;
-		normalizeServerBody(body: unknown): unknown;
-		requestDuplicates(
-			apiFetch: unknown, items: unknown[], opts?: Record<string, unknown>,
-		): Promise<Record<string, unknown>>;
-		buildPlan(items: unknown[], opts: Record<string, unknown>): {
-			total: number;
-			duplicates: Array<{
-				index: number; kind: string; name: string;
-				queueMatch: unknown; completed: unknown; unfinished: unknown;
-			}>;
+		return w.HP_UPLOAD_DEDUPE as {
+			DUP_TIMEOUT_MS: number;
+			key(name: string, size: number): string;
+			queueMatches(entries: unknown[], file: unknown): Array<{ name: string }>;
+			normalizeServerBody(body: unknown): unknown;
+			duplicatesRequest(file: unknown): {
+				url: string; method: string; body: string;
+			};
+			requestDuplicates(
+				apiFetch: unknown, items: unknown[], opts?: Record<string, unknown>,
+			): Promise<Record<string, unknown>>;
+			buildPlan(items: unknown[], opts: Record<string, unknown>): {
+				total: number;
+				duplicates: Array<{
+					index: number; kind: string; name: string;
+					queueMatch: unknown; completed: unknown; unfinished: unknown;
+					processing: unknown;
+				}>;
+			};
 		};
-	};
 }
 
 function file(name: string, size: number) {
@@ -84,18 +88,20 @@ describe("重复文件预检模块", () => {
 		expect(D.queueMatches(entries, file("c.tif", 10)).length).toBe(0);
 	});
 
-	it("buildPlan：队列命中优先；否则 completed；再否则 unfinished", () => {
+	it("buildPlan：队列 > 未完成 > 处理中 > 已完成；processing 不当作可续传", () => {
 		const D = loadDedupe();
 		const items = [
 			{ file: file("q.tif", 10) },
 			{ file: file("c.tif", 20) },
 			{ file: file("u.tif", 30) },
+			{ file: file("p.tif", 50) },
 			{ file: file("ok.tif", 40) },
 		];
 		const serverResults: Record<string, unknown> = {};
 		serverResults[D.key("c.tif", 20)] = {
 			completed: { slide_id: "sld_c", display_name: "C", completed_at: 1 },
 			unfinished: null,
+			processing: null,
 		};
 		serverResults[D.key("u.tif", 30)] = {
 			completed: null,
@@ -103,15 +109,25 @@ describe("重复文件预检模块", () => {
 				job_id: "inj_u", state: "uploading",
 				uploaded_parts: 2, total_parts: 5,
 			},
+			processing: { job_id: "inj_p", state: "completing" },
+		};
+		serverResults[D.key("p.tif", 50)] = {
+			completed: { slide_id: "sld_p", display_name: "P", completed_at: 2 },
+			unfinished: null,
+			processing: { job_id: "inj_proc", state: "validating" },
 		};
 		const plan = D.buildPlan(items, {
 			queueEntries: [{ name: "q.tif", size: 10, state: "uploading" }],
 			serverResults,
 		});
-		expect(plan.total).toBe(4);
+		expect(plan.total).toBe(5);
 		expect(plan.duplicates.map((d) => [d.name, d.kind])).toEqual([
 			["q.tif", "queue"], ["c.tif", "completed"], ["u.tif", "unfinished"],
+			["p.tif", "processing"],
 		]);
+		// 旧任务可续传 + 新任务处理中：unfinished 优先（可执行的续传）
+		expect(plan.duplicates.find((d) => d.name === "u.tif")!.processing)
+			.toEqual({ job_id: "inj_p", state: "completing" });
 	});
 
 	it("normalizeServerBody：非法/空响应 → null（fail open）；字段裁剪", () => {
@@ -123,25 +139,47 @@ describe("重复文件预检模块", () => {
 			completed: { slide_id: "sld_1", display_name: "", completed_at: 5 },
 			unfinished: { job_id: "inj_1", state: "uploading",
 				uploaded_parts: null, total_parts: 3 },
+			processing: { job_id: "inj_2", state: "queued" },
 		}) as { completed: { slide_id: string; completed_at: number };
-			unfinished: { uploaded_parts: unknown } };
+			unfinished: { uploaded_parts: unknown };
+			processing: { job_id: string; state: string } };
 		expect(n.completed.slide_id).toBe("sld_1");
 		expect(n.completed.completed_at).toBe(5);
 		expect(n.unfinished.uploaded_parts).toBeNull();
+		expect(n.processing).toEqual({ job_id: "inj_2", state: "queued" });
+		const onlyProcessing = D.normalizeServerBody({
+			processing: { job_id: "inj_3", state: "ready" },
+		}) as { completed: unknown; unfinished: unknown;
+			processing: { job_id: string } };
+		expect(onlyProcessing.completed).toBeNull();
+		expect(onlyProcessing.unfinished).toBeNull();
+		expect(onlyProcessing.processing.job_id).toBe("inj_3");
+	});
+
+	it("duplicatesRequest：POST + JSON body（文件名不进 URL/查询串）", () => {
+		const D = loadDedupe();
+		const req = D.duplicatesRequest(file("patient-123.svs", 99));
+		expect(req.url).toBe("/api/ingestions/duplicates");
+		expect(req.method).toBe("POST");
+		expect(req.body).toBe(JSON.stringify({
+			filename: "patient-123.svs", size: 99,
+		}));
 	});
 
 	it("requestDuplicates：非 2xx / 坏 JSON / 抛错 → 该文件 null；唯一键去重", async () => {
 		const D = loadDedupe();
-		const calls: string[] = [];
-		const apiFetch = vi.fn((url: string) => {
-			calls.push(url);
-			if (url.indexOf("bad") >= 0) return Promise.reject(new Error("net"));
-			if (url.indexOf("err") >= 0) return Promise.resolve({ ok: false, status: 500 });
+		const calls: Array<{ url: string; init: Record<string, unknown> }> = [];
+		const apiFetch = vi.fn((url: string, init: Record<string, unknown>) => {
+			calls.push({ url, init });
+			const body = JSON.parse(String(init.body)) as { filename: string };
+			if (body.filename.indexOf("bad") >= 0) return Promise.reject(new Error("net"));
+			if (body.filename.indexOf("err") >= 0) return Promise.resolve({ ok: false, status: 500 });
 			return Promise.resolve({
 				ok: true,
 				json: () => Promise.resolve({
 					completed: { slide_id: "sld_ok", display_name: "ok", completed_at: 1 },
 					unfinished: null,
+					processing: null,
 				}),
 			});
 		});
@@ -152,6 +190,11 @@ describe("重复文件预检模块", () => {
 			{ file: file("err.tif", 10) },
 		], { timeoutMs: 50 });
 		expect(calls.length).toBe(3);
+		// 只读查询走 POST + JSON：文件名不进入 URL
+		expect(calls.every((c) => c.url === "/api/ingestions/duplicates"
+			&& c.init.method === "POST"
+			&& (c.init.headers as Record<string, string>)["Content-Type"]
+				=== "application/json")).toBe(true);
 		expect((out[D.key("ok.tif", 10)] as { completed: { slide_id: string } })
 			.completed.slide_id).toBe("sld_ok");
 		expect(out[D.key("bad.tif", 10)] ?? null).toBeNull();
@@ -973,12 +1016,96 @@ describe("app.js 接线：重复提示 / 合并对话框 / fail-open / 幂等键
 		h.up._setUploadConfirm(null);
 	});
 
-	it("批量添加多个重复文件 → 只弹一个合并对话框（全部跳过 / 全部仍上传）", async () => {
+	it("服务端 processing（刚传完、服务器处理中）→ 「再传一份 / 不传了」，绝不取消任务", async () => {
 		const fetchImpl = vi.fn((url: string) => {
 			if (url.indexOf("/api/ingestions/duplicates") === 0) {
 				return Promise.resolve(statusResp({
+					completed: null,
+					unfinished: null,
+					processing: { job_id: "inj_proc", state: "completing" },
+				}));
+			}
+			if (url === "/api/ingestions") {
+				return Promise.resolve(statusResp({ job_id: "inj_new", stage: "terminal",
+					fail_code: "demo" }, 202));
+			}
+			return Promise.resolve(statusResp({ stage: "terminal", fail_code: "demo" }));
+		});
+		const h = loadApp(fetchImpl as unknown as typeof fetch,
+			{ mode: "official", capabilities: { cos_upload: cosCaps() } });
+		let prompt: Record<string, unknown> | null = null;
+		h.up._setUploadConfirm((opts: Record<string, unknown>) => {
+			prompt = opts;
+			return "upload";   // 再传一份
+		});
+		await h.up.uploadFiles([{ file: uploadFile("scan.tif", 30), handle: null }]);
+		await flush(10);
+		expect(prompt).toBeTruthy();
+		expect(String(prompt!.message)).toContain("upload.dup.processing");
+		const buttons = prompt!.buttons as Array<{ value: string; default?: boolean }>;
+		expect(buttons.map((b) => b.value)).toEqual(["upload", "skip"]);
+		expect(buttons.find((b) => b.default)!.value).toBe("skip");   // 默认：不传了
+		// 处理中任务绝不能被「再传一份」取消
+		expect(h.fetchCalls().some((c) =>
+			c.url === "/api/ingestions/inj_proc/cancel")).toBe(false);
+		// 用户坚持再传 → 照常新建任务
+		expect(h.fetchCalls().some((c) =>
+			c.url === "/api/ingestions" && c.method === "POST")).toBe(true);
+		h.up._setUploadConfirm(null);
+	});
+
+	it("同时有可续传旧任务与处理中任务：只取消旧任务，绝不取消 processing", async () => {
+		const fetchImpl = vi.fn((url: string) => {
+			if (url.indexOf("/api/ingestions/duplicates") === 0) {
+				return Promise.resolve(statusResp({
+					completed: null,
+					unfinished: { job_id: "inj_old", state: "uploading",
+						uploaded_parts: 2, total_parts: 3 },
+					processing: { job_id: "inj_proc", state: "completing" },
+				}));
+			}
+			if (url === "/api/ingestions") {
+				return Promise.resolve(statusResp({ job_id: "inj_new", stage: "terminal",
+					fail_code: "demo" }, 202));
+			}
+			return Promise.resolve(statusResp({ stage: "terminal", fail_code: "demo" }));
+		});
+		const h = loadApp(fetchImpl as unknown as typeof fetch,
+			{ mode: "official", capabilities: { cos_upload: cosCaps() } });
+		let prompt: Record<string, unknown> | null = null;
+		h.up._setUploadConfirm((opts: Record<string, unknown>) => {
+			prompt = opts;
+			return "upload";   // 重新上传
+		});
+		await h.up.uploadFiles([{ file: uploadFile("scan.tif", 30), handle: null }]);
+		await flush(12);
+		// 单项对话框优先展示可续传的 unfinished（queue > unfinished >
+		// processing > completed）
+		expect(String(prompt!.message)).toContain("upload.dup.resume");
+		const cancels = h.fetchCalls()
+			.filter((c) => /\/cancel$/.test(c.url))
+			.map((c) => c.url);
+		expect(cancels).toEqual(["/api/ingestions/inj_old/cancel"]);
+		expect(h.fetchCalls().some((c) =>
+			c.url === "/api/ingestions/inj_proc/cancel")).toBe(false);
+		h.up._setUploadConfirm(null);
+	});
+
+	it("批量添加多个重复文件 → 只弹一个合并对话框（全部跳过 / 全部仍上传）", async () => {
+		const fetchImpl = vi.fn((url: string, opts?: { body?: string }) => {
+			if (url.indexOf("/api/ingestions/duplicates") === 0) {
+				const body = JSON.parse(String(opts && opts.body)) as { filename: string };
+				if (body.filename === "b.tif") {
+					return Promise.resolve(statusResp({
+						completed: null,
+						unfinished: null,
+						processing: { job_id: "inj_proc", state: "validating" },
+					}));
+				}
+				return Promise.resolve(statusResp({
 					completed: { slide_id: "sld_x", display_name: "旧", completed_at: 1 },
 					unfinished: null,
+					processing: null,
 				}));
 			}
 			return Promise.resolve(statusResp({}));
@@ -996,6 +1123,8 @@ describe("app.js 接线：重复提示 / 合并对话框 / fail-open / 幂等键
 		]);
 		expect(prompts.length).toBe(1);
 		expect((prompts[0].list as string[]).length).toBe(2);
+		expect((prompts[0].list as string[])[0]).toContain("upload.dup.row.completed");
+		expect((prompts[0].list as string[])[1]).toContain("upload.dup.row.processing");
 		expect((prompts[0].buttons as Array<{ value: string }>).map((b) => b.value))
 			.toEqual(["skip", "upload"]);
 		expect(h.fetchCalls().some((c) => c.url === "/api/ingestions" && c.method === "POST"))

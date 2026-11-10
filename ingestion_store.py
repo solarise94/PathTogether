@@ -667,11 +667,15 @@ def list_jobs_for_owner(owner_user_id, *, limit=50):
 
 
 #: 重上传提示（upload-resilience 2026-11-10）：未完成的同一文件任务。
-#: 只包含「还有恢复价值」的状态——waiting/preparing 没有分块可续，
-#: 但仍算「同一文件的上传在途」，客户端据此决定复用而非新建。
-DUPLICATE_UNFINISHED_STATES = (
-    WAITING, PREPARING, UPLOADING, COMPLETING, QUEUED, DOWNLOADING,
-    VALIDATING, READY,
+#: 只包含「续传有意义」的状态——waiting/preparing 没有分块可续，但仍算
+#: 「同一文件的上传在途」，客户端据此决定复用而非新建。
+DUPLICATE_UNFINISHED_STATES = (WAITING, PREPARING, UPLOADING)
+
+#: 已传完、服务端正在处理的同一文件任务（upload-resilience 复核 2026-11-10）。
+#: 这些状态的分块已全部上传，续传没有意义；重上传也不得取消它们（否则会
+#: 杀掉一个即将完成的任务）。与 unfinished 互斥，客户端只提示「正在处理」。
+DUPLICATE_PROCESSING_STATES = (
+    COMPLETING, QUEUED, DOWNLOADING, VALIDATING, READY,
 )
 
 
@@ -719,13 +723,8 @@ def find_completed_duplicate(owner_user_id, filename, size, *, days=90):
         conn.close()
 
 
-def find_unfinished_duplicate(owner_user_id, filename, size):
-    """同 owner 最近一次未完成的同名同大小上传（upload-resilience）。
-
-    不做 COS 网络调用：返回 job 行（含 upload_id/object_key/
-    part_plan_json），由 HTTP 层按需经 ``cos_client.list_parts`` 取权威
-    已传分块。浏览器据此提供「继续上次未完成的上传」。
-    """
+def _find_duplicate_job(owner_user_id, filename, size, states):
+    """同 owner 最近一次处于 ``states`` 的同名同大小上传（不做 COS 网络调用）。"""
     conn = _connect()
     try:
         with conn.cursor() as cur:
@@ -737,11 +736,32 @@ def find_unfinished_duplicate(owner_user_id, filename, size):
                 "   AND declared_size=%s "
                 " ORDER BY created_at DESC, job_id DESC "
                 " LIMIT 1",
-                (owner_user_id, list(DUPLICATE_UNFINISHED_STATES),
-                 filename, int(size)))
+                (owner_user_id, list(states), filename, int(size)))
             return _norm_row(cur.fetchone())
     finally:
         conn.close()
+
+
+def find_unfinished_duplicate(owner_user_id, filename, size):
+    """同 owner 最近一次未完成的同名同大小上传（upload-resilience）。
+
+    不做 COS 网络调用：返回 job 行（含 upload_id/object_key/
+    part_plan_json），由 HTTP 层按需经 ``cos_client.list_parts`` 取权威
+    已传分块。浏览器据此提供「继续上次未完成的上传」。
+    """
+    return _find_duplicate_job(owner_user_id, filename, size,
+                               DUPLICATE_UNFINISHED_STATES)
+
+
+def find_processing_duplicate(owner_user_id, filename, size):
+    """同 owner 最近一次已传完、服务端正在处理的同名同大小上传。
+
+    与 ``find_unfinished_duplicate`` 同一匹配口径（owner + 原名 +
+    声明大小），但状态是 COMPLETING/QUEUED/DOWNLOADING/VALIDATING/READY：
+    这些任务没有可续传的分块，重上传**绝不能取消**它们。
+    """
+    return _find_duplicate_job(owner_user_id, filename, size,
+                               DUPLICATE_PROCESSING_STATES)
 
 
 def queue_position(job_id):

@@ -219,8 +219,10 @@ describe("P2-2 编排器：显式重传清任务 id；续传保留同任务", ()
 	});
 
 	it("uploadEntryArtifact 按条目上的任务 id 续传（源码级：resumeJobId 传 entry.uploadJobId）", () => {
+		// upload-resilience 扩展：服务端权威续传候选（entry.resumeServerJobId）
+		// 与本地失败回填的任务 id 同序复用；显式「重新上传」两者都不带。
 		expect(appSrc).toContain(
-			"resumeJobId: entry._freshUpload ? null : (entry.uploadJobId || null)");
+			"resumeJobId: entry._freshUpload ? null\n              : (entry.uploadJobId || entry.resumeServerJobId || null)");
 		// 显式重传不复活旧任务；任务建成即回填条目（onJobCreated）
 		expect(appSrc).toContain("onJobCreated: function (id) {");
 		expect(appSrc).toContain("entry.uploadJobId = id;");

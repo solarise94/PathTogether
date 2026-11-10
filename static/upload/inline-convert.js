@@ -548,7 +548,19 @@
     var activeUpload = null;   // 当前上传中的 entry
     var resumed = {};          // jobId -> true（已恢复的行，避免重复）
     var pumpScheduled = false;
+    var pumpSuspended = 0;     // >0：批量取消标记阶段（pump 不启动新条目）
     var attached = false;   // runner 事件只订阅一次
+
+    //: 可取消状态（与 app.js inlineButtonKinds 的 cancel 分支同一集合；
+    //: 批量取消按此判定「可取消行」）。停放中的恢复行（parked）不计——
+    //: 它们还没开始，取消语义是「移除该行」而不是取消在途任务。
+    var CANCELLABLE_STATES = {
+      need_folder: 1, companion_confirm: 1, need_disk_confirm: 1,
+      identity_wait: 1, convert_queued: 1, requeue_convert: 1,
+      converting: 1, upload_queued: 1, uploading: 1,
+    };
+    //: 取消往返等待上限：超过即释放槽位（服务端兜底清理；绝不永久卡槽）
+    var CANCEL_SLOT_WAIT_MS = 10000;
 
     function uuid() {
       if (deps.uuid) return deps.uuid();
@@ -578,6 +590,14 @@
         jobId: fields.jobId || null,
         slideId: null,
         uploadJobId: null,
+        // upload-resilience：服务端权威续传（入队时从 duplicates 端点得知的
+        // 未完成任务）与创建幂等 nonce（每队列条目一次，重试复用）。
+        //   resumeServerJobId：直传条目要复用的既有 ingestion；
+        //   serverParts：权威 ListParts 候选（引擎逐块 MD5 核验后才跳过）；
+        //   idemNonce：幂等键随机段（app.js 入队时生成/上传入口补齐）。
+        resumeServerJobId: fields.resumeJobId || null,
+        serverParts: fields.serverParts || null,
+        idemNonce: fields.idemNonce || null,
         target: fields.target || null,
         state: "sniffing",
         stage: null,
@@ -641,6 +661,9 @@
         size: typeof file.size === "number" ? file.size : 0,
         target: opts.assocTarget || null,
         fileHandle: opts.fileHandle || null,
+        resumeJobId: opts.resumeJobId || null,
+        serverParts: opts.serverParts || null,
+        idemNonce: opts.idemNonce || null,
       });
       if (ui.row) ui.row(e);
       // 步 1：路由嗅探（有界读）
@@ -1001,7 +1024,15 @@
     }
 
     /// 「1 个转换 + 1 个上传并行」（设计 §5）：两条独立推进。
+    /// pumpSuspended：批量取消（cancelAll）的标记阶段——先给**所有**目标行
+    /// 打上 cancelled，再释放槽位/停传输；标记期间调度器绝不启动下一条
+    ///（否则取消活跃上传 → 槽位一释放就新建下一个服务端任务，用户接着
+    /// 取消它 → 1–3 秒后就被取消的 create→cancel churn）。
     function pump() {
+      if (pumpSuspended > 0) {
+        if (ui.refresh) ui.refresh(null);
+        return;
+      }
       if (!activeConvert) {
         var c = pick(["convert_queued"]) || pick(["requeue_convert"]);
         if (c) startConvert(c);
@@ -1256,8 +1287,14 @@
       if (activeConvert === e) activeConvert = null;
     }
     function releaseUploadSlot(e) {
+      if (!e) { activeUpload = null; return; }
+      // 取消往返未结束（upload-resilience）：槽位保留，等 releaseUploadSlot
+      // After / cancelAll 的统一释放。引擎的取消回执会立刻走到 completeUpload
+      // → releaseUploadSlot；若在这里放行，下一条会在 cancel 请求返回前就新建，
+      // 恢复 1–3 秒内被取消的 create→cancel churn。
+      if (e._cancelHold) { e._releaseDeferred = true; return; }
       if (activeUpload === e) activeUpload = null;
-      if (e && e._releaseLocks) { e._releaseLocks(); e._releaseLocks = null; }
+      if (e._releaseLocks) { e._releaseLocks(); e._releaseLocks = null; }
     }
 
     // ----------------------------------------------------- 上传执行 --
@@ -2013,6 +2050,10 @@
         // 不带 resumeJobId（不复活旧任务），转换产物经记录终态自然新建。
         e.uploadJobId = null;
         e.errorIngestionId = null;
+        // 显式「重新上传」：服务端权威续传候选一并作废（否则会再次复用
+        // 刚被放弃的旧任务）；幂等 nonce 保留（同一条目的创建重试仍幂等）。
+        e.resumeServerJobId = null;
+        e.serverParts = null;
         e._freshUpload = true;
         e.parked = false;
         e.state = "upload_queued";
@@ -2071,27 +2112,160 @@
       return null;
     }
 
-    function cancel(e) {
-      // 取消是**用户意图**：先打标记，随后的迟到回执（转换 done / 上传
-      // 成功或 cancelled）不得把它翻回 done/upload_failed。
+    // -------- 取消（单条 / 全部，「先标记、后释放槽位」） --------
+
+    /// 可取消条目（与行按钮同一集合；停放中的恢复行除外）。
+    function cancellableEntries() {
+      var out = [];
+      for (var i = 0; i < entries.length; i++) {
+        var e = entries[i];
+        if (e.cancelled || e.parked) continue;
+        if (!CANCELLABLE_STATES[e.state]) continue;
+        out.push(e);
+      }
+      return out;
+    }
+
+    function cancellableCount() { return cancellableEntries().length; }
+
+    /// 取消标记（不动槽位、不调度）：迟到回执（转换 done / 上传成功或
+    /// cancelled）不得把已取消行翻回 done/upload_failed。
+    function markCancelled(e) {
+      var st = e.state;
       e.cancelled = true;
-      if (e.state === "converting" && runner.cancelJob) {
-        Promise.resolve(runner.cancelJob()).then(null, function () { /* */ });
+      e.state = "cancelled";
+      setStage(e, "upload.cos.cancelled");
+      if (ui.buttons) ui.buttons(e);
+      if (ui.refresh) ui.refresh(e);
+      return st;
+    }
+
+    /// 停传输（返回可能为 Promise：引擎 cancel 请求往返 / runner.cancelJob）。
+    function stopTransfer(e, st) {
+      var p = null;
+      if (st === "converting" && runner && runner.cancelJob) {
+        try { p = runner.cancelJob(); } catch (err) { p = null; }
       }
       // 停传：产物条目走 e._upload（本模块 uploadArtifact 设的引擎句柄）；
       // 直传条目的引擎在 app.js 的 uploadFileCos 闭包里 —— 由注入的
-      // deps.cancelArtifact(entry) 转达（app.js 侧取消其引擎并 POST /cancel）。
-      if (e.state === "uploading") {
+      // deps.cancelArtifact(entry) 转达（app.js 侧取消其引擎并 POST /cancel，
+      // 返回 cancel 请求的 Promise 供槽位延后释放）。
+      if (st === "uploading") {
         if (e._upload && e._upload.cancel) {
-          try { e._upload.cancel(); } catch (err) { /* */ }
+          try { p = e._upload.cancel(); } catch (err) { p = null; }
         } else if (typeof deps.cancelArtifact === "function") {
-          try { deps.cancelArtifact(e); } catch (err) { /* */ }
+          try { p = deps.cancelArtifact(e); } catch (err) { p = null; }
         }
       }
-      releaseConvertSlot(e);
+      return p;
+    }
+
+    /// 上传槽位延后释放（upload-resilience）：取消活跃上传时，先等取消
+    /// 请求往返结束，再释放槽位并调度下一条——避免「取消 A → 立刻新建 B
+    /// →（用户连点取消）B 在 1–3 秒内被取消」的 create→cancel churn。
+    /// 没有真实往返（旧适配器/测试替身返回 undefined）时保持同步释放：
+    /// 既有语义与断言不变。超时兜底 CANCEL_SLOT_WAIT_MS（槽位绝不永久占用）。
+    function releaseUploadSlotAfter(e, pending) {
+      if (!pending || typeof pending.then !== "function") {
+        releaseUploadSlot(e);
+        schedule();
+        return;
+      }
+      e._cancelHold = true;
+      var settled = false;
+      function done() {
+        if (settled) return;
+        settled = true;
+        e._cancelHold = false;
+        e._releaseDeferred = false;
+        releaseUploadSlot(e);
+        schedule();
+      }
+      Promise.resolve(pending).then(done, done);
+      if (deps.setTimer) deps.setTimer(done, CANCEL_SLOT_WAIT_MS);
+      if (ui.refresh) ui.refresh(null);
+    }
+
+    /// 协助态（没有本地产物/服务端任务）：取消 = 移除该行（唯一收口）。
+    function removeHelpEntry(e) {
+      e.cancelled = true;
+      var at = entries.indexOf(e);
+      if (at >= 0) entries.splice(at, 1);
+      if (ui.remove) ui.remove(e);
+      if (ui.refresh) ui.refresh(e);
+    }
+
+    function cancel(e) {
+      if (!e) return;
+      var st = e.state;
+      if (st === "need_folder" || st === "companion_confirm") {
+        removeHelpEntry(e);
+        return;
+      }
+      if (e.cancelled) return;
+      markCancelled(e);
+      var pending = stopTransfer(e, st);
+      if (st === "converting") releaseConvertSlot(e);
+      if (st === "uploading" && activeUpload === e) {
+        // 活跃上传：取消往返结束前不启动下一条（pump 的槽位仍被占用）
+        releaseUploadSlotAfter(e, pending);
+        return;
+      }
       releaseUploadSlot(e);
-      setStage(e, "upload.cos.cancelled");
-      settle(e, "cancelled");
+      schedule();
+    }
+
+    /// 全部取消（面板头部按钮；≥2 个可取消行时可见）。
+    /// 两阶段：① 在 pumpSuspended 内给**每个**目标行打取消标记（不给任何
+    /// 槽位释放机会——调度器不会启动新条目，因而绝不新建服务端任务）；
+    /// ② 再统一停传输、释放转换槽；上传槽等所有取消往返结束（或超时）
+    /// 后释放。返回被取消的行数。
+    function cancelAll() {
+      var list = cancellableEntries();
+      if (!list.length) return 0;
+      var marked = [];
+      var help = 0;
+      pumpSuspended += 1;
+      try {
+        list.forEach(function (e) {
+          if (e.state === "need_folder" || e.state === "companion_confirm") {
+            removeHelpEntry(e);
+            help += 1;
+            return;
+          }
+          var st = markCancelled(e);
+          marked.push({ e: e, state: st });
+        });
+      } finally {
+        pumpSuspended -= 1;
+      }
+      var pending = [];
+      marked.forEach(function (m) {
+        if (m.state === "converting") releaseConvertSlot(m.e);
+        var p = stopTransfer(m.e, m.state);
+        if (p && typeof p.then === "function") {
+          m.e._cancelHold = true;
+          pending.push(Promise.resolve(p).then(function () {}, function () {}));
+        }
+      });
+      var settled = false;
+      function releaseAll() {
+        if (settled) return;
+        settled = true;
+        marked.forEach(function (m) {
+          m.e._cancelHold = false;
+          m.e._releaseDeferred = false;
+          releaseUploadSlot(m.e);
+        });
+        schedule();
+      }
+      if (!pending.length) releaseAll();
+      else {
+        Promise.all(pending).then(releaseAll, releaseAll);
+        if (deps.setTimer) deps.setTimer(releaseAll, CANCEL_SLOT_WAIT_MS);
+      }
+      if (ui.refresh) ui.refresh(null);
+      return marked.length + help;
     }
 
     function discard(e) {
@@ -2458,6 +2632,9 @@
       resolveCompanionFolder: resolveCompanionFolder,
       act: act,
       cancel: cancel,
+      cancelAll: cancelAll,
+      cancellableEntries: cancellableEntries,
+      cancellableCount: cancellableCount,
       discard: discard,
       restore: restore,
       recheckOwnership: recheckOwnership,

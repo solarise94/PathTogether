@@ -2026,9 +2026,11 @@ describe("独立复核 #4：归属字段写入等身份就绪", () => {
 describe("目标关联与文案（§3.5 / §8）", () => {
 	it("入队前冻结快照 + uploadFileCos 字面量含 assocTarget（A1：钉「被传」）", () => {
 		expect(appSrc).toContain("opts.assocTarget = importTargetSnapshot()");
+		// upload-resilience：字面量新增了续传/幂等/句柄字段（注释较长），
+		// 取更宽的窗口；断言语义不变（冻结快照必须原样转发）。
 		const call = appSrc.slice(
 			appSrc.indexOf("uploadFileCos(file, row, {"),
-			appSrc.indexOf("uploadFileCos(file, row, {") + 700);
+			appSrc.indexOf("uploadFileCos(file, row, {") + 1200);
 		expect(call).toContain("assocTarget: opts.assocTarget");
 	});
 
@@ -2571,10 +2573,11 @@ describe("上传行按钮（§6.3 是按钮全集的唯一权威）", () => {
 			appSrc.indexOf("function cosUploadSucceeded"));
 		expect(cos).toContain("opts.onOutcome");
 		// 直传声明与冻结目标的转发仍在（第四轮 A1）——该字面量在**调用方**
-		// uploadFileClassified 内，所以从那里取片段
+		// uploadFileClassified 内，所以从那里取片段。upload-resilience 新增了
+		// 续传/幂等/句柄字段（含注释），窗口相应加宽；断言语义不变。
 		const callSite = appSrc.slice(
 			appSrc.indexOf("uploadFileCos(file, row, {"),
-			appSrc.indexOf("uploadFileCos(file, row, {") + 900);
+			appSrc.indexOf("uploadFileCos(file, row, {") + 1400);
 		expect(callSite).toContain("assocTarget: opts.assocTarget");
 		expect(callSite).toContain("directClass: cls ? (cls.directClass || null) : null");
 	});

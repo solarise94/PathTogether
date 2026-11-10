@@ -125,6 +125,59 @@ def _write_plain_rgb_lzw_with_resolution(path, h=1200, w=1600,
     return data
 
 
+def _gradient_rgb(h, w, seed=31):
+    """低频渐变 + 轻噪声：每个窗口都有方差，且比纯噪声更易压缩。"""
+    yy, xx = np.indices((int(h), int(w)), dtype=np.uint32)
+    rng = np.random.default_rng(int(seed))
+    noise = rng.integers(0, 16, (int(h), int(w), 3), dtype=np.uint8)
+    base = np.stack([
+        (xx * 5 + yy * 3) % 251,
+        (xx * 2 + yy * 7 + 60) % 253,
+        ((xx + yy) * 4 + 30) % 249,
+    ], axis=2).astype(np.uint16)
+    return np.clip(base + noise, 0, 255).astype(np.uint8)
+
+
+def _write_gradient_rgb_ome(path, h=3100, w=4300, mpp=0.25):
+    import tifffile
+
+    data = _gradient_rgb(h, w)
+    meta = {"axes": "YXS", "PhysicalSizeX": mpp, "PhysicalSizeXUnit": "µm",
+            "PhysicalSizeY": mpp, "PhysicalSizeYUnit": "µm"}
+    tifffile.imwrite(str(path), data, photometric="rgb", compression="lzw",
+                     ome=True, metadata=meta)
+    return data
+
+
+def _write_zero_sublevel_pyramid(path, h=1200, w=1600):
+    """写一个 level 0 正常、唯一 SubIFD 全零的「旧构建器形态」金字塔。"""
+    import tifffile
+
+    rgb = _gradient_rgb(h, w)
+    sub = np.zeros(((int(h) + 1) // 2, (int(w) + 1) // 2, 3), np.uint8)
+    with tifffile.TiffWriter(str(path), ome=True) as tw:
+        tw.write(rgb, photometric="rgb", tile=(512, 512),
+                 compression="deflate", subifds=1,
+                 metadata={"axes": "YXS"})
+        tw.write(sub, photometric="rgb", tile=(512, 512),
+                 compression="deflate", subfiletype=1)
+    return rgb
+
+
+def _write_broken_pyramid_file(path, h=1200, w=1600):
+    return _write_zero_sublevel_pyramid(path, h=h, w=w)
+
+
+def _write_healthy_pyramid_file(path, h=1200, w=1600):
+    src = Path(path).with_name(Path(path).name + ".src.tiff")
+    try:
+        _write_gradient_rgb_ome(src, h=h, w=w)
+        sp.build_pyramid(src, path)
+    finally:
+        if src.exists():
+            src.unlink()
+
+
 def _platform_mpp(path):
     """经平台读取路径（slide_io）取 (mpp_x, mpp_y)；未报告为 None。"""
     slide = slide_io.open_slide(str(path))
@@ -383,6 +436,55 @@ def test_build_ome_physical_size_survives_platform_view(tmp_path):
     assert meta["mpp_x"] == pytest.approx(0.25)
 
 
+def test_build_populates_every_sublevel_with_real_content(tmp_path):
+    """回归：level 2..N 必须等 level 1 填满后再生成，不能写出全零层。"""
+    src = tmp_path / "gradient.ome.tiff"
+    dst = tmp_path / "out.ome.tiff"
+    _write_gradient_rgb_ome(src)
+
+    result = sp.build_pyramid(src, dst)
+    assert result.levels >= 4  # ≥3 个 SubIFD，足以覆盖旧 bug
+    meta = sp.validate_pyramid(src, dst, lossless=True)
+    assert meta["sublevel_windows"] >= 3 * (result.levels - 1)
+    assert meta["sublevel_max_mean_diff"] is not None
+    assert meta["sublevel_max_mean_diff"] <= sp.PYRAMID_SUBLEVEL_TOLERANCE
+
+    slide = slide_io.open_slide(str(dst))
+    try:
+        assert slide.level_count == result.levels
+        for level in range(1, slide.level_count):
+            lw, lh = slide.level_dimensions[level]
+            win = min(256, lw, lh)
+            actual = sp._rgba_array(
+                slide.read_region((0, 0), level, (win, win)))
+            # 直接由 level 0 对应区域逐级 2× 盒式下采样（与构建器同滤波器）。
+            expected = sp._rgba_array(slide.read_region(
+                (0, 0), 0, (win * (1 << level), win * (1 << level))))
+            for _ in range(level):
+                expected = sp._downsample_rgba(expected)
+            assert expected.shape == actual.shape
+            assert float(actual[..., :3].std()) > 1.0, \
+                "level %d 为常量/全零" % level
+            diff = np.abs(expected[..., :3].astype(np.int16)
+                          - actual[..., :3].astype(np.int16))
+            assert float(diff.mean(axis=(0, 1)).max()) <= \
+                sp.PYRAMID_SUBLEVEL_TOLERANCE, "level %d 内容不符" % level
+    finally:
+        slide.close()
+
+
+def test_validate_rejects_zeroed_sublevels(tmp_path):
+    """新校验必须拒绝「层数/尺寸正确但缩减层全零」的旧构建器输出。"""
+    broken = tmp_path / "broken.ome.tiff"
+    _write_zero_sublevel_pyramid(broken)
+
+    with pytest.raises(sp.PyramidValidationError) as ei:
+        sp.validate_pyramid(broken, broken, lossless=True)
+    message = str(ei.value)
+    assert "level 1" in message
+    assert "全零" in message or "常量" in message
+
+
 # --------------------------------------------------------------------------- #
 # 流式/上限/跳过
 # --------------------------------------------------------------------------- #
@@ -553,3 +655,105 @@ def test_backfill_apply_refuses_not_eligible(tmp_path):
     code, payload = mod.rebuild_one(desc.slide_id)
     assert code == 1
     assert payload["refused"] == "not_eligible"
+
+
+# --------------------------------------------------------------------------- #
+# 修复模式（--repair）：只读列出 / 拒绝健康文件 / 重建旧构建器坏金字塔
+# --------------------------------------------------------------------------- #
+def test_repair_dry_run_lists_only_broken_pyramids(tmp_path):
+    mod = _load_backfill()
+    broken, broken_path = _mk_ready_slide(
+        "sld_pyrbroken", tmp_path, _write_broken_pyramid_file)
+    healthy, healthy_path = _mk_ready_slide(
+        "sld_pyrhealthy", tmp_path, _write_healthy_pyramid_file)
+    single, single_path = _mk_ready_slide(
+        "sld_pyrsingle", tmp_path, _write_gradient_rgb_ome)
+    before = {p: (p.stat().st_mtime_ns, p.stat().st_size)
+              for p in (broken_path, healthy_path, single_path)}
+
+    items = list(mod._repair_candidates())
+    assert {it["slide_id"] for it in items} == {broken.slide_id}
+    item = items[0]
+    assert item["width"] == 1600 and item["height"] == 1200
+    assert item["level_count"] == 2
+    assert item["bytes"] == broken_path.stat().st_size
+    # 只读：三个文件的内容/时间戳都不变。
+    for path, sig in before.items():
+        assert (path.stat().st_mtime_ns, path.stat().st_size) == sig
+    # 健康金字塔与单层大图都不在候选里。
+    assert healthy.slide_id not in {it["slide_id"] for it in items}
+    assert single.slide_id not in {it["slide_id"] for it in items}
+
+
+def test_repair_refuses_healthy_and_single_level(tmp_path):
+    mod = _load_backfill()
+    healthy, healthy_path = _mk_ready_slide(
+        "sld_pyrhealthy2", tmp_path, _write_healthy_pyramid_file)
+    single, _ = _mk_ready_slide("sld_pyrsingle2", tmp_path,
+                                _write_gradient_rgb_ome)
+    before = (healthy_path.stat().st_mtime_ns, healthy_path.stat().st_size)
+
+    code, payload = mod.repair_one(healthy.slide_id)
+    assert code == 1
+    assert payload["refused"] == "not_broken"
+    code, payload = mod.repair_one(single.slide_id)
+    assert code == 1
+    assert payload["refused"] == "not_broken"
+    assert (healthy_path.stat().st_mtime_ns,
+            healthy_path.stat().st_size) == before
+
+
+def test_repair_rebuilds_broken_pyramid_and_accounts(tmp_path, monkeypatch):
+    mod = _load_backfill()
+    desc, path = _mk_ready_slide("sld_pyrrepair", tmp_path,
+                                 _write_broken_pyramid_file)
+    before_size = path.stat().st_size
+    before_rev = desc.revision
+    before_sig = slide_cache.signature_of(path)
+    broken_slide = slide_io.open_slide(str(path))
+    try:
+        old_level0 = np.asarray(
+            broken_slide.read_region((0, 0), 0, (512, 512)).convert("RGB"))
+    finally:
+        broken_slide.close()
+
+    calls = []
+    real = slide_store.record_pyramid_rebuild
+
+    def spy(slide_id, **kwargs):
+        calls.append((slide_id, dict(kwargs)))
+        return real(slide_id, **kwargs)
+
+    monkeypatch.setattr(slide_store, "record_pyramid_rebuild", spy)
+    code, payload = mod.repair_one(desc.slide_id)
+    assert code == 0, payload
+    # 复用正常 --apply 的记账原语（expected_bytes = 修复前磁盘大小）。
+    assert calls and calls[0][0] == desc.slide_id
+    assert int(calls[0][1]["expected_bytes"]) == before_size
+
+    after = slide_store.resolve_slide_id(desc.slide_id)
+    assert after.revision != before_rev
+    assert int(after.accounted_bytes) == int(payload["bytes_after"])
+    assert slide_cache.signature_of(path) != before_sig
+
+    meta = sp.validate_pyramid(path, path, lossless=True)
+    assert meta["sublevel_windows"] >= 3
+    assert meta["sublevel_max_mean_diff"] <= sp.PYRAMID_SUBLEVEL_TOLERANCE
+    slide = slide_io.open_slide(str(path))
+    try:
+        assert slide.level_count > 1
+        new_level0 = np.asarray(
+            slide.read_region((0, 0), 0, (512, 512)).convert("RGB"))
+        # level 0 只做无损提取/重写：修复不能改变原有像素。
+        assert np.array_equal(new_level0, old_level0)
+        for level in range(1, slide.level_count):
+            lw, lh = slide.level_dimensions[level]
+            img = np.asarray(slide.read_region(
+                (0, 0), level, (min(64, lw), min(64, lh))).convert("RGB"))
+            assert float(img.std()) > 1.0
+    finally:
+        slide.close()
+    # 所有临时文件（level-0 提取/构建输出/备份）都已清理。
+    parent = path.parent
+    assert not list(parent.glob(".pyramid-*"))
+    assert not list(parent.glob(".pyramid-scratch-*"))

@@ -25,10 +25,15 @@ OME-TIFF，使 viewer/AI 能用真正的低分辨率层看「当前小区域 + �
     有损/无损。
   * 缩减层：RGB 8-bit 用 JPEG q90；其他（uint16/多通道/灰度）用 deflate。
 - **流式/内存**：level 0 的 tile 生成器逐块读源（zarr/tifffile），同时把
-  2× 下采样写进同级目录的临时 zarr store（level 1）；随后逐级从上一级
-  store 生成下一级。最终用 tifffile 的 ``tile=`` 生成器写 SubIFD。峰值
-  内存只与 tile/块有关（512² × 通道 × dtype），与全图尺寸无关（临时
-  zarr 文件页不计入进程 RSS，不持整级数组）。
+  2× 下采样写进同级目录的临时 zarr store（level 1）。level 1 必须等
+  ``tw.write(level0_tiles(), ...)`` **返回**后才完整（生成器惰性填充），
+  因此 level 2..N 的生成也在 TiffWriter 块内、level 0 写完之后、写 SubIFD
+  之前执行；否则会用尚未填充的 level 1 降采样出全零层。峰值内存只与
+  tile/块有关（512² × 通道 × dtype），与全图尺寸无关（临时 zarr 文件页
+  不计入进程 RSS，不持整级数组）。
+- **校验**：``validate_pyramid`` 除 level-0 像素外，还逐级比较 SubIFD
+  内容（3 个采样窗口 + 最小层整层，与上一级 2× 盒式下采样对比）；全零/
+  常量的缩减层即使层数/尺寸正确也会被拒绝。
 - **硬上限**（任一命中 → 跳过并保留原文件，``PyramidSkip.reason``）：
   * ``width × height > 2^32``；
   * 预估输出 > 3× 源文件（写出后再按实际大小复核）；
@@ -78,6 +83,12 @@ PYRAMID_MIN_FREE_BYTES = 256 * 1024 * 1024
 #: tifffile 编码缓冲上限（默认 BUFFERSIZE=256MB × 编码输出 ≈ 512MB 峰值；
 #: 显式压到 32MB，保证 50k×50k 输出时进程 RSS 仍 < 512MB）。
 PYRAMID_WRITE_BUFFERSIZE = 32 * 1024 * 1024
+#: 缩减层内容校验的采样窗口边长（该层像素）与每层窗口数（含整层检查）。
+PYRAMID_SUBLEVEL_SAMPLE = 256
+#: 缩减层与上一级 2× 盒式下采样的平均绝对差上限（uint8，每通道）。
+#: 缩减层 JPEG q90 的误差量级约 3-6；12 留有解码器/整数取整余量，同时
+#: 远小于全零层造成的 100+ 差异。
+PYRAMID_SUBLEVEL_TOLERANCE = 12.0
 
 #: 认定为无损的 TIFF compression 枚举（tifffile Compression 值）。
 _LOSSLESS_COMPRESSIONS = frozenset({
@@ -638,11 +649,41 @@ def _report(progress, stage, done, total):
         pass
 
 
+def _output_metadata(layout):
+    """构建输出的 OME 元数据（物理尺寸/通道名；缺失时都不写）。"""
+    meta = {"axes": layout.axes}
+    if layout.mpp_x:
+        meta["PhysicalSizeX"] = float(layout.mpp_x)
+        meta["PhysicalSizeXUnit"] = _MPP_UNIT
+    if layout.mpp_y:
+        meta["PhysicalSizeY"] = float(layout.mpp_y)
+        meta["PhysicalSizeYUnit"] = _MPP_UNIT
+    if layout.channel_names:
+        channel_meta = {"Name": list(layout.channel_names)}
+        if layout.channel_colors and all(layout.channel_colors):
+            channel_meta["Color"] = list(layout.channel_colors)
+        meta["Channel"] = channel_meta
+    return meta
+
+
 def _tick(progress, stage, done, total, *, deadline, every=64):
     if deadline is not None and time.time() > float(deadline):
         raise PyramidSkip("deadline")
     if total <= 0 or done % every == 0 or done == total:
         _report(progress, stage, done, total)
+
+
+def _tile_boxes(height, width, tile=PYRAMID_TILE):
+    """按行优先产出输出 tile 的 (y0, y1, x0, x1)（边缘块按实际尺寸）。"""
+    rows = (int(height) + int(tile) - 1) // int(tile)
+    cols = (int(width) + int(tile) - 1) // int(tile)
+    for ty in range(rows):
+        y0 = ty * int(tile)
+        y1 = min(int(height), y0 + int(tile))
+        for tx in range(cols):
+            x0 = tx * int(tile)
+            x1 = min(int(width), x0 + int(tile))
+            yield y0, y1, x0, x1
 
 
 def build_pyramid(src_path, dst_path, *, scratch_dir=None, progress=None,
@@ -749,33 +790,10 @@ def build_pyramid(src_path, dst_path, *, scratch_dir=None, progress=None,
         sub_jpeg = bool(layout.native_rgb and layout.dtype == "uint8")
         sub_compression = "jpeg" if sub_jpeg else "deflate"
 
-        meta = {"axes": layout.axes}
-        if layout.mpp_x:
-            meta["PhysicalSizeX"] = float(layout.mpp_x)
-            meta["PhysicalSizeXUnit"] = _MPP_UNIT
-        if layout.mpp_y:
-            meta["PhysicalSizeY"] = float(layout.mpp_y)
-            meta["PhysicalSizeYUnit"] = _MPP_UNIT
-        if layout.channel_names:
-            channel_meta = {"Name": list(layout.channel_names)}
-            if layout.channel_colors and all(layout.channel_colors):
-                channel_meta["Color"] = list(layout.channel_colors)
-            meta["Channel"] = channel_meta
-
+        meta = _output_metadata(layout)
         tile = (PYRAMID_TILE, PYRAMID_TILE)
 
-        def tile_boxes(h, w):
-            rows = (h + PYRAMID_TILE - 1) // PYRAMID_TILE
-            cols = (w + PYRAMID_TILE - 1) // PYRAMID_TILE
-            for ty in range(rows):
-                y0 = ty * PYRAMID_TILE
-                y1 = min(h, y0 + PYRAMID_TILE)
-                for tx in range(cols):
-                    x0 = tx * PYRAMID_TILE
-                    x1 = min(w, x0 + PYRAMID_TILE)
-                    yield y0, y1, x0, x1
-
-        boxes0 = list(tile_boxes(height, width))
+        boxes0 = list(_tile_boxes(height, width))
         channels0 = int(layout.channels) if layout.axes == "CYX" else 1
         total0 = len(boxes0) * channels0
 
@@ -862,15 +880,11 @@ def build_pyramid(src_path, dst_path, *, scratch_dir=None, progress=None,
                     _tick(progress, "level%d" % i, done, total,
                           deadline=deadline)
 
-        for i in range(2, len(level_dims)):
-            build_next_level(i)
-            _report(progress, "levels_built", i - 1, max(1, len(level_dims) - 1))
-
         # ---- 写出 OME-TIFF（每级 tile 生成器）---- #
         def level_tiles(i):
             mem = tmp_levels[i]
             out_h, out_w = level_dims[i][1], level_dims[i][0]
-            boxes = list(tile_boxes(out_h, out_w))
+            boxes = list(_tile_boxes(out_h, out_w))
             channels_i = int(layout.channels) if layout.axes == "CYX" else 1
             total = len(boxes) * channels_i
             done = 0
@@ -916,6 +930,14 @@ def build_pyramid(src_path, dst_path, *, scratch_dir=None, progress=None,
                 common0.update(
                     photometric="rgb" if layout.native_rgb else "minisblack")
             tw.write(level0_tiles(), **common0)
+
+            # level 1 的临时 zarr 由上面的生成器惰性填充，tw.write 返回时
+            # 才完整。level 2..N 必须在此之后生成（写文件期间不写目标文件，
+            # 只在内存/scratch 中计算），否则会从空 level 1 降采样出全零层。
+            for i in range(2, len(level_dims)):
+                build_next_level(i)
+                _report(progress, "levels_built", i - 1,
+                        max(1, len(level_dims) - 1))
 
             for i in range(1, len(level_dims)):
                 shape = _canonical_shape(layout, level_dims[i][0],
@@ -980,6 +1002,107 @@ def build_pyramid(src_path, dst_path, *, scratch_dir=None, progress=None,
             shutil.rmtree(scratch, ignore_errors=True)
 
 
+def extract_level0_tiff(src_path, dst_path, *, progress=None, deadline=None):
+    """把 TIFF 金字塔的 level 0 无损写成单层分块 OME-TIFF（修复用）。
+
+    背景：旧构建器写出的金字塔 level 0 正确但 SubIFD 全零。修复只能以
+    level 0 为源重建，不能信任现有缩减层。本函数逐 512 tile 从源 zarr
+    读取解码后的 level 0，用 deflate 原样写出（不再有损重编码）；
+    物理尺寸与通道名完全沿用平台视图（``slide_io`` 未报告 mpp 时都不写，
+    与 :func:`build_pyramid` 同口径）。
+
+    ``dst_path`` 必须不存在；调用方负责临时路径与清理。
+    """
+    src_path = os.fspath(src_path)
+    dst_path = os.fspath(dst_path)
+    if os.path.exists(dst_path):
+        raise PyramidError("输出路径已存在：%s" % dst_path)
+    if not os.path.isfile(src_path):
+        raise PyramidSkip("source_unreadable", "源文件不存在")
+
+    import tifffile
+
+    tif = None
+    store = root = None
+    try:
+        try:
+            tif = tifffile.TiffFile(src_path)
+        except Exception as exc:  # noqa: BLE001
+            raise PyramidSkip("source_unreadable", type(exc).__name__) from exc
+        series_index, series = _pick_series(tif)
+        try:
+            source_mpp = _source_mpp(src_path)
+        except Exception as exc:  # noqa: BLE001
+            raise PyramidSkip("source_unreadable",
+                              type(exc).__name__) from exc
+        # level_count 传 1 仅表示「按单层源读取 level 0」；兼容多级源。
+        layout = _source_layout(tif, series, level_count=1,
+                                series_index=series_index,
+                                source_mpp=source_mpp)
+        store, root, array = _open_source_zarr(tif, series_index)
+
+        width, height = int(layout.width), int(layout.height)
+        boxes = list(_tile_boxes(height, width))
+        channels = int(layout.channels) if layout.axes == "CYX" else 1
+        total = len(boxes) * channels
+        done = 0
+
+        def tiles():
+            nonlocal done
+            if layout.axes == "CYX":
+                for c in range(int(layout.channels)):
+                    for y0, y1, x0, x1 in boxes:
+                        block = _read_source_block(
+                            array, layout, y0, y1, x0, x1, channel=c)
+                        done += 1
+                        _tick(progress, "extract0", done, total,
+                              deadline=deadline)
+                        yield block
+                return
+            for y0, y1, x0, x1 in boxes:
+                block = _read_source_block(array, layout, y0, y1, x0, x1)
+                done += 1
+                _tick(progress, "extract0", done, total, deadline=deadline)
+                yield block
+
+        raw0 = width * height * int(layout.channels) * \
+            np.dtype(layout.dtype).itemsize
+        kw = dict(
+            shape=_canonical_shape(layout, width, height),
+            dtype=layout.dtype,
+            tile=(PYRAMID_TILE, PYRAMID_TILE),
+            compression="deflate",
+            photometric="rgb" if layout.axes == "YXS" else "minisblack",
+            metadata=_output_metadata(layout),
+            resolution=None,
+            buffersize=PYRAMID_WRITE_BUFFERSIZE,
+        )
+        with tifffile.TiffWriter(dst_path, bigtiff=bool(raw0 > 3_500_000_000),
+                                 ome=True) as tw:
+            tw.write(tiles(), **kw)
+        _report(progress, "done", len(boxes) * channels,
+                max(1, len(boxes) * channels))
+        return {"width": width, "height": height, "axes": layout.axes,
+                "dtype": layout.dtype, "channels": int(layout.channels)}
+    finally:
+        try:
+            if root is not None:
+                close = getattr(root, "close", None)
+                if callable(close):
+                    close()
+            if store is not None:
+                close = getattr(store, "close", None)
+                if callable(close):
+                    close()
+        except Exception:  # noqa: BLE001
+            pass
+        if tif is not None:
+            try:
+                tif.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 # --------------------------------------------------------------------------- #
 # 输出校验（必须走 PT 自己的 slide_io 读取路径）
 # --------------------------------------------------------------------------- #
@@ -1009,16 +1132,140 @@ def _sample_boxes(width, height, size=256):
     return out
 
 
+def _rgba_array(img):
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    return np.asarray(img, dtype=np.uint8)
+
+
+def _downsample_rgba(arr):
+    """对 (H, W, 4) 的 RGBA 块做 2× 盒式下采样（复用通道在前的实现）。"""
+    return np.transpose(
+        _downsample2(np.transpose(arr, (2, 0, 1))), (1, 2, 0))
+
+
+def _mean_abs_channel_diff(expected, actual):
+    """RGB 三通道平均绝对差的最大值（uint8 量纲）。"""
+    exp = expected[..., :3].astype(np.int16)
+    act = actual[..., :3].astype(np.int16)
+    return float(np.abs(exp - act).mean(axis=(0, 1)).max())
+
+
+def _check_level_content(level, box, expected, actual, *, tolerance):
+    """比较一个缩减层窗口与上一级 2× 下采样；拒绝常量/全零层。
+
+    返回该窗口每通道平均绝对差的最大值。全零/常量判定是显式的：旧构建
+    器把空 level 1 降采样成全零 SubIFD 时，平均差已经很大；这里再加一条
+    明确信号，避免「源本身很暗」让大窗口的平均差落回容差内。
+    """
+    if expected.shape != actual.shape:
+        raise PyramidValidationError(
+            "level %d 窗口 %r 尺寸不一致（expected=%r actual=%r）"
+            % (level, box, expected.shape, actual.shape))
+    exp_rgb = expected[..., :3]
+    act_rgb = actual[..., :3]
+    exp_mean, exp_std = float(exp_rgb.mean()), float(exp_rgb.std())
+    act_mean, act_std = float(act_rgb.mean()), float(act_rgb.std())
+    if (exp_std > 1.0 and act_std <= 0.5) or \
+            (exp_mean > 1.0 and int(act_rgb.max()) == 0):
+        raise PyramidValidationError(
+            "level %d 窗口 %r 为常量/全零，但 level 0 对应区域有内容"
+            "（expected mean=%.1f std=%.1f，actual mean=%.1f std=%.1f）"
+            % (level, box, exp_mean, exp_std, act_mean, act_std))
+    metric = _mean_abs_channel_diff(expected, actual)
+    if metric > float(tolerance):
+        raise PyramidValidationError(
+            "level %d 窗口 %r 内容与上一级 2× 下采样不一致"
+            "（mean_diff=%.2f > %.2f）" % (level, box, metric, tolerance))
+    return metric
+
+
+def _read_level_rgba(slide, level, ox, oy, win_w, win_h):
+    """按 level 坐标读窗口（location 仍为 level-0 坐标，与 OpenSlide 一致）。"""
+    factor = 1 << int(level)
+    return _rgba_array(slide.read_region(
+        (int(ox) * factor, int(oy) * factor), int(level),
+        (int(win_w), int(win_h))))
+
+
+def _sublevel_expected(slide, level, ox, oy, win_w, win_h, prev_dims):
+    """上一级对应区域做一次 2× 盒式下采样（与构建器同一滤波器）。
+
+    ``ox/oy`` 是 level 坐标；2× 盒式链条逐级回到 level 0，因此期望内容
+    等价于 level-0 对应区域按该级倍率下采样，但每次只读上一级 ≤512 px，
+    内存与倍率无关（深层的 level-0 直读会到 GB 级）。
+    """
+    factor = 1 << int(level)
+    prev_w, prev_h = int(prev_dims[0]), int(prev_dims[1])
+    src_w = min(int(win_w) * 2, prev_w - 2 * int(ox))
+    src_h = min(int(win_h) * 2, prev_h - 2 * int(oy))
+    if src_w <= 0 or src_h <= 0:
+        raise PyramidValidationError(
+            "level %d 窗口 %r 超出上一级尺寸 %dx%d"
+            % (level, (ox, oy), prev_w, prev_h))
+    arr = _rgba_array(slide.read_region(
+        (int(ox) * factor, int(oy) * factor), int(level) - 1,
+        (src_w, src_h)))
+    return _downsample_rgba(arr)
+
+
+def _validate_sublevels(dst, dims, *, tolerance, comparable):
+    """逐级校验 SubIFD 内容；返回 (检查窗口数, 最大平均绝对差或 None)。
+
+    每级采样 ≤3 个 ≤256 px 窗口；最小层（≤1024 px）再整层比较一次。
+    ``comparable`` 为 False（float 等按窗口归一化的 dtype）时只做全零/
+    常量检查，因为 ``slide_io`` 的 float 归一化以窗口极值为基准，跨窗口
+    像素差不具可比性。
+    """
+    checked = 0
+    metrics = []
+    last = len(dims) - 1
+    for level in range(1, len(dims)):
+        lw, lh = int(dims[level][0]), int(dims[level][1])
+        win = max(1, min(PYRAMID_SUBLEVEL_SAMPLE, lw, lh))
+        for (ox, oy) in _sample_boxes(lw, lh, PYRAMID_SUBLEVEL_SAMPLE):
+            expected = _sublevel_expected(dst, level, ox, oy, win, win,
+                                          dims[level - 1])
+            actual = _read_level_rgba(dst, level, ox, oy, win, win)
+            checked += 1
+            if comparable:
+                metrics.append(_check_level_content(
+                    level, (ox, oy), expected, actual,
+                    tolerance=tolerance))
+            else:
+                _check_level_content(level, (ox, oy), expected, actual,
+                                     tolerance=float("inf"))
+        if level == last and \
+                lw <= PYRAMID_TARGET_LONG_EDGE and \
+                lh <= PYRAMID_TARGET_LONG_EDGE:
+            expected = _sublevel_expected(dst, level, 0, 0, lw, lh,
+                                          dims[level - 1])
+            actual = _read_level_rgba(dst, level, 0, 0, lw, lh)
+            checked += 1
+            if comparable:
+                metrics.append(_check_level_content(
+                    level, (0, 0), expected, actual, tolerance=tolerance))
+            else:
+                _check_level_content(level, (0, 0), expected, actual,
+                                     tolerance=float("inf"))
+    return checked, (max(metrics) if metrics else None)
+
+
 def validate_pyramid(src_path, dst_path, *, expected_dims=None,
-                     lossless=None, max_mean_diff=8.0):
+                     lossless=None, max_mean_diff=8.0,
+                     sublevel_tolerance=PYRAMID_SUBLEVEL_TOLERANCE):
     """用 ``slide_io.open_slide`` 校验输出可读、层数/尺寸/mpp/像素正确。
 
     - level_count > 1，level-0 尺寸与源一致，每级尺寸符合 2× 序列；
-    - mpp（openslide.mpp-x）在源与输出间一致（都缺失也视为一致）；
+    - mpp（openslide.mpp-x/y）在源与输出间一致（都缺失也视为一致）；
     - 3 个 level-0 采样窗口逐像素比较：无损源要求完全相等；JPEG 源允许
-      平均差 ≤ ``max_mean_diff``（同一 JPEG 解码器误差量级）。
+      平均差 ≤ ``max_mean_diff``（同一 JPEG 解码器误差量级）；
+    - **每个 level ≥1** 采样 ≤3 个窗口（最小层整层）与上一级 2× 盒式
+      下采样比较（链条回到 level 0），平均绝对差 ≤ ``sublevel_tolerance``；
+      全零/常量缩减层即使层数/尺寸正确也抛 :class:`PyramidValidationError`。
 
-    返回 ``{"levels", "level_dimensions", "mpp_x", "mean_diff"}``。
+    返回 ``{"levels", "level_dimensions", "mpp_x", "mean_diff",
+    "sublevel_windows", "sublevel_max_mean_diff"}``。
     """
     import slide_io
 
@@ -1090,11 +1337,19 @@ def validate_pyramid(src_path, dst_path, *, expected_dims=None,
             raise PyramidValidationError(
                 "JPEG 源 level-0 差异过大（mean_diff=%.2f > %.2f）"
                 % (worst, max_mean_diff))
+        # 缩减层内容：uint8/uint16 经 slide_io 线性映射到 8-bit，可跨级比较；
+        # float 源每个窗口独立归一化，只做全零/常量检查。
+        dtype = str(getattr(dst, "_dtype", "") or "")
+        sub_windows, sub_worst = _validate_sublevels(
+            dst, got, tolerance=sublevel_tolerance,
+            comparable=dtype in ("uint8", "uint16"))
         return {
             "levels": int(dst.level_count),
             "level_dimensions": got,
             "mpp_x": _mpp_of(dst, "x"),
             "mean_diff": worst,
+            "sublevel_windows": sub_windows,
+            "sublevel_max_mean_diff": sub_worst,
         }
     finally:
         for slide in (src, dst):
@@ -1123,9 +1378,10 @@ __all__ = [
     "PYRAMID_MIN_LONG_EDGE", "PYRAMID_TARGET_LONG_EDGE", "PYRAMID_TILE",
     "PYRAMID_JPEG_QUALITY_LEVEL0", "PYRAMID_JPEG_QUALITY_SUBLEVEL",
     "PYRAMID_MAX_PIXELS", "PYRAMID_MAX_GROWTH_RATIO",
+    "PYRAMID_SUBLEVEL_SAMPLE", "PYRAMID_SUBLEVEL_TOLERANCE",
     "PyramidSkip", "PyramidError", "PyramidValidationError", "PyramidResult",
     "pyramid_enabled", "min_long_edge", "needs_pyramid",
     "is_buildable_source",
     "level_dimensions_for", "estimate_output_bytes", "build_pyramid",
-    "validate_pyramid", "file_sha256",
+    "extract_level0_tiff", "validate_pyramid", "file_sha256",
 ]

@@ -3,8 +3,9 @@
 
 全部图像由 tifffile 在 TEST_RUN_DIR 下合成（确定性噪声/底纹，无患者数据、
 无真实切片）。覆盖：阈值/env、RGB 无损（LZW）与 JPEG 源、uint16 多通道
-OME、非 OME resolution 标签、流式块读取上界、硬上限跳过、回填 dry-run 与
---apply 的 revision/记账/删除任务拒绝。
+OME、非 OME resolution 标签（平台视图权威，不按标签编造 mpp）、流式块
+读取上界、硬上限跳过、回填 dry-run 与 --apply 的 revision/记账/删除任务
+拒绝。
 
 运行（遵循工作区 TEST_RUN_DIR 约定）::
 
@@ -110,6 +111,40 @@ def _write_tiled_with_resolution(path, h=1200, w=1800, mpp=1.0):
     tifffile.imwrite(str(path), data, photometric="rgb", tile=(64, 64),
                      resolution=(10000, 10000), resolutionunit="CENTIMETER")
     return data
+
+
+def _write_plain_rgb_lzw_with_resolution(path, h=1200, w=1600,
+                                         resolution=(40000, 40000),
+                                         unit="CENTIMETER"):
+    import tifffile
+
+    # 生产上报的形态：单层条带 RGB TIFF + 分辨率标签（非 OME）。
+    data = _noise_rgb(h, w, seed=29)
+    tifffile.imwrite(str(path), data, photometric="rgb", compression="lzw",
+                     resolution=resolution, resolutionunit=unit)
+    return data
+
+
+def _platform_mpp(path):
+    """经平台读取路径（slide_io）取 (mpp_x, mpp_y)；未报告为 None。"""
+    slide = slide_io.open_slide(str(path))
+    try:
+        props = slide.properties or {}
+        out = []
+        for axis in ("x", "y"):
+            raw = props.get("openslide.mpp-%s" % axis)
+            out.append(float(raw) if raw not in (None, "") else None)
+        return tuple(out)
+    finally:
+        slide.close()
+
+
+def _assert_same_mpp(src_mpp, dst_mpp):
+    for s_val, d_val in zip(src_mpp, dst_mpp):
+        if s_val is None:
+            assert d_val is None
+        else:
+            assert d_val == pytest.approx(s_val, rel=1e-6)
 
 
 def _write_unsupported_tzyx(path, t=2, c=2, z=1, h=300, w=400):
@@ -292,6 +327,60 @@ def test_build_nonome_resolution_tags_keep_mpp(tmp_path):
     sp.build_pyramid(src, dst)
     meta = sp.validate_pyramid(src, dst, lossless=True)
     assert meta["mpp_x"] == pytest.approx(src_mpp, rel=1e-6)
+
+
+def test_build_plain_tiff_cm_resolution_keeps_platform_mpp(tmp_path):
+    """生产回归：条带 LZW 明文 TIFF + 分辨率标签。
+
+    平台视图（slide_io）对该源不报告 mpp（OpenSlide 打不开、TiffFileSlide
+    无 OME PhysicalSize）。输出必须与平台视图一致（同样不报告 mpp），
+    构建与校验都不得再因 mpp 存在性不一致而失败。
+    """
+    src = tmp_path / "plain_cm.tiff"
+    dst = tmp_path / "out.ome.tiff"
+    _write_plain_rgb_lzw_with_resolution(src)
+
+    src_mpp = _platform_mpp(src)
+    result = sp.build_pyramid(src, dst)  # 旧实现写 0.25 µm/px 导致校验失败
+    assert result.levels > 1
+    meta = sp.validate_pyramid(src, dst, lossless=True)
+    dst_mpp = _platform_mpp(dst)
+    _assert_same_mpp(src_mpp, dst_mpp)
+    if dst_mpp[0] is None:
+        assert meta["mpp_x"] is None
+    else:
+        assert meta["mpp_x"] == pytest.approx(dst_mpp[0], rel=1e-6)
+
+
+def test_build_plain_tiff_72dpi_default_does_not_invent_mpp(tmp_path):
+    """72 dpi 只是导出器默认值：不得被换算成 ≈352.8 µm/px 写进输出。"""
+    src = tmp_path / "plain_72dpi.tiff"
+    dst = tmp_path / "out.ome.tiff"
+    _write_plain_rgb_lzw_with_resolution(src, resolution=(72, 72),
+                                         unit="INCH")
+
+    src_mpp = _platform_mpp(src)
+    sp.build_pyramid(src, dst)
+    meta = sp.validate_pyramid(src, dst, lossless=True)
+    dst_mpp = _platform_mpp(dst)
+    _assert_same_mpp(src_mpp, dst_mpp)
+    # 25400/72 ≈ 352.8；输出绝不能凭空带上这个值。
+    assert dst_mpp[0] is None or abs(dst_mpp[0] - 352.8) > 1.0
+    assert meta["mpp_x"] is None or abs(meta["mpp_x"] - 352.8) > 1.0
+
+
+def test_build_ome_physical_size_survives_platform_view(tmp_path):
+    """OME PhysicalSize 经平台视图读出后必须原样留在输出（标定不变）。"""
+    src = tmp_path / "mpp.ome.tiff"
+    dst = tmp_path / "out.ome.tiff"
+    _write_rgb_lzw_ome(src, mpp=0.25)
+
+    src_mpp = _platform_mpp(src)
+    assert src_mpp == pytest.approx((0.25, 0.25))
+    sp.build_pyramid(src, dst)
+    meta = sp.validate_pyramid(src, dst, lossless=True)
+    _assert_same_mpp(src_mpp, _platform_mpp(dst))
+    assert meta["mpp_x"] == pytest.approx(0.25)
 
 
 # --------------------------------------------------------------------------- #

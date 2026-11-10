@@ -34,8 +34,12 @@ OME-TIFF，使 viewer/AI 能用真正的低分辨率层看「当前小区域 + �
   * 预估输出 > 3× 源文件（写出后再按实际大小复核）；
   * 目标盘 scratch 空间不足（临时 zarr + 预估输出 + 安全余量）；
   * 不支持的 axes/dtype/压缩形态（如 T/Z>1、4 通道 RGBA、JPEG2000）。
-- **物理尺寸/元数据**：优先沿用 OME-XML ``PhysicalSizeX/Y``（µm）；非 OME
-  源从 TIFF Resolution 标签换算；通道名/颜色从 OME ``Channel`` 复制。
+- **物理尺寸/元数据**：以平台读取路径（``slide_io.open_slide``）报告的
+  mpp 为唯一权威（viewer/AI 与 ``validate_pyramid`` 都读
+  ``openslide.mpp-x/y``），输出原样写回 OME-XML ``PhysicalSizeX/Y``（µm）；
+  平台未报告 mpp 时不写物理尺寸——TIFF Resolution 标签常只是导出器的
+  无意义默认值（如 72 dpi），不能据此改动切片标定。通道名/颜色从 OME
+  ``Channel`` 复制。
 - **原子性**：本模块只写调用方给出的目标路径。调用方（worker/回填脚本）
   在同一目录生成临时文件、校验后原子替换，并负责记账/内容 revision。
 
@@ -297,57 +301,37 @@ def _pick_series(tif):
     return best, tif.series[best]
 
 
-def _rational_value(tag):
-    """TIFF RATIONAL/SRATIONAL 标签 → float（缺失/非法返回 None）。"""
-    if tag is None:
-        return None
-    value = getattr(tag, "value", tag)
-    try:
-        if isinstance(value, (tuple, list)):
-            if len(value) == 2:
-                num, den = float(value[0]), float(value[1])
-                return num / den if den else None
-            return float(value[0]) if value else None
-        return float(value)
-    except (TypeError, ValueError, ZeroDivisionError):
-        return None
+def _source_mpp(src_path):
+    """从平台读取路径取源标定 (mpp_x, mpp_y, objective_power)。
 
+    以 ``slide_io.open_slide`` 的视图为**唯一权威**：viewer/AI 与
+    ``validate_pyramid`` 都读 ``openslide.mpp-x/y``，输出必须沿用同一值。
+    不回落到 TIFF ``XResolution``/``YResolution`` 标签：它们常常只是
+    导出器的无意义默认值（如 72 dpi），按标签换算会在用户不觉察时改掉
+    切片标定，也会让输出与平台视图不一致而校验失败。
 
-def _source_mpp(tif, series):
-    """解析源物理像素尺寸（µm）：OME PhysicalSize 优先，其次 Resolution 标签。"""
-    mpp_x = mpp_y = None
-    objective = None
-    try:
-        ome_xml = tif.ome_metadata if tif.is_ome else None
-    except Exception:  # noqa: BLE001
-        ome_xml = None
-    if ome_xml:
-        import slide_io
+    平台未报告的值返回 None（输出据此不写对应物理尺寸）。
+    """
+    import slide_io
 
-        mpp_x, mpp_y, objective = slide_io._parse_ome_mpp(ome_xml)  # noqa: SLF001
-        # OME 元数据是权威：只要给出了任一 PhysicalSize，就不再回落到 TIFF
-        # Resolution 标签（否则会把缺失的一轴编造成标签默认值）。
-        if mpp_x is not None or mpp_y is not None:
-            return mpp_x, mpp_y, objective
+    slide = slide_io.open_slide(os.fspath(src_path))
     try:
-        page = series.pages[0]
-        tags = page.tags
-        xres = _rational_value(tags.get("XResolution"))
-        yres = _rational_value(tags.get("YResolution"))
-        unit = tags.get("ResolutionUnit")
-        unit = getattr(unit, "value", unit)
-        if xres and xres > 0 and yres and yres > 0:
-            if int(unit or 2) == 3:      # centimeter
-                tx, ty = 10000.0 / xres, 10000.0 / yres
-            else:                        # inch（TIFF 默认）
-                tx, ty = 25400.0 / xres, 25400.0 / yres
-            if mpp_x is None:
-                mpp_x = tx
-            if mpp_y is None:
-                mpp_y = ty
-    except Exception:  # noqa: BLE001
-        pass
-    return mpp_x, mpp_y, objective
+        props = getattr(slide, "properties", None) or {}
+
+        def _num(key):
+            raw = props.get(key)
+            try:
+                return float(raw) if raw not in (None, "") else None
+            except (TypeError, ValueError):
+                return None
+
+        return (_num("openslide.mpp-x"), _num("openslide.mpp-y"),
+                _num("openslide.objective-power"))
+    finally:
+        try:
+            slide.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _source_channels(tif, series_index=0):
@@ -374,8 +358,13 @@ def _source_channels(tif, series_index=0):
     return names, colors
 
 
-def _source_layout(tif, series, *, level_count, series_index=0):
-    """把 series axes/shape 收敛为受支持的三类布局；否则 PyramidalSkip。"""
+def _source_layout(tif, series, *, level_count, series_index=0,
+                   source_mpp=None):
+    """把 series axes/shape 收敛为受支持的三类布局；否则 PyramidalSkip。
+
+    ``source_mpp`` 是 :func:`_source_mpp` 的 ``(mpp_x, mpp_y, objective)``；
+    只在构建入口从平台视图解析一次，布局只负责携带。
+    """
     if level_count > 1:
         raise PyramidSkip("already_multilevel")
     axes = str(series.axes or "")
@@ -452,7 +441,7 @@ def _source_layout(tif, series, *, level_count, series_index=0):
             raise PyramidSkip("unsupported_axes",
                               "轴 %s=%d（仅支持首平面单层）" % (ax, shape[i]))
 
-    mpp_x, mpp_y, objective = _source_mpp(tif, series)
+    mpp_x, mpp_y, objective = source_mpp or (None, None, None)
     names, colors = _source_channels(tif, series_index)
     if len(names) != channels:
         names = []
@@ -698,8 +687,16 @@ def build_pyramid(src_path, dst_path, *, scratch_dir=None, progress=None,
     try:
         series_index, series = _pick_series(tif)
         levels = series.levels or [series]
+        # 标定必须与平台读取路径一致（viewer/AI/validate 同源）；平台打不开
+        # 的源不构成可校验的资产，确定性跳过并保留原文件。
+        try:
+            source_mpp = _source_mpp(src_path)
+        except Exception as exc:  # noqa: BLE001
+            raise PyramidSkip("source_unreadable",
+                              type(exc).__name__) from exc
         layout = _source_layout(tif, series, level_count=len(levels),
-                                series_index=series_index)
+                                series_index=series_index,
+                                source_mpp=source_mpp)
 
         width, height = layout.width, layout.height
         if max(width, height) <= min_long_edge():
@@ -907,6 +904,10 @@ def build_pyramid(src_path, dst_path, *, scratch_dir=None, progress=None,
                 compression=level0_compression,
                 subifds=max(0, len(level_dims) - 1),
                 metadata=meta,
+                # 平台未报 mpp 时不能留下可换算成 mpp 的 Resolution 标签。
+                # 显式 None 时 tifffile 写 (1,1)+RESUNIT.NONE（无物理单位，
+                # 读不出 mpp）；显式传参也防止将来默认值变化。
+                resolution=None,
                 buffersize=PYRAMID_WRITE_BUFFERSIZE,
             )
             if level0_jpeg:
@@ -921,6 +922,7 @@ def build_pyramid(src_path, dst_path, *, scratch_dir=None, progress=None,
                                         level_dims[i][1])
                 sub = dict(shape=shape, dtype=layout.dtype, tile=tile,
                            subfiletype=1, compression=sub_compression,
+                           resolution=None,
                            buffersize=PYRAMID_WRITE_BUFFERSIZE)
                 if sub_jpeg:
                     sub.update(photometric="ycbcr", subsampling=(1, 1))

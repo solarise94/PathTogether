@@ -154,6 +154,6 @@ describe("workbench inline conversion beacon", () => {
 		expect(appSrc).toContain(
 			"reportConversion: window.HP_INLINE_CONVERT.reportConversion,");
 		expect(indexSrc).toContain("/static/upload/inline-convert.js?v=20261110a");
-		expect(indexSrc).toContain("/static/app.js?v=20261110a");
+		expect(indexSrc).toContain("/static/app.js?v=20261110b");
 	});
 });

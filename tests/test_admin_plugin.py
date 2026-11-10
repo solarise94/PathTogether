@@ -1007,7 +1007,9 @@ def test_admin_manifest_plugin_version_bumped_with_hashes():
     # 0.4.25 = 站点统计国家/地区（2026-11-08）：top_countries 以中文地区名 +
     # ISO 码展示（Intl.DisplayNames，缺能力回退原始码），并在表下按 CC BY 4.0
     # 署名为 IP 地理位置来源 DB-IP；hashes/pin 按最终 bundle 重算。
-    assert data["pluginVersion"] == "0.4.25"  # hashes/pin 同步
+    # 0.4.26 = 站点统计三张小表（来源/落地页/国家）在三列卡内不再横向滚动：
+    # 去掉大表 min-width，名称折行、访问数右对齐；仅 style.css 变化。
+    assert data["pluginVersion"] == "0.4.26"  # hashes/pin 同步
     assert "admin:settings:read" in data["adminPermissions"]
     assert "admin:settings:write" in data["adminPermissions"]
     assert "admin:slides:read" in data["adminPermissions"]

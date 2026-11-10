@@ -613,6 +613,18 @@ body {
 /* ---- wave 2（§4.2）：概览「站点访问」匿名统计卡 ---- */
 .adm-site-h3 { font-size: 14px; font-weight: 600; margin: 16px 0 8px; }
 .adm-site-grid { margin-top: 4px; }
+/* 来源 / 落地页 / 国家三张小表并排（0.4.25 起三列）：卡宽约 300–570px，
+   不能沿用大表的 min-width:640px，否则表格在卡内横向滚动，名称和访问数
+   不能同屏。名称列折行，访问数列右对齐不折行。 */
+.adm-site-grid .adm-table { min-width: 0; }
+.adm-site-grid .adm-table td:first-child {
+  white-space: normal; word-break: normal; overflow-wrap: anywhere;
+}
+.adm-site-grid .adm-table th:last-child,
+.adm-site-grid .adm-table td:last-child {
+  width: 1%; white-space: nowrap; text-align: right;
+}
+#adm-site-kinds { grid-template-columns: minmax(180px, max-content) 1fr; }
 
 /* ---- 响应式（§9.3 + §4.3 移动端列适配） ---- */
 @media (max-width: 1023px) {

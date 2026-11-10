@@ -86,6 +86,8 @@ def test_ensure_schema_idempotent(conn):
         "upload_tasks",
         # 0046/0048：KFB 转换任务 + 源别名
         "conversion_jobs", "conversion_job_sources",
+        # 0094：匿名本地转换完成计数
+        "tool_conversion_daily",
     }
     assert expected <= tables, "缺失表: %s" % (expected - tables)
 
@@ -377,6 +379,10 @@ def test_schema_migrations_recorded(conn):
         # subject_type 词表由 'user' 放宽为 'user'|'owner'——owner 迁移
         # Credit 钱包后同样走 hold 预占/结算。
         "0093_owner_credit_holds.sql",
+        # 匿名本地转换完成计数（2026-11-10）：tool_conversion_daily
+        # （UTC+8 日界 × source × 归一化输入格式；只存计数，不存文件/访客
+        # 标识；转换器页与工作台 inline 转换共用）。
+        "0094_tool_conversion_counts.sql",
     ]
 
 

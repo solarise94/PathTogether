@@ -68,14 +68,17 @@ const KFB_BIG_W = 4000;
 const KFB_BIG_H = 3000;
 
 /** 面板发起的新 **API** 请求判定（设计 §9.4 用例 C / §9.2 第 9 项的 A7 口径）：
- * 页面自身加载就发的 5 个 GET 与查看器资源（info/thumbnail/tiles）不计；
- * 静态资源（含运行器动态 import 的 runner/engine/worker/wasm）不是 API 请求，
- * 也不计——「零面板发起的新请求」指的是控制 API 与跨源 PUT。 */
+ * 页面自身加载就发的 5 个 GET、查看器资源（info/thumbnail/tiles）与匿名
+ * 转换完成计数 beacon（0094，成功转换即发一次）不计；静态资源（含运行器
+ * 动态 import 的 runner/engine/worker/wasm）不是 API 请求，也不计——「零
+ * 面板发起的新请求」指的是控制 API 与跨源 PUT。 */
 const PANEL_INITIATED_API = (url: string): boolean => {
   const p = new URL(url).pathname;
   if (!p.startsWith("/api/")) return false;
   if (["/api/auth/info", "/api/slides", "/api/projects", "/api/share/list",
-       "/api/annotations"].some((k) => p === k)) return false;
+       "/api/annotations", "/api/tools/conversions"].some((k) => p === k)) {
+    return false;
+  }
   if (/^\/api\/slides\/[^/]+\/(info|thumbnail|tiles)/.test(p)) return false;
   return true;
 };

@@ -272,6 +272,7 @@ function mkOrch(over: {
 	identityReady?: () => Promise<void>;
 	authEnabled?: () => boolean;
 	companion?: unknown;   // 注入 HP_MRXS_COMPANION 替身（缺省用真模块）
+	reportConversion?: (format: string) => void;
 } = {}) {
 	const w = loadInline();
 	const I = w.HP_INLINE_CONVERT as ReturnType<typeof IC>;
@@ -329,6 +330,8 @@ function mkOrch(over: {
 		target: () => ({ pid: "p1" }),
 		onArtifact: over.onArtifact ?? null,
 		onUploaded: over.onUploaded ?? null,
+		// 0094：匿名完成计数回调（缺省不注入 = 不计数，既有用例无网络副作用）
+		reportConversion: over.reportConversion,
 		cancelArtifact: (e: Entry) => {
 			cancelCalls.push(e.id);
 			if (e._upload && (e._upload as { cancel?: () => void }).cancel) {
@@ -701,6 +704,38 @@ describe("转换 → 上传（一次授权整链）", () => {
 		// 嗅探不出 → 不带声明（绝不写死 converter-bigtiff）
 		const body = h.cos.uploads[0].createBody as { direct_class?: string } | null;
 		expect(body?.direct_class).toBeUndefined();
+	});
+
+	it("0094：成功转换后匿名计数一次（source=workbench 回调；格式取检测扩展名）", async () => {
+		const counted: string[] = [];
+		const h = mkOrch({ reportConversion: (format) => counted.push(format) });
+		const kfb = Uint8Array.from([0xF1, 0x01, 0xEE, 0xEE, 0x4B, 0x46, 0x42, 0x00, 0, 0, 0, 0]);
+		const e = h.orch.enqueue(fakeFile("a.kfb", kfb))!;
+		await flush(25);
+		expect(e.state).toBe("done");
+		expect(counted).toEqual(["kfb"]);
+		// 后续上传/重渲染不重复计数（每个成功任务恰好一次）
+		h.orch.recheckOwnership();
+		await flush(10);
+		expect(counted).toEqual(["kfb"]);
+	});
+
+	it("0094：失败/取消的转换不计数", async () => {
+		const counted: string[] = [];
+		const h = mkOrch({
+			reportConversion: (format) => counted.push(format),
+			runner: {
+				startJob: (_file: unknown, opts: Record<string, unknown>) => ({
+					jobId: opts.jobId,
+					done: Promise.resolve({ ok: false, error: { code: "io_recoverable" } }),
+				}),
+			},
+		});
+		const kfb = Uint8Array.from([0xF1, 0x01, 0xEE, 0xEE, 0x4B, 0x46, 0x42, 0x00, 0, 0, 0, 0]);
+		const e = h.orch.enqueue(fakeFile("a.kfb", kfb))!;
+		await flush(25);
+		expect(e.state).toBe("convert_failed");
+		expect(counted).toEqual([]);
 	});
 
 	it("产物是 OME-XML → createBody.direct_class='ome-tiff'（§4.3 主链路）", async () => {

@@ -3085,6 +3085,65 @@ describe("访问统计刷新", () => {
     await ticks(6);
     expect(bus2.els["adm-site-card"].hidden).toBe(true);
   });
+
+  it("0094 本地转换卡：KPI（今日/近30天/累计）、来源与格式表按 payload 渲染", async () => {
+    const bus = loadPluginUiWithBus();
+    const NONCE = "d4".repeat(32);
+    bus.dispatch(bus.parent, {
+      kind: "init", bridge: "admin", protocolVersion: "1.0.0",
+      nonce: NONCE, adminPermissions: ["admin:overview:read"],
+    });
+    bus.client!.showPage("overview");
+    await ticks(4);
+    replyMethod(bus, NONCE, "admin.siteStats.get", {
+      ok: true,
+      result: {
+        generated_at: 1700000000,
+        today: { visits: 1, unique_visitors: 1, bots: 0 },
+        d7: { visits: 1, unique_visitors: 1, bots: 0 },
+        d30: { visits: 1, unique_visitors: 1, bots: 0 },
+        conversions: {
+          today: 3, d7: 9, d30: 21, all: 40,
+          by_source: { converter: 15, workbench: 6 },
+          by_format: [
+            { format: "svs", count: 12 },
+            { format: "kfb", count: 9 },
+          ],
+        },
+      },
+    });
+    await ticks(6);
+    expect(bus.els["adm-site-conversions-block"].hidden).toBe(false);
+    const kpis = bus.els["adm-site-conversions-kpis"].textContent;
+    expect(kpis).toContain("今日");
+    expect(kpis).toContain("近 30 天");
+    expect(kpis).toContain("累计");
+    expect(kpis).toContain("21");
+    expect(kpis).toContain("40");
+    expect(kpis).toContain("转换器 15 · 工作台 6");
+    const rows = bus.els["adm-site-conversions-tbody"].textContent;
+    expect(rows).toContain("svs");
+    expect(rows).toContain("12");
+    expect(rows).toContain("kfb");
+    expect(rows).toContain("9");
+  });
+
+  it("0094 旧服务端无 conversions 键：转换卡整块隐藏（不伪造 0）", async () => {
+    const bus = loadPluginUiWithBus();
+    const NONCE = "d5".repeat(32);
+    bus.dispatch(bus.parent, {
+      kind: "init", bridge: "admin", protocolVersion: "1.0.0",
+      nonce: NONCE, adminPermissions: ["admin:overview:read"],
+    });
+    bus.client!.showPage("overview");
+    await ticks(4);
+    replyMethod(bus, NONCE, "admin.siteStats.get", {
+      ok: true,
+      result: { generated_at: 1700000000, top_referrers: [] },
+    });
+    await ticks(6);
+    expect(bus.els["adm-site-conversions-block"].hidden).toBe(true);
+  });
 });
 
 // --------------------------------------------------------------------------- //

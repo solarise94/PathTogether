@@ -191,6 +191,21 @@
                      DOM 并显示；内容/链接均来自后端下发的归属信息 -->
                 <p class="adm-note" id="adm-site-countries-attribution" hidden></p>
               </div>
+              <!-- 匿名本地转换完成计数（0094，2026-11-10）：转换器页与工作台
+                   inline 转换共用；只含日/来源/归一化输入格式/计数。复用
+                   .adm-site-grid 的窄卡与两列表格规则，不新增宽表。 -->
+              <div class="adm-summary-card" id="adm-site-conversions-block">
+                <h3>本地转换（今日 / 近 30 天 / 累计）</h3>
+                <p class="adm-note">只统计在浏览器内完成转换的本地任务（转换器页与工作台上传面板），转换完成即计数；不含文件内容或用户身份。</p>
+                <dl class="adm-kv" id="adm-site-conversions-kpis"></dl>
+                <h3 class="adm-site-h3">按输入格式（近 30 天）</h3>
+                <div class="adm-table-wrap">
+                  <table class="adm-table">
+                    <thead><tr><th>输入格式</th><th>转换</th></tr></thead>
+                    <tbody id="adm-site-conversions-tbody"></tbody>
+                  </table>
+                </div>
+              </div>
             </div>
             <dl id="adm-site-kinds" class="adm-kv"></dl>
             <h3 class="adm-site-h3">最近访问（20 条）</h3>

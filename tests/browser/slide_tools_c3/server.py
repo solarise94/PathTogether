@@ -7,7 +7,9 @@
 - 不做 owner/user 种子与凭据文件（本页无登录面；AUTH_ENABLED=True 用于证明
   /tools/slides 无需登录可达，方式与 pytest 的 test_phase1_auth_ui 相同——
   import 后改模块属性，request 期生效）；
-- 不起 share_server（工具页零 /api/ 请求，网络捕获断言会证明这一点）；
+- 不起 share_server（工具页只有匿名转换计数两个精确 API 路径：
+  GET /api/tools/conversions/summary 与成功后的 POST /api/tools/conversions，
+  其余 /api/ 请求为零，网络捕获断言会证明这一点）；
 - postmaster 为守护进程：写 marker 供父进程在 SIGKILL 后收割（同 e2e）。
 
 运行：python3 tests/browser/slide_tools_c3/server.py --port 8943

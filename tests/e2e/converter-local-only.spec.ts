@@ -2,8 +2,10 @@
  * 独立转换器本地化验收（2026-10-20 用户决定：/tools/slides 只做本地转换与
  * 本地保存；上传与交接整体退役）。真实 Chromium 网络断言：
  *
- *  1. 选文件 → 转换 →（可取消/续跑）全程只有静态代码/引擎加载——零
- *     /api/*（上传能力/登录信息/ingestion）、零跨源对象存储 PUT、零文件字节；
+ *  1. 选文件 → 转换 →（可取消/续跑）全程只有静态代码/引擎加载与**匿名
+ *     转换完成计数**（0094：GET summary + 成功后的 POST beacon，精确两个
+ *     路径）——零上传 API（上传能力/登录信息/ingestion）、零跨源对象存储
+ *     PUT、零文件字节；
  *  2. 不登录可用（页面公开；保存走本机 picker，不发请求）；
  *  3. 历史 pending 上传意图/上传回执：打开页面、继续转换、保存都不发上传
  *     请求，不丢产物、不静默取消其他任务；
@@ -76,9 +78,17 @@ open(${JSON.stringify(out)}, 'wb').write(header + ifd + ome + b'\\x00' + b'\\x00
   return out;
 }
 
-/** 请求分类：/api/* 与跨源对象存储 PUT 是「上传面」；静态资源不是。 */
+/** 匿名本地转换计数的两个精确路径（0094）：不是上传面，网络断言放行。 */
+const ANON_COUNT_PATHS = new Set([
+  "/api/tools/conversions",
+  "/api/tools/conversions/summary",
+]);
+
+/** 请求分类：除匿名计数外的 /api/* 与跨源对象存储 PUT 是「上传面」；
+ * 静态资源不是。 */
 function isApi(url: string): boolean {
-  return new URL(url).pathname.startsWith("/api/");
+  const path = new URL(url).pathname;
+  return path.startsWith("/api/") && !ANON_COUNT_PATHS.has(path);
 }
 function isCrossOriginPut(url: string, method: string): boolean {
   const u = new URL(url);
@@ -152,7 +162,8 @@ test("转换器本地转换全程零 API/零对象存储；不登录可用；无
   await expect(page.locator("#result-section")).toBeVisible({ timeout: 240_000 });
   await expect(page.locator("#result-grid")).toContainText("ome");
 
-  // 全程：零 /api/*（上传能力/登录信息/ingestion 都属 /api/*）、零跨源 PUT
+  // 全程：零上传 API（上传能力/登录信息/ingestion；匿名计数两路径已排除）、
+  // 零跨源 PUT
   expect(apiCalls, `API calls: ${apiCalls.join(", ")}`).toEqual([]);
   expect(cosPuts).toEqual([]);
   // COS 上传引擎不再被加载

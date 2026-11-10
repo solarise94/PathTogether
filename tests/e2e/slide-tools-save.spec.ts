@@ -2,6 +2,18 @@ import { test, expect, type Page } from '@playwright/test';
 
 test.use({ locale: 'zh-CN', viewport: { width: 1440, height: 950 } });
 
+// 0094：匿名本地转换计数（summary GET + 成功 beacon POST）是该页仅有的
+// 同源 API 请求；本用例验证「保存/转换不产生上传 API」，故只排除这两个
+// 精确路径，其余 /api/* 仍然必须为零。
+const ANON_COUNT_PATHS = new Set([
+  '/api/tools/conversions',
+  '/api/tools/conversions/summary',
+]);
+const isUploadApi = (url: string): boolean => {
+  const path = new URL(url).pathname;
+  return path.startsWith('/api/') && !ANON_COUNT_PATHS.has(path);
+};
+
 // Synthetic uncompressed RGB BMP; input stays in the browser. No private sample
 // files or upload tasks. The picker substitute uses a real OPFS writable handle.
 function bmp() {
@@ -45,7 +57,7 @@ async function convert(page: Page) {
 test('转换保存：取消、失败的反馈保持可见，语言切换和重试成功，文件只在本地', async ({ page }) => {
   await picker(page);
   const api: string[] = [], errors: string[] = [];
-  page.on('request', r => { if (new URL(r.url()).pathname.startsWith('/api/')) api.push(r.url()); });
+  page.on('request', r => { if (isUploadApi(r.url())) api.push(r.url()); });
   page.on('pageerror', e => errors.push(e.message));
   await open(page);
   await expect(page.locator('#save-capability-note')).toBeHidden();

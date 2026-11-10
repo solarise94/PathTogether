@@ -165,6 +165,8 @@ _BUSINESS_TABLES = (
     # 0030 起：Batch D2 站点匿名访问事件（无用户外键、无 IP/UA/query/
     # token/资源 ID 列；worker 批量写跨用例必残留，显式列出清空）
     "site_visit_events",
+    # 0094 起：匿名本地转换完成计数（无用户/文件/网络标识；跨用例必须清空）
+    "tool_conversion_daily",
     # 0037 起：I 线注册验证邮件队列（users 的 activation/email 列随 users
     # 清空重置；registration_mail_jobs 无外键，显式列出防跨用例残留
     # token/配额占用）

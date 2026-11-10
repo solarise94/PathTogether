@@ -2,9 +2,11 @@
 // 页面唯一职责：UI、文件授权、设置选择与结果展示；全部转换逻辑经
 // C2 运行器（slide-transform/runner.js，页面唯一 API 面）。零第三方依赖。
 //
-// 隐私（2026-10-20 收敛）：本页只做本地转换与本地保存——除自托管静态代码
-// 与引擎外不发任何网络请求；文件字节/文件名/哈希/缩略图不出浏览器；不创建
-// 平台任务。上传统一在工作台上传面板完成，本页不再提供任何上传入口。
+// 隐私（2026-10-20 收敛，2026-11-10 计数）：本页只做本地转换与本地保存。
+// 除自托管静态代码/引擎外，本页只有两类同源请求：加载时读取匿名转换完成
+// 汇总（页脚一行），以及每次转换成功后发送一次匿名完成计数（source=converter，
+// 仅归一化输入格式；无文件字节/文件名/大小/哈希/访客标识）。文件内容与文件名
+// 绝不出浏览器；不创建平台任务。上传统一在工作台上传面板完成。
 //
 // 结构：默认视图 = 标题 + 一行本地处理说明 + 大拖放区/选择文件；识别后
 // 只出现一张配置摘要（文件/类型/输出/画质 + 折叠「更多选项」）与「开始
@@ -119,6 +121,7 @@ const els = {
   diskBody: $('disk-dialog-body'),
   diskConfirm: $('disk-confirm-btn'),
   diskDeny: $('disk-deny-btn'),
+  conversionCount: $('conversion-count'),
 };
 
 const t = (key, vars) => window.HP_I18N.t(key, vars);
@@ -319,6 +322,7 @@ function rerenderForLang() {
   renderSaveStatus();
   renderResultPanel();
   renderJobs(page.lastJobs || []);
+  renderConversionCount();
   if (page.prep) {
     renderSummary();
     renderProbeSummary();
@@ -1157,6 +1161,75 @@ function probeEstimate() {
   return p.document && p.document.estimate ? p.document.estimate : (p.estimate || {});
 }
 
+// ------------------------------------------- anonymous conversion count (0094) --
+// 页脚一行汇总 + 每次成功转换一次 fire-and-forget beacon。两者都只发同源
+// 请求、不携带 Cookie（credentials:'omit'），失败一律静默——统计是锦上添花，
+// 绝不影响转换/保存/结果面板。
+let conversionStats = null;
+
+function extToken(name) {
+  const m = /\.([A-Za-z0-9]+)$/.exec(String(name || ''));
+  return m ? m[1].toLowerCase() : '';
+}
+
+/// 计数上报的输入格式：探测到的检测器 format id 优先（页面已持有），普通
+/// 图片（plain-image-bmp-jpeg 不区分 BMP/JPEG）回退源文件扩展名；任务列表
+/// 路径在摘要不属于当前 prep 时回退任务源文件扩展名。
+function conversionInputFormat(sourceName, useProbe) {
+  const fmt = useProbe === false ? '' : String(probeDoc().format || '');
+  if (fmt && !fmt.startsWith('plain-image')) return fmt;
+  const name = sourceName || (page.prep && page.prep.identity
+    && page.prep.identity.name) || (page.file && page.file.name) || '';
+  return extToken(name) || fmt;
+}
+
+function reportCompletedConversion(format) {
+  try {
+    if (typeof fetch !== 'function') return;
+    const pending = fetch('/api/tools/conversions', {
+      method: 'POST',
+      keepalive: true,
+      credentials: 'omit',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: 'converter', format: String(format || '') }),
+    });
+    if (pending && typeof pending.catch === 'function') pending.catch(() => {});
+  } catch (e) { /* 计数失败绝不影响结果 */ }
+}
+
+async function loadConversionSummary() {
+  if (!els.conversionCount || typeof fetch !== 'function') return;
+  try {
+    const resp = await fetch('/api/tools/conversions/summary', {
+      credentials: 'omit',
+      cache: 'no-store',
+    });
+    if (!resp || !resp.ok) return;
+    const data = await resp.json();
+    const total = Number(data && data.total);
+    const since = String((data && data.since) || '');
+    if (!Number.isFinite(total) || total <= 0
+        || !/^\d{4}-\d{2}-\d{2}$/.test(since)) return;
+    conversionStats = { total, since };
+    renderConversionCount();
+  } catch (e) { /* 汇总不可用：保持隐藏 */ }
+}
+
+function renderConversionCount() {
+  const el = els.conversionCount;
+  if (!el) return;
+  if (!conversionStats) {
+    el.hidden = true;
+    return;
+  }
+  const lang = document.documentElement.lang === 'en' ? 'en-US' : 'zh-CN';
+  el.textContent = t('tools.stats.completed', {
+    count: Number(conversionStats.total).toLocaleString(lang),
+    since: conversionStats.since,
+  });
+  el.hidden = false;
+}
+
 // Summary card shows a reader-friendly family name; the core's format id stays
 // in the technical summary under "更多选项".
 function formatFamilyLabel(id) {
@@ -1671,6 +1744,9 @@ async function driveConversion() {
       renderResultPanel();
       renderSaveStatus();
       setRunJob(jobName, 'done');
+      // 匿名完成计数（0094）：一次成功转换只发一次；失败静默。
+      reportCompletedConversion(conversionInputFormat(
+        page.readyInfo && page.readyInfo.sourceName, true));
     } else if (isCancelledResult(result)) {
       showCancelledState();
     } else {
@@ -2517,6 +2593,10 @@ async function onJobAction(action, job, btnEl = null) {
           renderResultPanel();
           renderSaveStatus();
           setRunJob(jobName, 'done');
+          // 匿名完成计数（0094）：任务列表开始/续跑的成功同样计一次；摘要
+          // 不属于当前 prep 时用任务源文件扩展名（不使用别的任务的探测结果）。
+          reportCompletedConversion(conversionInputFormat(
+            job.source && job.source.name, !!thisPrep));
           // 2026-10-20：历史 pending 上传意图不再执行——转换完成后停在结果
           // 面板（保存到电脑），绝不自动上传。
         } else if (isCancelledResult(result)) {
@@ -2585,6 +2665,8 @@ window.addEventListener('beforeunload', (ev) => {
 async function init() {
   document.title = t('tools.doc.title');
   renderSaveStatus();
+  // 匿名完成汇总（0094）：与 runner 初始化并行；失败保持隐藏，不阻塞页面。
+  void loadConversionSummary();
   try {
     page.runner = await SlideToolsRunner.create();
   } catch (e) {

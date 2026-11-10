@@ -102,6 +102,9 @@ DASHBOARD_KEYS = {
     "visitor_kinds", "entry_hosts", "host_filter_configured", "legacy",
     "geo_configured", "geo_source",
 }
+#: app 路由在 store 契约之上附加 conversions（0094；dashboard_stats 本身
+#: 仍是原样透传的纯站点访问统计）。
+APP_DASHBOARD_KEYS = DASHBOARD_KEYS | {"conversions"}
 WINDOW_KEYS = {"visits", "unique_visitors", "bots"}
 DAILY_KEYS = {"date", "visits", "unique_visitors", "bots"}
 RECENT_KEYS = {"occurred_at", "page_key", "request_host", "referrer_domain",
@@ -1843,7 +1846,7 @@ def test_app_admin_site_stats_owner_only(monkeypatch):
     resp = client.get("/api/admin/v1/site-stats")
     assert resp.status_code == 200
     payload = resp.get_json()
-    assert set(payload.keys()) == DASHBOARD_KEYS
+    assert set(payload.keys()) == APP_DASHBOARD_KEYS
     for key in ("today", "d7", "d30"):
         assert set(payload[key].keys()) == WINDOW_KEYS
     assert set(payload["visitor_kinds"].keys()) == set(sss.VISITOR_KINDS)
@@ -1853,6 +1856,12 @@ def test_app_admin_site_stats_owner_only(monkeypatch):
         assert set(row.keys()) == DAILY_KEYS
     assert payload["geo_configured"] is False
     assert payload["geo_source"] is None
+    # 0094：本地转换计数固定形状（无数据时为零 + 两个来源键）
+    assert set(payload["conversions"].keys()) == {
+        "today", "d7", "d30", "all", "by_source", "by_format"}
+    assert payload["conversions"]["all"] == 0
+    assert payload["conversions"]["by_source"] == {
+        "converter": 0, "workbench": 0}
     # 无写副作用：调用前后 site 表行数不变（不创建事件、不清理）
     n_before = _site_count()
     resp = client.get("/api/admin/v1/site-stats")

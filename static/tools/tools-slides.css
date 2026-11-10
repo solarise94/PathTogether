@@ -681,6 +681,13 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
   color: var(--muted); font-size: 13px;
 }
 .footer-note p { margin: 0; }
+/* 匿名本地转换完成汇总（0094）：一行小字，放在支持区与页脚说明之间；
+   只在有数据时由 JS 取消 hidden。 */
+.footer-note .footer-stat {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
 /* 页脚支持入口：独立的暖色提示区与按钮。 */
 .footer-support {
   display: flex;

@@ -308,10 +308,15 @@ def test_site_stats_owner_only_and_readonly_passthrough():
     for key in ("generated_at", "today", "d7", "d30", "daily",
                 "top_referrers", "top_pages",
                 "top_countries", "recent", "visitor_kinds", "entry_hosts",
-                "host_filter_configured", "legacy", "geo_configured"):
+                "host_filter_configured", "legacy", "geo_configured",
+                # 0094：匿名本地转换完成计数（独立小卡；零形状也固定下发）
+                "conversions"):
         assert key in body, key
     for seg in ("today", "d7", "d30"):
         assert set(body[seg].keys()) == {"visits", "unique_visitors", "bots"}
+    assert set(body["conversions"].keys()) == {
+        "today", "d7", "d30", "all", "by_source", "by_format"}
+    assert body["conversions"]["all"] == 0
     # R4（2026-09-19）：daily = 近 7 天倒序 7 行；top_referrers_with_bots
     # 对照口径已随爬虫开关退役
     assert len(body["daily"]) == 7

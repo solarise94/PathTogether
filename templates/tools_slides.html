@@ -9,15 +9,15 @@
   <link rel="alternate" href="/guide/conversion.md" type="text/markdown" />
   {% if canonical %}<link rel="canonical" href="{{ canonical }}" />{% endif %}
   {% include "_site_icons.html" %}
-  <link rel="stylesheet" href="/static/tools/tools-slides.css?v=20261026c" />
-  <script defer src="/static/i18n.js?v=20261107a"></script>
+  <link rel="stylesheet" href="/static/tools/tools-slides.css?v=20261110a" />
+  <script defer src="/static/i18n.js?v=20261110a"></script>
   <!-- 2026-10-20：本页只做本地转换与保存——不再加载 COS 上传引擎。
        slide-sniff 仅用于「此文件无需转换」提示（头级嗅探，零网络）。 -->
   <script defer src="/static/upload/slide-sniff.js?v=20261106c"></script>
   <!-- MRXS「先选 .mrxs，再选同名数据文件夹」的共享协助逻辑（工作台/转换器页
        同一实现；classic script，页面在用户手势内惰性读 window.HP_MRXS_COMPANION） -->
   <script defer src="/static/upload/mrxs-companion.js?v=20261021"></script>
-  <script type="module" src="/static/tools/tools-slides.js?v=20261103a"></script>
+  <script type="module" src="/static/tools/tools-slides.js?v=20261110a"></script>
 </head>
 <body id="top" data-inline-convert-enabled="{{ 'true' if inline_convert_enabled else 'false' }}">
   <a class="skip-link" href="#main" data-i18n="tools.skip">跳到主要内容</a>
@@ -156,7 +156,7 @@
             <summary data-i18n="tools.privacy.brief">需要上传？请前往工作台。</summary>
             <h3 id="privacy-title" data-i18n="tools.privacy.title">本地与隐私</h3>
             <ul class="privacy-list">
-              <li data-i18n="tools.privacy.details">识别、转换与保存都在这台设备的浏览器内完成；除加载本页自身的静态代码与引擎外，本页不连接平台，也不发送文件内容、文件名或哈希。已兼容的文件（OME-TIFF 等）无需转换，可直接使用；如需上传，请前往工作台。</li>
+              <li data-i18n="tools.privacy.details">识别、转换与保存都在这台设备的浏览器内完成；除加载本页自身的静态代码与引擎外，本页只发送匿名的转换完成计数（不含文件内容、文件名、大小或哈希）。已兼容的文件（OME-TIFF 等）无需转换，可直接使用；如需上传，请前往工作台。</li>
               <!-- 2026-10-21 支持入口补充（§本地与隐私）：主动打开支持页/收款链接会访问外部，但支持操作不读取/上传切片文件 -->
               <li data-i18n="tools.support.privacy">打开支持页会访问网站；继续打开收款链接时会访问相应支付服务。转换与保存仍在本机完成，支持操作不会读取或上传你的切片文件。</li>
             </ul>
@@ -401,6 +401,9 @@
           <span data-i18n="tools.support.link">支持项目 ↗</span>
         </a>
       </div>
+      <!-- 匿名本地转换完成汇总（0094）：只在 summary 可用且 total>0 时由
+           tools-slides.js 显示；失败/零值保持 hidden（不占位、不提示错误）。 -->
+      <p id="conversion-count" class="footer-stat" hidden></p>
       <p data-i18n="tools.footer">本地工具不会替你判断医学结论；输出文件请自行妥善保管。</p>
     </div>
   </footer>

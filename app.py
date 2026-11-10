@@ -183,6 +183,32 @@ try:
 except ImportError:  # pragma: no cover - 仅在 store 缺失的构建里触达
     site_stats_store = None
 
+# 匿名本地转换完成计数（0094，2026-11-10）：/tools/slides 与工作台 inline
+# 转换成功后由浏览器发同源 beacon；只落 day/source/format/count（见
+# tool_conversion_store 模块 docstring 的隐私不变量）。store 未随镜像发布时
+# beacon 静默 204、summary 503（转换器页隐藏统计行），页面功能不受影响。
+try:
+    import tool_conversion_store
+except ImportError:  # pragma: no cover - 仅在 store 缺失的构建里触达
+    tool_conversion_store = None
+
+#: 本地转换 beacon 的精确路径（公开、无 Cookie 会话；CSRF 豁免只覆盖它们）
+TOOL_CONVERSIONS_PATH = "/api/tools/conversions"
+TOOL_CONVERSIONS_SUMMARY_PATH = "/api/tools/conversions/summary"
+#: beacon body 上限（字节）——只接受 {source, format} 两个短字段
+TOOL_CONVERSIONS_MAX_BODY = 1024
+
+
+def _tool_conversion_empty_dashboard():
+    """admin 站点卡的固定零形状（store 缺失/查询失败时降级）。"""
+    if tool_conversion_store is not None:
+        return tool_conversion_store.empty_dashboard()
+    return {
+        "today": 0, "d7": 0, "d30": 0, "all": 0,
+        "by_source": {"converter": 0, "workbench": 0},
+        "by_format": [],
+    }
+
 # Stage 5-1：插件 manifest 版本常量单一来源（plugins/sdk/manifest.py）。
 # plugins/ 与 plugins/sdk/ 各有 __init__.py（plugins/histopilot/ 不加，保持静态目录）。
 from plugins.sdk.manifest import (  # noqa: E402
@@ -1037,7 +1063,9 @@ def _require_auth():
     """启用认证时拦截未登录 / 已禁用 / 已删除 / **未激活**用户的请求。
 
     放行 /login、/register、/demo、/tools/slides（C3 本地工具页，无账号本地
-    转换）、/support（公开支持项目页，只读、无账号/数据库访问）、
+    转换）、/api/tools/conversions 与其 summary（匿名本地转换计数，精确
+    路径；不读 session、不设 Cookie）、/support（公开支持项目页，只读、
+    无账号/数据库访问）、
     /verify-email、/api/registration/{start,
     verify,resend}、/api/demo/*、/static/、/plugins/、/healthz、/internal/、
     /api/plugin/；其余请求检查 session，并按 user_id 回查用户是否仍存在且
@@ -1066,7 +1094,8 @@ def _require_auth():
         return None
     # /support/ 前缀：赞助订单族（收银台跳转页/回跳页/支付宝异步通知）
     # 与 /support 同为公开路径；订单路由自身再按功能闸 404（关闭态）。
-    if (path in ("/login", "/register", "/demo", "/tools/slides", "/support")
+    if (path in ("/login", "/register", "/demo", "/tools/slides", "/support",
+                 TOOL_CONVERSIONS_PATH, TOOL_CONVERSIONS_SUMMARY_PATH)
             or path.startswith("/support/")
             # Credit 充值异步通知（0088）：支付宝服务器无本站会话。**仅精确
             # 路径 + POST** 放行；其余 /payments/* 与 GET 不在白名单内。
@@ -1333,6 +1362,12 @@ def _csrf_exempt_path(path: str) -> bool:
             # POST 豁免」处理，避免把通知误判为漏 CSRF 的写端点。
             return True
         return request.method == "POST"
+    # 匿名本地转换计数（0094）：公开 beacon 与只读 summary 不使用 Cookie
+    # 会话——**仅这两个精确路径**豁免（前缀/子路径不豁免），因此 GET 不会
+    # 触发 ensure_csrf_token，响应不会出现 Set-Cookie；POST 的同源与频控
+    # 校验在视图内完成（见 _tool_conversions_post）。
+    if path in (TOOL_CONVERSIONS_PATH, TOOL_CONVERSIONS_SUMMARY_PATH):
+        return True
     # C5 用户面 grant 端点走 Cookie+CSRF（前缀豁免的显式例外）
     if path == _PLUGIN_USER_FACE_PREFIX or \
             path.startswith(_PLUGIN_USER_FACE_PREFIX + "/"):
@@ -1591,8 +1626,14 @@ def _is_user_activity_request() -> bool:
     必须保持原样。公开路径白名单与 ``_require_auth`` 不查用户就放行的分支保持
     一致（public_site GET/HEAD、/legal/、/login、/register、/support 及其子
     路径、/tools/slides、/demo、注册公开通道、/api/demo/、/healthz、
-    /favicon.ico）。
+    /favicon.ico、匿名本地转换计数 beacon/summary）。
     """
+    # 匿名转换计数（0094）：公开、无 Cookie 会话，POST/GET 都不算用户活跃
+    # （判定必须先于写方法分支——否则每个成功转换的 beacon 都会读一次
+    # session，给响应平白加 Vary: Cookie）。
+    if (request.path or "") in (TOOL_CONVERSIONS_PATH,
+                                TOOL_CONVERSIONS_SUMMARY_PATH):
+        return False
     method = request.method
     if method in ("POST", "PUT", "PATCH", "DELETE"):
         return True
@@ -3834,7 +3875,8 @@ def tools_slides():
     """本地切片工具（C3）：无账号的本地转换页（KFB/KFBF → BigTIFF/OME）。
 
     - 全部识别/转换/校验/保存在用户浏览器内完成（WASM + OPFS，见
-      static/tools/slide-transform/）；页面除自托管静态代码外不发任何网络请求，
+      static/tools/slide-transform/）；除自托管静态代码/引擎外，页面只在
+      转换成功后向同源发送匿名完成计数（0094，无文件名/大小/访客标识），
       不创建平台任务（计划 §6）。
     - 无登录（_require_auth 显式放行本路径）；页面级最小 CSP 由
       _apply_slide_tools_security_headers 设置（不改全站头）。
@@ -3849,6 +3891,123 @@ def tools_slides():
         # 同一载荷字段（_inline_convert_payload），关闭态随形下发
         inline_convert_enabled=_inline_convert_payload()["enabled"]))
     return _apply_slide_tools_security_headers(resp)
+
+
+# --------------------------------------------------------------------------- #
+# 匿名本地转换完成计数（0094，2026-11-10）
+#
+# 两个公开端点（精确路径；_require_auth / _csrf_exempt_path 已显式放行，
+# 不读 session、不下发任何 Cookie）：
+#   POST /api/tools/conversions          → 204（成功/忽略都 204，不泄露判定）
+#   GET  /api/tools/conversions/summary  → {total, since}，public max-age=60
+#
+# 隐私：只落 UTC+8 日 × source × 归一化输入格式 × count；不保存文件名/
+# 大小/IP/UA/用户 ID。防刷：site_stats UA 词表判定的疑似 bot 直接忽略；每
+# 日访客 HMAC（日轮换，仅进程内）最多 20 次；body ≤ 1 KB；必须同源
+# （Origin 或 Referer 的 host 与请求 Host 完全一致），否则静默 204。
+# 进程内上限的跨 worker 局限见 tool_conversion_store 模块 docstring。
+# --------------------------------------------------------------------------- #
+_TOOL_CONVERSION_WARN_INTERVAL_SECONDS = 300
+_tool_conversion_warn_last = {"ts": None}
+
+
+def _warn_tool_conversion_throttled(message: str) -> None:
+    """计数写失败节流 warning（同类一条/5 分钟；不含 IP/UA/body 等原始值）。"""
+    now = time.monotonic()
+    last = _tool_conversion_warn_last["ts"]
+    if last is not None and now - last < _TOOL_CONVERSION_WARN_INTERVAL_SECONDS:
+        return
+    _tool_conversion_warn_last["ts"] = now
+    app.logger.warning("[tool-conversions] %s", message)
+
+
+def _tool_conversion_same_origin() -> bool:
+    """Origin（优先）或 Referer 的 netloc 是否与请求 Host 完全一致。
+
+    两者都缺失、格式非法、``Origin: null`` 或 host 不匹配 → False（调用方
+    静默 204）。只做字符串级 host:port 比较，不跟随任何重定向。
+    """
+    host = (request.host or "").strip().lower()
+    if not host:
+        return False
+    for name in ("Origin", "Referer"):
+        raw = (request.headers.get(name) or "").strip()
+        if not raw:
+            continue
+        try:
+            netloc = urlsplit(raw).netloc
+        except ValueError:
+            return False
+        return bool(netloc) and netloc.lower() == host
+    return False
+
+
+def _tool_conversion_parse_body():
+    """读取并解析 ≤ 1 KB 的 JSON 对象；超限/空/非法 → None。"""
+    length = request.content_length
+    if length is not None and length > TOOL_CONVERSIONS_MAX_BODY:
+        return None
+    raw = request.stream.read(TOOL_CONVERSIONS_MAX_BODY + 1)
+    if not raw or len(raw) > TOOL_CONVERSIONS_MAX_BODY:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _tool_conversion_noop_response():
+    """beacon 的静默成功（204）；显式 no-store，不带任何 Cookie/body。"""
+    resp = make_response("", 204)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route(TOOL_CONVERSIONS_PATH, methods=["POST"])
+def tool_conversions_post():
+    """匿名 beacon：成功完成一次本地转换（converter / workbench）。
+
+    判定顺序：store 缺失/非同源/疑似 bot/超每日上限 → 静默 204；其余非法
+    输入（body 超限、非 JSON 对象、source 不在词表）→ 400 invalid_request。
+    DB 写失败只记节流 warning，仍返回 204（计数允许少计，页面永不阻塞）。
+    """
+    if tool_conversion_store is None:
+        return _tool_conversion_noop_response()
+    if not _tool_conversion_same_origin():
+        return _tool_conversion_noop_response()
+    if tool_conversion_store.is_bot(request.headers.get("User-Agent", "")):
+        return _tool_conversion_noop_response()
+    data = _tool_conversion_parse_body()
+    if data is None:
+        return jsonify(error="invalid_request"), 400
+    source = tool_conversion_store.normalize_source(data.get("source"))
+    if source is None:
+        return jsonify(error="invalid_request"), 400
+    if not tool_conversion_store.allow_visitor(request.remote_addr or ""):
+        return _tool_conversion_noop_response()
+    try:
+        tool_conversion_store.record(source, data.get("format"))
+    except Exception:
+        _warn_tool_conversion_throttled(
+            "本地转换计数写入失败（best-effort 丢弃，不影响页面）")
+    return _tool_conversion_noop_response()
+
+
+@app.route(TOOL_CONVERSIONS_SUMMARY_PATH, methods=["GET"])
+def tool_conversions_summary():
+    """公开汇总（转换器页一行统计）：{total, since}；失败 503 且不可缓存。"""
+    if tool_conversion_store is None:
+        return jsonify(error="unavailable"), 503
+    try:
+        data = tool_conversion_store.summary()
+    except Exception:
+        _warn_tool_conversion_throttled(
+            "本地转换汇总读取失败（转换器页隐藏统计行）")
+        return jsonify(error="unavailable"), 503
+    resp = jsonify(data)
+    resp.headers["Cache-Control"] = "public, max-age=60"
+    return resp
 
 
 # --------------------------------------------------------------------------- #
@@ -13963,7 +14122,11 @@ def admin_v1_settings_model_put():
 
 @app.route("/api/admin/v1/site-stats", methods=["GET"])
 def admin_v1_site_stats():
-    """站点访问统计（Batch D2；owner-only 只读透传 site_stats_store.dashboard_stats）。"""
+    """站点访问统计（Batch D2；owner-only 只读透传 dashboard_stats）。
+
+    另附加 ``conversions``（0094 本地转换计数；独立小卡），dashboard_stats
+    本身的站点访问契约不变。
+    """
     auth = _require_owner_admin_v1()
     if auth:
         return auth
@@ -13975,6 +14138,15 @@ def admin_v1_site_stats():
     except Exception:
         app.logger.exception("admin v1 site stats 读取失败")
         return _admin_v1_error(500, "internal", "站点访问统计读取失败")
+    # 匿名本地转换计数（0094）：同一站点卡上的独立小卡片；store/表不可用时
+    # 退化为固定零形状（不影响访问统计本身），绝不 500。
+    try:
+        stats["conversions"] = (tool_conversion_store.dashboard()
+                                if tool_conversion_store is not None
+                                else _tool_conversion_empty_dashboard())
+    except Exception:
+        app.logger.warning("admin v1 site conversions 读取失败（降级为零形状）")
+        stats["conversions"] = _tool_conversion_empty_dashboard()
     # 原样透传（聚合形态由 store 契约钉死）；无写副作用
     return jsonify(stats)
 

@@ -448,6 +448,44 @@
     }
   }
 
+  // ------------------------------------------------ 匿名完成计数（0094） --
+
+  /// 工作台 inline 转换成功后的匿名计数（source='workbench'）。一次成功
+  /// 转换只发一次、fire-and-forget；失败静默。只发送归一化输入格式（扩展
+  /// 名，如 svs/mrxs），不含文件名/大小/文件内容/哈希/用户 ID。转换完成
+  /// 即计数（与之后是否上传无关）。
+  function reportConversion(format) {
+    try {
+      if (typeof fetch !== "function") return;
+      var pending = fetch("/api/tools/conversions", {
+        method: "POST",
+        keepalive: true,
+        credentials: "omit",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source: "workbench",
+          format: String(format || ""),
+        }),
+      });
+      if (pending && typeof pending.catch === "function") {
+        pending.catch(function () { /* 统计失败不影响转换/上传 */ });
+      }
+    } catch (e) { /* 同上 */ }
+  }
+
+  /// entry 的输入格式 token（slide-sniff 给出的检测扩展名优先；缺省回退
+  /// 文件名尾段）。只取扩展名，不涉及文件内容。
+  function conversionFormatOf(entry) {
+    var ext = entry && entry.cls && entry.cls.ext;
+    if (!ext && entry) ext = extOfName(entry.name);
+    return String(ext || "").replace(/^\./, "").toLowerCase();
+  }
+
+  function extOfName(name) {
+    var m = /\.[A-Za-z0-9]+$/.exec(String(name || ""));
+    return m ? m[0] : "";
+  }
+
   // ------------------------------------------------------------ 编排器 --
 
   /// createOrchestrator(deps) —— deps 全部注入（便于测试与 app.js 接线）：
@@ -488,6 +526,8 @@
   ///   locks         navigator.locks（可注入假实现）
   ///   now/setTimer  定时器（测试可注入）
   ///   requestSupport(entry)  打开申请支持（app.js 提供）
+  ///   reportConversion(format)  成功转换后的匿名计数回调（可省；app.js 传
+  ///                 HP_INLINE_CONVERT.reportConversion，测试可注入假实现）
   function createOrchestrator(deps) {
     deps = deps || {};
     var runner = deps.runner;
@@ -500,6 +540,8 @@
       (typeof window !== "undefined" ? window.HP_MRXS_COMPANION : null) || null;
     var ui = deps.ui || {};
     var caps = deps.caps || {};
+    var countConversion = typeof deps.reportConversion === "function"
+      ? deps.reportConversion : null;
     var locks = deps.locks ||
       (typeof navigator !== "undefined" ? navigator.locks : null);
     var account = typeof deps.account === "function" ? deps.account : function () { return ""; };
@@ -1178,6 +1220,12 @@
       }
       e.result = result.result || null;
       e.validation = result.validation || null;
+      // 匿名完成计数（0094）：每个成功转换恰好一次；失败/取消不计。
+      // 计数回调抛错也绝不能改变已成功的结果行。
+      if (countConversion && !e.conversionCounted) {
+        e.conversionCounted = true;
+        try { countConversion(conversionFormatOf(e)); } catch (err) { /* */ }
+      }
       e.state = "converted";
       setStage(e, "tools.phase.ready", 1);
       if (ui.buttons) ui.buttons(e);
@@ -2488,6 +2536,7 @@
     PHASE_KEYS: PHASE_KEYS,
     progressStage: progressStage,
     WARN_STATES: WARN_STATES,
+    reportConversion: reportConversion,
     createOrchestrator: createOrchestrator,
   };
 })();

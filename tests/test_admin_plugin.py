@@ -1009,7 +1009,11 @@ def test_admin_manifest_plugin_version_bumped_with_hashes():
     # 署名为 IP 地理位置来源 DB-IP；hashes/pin 按最终 bundle 重算。
     # 0.4.26 = 站点统计三张小表（来源/落地页/国家）在三列卡内不再横向滚动：
     # 去掉大表 min-width，名称折行、访问数右对齐；仅 style.css 变化。
-    assert data["pluginVersion"] == "0.4.26"  # hashes/pin 同步
+    # 0.4.27 = 匿名本地转换完成计数（2026-11-10）：站点访问卡内新增
+    # 「本地转换（今日 / 近 30 天 / 累计）」KPI + 近 30 天输入格式两列表
+    # （复用 .adm-site-grid 窄卡，不新增宽表；index.html/main.js 变化，
+    # style.css 未变）；hashes/pin 按最终 bundle 重算。
+    assert data["pluginVersion"] == "0.4.27"  # hashes/pin 同步
     assert "admin:settings:read" in data["adminPermissions"]
     assert "admin:settings:write" in data["adminPermissions"]
     assert "admin:slides:read" in data["adminPermissions"]

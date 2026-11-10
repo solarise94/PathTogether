@@ -11663,6 +11663,9 @@
           }
         },
         onUploaded: inlineUploaded,
+        // 匿名完成计数（0094）：inline 转换成功即 fire-and-forget 计数
+        // （source=workbench），与之后是否上传无关；实现留在 inline-convert.js。
+        reportConversion: window.HP_INLINE_CONVERT.reportConversion,
         apiFetch: apiFetch,
         apiFetchNoRedirect: apiFetchNoRedirect,
         setTimer: function (fn, ms) { setTimeout(fn, ms); },

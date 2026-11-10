@@ -147,14 +147,26 @@ async function scenarioA() {
 
     // (j) 网络捕获断言
     const origin = `http://127.0.0.1:${PORT}`;
+    // 0094：匿名本地转换计数是该页仅有的 API 请求（summary GET + 成功
+    // beacon POST）；放行这两个精确路径，其余 /api/* 与写方法仍必须为零。
+    const anonCountPaths = new Set([
+      '/api/tools/conversions',
+      '/api/tools/conversions/summary',
+    ]);
+    const isAnonCount = (r) => anonCountPaths.has(new URL(r.url).pathname);
     const bad = requests.filter((r) => !r.url.startsWith(origin));
-    const nonGet = requests.filter((r) => r.method !== 'GET');
-    const apiCalls = requests.filter((r) => r.url.includes('/api/'));
+    const nonGet = requests.filter((r) => r.method !== 'GET' &&
+      !(r.method === 'POST' &&
+        new URL(r.url).pathname === '/api/tools/conversions'));
+    const apiCalls = requests.filter((r) => r.url.includes('/api/') &&
+      !isAnonCount(r));
+    const anonCountCalls = requests.filter(isAnonCount);
     const nameLeak = requests.filter((r) => r.url.includes(path.basename(kfb)));
     const shaLeak = requests.filter((r) => r.url.toLowerCase().includes(nativeSha.slice(0, 16)));
     const nonStatic = requests.filter((r) => {
       const u = new URL(r.url);
-      return u.pathname !== '/tools/slides' && !u.pathname.startsWith('/static/');
+      return u.pathname !== '/tools/slides' && !u.pathname.startsWith('/static/') &&
+        !anonCountPaths.has(u.pathname);
     });
     const downloads = await page.evaluate(() => window.__downloads);
     const cspErrors = consoleErrors.filter((e) => /Refused|Content Security Policy|CSP/i.test(e));
@@ -163,7 +175,8 @@ async function scenarioA() {
     record('j-network-capture', bad.length === 0 && nonGet.length === 0 && apiCalls.length === 0
       && nameLeak.length === 0 && shaLeak.length === 0 && nonStatic.length === 0 && (!downloads || downloads.length === 0),
       { totalRequests: requests.length, nonSameOrigin: bad.length, nonGet: nonGet.map((r) => r.method),
-        apiCalls: apiCalls.length, nameLeak: nameLeak.length, shaLeak: shaLeak.length,
+        apiCalls: apiCalls.length, anonCountCalls: anonCountCalls.length,
+        nameLeak: nameLeak.length, shaLeak: shaLeak.length,
         nonPageStatic: nonStatic.map((r) => new URL(r.url).pathname), downloads: downloads || [],
         requestPaths: [...new Set(requests.map((r) => new URL(r.url).pathname))] });
     record('csp-real-app', headers.wasmType === 'application/wasm' && cspErrors.length === 0,

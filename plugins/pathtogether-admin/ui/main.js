@@ -1098,6 +1098,47 @@
     });
   }
 
+  // 匿名本地转换完成计数（0094，2026-11-10）：后端 dashboard 的
+  // conversions 键（today/d7/d30/all + by_source + by_format）。旧服务端
+  // 没有该键时整块隐藏（不伪造 0）。
+  function renderSiteConversions(res) {
+    var block = $("adm-site-conversions-block");
+    var conv = res && res.conversions;
+    if (!block) return;
+    if (!conv || typeof conv !== "object") {
+      block.hidden = true;
+      return;
+    }
+    block.hidden = false;
+    var dl = $("adm-site-conversions-kpis");
+    if (dl) {
+      dl.textContent = "";
+      kvRow(dl, "今日", fmtNum(conv.today));
+      kvRow(dl, "近 30 天", fmtNum(conv.d30));
+      kvRow(dl, "累计", fmtNum(conv.all));
+      var src = conv.by_source || {};
+      kvRow(dl, "来源（近 30 天）", "转换器 " + fmtNum(src.converter)
+        + " · 工作台 " + fmtNum(src.workbench));
+    }
+    var tbody = $("adm-site-conversions-tbody");
+    if (tbody) {
+      tbody.textContent = "";
+      var rows = conv.by_format || [];
+      rows.forEach(function (r) {
+        var tr = document.createElement("tr");
+        tr.appendChild(td(r.format || "other"));
+        tr.appendChild(td(fmtNum(r.count)));
+        tbody.appendChild(tr);
+      });
+      if (!rows.length) {
+        var emptyTr = document.createElement("tr");
+        emptyTr.appendChild(td("近 30 天没有记录"));
+        emptyTr.appendChild(td("—"));
+        tbody.appendChild(emptyTr);
+      }
+    }
+  }
+
   function renderSiteStats(res) {
     var card = $("adm-site-card");
     if (!card) return;
@@ -1160,6 +1201,7 @@
       });
     }
     renderSiteReferrers(res);
+    renderSiteConversions(res);
     fillTop("adm-site-pages-tbody", res.top_pages,
       function (r) { return r.page_key; },
       function (r) { return r.visits; });

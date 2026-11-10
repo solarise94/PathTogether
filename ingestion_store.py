@@ -2135,6 +2135,108 @@ def waiting_and_holding_counts():
         conn.close()
 
 
+def renew_worker_lease(job_id, token, *, lease_seconds=None):
+    """长时间处理（金字塔构建）期间续租：token 匹配且任务未终态则延长。
+
+    返回 False = 租约已易主/任务已终态——调用方必须停止写入（旧 generation
+    的任何收口都会被 fencing 拒绝），构建临时文件按失败清理。
+    """
+    lease = (cos_config.COS_WORKER_LEASE_SECONDS if lease_seconds is None
+             else int(lease_seconds))
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE ingestion_jobs SET "
+                    "worker_lease_expires_at=now() + make_interval(secs => %s), "
+                    "updated_at=now() "
+                    "WHERE job_id=%s AND worker_lease_token=%s "
+                    "AND NOT (state = ANY(%s)) RETURNING job_id",
+                    (lease, job_id, token, sorted(TERMINAL_STATES)))
+                return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+
+def worker_note_pyramid_event(job_id, generation, kind, detail=None):
+    """记录金字塔阶段事件（started/skipped/failed），带 generation fencing。
+
+    只追加事件，不做状态转移；generation 过期抛 :class:`StaleLease`，
+    调用方（worker）静默放弃——绝不因诊断事件让摄取失败。
+    """
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                job = get_job_locked(cur, job_id)
+                if job is None:
+                    raise IngestionStateError(
+                        "ingestion job 不存在：%r" % job_id)
+                if job["worker_generation"] != int(generation):
+                    raise StaleLease("generation 过期（pyramid 事件被拒）")
+                if job["state"] not in (READY, COMPLETED):
+                    raise IngestionStateError(
+                        "pyramid 事件要求 ready/completed（当前 %s）"
+                        % job["state"])
+                _append_event(cur, job_id, kind, detail)
+                return True
+    finally:
+        conn.close()
+
+
+def worker_record_pyramid_built(job_id, generation, slide_id, *,
+                                bytes_before, bytes_after, levels, seconds,
+                                revision, level0_compression=None,
+                                sublevel_compression=None):
+    """金字塔替换成功后的记账 + ``pyramid_built`` 事件（同一短事务）。
+
+    调用方已在同一目录完成原子替换；本函数：
+      1. advisory ``slide:<slide_id>``（第一把锁）→ job 行（generation CAS）
+         → slides 行 CAS / 配额差额 / 内容 revision（slide_store 原语）；
+      2. 追加 ``pyramid_built`` 事件。
+
+    事务失败由调用方回滚文件（硬链接备份恢复）；generation 过期抛
+    :class:`StaleLease`（构建结果作废，但摄取不失败）。
+    """
+    sid = str(slide_id or "").strip()
+    if not sid:
+        raise IngestionStateError("pyramid 记账缺少 slide_id")
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                slide_store.acquire_slide_lock(cur, sid)  # 第一把锁
+                job = get_job_locked(cur, job_id)
+                if job is None:
+                    raise IngestionStateError(
+                        "ingestion job 不存在：%r" % job_id)
+                if job["worker_generation"] != int(generation):
+                    raise StaleLease("generation 过期（pyramid 记账被拒）")
+                if job["state"] != READY:
+                    raise IngestionStateError(
+                        "pyramid 记账要求 ready（当前 %s）" % job["state"])
+                if (job.get("slide_id") or "").strip() != sid:
+                    raise IngestionStateError(
+                        "pyramid slide_id 与任务绑定不一致（%s != %s）"
+                        % (sid, job.get("slide_id")))
+                delta = slide_store.record_pyramid_rebuild(
+                    sid, expected_bytes=int(bytes_before),
+                    new_bytes=int(bytes_after), revision=revision, conn=conn)
+                _append_event(cur, job_id, "pyramid_built", {
+                    "levels": int(levels),
+                    "seconds": float(seconds),
+                    "bytes_before": int(bytes_before),
+                    "bytes_after": int(bytes_after),
+                    "accounted_delta": int(delta),
+                    "level0_compression": level0_compression,
+                    "sublevel_compression": sublevel_compression,
+                })
+                return delta
+    finally:
+        conn.close()
+
+
 def release_worker_lease(job_id, token):
     """worker 瞬态失败后主动释放租约（不等 TTL），下轮立即重试。
 

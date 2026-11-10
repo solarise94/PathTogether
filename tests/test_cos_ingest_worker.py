@@ -86,11 +86,11 @@ def _mk_owner(user_id, quota=1024 ** 4):
     _sql(op)
 
 
-def _mkjob(owner="own", role="owner", size=150, name="a.svs"):
+def _mkjob(owner="own", role="owner", size=150, name="a.svs", ext="svs"):
     if role == "owner" and owner:
         _mk_owner(owner)
     return ist.create_waiting_job(
-        owner, role, name, name, "svs", size,
+        owner, role, name, name, ext, size,
         idempotency_key="K%d" % next(_seq))[0]
 
 
@@ -132,9 +132,9 @@ def _staged(job_id, generation=None, ext="svs"):
     return ciw.staging_data_path(job_id, generation, ext, root=_env_dir())
 
 
-def _bundle_data(slide_id):
-    """已发布 ID 包入口文件路径（objects/<slide_id>/data.svs）。"""
-    return slide_storage.bundle_dir(slide_id, root=_env_dir()) / "data.svs"
+def _bundle_data(slide_id, ext="svs"):
+    """已发布 ID 包入口文件路径（objects/<slide_id>/data.<ext>）。"""
+    return slide_storage.bundle_dir(slide_id, root=_env_dir()) / ("data." + ext)
 
 
 # --------------------------------------------------------------------------- #
@@ -352,7 +352,11 @@ def _drive_to_validating(fake, st, size=150, owner="own", role="user",
     ist.request_upload_complete(job["job_id"])
     assert ciw.process_completing(cos=fake, state=st) == job["job_id"]
     assert ciw.process_queued(cos=fake, state=st) == job["job_id"]
-    assert ciw.process_downloading(cos=fake, state=st) == job["job_id"]
+    # 测试夹具把单次下载块缩到 30B：多次 duty 推进直到 validating。
+    for _ in range(10000):
+        if ist.get_job(job["job_id"])["state"] == ist.VALIDATING:
+            break
+        assert ciw.process_downloading(cos=fake, state=st) == job["job_id"]
     out = ist.get_job(job["job_id"])
     assert out["state"] == ist.VALIDATING
     return out, payload
@@ -1295,3 +1299,232 @@ def test_review_heartbeat_during_listparts_must_prevent_idle_cancel(monkeypatch)
     current = ist.get_job(jid)
     assert terminated == [], (terminated, current["state"], current["fail_code"])
     assert current["state"] == ist.UPLOADING
+
+
+# --------------------------------------------------------------------------- #
+# 摄取期金字塔（slide_pyramid）：真实单层 OME-TIFF payload 走完整链路
+# --------------------------------------------------------------------------- #
+def _gradient_rgb_payload(h=1200, w=1600, quality=90):
+    """单层 OME-TIFF（JPEG tile）字节：平滑渐变，体积小且确定性强。"""
+    import numpy as np
+    import tifffile
+    from PIL import Image
+
+    yy, xx = np.indices((int(h), int(w)), dtype=np.uint32)
+    r = ((xx * 3 + yy * 5) % 256).astype(np.uint8)
+    g = ((xx * 7 + yy * 11) % 256).astype(np.uint8)
+    b = ((xx * 13 + yy * 17) % 256).astype(np.uint8)
+    rgb = np.stack([r, g, b], axis=-1)
+
+    def tiles():
+        for y in range(0, int(h), 512):
+            for x in range(0, int(w), 512):
+                block = np.full((512, 512, 3), 255, np.uint8)
+                part = rgb[y:min(int(h), y + 512), x:min(int(w), x + 512)]
+                block[:part.shape[0], :part.shape[1]] = part
+                buf = io.BytesIO()
+                Image.fromarray(block, mode="RGB").save(
+                    buf, "JPEG", quality=int(quality), subsampling=0)
+                yield buf.getvalue()
+
+    out = io.BytesIO()
+    with tifffile.TiffWriter(out, ome=True) as tw:
+        tw.write(tiles(), shape=rgb.shape, dtype="uint8", tile=(512, 512),
+                 compression="jpeg", photometric="ycbcr",
+                 subsampling=(1, 1),
+                 metadata={"axes": "YXS",
+                           "PhysicalSizeX": 0.5, "PhysicalSizeXUnit": "µm",
+                           "PhysicalSizeY": 0.5, "PhysicalSizeYUnit": "µm"})
+    return out.getvalue()
+
+
+def _allow_big_payload(monkeypatch):
+    """真实 OME-TIFF payload 大于默认 1MB 测试池：放大池容量并同步库行。"""
+    monkeypatch.setattr(cos_config, "COS_POOL_CAPACITY_BYTES", 20_000_000)
+    monkeypatch.setattr(cos_config, "COS_POOL_SAFETY_BYTES", 100_000)
+    cos_pool_store.ensure_pool_state()
+
+
+def _drive_payload_to_validating(fake, st, payload, owner="own",
+                                 role="user", name="a.tiff", ext="tiff"):
+    # 真实 TIFF payload 远大于默认 30B 测试块：单次 duty 读完，避免
+    # 逐代收养造成 O(n²) 复制（生产块大小是环境常量，语义不变）。
+    ciw.DOWNLOAD_CHUNK_BYTES = max(int(ciw.DOWNLOAD_CHUNK_BYTES),
+                                   len(payload) + 1)
+    _mk_user(owner)
+    job = _mkjob(owner=owner, role=role, size=len(payload), name=name,
+                 ext=ext)
+    assert _admit(job["job_id"])["outcome"] == "admitted"
+    assert ciw.process_preparing(cos=fake, state=st) == job["job_id"]
+    job = ist.get_job(job["job_id"])
+    for spec in job["part_plan_json"]:
+        fake.put_part(job["object_key"], job["upload_id"],
+                      spec["part_number"],
+                      payload[spec["offset"]:spec["offset"] + spec["length"]])
+    ist.request_upload_complete(job["job_id"])
+    assert ciw.process_completing(cos=fake, state=st) == job["job_id"]
+    assert ciw.process_queued(cos=fake, state=st) == job["job_id"]
+    # 测试夹具把单次下载块缩到 30B：多次 duty 推进直到 validating。
+    for _ in range(10000):
+        if ist.get_job(job["job_id"])["state"] == ist.VALIDATING:
+            break
+        assert ciw.process_downloading(cos=fake, state=st) == job["job_id"]
+    out = ist.get_job(job["job_id"])
+    assert out["state"] == ist.VALIDATING
+    return out
+
+
+def _event_details(job_id):
+    def op(cur):
+        cur.execute("SELECT kind, detail FROM ingestion_events "
+                    "WHERE job_id=%s ORDER BY created_at, kind", (job_id,))
+        out = []
+        for row in cur.fetchall():
+            detail = row["detail"]
+            if isinstance(detail, str):
+                detail = json.loads(detail)
+            out.append((row["kind"], detail))
+        return out
+    return _sql(op)
+
+
+def _used_bytes(user_id):
+    def op(cur):
+        cur.execute("SELECT used_bytes, quota_bytes, reserved_bytes "
+                    "FROM upload_user_quotas WHERE user_id=%s", (user_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+    return _sql(op)
+
+
+def test_ready_builds_pyramid_events_accounting_and_revision(monkeypatch):
+    """单层大切片 → 构建/校验/原子替换 + 记账 + pyramid_built + viewer_ready。"""
+    monkeypatch.setenv("INGEST_PYRAMID_MIN_LONG_EDGE", "1024")
+    _allow_big_payload(monkeypatch)
+    fake, st = FakeCos(), {}
+    payload = _gradient_rgb_payload(h=1200, w=1600, quality=60)
+    job = _drive_payload_to_validating(fake, st, payload)
+    job_id, sid = job["job_id"], job["slide_id"]
+    assert ciw.process_validating(cos=fake, state=st) == job_id
+    before = os.path.getsize(_bundle_data(sid, "tiff"))
+    before_rev = slide_store.resolve_slide_id(sid).revision
+    assert ciw.process_ready(cos=fake, state=st) == job_id
+
+    out = ist.get_job(job_id)
+    assert out["state"] == ist.COMPLETED and out["viewer_ready"] is True
+    path = _bundle_data(sid, "tiff")
+    after = os.path.getsize(path)
+    assert after != before, _event_details(job_id)
+    # 输出可经 PT 自身路径打开为多级金字塔，mpp 保留。
+    slide = slide_io.open_slide(str(path))
+    try:
+        assert slide.level_count > 1
+        assert float(slide.properties["openslide.mpp-x"]) == 0.5
+    finally:
+        slide.close()
+    desc = slide_store.resolve_slide_id(sid)
+    assert int(desc.accounted_bytes) == after
+    assert desc.revision != before_rev
+    assert int(desc.revision.split(":")[1], 16) >= 0  # sha 前缀形态
+    ledger = _used_bytes("own")
+    assert int(ledger["used_bytes"]) == after
+
+    events = _event_details(job_id)
+    kinds = [k for k, _ in events]
+    assert "pyramid_started" in kinds
+    assert "pyramid_built" in kinds
+    assert kinds.index("pyramid_started") < kinds.index("pyramid_built")
+    assert kinds.index("pyramid_built") < kinds.index("viewer_ready")
+    detail = dict(events)["pyramid_built"]
+    assert detail["levels"] > 1
+    assert detail["bytes_before"] == before
+    assert detail["bytes_after"] == after
+    assert "seconds" in detail
+
+
+def test_ready_small_slide_untouched(monkeypatch):
+    monkeypatch.setenv("INGEST_PYRAMID_MIN_LONG_EDGE", "1024")
+    _allow_big_payload(monkeypatch)
+    fake, st = FakeCos(), {}
+    payload = _gradient_rgb_payload(h=300, w=400)
+    job = _drive_payload_to_validating(fake, st, payload)
+    job_id, sid = job["job_id"], job["slide_id"]
+    assert ciw.process_validating(cos=fake, state=st) == job_id
+    size_before = os.path.getsize(_bundle_data(sid, "tiff"))
+
+    assert ciw.process_ready(cos=fake, state=st) == job_id
+    assert ist.get_job(job_id)["state"] == ist.COMPLETED
+    assert os.path.getsize(_bundle_data(sid, "tiff")) == size_before
+    kinds = [k for k, _ in _event_details(job_id)]
+    assert "pyramid_started" not in kinds
+
+
+def test_ready_builder_exception_keeps_original_and_completes(monkeypatch):
+    monkeypatch.setenv("INGEST_PYRAMID_MIN_LONG_EDGE", "1024")
+    _allow_big_payload(monkeypatch)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("synthetic build failure")
+
+    monkeypatch.setattr(ciw.slide_pyramid, "build_pyramid", boom)
+    fake, st = FakeCos(), {}
+    payload = _gradient_rgb_payload(h=1200, w=1600)
+    job = _drive_payload_to_validating(fake, st, payload)
+    job_id, sid = job["job_id"], job["slide_id"]
+    assert ciw.process_validating(cos=fake, state=st) == job_id
+    size_before = os.path.getsize(_bundle_data(sid, "tiff"))
+    accounted_before = slide_store.resolve_slide_id(sid).accounted_bytes
+
+    assert ciw.process_ready(cos=fake, state=st) == job_id
+    out = ist.get_job(job_id)
+    assert out["state"] == ist.COMPLETED and out["viewer_ready"] is True
+    assert os.path.getsize(_bundle_data(sid, "tiff")) == size_before
+    assert slide_store.resolve_slide_id(sid).accounted_bytes == accounted_before
+    events = _event_details(job_id)
+    failed = [d for k, d in events if k == "pyramid_failed"]
+    assert failed and failed[0]["error_type"] == "RuntimeError"
+    # 原文件仍是单层（未被破坏）。
+    slide = slide_io.open_slide(str(_bundle_data(sid, "tiff")))
+    try:
+        assert slide.level_count == 1
+    finally:
+        slide.close()
+
+
+def test_ready_quota_exceeded_keeps_original(monkeypatch):
+    monkeypatch.setenv("INGEST_PYRAMID_MIN_LONG_EDGE", "1024")
+    _allow_big_payload(monkeypatch)
+    fake, st = FakeCos(), {}
+    payload = _gradient_rgb_payload(h=1200, w=1600, quality=90)
+    job = _drive_payload_to_validating(fake, st, payload)
+    job_id, sid = job["job_id"], job["slide_id"]
+    assert ciw.process_validating(cos=fake, state=st) == job_id
+    size_before = os.path.getsize(_bundle_data(sid, "tiff"))
+    accounted_before = slide_store.resolve_slide_id(sid).accounted_bytes
+
+    # 配额收紧到恰好等于已用：任何正增长都不可吸收。
+    def op(cur):
+        cur.execute("UPDATE upload_user_quotas SET quota_bytes = used_bytes, "
+                    "extra_quota_bytes = 0 WHERE user_id = 'own'")
+    _sql(op)
+
+    assert ciw.process_ready(cos=fake, state=st) == job_id
+    assert ist.get_job(job_id)["state"] == ist.COMPLETED
+    assert os.path.getsize(_bundle_data(sid, "tiff")) == size_before
+    assert slide_store.resolve_slide_id(sid).accounted_bytes == accounted_before
+    skipped = [d for k, d in _event_details(job_id) if k == "pyramid_skipped"]
+    assert skipped and skipped[0]["reason"] == "quota_exceeded"
+
+
+def test_worker_lease_renewal_extends_only_for_current_token():
+    fake, st = FakeCos(), {}
+    job = _mkjob(size=150)
+    assert _admit(job["job_id"])["outcome"] == "admitted"
+    assert ciw.process_preparing(cos=fake, state=st) == job["job_id"]
+    # preparing 收口会释放租约；重新领取 uploading 状态以获得活动租约。
+    cur_job = ist.claim_next_job_for_worker([ist.UPLOADING])
+    assert cur_job is not None and cur_job["job_id"] == job["job_id"]
+    token = cur_job["worker_lease_token"]
+    assert token
+    assert ist.renew_worker_lease(job["job_id"], token)
+    assert not ist.renew_worker_lease(job["job_id"], "wl_wrong_token")

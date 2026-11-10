@@ -16299,6 +16299,184 @@ def api_ingestion_resume(job_id):
     return jsonify(_ingestion_state_body(job)), 202
 
 
+# --------------------------------------------------------------------------- #
+# 重上传提示与断点续传的权威分块（upload-resilience 2026-11-10）
+#
+# 生产证据：30 天内 5 个用户在同名同大小文件完成后 2 秒–6 分钟又重新上传；
+# 一次 3.5 GB 重传在完成后 2 秒开始、5 分钟后被取消；两个用户出现重复切片。
+# 于是新增两个**只读**端点：
+#   - POST /api/ingestions/duplicates   面板加文件时提示「列表里已有 / 切片库
+#     已有 / 上一次未完成 / 服务器正在处理」，并给出未完成任务的块数
+#     （owner 隔离）。文件名只放 JSON body——路径/查询串会进访问日志。
+#   - GET /api/ingestions/<id>/parts   续传前的权威已传分块（COS ListParts：
+#     编号 / ETag / 长度），浏览器逐块核验内容后才跳过。
+#
+# 与文件头「COS 网络调用一律不在本进程」的关系：本块唯一的远程调用是
+# 只读 ListParts（续传元数据）；写入路径（Initiate/Complete/Abort/GET）
+# 仍全部由独立 worker 执行。调用失败一律降级为「无权威清单」（绝不猜测、
+# 绝不影响上传主链路）。web 线程不能被 SDK 默认超时（30s × 4 次尝试）
+# 钉住——两个调用点都显式传入受限的 timeout/retry。
+# --------------------------------------------------------------------------- #
+def _ingestion_list_parts(job, *, timeout=None, retry=None):
+    """任务当前已上传分块（COS ListParts）。不可用/失败 → None。"""
+    if (job.get("state") not in (ingestion_store.UPLOADING,
+                                 ingestion_store.COMPLETING)
+            or not job.get("upload_id") or not job.get("object_key")):
+        return None
+    try:
+        return cos_client.list_parts(job["object_key"], job["upload_id"],
+                                     timeout=timeout, retry=retry)
+    except cos_client.CosConfigMissing:
+        app.logger.debug("ListParts 跳过（COS 配置缺失，job=%s）",
+                         job.get("job_id"))
+        return None
+    except cos_client.CosClientError as e:
+        # 脱敏异常（cos_client 已去除凭据/URL）；重传提示允许降级为未知块数
+        app.logger.warning("ListParts 失败（job=%s）：%s", job.get("job_id"), e)
+        return None
+
+
+def _ingestion_part_sizes(job):
+    """冻结计划编号 → 长度（缺失/损坏 → 空表）。"""
+    plan = job.get("part_plan_json") or []
+    try:
+        return {int(p["part_number"]): int(p["length"])
+                for p in plan if p and "part_number" in p and "length" in p}
+    except (TypeError, ValueError):
+        return {}
+
+
+#: duplicates 只读查询的请求体上限（文件名 + 大小，正常 < 1 KB）。
+_DUPLICATES_MAX_BODY_BYTES = 4096
+
+
+@app.route("/api/ingestions/duplicates", methods=["GET", "POST"])
+def api_ingestion_duplicates():
+    """同名同大小上传提示（面板加文件时调用；owner 隔离）。
+
+    请求体（JSON，上限 4 KB）：``{"filename": "...", "size": <int>}``——
+    文件名只走 body，不进 URL/访问日志。响应：
+      {"completed": {"slide_id","display_name","completed_at"} | null,
+       "unfinished": {"job_id","state","uploaded_parts","total_parts"} | null,
+       "processing": {"job_id","state"} | null}
+
+    completed：90 天内该 owner 已完成、资产仍 ready 的同名同大小上传。
+    unfinished：仍可续传（waiting/preparing/uploading）的同名同大小任务；
+    uploaded_parts 为 COS ListParts 的权威块数（仅 uploading；waiting/
+    preparing 没有分块，0 是事实），取不到时为 null（前端按未知块数展示，
+    绝不臆造）。
+    processing：分块已全部传完、服务端正在处理（completing/queued/
+    downloading/validating/ready）的任务——重上传**不得取消**它们。
+    """
+    # 显式收下 GET：否则 /api/ingestions/<job_id> 会把它当任务查询（403），
+    # 看起来像权限问题；这里明确「只接受 POST」，也说明文件名不进查询串。
+    if request.method != "POST":
+        return jsonify(error="该端点只接受 POST（JSON body）",
+                       code="method_not_allowed"), 405
+    if not can_upload():
+        return jsonify(error="无上传权限"), 403
+    if (request.content_length is not None
+            and request.content_length > _DUPLICATES_MAX_BODY_BYTES):
+        return jsonify(error="请求体过大（上限 4 KB）",
+                       code="body_too_large"), 400
+    raw = request.get_data(cache=True) or b""
+    if len(raw) > _DUPLICATES_MAX_BODY_BYTES:
+        return jsonify(error="请求体过大（上限 4 KB）",
+                       code="body_too_large"), 400
+    if not request.is_json:
+        return jsonify(error="需要 JSON 请求体", code="invalid_body"), 400
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify(error="需要 JSON 对象", code="invalid_body"), 400
+    filename = body.get("filename")
+    if not isinstance(filename, str) or not filename.strip():
+        return jsonify(error="缺少 filename 参数",
+                       code="invalid_filename"), 400
+    filename = filename.strip()
+    try:
+        if isinstance(body.get("size"), bool):
+            raise ValueError
+        size = int(body.get("size"))
+    except (TypeError, ValueError):
+        return jsonify(error="size 需为正整数（十进制字节）",
+                       code="invalid_size"), 400
+    if size <= 0:
+        return jsonify(error="size 需为正整数（十进制字节）",
+                       code="invalid_size"), 400
+
+    uid = (current_identity().get("user_id") or "")
+    completed = ingestion_store.find_completed_duplicate(uid, filename, size)
+    unfinished_job = ingestion_store.find_unfinished_duplicate(
+        uid, filename, size)
+    processing_job = ingestion_store.find_processing_duplicate(
+        uid, filename, size)
+    unfinished = None
+    if unfinished_job is not None:
+        sizes = _ingestion_part_sizes(unfinished_job)
+        if unfinished_job["state"] == ingestion_store.UPLOADING:
+            # Web 线程不能被 SDK 默认重试钉住：浏览器 3 秒已放弃。
+            parts = _ingestion_list_parts(unfinished_job, timeout=3, retry=0)
+            # None = COS 清单不可得（网络/状态未到）；前端显示未知块数
+            uploaded = len(parts) if parts is not None else None
+        else:
+            # 尚未进入上传（waiting/preparing）：没有已传分块，0 是事实
+            uploaded = 0
+        unfinished = {
+            "job_id": unfinished_job["job_id"],
+            "state": unfinished_job["state"],
+            "total_parts": len(sizes),
+            "uploaded_parts": uploaded,
+        }
+    processing = None
+    if processing_job is not None:
+        processing = {"job_id": processing_job["job_id"],
+                      "state": processing_job["state"]}
+    resp = jsonify(completed=completed, unfinished=unfinished,
+                   processing=processing)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/ingestions/<job_id>/parts", methods=["GET"])
+def api_ingestion_parts_list(job_id):
+    """续传权威清单：冻结计划 + COS ListParts（编号/ETag/长度）。
+
+    只读、owner 隔离；任务必须仍在 uploading/completing 且已有 uploadId。
+    ETag 原样返回（COS 可能带引号）——浏览器按 32 位十六进制 MD5 规范化
+    后逐块核验；非 MD5 形态（如 KMS 加密）由浏览器回退为重传该块。
+    """
+    job, err = _ingestion_fetch(job_id)
+    if err is not None:
+        return err
+    if job["state"] not in (ingestion_store.UPLOADING,
+                            ingestion_store.COMPLETING):
+        return jsonify(error="任务当前状态 %s 不接受续传清单" % job["state"],
+                       code="ingestion_state_conflict"), 409
+    sizes = _ingestion_part_sizes(job)
+    if not sizes or not job.get("upload_id") or not job.get("object_key"):
+        return jsonify(error="分块计划未就绪，请稍后重试",
+                       code="plan_not_ready"), 409
+    _touch_ingestion_client_seen(job)
+    # 浏览器在 8 秒左右放弃：web 线程只给 8 秒超时 + 1 次重试。
+    parts = _ingestion_list_parts(job, timeout=8, retry=1)
+    if parts is None:
+        return jsonify(error="暂时无法读取已上传分块，请稍后重试",
+                       code="list_parts_failed"), 502
+    resp = jsonify(
+        job_id=job_id,
+        state=job["state"],
+        total_parts=len(sizes),
+        uploaded_parts=len(parts),
+        plan=[{"part_number": n, "length": sizes[n]}
+              for n in sorted(sizes)],
+        parts=[{"part_number": int(p["part_number"]),
+                "size": int(p["size"]),
+                "etag": p.get("etag")} for p in parts],
+    )
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @app.route("/api/conversions", methods=["GET"])
 def api_conversion_list():
     """当前身份的转换任务列表（open/recent，分页）。本人隔离。"""

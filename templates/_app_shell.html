@@ -311,12 +311,20 @@
          - #file-input 与上传进度容器保留：上传管线不变，进度行照旧显示在这里。
          - 底部账户区保留。旧侧栏搜索（slide-search）由顶栏「搜索」浮层替代。 #}
       <div class="sidebar-top fb-top">
-        <input id="file-input" type="file"
+        <input id="file-input" type="file" multiple
                accept=".svs,.tif,.tiff,.ome.tif,.ome.tiff,.ndpi,.vms,.vmu,.scn,.bif,.svslide,.bmp,.jpg,.jpeg,.kfb,.kfbf,.tmap,.mrxs,.zip"
                hidden />
         <div id="progress-wrap" class="progress-wrap" style="display:none;">
           <div id="progress-bar" class="progress-bar"></div>
           <span id="progress-text" class="progress-text">0%</span>
+        </div>
+        {# upload-resilience（2026-11-10）：队列头部「全部取消」（≥2 个可取消
+           行时才显示）。与行容器一起移动进抽屉宿主，关抽屉后仍可达；取消
+           编排在 inline-convert 编排器（先整体标记、再释放槽位，绝不新建
+           服务端任务）。 #}
+        <div id="upload-bulk-bar" class="upload-bulk-bar" hidden>
+          <button id="upload-cancel-all" type="button" class="upload-item-btn"
+                  data-i18n="upload.cos.cancel_all">全部取消</button>
         </div>
         <!-- U3：多文件各自独立进度行（修共用进度条的 bug；分片上传三段状态） -->
         <div id="upload-progress-list" class="upload-progress-list"></div>

@@ -52,7 +52,37 @@
     "upload.cos.retry": { zh: "重试", en: "Retry" },
     "upload.cos.recheck": { zh: "重新检查状态", en: "Re-check status" },
     "upload.cos.resume_hint": { zh: "上传未完成；重新选择同名文件可续传", en: "Upload unfinished; re-select the same file to resume" },
+    "upload.cos.resume_hint.handle": { zh: "上传未完成；点「继续上传」或重新选择同名文件可续传", en: "Upload unfinished; click “Continue upload” or re-select the same file to resume" },
     "upload.cos.resume_confirm": { zh: "检测到「{name}」有未完成的云端直传任务，续传已上传的分块？", en: "An unfinished cloud upload for \"{name}\" exists. Resume from the uploaded parts?" },
+    "upload.cos.resume_confirm.title": { zh: "继续未完成的上传", en: "Resume unfinished upload" },
+    "upload.cos.cancel_all": { zh: "全部取消", en: "Cancel all" },
+    "upload.cos.cancelled_all": { zh: "已取消 {n} 个上传", en: "Cancelled {n} uploads" },
+    // upload-resilience：重复文件提示 / 服务端续传 / 句柄续传（i18n.js 为主源，
+    // 此处兜底）
+    "upload.dup.title": { zh: "重复文件", en: "Duplicate file" },
+    "upload.dup.queue": { zh: "「{name}」已在上传列表中，仍要再添加一份吗？", en: "“{name}” is already in the upload list. Add another copy anyway?" },
+    "upload.dup.completed": { zh: "你的切片库里已有同名同大小的「{name}」（{time} 上传），仍要再上传一份吗？", en: "You already have “{name}” with the same size in your slide library (uploaded {time}). Upload another copy anyway?" },
+    "upload.dup.processing": { zh: "「{name}」刚上传完成，服务器正在处理，处理完会出现在切片库里。仍要再上传一份吗？", en: "“{name}” just finished uploading and is being processed; it will appear in your slide library shortly. Upload another copy anyway?" },
+    "upload.dup.upload": { zh: "再传一份", en: "Upload anyway" },
+    "upload.dup.skip": { zh: "不传了", en: "Don't upload" },
+    "upload.dup.skipAll": { zh: "全部跳过", en: "Skip all" },
+    "upload.dup.uploadAll": { zh: "全部仍上传", en: "Upload all anyway" },
+    "upload.dup.batch.title": { zh: "{n} 个文件重复", en: "{n} duplicate files" },
+    "upload.dup.batch.body": { zh: "以下文件已在上传列表中或你的切片库里：", en: "These files are already in the upload list or your slide library:" },
+    "upload.dup.batch.hint": { zh: "选择「全部仍上传」会为未完成的上传新建任务（旧任务会先被取消）。", en: "“Upload all anyway” creates new jobs for unfinished uploads (the old jobs are cancelled first)." },
+    "upload.dup.row.queue": { zh: "{name} — 已在上传列表", en: "{name} — already in the upload list" },
+    "upload.dup.row.completed": { zh: "{name} — 切片库已有（{time}）", en: "{name} — already in your slide library ({time})" },
+    "upload.dup.row.processing": { zh: "{name} — 刚上传完，正在处理", en: "{name} — just uploaded, processing" },
+    "upload.dup.row.unfinished": { zh: "{name} — 有未完成的上传", en: "{name} — unfinished upload" },
+    "upload.dup.resume": { zh: "检测到「{name}」有未完成的上传（已传 {uploaded}/{total} 块），要继续上次的上传吗？", en: "An unfinished upload of “{name}” was found ({uploaded}/{total} parts uploaded). Continue that upload?" },
+    "upload.dup.resume.generic": { zh: "检测到「{name}」有未完成的上传，要继续上次的上传吗？", en: "An unfinished upload of “{name}” was found. Continue that upload?" },
+    "upload.dup.resume.action": { zh: "继续上次未完成的上传（已传 {uploaded}/{total} 块）", en: "Continue the unfinished upload ({uploaded}/{total} parts uploaded)" },
+    "upload.dup.resume.action.plain": { zh: "继续上传", en: "Continue upload" },
+    "upload.dup.restart": { zh: "重新上传", en: "Start over" },
+    "upload.resume.button": { zh: "继续上传", en: "Continue upload" },
+    "upload.resume.err.permission": { zh: "无法继续上传：浏览器未授予读取该文件的权限，请重新选择文件", en: "Cannot continue: the browser was not allowed to read this file. Please re-select it." },
+    "upload.resume.err.file_changed": { zh: "无法继续上传：本地文件已变更，请重新选择文件", en: "Cannot continue: the local file has changed. Please re-select it." },
+    "upload.resume.err.unavailable": { zh: "无法继续上传：浏览器无法再次读取该文件，请重新选择文件", en: "Cannot continue: the browser cannot read this file again. Please re-select it." },
     "upload.cos.err.format_unsupported": { zh: "不支持该文件格式", en: "Unsupported file format" },
     "upload.cos.err.too_large": { zh: "文件超过平台上限", en: "File exceeds the platform size limit" },
     "upload.cos.err.pool_config": { zh: "服务端存储配置暂不能接纳该大小，请联系运维", en: "Server storage config cannot accept this size yet; contact the operator" },
@@ -1546,6 +1576,10 @@
     progressBar: $("progress-bar"),
     progressText: $("progress-text"),
     uploadProgressList: $("upload-progress-list"),
+    // upload-resilience：队列头部的「全部取消」（≥2 个可取消行时可见）。
+    // 与行容器一起移动（侧栏 ↔ 抽屉宿主），关抽屉后仍可达。
+    uploadBulkBar: $("upload-bulk-bar"),
+    uploadCancelAll: $("upload-cancel-all"),
     // P2 复核 2026-10-20（问题 3）：抽屉内的上传队列宿主（行容器的「第二个
     // 家」）。抽屉打开时行容器移到这里（与选择文件的同一面板），关闭时移回
     // 侧栏——同一份 DOM/状态，绝不复制第二份任务列表。
@@ -10599,6 +10633,502 @@
     tick();
   }
 
+  // =========================================================================
+  // upload-resilience（2026-11-10）：重复文件提示 → 服务端/句柄续传 →
+  // 幂等创建 → 全部取消。
+  //
+  // 生产证据：30 天内 5 个用户把同名同大小文件在完成后 2 秒–6 分钟又传了
+  // 一遍（其中 3.5 GB 一次在完成后 2 秒开始、5 分钟后取消），两个用户最终
+  // 出现重复切片。加文件时先做一次**不阻塞**的去重检查（本地面板队列同步
+  // 判定 + POST /api/ingestions/duplicates，3 秒超时 fail-open），批量添加
+  // 合并为一个对话框。文件名只走 JSON body（不进 URL/访问日志）。
+  // =========================================================================
+
+  //: 测试注入口（HP_UPLOAD._setUploadConfirm）：opts -> value/Promise。
+  //: 生产恒为 null → 走样式化对话框；测试 harness 没有 document.body。
+  var uploadDedupeImpl = null;
+
+  // 幂等 nonce / 键的实现在 uploadEntryArtifact/createEntryUpload 之前——
+  // 两者都被 inline-convert 单测按源码切片直接编译（切片只含该区段），
+  // 放在这里会让切片缺依赖。见 createEntryUpload 上方的定义。
+
+  /// 样式化确认对话框（复用 .dialog-mask/.picker-dialog/.picker-title/
+  /// .picker-footer，与新建项目对话框同一设计语言）。重复/续传提示需要
+  /// 「再传一份 / 不传了 / 继续上次上传」多选与默认焦点——window.confirm
+  /// 做不到（也没有样式）。Esc/遮罩点击 = null（调用方按安全默认处理）。
+  function showUploadDialog(opts) {
+    if (typeof uploadDedupeImpl === "function") {
+      return Promise.resolve(uploadDedupeImpl(opts));
+    }
+    if (typeof document === "undefined" || !document.body ||
+        typeof document.createElement !== "function") {
+      return Promise.resolve(null);
+    }
+    return new Promise(function (resolve) {
+      var mask = document.createElement("div");
+      mask.className = "dialog-mask upload-confirm-mask";
+      var dlg = document.createElement("div");
+      dlg.className = "picker-dialog upload-confirm-dialog";
+      dlg.setAttribute("role", "dialog");
+      dlg.setAttribute("aria-modal", "true");
+      var title = document.createElement("div");
+      title.className = "picker-title";
+      var titleText = document.createElement("span");
+      titleText.textContent = opts.title || "";
+      title.appendChild(titleText);
+      var body = document.createElement("div");
+      body.className = "pcd-body upload-confirm-body";
+      var msg = document.createElement("p");
+      msg.className = "imp-hint";
+      msg.textContent = opts.message || "";
+      body.appendChild(msg);
+      if (opts.list && opts.list.length) {
+        var ul = document.createElement("ul");
+        ul.className = "upload-dup-list";
+        opts.list.forEach(function (line) {
+          var li = document.createElement("li");
+          li.textContent = line;
+          ul.appendChild(li);
+        });
+        body.appendChild(ul);
+      }
+      if (opts.hint) {
+        var hint = document.createElement("p");
+        hint.className = "imp-hint upload-confirm-hint";
+        hint.textContent = opts.hint;
+        body.appendChild(hint);
+      }
+      var footer = document.createElement("div");
+      footer.className = "picker-footer";
+      var defaultBtn = null;
+      var settled = false;
+      function close(value) {
+        if (settled) return;
+        settled = true;
+        if (document.removeEventListener) {
+          document.removeEventListener("keydown", onKey, true);
+        }
+        if (mask.parentNode && mask.parentNode.removeChild) {
+          mask.parentNode.removeChild(mask);
+        }
+        resolve(value);
+      }
+      function onKey(ev) {
+        if (ev && ev.key === "Escape") {
+          if (ev.preventDefault) ev.preventDefault();
+          close(null);
+        }
+      }
+      (opts.buttons || []).forEach(function (b) {
+        var btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = b.kind === "primary"
+          ? "btn primary" : "btn secondary";
+        btn.textContent = b.label;
+        btn.addEventListener("click", function (ev) {
+          if (ev && ev.preventDefault) ev.preventDefault();
+          close(b.value);
+        });
+        if (b.default) defaultBtn = btn;
+        footer.appendChild(btn);
+      });
+      dlg.appendChild(title);
+      dlg.appendChild(body);
+      dlg.appendChild(footer);
+      mask.appendChild(dlg);
+      mask.addEventListener("click", function (ev) {
+        if (ev && ev.target === mask) close(null);
+      });
+      if (document.addEventListener) {
+        document.addEventListener("keydown", onKey, true);
+      }
+      document.body.appendChild(mask);
+      if (defaultBtn && typeof defaultBtn.focus === "function") {
+        setTimeout(function () {
+          try { defaultBtn.focus(); } catch (e) { /* */ }
+        }, 0);
+      }
+    });
+  }
+
+  function dupTimeText(ts) {
+    if (typeof ts !== "number" || !isFinite(ts)) return "";
+    try {
+      var lang = (window.HP_I18N && window.HP_I18N.getLang()) || "zh";
+      var fmt = new Intl.DateTimeFormat(lang === "en" ? "en-US" : "zh-CN",
+        { dateStyle: "medium", timeStyle: "short" });
+      return fmt.format(new Date(ts * 1000));
+    } catch (e) {
+      try { return new Date(ts * 1000).toLocaleString(); }
+      catch (e2) { return ""; }
+    }
+  }
+
+  /// GET /api/ingestions/<id>/parts（服务端权威 ListParts），3 秒超时。
+  /// 失败 → null（引擎退回「无清单」：仍复用同一任务，只是不跳过任何块）。
+  function fetchServerParts(jobId) {
+    if (!jobId) return Promise.resolve(null);
+    var ctl = (typeof AbortController === "function")
+      ? new AbortController() : null;
+    return new Promise(function (resolve) {
+      var settled = false;
+      var timer = setTimeout(function () {
+        if (ctl) { try { ctl.abort(); } catch (e) { /* */ } }
+        done(null);
+      }, 3000);
+      function done(v) {
+        if (settled) return;
+        settled = true;
+        try { clearTimeout(timer); } catch (e) { /* */ }
+        resolve(v || null);
+      }
+      var p;
+      try {
+        p = apiFetch("/api/ingestions/" + encodeURIComponent(jobId) + "/parts",
+                     ctl ? { signal: ctl.signal } : undefined);
+      } catch (e) {
+        p = Promise.reject(e);
+      }
+      Promise.resolve(p).then(function (res) {
+        if (!res || !res.ok) { done(null); return; }
+        return res.json().then(function (body) {
+          done(body && Array.isArray(body.parts) ? body.parts : null);
+        }, function () { done(null); });
+      }, function () { done(null); });
+    });
+  }
+
+  /// 批量取消旧任务（「仍要上传」时先把同名未完成任务取消，避免服务端
+  /// 单活跃任务闸 409）。逐条等待、每条 3 秒上限；失败继续（服务端兜底）。
+  function cancelServerJobs(jobIds) {
+    var ids = (jobIds || []).filter(function (id) {
+      return typeof id === "string" && id;
+    });
+    var seq = Promise.resolve();
+    ids.forEach(function (id) {
+      seq = seq.then(function () {
+        var ctl = (typeof AbortController === "function")
+          ? new AbortController() : null;
+        return new Promise(function (resolve) {
+          var settled = false;
+          var timer = setTimeout(function () {
+            if (ctl) { try { ctl.abort(); } catch (e) { /* */ } }
+            done();
+          }, 3000);
+          function done() {
+            if (settled) return;
+            settled = true;
+            try { clearTimeout(timer); } catch (e) { /* */ }
+            resolve();
+          }
+          try {
+            Promise.resolve(apiFetch(
+              "/api/ingestions/" + encodeURIComponent(id) + "/cancel",
+              Object.assign({ method: "POST" },
+                            ctl ? { signal: ctl.signal } : {})))
+              .then(done, done);
+          } catch (e) { done(); }
+        });
+      });
+    });
+    return seq;
+  }
+
+  //: 预检期间的「已在添加」占位：两个相同文件几乎同时加入时，本地队列
+  //: 检查也能看到第一个（否则都通过检查、双双入队）。
+  var uploadPendingKeys = {};
+  function reserveUploadKey(key, delta) {
+    var n = (uploadPendingKeys[key] || 0) + delta;
+    if (n > 0) uploadPendingKeys[key] = n;
+    else delete uploadPendingKeys[key];
+  }
+  function pendingUploadEntries() {
+    var out = [];
+    Object.keys(uploadPendingKeys).forEach(function (k) {
+      if (!(uploadPendingKeys[k] > 0)) return;
+      var at = k.lastIndexOf("\u0000");
+      out.push({
+        name: k.slice(0, at),
+        size: Number(k.slice(at + 1)),
+        state: "adding",   // 视作非终态行：已在面板队列里
+      });
+    });
+    return out;
+  }
+  function panelQueueEntriesForDedupe() {
+    var list = (inlineOrch && typeof inlineOrch.list === "function")
+      ? inlineOrch.list() : [];
+    return list.concat(pendingUploadEntries());
+  }
+
+  function normalizeUploadEntries(items, fallbackHandle) {
+    var out = [];
+    (items || []).forEach(function (it) {
+      if (!it) return;
+      var file = it.file || it;
+      if (!file || typeof file.name !== "string" || !file.name) return;
+      var handle = it.file ? (it.handle || null) : (fallbackHandle || null);
+      out.push({
+        file: file,
+        handle: handle,
+        nonce: typeof it.nonce === "string" && it.nonce
+          ? it.nonce : newIdemNonce(),
+      });
+    });
+    return out;
+  }
+
+  /// 「选择文件」：Chromium 用 showOpenFilePicker（多选 + FileSystemFileHandle
+  /// → 刷新后免重选续传）；其他浏览器回落隐藏 input（既有行为，Firefox/
+  /// Safari 保持「重新选择同名文件」提示）。用户取消选择 → 不做任何事。
+  function pickUploadFiles() {
+    var RH = window.HP_RESUME_HANDLES;
+    if (!RH || typeof RH.pickerSupported !== "function" ||
+        !RH.pickerSupported()) {
+      if (els.fileInput) els.fileInput.click();
+      return Promise.resolve(false);
+    }
+    var p;
+    try {
+      p = RH.pickFiles();
+    } catch (e) {
+      p = Promise.resolve({ supported: false, items: [] });
+    }
+    return Promise.resolve(p).then(function (res) {
+      if (res && res.supported) {
+        if (!res.cancelled && res.items && res.items.length) {
+          uploadFiles(res.items);
+        }
+        return true;   // 取消/失败：不回落（避免丢失用户手势后的第二次选择）
+      }
+      if (els.fileInput) els.fileInput.click();
+      return false;
+    });
+  }
+
+  /// 批量加文件（多选 / 拖放 / 文件夹成员共用一个入口）：
+  ///   1. 同步把本次待添加文件记入占位（并发添加同一文件也只提示一次）；
+  ///   2. 本地面板队列判定 + 服务端 duplicates 查询（3 秒 fail-open）；
+  ///   3. 0 个重复 → 直接入队；1 个 → 单项对话框；多个 → 合并对话框。
+  /// 返回 Promise<入队条目数>。
+  function uploadFiles(items, opts) {
+    opts = opts || {};
+    var assoc = (opts.assocTarget !== undefined)
+      ? opts.assocTarget : importTargetSnapshot();
+    var entries = normalizeUploadEntries(items, opts.fileHandle);
+    if (!entries.length) return Promise.resolve(0);
+    if (opts.noDedupe || opts.cosRetry) {
+      return enqueueUploadEntries(entries, assoc, opts, {});
+    }
+    var dd = window.HP_UPLOAD_DEDUPE;
+    // 队列快照必须在**本批占位之前**取：占位只用于「另一个并发添加批次」
+    // 看到本批文件，绝不能把本批自己算成「已在上传列表」。
+    var queueEntries = panelQueueEntriesForDedupe();
+    var counts = {};
+    entries.forEach(function (it) {
+      var k = (dd ? dd.key(it.file.name, it.file.size)
+                  : it.file.name + "\u0000" + it.file.size);
+      counts[k] = (counts[k] || 0) + 1;
+      reserveUploadKey(k, 1);
+    });
+    function releaseReservations() {
+      Object.keys(counts).forEach(function (k) {
+        reserveUploadKey(k, -counts[k]);
+      });
+    }
+    if (!dd) {
+      releaseReservations();
+      return enqueueUploadEntries(entries, assoc, opts, {});
+    }
+    return dd.requestDuplicates(apiFetch, entries, {
+      timeoutMs: dd.DUP_TIMEOUT_MS,
+      setTimer: setTimeout,
+    }).then(function (serverResults) {
+      var plan = dd.buildPlan(entries, {
+        queueEntries: queueEntries,
+        serverResults: serverResults,
+      });
+      return decideUploadDuplicates(plan, entries, assoc, opts);
+    }, function () {
+      // requestDuplicates 自身不 reject；防御性 fail-open
+      return enqueueUploadEntries(entries, assoc, opts, {});
+    }).then(function (n) {
+      releaseReservations();
+      return n;
+    }, function (err) {
+      releaseReservations();
+      throw err;
+    });
+  }
+
+  function enqueueUploadEntries(entries, assoc, opts, perIndex) {
+    var seq = Promise.resolve();
+    var enqueued = 0;
+    entries.forEach(function (it, index) {
+      seq = seq.then(function () {
+        var extra = perIndex && perIndex[index] ? perIndex[index] : null;
+        enqueued += 1;
+        return enqueueOneUpload(it, assoc, opts, extra);
+      });
+    });
+    return seq.then(function () { return enqueued; });
+  }
+
+  function enqueueOneUpload(it, assoc, opts, extra) {
+    extra = extra || {};
+    // 续传来源：批量决策（extra）优先；单文件重试（uploadFile 把 cosRetry
+    // 归一为 resumeJobId）走 opts。两者都复用同一 ingestion。
+    var resumeJobId = extra.resumeJobId || opts.resumeJobId || null;
+    var settings = {
+      assocTarget: assoc,
+      fileHandle: it.handle || null,
+      idemNonce: it.nonce,
+      // 服务端权威续传（选项）：复用同一 ingestion，跳过已核验分块
+      resumeJobId: resumeJobId,
+      skipConfirm: !!resumeJobId,
+      serverParts: extra.serverParts || opts.serverParts || null,
+    };
+    if (!inlineEnabled()) {          // 开关关闭 → 回退路径（控制流不变）
+      legacyUploadFile(it.file, settings);
+      return Promise.resolve();
+    }
+    // 面板内转换（设计 §2.2①）：全部交给面板队列（含散文件 bundle 的
+    // 「需要完整包」类型化说明，§4.1.1）。运行器懒加载；加载失败 → 回退
+    // 到既有分流（绝不静默丢弃用户的选择）。opts.fileHandle：drop 事件内
+    // 同步捕获的 FileSystemFileHandle Promise（MRXS 协助流程的 startIn 定位；
+    // upload-resilience 起也用于刷新后免重选续传）。
+    return ensureInlineOrch().then(function (orch) {
+      if (orch) {
+        orch.enqueue(it.file, settings);
+      } else legacyUploadFile(it.file, settings);
+    });
+  }
+
+  function decideUploadDuplicates(plan, entries, assoc, opts) {
+    if (!plan.duplicates.length) {
+      return enqueueUploadEntries(entries, assoc, opts, {});
+    }
+    var byIndex = {};
+    plan.duplicates.forEach(function (d) { byIndex[d.index] = d; });
+    var prompt = plan.duplicates.length === 1
+      ? singleDuplicateDialog(plan.duplicates[0])
+      : batchDuplicateDialog(plan.duplicates);
+    return prompt.then(function (decision) {
+      var action = decision && decision.action ? decision.action : "skip";
+      if (action === "skip") {
+        var rest = entries.filter(function (e, i) { return !byIndex[i]; });
+        return enqueueUploadEntries(rest, assoc, opts, {});
+      }
+      if (action === "resume" && decision && decision.index != null) {
+        return fetchServerParts(decision.jobId).then(function (parts) {
+          var per = {};
+          per[decision.index] = {
+            resumeJobId: decision.jobId,
+            serverParts: parts,
+          };
+          return enqueueUploadEntries(entries, assoc, opts, per);
+        });
+      }
+      // 仍上传：同名**未完成**任务先取消（否则服务端单活跃任务闸 409），
+      // 再按全新任务入队。processing（分块已传完、服务端正在处理）绝不
+      // 取消——用户只是再添一份，不应杀掉一个即将完成的任务。
+      var stale = plan.duplicates.filter(function (d) {
+        return d.kind === "unfinished" && d.unfinished;
+      }).map(function (d) { return d.unfinished.job_id; });
+      return cancelServerJobs(stale).then(function () {
+        return enqueueUploadEntries(entries, assoc, opts, {});
+      });
+    });
+  }
+
+  function singleDuplicateDialog(dup) {
+    var buttons = [
+      { label: tt("upload.dup.upload"), value: "upload", kind: "secondary" },
+      { label: tt("upload.dup.skip"), value: "skip", kind: "primary",
+        default: true },
+    ];
+    var message;
+    var title = tt("upload.dup.title");
+    if (dup.kind === "queue") {
+      message = tt("upload.dup.queue", { name: dup.name });
+    } else if (dup.kind === "processing") {
+      // 分块已全部传完：没有续传选项，也绝不取消既有任务。
+      message = tt("upload.dup.processing", { name: dup.name });
+    } else if (dup.kind === "completed") {
+      message = tt("upload.dup.completed", {
+        name: dup.name,
+        time: dupTimeText(dup.completed && dup.completed.completed_at),
+      });
+    } else {
+      var total = dup.unfinished ? dup.unfinished.total_parts : null;
+      var done = dup.unfinished ? dup.unfinished.uploaded_parts : null;
+      if (typeof total === "number" && total > 0 &&
+          typeof done === "number") {
+        message = tt("upload.dup.resume", {
+          name: dup.name, uploaded: done, total: total,
+        });
+      } else {
+        message = tt("upload.dup.resume.generic", { name: dup.name });
+      }
+      buttons = [
+        {
+          label: tt("upload.dup.resume.action", {
+            uploaded: (typeof done === "number" ? done : "?"),
+            total: (typeof total === "number" ? total : "?"),
+          }),
+          value: "resume", kind: "primary", default: true,
+        },
+        { label: tt("upload.dup.restart"), value: "upload",
+          kind: "secondary" },
+        { label: tt("upload.dup.skip"), value: "skip", kind: "secondary" },
+      ];
+    }
+    return showUploadDialog({
+      title: title,
+      message: message,
+      buttons: buttons,
+    }).then(function (value) {
+      if (value === "resume") {
+        return { action: "resume", index: dup.index,
+                 jobId: dup.unfinished.job_id };
+      }
+      if (value === "upload") return { action: "upload" };
+      return { action: "skip" };
+    });
+  }
+
+  function batchDuplicateDialog(dups) {
+    var lines = dups.map(function (d) {
+      if (d.kind === "queue") {
+        return tt("upload.dup.row.queue", { name: d.name });
+      }
+      if (d.kind === "completed") {
+        return tt("upload.dup.row.completed", {
+          name: d.name,
+          time: dupTimeText(d.completed && d.completed.completed_at),
+        });
+      }
+      if (d.kind === "processing") {
+        return tt("upload.dup.row.processing", { name: d.name });
+      }
+      return tt("upload.dup.row.unfinished", { name: d.name });
+    });
+    return showUploadDialog({
+      title: tt("upload.dup.batch.title", { n: dups.length }),
+      message: tt("upload.dup.batch.body"),
+      list: lines,
+      hint: tt("upload.dup.batch.hint"),
+      buttons: [
+        { label: tt("upload.dup.skipAll"), value: "skip", kind: "primary",
+          default: true },
+        { label: tt("upload.dup.uploadAll"), value: "upload",
+          kind: "secondary" },
+      ],
+    }).then(function (value) {
+      return { action: value === "upload" ? "upload" : "skip" };
+    });
+  }
+
   function uploadFile(file, opts) {
     if (!file) return;
     opts = opts || {};
@@ -10607,23 +11137,20 @@
     // 面板内转换（设计 §3.5 第 1 点）：快照必须在**入队之前**取——这条既
     // 有语义与源码级断言（viewer-folders.test.ts）都由本次接线保持。
     opts.assocTarget = importTargetSnapshot();
-    if (!inlineEnabled()) {          // 开关关闭 → 回退路径（控制流不变）
-      legacyUploadFile(file, opts);
-      return;
+    // 续传重试（cosRetry）与显式 resumeJobId 统一成一个续传意图：入队层
+    // 只认 resumeJobId（cosRetry 仍用于跳过去重提示）。
+    if (!opts.resumeJobId && opts.cosRetry) opts.resumeJobId = opts.cosRetry;
+    var item = { file: file, handle: opts.fileHandle || null };
+    if (typeof opts.idemNonce === "string" && opts.idemNonce) {
+      item.nonce = opts.idemNonce;
     }
-    // 面板内转换（设计 §2.2①）：全部交给面板队列（含散文件 bundle 的
-    // 「需要完整包」类型化说明，§4.1.1）。运行器懒加载；加载失败 → 回退
-    // 到既有分流（绝不静默丢弃用户的选择）。opts.fileHandle：drop 事件内
-    // 同步捕获的 FileSystemFileHandle Promise（MRXS 协助流程的 startIn 定位）
-    ensureInlineOrch().then(function (orch) {
-      if (orch) {
-        orch.enqueue(file, {
-          assocTarget: opts.assocTarget,
-          fileHandle: opts.fileHandle || null,
-        });
-      }
-      else legacyUploadFile(file, opts);
-    });
+    // 重试/续传（cosRetry）不再做去重提示：用户已经对同一文件做过选择。
+    // COS 不可用（能力关闭/配置非法）时跳过提示：这次上传必然失败，先给
+    // 「上传暂不可用」而不是重复文件名（也不发无谓的 duplicates 请求）。
+    if (opts.noDedupe || opts.cosRetry || !COS_UPLOAD_CONFIG) {
+      return uploadFiles([item], Object.assign({}, opts, { noDedupe: true }));
+    }
+    return uploadFiles([item], opts);
   }
 
   /// 既有分流路径（开关关闭 / 面板初始化失败时的回退；控制流不变）。
@@ -10647,6 +11174,12 @@
     });
   }
 
+  /// 内部重试（面板初始化失败后的「重试」）：不再重复入队前的重复提示——
+  /// 用户已经对同一文件做过选择，提示只会变成噪音。
+  function retryOpts(opts) {
+    return Object.assign({}, opts || {}, { noDedupe: true });
+  }
+
   function uploadFileClassified(file, row, opts, cls) {
     // U3（统一 COS，docs/cos-only-upload-agent-plan-20260928.md §4）：新任务
     // 只建 ingestion。能力不可用（capability off / 容量配置门禁未过）→ 禁用
@@ -10662,7 +11195,7 @@
     //（开关关闭/引擎初始化失败）时行内说明 + 重试，绝不跳转换器页面
     if (cls && cls.cls === "convert") {
       convertNeededUnavailable(file, file && file.name,
-        function () { uploadFile(file, opts); }, row);
+        function () { uploadFile(file, retryOpts(opts)); }, row);
       return;
     }
     if (cls && cls.cls === "unsupported") {
@@ -10683,7 +11216,7 @@
       // 时的兜底）；面板不可用 → 行内说明 + 重试，绝不跳转换器页面
       if (isBrowserConvertFile(file)) {
         convertNeededUnavailable(file, file && file.name,
-          function () { uploadFile(file, opts); }, row);
+          function () { uploadFile(file, retryOpts(opts)); }, row);
         return;
       }
       row.markError();
@@ -10693,8 +11226,15 @@
       return;
     }
     uploadFileCos(file, row, {
-      resumeJobId: opts.cosRetry || null,
-      skipConfirm: !!opts.cosRetry,
+      // cosRetry：行内重试（同任务续传）；resumeJobId：入队前的服务端
+      // 权威续传选择（duplicates → 继续上次未完成的上传）。
+      resumeJobId: opts.cosRetry || opts.resumeJobId || null,
+      skipConfirm: !!(opts.cosRetry || opts.resumeJobId),
+      // upload-resilience：服务端权威已传分块（续传时的内容核验候选）/
+      // 每队列条目的幂等 nonce / 刷新后免重选续传的文件句柄
+      serverParts: opts.serverParts || null,
+      idemNonce: opts.idemNonce || null,
+      fileHandle: opts.fileHandle || null,
       // 直传类携带 direct_class 声明（ome-tiff/converter-bigtiff/
       // legacy-direct/unconverted-variant:svs-jp2k；服务端词表校验 + worker
       // 头级核验）
@@ -11111,7 +11651,10 @@
     // 同一通道也保证**迟到回调**（取消后才 resolve 的锁/引擎回执）不能再
     // 二次收口：outcomeSettled 恒为闸。
     var outcomeSettled = false;
-    var inflightJobId = null;   // 本行当前服务器任务（收口时从在传表清除）
+    // 本行当前服务器任务。续传入口（resumeJobId）没有 created 事件，但同一
+    // 任务仍在传：在传表/句柄清理都要按它登记（upload-resilience）。
+    var inflightJobId = opts.resumeJobId || null;
+    if (inflightJobId) cosInflightJobs[inflightJobId] = (file && file.name) || "?";
     function entryCancelled() {
       if (opts.isCancelled && opts.isCancelled()) return true;
       return !!(lockAbort && lockAbort.signal && lockAbort.signal.aborted);
@@ -11142,6 +11685,29 @@
     // 现读值会把产物静默记到新账号名下。
     var frozenAccount = String(currentUserId || "");
     var jobId = opts.resumeJobId || null;   // created 事件回填（重试按钮用）
+    // 幂等键（upload-resilience）：nonce 每个队列条目生成一次（app.js 入队
+    // 时），创建请求重试复用同一键——响应丢失但服务端已建行时不产生第二个
+    // 任务（ingestion_store 的 (owner,key) 复用分支）。
+    var idemNonce = typeof opts.idemNonce === "string" ? opts.idemNonce : "";
+    var idemKey = idemNonce
+      ? cosIdempotencyKey(frozenAccount, file, idemNonce) : null;
+    // 刷新后免重选续传：任务创建成功即把句柄落 IndexedDB（成功/取消/终态
+    // 删除；失败保留，供「继续上传」复用）。只有单文件直传路径会带句柄
+    // （转换产物/MRXS 包的字节不是重选的原文件）。
+    function saveResumeHandle(createdJobId) {
+      if (!createdJobId || !opts.fileHandle ||
+          !window.HP_RESUME_HANDLES) return;
+      try {
+        window.HP_RESUME_HANDLES.save(createdJobId, opts.fileHandle, {
+          filename: file.name, size: file.size,
+          last_modified: file.lastModified,
+        });
+      } catch (e) { /* 便利性功能失败不影响上传 */ }
+    }
+    function dropResumeHandle() {
+      if (!inflightJobId || !window.HP_RESUME_HANDLES) return;
+      try { window.HP_RESUME_HANDLES.remove(inflightJobId); } catch (e) {}
+    }
     var upload = null;
     // 复核修复：页面可见性恢复时补一拍在场证据（心跳的驱动源只有 JS 事件
     // 循环，标签被挂起期间停摆——重新可见即刷新 client_seen_at，缩小服务端
@@ -11195,6 +11761,13 @@
       // done 收口挂钩负责（三种终态同一路径）。
       if (outcomeSettled) return;
       if (upload && typeof upload.settled === "function" && upload.settled()) {
+        return;
+      }
+      // upload-resilience：面板直传条目把取消交给编排器——它会在取消请求
+      // 往返结束前保留上传槽（不启动下一条），并统一收口行状态。
+      if (typeof opts.onCancel === "function") {
+        try { opts.onCancel(); } catch (e) { /* 回退到本地取消 */ }
+        if (lockAbort) { try { lockAbort.abort(); } catch (e) {} }
         return;
       }
       if (lockAbort) { try { lockAbort.abort(); } catch (e) {} }
@@ -11261,9 +11834,15 @@
         account: frozenAccount,
         resumeJobId: jobId,
         skipConfirm: !!opts.skipConfirm,
+        // 本地记录续传确认：保持抽出前的 window.confirm 语义（对话框只用于
+        // 入队前的重复/服务端续传提示；引擎内的续传询问不引入异步窗口）。
         confirmResume: function () {
           return window.confirm(tt("upload.cos.resume_confirm", { name: file.name }));
         },
+        // upload-resilience：创建幂等键 + 服务端权威已传分块（续传候选；
+        // 引擎在跳过任何块之前用 MD5(ETag) 逐块核验）。
+        idempotencyKey: idemKey,
+        serverParts: opts.serverParts || null,
         // 工作台保持抽出前行为：完成请求网络失败不自动重发（行级失败提示
         // 重选同名文件续传）；工具页才开 retryCompleteOnNetworkError。
         retryCompleteOnNetworkError: false,
@@ -11299,6 +11878,9 @@
             // folder-experience §1.3×§5：ingestion 建成即把上传开始时冻结的
             // 目标快照按任务 ID 落盘——刷新后恢复行完成仍按原目标关联
             fbUpAssocSave(jobId, opts.assocTarget);
+            // upload-resilience：句柄按 job_id 落 IndexedDB（刷新后恢复行
+            // 提供「继续上传」；仅 Chromium 系 + 单文件直传路径）
+            saveResumeHandle(jobId);
           }
         },
       });
@@ -11318,9 +11900,11 @@
       }
       var settled = upload.done.then(function (r) {
         if (!r || r.cancelled) {
+          dropResumeHandle();   // 取消 = 终态：句柄不再需要
           settleOutcome(null, { cancelled: true, __cancelled: true });
           return;
         }
+        dropResumeHandle();     // 成功（viewable）：终态清理句柄
         if (opts.onOutcome) {
           // 面板直传条目：结果交回编排器收口（行 UI/关联/打开由面板负责），
           // 不在这里刷新列表与打开切片（避免与面板回调重复）
@@ -11329,6 +11913,9 @@
         }
         cosUploadSucceeded(row, r.body, file, opts.assocTarget);
       }, function (err) {
+        // 服务器终态（不可续传）→ 句柄无意义；网络/分块/轮询失败保留句柄，
+        // 失败行的「继续上传」可直接复用（刷新后也能免重选）。
+        if (err && err.terminal) dropResumeHandle();
         if (opts.onOutcome) {
           if (isAccountMismatchError(err)) {
             // 面板编排器按服务端核对结果收口 account_mismatch（改绑/删除）：
@@ -11362,13 +11949,13 @@
         if (err && typeof err.part === "number") {
           // 分块最终失败：从 confirmed 续传（服务端计划仍在，跳过已确认块）
           addRowButton(row, tt("upload.cos.retry"), function () {
-            uploadFile(file, { cosRetry: jobId });
+            uploadFile(file, { cosRetry: jobId, idemNonce: idemNonce });
           });
         } else if (err && err.recheck) {
           // review #9：状态轮询连续失败放弃 → 只提供「重新检查状态」
           //（同 job 重入状态机重新查询；绝不重建任务/重传分片）
           addRowButton(row, tt("upload.cos.recheck"), function () {
-            uploadFile(file, { cosRetry: jobId });
+            uploadFile(file, { cosRetry: jobId, idemNonce: idemNonce });
           });
         }
         row.finish(10000);
@@ -11433,9 +12020,60 @@
   function pollRestoredRow(job) {
     var done = false;
     var row = null;
+    var resumeBtn = null;
+    var resumeRec = null;
     function ensureRow() {
       if (!row) row = makeUploadRow({ name: job.filename, size: job.size });
       return row;
+    }
+    // upload-resilience（Chromium only，渐进增强）：任务创建时落盘的
+    // FileSystemFileHandle → 恢复行给「继续上传」，点击（用户手势）时
+    // 申请读权限并核对 name+size+lastModified，然后走正常续传路径。
+    // 无句柄/无权限/文件已变 → 保持今天的「重新选择同名文件」提示。
+    function ensureResumeButton() {
+      if (resumeBtn || done || !resumeRec) return;
+      resumeBtn = addRowButton(ensureRow(), tt("upload.resume.button"),
+        function () {
+          if (done || !window.HP_RESUME_HANDLES) return;
+          window.HP_RESUME_HANDLES.fileFromHandle(resumeRec).then(
+            function (res) {
+              if (!res || !res.file) {
+                var code = (res && res.error) || "unavailable";
+                toast(tt(code === "file_changed"
+                  ? "upload.resume.err.file_changed"
+                  : code === "permission_denied"
+                    ? "upload.resume.err.permission"
+                    : "upload.resume.err.unavailable"), "error");
+                return;
+              }
+              done = true;   // 停旧行轮询：后续 tick 早返回
+              if (row && row._row && row._row.parentNode &&
+                  row._row.parentNode.removeChild) {
+                row._row.parentNode.removeChild(row._row);
+              }
+              // 服务端权威已传分块（3 秒超时 → null：引擎仍复用同一任务，
+              // 只是不跳过任何块，绝不新建第二个任务）
+              fetchServerParts(job.job_id).then(function (parts) {
+                uploadFile(res.file, {
+                  cosRetry: job.job_id,
+                  serverParts: parts,
+                  idemNonce: newIdemNonce(),
+                  noDedupe: true,
+                });
+              });
+            });
+        });
+    }
+    if (window.HP_RESUME_HANDLES &&
+        typeof window.HP_RESUME_HANDLES.supported === "function" &&
+        window.HP_RESUME_HANDLES.supported()) {
+      try {
+        window.HP_RESUME_HANDLES.load(job.job_id).then(function (rec) {
+          if (done || !rec || !rec.handle) return;
+          resumeRec = rec;
+          ensureResumeButton();
+        }, function () { /* IndexedDB 不可用：保持重选提示 */ });
+      } catch (e) { /* 同上 */ }
     }
     function tick() {
       apiFetch("/api/ingestions/" + encodeURIComponent(job.job_id))
@@ -11500,7 +12138,10 @@
             });
             return;
           }
-          var note = (st === "uploading") ? tt("upload.cos.resume_hint") : "";
+          var note = (st === "uploading")
+            ? tt(resumeRec ? "upload.cos.resume_hint.handle"
+                           : "upload.cos.resume_hint")
+            : "";
           cosShowStage(ensureRow(), b, note);
           setTimeout(tick, 3000);
         })
@@ -11637,6 +12278,8 @@
           },
           refresh: function () {
             applyBeforeunload();
+            // upload-resilience：队列变化即刷新「全部取消」可见性（≥2 行）
+            syncUploadBulkBar();
             // P2 问题 3：本机队列变化立即重画抽屉「后台任务」的本机部分
             //（服务器部分沿用缓存，不添网络请求）
             refreshImportTasksLocalOnly();
@@ -11658,9 +12301,12 @@
         target: function () { return importTargetSnapshot(); },
         onArtifact: uploadEntryArtifact,
         cancelArtifact: function (entry) {
+          // 取消引擎并**返回** cancel 请求的 Promise：编排器据此把上传槽
+          // 保留到取消往返结束（避免取消 A 立刻建 B 的 create→cancel churn）。
           if (entry && entry._upload && entry._upload.cancel) {
-            try { entry._upload.cancel(); } catch (e) { /* */ }
+            try { return entry._upload.cancel(); } catch (e) { /* */ }
           }
+          return Promise.resolve();
         },
         onUploaded: inlineUploaded,
         // 匿名完成计数（0094）：inline 转换成功即 fire-and-forget 计数
@@ -12110,9 +12756,10 @@
       return;
     }
     if (kind === "reselect") {
-      // 「重新选择文件」：复用同一个隐藏 file input；选中的文件作为**新条目**
+      // 「重新选择文件」：复用同一个选择入口；选中的文件作为**新条目**
       // 入队（旧条目留在行上供清理，绝不静默替换用户看不到的东西）。
-      if (els.fileInput) els.fileInput.click();
+      // Chromium 会同时保留句柄（刷新后免重选续传）。
+      pickUploadFiles();
       return;
     }
     inlineOrch.act(entry.id, "continue");
@@ -12168,6 +12815,9 @@
     // 地早返回 {cancelled:true}，编排器 completeUpload 据此收口（槽位/锁
     // 照常释放、行保持「已取消」、不弹失败 toast）。
     if (entry.cancelled) return Promise.resolve({ cancelled: true });
+    // upload-resilience：幂等 nonce（每队列条目一次；转换产物与直传一致）。
+    // 创建请求重试复用同一键——网络抖动不产生第二个服务端任务。
+    if (!entry.idemNonce) entry.idemNonce = newIdemNonce();
     if (!artifact) {
       // 直传条目（无本机产物）：复用既有直传状态机 uploadFileCos——它的
       // 门禁（能力/账号/源大小/词表）、记录持久化、跨标签内容锁与心跳全部
@@ -12195,9 +12845,25 @@
               entry._freshUpload = false;
             },
             // 同任务续传：上一轮失败留下的任务 id（part/network/recheck 恢复）；
-            // 显式「重新上传」已置 _freshUpload → 不带 resumeJobId（新建任务）。
-            resumeJobId: entry._freshUpload ? null : (entry.uploadJobId || null),
-            skipConfirm: !!entry.uploadJobId && !entry._freshUpload,
+            // 服务端权威续传（入队时 duplicates 端点报告的未完成任务）同样
+            // 复用同一 ingestion；显式「重新上传」已置 _freshUpload → 不带
+            // resumeJobId（新建任务）。
+            resumeJobId: entry._freshUpload ? null
+              : (entry.uploadJobId || entry.resumeServerJobId || null),
+            skipConfirm: !entry._freshUpload &&
+              !!(entry.uploadJobId || entry.resumeServerJobId),
+            // upload-resilience：权威已传分块（逐块 MD5 核验后才跳过）、
+            // 幂等 nonce（每队列条目一次；重试复用）、文件句柄（刷新后
+            // 免重选续传；MRXS 协助流程的 startIn 定位也用它）。
+            serverParts: entry.serverParts || null,
+            idemNonce: entry.idemNonce || (entry.idemNonce = newIdemNonce()),
+            fileHandle: entry._fileHandle || null,
+            // 行上的「取消」（uploadFileCos 自绘，直传条目没有面板 cancel
+            // 按钮）交回编排器：先整体标记再等取消往返，避免下一条被立刻
+            // 创建（upload-resilience 的 create→cancel churn 修复）。
+            onCancel: function () {
+              if (inlineOrch) inlineOrch.act(entry.id, "cancel");
+            },
             onEngine: function (upload) {
               // 取消按钮据此真正停传（设计 §5 / §6.3 的「取消」语义）
               entry._upload = upload;
@@ -12329,6 +12995,66 @@
     return null;
   }
 
+  // ---------- 创建幂等键（upload-resilience 2026-11-10） ----------
+  // 定义位置固定在 uploadEntryArtifact/createEntryUpload 之间：inline-convert
+  // 单测按源码切片直接编译该区段（切片从 uploadEntryArtifact 到「完成收口」），
+  // 幂等键的实现必须随切片一起可见。函数声明在 IIFE 内提升，uploadFile 等
+  // 更早的调用点照常使用。
+
+  function newIdemNonce() {
+    var bytes = new Uint8Array(8);
+    try {
+      if (typeof crypto === "undefined" || !crypto ||
+          typeof crypto.getRandomValues !== "function") {
+        throw new Error("no crypto");
+      }
+      crypto.getRandomValues(bytes);
+    } catch (e) {
+      for (var i = 0; i < bytes.length; i++) {
+        bytes[i] = Math.floor(Math.random() * 256);
+      }
+    }
+    var out = "";
+    for (var j = 0; j < bytes.length; j++) {
+      out += (bytes[j] < 16 ? "0" : "") + bytes[j].toString(16);
+    }
+    return out;
+  }
+
+  /// FNV-1a 双 32 位（64 位近似）：把 (账号, 文件名, 大小, lastModified,
+  /// 随机 nonce) 压成短串。键长远小于服务端 128 上限；唯一性由 nonce 保证。
+  function fnv1a64Hex(s) {
+    var h1 = 0x811c9dc5 | 0;
+    var h2 = 0x01000193 | 0;
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      h1 ^= c;
+      h1 = Math.imul(h1, 0x01000193) | 0;
+      h2 ^= (c + i) | 0;
+      h2 = Math.imul(h2, 0x01000193) | 0;
+    }
+    function hex8(n) {
+      var v = (n >>> 0).toString(16);
+      while (v.length < 8) v = "0" + v;
+      return v;
+    }
+    return hex8(h1) + hex8(h2);
+  }
+
+  /// 创建幂等键（服务端 ingestion_jobs_idempotency_live：同 owner+key 的
+  /// 存活任务唯一，重试复用既有行）。nonce 每个队列条目生成一次并随条目
+  /// 保存——创建请求网络抖动重发时复用同一键，绝不建第二个服务端任务。
+  function cosIdempotencyKey(account, file, nonce) {
+    var material = [
+      String(account || ""),
+      (file && file.name) || "",
+      String((file && file.size) || 0),
+      String((file && file.lastModified) || 0),
+      String(nonce || ""),
+    ].join("|");
+    return "ptu:" + fnv1a64Hex(material) + ":" + String(nonce || "");
+  }
+
   function createEntryUpload(entry, artifact, job, name, declaration, cfg) {
     // 取消边界：建引擎（随后 createUpload 的链上就是 POST /api/ingestions）
     // 前的最后一道闸。引擎句柄（entry._upload）在下一行同步挂上，此后编排
@@ -12355,6 +13081,13 @@
         heartbeatFetch: apiFetchNoRedirect,
         config: cfg,
         createBody: declaration ? { direct_class: declaration } : null,
+        // upload-resilience：转换产物的创建同样按队列条目幂等（重试复用
+        // 同一 ingestion）。lastModified 对 OPFS 产物无意义 → 0。
+        idempotencyKey: entry.idemNonce
+          ? cosIdempotencyKey(acct,
+              { name: name, size: artifact.size, lastModified: 0 },
+              entry.idemNonce)
+          : null,
         storage: {
           save: function (rec) {
             if (!rec || !rec.job_id) return undefined;
@@ -12627,12 +13360,29 @@
   // 与 HP_AUTH 同风格的命名空间导出，不进业务调用面
   window.HP_UPLOAD = {
     uploadFile: uploadFile,
+    // upload-resilience：批量入口（多选/拖放/文件夹）与去重/续传辅助的
+    // 测试驱动面（真实入口，不复制逻辑）
+    uploadFiles: uploadFiles,
+    uploadFileCos: uploadFileCos,
+    fetchServerParts: fetchServerParts,
+    cancelServerJobs: cancelServerJobs,
+    cosIdempotencyKey: cosIdempotencyKey,
+    newIdemNonce: newIdemNonce,
+    panelQueueEntriesForDedupe: panelQueueEntriesForDedupe,
+    syncUploadBulkBar: syncUploadBulkBar,
+    pickUploadFiles: pickUploadFiles,
+    // 对话框注入口（测试 harness 没有 document.body；生产环境下
+    // _setUploadConfirm(null) 恢复样式化对话框）
+    _setUploadConfirm: function (fn) {
+      var prev = uploadDedupeImpl;
+      uploadDedupeImpl = (typeof fn === "function") ? fn : null;
+      return prev;
+    },
     // W4/R5：转换轮询（观察超时不判失败；401/403/404 分级处理）
     pollConversionJob: pollConversionJob,
     // COS 直传（测试入口：真实路由/状态机/独立传输的驱动面）
     cosUploadEligible: cosUploadEligible,
     cosIneligibleReason: cosIneligibleReason,
-    uploadFileCos: uploadFileCos,
     resolveCosConfig: resolveCosConfig,
     cosStageKey: cosStageKey,
     // upload-liveness：稳定机器码/fail_detail → 可读文案（测试驱动面）
@@ -12753,13 +13503,17 @@
     }
     var files = dt.files;
     if (files && files.length > 0) {
+      // upload-resilience：一次拖入多个文件 → 一次批量去重预检（合并对话框）；
+      // 每个文件带 drop 事件内同步捕获的句柄（刷新后免重选续传）。
+      var items = [];
       for (var f2 = 0; f2 < files.length; f2++) {
         var handle = null;
         for (var h2 = 0; h2 < handles.length; h2++) {
           if (handles[h2][0] === files[f2]) { handle = handles[h2][1]; break; }
         }
-        uploadFile(files[f2], handle ? { fileHandle: handle } : undefined);
+        items.push({ file: files[f2], handle: handle });
       }
+      uploadFiles(items);
     }
   }
 
@@ -12820,7 +13574,9 @@
         importBundleRows(rows, dirEntry.name);
         return;
       }
-      rows.forEach(function (r) { uploadFile(r.file); });
+      // upload-resilience：普通文件夹 → 一次批量（合并去重对话框），不再
+      // 每个成员各弹一次提示。
+      uploadFiles(rows.map(function (r) { return { file: r.file, handle: null }; }));
     }).catch(function () {
       toast(tt("imp.drop.dir.unreadable"), "error");
     });
@@ -13487,7 +14243,35 @@
     if (!list || !list.parentNode) return;
     if (!uploadListHome) uploadListHome = list.parentNode;
     var host = (importDrawerState.open && els.importUploadHost) || uploadListHome;
+    // upload-resilience：「全部取消」条随行容器一起移动（侧栏 ↔ 抽屉宿主），
+    // 关抽屉后仍可达；它永远在行容器之前。insertBefore 的参照节点必须是
+    // 目标宿主的子节点——行容器还在旧宿主时先 append 条，再移动容器，
+    // 否则会抛 NotFoundError（会连累打开抽屉）。
+    var bar = els.uploadBulkBar;
+    if (bar) {
+      var ref = (list.parentNode === host) ? list : null;
+      if (bar.parentNode !== host || (ref && bar.nextSibling !== ref)) {
+        if (bar.parentNode && bar.parentNode.removeChild) {
+          bar.parentNode.removeChild(bar);
+        }
+        if (ref && host.insertBefore) host.insertBefore(bar, ref);
+        else host.appendChild(bar);
+      }
+    }
     if (list.parentNode !== host) host.appendChild(list);
+  }
+
+  /// 「全部取消」可见性：≥2 个可取消行才显示（单行用行内取消；0/1 行时
+  /// 头部按钮只会制造噪音）。文案随语言刷新。
+  function syncUploadBulkBar() {
+    var bar = els.uploadBulkBar;
+    if (!bar) return;
+    var n = (inlineOrch && typeof inlineOrch.cancellableCount === "function")
+      ? inlineOrch.cancellableCount() : 0;
+    bar.hidden = n < 2;
+    if (els.uploadCancelAll) {
+      els.uploadCancelAll.textContent = tt("upload.cos.cancel_all");
+    }
   }
 
   function initUploadRowHostSync() {
@@ -13501,6 +14285,7 @@
     if (block && typeof MutationObserver === "function") {
       var syncVisible = function () {
         block.hidden = list.childElementCount === 0;
+        syncUploadBulkBar();
       };
       new MutationObserver(syncVisible).observe(list, { childList: true });
       syncVisible();
@@ -15289,8 +16074,23 @@
       els.uploadBtn.addEventListener("click", function () { els.fileInput.click(); });
     }
     els.fileInput.addEventListener("change", function () {
-      if (this.files && this.files[0]) { uploadFile(this.files[0]); this.value = ""; }
+      var picked = this.files ? Array.from(this.files) : [];
+      this.value = "";   // 允许再次选择同一文件触发 change
+      if (!picked.length) return;
+      // upload-resilience：多选/文件夹一次进入批量去重预检（一个合并对话框）
+      uploadFiles(picked.map(function (f) { return { file: f, handle: null }; }));
     });
+
+    // upload-resilience：「全部取消」（≥2 个可取消行时可见）。编排器先给
+    // 所有目标行打取消标记（pump 停摆）再释放槽位——绝不新建服务端任务。
+    if (els.uploadCancelAll) {
+      els.uploadCancelAll.addEventListener("click", function () {
+        if (!inlineOrch || typeof inlineOrch.cancelAll !== "function") return;
+        var n = inlineOrch.cancelAll();
+        syncUploadBulkBar();
+        if (n > 0) toast(tt("upload.cos.cancelled_all", { n: n }), "info");
+      });
+    }
 
     // 标注
     els.annoBtn.addEventListener("click", function () {
@@ -15483,7 +16283,7 @@
     }
     if (els.importPickFiles) {
       els.importPickFiles.addEventListener("click", function () {
-        if (els.fileInput) els.fileInput.click();
+        pickUploadFiles();
       });
     }
     // 「选择文件夹（MRXS）」（webkitdirectory）→ MRXS 完整包走面板队列
@@ -15499,7 +16299,7 @@
     if (els.importDropZone) {
       // 抽屉内大拖放区点击 = 打开文件选择（拖放本身由 document 级处理）
       els.importDropZone.addEventListener("click", function () {
-        if (els.fileInput) els.fileInput.click();
+        pickUploadFiles();
       });
     }
     if (els.importTargetSelect) {

@@ -34,7 +34,13 @@
           },
           resumeJobId: string | null,   // 显式续传：跳过创建与询问
           skipConfirm: bool,            // 续传不询问（重试按钮语义）
-          confirmResume: () => bool,    // 发现可续传任务时询问（默认 true）
+          confirmResume: () => bool,    // 发现可续传任务时询问（默认 true；
+                                        // 可返回 Promise——页面样式化对话框）
+          idempotencyKey: string|null,  // 创建幂等键（队列条目派生；重试复用）
+          serverParts: Array|null,      // 服务端权威 ListParts 候选
+                                        // [{part_number,size,etag}]：只作为
+                                        // 「已传块」候选，跳过前逐块 MD5 核验；
+                                        // 非 32 位十六进制 ETag → 重传该块
           account: string,              // 条目绑定的账号（入队/上传开始时冻结）：
                                         // 随记录持久化（他号记录绝不续传）+
                                         // 新任务创建体带 expected_account（服务端
@@ -345,6 +351,217 @@
     return step();
   }
 
+  // ---------- MD5（RFC 1321；服务端 ListParts 的 ETag 内容凭证） ----------
+  // 用途（upload-resilience 2026-11-10）：服务端权威 ListParts 给的是分块
+  // ETag；COS 分块上传在**未启用 SSE-KMS** 时 ETag = 该分块字节的 MD5。
+  // 本仓库从不设置 SSE/C 头（presign_upload_part 只绑定 Content-Length），
+  // 也未配置桶级加密，因此按 MD5 核验；ETag 不是 32 位十六进制（KMS/实现
+  // 差异）时调用方回退为重传该块——绝不凭「编号对得上」跳过。
+  //
+  // 为什么自己实现：WebCrypto 不提供 MD5；为一次续传核验引入 npm 依赖不值
+  // 得。实现是紧凑的经典 RFC 1321 变换，随包导出供单测按已知向量核验。
+  // 有界内存 + 主动让出事件循环：每 4 MiB 子块喂一次，之后 setTimeout(0)
+  // 让出一拍，避免大分块同步压缩冻结渲染器。
+  var MD5_K = [
+    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
+    0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+    0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+    0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+    0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+    0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
+    0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+    0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+    0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+  ];
+  var MD5_S = [
+    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+    5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+  ];
+
+  function Md5() {
+    this.a = 0x67452301;
+    this.b = 0xefcdab89 | 0;
+    this.c = 0x98badcfe | 0;
+    this.d = 0x10325476;
+    this.words = new Int32Array(16);
+    this.tail = new Uint8Array(64);
+    this.tailLen = 0;
+    this.total = 0;   // 已喂入字节数
+  }
+
+  Md5.prototype._block = function (bytes, offset) {
+    var m = this.words;
+    for (var i = 0; i < 16; i++) {
+      var o = offset + i * 4;
+      m[i] = (bytes[o] | (bytes[o + 1] << 8) |
+              (bytes[o + 2] << 16) | (bytes[o + 3] << 24)) | 0;
+    }
+    var a = this.a, b = this.b, c = this.c, d = this.d;
+    for (var j = 0; j < 64; j++) {
+      var f, g;
+      if (j < 16) { f = (b & c) | (~b & d); g = j; }
+      else if (j < 32) { f = (d & b) | (~d & c); g = (5 * j + 1) & 15; }
+      else if (j < 48) { f = b ^ c ^ d; g = (3 * j + 5) & 15; }
+      else { f = c ^ (b | ~d); g = (7 * j) & 15; }
+      var x = (a + f + MD5_K[j] + m[g]) | 0;
+      var s = MD5_S[j];
+      var rot = ((x << s) | (x >>> (32 - s))) | 0;
+      var nextB = (b + rot) | 0;
+      a = d; d = c; c = b; b = nextB;
+    }
+    this.a = (this.a + a) | 0;
+    this.b = (this.b + b) | 0;
+    this.c = (this.c + c) | 0;
+    this.d = (this.d + d) | 0;
+  };
+
+  Md5.prototype.update = function (bytes) {
+    var i = 0;
+    this.total += bytes.length;
+    // 先补齐上次剩余的尾部
+    if (this.tailLen) {
+      var need = 64 - this.tailLen;
+      var take = Math.min(need, bytes.length);
+      this.tail.set(bytes.subarray(0, take), this.tailLen);
+      this.tailLen += take;
+      i += take;
+      if (this.tailLen === 64) {
+        this._block(this.tail, 0);
+        this.tailLen = 0;
+      }
+    }
+    for (; i + 63 < bytes.length; i += 64) this._block(bytes, i);
+    if (i < bytes.length) {
+      this.tail.set(bytes.subarray(i), 0);
+      this.tailLen = bytes.length - i;
+    }
+    return this;
+  };
+
+  function _le32hex(word) {
+    var out = "";
+    for (var i = 0; i < 4; i++) {
+      var b = (word >>> (i * 8)) & 0xff;
+      out += (b < 16 ? "0" : "") + b.toString(16);
+    }
+    return out;
+  }
+
+  Md5.prototype.hex = function () {
+    // 纯函数式收尾：不动 this（同一实例可反复取摘要/继续 update——测试用）
+    var bitsLo = (this.total * 8) | 0;
+    var bitsHi = Math.floor(this.total / 0x20000000) | 0;   // floor(bytes/2^29)
+    var tail = new Uint8Array(128);
+    tail.set(this.tail.subarray(0, this.tailLen), 0);
+    var tl = this.tailLen;
+    tail[tl] = 0x80;
+    var totalLen = (tl < 56) ? 64 : 128;
+    var dv = new DataView(tail.buffer);
+    dv.setUint32(totalLen - 8, bitsLo >>> 0, true);
+    dv.setUint32(totalLen - 4, bitsHi >>> 0, true);
+    var fin = new Md5();
+    fin.a = this.a; fin.b = this.b; fin.c = this.c; fin.d = this.d;
+    for (var o = 0; o < totalLen; o += 64) fin._block(tail, o);
+    return _le32hex(fin.a) + _le32hex(fin.b) +
+      _le32hex(fin.c) + _le32hex(fin.d);
+  };
+
+  /// 同步便捷入口（单测/小缓冲）：字节 → 32 位小写十六进制 MD5。
+  function md5Hex(bytes) {
+    var u8 = (bytes instanceof Uint8Array) ? bytes : new Uint8Array(bytes || []);
+    return new Md5().update(u8).hex();
+  }
+
+  /// 流式 MD5（与 sha256HexChunked 同款有界内存/让出策略）。
+  function md5HexChunked(blob) {
+    if (!blob || !(blob.size > 0)) return Promise.resolve(null);
+    var ctx = new Md5();
+    var offset = 0;
+    function step() {
+      if (offset >= blob.size) return Promise.resolve(ctx.hex());
+      var end = Math.min(blob.size, offset + DIGEST_CHUNK_BYTES);
+      var p;
+      try {
+        p = blob.slice(offset, end).arrayBuffer();
+      } catch (e) {
+        p = Promise.reject(e);
+      }
+      return p.then(function (buf) {
+        if (!buf || buf.byteLength !== end - offset) {
+          throw new Error("short read");
+        }
+        ctx.update(new Uint8Array(buf));
+        offset = end;
+        if (offset >= blob.size) return null;
+        // 每 4 MiB 让出一拍（MD5 是同步压缩；绝不长时间占住主线程）
+        return new Promise(function (r) { setTimeout(r, 0); });
+      }).then(step, function () { return null; });
+    }
+    return step();
+  }
+
+  /// 分块内容凭证（续传核验专用）：一次读取同时得到
+  ///   md5    → 与 COS ListParts 的分块 ETag 比对；
+  ///   sha256 → 与记录里的 digest_scheme 同一方案（供后续续传复用）。
+  /// 读失败/短读/哈希不可用 → null（调用方按「无法核验」重传该块）。
+  function partDigestsChunked(blob) {
+    var subtle = (typeof crypto !== "undefined" && crypto && crypto.subtle)
+      ? crypto.subtle : null;
+    if (!subtle || !blob || !(blob.size > 0)) return Promise.resolve(null);
+    var ctx = new Md5();
+    var acc = null;          // 4 MiB 子块 SHA-256 拼接
+    var offset = 0;
+    function step() {
+      if (offset >= blob.size) {
+        if (!acc) return Promise.resolve(null);
+        return subtle.digest("SHA-256", acc).then(function (d) {
+          return { md5: ctx.hex(), sha256: bytesHex(d) };
+        }, function () { return null; });
+      }
+      var end = Math.min(blob.size, offset + DIGEST_CHUNK_BYTES);
+      var p;
+      try {
+        p = blob.slice(offset, end).arrayBuffer();
+      } catch (e) {
+        p = Promise.reject(e);
+      }
+      return p.then(function (buf) {
+        if (!buf || buf.byteLength !== end - offset) {
+          throw new Error("short read");
+        }
+        ctx.update(new Uint8Array(buf));
+        return subtle.digest("SHA-256", buf).then(function (d) {
+          var nd = new Uint8Array(d);
+          var next = new Uint8Array((acc ? acc.length : 0) + nd.length);
+          if (acc) next.set(acc, 0);
+          next.set(nd, acc ? acc.length : 0);
+          acc = next;
+          offset = end;
+          if (offset >= blob.size) return null;
+          return new Promise(function (r) { setTimeout(r, 0); });
+        });
+      }).then(step, function () { return null; });
+    }
+    return step();
+  }
+
+  /// ETag 规范化：去引号/空白；只有 32 位十六进制（MD5 形态）才可用于
+  /// 内容核验。非 MD5（SSE-KMS 等）返回 null → 调用方重传该块。
+  function etagMd5(etag) {
+    var s = String(etag == null ? "" : etag).trim().replace(/^W\//, "");
+    s = s.replace(/^"+|"+$/g, "").trim();
+    return /^[0-9a-fA-F]{32}$/.test(s) ? s.toLowerCase() : null;
+  }
+
   function createUpload(opts) {
     var cfg = opts.config;
     var apiFetch = opts.apiFetch;
@@ -356,6 +573,14 @@
     var confirmedMap = {};         // part_number -> ETag|""（ETag 仅提示）
     var digestMap = {};            // 本次会话确认的分片 -> SHA-256（review #1）
     var resumeDigests = {};        // 续传记录里已核验的旧分片摘要（review #1）
+    // 服务端权威 ListParts（opts.serverParts）：编号 -> ETag(MD5)/长度。
+    // 用于「本地记录已被清掉 / 另一设备开始的上传」——只凭服务端清单跳过
+    // 任何分块之前，必须逐块用重选文件的 MD5 与 ETag 比对（见
+    // verifyResumeDigests）；非 MD5 ETag 或长度不符 → 重传该块。
+    var resumeEtags = {};
+    var resumeEtagSizes = {};
+    var serverParts = (opts.serverParts && typeof opts.serverParts.length ===
+        "number") ? opts.serverParts : null;
     var resumeRejected = false;    // 续传身份核验失败：本轮不再尝试续传
     var plan = null;               // [{part_number, offset, length}]
     var planByNum = {};            // part_number -> {offset, length}（字节折算）
@@ -590,15 +815,41 @@
       });
     }
 
-    // 计划冻结后、跳过任何分块前：逐片比对「新选中文件」的分片 SHA-256。
-    //  - 不符 → {mismatch: n}（调用方弃旧任务、全新创建，绝不混用）；
-    //  - 缺摘要的已确认分块 → 从跳过表移除（重传，同编号覆盖，安全）；
-    //  - 全部相符 → 保留（且把这些摘要并入后续记录）。
-    function verifyResumeDigests() {
-      var nums = confirmedList().filter(function (n) {
-        return resumeDigests.hasOwnProperty(n);
+    // 服务端权威 ListParts 合并（upload-resilience 2026-11-10）。
+    // 只在 prepareResume 的显式 resumeJobId 分支调用：本地记录缺失（清理过 /
+    // 另一设备开始）时，服务端清单是「已传了哪些块」的唯一来源。这里只
+    // **声明候选**，真正跳过之前仍由 verifyResumeDigests 逐块核验内容
+    // （MD5 vs ETag）；非 MD5 ETag 不进入候选（重传）。
+    function applyServerParts() {
+      if (!serverParts) return;
+      serverParts.forEach(function (p) {
+        if (!p) return;
+        var n = parseInt(p.part_number, 10);
+        if (!(n > 0)) return;
+        var md5 = etagMd5(p.etag);
+        if (!md5) return;   // KMS/非 MD5 ETag：无法证明字节同源 → 重传
+        resumeEtags[n] = md5;
+        var sz = parseInt(p.size, 10);
+        if (sz > 0) resumeEtagSizes[n] = sz;
+        if (!confirmedMap.hasOwnProperty(n)) {
+          confirmedMap[n] = "";
+          totalConfirmed++;
+        }
       });
-      var verified = {};
+    }
+
+    // 计划冻结后、跳过任何分块前：逐片核验「新选中文件」的内容凭证。
+    //  - 本地 SHA-256 记录存在 → 与记录比对；不符 → {mismatch: n}（调用方
+    //    弃旧任务、全新创建，绝不混用）；
+    //  - 无本地摘要但有服务端 ETag（32 位 MD5）→ 现场算该块 MD5（同一遍
+    //    读取顺带算 SHA-256 供记录复用）：不符/长度不符/非 MD5 → 从跳过表
+    //    移除（重传该块，同编号覆盖安全）；
+    //  - 两种凭证都没有 → 移除（重传）。
+    //  - 全部相符 → 保留（且把摘要并入后续记录）。
+    function verifyResumeDigests() {
+      var nums = confirmedList();
+      var verified = {};     // n -> SHA-256（本次可持久化的内容凭证）
+      var drop = [];         // 无法核验/不符的服务端候选 → 重传
       var bad = null;
       var seq = Promise.resolve();
       nums.forEach(function (n) {
@@ -606,18 +857,43 @@
           if (bad || stopped) return null;
           var item = planByNum[n];
           if (!item) return null;   // 计划外编号：交由服务端状态裁定
-          // 同一分片摘要方案流式核验（4 MiB 子块；不整片读入内存）
-          return sha256HexChunked(source.slice(item.offset, item.offset + item.length))
-            .then(function (hex) {
-              if (!hex || hex !== resumeDigests[n]) { bad = bad || n; return; }
-              verified[n] = hex;
-            });
+          if (resumeDigests.hasOwnProperty(n)) {
+            // 同一分片摘要方案流式核验（4 MiB 子块；不整片读入内存）
+            return sha256HexChunked(
+              source.slice(item.offset, item.offset + item.length))
+              .then(function (hex) {
+                if (!hex || hex !== resumeDigests[n]) { bad = bad || n; return; }
+                verified[n] = hex;
+              });
+          }
+          if (resumeEtags.hasOwnProperty(n)) {
+            if (resumeEtagSizes[n] > 0 && resumeEtagSizes[n] !== item.length) {
+              drop.push(n);   // 服务端块长与冻结计划不符：重传
+              return null;
+            }
+            return partDigestsChunked(
+              source.slice(item.offset, item.offset + item.length))
+              .then(function (d) {
+                if (!d || !d.md5 || d.md5 !== resumeEtags[n]) {
+                  drop.push(n);
+                  return;
+                }
+                if (!d.sha256) { drop.push(n); return; }   // 无 SHA 凭证：重传
+                verified[n] = d.sha256;
+              });
+          }
+          drop.push(n);   // 有编号无凭证：绝不跳过
         });
       });
       return seq.then(function () {
         if (bad) return { mismatch: bad };
-        // 只保留已验证分块进跳过表；缺摘要的已确认分块移出（重传，
-        // 同编号覆盖安全；confirmedBytes 折算回退）
+        drop.forEach(function (n) {
+          if (!confirmedMap.hasOwnProperty(n)) return;
+          delete confirmedMap[n];
+          totalConfirmed--;
+          confirmedBytes -= (planByNum[n] && planByNum[n].length) || 0;
+        });
+        // 只保留已验证分块进跳过表；缺凭证的已确认分块移出（重传）
         confirmedList().forEach(function (n) {
           if (verified.hasOwnProperty(n)) return;
           delete confirmedMap[n];
@@ -625,6 +901,8 @@
           confirmedBytes -= (planByNum[n] && planByNum[n].length) || 0;
         });
         resumeDigests = verified;
+        resumeEtags = {};
+        resumeEtagSizes = {};
         return null;
       });
     }
@@ -1024,18 +1302,25 @@
     // 终态守卫（P3 复核 2026-10-18）：done 已收口（入库完成/失败/取消）后
     // cancel 是空操作——已发布/终态资产的 cancel 请求只会被服务端拒绝；
     // 失败行的服务端计划要留给「继续上传」复用，也不得在此误取消。
+    // upload-resilience：返回 cancel 请求的 Promise（不阻塞 UI 收口），面板
+    // 编排器据此把上传槽保留到取消往返结束再调度下一条——避免「取消 A →
+    // 立刻新建 B → 用户又取消 B」的 create→cancel churn。无任务/已终态
+    // 返回已 resolve 的 Promise（旧调用方忽略返回值，语义不变）。
     function cancel() {
-      if (stopped || doneSettled) return;
+      if (stopped || doneSettled) return Promise.resolve(false);
       stopped = true;
       settleCancelled({ cancelled: true });
       stopTimers();
       if (abortCtl) { try { abortCtl.abort(); } catch (e) {} }
-      if (jobId) {
-        quiet(storage.remove(jobId));
-        // 网络失败也照常停 UI：服务端等待超时/容量调度器会兜底清理
-        apiFetch("/api/ingestions/" + encodeURIComponent(jobId) + "/cancel",
-                 { method: "POST" }).catch(function () {});
-      }
+      if (!jobId) return Promise.resolve(false);
+      quiet(storage.remove(jobId));
+      // 网络失败也照常停 UI：服务端等待超时/容量调度器会兜底清理
+      return Promise.resolve()
+        .then(function () {
+          return apiFetch("/api/ingestions/" + encodeURIComponent(jobId) +
+                          "/cancel", { method: "POST" });
+        })
+        .then(function () { return true; }, function () { return false; });
     }
 
     // 创建新任务（持久化先行；落盘失败 = 弃单，见 abandonUnsaved）
@@ -1046,6 +1331,15 @@
         filename: source.name, declared_size: source.size,
       }, (opts.createBody && typeof opts.createBody === "object")
         ? opts.createBody : {});
+      // 幂等键（upload-resilience）：调用方按队列条目生成（账号+文件名+大小+
+      // lastModified+随机 nonce），创建请求重试时复用同一键——网络抖动导致
+      // 「响应丢失但服务端已建行」时，重试命中 ingestion_jobs 幂等复用分支
+      // （ingestion_store.create_waiting_job），绝不产生第二个服务端任务。
+      // 服务端约束：非空字符串 ≤128。
+      if (typeof opts.idempotencyKey === "string") {
+        var idem = opts.idempotencyKey.trim();
+        if (idem) createBody.idempotency_key = idem.slice(0, 128);
+      }
       // 跨账号归属核对（P1 cross-account 2026-10-15）：expected_account =
       // 本引擎实例冻结的绑定账号（opts.account——调用方在入队/上传开始时
       // 冻结，不是发请求时现读的全局）。前端缓存身份不可靠（另一标签页
@@ -1098,7 +1392,9 @@
               jobId = null;          // 本地视为无候选；他号服务端任务不动
               return null;
             }
-            if (verdict === "discard") {
+            if (verdict === "discard" && !serverParts) {
+              // legacy 本地记录（有确认块、无内容摘要）：无凭证 → 弃旧任务。
+              // 但服务端权威清单在场时改由逐块 MD5 核验裁定（upload-resilience）
               return cancelJob(jobId).then(function () {
                 resetForFreshCreate();
                 resumeRejected = true;
@@ -1107,6 +1403,9 @@
             }
           }
           return loadConfirmedFromStorage().then(function () {
+            // upload-resilience：本地记录缺失/无摘要时，用服务端权威
+            // ListParts 补齐候选（内容核验在 verifyResumeDigests）。
+            applyServerParts();
             if (!opts.useResumeEndpoint) return null;
             // 工具页：服务端已离开 uploading 而任务未收口（如卡在
             // completing）按 /resume 语义拉回 uploading（服务端拒绝即忽略，
@@ -1126,24 +1425,28 @@
       // 先取消旧任务再全新创建（不双占、不静默复用）。
       // review #1：候选记录必须绑定同一账号（他号记录绝不 offered/used）；
       // legacy 候选（有确认分块、无摘要）按弃单处理，绝不凭名称/大小复用。
+      // upload-resilience：confirmResume 允许返回 Promise（页面用样式化
+      // 对话框而不是 window.confirm；对话框需要等待用户点击）。
       var prev = storage.findResumable ? storage.findResumable(source) : null;
       if (!prev) return Promise.resolve(null);
       if (prev.account !== undefined && prev.account !== null &&
           String(prev.account) !== account) {
         return Promise.resolve(null);
       }
-      var doResume = opts.skipConfirm ||
-        (opts.confirmResume ? opts.confirmResume() : true);
-      if (!doResume) return cancelJob(prev.job_id);
-      var verdict = prepareResumeRecord(prev);
-      if (verdict === "discard") {
-        return cancelJob(prev.job_id).then(function () {
-          resumeRejected = true;
-          return null;
-        });
-      }
-      jobId = prev.job_id;
-      return loadConfirmedFromStorage();
+      var answer = opts.skipConfirm ? true
+        : (opts.confirmResume ? opts.confirmResume() : true);
+      return Promise.resolve(answer).then(function (doResume) {
+        if (!doResume) return cancelJob(prev.job_id);
+        var verdict = prepareResumeRecord(prev);
+        if (verdict === "discard") {
+          return cancelJob(prev.job_id).then(function () {
+            resumeRejected = true;
+            return null;
+          });
+        }
+        jobId = prev.job_id;
+        return loadConfirmedFromStorage();
+      });
     }
 
     // —— 上传前置魔数校验（upload-liveness 0084：fail-fast）——
@@ -1302,5 +1605,11 @@
     // 分片摘要方案（published receipt 的内容凭证核验与引擎同一实现）
     digestScheme: DIGEST_SCHEME,
     sha256HexChunked: sha256HexChunked,
+    // 续传服务端清单的内容核验（upload-resilience 2026-11-10）：
+    // ETag(MD5) ↔ 分块字节；随包导出供单测按已知向量核验。
+    md5Hex: md5Hex,
+    md5HexChunked: md5HexChunked,
+    partDigestsChunked: partDigestsChunked,
+    etagMd5: etagMd5,
   };
 })();

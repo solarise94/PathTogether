@@ -856,6 +856,26 @@ button {
   gap: 6px;
   margin-top: 8px;
 }
+/* upload-resilience（2026-11-10）：队列头部的「全部取消」条。与行容器
+   一起移动进抽屉宿主；只在 ≥2 个可取消行时显示（app.js 控制 hidden）。 */
+.upload-bulk-bar {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 6px;
+}
+.upload-bulk-bar[hidden] { display: none; }
+/* 重复文件合并对话框的清单（长名字换行，不撑破面板宽度） */
+.upload-dup-list {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  max-height: 40vh;
+  overflow: auto;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.upload-dup-list li { margin: 2px 0; }
+.upload-confirm-dialog { max-width: min(460px, calc(100vw - 32px)); }
+.upload-confirm-body { display: flex; flex-direction: column; gap: 2px; }
 .upload-item {
   padding: 6px 8px;
   border: 1px solid var(--hover-strong);

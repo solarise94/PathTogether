@@ -472,7 +472,12 @@ test("B PNG 内容改名 .jpg 当场被拒（零 ingestion），「申请支持�
   const supportPosts: Array<Record<string, unknown>> = [];
   page.on("request", (r) => {
     const u = new URL(r.url());
-    if (u.pathname.startsWith("/api/ingestions")) ingestionCalls.push(u.pathname);
+    // upload-resilience：POST /api/ingestions/duplicates 是只读的重复提示
+    // 查询（不建任务）；「零 ingestion」断言只统计会改服务端状态的任务请求。
+    if (u.pathname.startsWith("/api/ingestions") &&
+        !u.pathname.startsWith("/api/ingestions/duplicates")) {
+      ingestionCalls.push(u.pathname);
+    }
     if (r.method() === "PUT" && u.hostname === "127.0.0.1"
         && /\/incoming\//.test(u.pathname)) crossOriginPuts.push(u.pathname);
   });
@@ -541,7 +546,12 @@ test("C 转换中刷新页面，点「继续」把转换做完并上传（刷新
   const crossOriginPuts: string[] = [];
   page.on("request", (r) => {
     const u = new URL(r.url());
-    if (u.pathname.startsWith("/api/ingestions")) ingestionCalls.push(u.pathname);
+    // upload-resilience：POST /api/ingestions/duplicates 是只读的重复提示
+    // 查询（不建任务）；「零 ingestion」断言只统计会改服务端状态的任务请求。
+    if (u.pathname.startsWith("/api/ingestions") &&
+        !u.pathname.startsWith("/api/ingestions/duplicates")) {
+      ingestionCalls.push(u.pathname);
+    }
     if (r.method() === "PUT" && u.hostname === "127.0.0.1"
         && /\/incoming\//.test(u.pathname)) crossOriginPuts.push(u.pathname);
   });
@@ -662,7 +672,11 @@ test("开关 inline_convert 关闭：需转换文件行内说明 + 重试/支持
   page.context().on("page", (p) => popups.push(p.url()));
   const ingestionCalls: string[] = [];
   page.on("request", (r) => {
-    if (new URL(r.url()).pathname.startsWith("/api/ingestions")) ingestionCalls.push(r.url());
+    // 同上：只读 duplicates 查询（POST）不计入「零 ingestion」断言
+    if (new URL(r.url()).pathname.startsWith("/api/ingestions") &&
+        !new URL(r.url()).pathname.startsWith("/api/ingestions/duplicates")) {
+      ingestionCalls.push(r.url());
+    }
   });
   const pageErrors: string[] = [];
   page.on("pageerror", (e) => pageErrors.push(e.message));

@@ -450,6 +450,14 @@ test("c 抽屉选择文件后进度与取消在抽屉内（侧栏折叠 + 小屏
   // 小屏（≤768px 抽屉全宽覆盖）——进度不得依赖侧栏；行必须渲染在可见的
   // 抽屉面板内（后面按几何断言行在抽屉边界内）
   await page.setViewportSize({ width: 480, height: 860 });
+  // upload-resilience：Chromium 的「选择文件」改走 showOpenFilePicker（多选 +
+  // FileSystemFileHandle，供刷新后免重选续传）。原生选择器无法由 Playwright
+  // 驱动（也不发 filechooser 事件）——本用例验证的是**回退路径**的抽屉进度/
+  // 取消（Firefox/Safari 生产路径）；句柄持久化由 tests/js/upload-resilience
+  // 单测覆盖。移除该 API 让按钮回落到既有 #file-input。
+  await page.addInitScript(() => {
+    delete (window as { showOpenFilePicker?: unknown }).showOpenFilePicker;
+  });
   await openWorkbench(page);
 
   // 真实点击路径：导入切片（＋菜单）→ 导入抽屉 → 选择文件 → FileChooser

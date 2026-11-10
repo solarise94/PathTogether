@@ -631,10 +631,11 @@ describe("转换器页接线（/tools/slides）", () => {
 		// 行附注是 aria-live（确认/拒绝的状态变化读屏可闻）
 		expect(appSrc).toMatch(/upload-item-status";[\s\S]{0,120}setAttribute\("aria-live", "polite"\)/);
 		// drop 事件内同步捕获 FileSystemFileHandle（getAsString 之外唯一的
-		// 事件内窗口），并按 File 传给 uploadFile → enqueue → _fileHandle
+		// 事件内窗口），随批量条目交给 uploadFiles → enqueue → _fileHandle
+		//（upload-resilience：多文件一次批量去重；句柄按文件保留）。
 		expect(appSrc).toMatch(/function handleWorkbenchDrop\(dt\)[\s\S]*?getAsFileSystemHandle/);
-		expect(appSrc).toMatch(/uploadFile\(files\[f2\], handle \? \{ fileHandle: handle \} : undefined\)/);
-		expect(appSrc).toMatch(/fileHandle: opts\.fileHandle \|\| null/);
+		expect(appSrc).toMatch(/items\.push\(\{ file: files\[f2\], handle: handle \}\)/);
+		expect(appSrc).toContain("handle: opts.fileHandle || null");
 		// 协助行的「选择文件夹」：目录选择器优先；无 API/SecurityError → 同
 		// 手势回退 webkitdirectory input（pendingCompanion 标记待处理）
 		expect(appSrc).toContain("function companionPickForEntry(entry)");

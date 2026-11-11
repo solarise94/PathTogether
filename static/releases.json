@@ -3,6 +3,31 @@
   "version_scheme": "YYYY.MM.DD product release. Do not use PathTogether package.json 0.1.0 (test package) as the product version.",
   "releases": [
     {
+      "version": "2026.11.11",
+      "date": "2026-11-11",
+      "published": true,
+      "components": {
+        "histopilot": "0.4.11",
+        "pathtogether": "suite-20261111a"
+      },
+      "items": {
+        "zh": [
+          "部分大尺寸切片原本只有一层原图（常见于某些显微镜软件或扫描仪导出的单层 TIFF / OME-TIFF），缩小查看时又慢又吃力。现在上传这类文件后，服务器会自动补建缩略层级：查看器缩放更流畅，AI 读片也能先看整片概况、再放大到局部。原图像素无损保留，比例尺不变。",
+          "此前已经上传的这类切片已全部补建完成，无需重新上传；其中原本未压缩的文件改为无损压缩，占用的存储空间随之减少。",
+          "添加文件时，如果它已在上传列表中、切片库里已有同名同大小的切片，或刚上传完还在处理，会先提示你确认，避免重复上传。",
+          "上传中断后可以接着传：重新选择同一个文件，已上传的部分逐块核对无误后直接跳过；在 Chrome、Edge 等浏览器中刷新页面后，点「继续上传」即可，不必重新选择文件。",
+          "上传列表中有两个以上任务时，可以一键「全部取消」。"
+        ],
+        "en": [
+          "Some large slides contain only a single full-resolution layer (common for single-layer TIFF / OME-TIFF files exported by certain microscope software or scanners), which made zooming out slow. After upload, the server now builds overview levels for these files automatically: zooming in the viewer is smoother, and AI analysis can look at the whole slide first and then zoom into regions. Original pixels are preserved losslessly and the scale is unchanged.",
+          "Slides of this kind that were uploaded earlier have all been given overview levels; there is no need to upload them again. Files that were stored uncompressed now use lossless compression, so they take up less storage.",
+          "When you add a file that is already in the upload list, matches a slide with the same name and size in your library, or has just finished uploading and is still being processed, you are asked to confirm first to avoid duplicate uploads.",
+          "Interrupted uploads can be resumed: select the same file again and parts already uploaded are checked block by block and skipped. In Chrome, Edge and similar browsers, after a page refresh you can simply click “Continue upload” without selecting the file again.",
+          "When the upload list has two or more items, you can cancel them all at once with “Cancel all”."
+        ]
+      }
+    },
+    {
       "version": "2026.11.09",
       "date": "2026-11-09",
       "published": true,

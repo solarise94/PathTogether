@@ -1006,11 +1006,11 @@ def test_login_dialog_template_phase1_requirements():
     entry_html = (REPO_ROOT / "templates" / "entry.html").read_text(encoding="utf-8")
     assert '{% include "_login_dialog.html" %}' in entry_html
     text = (REPO_ROOT / "templates" / "_login_dialog.html").read_text(encoding="utf-8")
-    # 次入口：注册方式 + Demo；找回提示为纯文本（非链接，docs §6.1）
+    # 次入口：注册方式 + Demo；忘记密码为可点击的自助入口（0095）
     assert 'href="/register"' in text and "login.register" in text
     assert 'href="/demo"' in text and "login.demo" in text
-    assert '<p class="login-dialog-forgot" data-i18n="login.forgot">' in text
-    assert 'class="forgot" href=' not in text
+    assert '<a href="/password-reset" data-i18n="login.forgot">' in text
+    assert "联系管理员重置" not in text
     # 弹窗表单：提交按钮 + CSRF 隐藏域 + next 透传
     assert 'type="submit"' in text
     assert 'name="csrf_token"' in text

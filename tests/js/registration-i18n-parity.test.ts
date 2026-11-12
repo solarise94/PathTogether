@@ -22,6 +22,8 @@ const i18nSrc = readFileSync(join(root, "static/i18n.js"), "utf8");
 const dialogSrc = readFileSync(join(root, "templates/_login_dialog.html"), "utf8");
 const helpSrc = readFileSync(join(root, "templates/registration_help.html"), "utf8");
 const verifySrc = readFileSync(join(root, "templates/verify_email.html"), "utf8");
+const resetRequestSrc = readFileSync(join(root, "templates/password_reset.html"), "utf8");
+const resetLandingSrc = readFileSync(join(root, "templates/reset_password.html"), "utf8");
 const loaderSrc = readFileSync(join(root, "static/register-turnstile.js"), "utf8");
 const helpJsSrc = readFileSync(join(root, "static/registration-help.js"), "utf8");
 
@@ -109,6 +111,22 @@ describe("注册防刷页面 i18n 键位一致性", () => {
 			expect(en.has(key), `i18n.js en 缺键：${key}`).toBe(true);
 			const zhVal = (zh.get(key) ?? "").replace(/\\"/g, "\"");
 			expect(zhVal, `模板默认与 zh 词典不一致：${key}`).toBe(templateDefault);
+		}
+	});
+
+	it("找回密码两页：data-i18n 键 zh/en 都存在，静态模板默认=zh 词典值", () => {
+		const zh = dictEntries("zh");
+		const en = dictEntries("en");
+		for (const src of [resetRequestSrc, resetLandingSrc]) {
+			for (const [key, templateDefault] of templateKeys(src)) {
+				if (key.includes("{{") || templateDefault.includes("{{")) {
+					continue; // 动态文案（如 generic_message）由 Python 测试覆盖
+				}
+				expect(zh.has(key), `i18n.js zh 缺键：${key}`).toBe(true);
+				expect(en.has(key), `i18n.js en 缺键：${key}`).toBe(true);
+				const zhVal = (zh.get(key) ?? "").replace(/\\"/g, "\"");
+				expect(zhVal, `模板默认与 zh 词典不一致：${key}`).toBe(templateDefault);
+			}
 		}
 	});
 

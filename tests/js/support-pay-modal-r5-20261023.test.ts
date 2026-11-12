@@ -322,6 +322,6 @@ describe("支付弹层 r5：资产版本与既有口径（2026-10-23）", () => 
     expect(html).toContain("/static/support/support.js?v=20261026a");
     expect(html).not.toContain("/static/support/support.js?v=20261023a");
     expect(html).toContain("/static/support/support.css?v=20261023a");
-    expect(html).toContain("/static/i18n.js?v=20261026a");
+    expect(html).toContain("/static/i18n.js?v=20261112a");
   });
 });

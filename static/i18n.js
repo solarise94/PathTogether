@@ -830,7 +830,7 @@
       // 「注册方式」入口提示已下线
       "login.register": "没有账号？注册",
       "login.demo": "先体验 Demo",
-      "login.forgot": "忘记密码？请联系管理员重置。",
+      "login.forgot": "忘记密码？",
       "login.error.invalid": "账号或密码错误",
       "login.error.locked": "尝试过于频繁，请稍后再试",
       "login.error.unavailable": "登录暂不可用：跨 worker 登录防爆破需要 PostgreSQL 后端，已按安全策略暂停登录。请联系管理员。",
@@ -841,6 +841,36 @@
       "login.password_changed": "密码已修改，请使用新密码重新登录",
       // 注册成功后转登录的提示（P1 public §4.2；模板默认同值）
       "login.registered": "注册成功，请使用邮箱和密码登录",
+      // 邮件找回密码成功后的登录页提示（0095；模板默认同值）
+      "login.password_reset": "密码已重置，请用新密码登录",
+
+      // ---- 自助找回密码（0095 /password-reset + /reset-password） ----
+      "password.reset.badge": "找回密码",
+      "password.reset.title": "找回密码",
+      "password.reset.subtitle": "输入注册邮箱，我们会发送重置链接。",
+      "password.reset.email": "邮箱地址",
+      "password.reset.email.ph": "you@example.com",
+      "password.reset.email.hint": "为保护账号安全，无论邮箱是否注册都会显示相同提示。",
+      "password.reset.submit": "发送重置链接",
+      "password.reset.sent.title": "请求已提交",
+      "password.reset.sent": "如果该邮箱已注册，我们已发送重置链接，请在 30 分钟内查收。",
+      "password.reset.sent.hint": "如果没有收到，请检查垃圾邮件；重置链接只能使用一次。",
+      "password.reset.again": "重新填写邮箱",
+      "password.reset.back_login": "返回登录",
+      "password.reset.challenge_failed.title": "安全验证未完成",
+      "password.reset.challenge_failed": "安全验证未完成，本次未发送重置邮件。请重新完成验证后再试。",
+      "password.reset.challenge_unavailable.title": "验证服务暂时不可用",
+      "password.reset.challenge_unavailable": "安全验证服务暂时不可用，本次未发送重置邮件。请稍后重试。",
+      "password.reset.form.title": "设置新密码",
+      "password.reset.form.subtitle": "链接有效，请在下方设置新密码（15..200 个字符）。",
+      "password.reset.new": "新密码",
+      "password.reset.confirm": "确认新密码",
+      "password.reset.form.hint": "重置成功后，所有已登录设备都需要用新密码重新登录。",
+      "password.reset.submit_new": "重置密码",
+      "password.reset.invalid.title": "链接无效或已过期",
+      "password.reset.invalid": "该重置链接无效、已过期或已被使用。请重新请求重置链接。",
+      "password.reset.request_again": "重新请求重置链接",
+      "password.reset.footer": "仅用于研究、教学和软件演示，不用于临床诊断。",
 
       // ---- 入口分流页（docs §3.2） ----
       "entry.demo": "直接体验 Demo",
@@ -1424,7 +1454,7 @@
       "upload.cos.err.raster_mismatch": "文件内容与扩展名不符（例如 PNG/WebP 被存成了 .jpg）：请用正确格式重新保存或改名后再上传",
       "upload.cos.err.magic": "文件内容与扩展名不符（检测到 {type}）：请用正确格式重新保存后再上传",
       // 存储配额超限（2026-11-04）：上限数值取该用户实际配额；拿不到数值时
-      // 使用不带数字的通用版本（login.forgot 同款「联系管理员」措辞）。
+      // 使用不带数字的通用版本（不含具体配额数值，需联系管理员）。
       "upload.cos.stage.quota_full": "存储空间已满",
       "upload.cos.err.quota": "存储空间已满（上限 {quota}）。如需更多容量，请联系管理员。",
       "upload.cos.err.quota.generic": "存储空间已满。如需更多容量，请联系管理员。",
@@ -2932,7 +2962,7 @@
       // (unified dialog); the old registration-options hint is retired
       "login.register": "No account? Sign up",
       "login.demo": "Try the Demo first",
-      "login.forgot": "Forgot your password? Contact an administrator to reset it.",
+      "login.forgot": "Forgot your password?",
       "login.error.invalid": "Incorrect account or password",
       "login.error.locked": "Too many attempts. Please try again later.",
       "login.error.unavailable": "Login is temporarily unavailable: cross-worker brute-force protection requires a PostgreSQL backend. Please contact the administrator.",
@@ -2943,6 +2973,36 @@
       "login.password_changed": "Password changed. Please log in again with your new password.",
       // Notice after completing registration and returning to login (P1 public §4.2)
       "login.registered": "Sign-up complete. Log in with your email and password.",
+      // Notice after a successful email password reset (0095)
+      "login.password_reset": "Password reset. Please sign in with your new password.",
+
+      // ---- Self-service password reset (0095 /password-reset + /reset-password) ----
+      "password.reset.badge": "Reset password",
+      "password.reset.title": "Reset your password",
+      "password.reset.subtitle": "Enter your registered email and we will send a reset link.",
+      "password.reset.email": "Email address",
+      "password.reset.email.ph": "you@example.com",
+      "password.reset.email.hint": "To protect your account, the same message is shown whether or not the email is registered.",
+      "password.reset.submit": "Send reset link",
+      "password.reset.sent.title": "Request submitted",
+      "password.reset.sent": "If this email is registered, we have sent a reset link. Please check your inbox within 30 minutes.",
+      "password.reset.sent.hint": "If it does not arrive, check your spam folder. The reset link can only be used once.",
+      "password.reset.again": "Enter a different email",
+      "password.reset.back_login": "Back to login",
+      "password.reset.challenge_failed.title": "Security check not completed",
+      "password.reset.challenge_failed": "The security check was not completed, so no reset email was sent. Please complete the check and try again.",
+      "password.reset.challenge_unavailable.title": "Verification service temporarily unavailable",
+      "password.reset.challenge_unavailable": "The security verification service is temporarily unavailable, so no reset email was sent. Please try again later.",
+      "password.reset.form.title": "Set a new password",
+      "password.reset.form.subtitle": "The link is valid. Set a new password below (15–200 characters).",
+      "password.reset.new": "New password",
+      "password.reset.confirm": "Confirm new password",
+      "password.reset.form.hint": "After resetting, all signed-in devices will need to sign in again with the new password.",
+      "password.reset.submit_new": "Reset password",
+      "password.reset.invalid.title": "Link invalid or expired",
+      "password.reset.invalid": "This reset link is invalid, expired or already used. Please request a new reset link.",
+      "password.reset.request_again": "Request a new reset link",
+      "password.reset.footer": "For research, teaching and software demonstration only; not for clinical diagnosis.",
 
       // ---- 入口分流页（docs §3.2） ----
       "entry.demo": "Try the Demo",

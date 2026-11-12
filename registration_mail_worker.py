@@ -734,7 +734,11 @@ class TencentSesMailSender:
 class PurposeRoutingMailSender:
     """Fixed routes by server-frozen purpose; transport errors never change routes."""
 
-    SMTP_KEYS = frozenset(("user_feedback_zh", "format_request_zh"))
+    #: 完整正文走 SMTP 的用途：复杂诊断正文 + 自助找回密码（重置邮件是
+    #: 纯文本账号服务邮件，尚未为它新建/审核 SES 模板；在 tencent_ses 混合
+    #: 模式下同样由既有 SMTP 通道发送，不跨通道回退）。
+    SMTP_KEYS = frozenset(("user_feedback_zh", "format_request_zh",
+                           "password_reset_zh", "password_reset_en"))
 
     def __init__(self, ses, smtp):
         self.ses = ses
@@ -837,9 +841,9 @@ def drain_once(limit=_DRAIN_BATCH, sender=None, environ=None) -> int:
     registration_store.resolve_effective_registration_mode 的权威判定（worker
     绝不 import Flask app）。非 email_verify_invite_activation → **注册类
     邮件（purpose='email_verify'）暂停**（保留 queued：不 fail、不计时、
-    不改状态）；账户服务邮件（purpose='email_change'，登录用户的本人
-    操作）不在注册停机范围内，照常发送（注册关闭不应波及已注册用户
-    的本人邮件——P1-3 改绑闭环依赖此通道）。
+    不改状态）；账户服务邮件（purpose='email_change' / 'password_reset'，
+    登录用户的本人操作）不在注册停机范围内，照常发送（注册关闭不应波及
+    已注册用户的本人邮件——P1-3 改绑与 0095 找回密码闭环依赖此通道）。
 
     每条作业独立事务：``SELECT ... FOR UPDATE SKIP LOCKED``（行锁只在单条
     发送期间持有）→ 解密载荷 → sender.send → 按阶段分类落状态（P1-1）：

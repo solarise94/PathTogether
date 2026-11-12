@@ -28,6 +28,7 @@ _PUBLIC_NAMES = (
     # 统一密码策略（两实现一致）
     "PASSWORD_MIN_LENGTH",
     "PASSWORD_MAX_LENGTH",
+    "validate_password",
     # user ai_config.max_steps 默认值（两实现一致）
     "DEFAULT_USER_MAX_STEPS",
     # —— 函数 ——

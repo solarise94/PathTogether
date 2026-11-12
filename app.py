@@ -109,6 +109,10 @@ import registration_antibot
 # 存量冲突清单 / orphan pending 处置的存储原语（复用 registration_mail_jobs
 # 队列与 registration_store 公开校验函数；详见 identity_store 模块 docstring）。
 import identity_store
+# 自助找回密码（0095）：公开入口入队 → /reset-password 落地消费。复用
+# registration_mail_jobs / registration_mail_worker / registration_antibot
+# 与 user_store 统一密码策略；账号存在性不泄露出任何响应。
+import password_reset_store
 # PR4 用户来源归因（docs/admin-billing-plugin-implementation-plan.md §11）：
 # acquisition_store 提供 /r/<source_code> 触点写入、注册归因（redeem_invite
 # 同事务）、匿名触点 90 天清理与 admin 漏斗/明细汇总。PostgreSQL 唯一后端。
@@ -912,11 +916,13 @@ def _auth_hash_salt() -> str:
 
 
 def _auth_subject_hash(account: str) -> str:
-    """规范化账号（lower+strip）的带盐 HMAC-SHA256（scope=account 的 subject）。"""
-    norm = (account or "").strip().lower()
-    return hmac.new(
-        ("acct:" + _auth_hash_salt()).encode("utf-8"),
-        norm.encode("utf-8"), hashlib.sha256).hexdigest()
+    """规范化账号（lower+strip）的带盐 HMAC-SHA256（scope=account 的 subject）。
+
+    实现下沉到 auth_limit_store.account_subject_hash：密码重置事务在同一
+    事务内清登录失败桶时复用同一函数，避免两处盐链/规范化漂移。
+    """
+    import auth_limit_store
+    return auth_limit_store.account_subject_hash(account, _auth_hash_salt())
 
 
 def _ip_prefix(ip: str) -> str:
@@ -1032,6 +1038,11 @@ _REGISTRATION_PUBLIC_PATHS = frozenset({
     "/registration-help",
     # P1：public 名额公共快照（只读、无枚举信号；§4.3）
     "/api/registration/public-status",
+    # 0095 自助找回密码：申请表单（GET/POST）与邮件落地页（GET/POST）均
+    # 匿名可用；CSRF 仍由全局 before_request 闸覆盖（与 /register 同口径），
+    # 账号存在性不通过状态码/正文泄露。
+    "/password-reset",
+    "/reset-password",
 })
 
 #: enrollment 受限会话白名单（设计文档第 8 节 I-R4）：pending_activation
@@ -6143,11 +6154,13 @@ app.session_interface = _PtSessionInterface()
 
 def _login_page(error=None, error_code=None, next_url="/app", retry_after=0,
                 status=200, headers=None, password_changed=False,
-                registered=False):
+                registered=False, password_reset=False):
     """渲染登录页（统一携带 CSRF token 与服务端权威 retry_after）。
 
     password_changed=True 时渲染「密码已修改，请使用新密码重新登录」提示
     （本人改密成功后前端跳 /login?password_changed=1，docs §7.1-7）。
+    password_reset=True 时渲染「密码已重置，请用新密码登录」提示（0095
+    邮件找回密码成功后 303 到 /login?password_reset=1，不自动登录）。
     registered=True 时渲染「注册成功」提示（P1：public 注册成功跳
     /login?registered=1，§4.2）。
     next_url 默认 /app：无安全 next 的普通登录成功直接进工作台（R3）。
@@ -6158,6 +6171,7 @@ def _login_page(error=None, error_code=None, next_url="/app", retry_after=0,
                login_next_url=_safe_next_path(next_url),
                login_retry_after=int(retry_after or 0),
                login_password_changed=bool(password_changed),
+               login_password_reset=bool(password_reset),
                login_registered=bool(registered))
     resp = make_response(render_template("entry.html", **ctx), status)
     resp = _apply_landing_security_headers(resp)
@@ -6197,6 +6211,7 @@ def login():
         return _login_page(
             next_url=next_url,
             password_changed=request.args.get("password_changed") == "1",
+            password_reset=request.args.get("password_reset") == "1",
             registered=request.args.get("registered") == "1")
 
     # ---- POST ----
@@ -7053,6 +7068,273 @@ def api_account_email_change_confirm():
                    email_masked=registration_store.mask_login_id(
                        result["email"]),
                    sessions_revoked=True)
+
+
+# =========================================================================== #
+# 0095 自助找回密码（忘记密码 → 邮件重置链接 → 设置新密码）
+#
+# 流程：
+#   1. GET /password-reset：公开申请表单（邮箱 + 可选 Turnstile；CSRF 走全局
+#      before_request 闸，与 /register 同口径）；
+#   2. POST /password-reset：规范化邮箱 → 每 IP 前缀限流 → 入口站点解析 →
+#      Turnstile（required 时 fail-closed）→ password_reset_store 单事务
+#      判定账号资格/同邮箱配额并入队（purpose='password_reset'，0095 扩词表；
+#      payload 绑定 user_id + auth_version，token 只存 HMAC hash）；
+#      **任何账号状态（未知/owner/禁用/未激活/符合条件）都渲染同一通用文案**，
+#      仅服务端日志区分；
+#   3. GET /reset-password?token=：只展示不消费；有效才给新密码表单，
+#      无效/过期/已用一律中性提示 + 重新申请入口；页面 no-store +
+#      Referrer-Policy: no-referrer（token 在 URL 上，绝不通过 Referer 外泄）；
+#   4. POST /reset-password：token + 新密码 + 确认 + CSRF；单事务消费 token、
+#      更新 password_hash、auth_version+1（全端 session 失效）、清登录失败
+#      桶、写 user.password_reset_email 审计；不自动登录，303 回
+#      /login?password_reset=1。
+# =========================================================================== #
+PASSWORD_RESET_GENERIC_MESSAGE = (
+    "如果该邮箱已注册，我们已发送重置链接，请在 30 分钟内查收。")
+
+
+def _password_reset_entry_site():
+    """本次找回密码请求的入口站点（origin/default_locale）。
+
+    与注册/改绑共用 registration_antibot 的 Host 映射；生产未知 Host
+    （refused）时申请页仍可渲染，但申请 POST 拒绝发信并回通用响应。
+    """
+    entry = _registration_entry_site()
+    if entry and not entry.get("refused"):
+        return {"origin": entry["origin"], "name": entry["name"],
+                "default_locale": entry["default_locale"]}
+    return {"origin": "", "name": "HistoPilot", "default_locale": "zh"}
+
+
+def _password_reset_turnstile_context():
+    """申请表单的 Turnstile 渲染上下文（独立 action；secret 绝不出现）。"""
+    return registration_antibot.turnstile_widget_context(
+        action=registration_antibot.ACTION_PASSWORD_RESET_START)
+
+
+def _password_reset_csp(allow_turnstile=False):
+    """找回密码页 CSP：仅本域资源；Turnstile 已配置时追加官方源。
+
+    与 landing 页同口径（不放开任意第三方域名、不加 'unsafe-inline'）；
+    页面样式/脚本全部外置（static/password-reset.{css,js}）。
+    """
+    script_src = "'self'"
+    frame_directive = ""
+    if allow_turnstile:
+        script_src += " https://challenges.cloudflare.com"
+        frame_directive = "frame-src https://challenges.cloudflare.com; "
+    return (
+        "default-src 'none'; script-src " + script_src + "; style-src 'self'; "
+        "img-src 'self' data:; font-src 'self'; connect-src 'self'; "
+        "base-uri 'none'; form-action 'self'; " + frame_directive +
+        "frame-ancestors 'none'")
+
+
+def _apply_password_reset_security_headers(resp, allow_turnstile=False):
+    """找回密码页面统一安全头：禁止缓存、禁止嵌入、Referer 不外发。
+
+    token 只出现在 /reset-password?token=… 的 URL 上；Referrer-Policy:
+    no-referrer 保证点击任何链接/加载子资源时都不会把含 token 的 URL 经
+    Referer 带给第三方。
+    """
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    # 不进入搜索引擎索引（reset 页 URL 含 token；申请页含邮箱表单）
+    resp.headers["X-Robots-Tag"] = "noindex, nofollow"
+    resp.headers["Content-Security-Policy"] = _password_reset_csp(
+        allow_turnstile)
+    return resp
+
+
+def _password_reset_request_page(state="form", error=None, status=200):
+    """渲染找回密码申请页（form / submitted / challenge_*）。"""
+    turnstile = _password_reset_turnstile_context()
+    resp = make_response(render_template(
+        "password_reset.html", state=state, error=error,
+        csrf_token=ensure_csrf_token(), turnstile=turnstile,
+        entry_site=_password_reset_entry_site(),
+        generic_message=PASSWORD_RESET_GENERIC_MESSAGE), status)
+    return _apply_password_reset_security_headers(
+        resp, allow_turnstile=turnstile["enabled"])
+
+
+def _password_reset_generic_page():
+    """账号存在性通用响应（未知/owner/禁用/未激活/符合条件/限额同一页面）。"""
+    return _password_reset_request_page(state="submitted")
+
+
+def _password_reset_turnstile_guard():
+    """找回密码申请前置 Turnstile 校验（同 registration 的三分类语义）。
+
+    返回 None（通过或未启用）或页面状态 challenge_failed /
+    challenge_unavailable——均不入队、不占邮箱发送额度。
+    """
+    cfg = registration_antibot.load_turnstile_config()
+    if not cfg.required:
+        return None
+    result = registration_antibot.verify(
+        _turnstile_request_token(),
+        action=registration_antibot.ACTION_PASSWORD_RESET_START,
+        remoteip=(request.remote_addr or "").strip(),
+        expected_hostname=registration_antibot.request_hostname(request.host),
+        config=cfg)
+    if result.ok:
+        return None
+    req_id = secrets.token_hex(8)
+    if result.status == "rejected":
+        app.logger.warning(
+            "password_reset challenge_rejected req=%s entry=%s reason=%s",
+            req_id, registration_antibot.request_hostname(request.host) or "-",
+            result.reason)
+        return "challenge_failed"
+    app.logger.warning(
+        "password_reset challenge_unavailable req=%s entry=%s reason=%s",
+        req_id, registration_antibot.request_hostname(request.host) or "-",
+        result.reason)
+    return "challenge_unavailable"
+
+
+@app.route("/password-reset", methods=["GET", "POST"])
+def password_reset_request():
+    """找回密码申请（公开；账号存在性不泄露）。
+
+    - GET：渲染邮箱表单（Turnstile 配置与注册同一套）；
+    - POST：邮箱形态校验 → 每 IP 前缀限流 → 入口站点 → Turnstile →
+      单事务资格/配额/入队；**所有账号状态都返回同一通用页面**；
+    - 限流存储/邮件通道不可用时也不改变对外文案（服务端日志留痕）。
+    """
+    if request.method == "GET":
+        return _password_reset_request_page()
+
+    email = (request.form.get("email") or "").strip()
+    try:
+        email_norm = registration_store.validate_email(email)
+    except registration_store.EmailVerifyError:
+        # 形态错误是本地输入问题，不是账号存在性信号
+        return _password_reset_request_page(
+            error="请输入有效的邮箱地址", status=400)
+
+    # 每 IP 前缀限流（先于 Turnstile，与 /register 的处理顺序一致）。超限
+    # 返回与成功完全相同的通用页面，仅服务端日志留痕。
+    import auth_limit_store
+    ip_hash = _ip_prefix_hash(request.remote_addr or "")
+    try:
+        retry = auth_limit_store.check_password_reset_ip_locked(ip_hash)
+        if retry <= 0:
+            retry = auth_limit_store.record_password_reset_attempt(ip_hash)
+    except Exception:
+        app.logger.exception(
+            "找回密码 IP 限流存储不可用（fail-closed：不发信，通用响应）")
+        return _password_reset_generic_page()
+    if retry > 0:
+        app.logger.warning("找回密码请求触发 IP 限流（ip_prefix=%s）",
+                           (ip_hash or "-")[:12])
+        return _password_reset_generic_page()
+
+    entry = _registration_entry_site()
+    if not entry or entry.get("refused"):
+        # 生产部署未知 Host：不把任意 Host 反射进重置链接（§6 信任边界）
+        app.logger.warning(
+            "找回密码入口未映射（拒绝发信）host=%s",
+            registration_antibot.request_hostname(request.host) or "-")
+        return _password_reset_generic_page()
+
+    tstate = _password_reset_turnstile_guard()
+    if tstate is not None:
+        return _password_reset_request_page(state=tstate)
+
+    locale = registration_antibot.normalize_form_locale(
+        request.form.get("form_locale"), entry.get("default_locale") or "zh")
+    try:
+        result = password_reset_store.request_password_reset(
+            email_norm, base_url=entry["origin"], locale=locale)
+    except password_reset_store.PasswordResetError as exc:
+        # 账号状态/内部拒绝一律通用响应；只记稳定 code
+        app.logger.warning("找回密码请求未入队（code=%s）", exc.code)
+        return _password_reset_generic_page()
+    except Exception:
+        app.logger.exception("找回密码请求异常（通用响应）")
+        return _password_reset_generic_page()
+    if result.get("kind") == "rate_limited":
+        app.logger.warning("找回密码请求触发邮箱配额（email=%s）",
+                           result.get("email_masked") or "-")
+    try:
+        registration_mail_worker.drain_async()
+    except Exception:
+        app.logger.warning("找回密码邮件即时排水启动失败（留待 worker）",
+                           exc_info=True)
+    return _password_reset_generic_page()
+
+
+def _reset_password_page(state, *, token="", email_masked=None, error=None,
+                         status=200):
+    """渲染重置密码落地页（form / invalid）。
+
+    无效/过期/已用统一渲染中性 invalid 页面（不区分细分状态），token 与
+    邮箱都不回显；有效页也只回掩码邮箱（模板当前不展示完整邮箱）。
+    """
+    resp = make_response(render_template(
+        "reset_password.html", state=state, error=error,
+        email_masked=email_masked,
+        token=token if state == "form" else "",
+        csrf_token=ensure_csrf_token()), status)
+    return _apply_password_reset_security_headers(resp)
+
+
+@app.route("/reset-password", methods=["GET", "POST"])
+def reset_password_landing():
+    """重置密码落地与提交。
+
+    - GET：只读校验 token（绝不消费）；有效才渲染新密码表单；
+    - POST：token + 新密码 + 确认 + CSRF；先做只读 token 校验与密码规则
+      校验（不消费），全部通过后单事务消费/改密/清失败桶/审计；
+    - 成功后 303 /login?password_reset=1（不自动登录）；当前端 session 显式
+      清空（auth_version 已推进，旧会话已失效）。
+    """
+    if request.method == "GET":
+        token = (request.args.get("token") or "").strip()
+        view = password_reset_store.check_password_reset_token(token)
+        state = "form" if (view.get("state") or "unknown") == "valid" \
+            else "invalid"
+        return _reset_password_page(
+            state, token=token, email_masked=view.get("email_masked"))
+
+    token = (request.form.get("token") or "").strip()
+    new_password = request.form.get("new_password")
+    confirm = request.form.get("password_confirm")
+    view = password_reset_store.check_password_reset_token(token)
+    if (view.get("state") or "unknown") != "valid":
+        return _reset_password_page("invalid")
+    if new_password != confirm:
+        return _reset_password_page(
+            "form", token=token, email_masked=view.get("email_masked"),
+            error="两次输入的密码不一致", status=400)
+    try:
+        user_store.validate_password(new_password)
+    except ValueError as exc:
+        # 与本人改密/注册同一套 15..200、非全空白规则与文案
+        return _reset_password_page(
+            "form", token=token, email_masked=view.get("email_masked"),
+            error=str(exc), status=400)
+    try:
+        password_reset_store.consume_password_reset(
+            token, new_password,
+            account_hash_salt=_auth_hash_salt(),
+            ip_prefix_hash=_ip_prefix_hash(request.remote_addr or ""))
+    except password_reset_store.PasswordResetError:
+        # 并发过期 / 已被其它路径改密（auth_version 已推进）/ owner 防御：
+        # 一律中性 invalid 页面，不泄露账号状态
+        return _reset_password_page("invalid")
+    except Exception:
+        app.logger.exception("密码重置提交异常（统一中性响应）")
+        return _reset_password_page("invalid")
+    # auth_version 已 +1：当前端（可能存在的）session 立即失效；不自动登录
+    session.clear()
+    return redirect("/login?password_reset=1", code=303)
 
 
 # =========================================================================== #

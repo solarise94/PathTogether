@@ -593,3 +593,101 @@ def test_migration_0081_applied_upgrade_and_idempotent(pg_uri):
         assert violated, "未知 purpose 应被 0081 约束拒绝"
     finally:
         c.close()
+
+
+# --------------------------------------------------------------------------- #
+# 8. 0095_password_reset_purpose（自助找回密码）：fresh/升级两路 + 原始 SQL
+#    重跑幂等
+# --------------------------------------------------------------------------- #
+_MIGRATION_0095 = "0095_password_reset_purpose.sql"
+
+
+def test_migration_0095_applied_upgrade_and_idempotent(pg_uri):
+    """fresh 库：conftest ensure_schema 已应用 0095（purpose 词表含
+    password_reset）。升级库：把约束回拨成 0061 旧词表后重跑 0095 原始 SQL
+    **两次**（第二次验证幂等）——必须换上新词表且保留既有全部用途值。"""
+    c = psycopg.connect(pg_uri)
+    try:
+        with c.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM schema_migrations WHERE filename=%s",
+                (_MIGRATION_0095,))
+            assert cur.fetchone() is not None, "0095 应已被 ensure_schema 应用"
+        c.commit()
+    finally:
+        c.close()
+
+    sql = (pg_store.migrations_dir() / _MIGRATION_0095).read_text(
+        encoding="utf-8")
+    c = psycopg.connect(pg_uri)
+    try:
+        with c.cursor() as cur:
+            # 模拟「已执行 0061 的存量库」：换回旧词表约束（无 password_reset）
+            cur.execute(
+                "ALTER TABLE registration_mail_jobs "
+                "DROP CONSTRAINT IF EXISTS registration_mail_jobs_purpose_check")
+            cur.execute(
+                "ALTER TABLE registration_mail_jobs ADD CONSTRAINT "
+                "registration_mail_jobs_purpose_check "
+                "CHECK (purpose IN ('email_verify', 'email_change', "
+                "'test_application', 'test_decision', "
+                "'registration_created'))")
+        c.commit()
+        # 旧约束下：password_reset 必须被拒（确认回拨成立）
+        blocked = False
+        try:
+            with c.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO registration_mail_jobs "
+                    "(job_id, purpose, email_normalized, token_hash, "
+                    "payload_enc, status, expires_at) VALUES "
+                    "('rmj_m95p','password_reset','a@x.com','t95','x',"
+                    "'queued', now() + interval '1 day')")
+            c.commit()
+        except psycopg.errors.CheckViolation:
+            blocked = True
+            c.rollback()
+        assert blocked, "0061 旧词表应拒绝 password_reset（回拨成立）"
+        # 升级：重跑 0095 原始 SQL 两次（第二次验证幂等）
+        for _ in range(2):
+            with c.cursor() as cur:
+                cur.execute(sql)
+        c.commit()
+        with c.cursor() as cur:
+            cur.execute(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                "WHERE conrelid='registration_mail_jobs'::regclass "
+                "AND conname='registration_mail_jobs_purpose_check'")
+            defn = cur.fetchone()[0]
+            for purpose in ("email_verify", "email_change",
+                            "test_application", "test_decision",
+                            "registration_created", "user_feedback",
+                            "password_reset"):
+                assert "'%s'" % purpose in defn, \
+                    "词表必须保留/新增 %s：%s" % (purpose, defn)
+            # 新词表：password_reset 通过（随后清理）
+            cur.execute(
+                "INSERT INTO registration_mail_jobs "
+                "(job_id, purpose, email_normalized, token_hash, "
+                "payload_enc, status, expires_at) VALUES "
+                "('rmj_m95p','password_reset','a@x.com','t95','x','queued',"
+                "now() + interval '1 day')")
+            cur.execute(
+                "DELETE FROM registration_mail_jobs WHERE job_id='rmj_m95p'")
+        c.commit()
+        violated = False
+        try:
+            with c.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO registration_mail_jobs "
+                    "(job_id, purpose, email_normalized, token_hash, "
+                    "payload_enc, status, expires_at) VALUES "
+                    "('rmj_m95x','bogus_purpose','a@x.com','t95x','x',"
+                    "'queued', now() + interval '1 day')")
+            c.commit()
+        except psycopg.errors.CheckViolation:
+            violated = True
+            c.rollback()
+        assert violated, "未知 purpose 应被 0095 约束拒绝"
+    finally:
+        c.close()

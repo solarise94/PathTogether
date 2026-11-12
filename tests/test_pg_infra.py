@@ -383,6 +383,9 @@ def test_schema_migrations_recorded(conn):
         # （UTC+8 日界 × source × 归一化输入格式；只存计数，不存文件/访客
         # 标识；转换器页与工作台 inline 转换共用）。
         "0094_tool_conversion_counts.sql",
+        # 自助找回密码（0095）：registration_mail_jobs.purpose 词表扩
+        # 'password_reset'（payload 绑定 user_id + auth_version）。
+        "0095_password_reset_purpose.sql",
     ]
 
 

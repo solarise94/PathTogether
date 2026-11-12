@@ -37,6 +37,9 @@ SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 #: 注册防刷的两种 action（§7）：首次提交 / 主动重发
 ACTION_REGISTRATION_START = "registration_start"
 ACTION_REGISTRATION_RESEND = "registration_resend"
+#: 找回密码启动表单的 action（同一套 Turnstile 配置/校验；独立 action 便于
+#: Cloudflare 侧区分挑战用途）
+ACTION_PASSWORD_RESET_START = "password_reset_start"
 
 #: 前端 token 的表单/JSON 字段名（Turnstile widget 自动注入）
 TURNSTILE_TOKEN_FIELD = "cf-turnstile-response"
@@ -368,17 +371,19 @@ def verify(token, *, action, remoteip=None, expected_hostname=None,
     return TurnstileResult("ok", "")
 
 
-def turnstile_widget_context(config=None) -> dict:
-    """注册弹窗的 Turnstile 渲染上下文（sitekey 公开；secret 绝不出现）。
+def turnstile_widget_context(config=None, action=ACTION_REGISTRATION_START) -> dict:
+    """注册弹窗/找回密码表单的 Turnstile 渲染上下文（sitekey 公开；secret 绝不出现）。
 
     ``enabled`` 仅在 required 且 configured 时为 True；required 但未配齐时
     为 False（widget 不渲染，发送路径一律 fail-closed 到 unavailable 态）。
+    ``action`` 缺省为注册首次提交；找回密码传入
+    :data:`ACTION_PASSWORD_RESET_START`。
     """
     cfg = config if config is not None else load_turnstile_config()
     return {
         "enabled": cfg.available,
         "site_key": cfg.site_key if cfg.available else "",
-        "action": ACTION_REGISTRATION_START,
+        "action": action,
     }
 
 

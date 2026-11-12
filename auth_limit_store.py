@@ -17,6 +17,8 @@ IP 前缀带盐 hash），绝不存明文账号或完整 IP。json/dual 后端 f
 操作，不能退化为无防爆破。
 """
 
+import hashlib
+import hmac
 import math
 import os
 import time
@@ -94,6 +96,18 @@ SUPPORT_STATUS_IP_WINDOW_SECONDS = _int_env(
     "SUPPORT_STATUS_IP_WINDOW_SECONDS", 900)
 SUPPORT_STATUS_IP_LOCK_SECONDS = _int_env(
     "SUPPORT_STATUS_IP_LOCK_SECONDS", 600)
+
+# 自助找回密码启动端点桶（0095；复用同一 (scope, subject_hash) 通用计数
+# 行，无需新表）：每 IP 前缀 15 分钟 10 次**尝试**（成功也计，达限锁 15
+# 分钟）。账号存在性不泄露——超限仍回通用响应，仅在服务端日志留痕；同邮箱
+# 冷却/日限额另由 registration_mail_jobs 作业行计数（password_reset_store）。
+SCOPE_PASSWORD_RESET_IP = "pwreset_ip"
+PASSWORD_RESET_IP_ATTEMPT_LIMIT = _int_env(
+    "PASSWORD_RESET_IP_ATTEMPT_LIMIT", 10)
+PASSWORD_RESET_IP_WINDOW_SECONDS = _int_env(
+    "PASSWORD_RESET_IP_WINDOW_SECONDS", 900)
+PASSWORD_RESET_IP_LOCK_SECONDS = _int_env(
+    "PASSWORD_RESET_IP_LOCK_SECONDS", 900)
 
 
 def _connect():
@@ -293,8 +307,22 @@ def check_auth_locked(account_hash, ip_prefix_hash):
         conn.close()
 
 
-def clear_auth_failures(account_hash, ip_prefix_hash):
-    """成功登录后清理该账号与来源 IP 前缀两条记录（不影响其他主体）。"""
+def account_subject_hash(account, salt) -> str:
+    """规范化账号（lower+strip）的带盐 HMAC-SHA256（scope=account 的 subject）。
+
+    app 层 ``_auth_subject_hash`` 与找回密码消费事务共用本实现，保证「清
+    登录失败桶」命中的正是 ``record_auth_failure`` 写入的同一 subject。
+    salt 由调用方提供（AUTH_SUBJECT_HASH_SALT 或 app secret）；本函数不
+    自行读取配置。
+    """
+    norm = (account or "").strip().lower()
+    return hmac.new(
+        ("acct:" + str(salt or "")).encode("utf-8"),
+        norm.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _clear_auth_failures_clauses(account_hash, ip_prefix_hash):
+    """构造清桶 WHERE 子句与参数（两个桶独立；空 subject 跳过）。"""
     clauses = []
     params = []
     for scope, subject_hash in (
@@ -303,16 +331,32 @@ def clear_auth_failures(account_hash, ip_prefix_hash):
         if subject_hash:
             clauses.append("(scope=%s AND subject_hash=%s)")
             params.extend((scope, subject_hash))
+    return clauses, params
+
+
+def clear_auth_failures_tx(cur, account_hash, ip_prefix_hash) -> int:
+    """同事务清该账号与来源 IP 前缀两条记录（成功登录/密码重置共用）。
+
+    调用方自行持有事务；返回删除行数。语义与 :func:`clear_auth_failures`
+    完全一致，供需要「改密 + 清桶」原子提交的密码重置事务注入 cursor。
+    """
+    clauses, params = _clear_auth_failures_clauses(
+        account_hash, ip_prefix_hash)
     if not clauses:
         return 0
+    cur.execute(
+        "DELETE FROM auth_rate_limits WHERE " + " OR ".join(clauses), params)
+    return cur.rowcount or 0
+
+
+def clear_auth_failures(account_hash, ip_prefix_hash):
+    """成功登录后清理该账号与来源 IP 前缀两条记录（不影响其他主体）。"""
     conn = _connect()
     try:
         with pg_store.transaction(conn) as c:
             with c.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM auth_rate_limits WHERE "
-                    + " OR ".join(clauses), params)
-                return cur.rowcount
+                return clear_auth_failures_tx(
+                    cur, account_hash, ip_prefix_hash)
     finally:
         conn.close()
 
@@ -514,6 +558,54 @@ def check_support_status_ip_locked(ip_prefix_hash):
                 if row is None:
                     return 0
                 return _retry_after(row["locked_until"], now)
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# 自助找回密码启动限流（0095）：每 IP 前缀尝试桶（成功也计）。全部 PG 权威，
+# 多 worker 一致；超限由路由层返回与成功完全相同的通用响应（不泄露账号
+# 是否存在），仅服务端日志留痕。
+# --------------------------------------------------------------------------- #
+def check_password_reset_ip_locked(ip_prefix_hash):
+    """查询找回密码启动端点限流锁定状态：返回剩余锁定秒数（0=未锁）。"""
+    if not ip_prefix_hash:
+        return 0
+    now = time.time()
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT extract(epoch from locked_until)::float8 "
+                    "AS locked_until FROM auth_rate_limits "
+                    "WHERE scope=%s AND subject_hash=%s",
+                    (SCOPE_PASSWORD_RESET_IP, ip_prefix_hash))
+                row = cur.fetchone()
+                if row is None:
+                    return 0
+                return _retry_after(row["locked_until"], now)
+    finally:
+        conn.close()
+
+
+def record_password_reset_attempt(ip_prefix_hash):
+    """记录一次找回密码启动尝试（成功也计）；返回锁定剩余秒数（0=未锁）。"""
+    now = time.time()
+    conn = _connect()
+    try:
+        with pg_store.transaction(conn) as c:
+            with c.cursor() as cur:
+                _purge_expired(cur, now, PASSWORD_RESET_IP_WINDOW_SECONDS,
+                               PASSWORD_RESET_IP_LOCK_SECONDS)
+                if not ip_prefix_hash:
+                    return 0
+                state = _record_failure(
+                    cur, SCOPE_PASSWORD_RESET_IP, ip_prefix_hash,
+                    PASSWORD_RESET_IP_ATTEMPT_LIMIT,
+                    PASSWORD_RESET_IP_WINDOW_SECONDS,
+                    PASSWORD_RESET_IP_LOCK_SECONDS, now)
+        return int(state.get("retry_after_seconds") or 0)
     finally:
         conn.close()
 

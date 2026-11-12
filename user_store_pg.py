@@ -124,6 +124,16 @@ PASSWORD_MIN_LENGTH = 15
 PASSWORD_MAX_LENGTH = 200
 
 
+def validate_password(password):
+    """公共密码策略校验（找回密码等入口复用；语义同 :func:`_validate_password`）。
+
+    新增公开名只做薄转发，不改变既有写路径：所有密码写入口仍直接调用
+    ``_validate_password``；需要「先校验、后决定是否消费 token」的流程
+    （password_reset_store）用本函数保证与 store 同一套规则与文案。
+    """
+    return _validate_password(password)
+
+
 def _validate_password(password):
     """统一密码策略校验：str、非全空白且 15..200 字符；违规 raise ValueError。
 

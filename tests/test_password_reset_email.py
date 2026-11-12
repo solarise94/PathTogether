@@ -370,6 +370,54 @@ def test_turnstile_not_required_has_no_widget(monkeypatch):
     assert 'name="csrf_token"' in page
 
 
+def test_failed_turnstile_does_not_consume_ip_bucket(monkeypatch):
+    """无挑战 token 的脚本流量不得消耗 IP 前缀桶（Turnstile 之后才计数）。
+
+    否则同一 CGNAT/校园网前缀下的真实用户被静默锁死：因为所有分支都只
+    显示通用页面，用户无法察觉。N 次失败挑战后，同前缀的有效挑战仍必须
+    能入队 password_reset 作业。
+    """
+    _mk_user("tsip@x.com")
+    monkeypatch.setattr(registration_antibot, "load_turnstile_config",
+                        lambda: _turnstile_cfg())
+
+    def _verify(token, **kwargs):
+        if token == "good-token":
+            return registration_antibot.TurnstileResult("ok", "")
+        return registration_antibot.TurnstileResult(
+            "rejected", "challenge_failed")
+
+    monkeypatch.setattr(registration_antibot, "verify", _verify)
+
+    client = _client()
+    n = auth_limit_store.PASSWORD_RESET_IP_ATTEMPT_LIMIT + 5
+    for _ in range(n):
+        r = _post_start(client, "tsip@x.com",
+                        **{"cf-turnstile-response": "bad-token"})
+        assert r.status_code == 200
+        assert "安全验证未完成" in r.get_data(as_text=True)
+    assert _jobs() == []
+    # 失败挑战不计入 IP 前缀桶
+    conn = pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*)::int AS n FROM auth_rate_limits "
+                "WHERE scope=%s", (auth_limit_store.SCOPE_PASSWORD_RESET_IP,))
+            assert cur.fetchone()["n"] == 0
+    finally:
+        conn.close()
+
+    # 同前缀、有效挑战、符合条件邮箱：必须照常入队
+    r = _post_start(client, "tsip@x.com",
+                    **{"cf-turnstile-response": "good-token"})
+    assert r.status_code == 200
+    assert GENERIC in r.get_data(as_text=True)
+    jobs = _jobs()
+    assert len(jobs) == 1
+    assert jobs[0]["email_normalized"] == "tsip@x.com"
+
+
 # =========================================================================== #
 # 3. 限流：同邮箱冷却/日上限 + 每 IP 前缀尝试桶（超限仍通用响应）
 # =========================================================================== #

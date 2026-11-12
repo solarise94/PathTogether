@@ -7203,7 +7203,7 @@ def password_reset_request():
     """找回密码申请（公开；账号存在性不泄露）。
 
     - GET：渲染邮箱表单（Turnstile 配置与注册同一套）；
-    - POST：邮箱形态校验 → 每 IP 前缀限流 → 入口站点 → Turnstile →
+    - POST：邮箱形态校验 → 入口站点 → Turnstile → 每 IP 前缀限流 →
       单事务资格/配额/入队；**所有账号状态都返回同一通用页面**；
     - 限流存储/邮件通道不可用时也不改变对外文案（服务端日志留痕）。
     """
@@ -7218,8 +7218,23 @@ def password_reset_request():
         return _password_reset_request_page(
             error="请输入有效的邮箱地址", status=400)
 
-    # 每 IP 前缀限流（先于 Turnstile，与 /register 的处理顺序一致）。超限
-    # 返回与成功完全相同的通用页面，仅服务端日志留痕。
+    entry = _registration_entry_site()
+    if not entry or entry.get("refused"):
+        # 生产部署未知 Host：不把任意 Host 反射进重置链接（§6 信任边界）
+        app.logger.warning(
+            "找回密码入口未映射（拒绝发信）host=%s",
+            registration_antibot.request_hostname(request.host) or "-")
+        return _password_reset_generic_page()
+
+    tstate = _password_reset_turnstile_guard()
+    if tstate is not None:
+        return _password_reset_request_page(state=tstate)
+
+    # 每 IP 前缀限流（**Turnstile 之后**）：无挑战 token 的脚本流量不能
+    # 消耗该桶——否则同一 CGNAT/校园网前缀下的真实用户会被静默锁死，
+    # 且因子账号不存在信号只能看到通用页面而无法察觉。Turnstile 未配置
+    # 时 `_password_reset_turnstile_guard` 直接放行，此处照常计数。
+    # 超限返回与成功完全相同的通用页面，仅服务端日志留痕。
     import auth_limit_store
     ip_hash = _ip_prefix_hash(request.remote_addr or "")
     try:
@@ -7234,18 +7249,6 @@ def password_reset_request():
         app.logger.warning("找回密码请求触发 IP 限流（ip_prefix=%s）",
                            (ip_hash or "-")[:12])
         return _password_reset_generic_page()
-
-    entry = _registration_entry_site()
-    if not entry or entry.get("refused"):
-        # 生产部署未知 Host：不把任意 Host 反射进重置链接（§6 信任边界）
-        app.logger.warning(
-            "找回密码入口未映射（拒绝发信）host=%s",
-            registration_antibot.request_hostname(request.host) or "-")
-        return _password_reset_generic_page()
-
-    tstate = _password_reset_turnstile_guard()
-    if tstate is not None:
-        return _password_reset_request_page(state=tstate)
 
     locale = registration_antibot.normalize_form_locale(
         request.form.get("form_locale"), entry.get("default_locale") or "zh")

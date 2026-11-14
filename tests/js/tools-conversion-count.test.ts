@@ -7,7 +7,7 @@
  * 覆盖：
  *   - 页脚统计行位置/默认 hidden + zh/en 文案与占位符；
  *   - 成功转换后的 fire-and-forget beacon（两条成功路径各一次，
- *     source='converter'，keepalive，无 Cookie，失败吞掉）；
+ *     source='converter'，keepalive，无 Cookie，失败吞掉、成功后刷新汇总）；
  *   - 加载时读 summary、失败/0 保持隐藏、语言切换重渲染；
  *   - 静态资源 cache-buster 与 i18n 文案同步。
  */
@@ -85,7 +85,7 @@ describe("converter page summary line", () => {
 	});
 
 	it("static assets are cache-busted for this change", () => {
-		expect(shellSrc).toContain("/static/tools/tools-slides.js?v=20261110a");
+		expect(shellSrc).toContain("/static/tools/tools-slides.js?v=20261114a");
 		expect(shellSrc).toContain("/static/tools/tools-slides.css?v=20261110a");
 		expect(shellSrc).toContain("/static/i18n.js?v=20261110b");
 	});
@@ -99,7 +99,8 @@ describe("converter beacon after a successful conversion", () => {
 		expect(fn).toContain("keepalive: true");
 		expect(fn).toContain("credentials: 'omit'");
 		expect(fn).toContain("source: 'converter'");
-		expect(fn).toMatch(/pending\.catch\(\(\) => \{\}\)/);
+		expect(fn).toContain("if (resp && resp.ok) void loadConversionSummary();");
+		expect(fn).toMatch(/pending\.then\([\s\S]*?\}, \(\) => \{\}\)/);
 	});
 
 	it("fires once on each successful completion path (driveConversion + job list)", () => {

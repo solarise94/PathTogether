@@ -1193,7 +1193,14 @@ function reportCompletedConversion(format) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ source: 'converter', format: String(format || '') }),
     });
-    if (pending && typeof pending.catch === 'function') pending.catch(() => {});
+    // The summary was loaded only at page init. Read it again after the
+    // server has handled this completion so the footer reflects this run.
+    // A 204 may also mean the beacon was ignored, so never increment locally.
+    if (pending && typeof pending.then === 'function') {
+      pending.then((resp) => {
+        if (resp && resp.ok) void loadConversionSummary();
+      }, () => {});
+    }
   } catch (e) { /* 计数失败绝不影响结果 */ }
 }
 
